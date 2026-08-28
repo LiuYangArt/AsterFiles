@@ -276,8 +276,13 @@ impl TabSession {
             .collect();
     }
 
-    pub fn entry(&self, entry_id: EntryId) -> Option<&FileEntry> {
-        self.entries.iter().find(|entry| entry.id == entry_id)
+    pub fn visible_entry(&self, entry_id: EntryId) -> Option<&FileEntry> {
+        let entries = if matches!(self.load_state, LoadState::Partial) {
+            &self.pending_entries
+        } else {
+            &self.entries
+        };
+        entries.iter().find(|entry| entry.id == entry_id)
     }
 
     pub fn clear_selection(&mut self) {
@@ -516,6 +521,29 @@ mod tests {
     }
 
     #[test]
+    fn visible_entry_uses_pending_entries_during_partial_load() {
+        let mut session = TabSession::new(TabId(1));
+        let old = entry(1, "old", EntryKind::Directory, None);
+        let pending = entry(1, "pending", EntryKind::Directory, None);
+        session.replace_entries(vec![old]);
+        session.append_pending(vec![pending]);
+
+        assert_eq!(
+            session
+                .visible_entry(EntryId(1))
+                .map(|entry| entry.display_name.as_str()),
+            Some("pending")
+        );
+        session.commit_pending();
+        assert_eq!(
+            session
+                .visible_entry(EntryId(1))
+                .map(|entry| entry.display_name.as_str()),
+            Some("pending")
+        );
+    }
+
+    #[test]
     fn session_only_accepts_latest_request() {
         let mut session = TabSession::new(TabId(7));
         let (first, first_cancel) =
@@ -642,7 +670,9 @@ mod tests {
             modified: None,
         }]);
         assert_eq!(
-            session.entry(EntryId(9)).map(|entry| entry.path.clone()),
+            session
+                .visible_entry(EntryId(9))
+                .map(|entry| entry.path.clone()),
             Some(original)
         );
     }

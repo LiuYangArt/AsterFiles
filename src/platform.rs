@@ -45,6 +45,10 @@ mod windows_impl {
 
     use super::{KnownLocation, KnownLocationKind, Path, PathBuf};
 
+    pub fn double_click_interval() -> std::time::Duration {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+        std::time::Duration::from_millis(unsafe { GetDoubleClickTime() }.into())
+    }
     pub fn known_locations() -> Vec<KnownLocation> {
         let specifications = [
             (KnownLocationKind::Home, "主页", FOLDERID_Profile),
@@ -166,8 +170,12 @@ mod windows_impl {
 }
 
 #[cfg(windows)]
-pub use windows_impl::{known_locations, open_path};
+pub use windows_impl::{double_click_interval, known_locations, open_path};
 
+#[cfg(not(windows))]
+pub fn double_click_interval() -> std::time::Duration {
+    std::time::Duration::from_millis(500)
+}
 #[cfg(not(windows))]
 pub fn known_locations() -> Vec<KnownLocation> {
     std::env::var_os("HOME")

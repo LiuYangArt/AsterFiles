@@ -312,6 +312,7 @@ export component AppWindow inherits Window {
     callback toggle-focused();
     callback change-sort(int);
     callback open-entry(int);
+    callback activate-entry(int, bool, bool);
     callback new-tab();
     callback close-tab(int);
     callback restore-tab();
@@ -449,22 +450,14 @@ export component AppWindow inherits Window {
             VerticalLayout {
                 spacing: 0px;
                 Rectangle {
-                    height: 42px; background: #fbfbfc; border-color: #e7e8eb; border-width: 1px;
-                    HorizontalLayout {
-                        padding-left: 12px; padding-right: 12px; spacing: 8px;
-                        CommandButton { icon-source: @image-url("icons/actions/select-all.svg"); label: "全选"; clicked => { root.select-all(); } }
-                        CommandButton { width: 92px; icon-source: @image-url("icons/actions/close.svg"); label: "清除选择"; enabled: root.selected-count > 0; clicked => { root.clear-selection(); } }
-                        Rectangle { horizontal-stretch: 1; }
-                        CommandButton { icon-source: @image-url("icons/actions/sort.svg"); label: root.text-name + (root.sort-field == 0 ? (root.sort-descending ? " ↓" : " ↑") : ""); clicked => { root.change-sort(0); } }
-                        CommandButton { visible: !root.compact; icon-source: @image-url("icons/actions/sort.svg"); label: root.text-type + (root.sort-field == 1 ? (root.sort-descending ? " ↓" : " ↑") : ""); clicked => { root.change-sort(1); } }
-                        CommandButton { visible: !root.minimal; icon-source: @image-url("icons/actions/sort.svg"); label: root.text-size + (root.sort-field == 2 ? (root.sort-descending ? " ↓" : " ↑") : ""); clicked => { root.change-sort(2); } }
-                        CommandButton { visible: !root.compact; width: 104px; icon-source: @image-url("icons/actions/sort.svg"); label: root.text-modified + (root.sort-field == 3 ? (root.sort-descending ? " ↓" : " ↑") : ""); clicked => { root.change-sort(3); } }
-                    }
-                }
-
-                Rectangle {
                     height: 38px; background: #ffffff; border-color: #e7e8eb; border-width: 1px;
-                    HorizontalLayout { padding-left: 16px; padding-right: 16px; spacing: 12px; Text { text: root.text-name + (root.sort-field == 0 ? (root.sort-descending ? " ↓" : " ↑") : ""); width: root.compact ? 65% : 52%; color: #555862; font-size: 12px; vertical-alignment: center; } Text { visible: !root.compact; text: root.text-type + (root.sort-field == 1 ? (root.sort-descending ? " ↓" : " ↑") : ""); width: 16%; color: #696b74; font-size: 12px; vertical-alignment: center; } Text { visible: !root.compact; text: root.text-modified + (root.sort-field == 3 ? (root.sort-descending ? " ↓" : " ↑") : ""); width: 18%; color: #696b74; font-size: 12px; vertical-alignment: center; } Text { visible: !root.minimal; text: root.text-size + (root.sort-field == 2 ? (root.sort-descending ? " ↓" : " ↑") : ""); horizontal-stretch: 1; color: #696b74; font-size: 12px; vertical-alignment: center; } }
+                    HorizontalLayout {
+                        padding-left: 16px; padding-right: 16px; spacing: 12px;
+                        Rectangle { width: root.compact ? 65% : 52%; Text { x: 27px; width: parent.width - 27px; horizontal-alignment: left; text: root.text-name + (root.sort-field == 0 ? (root.sort-descending ? " ↓" : " ↑") : ""); color: root.sort-field == 0 ? #3b4f83 : #555862; font-size: 12px; font-weight: root.sort-field == 0 ? 600 : 400; vertical-alignment: center; } TouchArea { mouse-cursor: pointer; clicked => { root.change-sort(0); } } }
+                        Rectangle { visible: !root.compact; width: 16%; Text { width: parent.width; horizontal-alignment: left; text: root.text-type + (root.sort-field == 1 ? (root.sort-descending ? " ↓" : " ↑") : ""); color: root.sort-field == 1 ? #3b4f83 : #696b74; font-size: 12px; font-weight: root.sort-field == 1 ? 600 : 400; vertical-alignment: center; } TouchArea { mouse-cursor: pointer; clicked => { root.change-sort(1); } } }
+                        Rectangle { visible: !root.minimal; width: root.compact ? 35% : 14%; Text { width: parent.width; horizontal-alignment: left; text: root.text-size + (root.sort-field == 2 ? (root.sort-descending ? " ↓" : " ↑") : ""); color: root.sort-field == 2 ? #3b4f83 : #696b74; font-size: 12px; font-weight: root.sort-field == 2 ? 600 : 400; vertical-alignment: center; } TouchArea { mouse-cursor: pointer; clicked => { root.change-sort(2); } } }
+                        Rectangle { visible: !root.compact; horizontal-stretch: 1; Text { width: parent.width; horizontal-alignment: left; text: root.text-modified + (root.sort-field == 3 ? (root.sort-descending ? " ↓" : " ↑") : ""); color: root.sort-field == 3 ? #3b4f83 : #696b74; font-size: 12px; font-weight: root.sort-field == 3 ? 600 : 400; vertical-alignment: center; } TouchArea { mouse-cursor: pointer; clicked => { root.change-sort(3); } } }
+                    }
                 }
 
                 Rectangle {
@@ -476,8 +469,19 @@ export component AppWindow inherits Window {
                         for entry in root.files: Rectangle {
                             width: list.width;
                             height: 40px; background: entry.selected ? #dce6ff : (mouse.has-hover ? #eff4ff : #ffffff); border-color: entry.focused ? #4f6bed : #f1f1f3; border-width: entry.focused ? 2px : 1px;
-                            HorizontalLayout { padding-left: 16px; padding-right: 16px; spacing: 12px; HorizontalLayout { width: root.compact ? 65% : 52%; spacing: 9px; InlineIcon { icon-source: entry.is-directory ? @image-url("icons/files/folder.svg") : @image-url("icons/files/document.svg"); } Text { text: entry.name; color: #24252a; font-size: 13px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1;  } } Text { visible: !root.compact; text: entry.kind; width: 16%; color: #6f717a; font-size: 12px; vertical-alignment: center; } Text { visible: !root.compact; text: entry.modified; width: 18%; color: #6f717a; font-size: 12px; vertical-alignment: center; } Text { visible: !root.minimal; text: entry.size; horizontal-stretch: 1; color: #6f717a; font-size: 12px; vertical-alignment: center; horizontal-alignment: right; } }
-                            mouse := TouchArea { mouse-cursor: pointer; pointer-event(event) => { if event.button == PointerEventButton.left && event.kind == PointerEventKind.down { root.select-entry(entry.id, event.modifiers.control, event.modifiers.shift); } } double-clicked => { root.open-entry(entry.id); } }
+                            HorizontalLayout { padding-left: 16px; padding-right: 16px; spacing: 12px; HorizontalLayout { width: root.compact ? 65% : 52%; spacing: 9px; InlineIcon { icon-source: entry.is-directory ? @image-url("icons/files/folder.svg") : @image-url("icons/files/document.svg"); } Text { text: entry.name; color: #24252a; font-size: 13px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1;  } } Text { visible: !root.compact; text: entry.kind; width: 16%; color: #6f717a; font-size: 12px; vertical-alignment: center; } Text { visible: !root.minimal; text: entry.size; width: root.compact ? 35% : 14%; color: #6f717a; font-size: 12px; vertical-alignment: center; horizontal-alignment: right; } Text { visible: !root.compact; text: entry.modified; horizontal-stretch: 1; color: #6f717a; font-size: 12px; vertical-alignment: center; } }
+                            mouse := TouchArea {
+                                private property <bool> click-control: false;
+                                private property <bool> click-shift: false;
+                                mouse-cursor: pointer;
+                                pointer-event(event) => {
+                                    if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                                        self.click-control = event.modifiers.control;
+                                        self.click-shift = event.modifiers.shift;
+                                    }
+                                }
+                                clicked => { root.activate-entry(entry.id, self.click-control, self.click-shift); }
+                            }
                             accessible-role: list-item; accessible-label: entry.name;
                         }
                     }

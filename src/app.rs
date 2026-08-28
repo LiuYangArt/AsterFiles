@@ -354,7 +354,7 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
                 Some(EntryId(entry_id as u32))
             };
             entry_id.and_then(|entry_id| {
-                app.active().entry(entry_id).map(|entry| {
+                app.active().visible_entry(entry_id).map(|entry| {
                     (
                         app.active_tab,
                         entry.path.clone(),
@@ -438,6 +438,89 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
         }
     });
 
+    let weak = ui.as_weak();
+    let sender_for_activate_entry = sender.clone();
+    let state_for_activate_entry = state.clone();
+    let last_click = std::rc::Rc::new(Cell::new(None::<(TabId, RequestId, EntryId, Instant)>));
+    ui.on_activate_entry(move |entry_id, toggle, extend| {
+        let entry_id = EntryId(entry_id as u32);
+        let now = Instant::now();
+        let (tab_id, request_id) = {
+            let app = state_for_activate_entry
+                .lock()
+                .expect("app state mutex is not poisoned");
+            (app.active_tab, app.active().latest_request)
+        };
+        let double_click_interval = platform::double_click_interval();
+        let should_open = last_click.get().is_some_and(
+            |(previous_tab, previous_request, previous_id, previous_time)| {
+                previous_tab == tab_id
+                    && previous_request == request_id
+                    && previous_id == entry_id
+                    && now.saturating_duration_since(previous_time) <= double_click_interval
+            },
+        );
+        last_click.set((!should_open).then_some((tab_id, request_id, entry_id, now)));
+
+        if should_open {
+            let target = {
+                let app = state_for_activate_entry
+                    .lock()
+                    .expect("app state mutex is not poisoned");
+                app.active().visible_entry(entry_id).map(|entry| {
+                    (
+                        app.active_tab,
+                        entry.path.clone(),
+                        entry.kind == crate::domain::EntryKind::Directory,
+                    )
+                })
+            };
+            if let Some((tab_id, target, is_directory)) = target {
+                if is_directory {
+                    submit_navigation(
+                        &sender_for_activate_entry,
+                        &state_for_activate_entry,
+                        tab_id,
+                        target,
+                        NavigationKind::Normal,
+                    );
+                } else {
+                    thread::spawn(move || {
+                        if let Err(error) = platform::open_path(&target) {
+                            eprintln!("unable to open file: {error}");
+                        }
+                    });
+                }
+                if let Some(ui) = weak.upgrade() {
+                    refresh_ui(&ui, &state_for_activate_entry);
+                }
+            }
+            return;
+        }
+
+        let changed_rows = {
+            let mut app = state_for_activate_entry
+                .lock()
+                .expect("app state mutex is not poisoned");
+            let tab_id = app.active_tab;
+            let Some(tab) = app.tabs.get_mut(&tab_id) else {
+                return;
+            };
+            let previous_selected = tab.selected.clone();
+            let previous_focused = tab.focused;
+            tab.select_entry(entry_id, toggle, extend);
+            previous_selected
+                .into_iter()
+                .chain(tab.selected.iter().copied())
+                .chain(previous_focused)
+                .chain(tab.focused)
+                .collect::<std::collections::HashSet<_>>()
+        };
+        if let Some(ui) = weak.upgrade() {
+            update_file_rows(&ui, &state_for_activate_entry, &changed_rows);
+            update_selection_summary(&ui, &state_for_activate_entry);
+        }
+    });
     let weak = ui.as_weak();
     let state_for_select = state.clone();
     ui.on_select_entry(move |entry_id, toggle, extend| {
@@ -960,22 +1043,32 @@ fn wire_mouse_navigation(ui: &AppWindow) {
                 }
             }
             WindowEvent::MouseInput {
-                state: ElementState::Released,
+                state,
                 button: MouseButton::Back,
                 ..
             } => {
-                if ui.get_can_navigate_back() {
-                    ui.invoke_navigate_back();
+                if *state == ElementState::Released && ui.get_can_navigate_back() {
+                    let weak = ui.as_weak();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = weak.upgrade() {
+                            ui.invoke_navigate_back();
+                        }
+                    });
                 }
                 EventResult::PreventDefault
             }
             WindowEvent::MouseInput {
-                state: ElementState::Released,
+                state,
                 button: MouseButton::Forward,
                 ..
             } => {
-                if ui.get_can_navigate_forward() {
-                    ui.invoke_navigate_forward();
+                if *state == ElementState::Released && ui.get_can_navigate_forward() {
+                    let weak = ui.as_weak();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = weak.upgrade() {
+                            ui.invoke_navigate_forward();
+                        }
+                    });
                 }
                 EventResult::PreventDefault
             }
