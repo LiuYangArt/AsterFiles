@@ -16,6 +16,41 @@ export struct TabRow {
     loading: bool,
 }
 
+component IconButton inherits Button {
+    in property <image> icon-source;
+    icon: root.icon-source;
+    text: "";
+    width: 38px;
+    height: 38px;
+}
+
+component InlineIcon inherits Rectangle {
+    in property <image> icon-source;
+    in property <length> icon-size: 18px;
+    width: root.icon-size;
+    Image {
+        width: root.icon-size;
+        height: root.icon-size;
+        y: (parent.height - self.height) / 2;
+        source: root.icon-source;
+    }
+}
+component SidebarItem inherits Rectangle {
+    in property <image> icon-source;
+    in property <string> label;
+    height: 34px;
+    border-radius: 5px;
+    background: item-mouse.has-hover ? #e5e9f2 : transparent;
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 10px;
+        InlineIcon { icon-source: root.icon-source; }
+        Text { text: root.label; color: #4f535d; font-size: 13px; vertical-alignment: center; }
+    }
+    item-mouse := TouchArea { mouse-cursor: pointer; }
+}
+
 export component AppWindow inherits Window {
     title: "AsterFiles";
     preferred-width: 1180px;
@@ -29,10 +64,18 @@ export component AppWindow inherits Window {
     in property <string> status-text: "";
     in property <[FileRow]> files;
     in property <[TabRow]> tabs;
+    in property <bool> can-navigate-back: false;
+    in property <bool> can-navigate-forward: false;
+    in property <bool> can-navigate-up: false;
+    in property <bool> can-refresh: false;
     in property <bool> can-close-tab: false;
     in property <bool> can-restore-tab: false;
     in property <string> language-label: "EN";
     in property <string> text-go: "前往";
+    in property <string> text-back: "后退";
+    in property <string> text-forward: "前进";
+    in property <string> text-up: "向上";
+    in property <string> text-refresh: "刷新";
     in property <string> text-home: "主页";
     in property <string> text-desktop: "桌面";
     in property <string> text-downloads: "下载";
@@ -45,6 +88,10 @@ export component AppWindow inherits Window {
     in property <string> text-size: "大小";
 
     callback navigate-path(string);
+    callback navigate-back();
+    callback navigate-forward();
+    callback navigate-up();
+    callback refresh();
     callback open-entry(int);
     callback new-tab();
     callback close-tab();
@@ -52,57 +99,89 @@ export component AppWindow inherits Window {
     callback activate-tab(int);
     callback toggle-language();
 
+    shortcut-handler := FocusScope {
+        width: 0px;
+        height: 0px;
+        KeyBinding { keys: @keys(Alt + LeftArrow); enabled: root.can-navigate-back; activated => { root.navigate-back(); } }
+        KeyBinding { keys: @keys(Alt + RightArrow); enabled: root.can-navigate-forward; activated => { root.navigate-forward(); } }
+        KeyBinding { keys: @keys(Alt + UpArrow); enabled: root.can-navigate-up; activated => { root.navigate-up(); } }
+        KeyBinding { keys: @keys(F5); enabled: root.can-refresh; activated => { root.refresh(); } }
+        KeyBinding { keys: @keys(Control + R); enabled: root.can-refresh; activated => { root.refresh(); } }
+    }
+
     VerticalLayout {
         spacing: 0px;
 
         Rectangle {
-            height: 46px;
+            height: 50px;
             background: #ffffff;
-            border-color: #e7e8eb;
+            border-color: #e2e4e9;
             border-width: 1px;
             HorizontalLayout {
-                padding-left: 10px;
-                padding-right: 10px;
-                spacing: 6px;
-                Text { text: "AsterFiles"; width: 100px; color: #1e1f24; font-size: 15px; font-weight: 700; vertical-alignment: center; }
+                padding-left: 14px;
+                padding-right: 12px;
+                padding-top: 6px;
+                padding-bottom: 6px;
+                spacing: 7px;
+                Text { text: "AsterFiles"; width: 112px; color: #1e1f24; font-size: 15px; font-weight: 700; vertical-alignment: center; }
                 for tab in root.tabs: Rectangle {
                     width: 170px;
                     background: tab.active ? #eef2ff : #f7f7f8;
-                    border-color: tab.active ? #a9b8f8 : #e2e3e7;
+                    border-color: tab.active ? #9eaff6 : #e2e3e7;
                     border-width: 1px;
-                    border-radius: 6px;
+                    border-radius: 7px;
                     HorizontalLayout {
                         padding-left: 10px;
                         padding-right: 8px;
-                        spacing: 5px;
-                        Text { text: tab.loading ? "…" : ""; color: #5b5ce2; vertical-alignment: center; }
+                        spacing: 6px;
+                                        InlineIcon { icon-source: @image-url("icons/files/folder.svg"); icon-size: 16px; }
                         Text { text: tab.title; color: #303138; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                        Text { text: tab.loading ? "…" : ""; color: #4f6bed; vertical-alignment: center; }
                     }
                     tab-click := TouchArea { clicked => { root.activate-tab(tab.id); } }
                 }
-                Button { text: "+"; clicked => { root.new-tab(); } }
-                Button { text: "×"; enabled: root.can-close-tab; clicked => { root.close-tab(); } }
-                Button { text: "↶"; enabled: root.can-restore-tab; clicked => { root.restore-tab(); } }
+                IconButton { icon-source: @image-url("icons/actions/add.svg"); accessible-label: "New tab"; clicked => { root.new-tab(); } }
+                IconButton { icon-source: @image-url("icons/actions/close.svg"); enabled: root.can-close-tab; accessible-label: "Close tab"; clicked => { root.close-tab(); } }
+                Button { text: "恢复"; enabled: root.can-restore-tab; clicked => { root.restore-tab(); } }
                 Rectangle { horizontal-stretch: 1; }
                 Button { text: root.language-label; clicked => { root.toggle-language(); } }
             }
         }
 
         Rectangle {
-            height: 58px;
+            height: 56px;
             background: #fafbfc;
-            border-color: #e7e8eb;
+            border-color: #e2e4e9;
             border-width: 1px;
             HorizontalLayout {
-                padding-top: 10px;
-                padding-bottom: 10px;
+                padding-top: 9px;
+                padding-bottom: 9px;
                 padding-left: 14px;
                 padding-right: 14px;
-                spacing: 8px;
-                LineEdit {
-                    text <=> root.current-path;
+                spacing: 7px;
+                IconButton { icon-source: @image-url("icons/actions/back.svg"); enabled: root.can-navigate-back; accessible-label: root.text-back; clicked => { root.navigate-back(); } }
+                IconButton { icon-source: @image-url("icons/actions/forward.svg"); enabled: root.can-navigate-forward; accessible-label: root.text-forward; clicked => { root.navigate-forward(); } }
+                IconButton { icon-source: @image-url("icons/actions/up.svg"); enabled: root.can-navigate-up; accessible-label: root.text-up; clicked => { root.navigate-up(); } }
+                IconButton { icon-source: @image-url("icons/actions/refresh.svg"); enabled: root.can-refresh; accessible-label: root.text-refresh; clicked => { root.refresh(); } }
+                Rectangle {
+                    height: 38px;
                     horizontal-stretch: 1;
-                    accepted => { root.navigate-path(self.text); }
+                    background: #ffffff;
+                    border-color: #d7dae0;
+                    border-width: 1px;
+                    border-radius: 5px;
+                    TextInput {
+                        x: 12px;
+                        width: parent.width - 24px;
+                        height: parent.height;
+                        text <=> root.current-path;
+                        color: #24252a;
+                        selection-background-color: #b9c6ff;
+                        selection-foreground-color: #16171a;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                        accepted => { root.navigate-path(self.text); }
+                    }
                 }
                 Button { text: root.text-go; clicked => { root.navigate-path(root.current-path); } }
             }
@@ -120,15 +199,16 @@ export component AppWindow inherits Window {
                     padding-bottom: 14px;
                     padding-left: 10px;
                     padding-right: 10px;
-                    spacing: 6px;
-                    Text { text: root.text-home; font-size: 13px; font-weight: 700; color: #2b2c31; }
-                    Text { text: root.text-desktop; font-size: 13px; color: #60626c; }
-                    Text { text: root.text-downloads; font-size: 13px; color: #60626c; }
-                    Text { text: root.text-documents; font-size: 13px; color: #60626c; }
-                    Text { text: root.text-pictures; font-size: 13px; color: #60626c; }
-                    Rectangle { height: 12px; }
-                    Text { text: root.text-drives; font-size: 12px; font-weight: 700; color: #8b8d96; }
-                    Text { text: "Windows (C:)"; font-size: 13px; color: #60626c; }
+                    spacing: 3px;
+                    Text { text: root.text-home; height: 28px; font-size: 13px; font-weight: 700; color: #2b2c31; vertical-alignment: center; }
+                    SidebarItem { icon-source: @image-url("icons/locations/home.svg"); label: root.text-home; }
+                    SidebarItem { icon-source: @image-url("icons/locations/desktop.svg"); label: root.text-desktop; }
+                    SidebarItem { icon-source: @image-url("icons/locations/downloads.svg"); label: root.text-downloads; }
+                    SidebarItem { icon-source: @image-url("icons/locations/documents.svg"); label: root.text-documents; }
+                    SidebarItem { icon-source: @image-url("icons/locations/pictures.svg"); label: root.text-pictures; }
+                    Rectangle { height: 10px; }
+                    Text { text: root.text-drives; height: 28px; font-size: 12px; font-weight: 700; color: #777a84; vertical-alignment: center; }
+                    SidebarItem { icon-source: @image-url("icons/locations/drive.svg"); label: "Windows (C:)"; }
                     Rectangle { vertical-stretch: 1; }
                 }
             }
@@ -153,7 +233,7 @@ export component AppWindow inherits Window {
 
                 list := ListView {
                     for entry in root.files: Rectangle {
-                        height: 38px;
+                        height: 40px;
                         background: mouse.has-hover ? #eff4ff : #ffffff;
                         border-color: #f1f1f3;
                         border-width: 1px;
@@ -161,7 +241,12 @@ export component AppWindow inherits Window {
                             padding-left: 16px;
                             padding-right: 16px;
                             spacing: 12px;
-                            Text { text: entry.is-directory ? "▸  " + entry.name : "    " + entry.name; width: 52%; color: #24252a; font-size: 13px; vertical-alignment: center; overflow: elide; }
+                            HorizontalLayout {
+                                width: 52%;
+                                spacing: 9px;
+                                                        InlineIcon { icon-source: entry.is-directory ? @image-url("icons/files/folder.svg") : @image-url("icons/files/document.svg"); }
+                                Text { text: entry.name; color: #24252a; font-size: 13px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                            }
                             Text { text: entry.kind; width: 16%; color: #6f717a; font-size: 12px; vertical-alignment: center; }
                             Text { text: entry.modified; width: 18%; color: #6f717a; font-size: 12px; vertical-alignment: center; }
                             Text { text: entry.size; horizontal-stretch: 1; color: #6f717a; font-size: 12px; vertical-alignment: center; horizontal-alignment: right; }

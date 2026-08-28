@@ -7,10 +7,13 @@ use std::{
     time::Instant,
 };
 
-use slint::{ModelRc, VecModel};
+use slint::{
+    ModelRc, VecModel,
+    winit_030::{EventResult, WinitWindowAccessor, winit},
+};
 
 use crate::{
-    domain::{EntryId, FileEntry, LoadState, RequestId, TabId, TabSession},
+    domain::{EntryId, FileEntry, LoadState, NavigationKind, RequestId, TabId, TabSession},
     fs::{ReadOutcome, read_directory_batches, sort_entries},
     i18n::{Language, Texts},
     session_store,
@@ -161,6 +164,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
     let event_receiver = Arc::new(Mutex::new(event_receiver));
 
     wire_callbacks(&ui, request_sender.clone(), state.clone());
+    wire_mouse_navigation(&ui);
     start_event_pump(&ui, event_receiver, state.clone());
     refresh_ui(&ui, &state);
     let initial_tabs = {
@@ -176,7 +180,13 @@ pub fn run() -> Result<(), slint::PlatformError> {
             .collect::<Vec<_>>()
     };
     for (tab_id, path) in initial_tabs {
-        submit_navigation(&request_sender, &state, tab_id, path);
+        submit_navigation(
+            &request_sender,
+            &state,
+            tab_id,
+            path,
+            NavigationKind::Refresh,
+        );
     }
 
     let result = ui.run();
@@ -195,13 +205,14 @@ fn submit_navigation(
     state: &SharedSessions,
     tab_id: TabId,
     path: PathBuf,
+    kind: NavigationKind,
 ) {
     let request = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         let Some(tab) = app.tabs.get_mut(&tab_id) else {
             return;
         };
-        let (request_id, cancel) = tab.begin_navigation(path.clone());
+        let (request_id, cancel) = tab.begin_navigation(path.clone(), kind);
         DirectoryRequest {
             tab_id,
             request_id,
@@ -227,6 +238,7 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
             &state_for_path,
             tab_id,
             PathBuf::from(path.as_str()),
+            NavigationKind::Normal,
         );
         if let Some(ui) = weak.upgrade() {
             refresh_ui(&ui, &state_for_path);
@@ -247,7 +259,13 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
                 .lock()
                 .expect("app state mutex is not poisoned")
                 .active_tab;
-            submit_navigation(&sender_for_entry, &state_for_entry, tab_id, target);
+            submit_navigation(
+                &sender_for_entry,
+                &state_for_entry,
+                tab_id,
+                target,
+                NavigationKind::Normal,
+            );
             if let Some(ui) = weak.upgrade() {
                 refresh_ui(&ui, &state_for_entry);
             }
@@ -270,7 +288,13 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
             let tab_id = app.create_tab(path.clone());
             (tab_id, path)
         };
-        submit_navigation(&sender_for_new, &state_for_new, tab_id, path);
+        submit_navigation(
+            &sender_for_new,
+            &state_for_new,
+            tab_id,
+            path,
+            NavigationKind::Refresh,
+        );
         if let Some(ui) = weak.upgrade() {
             refresh_ui(&ui, &state_for_new);
         }
@@ -297,7 +321,13 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
             .expect("app state mutex is not poisoned")
             .restore_closed();
         if let Some((tab_id, path)) = restored {
-            submit_navigation(&sender_for_restore, &state_for_restore, tab_id, path);
+            submit_navigation(
+                &sender_for_restore,
+                &state_for_restore,
+                tab_id,
+                path,
+                NavigationKind::Refresh,
+            );
         }
         if let Some(ui) = weak.upgrade() {
             refresh_ui(&ui, &state_for_restore);
@@ -321,6 +351,120 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
     });
 
     let weak = ui.as_weak();
+    let sender_for_back = sender.clone();
+    let state_for_back = state.clone();
+    ui.on_navigate_back(move || {
+        let target = {
+            let app = state_for_back
+                .lock()
+                .expect("app state mutex is not poisoned");
+            app.active()
+                .back_target()
+                .map(|path| (app.active_tab, path))
+        };
+        if let Some((tab_id, path)) = target {
+            submit_navigation(
+                &sender_for_back,
+                &state_for_back,
+                tab_id,
+                path,
+                NavigationKind::Back,
+            );
+            if let Some(ui) = weak.upgrade() {
+                refresh_ui(&ui, &state_for_back);
+            }
+        }
+    });
+
+    let weak = ui.as_weak();
+    let sender_for_forward = sender.clone();
+    let state_for_forward = state.clone();
+    ui.on_navigate_forward(move || {
+        let target = {
+            let app = state_for_forward
+                .lock()
+                .expect("app state mutex is not poisoned");
+            app.active()
+                .forward_target()
+                .map(|path| (app.active_tab, path))
+        };
+        if let Some((tab_id, path)) = target {
+            submit_navigation(
+                &sender_for_forward,
+                &state_for_forward,
+                tab_id,
+                path,
+                NavigationKind::Forward,
+            );
+            if let Some(ui) = weak.upgrade() {
+                refresh_ui(&ui, &state_for_forward);
+            }
+        }
+    });
+
+    let weak = ui.as_weak();
+    let sender_for_up = sender.clone();
+    let state_for_up = state.clone();
+    ui.on_navigate_up(move || {
+        let target = {
+            let app = state_for_up
+                .lock()
+                .expect("app state mutex is not poisoned");
+            app.active()
+                .current_path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+                .map(|path| (app.active_tab, path))
+        };
+        if let Some((tab_id, path)) = target {
+            submit_navigation(
+                &sender_for_up,
+                &state_for_up,
+                tab_id,
+                path,
+                NavigationKind::Normal,
+            );
+            if let Some(ui) = weak.upgrade() {
+                refresh_ui(&ui, &state_for_up);
+            }
+        }
+    });
+
+    let weak = ui.as_weak();
+    let sender_for_refresh = sender;
+    let state_for_refresh = state.clone();
+    ui.on_refresh(move || {
+        let target = {
+            let app = state_for_refresh
+                .lock()
+                .expect("app state mutex is not poisoned");
+            if matches!(
+                app.active().load_state,
+                LoadState::Loading | LoadState::Partial
+            ) {
+                None
+            } else {
+                app.active()
+                    .current_path
+                    .clone()
+                    .map(|path| (app.active_tab, path))
+            }
+        };
+        if let Some((tab_id, path)) = target {
+            submit_navigation(
+                &sender_for_refresh,
+                &state_for_refresh,
+                tab_id,
+                path,
+                NavigationKind::Refresh,
+            );
+            if let Some(ui) = weak.upgrade() {
+                refresh_ui(&ui, &state_for_refresh);
+            }
+        }
+    });
+    let weak = ui.as_weak();
     ui.on_toggle_language(move || {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         app.language = app.language.toggle();
@@ -331,6 +475,37 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
     });
 }
 
+fn wire_mouse_navigation(ui: &AppWindow) {
+    let weak = ui.as_weak();
+    ui.window().on_winit_window_event(move |_, event| {
+        let winit::event::WindowEvent::MouseInput {
+            state: winit::event::ElementState::Released,
+            button,
+            ..
+        } = event
+        else {
+            return EventResult::Propagate;
+        };
+        let Some(ui) = weak.upgrade() else {
+            return EventResult::Propagate;
+        };
+        match button {
+            winit::event::MouseButton::Back => {
+                if ui.get_can_navigate_back() {
+                    ui.invoke_navigate_back();
+                }
+                EventResult::PreventDefault
+            }
+            winit::event::MouseButton::Forward => {
+                if ui.get_can_navigate_forward() {
+                    ui.invoke_navigate_forward();
+                }
+                EventResult::PreventDefault
+            }
+            _ => EventResult::Propagate,
+        }
+    });
+}
 fn spawn_directory_workers(
     worker_count: usize,
 ) -> (
@@ -539,6 +714,13 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
             })
             .collect::<Vec<_>>(),
     )));
+    ui.set_can_navigate_back(!tab.back_history.is_empty());
+    ui.set_can_navigate_forward(!tab.forward_history.is_empty());
+    ui.set_can_navigate_up(tab.current_path.as_deref().and_then(Path::parent).is_some());
+    ui.set_can_refresh(!matches!(
+        tab.load_state,
+        LoadState::Loading | LoadState::Partial
+    ));
     ui.set_can_close_tab(app.tab_order.len() > 1);
     ui.set_can_restore_tab(!app.closed_tabs.is_empty());
     ui.set_language_label(match app.language {
@@ -578,36 +760,63 @@ fn status_text(tab: &TabSession, texts: Texts) -> String {
 }
 
 fn apply_ui_texts(ui: &AppWindow, language: Language) {
-    let (go, home, desktop, downloads, documents, pictures, drives, name, kind, modified, size) =
-        match language {
-            Language::Chinese => (
-                "前往",
-                "主页",
-                "桌面",
-                "下载",
-                "文档",
-                "图片",
-                "磁盘",
-                "名称",
-                "类型",
-                "修改时间",
-                "大小",
-            ),
-            Language::English => (
-                "Go",
-                "Home",
-                "Desktop",
-                "Downloads",
-                "Documents",
-                "Pictures",
-                "Drives",
-                "Name",
-                "Type",
-                "Modified",
-                "Size",
-            ),
-        };
+    let (
+        go,
+        back,
+        forward,
+        up,
+        refresh,
+        home,
+        desktop,
+        downloads,
+        documents,
+        pictures,
+        drives,
+        name,
+        kind,
+        modified,
+        size,
+    ) = match language {
+        Language::Chinese => (
+            "前往",
+            "后退",
+            "前进",
+            "向上",
+            "刷新",
+            "主页",
+            "桌面",
+            "下载",
+            "文档",
+            "图片",
+            "磁盘",
+            "名称",
+            "类型",
+            "修改时间",
+            "大小",
+        ),
+        Language::English => (
+            "Go",
+            "Back",
+            "Forward",
+            "Up",
+            "Refresh",
+            "Home",
+            "Desktop",
+            "Downloads",
+            "Documents",
+            "Pictures",
+            "Drives",
+            "Name",
+            "Type",
+            "Modified",
+            "Size",
+        ),
+    };
     ui.set_text_go(go.into());
+    ui.set_text_back(back.into());
+    ui.set_text_forward(forward.into());
+    ui.set_text_up(up.into());
+    ui.set_text_refresh(refresh.into());
     ui.set_text_home(home.into());
     ui.set_text_desktop(desktop.into());
     ui.set_text_downloads(downloads.into());
