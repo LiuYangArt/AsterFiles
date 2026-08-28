@@ -1041,6 +1041,19 @@ fn update_selection_summary(ui: &AppWindow, state: &SharedSessions) {
     ui.set_selected_count(tab.selected.len() as i32);
     ui.set_status_text(status_text(tab, texts).into());
 }
+fn selected_sidebar_index(app: &AppState) -> Option<usize> {
+    let current = app.active().current_path.as_deref()?;
+    app.sidebar
+        .iter()
+        .enumerate()
+        .filter(|(_, location)| {
+            current == location.path
+                || (location.kind == KnownLocationKind::Drive
+                    && current.starts_with(&location.path))
+        })
+        .max_by_key(|(_, location)| (current == location.path, location.path.components().count()))
+        .map(|(index, _)| index)
+}
 fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
     let app = state.lock().expect("app state mutex is not poisoned");
     let texts = Texts::new(app.language);
@@ -1146,6 +1159,7 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
             })
             .collect::<Vec<_>>(),
     )));
+    let selected_sidebar = selected_sidebar_index(&app);
     ui.set_sidebar_items(ModelRc::new(VecModel::from(
         app.sidebar
             .iter()
@@ -1163,13 +1177,7 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
                     KnownLocationKind::Videos => 6,
                     KnownLocationKind::Drive => 7,
                 },
-                selected: tab.current_path.as_ref().is_some_and(|current| {
-                    if location.kind == KnownLocationKind::Drive {
-                        current.starts_with(&location.path)
-                    } else {
-                        current == &location.path
-                    }
-                }),
+                selected: selected_sidebar.is_some_and(|selected| selected == index),
                 is_drive: location.kind == KnownLocationKind::Drive,
             })
             .collect::<Vec<_>>(),
@@ -1331,6 +1339,43 @@ fn initial_path() -> PathBuf {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sidebar_selection_prefers_exact_known_folder_over_drive() {
+        let mut app = AppState::new(vec![PathBuf::from(r"C:\Users\Test\Pictures")], 0);
+        app.sidebar = vec![
+            KnownLocation {
+                kind: KnownLocationKind::Pictures,
+                label: "图片".to_owned(),
+                path: PathBuf::from(r"C:\Users\Test\Pictures"),
+            },
+            KnownLocation {
+                kind: KnownLocationKind::Drive,
+                label: "C:".to_owned(),
+                path: PathBuf::from(r"C:\"),
+            },
+        ];
+
+        assert_eq!(selected_sidebar_index(&app), Some(0));
+    }
+
+    #[test]
+    fn sidebar_selection_uses_drive_for_descendant_without_exact_location() {
+        let mut app = AppState::new(vec![PathBuf::from(r"C:\Projects\AsterFiles")], 0);
+        app.sidebar = vec![
+            KnownLocation {
+                kind: KnownLocationKind::Pictures,
+                label: "图片".to_owned(),
+                path: PathBuf::from(r"C:\Users\Test\Pictures"),
+            },
+            KnownLocation {
+                kind: KnownLocationKind::Drive,
+                label: "C:".to_owned(),
+                path: PathBuf::from(r"C:\"),
+            },
+        ];
+
+        assert_eq!(selected_sidebar_index(&app), Some(1));
+    }
     #[test]
     fn closing_a_tab_preserves_another_session() {
         let mut app = AppState::new(vec![PathBuf::from("one")], 0);

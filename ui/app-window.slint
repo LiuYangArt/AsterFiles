@@ -91,13 +91,12 @@ component BreadcrumbButton inherits Rectangle {
         Text { visible: !root.current; text: "›"; color: #777b85; font-size: 14px; vertical-alignment: center; }
     }
     crumb-touch := TouchArea {
-        enabled: !root.current;
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
     }
     accessible-role: button;
     accessible-label: root.label;
-    accessible-enabled: !root.current;
+    accessible-enabled: true;
 }
 
 
@@ -235,7 +234,7 @@ export component AppWindow inherits Window {
                 IconButton { visible: !root.compact; icon-source: @image-url("icons/actions/refresh.svg"); tip: root.text-refresh + " (F5)"; enabled: root.can-refresh; button-label: root.text-refresh; clicked => { root.refresh(); } }
                 Rectangle {
                     height: root.address-editing && root.address-has-error ? 52px : 38px; horizontal-stretch: 1; background: #ffffff; border-color: root.address-has-error ? #c42b1c : #d7dae0; border-width: root.address-has-error ? 2px : 1px; border-radius: 5px;
-                    if !root.address-editing: Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 2px; InlineIcon { icon-source: @image-url("icons/files/folder.svg"); icon-size: 16px; } for crumb in root.breadcrumbs: BreadcrumbButton { label: crumb.label; current: crumb.current; clicked => { root.navigate-breadcrumb(crumb.index); } } Rectangle { horizontal-stretch: 1; } } TouchArea { mouse-cursor: pointer; clicked => { root.begin-address-edit(); } } }
+                    if !root.address-editing: Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 2px; InlineIcon { icon-source: @image-url("icons/files/folder.svg"); icon-size: 16px; } for crumb in root.breadcrumbs: BreadcrumbButton { label: crumb.label; current: crumb.current; clicked => { root.navigate-breadcrumb(crumb.index); } } Rectangle { horizontal-stretch: 1; TouchArea { mouse-cursor: pointer; clicked => { root.begin-address-edit(); } } } } }
                     address-editor := LineEdit { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: root.address-has-error ? 30px : parent.height - 4px; text <=> root.address-input; font-size: 13px; accessible-label: "路径"; accepted(value) => { root.navigate-path(value); } key-pressed(event) => { if event.text == Key.Escape { root.cancel-address-edit(); return accept; } return reject; } }
                     if root.address-editing && root.address-has-error: Text { x: 10px; y: 32px; width: parent.width - 20px; height: 16px; text: root.address-error-text; color: #a4262c; font-size: 11px; vertical-alignment: center; }
                 }
@@ -287,6 +286,7 @@ export component AppWindow inherits Window {
                     list := ListView {
                         visible: root.files.length > 0;
                         for entry in root.files: Rectangle {
+                            width: list.width;
                             height: 40px; background: entry.selected ? #dce6ff : (mouse.has-hover ? #eff4ff : #ffffff); border-color: entry.focused ? #4f6bed : #f1f1f3; border-width: entry.focused ? 2px : 1px;
                             HorizontalLayout { padding-left: 16px; padding-right: 16px; spacing: 12px; HorizontalLayout { width: root.compact ? 65% : 52%; spacing: 9px; InlineIcon { icon-source: entry.is-directory ? @image-url("icons/files/folder.svg") : @image-url("icons/files/document.svg"); } Text { text: entry.name; color: #24252a; font-size: 13px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1;  } } Text { visible: !root.compact; text: entry.kind; width: 16%; color: #6f717a; font-size: 12px; vertical-alignment: center; } Text { visible: !root.compact; text: entry.modified; width: 18%; color: #6f717a; font-size: 12px; vertical-alignment: center; } Text { visible: !root.minimal; text: entry.size; horizontal-stretch: 1; color: #6f717a; font-size: 12px; vertical-alignment: center; horizontal-alignment: right; } }
                             mouse := TouchArea { mouse-cursor: pointer; clicked => { root.select-entry(entry.id); } double-clicked => { root.open-entry(entry.id); } }
