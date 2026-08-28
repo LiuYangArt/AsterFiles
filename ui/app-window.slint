@@ -1,4 +1,4 @@
-import { LineEdit, ListView } from "std-widgets.slint";
+import { ListView } from "std-widgets.slint";
 
 export struct FileRow { id: int, name: string, kind: string, size: string, modified: string, is-directory: bool, selected: bool, focused: bool }
 export struct HistoryRow { index: int, label: string }
@@ -99,7 +99,72 @@ component BreadcrumbButton inherits Rectangle {
     accessible-enabled: true;
 }
 
+component AddressEditor inherits Rectangle {
+    in-out property <string> text;
+    in property <bool> has-error: false;
+    callback accepted(string);
+    callback cancelled();
 
+    public function focus-and-select-all() {
+        editor.focus();
+        editor.select-all();
+    }
+
+    background: #ffffff;
+    forward-focus: editor;
+    property <bool> editor-has-focus: editor.has-focus;
+
+    changed editor-has-focus => {
+        if root.visible && !root.editor-has-focus {
+            root.cancelled();
+        }
+    }
+
+    editor := TextInput {
+        x: 8px;
+        width: parent.width - 38px;
+        height: parent.height;
+        text <=> root.text;
+        color: #30333a;
+        selection-background-color: #c7d7ff;
+        selection-foreground-color: #24252a;
+        font-size: 13px;
+        single-line: true;
+        vertical-alignment: center;
+        accessible-role: text-input;
+        accessible-label: "路径";
+        accepted => { root.accepted(root.text); }
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.cancelled();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+
+    Rectangle {
+        x: parent.width - 30px;
+        width: 30px;
+        height: parent.height;
+        border-radius: 4px;
+        background: dismiss-touch.pressed ? #dde3ed : dismiss-touch.has-hover ? #edf1f6 : transparent;
+        Image {
+            width: 16px;
+            height: 16px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            source: @image-url("icons/actions/close.svg");
+        }
+        dismiss-touch := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.cancelled(); }
+        }
+        accessible-role: button;
+        accessible-label: "取消编辑";
+    }
+}
 
 export component AppWindow inherits Window {
     title: "AsterFiles";
@@ -202,7 +267,7 @@ export component AppWindow inherits Window {
         KeyBinding { keys: @keys(Control + W); enabled: root.can-close-tab; activated => { root.close-tab(); } }
     }
 
-    public function focus-address-editor() { address-editor.focus(); address-editor.select-all(); }
+    public function focus-address-editor() { address-editor.focus-and-select-all(); }
 
     VerticalLayout {
         spacing: 0px;
@@ -235,7 +300,7 @@ export component AppWindow inherits Window {
                 Rectangle {
                     height: root.address-editing && root.address-has-error ? 52px : 38px; horizontal-stretch: 1; background: #ffffff; border-color: root.address-has-error ? #c42b1c : #d7dae0; border-width: root.address-has-error ? 2px : 1px; border-radius: 5px;
                     if !root.address-editing: Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 2px; InlineIcon { icon-source: @image-url("icons/files/folder.svg"); icon-size: 16px; } for crumb in root.breadcrumbs: BreadcrumbButton { label: crumb.label; current: crumb.current; clicked => { root.navigate-breadcrumb(crumb.index); } } Rectangle { horizontal-stretch: 1; TouchArea { mouse-cursor: pointer; clicked => { root.begin-address-edit(); } } } } }
-                    address-editor := LineEdit { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: root.address-has-error ? 30px : parent.height - 4px; text <=> root.address-input; font-size: 13px; accessible-label: "路径"; accepted(value) => { root.navigate-path(value); } key-pressed(event) => { if event.text == Key.Escape { root.cancel-address-edit(); return accept; } return reject; } }
+                    address-editor := AddressEditor { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: root.address-has-error ? 30px : parent.height - 4px; text <=> root.address-input; has-error: root.address-has-error; accepted(value) => { root.navigate-path(value); } cancelled => { root.cancel-address-edit(); } }
                     if root.address-editing && root.address-has-error: Text { x: 10px; y: 32px; width: parent.width - 20px; height: 16px; text: root.address-error-text; color: #a4262c; font-size: 11px; vertical-alignment: center; }
                 }
                 IconButton { visible: !root.minimal; icon-source: @image-url("icons/actions/forward.svg"); tip: root.text-go; button-label: root.text-go; clicked => { root.address-editing ? root.navigate-path(root.address-input) : root.begin-address-edit(); } }
@@ -304,5 +369,32 @@ export component AppWindow inherits Window {
                 Rectangle { height: 30px; background: #fafbfc; border-color: #e7e8eb; border-width: 1px; Text { x: 14px; text: root.status-text; color: #72747d; font-size: 11px; vertical-alignment: center; } }
             }
         }
+    }
+
+    if root.address-editing: Rectangle {
+        y: 0px;
+        width: parent.width;
+        height: 59px;
+        TouchArea { clicked => { root.cancel-address-edit(); } }
+    }
+    if root.address-editing: Rectangle {
+        x: 0px;
+        y: 59px;
+        width: 59px + (!root.minimal ? 45px : 0px) + (!root.compact ? 90px : 0px);
+        height: root.address-has-error ? 52px : 38px;
+        TouchArea { clicked => { root.cancel-address-edit(); } }
+    }
+    if root.address-editing: Rectangle {
+        x: parent.width - 59px - (!root.minimal ? 45px : 0px);
+        y: 59px;
+        width: 59px + (!root.minimal ? 45px : 0px);
+        height: root.address-has-error ? 52px : 38px;
+        TouchArea { clicked => { root.cancel-address-edit(); } }
+    }
+    if root.address-editing: Rectangle {
+        y: root.address-has-error ? 111px : 97px;
+        width: parent.width;
+        height: parent.height - self.y;
+        TouchArea { clicked => { root.cancel-address-edit(); } }
     }
 }
