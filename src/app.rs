@@ -986,6 +986,15 @@ fn wire_mouse_navigation(ui: &AppWindow) {
 }
 
 fn wire_window_controls(ui: &AppWindow) {
+    #[cfg(windows)]
+    use winit::platform::windows::{CornerPreference, WindowExtWindows};
+
+    #[cfg(windows)]
+    ui.window().with_winit_window(|window| {
+        window.set_corner_preference(CornerPreference::Round);
+        window.set_undecorated_shadow(true);
+    });
+
     let weak = ui.as_weak();
     ui.on_drag_window(move || {
         let Some(ui) = weak.upgrade() else {

@@ -80,28 +80,28 @@ component WindowButton inherits Rectangle {
     in property <string> label;
     callback clicked();
     width: 46px;
-    height: 46px;
+    height: 40px;
     background: root.kind == 2 && button-touch.has-hover ? #c42b1c : button-touch.pressed ? #d9dce2 : button-touch.has-hover ? #e8eaf0 : transparent;
     Rectangle {
         visible: root.kind == 0;
-        width: 11px; height: 1px;
-        x: (parent.width - self.width) / 2; y: 23px;
+        width: 10px; height: 1px;
+        x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
         background: root.kind == 2 && button-touch.has-hover ? #ffffff : #303138;
     }
     Rectangle {
         visible: root.kind == 1;
-        width: 10px; height: 10px;
+        width: 9px; height: 9px;
         x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
         border-width: 1px;
         border-color: #303138;
         background: transparent;
     }
-    Text {
+    Image {
         visible: root.kind == 2;
-        width: parent.width; height: parent.height;
-        text: "×"; font-size: 20px;
-        color: button-touch.has-hover ? #ffffff : #303138;
-        horizontal-alignment: center; vertical-alignment: center;
+        width: 14px; height: 14px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        source: button-touch.has-hover ? @image-url("icons/actions/close-white.svg") : @image-url("icons/actions/close.svg");
     }
     button-touch := TouchArea { clicked => { root.clicked(); } }
     accessible-role: button;
@@ -202,7 +202,7 @@ component AddressEditor inherits Rectangle {
 export component AppWindow inherits Window {
     title: "AsterFiles";
     no-frame: true;
-    resize-border-width: 6px;
+    resize-border-width: 10px;
     preferred-width: 1180px;
     preferred-height: 760px;
     min-width: 820px;
@@ -309,9 +309,9 @@ export component AppWindow inherits Window {
     VerticalLayout {
         spacing: 0px;
         Rectangle {
-            height: 46px; background: #f5f6f8; border-color: #d9dce2; border-width: 1px;
+            height: 48px; background: #f5f6f8; border-color: #d9dce2; border-width: 1px;
             HorizontalLayout {
-                padding-left: 8px; spacing: 5px;
+                padding-left: 8px; padding-top: 5px; padding-bottom: 3px; spacing: 5px;
                 for tab in root.tabs: Rectangle {
                     width: root.minimal ? 112px : 178px; height: 38px;
                     background: tab.active ? #ffffff : (tab-touch.has-hover ? #ebeef4 : transparent);
@@ -334,9 +334,12 @@ export component AppWindow inherits Window {
                         Text { visible: tab.loading && !(root.can-close-tab && tab-touch.has-hover); text: "…"; color: #4f6bed; vertical-alignment: center; }
                         Rectangle {
                             visible: root.can-close-tab && (tab-touch.has-hover || close-touch.has-hover);
-                            width: 24px; height: 24px; border-radius: 4px;
-                            background: close-touch.pressed ? #d7dae0 : close-touch.has-hover ? #e1e4ea : transparent;
-                            Image { width: 14px; height: 14px; x: 5px; y: 5px; source: @image-url("icons/actions/close.svg"); }
+                            width: 24px; height: 38px;
+                            Rectangle {
+                                width: 24px; height: 24px; y: 7px; border-radius: 4px;
+                                background: close-touch.pressed ? #d7dae0 : close-touch.has-hover ? #e1e4ea : transparent;
+                                Image { width: 12px; height: 12px; x: 6px; y: 6px; source: @image-url("icons/actions/close.svg"); }
+                            }
                             close-touch := TouchArea { mouse-cursor: pointer; clicked => { root.close-tab(tab.id); } }
                             accessible-role: button; accessible-label: "关闭标签";
                         }
