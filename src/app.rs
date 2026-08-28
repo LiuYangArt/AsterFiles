@@ -441,7 +441,7 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
 
     let weak = ui.as_weak();
     let state_for_select = state.clone();
-    ui.on_select_entry(move |entry_id| {
+    ui.on_select_entry(move |entry_id, toggle, extend| {
         let changed_rows = {
             let mut app = state_for_select
                 .lock()
@@ -450,13 +450,18 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
             let Some(tab) = app.tabs.get_mut(&tab_id) else {
                 return;
             };
-            let previous = tab.selected.first().copied();
-            let selected = EntryId(entry_id as u32);
-            tab.select_entry(selected, false, false);
-            [previous, Some(selected)]
+            let previous_selected = tab.selected.clone();
+            let previous_focused = tab.focused;
+            tab.select_entry(EntryId(entry_id as u32), toggle, extend);
+            previous_selected
+                .into_iter()
+                .chain(tab.selected.iter().copied())
+                .chain(previous_focused)
+                .chain(tab.focused)
+                .collect::<std::collections::HashSet<_>>()
         };
         if let Some(ui) = weak.upgrade() {
-            update_file_rows(&ui, &state_for_select, changed_rows.into_iter().flatten());
+            update_file_rows(&ui, &state_for_select, &changed_rows);
             update_selection_summary(&ui, &state_for_select);
         }
     });
@@ -967,14 +972,7 @@ fn wire_mouse_navigation(ui: &AppWindow) {
                 }
                 EventResult::PreventDefault
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Released,
-                button: MouseButton::Left,
-                ..
-            } if modifiers.get().control_key() => {
-                ui.invoke_toggle_focused();
-                EventResult::Propagate
-            }
+
             _ => EventResult::Propagate,
         }
     });
@@ -1147,7 +1145,7 @@ fn classify_error(kind: io::ErrorKind) -> LoadState {
 fn update_file_rows(
     ui: &AppWindow,
     state: &SharedSessions,
-    entry_ids: impl IntoIterator<Item = EntryId>,
+    changed: &std::collections::HashSet<EntryId>,
 ) {
     use slint::Model;
 
@@ -1161,10 +1159,8 @@ fn update_file_rows(
     let Some(model) = model.as_any().downcast_ref::<VecModel<FileRow>>() else {
         return;
     };
-    for entry_id in entry_ids {
-        if let Some(index) = tab.entries.iter().position(|entry| entry.id == entry_id)
-            && let Some(entry) = tab.entries.get(index)
-        {
+    for (index, entry) in tab.entries.iter().enumerate() {
+        if changed.contains(&entry.id) {
             model.set_row_data(index, file_row(entry, tab, texts));
         }
     }
@@ -1173,9 +1169,8 @@ fn update_file_rows(
 fn update_selection_summary(ui: &AppWindow, state: &SharedSessions) {
     let app = state.lock().expect("app state mutex is not poisoned");
     let tab = app.active();
-    let texts = Texts::new(app.language);
     ui.set_selected_count(tab.selected.len() as i32);
-    ui.set_status_text(status_text(tab, texts).into());
+    ui.set_status_text(status_text(tab, Texts::new(app.language)).into());
 }
 fn selected_sidebar_index(app: &AppState) -> Option<usize> {
     let current = app.active().current_path.as_deref()?;

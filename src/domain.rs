@@ -299,7 +299,17 @@ impl TabSession {
         self.focused = Some(entry_id);
         if extend {
             let anchor = self.selection_anchor.unwrap_or(entry_id);
-            self.selected = self.range_ids(anchor, entry_id);
+            let range = self.range_ids(anchor, entry_id);
+            if toggle {
+                for id in range {
+                    if !self.selected.contains(&id) {
+                        self.selected.push(id);
+                    }
+                }
+            } else {
+                self.selected = range;
+            }
+            self.selection_anchor = Some(anchor);
         } else if toggle {
             if let Some(index) = self.selected.iter().position(|id| *id == entry_id) {
                 self.selected.remove(index);
@@ -581,6 +591,28 @@ mod tests {
         assert_eq!(session.focused, Some(EntryId(1)));
     }
 
+    #[test]
+    fn control_shift_range_adds_to_existing_selection_and_keeps_anchor() {
+        let mut session = TabSession::new(TabId(1));
+        session.replace_entries(vec![
+            entry(1, "a", EntryKind::File, Some(1)),
+            entry(2, "b", EntryKind::File, Some(2)),
+            entry(3, "c", EntryKind::Directory, None),
+            entry(4, "d", EntryKind::File, Some(4)),
+            entry(5, "e", EntryKind::File, Some(5)),
+        ]);
+
+        session.select_entry(EntryId(1), false, false);
+        session.select_entry(EntryId(5), true, false);
+        session.select_entry(EntryId(3), true, true);
+
+        assert_eq!(
+            session.selected,
+            vec![EntryId(1), EntryId(5), EntryId(3), EntryId(4)]
+        );
+        assert_eq!(session.selection_anchor, Some(EntryId(5)));
+        assert_eq!(session.focused, Some(EntryId(3)));
+    }
     #[test]
     fn sorting_keeps_directories_first_in_both_directions() {
         let mut session = TabSession::new(TabId(1));

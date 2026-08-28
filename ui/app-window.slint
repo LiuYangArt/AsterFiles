@@ -225,7 +225,7 @@ export component AppWindow inherits Window {
     callback refresh();
     callback navigate-sidebar(int);
     callback navigate-breadcrumb(int);
-    callback select-entry(int);
+    callback select-entry(int, bool, bool);
     callback clear-selection();
     callback select-all();
     callback move-focus(int, bool);
@@ -355,7 +355,7 @@ export component AppWindow inherits Window {
                             width: list.width;
                             height: 40px; background: entry.selected ? #dce6ff : (mouse.has-hover ? #eff4ff : #ffffff); border-color: entry.focused ? #4f6bed : #f1f1f3; border-width: entry.focused ? 2px : 1px;
                             HorizontalLayout { padding-left: 16px; padding-right: 16px; spacing: 12px; HorizontalLayout { width: root.compact ? 65% : 52%; spacing: 9px; InlineIcon { icon-source: entry.is-directory ? @image-url("icons/files/folder.svg") : @image-url("icons/files/document.svg"); } Text { text: entry.name; color: #24252a; font-size: 13px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1;  } } Text { visible: !root.compact; text: entry.kind; width: 16%; color: #6f717a; font-size: 12px; vertical-alignment: center; } Text { visible: !root.compact; text: entry.modified; width: 18%; color: #6f717a; font-size: 12px; vertical-alignment: center; } Text { visible: !root.minimal; text: entry.size; horizontal-stretch: 1; color: #6f717a; font-size: 12px; vertical-alignment: center; horizontal-alignment: right; } }
-                            mouse := TouchArea { mouse-cursor: pointer; clicked => { root.select-entry(entry.id); } double-clicked => { root.open-entry(entry.id); } }
+                            mouse := TouchArea { mouse-cursor: pointer; pointer-event(event) => { if event.button == PointerEventButton.left && event.kind == PointerEventKind.down { root.select-entry(entry.id, event.modifiers.control, event.modifiers.shift); } } double-clicked => { root.open-entry(entry.id); } }
                             accessible-role: list-item; accessible-label: entry.name;
                         }
                     }
