@@ -75,6 +75,39 @@ component CommandButton inherits Rectangle {
     accessible-enabled: root.enabled;
 }
 
+component WindowButton inherits Rectangle {
+    in property <int> kind;
+    in property <string> label;
+    callback clicked();
+    width: 46px;
+    height: 46px;
+    background: root.kind == 2 && button-touch.has-hover ? #c42b1c : button-touch.pressed ? #d9dce2 : button-touch.has-hover ? #e8eaf0 : transparent;
+    Rectangle {
+        visible: root.kind == 0;
+        width: 11px; height: 1px;
+        x: (parent.width - self.width) / 2; y: 23px;
+        background: root.kind == 2 && button-touch.has-hover ? #ffffff : #303138;
+    }
+    Rectangle {
+        visible: root.kind == 1;
+        width: 10px; height: 10px;
+        x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+        border-width: 1px;
+        border-color: #303138;
+        background: transparent;
+    }
+    Text {
+        visible: root.kind == 2;
+        width: parent.width; height: parent.height;
+        text: "×"; font-size: 20px;
+        color: button-touch.has-hover ? #ffffff : #303138;
+        horizontal-alignment: center; vertical-alignment: center;
+    }
+    button-touch := TouchArea { clicked => { root.clicked(); } }
+    accessible-role: button;
+    accessible-label: root.label;
+}
+
 component BreadcrumbButton inherits Rectangle {
     in property <string> label;
     in property <bool> current: false;
@@ -168,6 +201,8 @@ component AddressEditor inherits Rectangle {
 
 export component AppWindow inherits Window {
     title: "AsterFiles";
+    no-frame: true;
+    resize-border-width: 6px;
     preferred-width: 1180px;
     preferred-height: 760px;
     min-width: 820px;
@@ -234,10 +269,11 @@ export component AppWindow inherits Window {
     callback change-sort(int);
     callback open-entry(int);
     callback new-tab();
-    callback close-tab();
+    callback close-tab(int);
     callback restore-tab();
     callback activate-tab(int);
     callback toggle-language();
+    callback drag-window();
 
     private property <bool> compact: root.window-width < 1000px;
     private property <bool> minimal: root.window-width < 900px;
@@ -268,25 +304,55 @@ export component AppWindow inherits Window {
         KeyBinding { keys: @keys(Return); enabled: !root.address-editing; activated => { root.open-entry(-1); } }
         KeyBinding { keys: @keys(Escape); enabled: !root.address-editing; activated => { root.clear-selection(); } }
         KeyBinding { keys: @keys(Control + T); activated => { root.new-tab(); } }
-        KeyBinding { keys: @keys(Control + W); enabled: root.can-close-tab; activated => { root.close-tab(); } }
+        KeyBinding { keys: @keys(Control + W); enabled: root.can-close-tab; activated => { root.close-tab(-1); } }
 
     VerticalLayout {
         spacing: 0px;
         Rectangle {
-            height: 50px; background: #ffffff; border-color: #e2e4e9; border-width: 1px;
+            height: 46px; background: #f5f6f8; border-color: #d9dce2; border-width: 1px;
             HorizontalLayout {
-                padding-left: 14px; padding-right: 12px; padding-top: 6px; padding-bottom: 6px; spacing: 7px;
-                Text { text: "AsterFiles"; width: root.minimal ? 80px : 112px; color: #1e1f24; font-size: 15px; font-weight: 700; vertical-alignment: center; }
+                padding-left: 8px; spacing: 5px;
                 for tab in root.tabs: Rectangle {
-                    width: root.minimal ? 110px : 170px; background: tab.active ? #eef2ff : #f7f7f8; border-color: tab.active ? #9eaff6 : #e2e3e7; border-width: tab.active ? 2px : 1px; border-radius: 7px;
-                    HorizontalLayout { padding-left: 10px; padding-right: 8px; spacing: 6px; InlineIcon { icon-source: @image-url("icons/files/folder.svg"); icon-size: 16px; } Text { text: tab.title; color: #303138; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; } Text { text: tab.loading ? "…" : ""; color: #4f6bed; vertical-alignment: center; } }
-                    TouchArea { mouse-cursor: pointer; clicked => { root.activate-tab(tab.id); } }
+                    width: root.minimal ? 112px : 178px; height: 38px;
+                    background: tab.active ? #ffffff : (tab-touch.has-hover ? #ebeef4 : transparent);
+                    border-color: tab.active ? #d7dae0 : transparent;
+                    border-width: tab.active ? 1px : 0px;
+                    border-radius: 7px;
+                    tab-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.activate-tab(tab.id); }
+                        pointer-event(event) => {
+                            if (event.button == PointerEventButton.middle && event.kind == PointerEventKind.up && root.can-close-tab) {
+                                root.close-tab(tab.id);
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        padding-left: 10px; padding-right: 7px; spacing: 6px;
+                        InlineIcon { icon-source: @image-url("icons/files/folder.svg"); icon-size: 16px; }
+                        Text { text: tab.title; color: #303138; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                        Text { visible: tab.loading && !(root.can-close-tab && tab-touch.has-hover); text: "…"; color: #4f6bed; vertical-alignment: center; }
+                        Rectangle {
+                            visible: root.can-close-tab && (tab-touch.has-hover || close-touch.has-hover);
+                            width: 24px; height: 24px; border-radius: 4px;
+                            background: close-touch.pressed ? #d7dae0 : close-touch.has-hover ? #e1e4ea : transparent;
+                            Image { width: 14px; height: 14px; x: 5px; y: 5px; source: @image-url("icons/actions/close.svg"); }
+                            close-touch := TouchArea { mouse-cursor: pointer; clicked => { root.close-tab(tab.id); } }
+                            accessible-role: button; accessible-label: "关闭标签";
+                        }
+                    }
                 }
-                IconButton { icon-source: @image-url("icons/actions/add.svg"); tip: "新建标签 (Ctrl+T)"; button-label: "新建标签"; clicked => { root.new-tab(); } }
-                IconButton { icon-source: @image-url("icons/actions/close.svg"); tip: "关闭标签 (Ctrl+W)"; enabled: root.can-close-tab; button-label: "关闭标签"; clicked => { root.close-tab(); } }
-                IconButton { visible: !root.minimal; icon-source: @image-url("icons/actions/refresh.svg"); tip: "恢复关闭的标签"; enabled: root.can-restore-tab; button-label: "恢复关闭的标签"; clicked => { root.restore-tab(); } }
-                Rectangle { horizontal-stretch: 1; }
-                IconButton { icon-source: @image-url("icons/actions/language.svg"); tip: "切换语言 (" + root.language-label + ")"; button-label: "切换语言"; clicked => { root.toggle-language(); } }
+                Rectangle { width: 38px; height: 38px; border-radius: 6px; background: add-touch.pressed ? #d9dce2 : add-touch.has-hover ? #e8eaf0 : transparent; Image { width: 20px; height: 20px; x: 9px; y: 9px; source: @image-url("icons/actions/add.svg"); } add-touch := TouchArea { mouse-cursor: pointer; clicked => { root.new-tab(); } } accessible-role: button; accessible-label: "新建标签"; Tooltip { text: @markdown("新建标签 (Ctrl+T)"); } }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    drag-touch := TouchArea {
+                        pointer-event(event) => { if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) { root.drag-window(); } }
+                        double-clicked => { root.maximized = !root.maximized; }
+                    }
+                }
+                WindowButton { kind: 0; label: "最小化"; clicked => { root.minimized = true; } }
+                WindowButton { kind: 1; label: root.maximized ? "还原" : "最大化"; clicked => { root.maximized = !root.maximized; } }
+                WindowButton { kind: 2; label: "关闭"; clicked => { root.close(); } }
             }
         }
 
@@ -322,6 +388,14 @@ export component AppWindow inherits Window {
                         accessible-role: button; accessible-label: location.label;
                     }
                     Rectangle { vertical-stretch: 1; }
+                    Rectangle {
+                        width: 38px; height: 38px; border-radius: 5px;
+                        background: language-touch.pressed ? #d7dce5 : language-touch.has-hover ? #e3e7ef : transparent;
+                        Image { width: 20px; height: 20px; x: 9px; y: 9px; source: @image-url("icons/actions/language.svg"); }
+                        language-touch := TouchArea { mouse-cursor: pointer; clicked => { root.toggle-language(); } }
+                        accessible-role: button; accessible-label: "切换语言";
+                        Tooltip { text: @markdown("切换语言"); }
+                    }
                 }
             }
 

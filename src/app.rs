@@ -80,11 +80,12 @@ impl AppState {
         id
     }
 
-    fn close_active(&mut self) -> Option<TabId> {
+    fn close_tab(&mut self, closing: TabId) -> Option<TabId> {
         if self.tab_order.len() == 1 {
             return None;
         }
-        let closing = self.active_tab;
+        let index = self.tab_order.iter().position(|id| *id == closing)?;
+        let closing_was_active = closing == self.active_tab;
         if let Some(mut tab) = self.tabs.remove(&closing) {
             tab.cancel_pending();
             if let Some(path) = tab.current_path.take() {
@@ -92,13 +93,10 @@ impl AppState {
                 self.closed_tabs.truncate(10);
             }
         }
-        let index = self
-            .tab_order
-            .iter()
-            .position(|id| *id == closing)
-            .expect("active tab is present in tab order");
         self.tab_order.remove(index);
-        self.active_tab = self.tab_order[index.min(self.tab_order.len() - 1)];
+        if closing_was_active {
+            self.active_tab = self.tab_order[index.min(self.tab_order.len() - 1)];
+        }
         Some(self.active_tab)
     }
 
@@ -191,6 +189,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
 
     wire_callbacks(&ui, request_sender.clone(), state.clone());
     wire_mouse_navigation(&ui);
+    wire_window_controls(&ui);
     start_event_pump(&ui, event_receiver, state.clone());
     {
         let mut app = state.lock().expect("app state mutex is not poisoned");
@@ -597,11 +596,19 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
 
     let weak = ui.as_weak();
     let state_for_close = state.clone();
-    ui.on_close_tab(move || {
-        state_for_close
+    ui.on_close_tab(move |tab_id| {
+        let mut app = state_for_close
             .lock()
-            .expect("app state mutex is not poisoned")
-            .close_active();
+            .expect("app state mutex is not poisoned");
+        let target = if tab_id < 0 {
+            app.active_tab
+        } else {
+            TabId(tab_id as u32)
+        };
+        if app.tabs.contains_key(&target) {
+            app.close_tab(target);
+        }
+        drop(app);
         if let Some(ui) = weak.upgrade() {
             refresh_ui(&ui, &state_for_close);
         }
@@ -940,7 +947,7 @@ fn wire_mouse_navigation(ui: &AppWindow) {
                         && character.is_some_and(|value| value.eq_ignore_ascii_case("w")) =>
                     {
                         if ui.get_can_close_tab() {
-                            ui.invoke_close_tab();
+                            ui.invoke_close_tab(-1);
                         }
                         true
                     }
@@ -975,6 +982,18 @@ fn wire_mouse_navigation(ui: &AppWindow) {
 
             _ => EventResult::Propagate,
         }
+    });
+}
+
+fn wire_window_controls(ui: &AppWindow) {
+    let weak = ui.as_weak();
+    ui.on_drag_window(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        ui.window().with_winit_window(|window| {
+            let _ = window.drag_window();
+        });
     });
 }
 fn spawn_directory_workers(
@@ -1512,8 +1531,21 @@ mod tests {
         let mut app = AppState::new(vec![PathBuf::from("one")], 0);
         let second = app.create_tab(PathBuf::from("two"));
         assert_eq!(app.active_tab, second);
-        assert_eq!(app.close_active(), Some(TabId(1)));
+        assert_eq!(app.close_tab(TabId(2)), Some(TabId(1)));
         assert_eq!(app.active().current_path, Some(PathBuf::from("one")));
+    }
+
+    #[test]
+    fn closing_an_inactive_tab_keeps_the_active_tab() {
+        let mut app = AppState::new(vec![PathBuf::from("one")], 0);
+        let second = app.create_tab(PathBuf::from("two"));
+        let third = app.create_tab(PathBuf::from("three"));
+        assert_eq!(app.active_tab, third);
+
+        assert_eq!(app.close_tab(second), Some(third));
+        assert_eq!(app.active_tab, third);
+        assert_eq!(app.active().current_path, Some(PathBuf::from("three")));
+        assert!(!app.tabs.contains_key(&second));
     }
 
     #[test]
