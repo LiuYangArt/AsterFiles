@@ -23,6 +23,7 @@ cargo build --release
 - 不增加网络协议、插件或索引服务，除非当前里程碑明确需要。
 - 注释说明目的、性能约束或 Windows 平台决策，不复述代码。
 - 修改完成后至少运行与变更范围相符的最小验证，并保留可读取的错误输出。
+- 每个开发任务完成后必须运行 `cargo build --release`，确保 `target/release/asterfiles.exe` 已更新，供用户直接测试；交付时报告 Release 文件时间与 SHA-256。
 
 ## task
 @docs/task-list.md
