@@ -1,12 +1,19 @@
 import { Button, LineEdit, ListView } from "std-widgets.slint";
 
 export struct FileRow {
+    id: int,
     name: string,
-    path: string,
     kind: string,
     size: string,
     modified: string,
     is-directory: bool,
+}
+
+export struct TabRow {
+    id: int,
+    title: string,
+    active: bool,
+    loading: bool,
 }
 
 export component AppWindow inherits Window {
@@ -16,11 +23,34 @@ export component AppWindow inherits Window {
     min-width: 820px;
     min-height: 520px;
     background: #f5f6f8;
+    default-font-family: "Segoe UI";
 
     in-out property <string> current-path: "C:\\";
-    in property <string> status-text: "Ready";
+    in property <string> status-text: "";
     in property <[FileRow]> files;
-    callback navigate(string);
+    in property <[TabRow]> tabs;
+    in property <bool> can-close-tab: false;
+    in property <bool> can-restore-tab: false;
+    in property <string> language-label: "EN";
+    in property <string> text-go: "前往";
+    in property <string> text-home: "主页";
+    in property <string> text-desktop: "桌面";
+    in property <string> text-downloads: "下载";
+    in property <string> text-documents: "文档";
+    in property <string> text-pictures: "图片";
+    in property <string> text-drives: "磁盘";
+    in property <string> text-name: "名称";
+    in property <string> text-type: "类型";
+    in property <string> text-modified: "修改时间";
+    in property <string> text-size: "大小";
+
+    callback navigate-path(string);
+    callback open-entry(int);
+    callback new-tab();
+    callback close-tab();
+    callback restore-tab();
+    callback activate-tab(int);
+    callback toggle-language();
 
     VerticalLayout {
         spacing: 0px;
@@ -30,15 +60,31 @@ export component AppWindow inherits Window {
             background: #ffffff;
             border-color: #e7e8eb;
             border-width: 1px;
-
             HorizontalLayout {
-                padding-left: 14px;
-                padding-right: 14px;
-                spacing: 8px;
-                Text { text: "✦"; color: #5b5ce2; font-size: 22px; vertical-alignment: center; }
-                Text { text: "AsterFiles"; color: #1e1f24; font-size: 15px; font-weight: 700; vertical-alignment: center; }
+                padding-left: 10px;
+                padding-right: 10px;
+                spacing: 6px;
+                Text { text: "AsterFiles"; width: 100px; color: #1e1f24; font-size: 15px; font-weight: 700; vertical-alignment: center; }
+                for tab in root.tabs: Rectangle {
+                    width: 170px;
+                    background: tab.active ? #eef2ff : #f7f7f8;
+                    border-color: tab.active ? #a9b8f8 : #e2e3e7;
+                    border-width: 1px;
+                    border-radius: 6px;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 8px;
+                        spacing: 5px;
+                        Text { text: tab.loading ? "…" : ""; color: #5b5ce2; vertical-alignment: center; }
+                        Text { text: tab.title; color: #303138; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                    }
+                    tab-click := TouchArea { clicked => { root.activate-tab(tab.id); } }
+                }
+                Button { text: "+"; clicked => { root.new-tab(); } }
+                Button { text: "×"; enabled: root.can-close-tab; clicked => { root.close-tab(); } }
+                Button { text: "↶"; enabled: root.can-restore-tab; clicked => { root.restore-tab(); } }
                 Rectangle { horizontal-stretch: 1; }
-                Text { text: "Rust + Slint performance prototype"; color: #858792; font-size: 12px; vertical-alignment: center; }
+                Button { text: root.language-label; clicked => { root.toggle-language(); } }
             }
         }
 
@@ -53,14 +99,12 @@ export component AppWindow inherits Window {
                 padding-left: 14px;
                 padding-right: 14px;
                 spacing: 8px;
-                Button { text: "←"; enabled: false; }
-                Button { text: "↑"; enabled: false; }
                 LineEdit {
                     text <=> root.current-path;
                     horizontal-stretch: 1;
-                    accepted => { root.navigate(self.text); }
+                    accepted => { root.navigate-path(self.text); }
                 }
-                Button { text: "Go"; clicked => { root.navigate(root.current-path); } }
+                Button { text: root.text-go; clicked => { root.navigate-path(root.current-path); } }
             }
         }
 
@@ -77,13 +121,13 @@ export component AppWindow inherits Window {
                     padding-left: 10px;
                     padding-right: 10px;
                     spacing: 6px;
-                    Text { text: "Home"; font-size: 13px; font-weight: 700; color: #2b2c31; }
-                    Text { text: "Desktop"; font-size: 13px; color: #60626c; }
-                    Text { text: "Downloads"; font-size: 13px; color: #60626c; }
-                    Text { text: "Documents"; font-size: 13px; color: #60626c; }
-                    Text { text: "Pictures"; font-size: 13px; color: #60626c; }
+                    Text { text: root.text-home; font-size: 13px; font-weight: 700; color: #2b2c31; }
+                    Text { text: root.text-desktop; font-size: 13px; color: #60626c; }
+                    Text { text: root.text-downloads; font-size: 13px; color: #60626c; }
+                    Text { text: root.text-documents; font-size: 13px; color: #60626c; }
+                    Text { text: root.text-pictures; font-size: 13px; color: #60626c; }
                     Rectangle { height: 12px; }
-                    Text { text: "Drives"; font-size: 12px; font-weight: 700; color: #8b8d96; }
+                    Text { text: root.text-drives; font-size: 12px; font-weight: 700; color: #8b8d96; }
                     Text { text: "Windows (C:)"; font-size: 13px; color: #60626c; }
                     Rectangle { vertical-stretch: 1; }
                 }
@@ -100,10 +144,10 @@ export component AppWindow inherits Window {
                         padding-left: 16px;
                         padding-right: 16px;
                         spacing: 12px;
-                        Text { text: "Name"; width: 52%; color: #696b74; font-size: 12px; vertical-alignment: center; }
-                        Text { text: "Type"; width: 16%; color: #696b74; font-size: 12px; vertical-alignment: center; }
-                        Text { text: "Modified"; width: 18%; color: #696b74; font-size: 12px; vertical-alignment: center; }
-                        Text { text: "Size"; horizontal-stretch: 1; color: #696b74; font-size: 12px; vertical-alignment: center; }
+                        Text { text: root.text-name; width: 52%; color: #696b74; font-size: 12px; vertical-alignment: center; }
+                        Text { text: root.text-type; width: 16%; color: #696b74; font-size: 12px; vertical-alignment: center; }
+                        Text { text: root.text-modified; width: 18%; color: #696b74; font-size: 12px; vertical-alignment: center; }
+                        Text { text: root.text-size; horizontal-stretch: 1; color: #696b74; font-size: 12px; vertical-alignment: center; }
                     }
                 }
 
@@ -122,9 +166,7 @@ export component AppWindow inherits Window {
                             Text { text: entry.modified; width: 18%; color: #6f717a; font-size: 12px; vertical-alignment: center; }
                             Text { text: entry.size; horizontal-stretch: 1; color: #6f717a; font-size: 12px; vertical-alignment: center; horizontal-alignment: right; }
                         }
-                        mouse := TouchArea {
-                            clicked => { if (entry.is-directory) { root.navigate(entry.path); } }
-                        }
+                        mouse := TouchArea { clicked => { if (entry.is-directory) { root.open-entry(entry.id); } } }
                     }
                 }
 

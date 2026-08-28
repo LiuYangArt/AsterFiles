@@ -12,7 +12,7 @@ cargo test
 cargo build --release
 ```
 
-构建产物位于 `target/release/`。运行日志暂时输出到终端；性能 artifacts 统一写入 `artifacts/perf/`。
+构建产物位于 `target/release/`。运行日志暂时输出到终端；UI 截图写入 `artifacts/ui/`，交互日志写入 `artifacts/logs/`，性能 artifacts 写入 `artifacts/perf/`。
 
 ## 项目约束
 
@@ -23,3 +23,22 @@ cargo build --release
 - 不增加网络协议、插件或索引服务，除非当前里程碑明确需要。
 - 注释说明目的、性能约束或 Windows 平台决策，不复述代码。
 - 修改完成后至少运行与变更范围相符的最小验证，并保留可读取的错误输出。
+
+## task
+@docs/task-list.md
+- 任务完成后更新文档状态
+- 涉及路径、后台加载、多标签页、本地化或网络边界时，同时遵守并更新 `docs/foundation-plan.md`
+
+## 架构红线
+
+- 文件身份始终保留为 Rust 的原始路径或稳定 ID；展示字符串不得反向承担打开、重命名等操作身份。
+- UI 线程禁止执行 `exists`、`is_dir`、目录枚举、元数据读取、Shell/COM 或网络探测。
+- 所有目录加载携带 `TabId + RequestId`；只有对应标签的最新请求可以更新页面。
+- 新导航、关闭标签和退出必须取消旧任务；慢任务不得占住全局唯一工作线程。
+- 目录和网络结果采用分批提交；不得等待完整列表后才显示首批内容。
+- 用户可见文案进入语言资源；新增硬编码文案需在当前切片内迁移。
+
+## 参考项目
+
+UI/交互参考 Files， 源码： F:\CodeProjects\Files
+网络部分参考WinSCP https://github.com/LiuYangArt/winscp

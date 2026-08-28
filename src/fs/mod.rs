@@ -1,3 +1,3 @@
 mod directory_reader;
 
-pub use directory_reader::{DirectoryLoad, load_directory};
+pub use directory_reader::{ReadOutcome, read_directory_batches, sort_entries};

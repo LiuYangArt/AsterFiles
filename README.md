@@ -26,4 +26,4 @@ cargo build --release
 - 文件核心不依赖 Slint，为后续替换列表实现或做性能基准保留清晰边界。
 - 优先本地路径；网络协议、全盘索引和插件系统后置。
 
-详细范围与性能目标见 [docs/architecture.md](docs/architecture.md)，后续实施顺序见 [docs/task-list.md](docs/task-list.md)。
+详细范围与性能目标见 [docs/architecture.md](docs/architecture.md)，前期架构实施见 [docs/foundation-plan.md](docs/foundation-plan.md)，UI 与交互约束见 [docs/ui-interaction-design.md](docs/ui-interaction-design.md)，后续实施顺序见 [docs/task-list.md](docs/task-list.md)。
