@@ -804,38 +804,174 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
 }
 
 fn wire_mouse_navigation(ui: &AppWindow) {
+    use winit::{
+        event::{ElementState, MouseButton, WindowEvent},
+        keyboard::{Key, ModifiersState, NamedKey},
+    };
+
     let weak = ui.as_weak();
-    let modifiers = Cell::new(winit::keyboard::ModifiersState::empty());
+    let modifiers = Cell::new(ModifiersState::empty());
     ui.window().on_winit_window_event(move |_, event| {
-        if let winit::event::WindowEvent::ModifiersChanged(changed) = event {
+        if let WindowEvent::ModifiersChanged(changed) = event {
             modifiers.set(changed.state());
             return EventResult::Propagate;
         }
-        let winit::event::WindowEvent::MouseInput {
-            state: winit::event::ElementState::Released,
-            button,
-            ..
-        } = event
-        else {
-            return EventResult::Propagate;
-        };
         let Some(ui) = weak.upgrade() else {
             return EventResult::Propagate;
         };
-        match button {
-            winit::event::MouseButton::Back => {
+        match event {
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed && !event.repeat =>
+            {
+                let modifiers = modifiers.get();
+                let control = modifiers.control_key();
+                let alt = modifiers.alt_key();
+                let shift = modifiers.shift_key();
+                let editing_address = ui.get_address_editing();
+                let character = match &event.logical_key {
+                    Key::Character(value) => Some(value.as_str()),
+                    _ => None,
+                };
+                let handled = match &event.logical_key {
+                    Key::Named(NamedKey::ArrowLeft) if alt && !control && !shift => {
+                        if ui.get_can_navigate_back() {
+                            ui.invoke_navigate_back();
+                        }
+                        true
+                    }
+                    Key::Named(NamedKey::ArrowRight) if alt && !control && !shift => {
+                        if ui.get_can_navigate_forward() {
+                            ui.invoke_navigate_forward();
+                        }
+                        true
+                    }
+                    Key::Named(NamedKey::ArrowUp) if alt && !control && !shift => {
+                        if ui.get_can_navigate_up() {
+                            ui.invoke_navigate_up();
+                        }
+                        true
+                    }
+                    Key::Named(NamedKey::F5) if !control && !alt && !shift => {
+                        if ui.get_can_refresh() {
+                            ui.invoke_refresh();
+                        }
+                        true
+                    }
+                    _ if control
+                        && !alt
+                        && !shift
+                        && character.is_some_and(|value| value.eq_ignore_ascii_case("r")) =>
+                    {
+                        if ui.get_can_refresh() {
+                            ui.invoke_refresh();
+                        }
+                        true
+                    }
+                    _ if ((control
+                        && !alt
+                        && character.is_some_and(|value| value.eq_ignore_ascii_case("l")))
+                        || (alt
+                            && !control
+                            && character.is_some_and(|value| value.eq_ignore_ascii_case("d"))))
+                        && !shift =>
+                    {
+                        ui.invoke_begin_address_edit();
+                        true
+                    }
+                    _ if !editing_address
+                        && control
+                        && !alt
+                        && !shift
+                        && character.is_some_and(|value| value.eq_ignore_ascii_case("a")) =>
+                    {
+                        ui.invoke_select_all();
+                        true
+                    }
+                    Key::Named(NamedKey::Space)
+                        if !editing_address && control && !alt && !shift =>
+                    {
+                        ui.invoke_toggle_focused();
+                        true
+                    }
+                    Key::Named(NamedKey::ArrowUp) if !editing_address && !control && !alt => {
+                        ui.invoke_move_focus(-1, shift);
+                        true
+                    }
+                    Key::Named(NamedKey::ArrowDown) if !editing_address && !control && !alt => {
+                        ui.invoke_move_focus(1, shift);
+                        true
+                    }
+                    Key::Named(NamedKey::Home) if !editing_address && !control && !alt => {
+                        ui.invoke_focus_boundary(false, shift);
+                        true
+                    }
+                    Key::Named(NamedKey::End) if !editing_address && !control && !alt => {
+                        ui.invoke_focus_boundary(true, shift);
+                        true
+                    }
+                    Key::Named(NamedKey::Enter)
+                        if !editing_address && !control && !alt && !shift =>
+                    {
+                        ui.invoke_open_entry(-1);
+                        true
+                    }
+                    Key::Named(NamedKey::Escape)
+                        if !editing_address && !control && !alt && !shift =>
+                    {
+                        ui.invoke_clear_selection();
+                        true
+                    }
+                    _ if control
+                        && !alt
+                        && !shift
+                        && character.is_some_and(|value| value.eq_ignore_ascii_case("t")) =>
+                    {
+                        ui.invoke_new_tab();
+                        true
+                    }
+                    _ if control
+                        && !alt
+                        && !shift
+                        && character.is_some_and(|value| value.eq_ignore_ascii_case("w")) =>
+                    {
+                        if ui.get_can_close_tab() {
+                            ui.invoke_close_tab();
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+                if handled {
+                    EventResult::PreventDefault
+                } else {
+                    EventResult::Propagate
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Back,
+                ..
+            } => {
                 if ui.get_can_navigate_back() {
                     ui.invoke_navigate_back();
                 }
                 EventResult::PreventDefault
             }
-            winit::event::MouseButton::Forward => {
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Forward,
+                ..
+            } => {
                 if ui.get_can_navigate_forward() {
                     ui.invoke_navigate_forward();
                 }
                 EventResult::PreventDefault
             }
-            winit::event::MouseButton::Left if modifiers.get().control_key() => {
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } if modifiers.get().control_key() => {
                 ui.invoke_toggle_focused();
                 EventResult::Propagate
             }

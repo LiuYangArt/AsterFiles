@@ -242,8 +242,12 @@ export component AppWindow inherits Window {
     private property <bool> compact: root.window-width < 1000px;
     private property <bool> minimal: root.window-width < 900px;
 
+    public function focus-address-editor() { address-editor.focus-and-select-all(); }
+
+    forward-focus: shortcut-handler;
     shortcut-handler := FocusScope {
-        width: 0px; height: 0px;
+        width: parent.width;
+        height: parent.height;
         KeyBinding { keys: @keys(Alt + LeftArrow); enabled: root.can-navigate-back; activated => { root.navigate-back(); } }
         KeyBinding { keys: @keys(Alt + RightArrow); enabled: root.can-navigate-forward; activated => { root.navigate-forward(); } }
         KeyBinding { keys: @keys(Alt + UpArrow); enabled: root.can-navigate-up; activated => { root.navigate-up(); } }
@@ -265,9 +269,6 @@ export component AppWindow inherits Window {
         KeyBinding { keys: @keys(Escape); enabled: !root.address-editing; activated => { root.clear-selection(); } }
         KeyBinding { keys: @keys(Control + T); activated => { root.new-tab(); } }
         KeyBinding { keys: @keys(Control + W); enabled: root.can-close-tab; activated => { root.close-tab(); } }
-    }
-
-    public function focus-address-editor() { address-editor.focus-and-select-all(); }
 
     VerticalLayout {
         spacing: 0px;
@@ -396,5 +397,6 @@ export component AppWindow inherits Window {
         width: parent.width;
         height: parent.height - self.y;
         TouchArea { clicked => { root.cancel-address-edit(); } }
+    }
     }
 }
