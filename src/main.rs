@@ -8,6 +8,9 @@ mod platform;
 mod session_store;
 
 fn main() -> Result<(), slint::PlatformError> {
+    // The current application surface is light-only; keep native widgets consistent with it.
+    unsafe { std::env::set_var("SLINT_STYLE", "fluent-light") };
+
     #[cfg(windows)]
     {
         use slint::winit_030::winit::platform::windows::{

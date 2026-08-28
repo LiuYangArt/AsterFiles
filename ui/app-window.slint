@@ -108,6 +108,49 @@ component WindowButton inherits Rectangle {
     accessible-label: root.label;
 }
 
+component LightScrollBar inherits Rectangle {
+    in-out property <length> value;
+    in property <length> maximum;
+    in property <length> page-size;
+    callback scrolled();
+
+    width: 12px;
+    visible: root.maximum > 0px;
+    background: scroll-touch.has-hover ? #f1f2f4 : transparent;
+    border-radius: 6px;
+
+    private property <length> track-padding: 4px;
+    private property <length> track-height: root.height - 2 * root.track-padding;
+    private property <length> thumb-height: max(28px, root.track-height * root.page-size / (root.maximum + root.page-size));
+    private property <length> thumb-travel: max(0px, root.track-height - root.thumb-height);
+
+    thumb := Rectangle {
+        width: scroll-touch.has-hover ? 6px : 3px;
+        height: root.thumb-height;
+        x: parent.width - self.width - 3px;
+        y: root.track-padding + root.thumb-travel * (-root.value / root.maximum);
+        border-radius: self.width / 2;
+        background: scroll-touch.has-hover ? #9a9da3 : #aeb1b6;
+    }
+
+    scroll-touch := TouchArea {
+        property <length> press-value;
+        property <length> press-y;
+        pointer-event(event) => {
+            if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                self.press-value = root.value;
+                self.press-y = self.mouse-y;
+            }
+        }
+        moved => {
+            if self.pressed && root.thumb-travel > 0px {
+                root.value = max(-root.maximum, min(0px, self.press-value - (self.mouse-y - self.press-y) * root.maximum / root.thumb-travel));
+                root.scrolled();
+            }
+        }
+    }
+}
+
 component BreadcrumbButton inherits Rectangle {
     in property <string> label;
     in property <bool> current: false;
@@ -369,7 +412,7 @@ export component AppWindow inherits Window {
                 IconButton { visible: !root.compact; icon-source: @image-url("icons/actions/refresh.svg"); tip: root.text-refresh + " (F5)"; enabled: root.can-refresh; button-label: root.text-refresh; clicked => { root.refresh(); } }
                 Rectangle {
                     height: root.address-editing && root.address-has-error ? 52px : 38px; horizontal-stretch: 1; background: #ffffff; border-color: root.address-has-error ? #c42b1c : #d7dae0; border-width: root.address-has-error ? 2px : 1px; border-radius: 5px;
-                    if !root.address-editing: Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 2px; InlineIcon { icon-source: @image-url("icons/files/folder.svg"); icon-size: 16px; } for crumb in root.breadcrumbs: BreadcrumbButton { label: crumb.label; current: crumb.current; clicked => { root.navigate-breadcrumb(crumb.index); } } Rectangle { horizontal-stretch: 1; TouchArea { mouse-cursor: pointer; clicked => { root.begin-address-edit(); } } } } }
+                    if !root.address-editing: Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; HorizontalLayout { padding-left: 8px; padding-right: 8px; padding-top: 3px; padding-bottom: 3px; spacing: 2px; InlineIcon { icon-source: @image-url("icons/files/folder.svg"); icon-size: 16px; } for crumb in root.breadcrumbs: BreadcrumbButton { label: crumb.label; current: crumb.current; clicked => { root.navigate-breadcrumb(crumb.index); } } Rectangle { horizontal-stretch: 1; TouchArea { mouse-cursor: pointer; clicked => { root.begin-address-edit(); } } } } }
                     address-editor := AddressEditor { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: root.address-has-error ? 30px : parent.height - 4px; text <=> root.address-input; has-error: root.address-has-error; accepted(value) => { root.navigate-path(value); } cancelled => { root.cancel-address-edit(); } }
                     if root.address-editing && root.address-has-error: Text { x: 10px; y: 32px; width: parent.width - 20px; height: 16px; text: root.address-error-text; color: #a4262c; font-size: 11px; vertical-alignment: center; }
                 }
@@ -428,6 +471,7 @@ export component AppWindow inherits Window {
                     background-touch := TouchArea { enabled: root.files.length > 0; clicked => { root.clear-selection(); } }
                     list := ListView {
                         visible: root.files.length > 0;
+                        vertical-scrollbar-policy: ScrollBarPolicy.always-off;
                         for entry in root.files: Rectangle {
                             width: list.width;
                             height: 40px; background: entry.selected ? #dce6ff : (mouse.has-hover ? #eff4ff : #ffffff); border-color: entry.focused ? #4f6bed : #f1f1f3; border-width: entry.focused ? 2px : 1px;
@@ -435,6 +479,13 @@ export component AppWindow inherits Window {
                             mouse := TouchArea { mouse-cursor: pointer; pointer-event(event) => { if event.button == PointerEventButton.left && event.kind == PointerEventKind.down { root.select-entry(entry.id, event.modifiers.control, event.modifiers.shift); } } double-clicked => { root.open-entry(entry.id); } }
                             accessible-role: list-item; accessible-label: entry.name;
                         }
+                    }
+                    LightScrollBar {
+                        x: parent.width - self.width;
+                        height: parent.height;
+                        value <=> list.viewport-y;
+                        maximum: max(0px, list.viewport-height - list.visible-height);
+                        page-size: list.visible-height;
                     }
                     if root.files.length == 0: VerticalLayout {
                         alignment: center; spacing: 8px;
