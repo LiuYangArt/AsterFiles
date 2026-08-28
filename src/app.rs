@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     collections::{HashMap, VecDeque},
     io,
     path::{Path, PathBuf},
@@ -13,9 +14,12 @@ use slint::{
 };
 
 use crate::{
-    domain::{EntryId, FileEntry, LoadState, NavigationKind, RequestId, TabId, TabSession},
-    fs::{ReadOutcome, read_directory_batches, sort_entries},
+    domain::{
+        EntryId, FileEntry, LoadState, NavigationKind, RequestId, SortField, TabId, TabSession,
+    },
+    fs::{ReadOutcome, read_directory_batches},
     i18n::{Language, Texts},
+    platform::{self, KnownLocation, KnownLocationKind},
     session_store,
 };
 
@@ -33,10 +37,11 @@ struct AppState {
     closed_tabs: VecDeque<PathBuf>,
     next_tab_id: u32,
     language: Language,
+    sidebar: Vec<KnownLocation>,
 }
 
 impl AppState {
-    fn new(initial_paths: Vec<PathBuf>) -> Self {
+    fn new(initial_paths: Vec<PathBuf>, active_index: usize) -> Self {
         let initial_paths = if initial_paths.is_empty() {
             vec![initial_path()]
         } else {
@@ -51,7 +56,7 @@ impl AppState {
             tabs.insert(id, tab);
             tab_order.push(id);
         }
-        let active_tab = tab_order[0];
+        let active_tab = tab_order[active_index.min(tab_order.len() - 1)];
         let next_tab_id = tab_order.len() as u32 + 1;
         Self {
             tabs,
@@ -60,6 +65,7 @@ impl AppState {
             closed_tabs: VecDeque::new(),
             next_tab_id,
             language: Language::Chinese,
+            sidebar: Vec::new(),
         }
     }
 
@@ -155,17 +161,41 @@ enum DirectoryEvent {
 
 pub fn run() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
-    let restored_paths = session_store::default_path()
-        .and_then(|path| session_store::load(&path).ok())
-        .filter(|paths| !paths.is_empty())
-        .unwrap_or_else(|| vec![initial_path()]);
-    let state = Arc::new(Mutex::new(AppState::new(restored_paths)));
+    let restored = session_store::default_path().and_then(|path| session_store::load(&path).ok());
+    let default_window = session_store::WindowPlacement {
+        x: 80,
+        y: 80,
+        width: 1180,
+        height: 760,
+    };
+    let (restored_paths, active_index, window) = restored
+        .filter(|session| !session.tab_paths.is_empty())
+        .map(|session| {
+            let window = if session.window.width > 7_680 || session.window.height > 4_320 {
+                default_window
+            } else {
+                session.window
+            };
+            (session.tab_paths, session.active_tab, window)
+        })
+        .unwrap_or_else(|| (vec![initial_path()], 0, default_window));
+    ui.window()
+        .set_position(slint::PhysicalPosition::new(window.x, window.y));
+    ui.window().set_size(slint::LogicalSize::new(
+        window.width as f32,
+        window.height as f32,
+    ));
+    let state = Arc::new(Mutex::new(AppState::new(restored_paths, active_index)));
     let (request_sender, event_receiver) = spawn_directory_workers(WORKER_COUNT);
     let event_receiver = Arc::new(Mutex::new(event_receiver));
 
     wire_callbacks(&ui, request_sender.clone(), state.clone());
     wire_mouse_navigation(&ui);
     start_event_pump(&ui, event_receiver, state.clone());
+    {
+        let mut app = state.lock().expect("app state mutex is not poisoned");
+        app.sidebar = platform::known_locations();
+    }
     refresh_ui(&ui, &state);
     let initial_tabs = {
         let app = state.lock().expect("app state mutex is not poisoned");
@@ -190,12 +220,30 @@ pub fn run() -> Result<(), slint::PlatformError> {
     }
 
     let result = ui.run();
-    let paths = state
-        .lock()
-        .expect("app state mutex is not poisoned")
-        .stable_paths();
-    if let Some(path) = session_store::default_path() {
-        let _ = session_store::save(&path, &paths);
+    let (paths, active_tab) = {
+        let app = state.lock().expect("app state mutex is not poisoned");
+        let active_tab = app
+            .tab_order
+            .iter()
+            .position(|id| *id == app.active_tab)
+            .unwrap_or(0);
+        (app.stable_paths(), active_tab)
+    };
+    let position = ui.window().position();
+    let size = ui.window().size();
+    if let Some(path) = session_store::default_path()
+        && let Ok(session) = session_store::SessionState::new(
+            session_store::WindowPlacement {
+                x: position.x,
+                y: position.y,
+                width: (size.width as f32 / ui.window().scale_factor()).round() as u32,
+                height: (size.height as f32 / ui.window().scale_factor()).round() as u32,
+            },
+            active_tab,
+            paths,
+        )
+    {
+        let _ = session_store::save(&path, &session);
     }
     result
 }
@@ -206,12 +254,16 @@ fn submit_navigation(
     tab_id: TabId,
     path: PathBuf,
     kind: NavigationKind,
-) {
+) -> bool {
     let request = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         let Some(tab) = app.tabs.get_mut(&tab_id) else {
-            return;
+            return false;
         };
+        if kind == NavigationKind::Normal && tab.current_path.as_ref() == Some(&path) {
+            tab.cancel_address_edit();
+            return false;
+        }
         let (request_id, cancel) = tab.begin_navigation(path.clone(), kind);
         DirectoryRequest {
             tab_id,
@@ -221,7 +273,7 @@ fn submit_navigation(
             started_at: Instant::now(),
         }
     };
-    let _ = sender.send(request);
+    sender.send(request).is_ok()
 }
 
 fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state: SharedSessions) {
@@ -229,15 +281,26 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
     let sender_for_path = sender.clone();
     let state_for_path = state.clone();
     ui.on_navigate_path(move |path| {
-        let tab_id = state_for_path
-            .lock()
-            .expect("app state mutex is not poisoned")
-            .active_tab;
+        let input = path.to_string();
+        let target = PathBuf::from(path.as_str());
+        let tab_id = {
+            let mut app = state_for_path
+                .lock()
+                .expect("app state mutex is not poisoned");
+            let tab_id = app.active_tab;
+            let tab = app
+                .tabs
+                .get_mut(&tab_id)
+                .expect("active tab session exists");
+            tab.update_address_input(input);
+            tab.address_editing = true;
+            tab_id
+        };
         submit_navigation(
             &sender_for_path,
             &state_for_path,
             tab_id,
-            PathBuf::from(path.as_str()),
+            target,
             NavigationKind::Normal,
         );
         if let Some(ui) = weak.upgrade() {
@@ -246,32 +309,259 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
     });
 
     let weak = ui.as_weak();
+    let state_for_edit = state.clone();
+    ui.on_begin_address_edit(move || {
+        let mut app = state_for_edit
+            .lock()
+            .expect("app state mutex is not poisoned");
+        let tab_id = app.active_tab;
+        if let Some(tab) = app.tabs.get_mut(&tab_id) {
+            tab.begin_address_edit();
+        }
+        drop(app);
+        if let Some(ui) = weak.upgrade() {
+            refresh_ui(&ui, &state_for_edit);
+            ui.invoke_focus_address_editor();
+        }
+    });
+
+    let weak = ui.as_weak();
+    let state_for_cancel_edit = state.clone();
+    ui.on_cancel_address_edit(move || {
+        let mut app = state_for_cancel_edit
+            .lock()
+            .expect("app state mutex is not poisoned");
+        let tab_id = app.active_tab;
+        if let Some(tab) = app.tabs.get_mut(&tab_id) {
+            tab.cancel_address_edit();
+        }
+        drop(app);
+        if let Some(ui) = weak.upgrade() {
+            refresh_ui(&ui, &state_for_cancel_edit);
+        }
+    });
+
+    let weak = ui.as_weak();
     let sender_for_entry = sender.clone();
     let state_for_entry = state.clone();
     ui.on_open_entry(move |entry_id| {
-        let target = state_for_entry
-            .lock()
-            .expect("app state mutex is not poisoned")
-            .active()
-            .entry_path(EntryId(entry_id as u32));
-        if let Some(target) = target {
-            let tab_id = state_for_entry
+        let target = {
+            let app = state_for_entry
                 .lock()
-                .expect("app state mutex is not poisoned")
-                .active_tab;
-            submit_navigation(
-                &sender_for_entry,
-                &state_for_entry,
-                tab_id,
-                target,
-                NavigationKind::Normal,
-            );
+                .expect("app state mutex is not poisoned");
+            let entry_id = if entry_id < 0 {
+                app.active().focused
+            } else {
+                Some(EntryId(entry_id as u32))
+            };
+            entry_id.and_then(|entry_id| {
+                app.active().entry(entry_id).map(|entry| {
+                    (
+                        app.active_tab,
+                        entry.path.clone(),
+                        entry.kind == crate::domain::EntryKind::Directory,
+                    )
+                })
+            })
+        };
+        if let Some((tab_id, target, is_directory)) = target {
+            if is_directory {
+                submit_navigation(
+                    &sender_for_entry,
+                    &state_for_entry,
+                    tab_id,
+                    target,
+                    NavigationKind::Normal,
+                );
+            } else {
+                thread::spawn(move || {
+                    if let Err(error) = platform::open_path(&target) {
+                        eprintln!("unable to open file: {error}");
+                    }
+                });
+            }
             if let Some(ui) = weak.upgrade() {
                 refresh_ui(&ui, &state_for_entry);
             }
         }
     });
 
+    let weak = ui.as_weak();
+    let sender_for_breadcrumb = sender.clone();
+    let state_for_breadcrumb = state.clone();
+    ui.on_navigate_breadcrumb(move |index| {
+        let target = {
+            let app = state_for_breadcrumb
+                .lock()
+                .expect("app state mutex is not poisoned");
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| app.active().breadcrumb_paths().get(index).cloned())
+                .map(|(_, path)| (app.active_tab, path))
+        };
+        if let Some((tab_id, path)) = target {
+            submit_navigation(
+                &sender_for_breadcrumb,
+                &state_for_breadcrumb,
+                tab_id,
+                path,
+                NavigationKind::Normal,
+            );
+            if let Some(ui) = weak.upgrade() {
+                refresh_ui(&ui, &state_for_breadcrumb);
+            }
+        }
+    });
+    let weak = ui.as_weak();
+    let sender_for_sidebar = sender.clone();
+    let state_for_sidebar = state.clone();
+    ui.on_navigate_sidebar(move |index| {
+        let target = {
+            let app = state_for_sidebar
+                .lock()
+                .expect("app state mutex is not poisoned");
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| app.sidebar.get(index))
+                .map(|location| (app.active_tab, location.path.clone()))
+        };
+        if let Some((tab_id, path)) = target {
+            submit_navigation(
+                &sender_for_sidebar,
+                &state_for_sidebar,
+                tab_id,
+                path,
+                NavigationKind::Normal,
+            );
+            if let Some(ui) = weak.upgrade() {
+                refresh_ui(&ui, &state_for_sidebar);
+            }
+        }
+    });
+
+    let weak = ui.as_weak();
+    let state_for_select = state.clone();
+    ui.on_select_entry(move |entry_id| {
+        let changed_rows = {
+            let mut app = state_for_select
+                .lock()
+                .expect("app state mutex is not poisoned");
+            let tab_id = app.active_tab;
+            let Some(tab) = app.tabs.get_mut(&tab_id) else {
+                return;
+            };
+            let previous = tab.selected.first().copied();
+            let selected = EntryId(entry_id as u32);
+            tab.select_entry(selected, false, false);
+            [previous, Some(selected)]
+        };
+        if let Some(ui) = weak.upgrade() {
+            update_file_rows(&ui, &state_for_select, changed_rows.into_iter().flatten());
+            update_selection_summary(&ui, &state_for_select);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let state_for_clear = state.clone();
+    ui.on_clear_selection(move || {
+        let mut app = state_for_clear
+            .lock()
+            .expect("app state mutex is not poisoned");
+        let tab_id = app.active_tab;
+        if let Some(tab) = app.tabs.get_mut(&tab_id) {
+            tab.clear_selection();
+        }
+        drop(app);
+        if let Some(ui) = weak.upgrade() {
+            refresh_ui(&ui, &state_for_clear);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let state_for_all = state.clone();
+    ui.on_select_all(move || {
+        let mut app = state_for_all
+            .lock()
+            .expect("app state mutex is not poisoned");
+        let tab_id = app.active_tab;
+        if let Some(tab) = app.tabs.get_mut(&tab_id) {
+            tab.select_all();
+        }
+        drop(app);
+        if let Some(ui) = weak.upgrade() {
+            refresh_ui(&ui, &state_for_all);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let state_for_focus = state.clone();
+    ui.on_move_focus(move |delta, extend| {
+        let mut app = state_for_focus
+            .lock()
+            .expect("app state mutex is not poisoned");
+        let tab_id = app.active_tab;
+        if let Some(tab) = app.tabs.get_mut(&tab_id) {
+            tab.move_focus(delta as isize, extend);
+        }
+        drop(app);
+        if let Some(ui) = weak.upgrade() {
+            refresh_ui(&ui, &state_for_focus);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let state_for_boundary = state.clone();
+    ui.on_focus_boundary(move |last, extend| {
+        let mut app = state_for_boundary
+            .lock()
+            .expect("app state mutex is not poisoned");
+        let tab_id = app.active_tab;
+        if let Some(tab) = app.tabs.get_mut(&tab_id) {
+            tab.focus_boundary(last, extend);
+        }
+        drop(app);
+        if let Some(ui) = weak.upgrade() {
+            refresh_ui(&ui, &state_for_boundary);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let state_for_toggle = state.clone();
+    ui.on_toggle_focused(move || {
+        let mut app = state_for_toggle
+            .lock()
+            .expect("app state mutex is not poisoned");
+        let tab_id = app.active_tab;
+        if let Some(tab) = app.tabs.get_mut(&tab_id) {
+            tab.toggle_focused();
+        }
+        drop(app);
+        if let Some(ui) = weak.upgrade() {
+            refresh_ui(&ui, &state_for_toggle);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let state_for_sort = state.clone();
+    ui.on_change_sort(move |field| {
+        let field = match field {
+            1 => SortField::Kind,
+            2 => SortField::Size,
+            3 => SortField::Modified,
+            _ => SortField::Name,
+        };
+        let mut app = state_for_sort
+            .lock()
+            .expect("app state mutex is not poisoned");
+        let tab_id = app.active_tab;
+        if let Some(tab) = app.tabs.get_mut(&tab_id) {
+            tab.set_sort(field);
+        }
+        drop(app);
+        if let Some(ui) = weak.upgrade() {
+            refresh_ui(&ui, &state_for_sort);
+        }
+    });
     let weak = ui.as_weak();
     let sender_for_new = sender.clone();
     let state_for_new = state.clone();
@@ -403,6 +693,44 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
     });
 
     let weak = ui.as_weak();
+    let sender_for_history = sender.clone();
+    let state_for_history = state.clone();
+    ui.on_navigate_history(move |is_back, index| {
+        let target = {
+            let app = state_for_history
+                .lock()
+                .expect("app state mutex is not poisoned");
+            let tab = app.active();
+            let stack = if is_back {
+                &tab.back_history
+            } else {
+                &tab.forward_history
+            };
+            let index = usize::try_from(index).ok();
+            index
+                .and_then(|index| stack.iter().rev().nth(index))
+                .cloned()
+                .map(|path| (app.active_tab, path))
+        };
+        if let Some((tab_id, path)) = target {
+            submit_navigation(
+                &sender_for_history,
+                &state_for_history,
+                tab_id,
+                path,
+                if is_back {
+                    NavigationKind::Back
+                } else {
+                    NavigationKind::Forward
+                },
+            );
+            if let Some(ui) = weak.upgrade() {
+                refresh_ui(&ui, &state_for_history);
+            }
+        }
+    });
+
+    let weak = ui.as_weak();
     let sender_for_up = sender.clone();
     let state_for_up = state.clone();
     ui.on_navigate_up(move || {
@@ -477,7 +805,12 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
 
 fn wire_mouse_navigation(ui: &AppWindow) {
     let weak = ui.as_weak();
+    let modifiers = Cell::new(winit::keyboard::ModifiersState::empty());
     ui.window().on_winit_window_event(move |_, event| {
+        if let winit::event::WindowEvent::ModifiersChanged(changed) = event {
+            modifiers.set(changed.state());
+            return EventResult::Propagate;
+        }
         let winit::event::WindowEvent::MouseInput {
             state: winit::event::ElementState::Released,
             button,
@@ -501,6 +834,10 @@ fn wire_mouse_navigation(ui: &AppWindow) {
                     ui.invoke_navigate_forward();
                 }
                 EventResult::PreventDefault
+            }
+            winit::event::MouseButton::Left if modifiers.get().control_key() => {
+                ui.invoke_toggle_focused();
+                EventResult::Propagate
             }
             _ => EventResult::Propagate,
         }
@@ -623,7 +960,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) {
             if let Some(tab) = app.tabs.get_mut(&tab_id)
                 && tab.accepts(request_id)
             {
-                sort_entries(&mut tab.pending_entries);
+                tab.sort_pending();
                 tab.commit_pending();
                 tab.commit_path(path);
                 tab.error = (skipped > 0).then(|| skipped.to_string());
@@ -671,6 +1008,39 @@ fn classify_error(kind: io::ErrorKind) -> LoadState {
     }
 }
 
+fn update_file_rows(
+    ui: &AppWindow,
+    state: &SharedSessions,
+    entry_ids: impl IntoIterator<Item = EntryId>,
+) {
+    use slint::Model;
+
+    let app = state.lock().expect("app state mutex is not poisoned");
+    let tab = app.active();
+    if !matches!(tab.load_state, LoadState::Complete) {
+        return;
+    }
+    let texts = Texts::new(app.language);
+    let model = ui.get_files();
+    let Some(model) = model.as_any().downcast_ref::<VecModel<FileRow>>() else {
+        return;
+    };
+    for entry_id in entry_ids {
+        if let Some(index) = tab.entries.iter().position(|entry| entry.id == entry_id)
+            && let Some(entry) = tab.entries.get(index)
+        {
+            model.set_row_data(index, file_row(entry, tab, texts));
+        }
+    }
+}
+
+fn update_selection_summary(ui: &AppWindow, state: &SharedSessions) {
+    let app = state.lock().expect("app state mutex is not poisoned");
+    let tab = app.active();
+    let texts = Texts::new(app.language);
+    ui.set_selected_count(tab.selected.len() as i32);
+    ui.set_status_text(status_text(tab, texts).into());
+}
 fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
     let app = state.lock().expect("app state mutex is not poisoned");
     let texts = Texts::new(app.language);
@@ -682,15 +1052,43 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
     };
     let file_rows = display_entries
         .iter()
-        .map(|entry| file_row(entry, texts))
+        .map(|entry| file_row(entry, tab, texts))
         .collect::<Vec<_>>();
     ui.set_files(ModelRc::new(VecModel::from(file_rows)));
-    ui.set_current_path(
-        tab.current_path
-            .as_deref()
-            .map(display_path)
-            .unwrap_or_default()
-            .into(),
+    ui.set_window_width(ui.window().size().width as f32 / ui.window().scale_factor());
+    let successful_path = tab
+        .current_path
+        .as_deref()
+        .map(display_path)
+        .unwrap_or_default();
+    let address_input = if tab.address_editing {
+        tab.address_input.clone()
+    } else {
+        successful_path.clone()
+    };
+    ui.set_current_path(successful_path.into());
+    ui.set_address_input(address_input.into());
+    ui.set_address_editing(tab.address_editing);
+    ui.set_address_has_error(matches!(
+        tab.load_state,
+        LoadState::NotFound
+            | LoadState::PermissionDenied
+            | LoadState::Disconnected
+            | LoadState::Failed
+    ));
+    ui.set_address_error_text(
+        if matches!(
+            tab.load_state,
+            LoadState::NotFound
+                | LoadState::PermissionDenied
+                | LoadState::Disconnected
+                | LoadState::Failed
+        ) {
+            texts.state(tab.load_state)
+        } else {
+            ""
+        }
+        .into(),
     );
     ui.set_status_text(status_text(tab, texts).into());
     ui.set_tabs(ModelRc::new(VecModel::from(
@@ -714,6 +1112,88 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
             })
             .collect::<Vec<_>>(),
     )));
+    let breadcrumb_paths = tab.breadcrumb_paths();
+    ui.set_breadcrumbs(ModelRc::new(VecModel::from(
+        breadcrumb_paths
+            .iter()
+            .enumerate()
+            .map(|(index, (label, _))| BreadcrumbRow {
+                index: index as i32,
+                label: label.clone().into(),
+                current: index + 1 == breadcrumb_paths.len(),
+            })
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_back_history(ModelRc::new(VecModel::from(
+        tab.back_history
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(index, path)| HistoryRow {
+                index: index as i32,
+                label: display_path(path).into(),
+            })
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_forward_history(ModelRc::new(VecModel::from(
+        tab.forward_history
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(index, path)| HistoryRow {
+                index: index as i32,
+                label: display_path(path).into(),
+            })
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_sidebar_items(ModelRc::new(VecModel::from(
+        app.sidebar
+            .iter()
+            .enumerate()
+            .map(|(index, location)| SidebarRow {
+                index: index as i32,
+                label: location.label.clone().into(),
+                icon_kind: match location.kind {
+                    KnownLocationKind::Home => 0,
+                    KnownLocationKind::Desktop => 1,
+                    KnownLocationKind::Downloads => 2,
+                    KnownLocationKind::Documents => 3,
+                    KnownLocationKind::Pictures => 4,
+                    KnownLocationKind::Music => 5,
+                    KnownLocationKind::Videos => 6,
+                    KnownLocationKind::Drive => 7,
+                },
+                selected: tab.current_path.as_ref().is_some_and(|current| {
+                    if location.kind == KnownLocationKind::Drive {
+                        current.starts_with(&location.path)
+                    } else {
+                        current == &location.path
+                    }
+                }),
+                is_drive: location.kind == KnownLocationKind::Drive,
+            })
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_selected_count(tab.selected.len() as i32);
+    ui.set_sort_field(match tab.sort_field {
+        SortField::Name => 0,
+        SortField::Kind => 1,
+        SortField::Size => 2,
+        SortField::Modified => 3,
+    });
+    ui.set_sort_descending(tab.sort_direction == crate::domain::SortDirection::Descending);
+    ui.set_page_state(match tab.load_state {
+        LoadState::Idle => 0,
+        LoadState::Loading => 1,
+        LoadState::Partial => 2,
+        LoadState::Complete if tab.entries.is_empty() => 3,
+        LoadState::Complete => 4,
+        LoadState::Cancelled => 5,
+        LoadState::NotFound => 6,
+        LoadState::PermissionDenied => 7,
+        LoadState::Disconnected => 8,
+        LoadState::Failed => 9,
+    });
     ui.set_can_navigate_back(!tab.back_history.is_empty());
     ui.set_can_navigate_forward(!tab.forward_history.is_empty());
     ui.set_can_navigate_up(tab.current_path.as_deref().and_then(Path::parent).is_some());
@@ -730,7 +1210,7 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
     apply_ui_texts(ui, app.language);
 }
 
-fn file_row(entry: &FileEntry, texts: Texts) -> FileRow {
+fn file_row(entry: &FileEntry, tab: &TabSession, texts: Texts) -> FileRow {
     debug_assert_eq!(
         entry.path.file_name(),
         Some(entry.original_name.as_os_str()),
@@ -743,10 +1223,18 @@ fn file_row(entry: &FileEntry, texts: Texts) -> FileRow {
         size: texts.size(entry.size_bytes).into(),
         modified: texts.modified(entry.modified).into(),
         is_directory: entry.kind == crate::domain::EntryKind::Directory,
+        selected: tab.selected.contains(&entry.id),
+        focused: tab.focused == Some(entry.id),
     }
 }
 
 fn status_text(tab: &TabSession, texts: Texts) -> String {
+    if !tab.selected.is_empty() {
+        return match texts.language {
+            Language::Chinese => format!("已选择 {} 项", tab.selected.len()),
+            Language::English => format!("{} selected", tab.selected.len()),
+        };
+    }
     match tab.load_state {
         LoadState::Complete => texts.items(
             tab.entries.len(),
@@ -845,11 +1333,34 @@ mod tests {
 
     #[test]
     fn closing_a_tab_preserves_another_session() {
-        let mut app = AppState::new(vec![PathBuf::from("one")]);
+        let mut app = AppState::new(vec![PathBuf::from("one")], 0);
         let second = app.create_tab(PathBuf::from("two"));
         assert_eq!(app.active_tab, second);
         assert_eq!(app.close_active(), Some(TabId(1)));
         assert_eq!(app.active().current_path, Some(PathBuf::from("one")));
+    }
+
+    #[test]
+    fn same_path_normal_navigation_is_ignored_without_new_request() {
+        let state = Arc::new(Mutex::new(AppState::new(vec![PathBuf::from("same")], 0)));
+        let (sender, receiver) = mpsc::channel();
+
+        assert!(!submit_navigation(
+            &sender,
+            &state,
+            TabId(1),
+            PathBuf::from("same"),
+            NavigationKind::Normal,
+        ));
+        assert!(receiver.try_recv().is_err());
+        let app = state.lock().expect("app state mutex is not poisoned");
+        assert_eq!(app.active().latest_request, RequestId(0));
+        assert!(app.active().back_history.is_empty());
+    }
+
+    #[test]
+    fn root_path_has_no_parent_navigation_target() {
+        assert!(Path::new(r"C:\").parent().is_none());
     }
 
     #[test]

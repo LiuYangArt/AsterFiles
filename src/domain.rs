@@ -1,10 +1,11 @@
 use std::{
+    cmp::Ordering,
     collections::HashMap,
     ffi::OsString,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
 };
 
@@ -38,12 +39,28 @@ pub enum NavigationKind {
     Refresh,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortField {
+    Name,
+    Kind,
+    Size,
+    Modified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDirection {
+    Ascending,
+    Descending,
+}
+
 #[derive(Debug)]
 pub struct TabSession {
     pub id: TabId,
     pub latest_request: RequestId,
     pub current_path: Option<PathBuf>,
     pub requested_path: Option<PathBuf>,
+    pub address_editing: bool,
+    pub address_input: String,
     pub navigation_kind: NavigationKind,
     pub back_history: Vec<PathBuf>,
     pub forward_history: Vec<PathBuf>,
@@ -54,6 +71,9 @@ pub struct TabSession {
     pub error: Option<String>,
     pub selected: Vec<EntryId>,
     pub focused: Option<EntryId>,
+    pub selection_anchor: Option<EntryId>,
+    pub sort_field: SortField,
+    pub sort_direction: SortDirection,
     pub scroll_offset: f32,
     pub first_batch_ms: Option<u128>,
     pub cancel_elapsed_ms: Option<u128>,
@@ -68,6 +88,8 @@ impl TabSession {
             latest_request: RequestId(0),
             current_path: None,
             requested_path: None,
+            address_editing: false,
+            address_input: String::new(),
             navigation_kind: NavigationKind::Normal,
             back_history: Vec::new(),
             forward_history: Vec::new(),
@@ -78,11 +100,62 @@ impl TabSession {
             error: None,
             selected: Vec::new(),
             focused: None,
+            selection_anchor: None,
+            sort_field: SortField::Name,
+            sort_direction: SortDirection::Ascending,
             scroll_offset: 0.0,
             first_batch_ms: None,
             cancel_elapsed_ms: None,
             discarded_results: 0,
             cancel: None,
+        }
+    }
+
+    pub fn begin_address_edit(&mut self) {
+        self.address_editing = true;
+        self.address_input = self
+            .current_path
+            .as_deref()
+            .map(display_path)
+            .unwrap_or_default();
+    }
+
+    pub fn breadcrumb_paths(&self) -> Vec<(String, PathBuf)> {
+        let Some(path) = self.current_path.as_deref() else {
+            return Vec::new();
+        };
+        let mut segments = Vec::new();
+        let mut cursor = PathBuf::new();
+        for component in path.components() {
+            cursor.push(component.as_os_str());
+            let label = match component {
+                std::path::Component::Prefix(_) => continue,
+                std::path::Component::RootDir => display_path(&cursor),
+                _ => component.as_os_str().to_string_lossy().into_owned(),
+            };
+            if !label.is_empty()
+                && segments
+                    .last()
+                    .is_none_or(|(_, previous)| previous != &cursor)
+            {
+                segments.push((label, cursor.clone()));
+            }
+        }
+        if segments.is_empty() && !path.as_os_str().is_empty() {
+            segments.push((display_path(path), path.to_path_buf()));
+        }
+        segments
+    }
+
+    pub fn update_address_input(&mut self, input: String) {
+        self.address_input = input;
+    }
+
+    pub fn cancel_address_edit(&mut self) {
+        self.address_editing = false;
+        self.address_input.clear();
+        if !matches!(self.load_state, LoadState::Loading | LoadState::Partial) {
+            self.error = None;
         }
     }
 
@@ -110,12 +183,12 @@ impl TabSession {
             && !self
                 .cancel
                 .as_ref()
-                .is_some_and(|cancel| cancel.load(Ordering::Acquire))
+                .is_some_and(|cancel| cancel.load(AtomicOrdering::Acquire))
     }
 
     pub fn cancel_pending(&mut self) {
         if let Some(cancel) = self.cancel.take() {
-            cancel.store(true, Ordering::Release);
+            cancel.store(true, AtomicOrdering::Release);
             if matches!(self.load_state, LoadState::Loading | LoadState::Partial) {
                 self.load_state = LoadState::Cancelled;
             }
@@ -128,6 +201,7 @@ impl TabSession {
             .map(|entry| (entry.id, entry.path.clone()))
             .collect();
         self.entries = entries;
+        self.reconcile_selection();
     }
 
     pub fn append_pending(&mut self, mut entries: Vec<FileEntry>) {
@@ -157,35 +231,38 @@ impl TabSession {
                 }
             }
             NavigationKind::Back => {
-                if self.back_history.last() == Some(&path) {
-                    self.back_history.pop();
+                if let Some(position) = self.back_history.iter().rposition(|item| item == &path) {
+                    let traversed = self.back_history.drain(position..).collect::<Vec<_>>();
                     if let Some(previous) = previous {
                         self.forward_history.push(previous);
                     }
+                    self.forward_history.extend(traversed.into_iter().skip(1));
                 }
             }
             NavigationKind::Forward => {
-                if self.forward_history.last() == Some(&path) {
-                    self.forward_history.pop();
+                if let Some(position) = self.forward_history.iter().rposition(|item| item == &path)
+                {
+                    let traversed = self.forward_history.drain(position..).collect::<Vec<_>>();
                     if let Some(previous) = previous {
                         self.back_history.push(previous);
                     }
+                    self.back_history.extend(traversed.into_iter().skip(1));
                 }
             }
             NavigationKind::Refresh => {}
         }
         self.current_path = Some(path);
         self.requested_path = None;
+        self.address_editing = false;
+        self.address_input.clear();
         self.navigation_kind = NavigationKind::Normal;
-        self.selected.clear();
-        self.focused = None;
+        self.clear_selection();
         self.scroll_offset = 0.0;
     }
 
     pub fn back_target(&self) -> Option<PathBuf> {
         self.back_history.last().cloned()
     }
-
     pub fn forward_target(&self) -> Option<PathBuf> {
         self.forward_history.last().cloned()
     }
@@ -199,9 +276,193 @@ impl TabSession {
             .collect();
     }
 
-    pub fn entry_path(&self, entry_id: EntryId) -> Option<PathBuf> {
-        self.entry_paths.get(&entry_id).cloned()
+    pub fn entry(&self, entry_id: EntryId) -> Option<&FileEntry> {
+        self.entries.iter().find(|entry| entry.id == entry_id)
     }
+
+    pub fn clear_selection(&mut self) {
+        self.selected.clear();
+        self.focused = None;
+        self.selection_anchor = None;
+    }
+
+    pub fn select_all(&mut self) {
+        self.selected = self.entries.iter().map(|entry| entry.id).collect();
+        self.focused = self.entries.first().map(|entry| entry.id);
+        self.selection_anchor = self.focused;
+    }
+
+    pub fn select_entry(&mut self, entry_id: EntryId, toggle: bool, extend: bool) {
+        if !self.entry_paths.contains_key(&entry_id) {
+            return;
+        }
+        self.focused = Some(entry_id);
+        if extend {
+            let anchor = self.selection_anchor.unwrap_or(entry_id);
+            self.selected = self.range_ids(anchor, entry_id);
+        } else if toggle {
+            if let Some(index) = self.selected.iter().position(|id| *id == entry_id) {
+                self.selected.remove(index);
+            } else {
+                self.selected.push(entry_id);
+            }
+            self.selection_anchor = Some(entry_id);
+        } else {
+            self.selected.clear();
+            self.selected.push(entry_id);
+            self.selection_anchor = Some(entry_id);
+        }
+    }
+
+    pub fn move_focus(&mut self, delta: isize, extend: bool) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let current = self
+            .focused
+            .and_then(|id| self.entry_index(id))
+            .unwrap_or(0);
+        let next = current
+            .saturating_add_signed(delta)
+            .min(self.entries.len() - 1);
+        let id = self.entries[next].id;
+        self.focused = Some(id);
+        if extend {
+            let anchor = self
+                .selection_anchor
+                .unwrap_or_else(|| self.entries[current].id);
+            self.selection_anchor = Some(anchor);
+            self.selected = self.range_ids(anchor, id);
+        } else {
+            self.selected = vec![id];
+            self.selection_anchor = Some(id);
+        }
+    }
+
+    pub fn focus_boundary(&mut self, last: bool, extend: bool) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let id = if last {
+            self.entries.last()
+        } else {
+            self.entries.first()
+        }
+        .expect("non-empty")
+        .id;
+        if extend {
+            let anchor = self.selection_anchor.or(self.focused).unwrap_or(id);
+            self.selection_anchor = Some(anchor);
+            self.selected = self.range_ids(anchor, id);
+            self.focused = Some(id);
+        } else {
+            self.selected = vec![id];
+            self.focused = Some(id);
+            self.selection_anchor = Some(id);
+        }
+    }
+
+    pub fn toggle_focused(&mut self) {
+        if let Some(id) = self.focused {
+            self.select_entry(id, true, false);
+        }
+    }
+
+    pub fn set_sort(&mut self, field: SortField) {
+        if self.sort_field == field {
+            self.sort_direction = match self.sort_direction {
+                SortDirection::Ascending => SortDirection::Descending,
+                SortDirection::Descending => SortDirection::Ascending,
+            };
+        } else {
+            self.sort_field = field;
+            self.sort_direction = SortDirection::Ascending;
+        }
+        let field = self.sort_field;
+        let direction = self.sort_direction;
+        self.entries
+            .sort_unstable_by(|left, right| compare_entries(left, right, field, direction));
+    }
+
+    pub fn sort_pending(&mut self) {
+        let field = self.sort_field;
+        let direction = self.sort_direction;
+        self.pending_entries
+            .sort_unstable_by(|left, right| compare_entries(left, right, field, direction));
+    }
+
+    fn range_ids(&self, left: EntryId, right: EntryId) -> Vec<EntryId> {
+        let Some(left) = self.entry_index(left) else {
+            return Vec::new();
+        };
+        let Some(right) = self.entry_index(right) else {
+            return Vec::new();
+        };
+        let (start, end) = if left <= right {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        self.entries[start..=end]
+            .iter()
+            .map(|entry| entry.id)
+            .collect()
+    }
+
+    fn entry_index(&self, id: EntryId) -> Option<usize> {
+        self.entries.iter().position(|entry| entry.id == id)
+    }
+
+    fn reconcile_selection(&mut self) {
+        self.selected.retain(|id| self.entry_paths.contains_key(id));
+        if self
+            .focused
+            .is_some_and(|id| !self.entry_paths.contains_key(&id))
+        {
+            self.focused = None;
+        }
+        if self
+            .selection_anchor
+            .is_some_and(|id| !self.entry_paths.contains_key(&id))
+        {
+            self.selection_anchor = None;
+        }
+    }
+}
+
+fn compare_entries(
+    left: &FileEntry,
+    right: &FileEntry,
+    field: SortField,
+    direction: SortDirection,
+) -> Ordering {
+    let directory_order =
+        (left.kind != EntryKind::Directory).cmp(&(right.kind != EntryKind::Directory));
+    if directory_order != Ordering::Equal {
+        return directory_order;
+    }
+    let value_order = match field {
+        SortField::Name => left
+            .display_name
+            .to_lowercase()
+            .cmp(&right.display_name.to_lowercase()),
+        SortField::Kind => left.kind.cmp(&right.kind),
+        SortField::Size => left.size_bytes.cmp(&right.size_bytes),
+        SortField::Modified => left.modified.cmp(&right.modified),
+    };
+    let value_order = match direction {
+        SortDirection::Ascending => value_order,
+        SortDirection::Descending => value_order.reverse(),
+    };
+    value_order.then_with(|| {
+        left.display_name
+            .to_lowercase()
+            .cmp(&right.display_name.to_lowercase())
+    })
+}
+
+fn display_path(path: &Path) -> String {
+    path.as_os_str().to_string_lossy().into_owned()
 }
 
 impl Drop for TabSession {
@@ -221,7 +482,7 @@ pub struct FileEntry {
     pub modified: Option<std::time::SystemTime>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EntryKind {
     Directory,
     File,
@@ -232,101 +493,125 @@ pub enum EntryKind {
 mod tests {
     use super::*;
 
+    fn entry(id: u32, name: &str, kind: EntryKind, size: Option<u64>) -> FileEntry {
+        FileEntry {
+            id: EntryId(id),
+            original_name: name.into(),
+            display_name: name.into(),
+            path: PathBuf::from(name),
+            kind,
+            size_bytes: size,
+            modified: None,
+        }
+    }
+
     #[test]
-    fn session_only_accepts_its_latest_request() {
+    fn session_only_accepts_latest_request() {
         let mut session = TabSession::new(TabId(7));
         let (first, first_cancel) =
-            session.begin_navigation(PathBuf::from("first"), NavigationKind::Normal);
-        let (second, _) = session.begin_navigation(PathBuf::from("second"), NavigationKind::Normal);
-
-        assert!(first_cancel.load(Ordering::Acquire));
+            session.begin_navigation("first".into(), NavigationKind::Normal);
+        let (second, _) = session.begin_navigation("second".into(), NavigationKind::Normal);
+        assert!(first_cancel.load(AtomicOrdering::Acquire));
         assert!(!session.accepts(first));
         assert!(session.accepts(second));
     }
 
     #[test]
-    fn failed_navigation_can_keep_last_successful_page() {
+    fn failed_navigation_keeps_successful_page_and_history() {
         let mut session = TabSession::new(TabId(1));
-        session.current_path = Some(PathBuf::from("good"));
-        session.begin_navigation(PathBuf::from("missing"), NavigationKind::Normal);
+        session.current_path = Some("good".into());
+        session.back_history = vec!["older".into()];
+        session.begin_navigation("missing".into(), NavigationKind::Normal);
         session.load_state = LoadState::NotFound;
-
-        assert_eq!(session.current_path, Some(PathBuf::from("good")));
-        assert_eq!(session.requested_path, Some(PathBuf::from("missing")));
+        assert_eq!(session.current_path, Some("good".into()));
+        assert_eq!(session.back_history, vec![PathBuf::from("older")]);
     }
 
     #[test]
-    fn entry_id_resolves_original_path() {
+    fn history_moves_only_after_success_and_supports_jumps() {
+        let mut session = TabSession::new(TabId(1));
+        session.current_path = Some("three".into());
+        session.back_history = vec!["one".into(), "two".into()];
+        session.begin_navigation("one".into(), NavigationKind::Back);
+        assert_eq!(session.back_history.len(), 2);
+        session.commit_path("one".into());
+        assert!(session.back_history.is_empty());
+        assert_eq!(
+            session.forward_history,
+            vec![PathBuf::from("three"), PathBuf::from("two")]
+        );
+    }
+
+    #[test]
+    fn windows_root_breadcrumb_is_visible_without_duplicate_drive_prefix() {
+        let mut session = TabSession::new(TabId(1));
+        session.current_path = Some(PathBuf::from(r"F:\"));
+        let breadcrumbs = session.breadcrumb_paths();
+        assert_eq!(
+            breadcrumbs,
+            vec![(r"F:\".to_owned(), PathBuf::from(r"F:\"))]
+        );
+    }
+    #[test]
+    fn address_edit_cancel_restores_successful_path() {
+        let mut session = TabSession::new(TabId(1));
+        session.current_path = Some(PathBuf::from("C:\\成功"));
+        session.begin_address_edit();
+        session.update_address_input("C:\\不存在📁".to_owned());
+        session.load_state = LoadState::NotFound;
+        session.cancel_address_edit();
+        assert!(!session.address_editing);
+        assert_eq!(session.current_path, Some(PathBuf::from("C:\\成功")));
+    }
+
+    #[test]
+    fn selection_supports_single_toggle_range_and_keyboard() {
+        let mut session = TabSession::new(TabId(1));
+        session.replace_entries(vec![
+            entry(1, "a", EntryKind::File, Some(1)),
+            entry(2, "b", EntryKind::File, Some(2)),
+            entry(3, "c", EntryKind::File, Some(3)),
+        ]);
+        session.select_entry(EntryId(1), false, false);
+        session.select_entry(EntryId(3), false, true);
+        assert_eq!(session.selected, vec![EntryId(1), EntryId(2), EntryId(3)]);
+        session.select_entry(EntryId(2), true, false);
+        assert!(!session.selected.contains(&EntryId(2)));
+        session.move_focus(-1, false);
+        assert_eq!(session.focused, Some(EntryId(1)));
+    }
+
+    #[test]
+    fn sorting_keeps_directories_first_in_both_directions() {
+        let mut session = TabSession::new(TabId(1));
+        session.replace_entries(vec![
+            entry(1, "small", EntryKind::File, Some(1)),
+            entry(2, "folder", EntryKind::Directory, None),
+            entry(3, "large", EntryKind::File, Some(10)),
+        ]);
+        session.set_sort(SortField::Size);
+        assert_eq!(session.entries[0].kind, EntryKind::Directory);
+        session.set_sort(SortField::Size);
+        assert_eq!(session.entries[0].kind, EntryKind::Directory);
+        assert_eq!(session.entries[1].display_name, "large");
+    }
+
+    #[test]
+    fn entry_id_resolves_original_unicode_path() {
         let mut session = TabSession::new(TabId(1));
         let original = PathBuf::from("中文").join("📁");
         session.replace_entries(vec![FileEntry {
             id: EntryId(9),
-            original_name: OsString::from("📁"),
-            display_name: "📁".to_owned(),
+            original_name: "📁".into(),
+            display_name: "📁".into(),
             path: original.clone(),
             kind: EntryKind::Directory,
             size_bytes: None,
             modified: None,
         }]);
-
-        assert_eq!(session.entry_path(EntryId(9)), Some(original));
-        assert_eq!(session.entries[0].original_name, OsString::from("📁"));
-    }
-
-    #[test]
-    fn back_and_forward_only_move_history_after_success() {
-        let mut session = TabSession::new(TabId(1));
-        session.current_path = Some(PathBuf::from("two"));
-        session.back_history = vec![PathBuf::from("one")];
-
-        session.begin_navigation(PathBuf::from("one"), NavigationKind::Back);
-        assert_eq!(session.back_history, vec![PathBuf::from("one")]);
-        assert!(session.forward_history.is_empty());
-
-        session.commit_path(PathBuf::from("one"));
-        assert!(session.back_history.is_empty());
-        assert_eq!(session.forward_history, vec![PathBuf::from("two")]);
-
-        session.begin_navigation(PathBuf::from("two"), NavigationKind::Forward);
-        session.commit_path(PathBuf::from("two"));
-        assert_eq!(session.back_history, vec![PathBuf::from("one")]);
-        assert!(session.forward_history.is_empty());
-    }
-
-    #[test]
-    fn failed_history_navigation_leaves_both_stacks_unchanged() {
-        let mut session = TabSession::new(TabId(1));
-        session.current_path = Some(PathBuf::from("two"));
-        session.back_history = vec![PathBuf::from("missing")];
-        session.forward_history = vec![PathBuf::from("three")];
-
-        session.begin_navigation(PathBuf::from("missing"), NavigationKind::Back);
-        session.load_state = LoadState::NotFound;
-
-        assert_eq!(session.current_path, Some(PathBuf::from("two")));
-        assert_eq!(session.back_history, vec![PathBuf::from("missing")]);
-        assert_eq!(session.forward_history, vec![PathBuf::from("three")]);
-    }
-
-    #[test]
-    fn refresh_does_not_change_history() {
-        let mut session = TabSession::new(TabId(1));
-        session.current_path = Some(PathBuf::from("two"));
-        session.back_history = vec![PathBuf::from("one")];
-        session.forward_history = vec![PathBuf::from("three")];
-
-        session.begin_navigation(PathBuf::from("two"), NavigationKind::Refresh);
-        session.commit_path(PathBuf::from("two"));
-
-        assert_eq!(session.back_history, vec![PathBuf::from("one")]);
-        assert_eq!(session.forward_history, vec![PathBuf::from("three")]);
-    }
-    #[test]
-    fn successful_path_commit_updates_tab_history() {
-        let mut session = TabSession::new(TabId(1));
-        session.current_path = Some(PathBuf::from("one"));
-        session.commit_path(PathBuf::from("two"));
-        assert_eq!(session.back_history, vec![PathBuf::from("one")]);
-        assert!(session.forward_history.is_empty());
+        assert_eq!(
+            session.entry(EntryId(9)).map(|entry| entry.path.clone()),
+            Some(original)
+        );
     }
 }

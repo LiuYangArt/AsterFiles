@@ -1,55 +1,106 @@
-import { Button, LineEdit, ListView } from "std-widgets.slint";
+import { LineEdit, ListView } from "std-widgets.slint";
 
-export struct FileRow {
-    id: int,
-    name: string,
-    kind: string,
-    size: string,
-    modified: string,
-    is-directory: bool,
-}
-
-export struct TabRow {
-    id: int,
-    title: string,
-    active: bool,
-    loading: bool,
-}
-
-component IconButton inherits Button {
-    in property <image> icon-source;
-    icon: root.icon-source;
-    text: "";
-    width: 38px;
-    height: 38px;
-}
+export struct FileRow { id: int, name: string, kind: string, size: string, modified: string, is-directory: bool, selected: bool, focused: bool }
+export struct HistoryRow { index: int, label: string }
+export struct BreadcrumbRow { index: int, label: string, current: bool }
+export struct TabRow { id: int, title: string, active: bool, loading: bool }
+export struct SidebarRow { index: int, label: string, icon-kind: int, selected: bool, is-drive: bool }
 
 component InlineIcon inherits Rectangle {
     in property <image> icon-source;
     in property <length> icon-size: 18px;
     width: root.icon-size;
+    Image { width: root.icon-size; height: root.icon-size; y: (parent.height - self.height) / 2; source: root.icon-source; }
+}
+
+component IconButton inherits Rectangle {
+    in property <image> icon-source;
+    in property <string> tip;
+    in property <string> button-label: root.tip;
+    in property <bool> enabled: true;
+    callback clicked();
+    width: 38px;
+    height: 38px;
+    border-radius: 5px;
+    border-width: 1px;
+    border-color: #e0e2e7;
+    background: !root.enabled ? #f8f8f9 : icon-touch.pressed ? #dde3ed : icon-touch.has-hover ? #edf1f6 : #ffffff;
+    opacity: root.enabled ? 1 : 0.46;
     Image {
-        width: root.icon-size;
-        height: root.icon-size;
+        width: 20px;
+        height: 20px;
+        x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         source: root.icon-source;
+        image-fit: contain;
     }
+    icon-touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    accessible-role: button;
+    accessible-label: root.button-label;
+    accessible-enabled: root.enabled;
+    Tooltip { text: @markdown("\{root.tip}"); }
 }
-component SidebarItem inherits Rectangle {
+
+component CommandButton inherits Rectangle {
     in property <image> icon-source;
     in property <string> label;
-    height: 34px;
+    in property <bool> enabled: true;
+    callback clicked();
+    width: 76px;
+    height: 32px;
+    horizontal-stretch: 0;
     border-radius: 5px;
-    background: item-mouse.has-hover ? #e5e9f2 : transparent;
+    border-width: 1px;
+    border-color: #e0e2e7;
+    background: !root.enabled ? #f8f8f9 : command-touch.pressed ? #dde3ed : command-touch.has-hover ? #edf1f6 : #ffffff;
+    opacity: root.enabled ? 1 : 0.5;
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 9px;
+        spacing: 6px;
+        InlineIcon { icon-source: root.icon-source; icon-size: 16px; }
+        Text { text: root.label; color: #30333a; font-size: 12px; vertical-alignment: center; }
+    }
+    command-touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+}
+
+component BreadcrumbButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> current: false;
+    callback clicked();
+    min-width: 42px;
+    height: 30px;
+    border-radius: 4px;
+    background: !root.current && crumb-touch.has-hover ? #edf1f6 : transparent;
     HorizontalLayout {
         padding-left: 8px;
         padding-right: 8px;
-        spacing: 10px;
-        InlineIcon { icon-source: root.icon-source; }
-        Text { text: root.label; color: #4f535d; font-size: 13px; vertical-alignment: center; }
+        spacing: 5px;
+        Text { text: root.label; color: #30333a; font-size: 12px; font-weight: root.current ? 600 : 400; vertical-alignment: center; }
+        Text { visible: !root.current; text: "›"; color: #777b85; font-size: 14px; vertical-alignment: center; }
     }
-    item-mouse := TouchArea { mouse-cursor: pointer; }
+    crumb-touch := TouchArea {
+        enabled: !root.current;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: !root.current;
 }
+
+
 
 export component AppWindow inherits Window {
     title: "AsterFiles";
@@ -58,25 +109,38 @@ export component AppWindow inherits Window {
     min-width: 820px;
     min-height: 520px;
     background: #f5f6f8;
+    in property <length> window-width: 1180px;
     default-font-family: "Segoe UI";
 
-    in-out property <string> current-path: "C:\\";
+    in property <string> current-path: "C:\\";
+    in-out property <string> address-input: "C:\\";
+    in property <bool> address-editing: false;
+    in property <bool> address-has-error: false;
+    in property <string> address-error-text: "";
     in property <string> status-text: "";
     in property <[FileRow]> files;
     in property <[TabRow]> tabs;
+    in property <[HistoryRow]> back-history;
+    in property <[HistoryRow]> forward-history;
+    in property <[BreadcrumbRow]> breadcrumbs;
+    in property <[SidebarRow]> sidebar-items;
     in property <bool> can-navigate-back: false;
     in property <bool> can-navigate-forward: false;
     in property <bool> can-navigate-up: false;
     in property <bool> can-refresh: false;
     in property <bool> can-close-tab: false;
     in property <bool> can-restore-tab: false;
+    in property <int> selected-count: 0;
+    in property <int> sort-field: 0;
+    in property <bool> sort-descending: false;
+    in property <int> page-state: 0;
     in property <string> language-label: "EN";
     in property <string> text-go: "前往";
     in property <string> text-back: "后退";
     in property <string> text-forward: "前进";
     in property <string> text-up: "向上";
     in property <string> text-refresh: "刷新";
-    in property <string> text-home: "主页";
+    in property <string> text-home: "常用位置";
     in property <string> text-desktop: "桌面";
     in property <string> text-downloads: "下载";
     in property <string> text-documents: "文档";
@@ -88,10 +152,22 @@ export component AppWindow inherits Window {
     in property <string> text-size: "大小";
 
     callback navigate-path(string);
+    callback begin-address-edit();
+    callback cancel-address-edit();
     callback navigate-back();
     callback navigate-forward();
+    callback navigate-history(bool, int);
     callback navigate-up();
     callback refresh();
+    callback navigate-sidebar(int);
+    callback navigate-breadcrumb(int);
+    callback select-entry(int);
+    callback clear-selection();
+    callback select-all();
+    callback move-focus(int, bool);
+    callback focus-boundary(bool, bool);
+    callback toggle-focused();
+    callback change-sort(int);
     callback open-entry(int);
     callback new-tab();
     callback close-tab();
@@ -99,116 +175,87 @@ export component AppWindow inherits Window {
     callback activate-tab(int);
     callback toggle-language();
 
+    private property <bool> compact: root.window-width < 1000px;
+    private property <bool> minimal: root.window-width < 900px;
+
     shortcut-handler := FocusScope {
-        width: 0px;
-        height: 0px;
+        width: 0px; height: 0px;
         KeyBinding { keys: @keys(Alt + LeftArrow); enabled: root.can-navigate-back; activated => { root.navigate-back(); } }
         KeyBinding { keys: @keys(Alt + RightArrow); enabled: root.can-navigate-forward; activated => { root.navigate-forward(); } }
         KeyBinding { keys: @keys(Alt + UpArrow); enabled: root.can-navigate-up; activated => { root.navigate-up(); } }
         KeyBinding { keys: @keys(F5); enabled: root.can-refresh; activated => { root.refresh(); } }
         KeyBinding { keys: @keys(Control + R); enabled: root.can-refresh; activated => { root.refresh(); } }
+        KeyBinding { keys: @keys(Control + L); activated => { root.begin-address-edit(); } }
+        KeyBinding { keys: @keys(Alt + D); activated => { root.begin-address-edit(); } }
+        KeyBinding { keys: @keys(Control + A); enabled: !root.address-editing; activated => { root.select-all(); } }
+        KeyBinding { keys: @keys(Control + Space); enabled: !root.address-editing; activated => { root.toggle-focused(); } }
+        KeyBinding { keys: @keys(UpArrow); enabled: !root.address-editing; activated => { root.move-focus(-1, false); } }
+        KeyBinding { keys: @keys(DownArrow); enabled: !root.address-editing; activated => { root.move-focus(1, false); } }
+        KeyBinding { keys: @keys(Shift + UpArrow); enabled: !root.address-editing; activated => { root.move-focus(-1, true); } }
+        KeyBinding { keys: @keys(Shift + DownArrow); enabled: !root.address-editing; activated => { root.move-focus(1, true); } }
+        KeyBinding { keys: @keys(Home); enabled: !root.address-editing; activated => { root.focus-boundary(false, false); } }
+        KeyBinding { keys: @keys(End); enabled: !root.address-editing; activated => { root.focus-boundary(true, false); } }
+        KeyBinding { keys: @keys(Shift + Home); enabled: !root.address-editing; activated => { root.focus-boundary(false, true); } }
+        KeyBinding { keys: @keys(Shift + End); enabled: !root.address-editing; activated => { root.focus-boundary(true, true); } }
+        KeyBinding { keys: @keys(Return); enabled: !root.address-editing; activated => { root.open-entry(-1); } }
+        KeyBinding { keys: @keys(Escape); enabled: !root.address-editing; activated => { root.clear-selection(); } }
+        KeyBinding { keys: @keys(Control + T); activated => { root.new-tab(); } }
+        KeyBinding { keys: @keys(Control + W); enabled: root.can-close-tab; activated => { root.close-tab(); } }
     }
+
+    public function focus-address-editor() { address-editor.focus(); address-editor.select-all(); }
 
     VerticalLayout {
         spacing: 0px;
-
         Rectangle {
-            height: 50px;
-            background: #ffffff;
-            border-color: #e2e4e9;
-            border-width: 1px;
+            height: 50px; background: #ffffff; border-color: #e2e4e9; border-width: 1px;
             HorizontalLayout {
-                padding-left: 14px;
-                padding-right: 12px;
-                padding-top: 6px;
-                padding-bottom: 6px;
-                spacing: 7px;
-                Text { text: "AsterFiles"; width: 112px; color: #1e1f24; font-size: 15px; font-weight: 700; vertical-alignment: center; }
+                padding-left: 14px; padding-right: 12px; padding-top: 6px; padding-bottom: 6px; spacing: 7px;
+                Text { text: "AsterFiles"; width: root.minimal ? 80px : 112px; color: #1e1f24; font-size: 15px; font-weight: 700; vertical-alignment: center; }
                 for tab in root.tabs: Rectangle {
-                    width: 170px;
-                    background: tab.active ? #eef2ff : #f7f7f8;
-                    border-color: tab.active ? #9eaff6 : #e2e3e7;
-                    border-width: 1px;
-                    border-radius: 7px;
-                    HorizontalLayout {
-                        padding-left: 10px;
-                        padding-right: 8px;
-                        spacing: 6px;
-                                        InlineIcon { icon-source: @image-url("icons/files/folder.svg"); icon-size: 16px; }
-                        Text { text: tab.title; color: #303138; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
-                        Text { text: tab.loading ? "…" : ""; color: #4f6bed; vertical-alignment: center; }
-                    }
-                    tab-click := TouchArea { clicked => { root.activate-tab(tab.id); } }
+                    width: root.minimal ? 110px : 170px; background: tab.active ? #eef2ff : #f7f7f8; border-color: tab.active ? #9eaff6 : #e2e3e7; border-width: tab.active ? 2px : 1px; border-radius: 7px;
+                    HorizontalLayout { padding-left: 10px; padding-right: 8px; spacing: 6px; InlineIcon { icon-source: @image-url("icons/files/folder.svg"); icon-size: 16px; } Text { text: tab.title; color: #303138; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; } Text { text: tab.loading ? "…" : ""; color: #4f6bed; vertical-alignment: center; } }
+                    TouchArea { mouse-cursor: pointer; clicked => { root.activate-tab(tab.id); } }
                 }
-                IconButton { icon-source: @image-url("icons/actions/add.svg"); accessible-label: "New tab"; clicked => { root.new-tab(); } }
-                IconButton { icon-source: @image-url("icons/actions/close.svg"); enabled: root.can-close-tab; accessible-label: "Close tab"; clicked => { root.close-tab(); } }
-                Button { text: "恢复"; enabled: root.can-restore-tab; clicked => { root.restore-tab(); } }
+                IconButton { icon-source: @image-url("icons/actions/add.svg"); tip: "新建标签 (Ctrl+T)"; button-label: "新建标签"; clicked => { root.new-tab(); } }
+                IconButton { icon-source: @image-url("icons/actions/close.svg"); tip: "关闭标签 (Ctrl+W)"; enabled: root.can-close-tab; button-label: "关闭标签"; clicked => { root.close-tab(); } }
+                IconButton { visible: !root.minimal; icon-source: @image-url("icons/actions/refresh.svg"); tip: "恢复关闭的标签"; enabled: root.can-restore-tab; button-label: "恢复关闭的标签"; clicked => { root.restore-tab(); } }
                 Rectangle { horizontal-stretch: 1; }
-                Button { text: root.language-label; clicked => { root.toggle-language(); } }
+                IconButton { icon-source: @image-url("icons/actions/language.svg"); tip: "切换语言 (" + root.language-label + ")"; button-label: "切换语言"; clicked => { root.toggle-language(); } }
             }
         }
 
         Rectangle {
-            height: 56px;
-            background: #fafbfc;
-            border-color: #e2e4e9;
-            border-width: 1px;
+            height: root.address-editing && root.address-has-error ? 70px : 56px; background: #fafbfc; border-color: #e2e4e9; border-width: 1px;
             HorizontalLayout {
-                padding-top: 9px;
-                padding-bottom: 9px;
-                padding-left: 14px;
-                padding-right: 14px;
-                spacing: 7px;
-                IconButton { icon-source: @image-url("icons/actions/back.svg"); enabled: root.can-navigate-back; accessible-label: root.text-back; clicked => { root.navigate-back(); } }
-                IconButton { icon-source: @image-url("icons/actions/forward.svg"); enabled: root.can-navigate-forward; accessible-label: root.text-forward; clicked => { root.navigate-forward(); } }
-                IconButton { icon-source: @image-url("icons/actions/up.svg"); enabled: root.can-navigate-up; accessible-label: root.text-up; clicked => { root.navigate-up(); } }
-                IconButton { icon-source: @image-url("icons/actions/refresh.svg"); enabled: root.can-refresh; accessible-label: root.text-refresh; clicked => { root.refresh(); } }
+                padding-top: 9px; padding-bottom: 9px; padding-left: 14px; padding-right: 14px; spacing: 7px;
+                ContextMenuArea { width: 38px; height: 38px; IconButton { icon-source: @image-url("icons/actions/back.svg"); tip: root.text-back + " (Alt+Left)"; enabled: root.can-navigate-back; button-label: root.text-back; clicked => { root.navigate-back(); } } Menu { for history in root.back-history: MenuItem { title: history.label; activated => { root.navigate-history(true, history.index); } } } }
+                ContextMenuArea { visible: !root.minimal; width: 38px; height: 38px; IconButton { icon-source: @image-url("icons/actions/forward.svg"); tip: root.text-forward + " (Alt+Right)"; enabled: root.can-navigate-forward; button-label: root.text-forward; clicked => { root.navigate-forward(); } } Menu { for history in root.forward-history: MenuItem { title: history.label; activated => { root.navigate-history(false, history.index); } } } }
+                IconButton { visible: !root.compact; icon-source: @image-url("icons/actions/up.svg"); tip: root.text-up + " (Alt+Up)"; enabled: root.can-navigate-up; button-label: root.text-up; clicked => { root.navigate-up(); } }
+                IconButton { visible: !root.compact; icon-source: @image-url("icons/actions/refresh.svg"); tip: root.text-refresh + " (F5)"; enabled: root.can-refresh; button-label: root.text-refresh; clicked => { root.refresh(); } }
                 Rectangle {
-                    height: 38px;
-                    horizontal-stretch: 1;
-                    background: #ffffff;
-                    border-color: #d7dae0;
-                    border-width: 1px;
-                    border-radius: 5px;
-                    TextInput {
-                        x: 12px;
-                        width: parent.width - 24px;
-                        height: parent.height;
-                        text <=> root.current-path;
-                        color: #24252a;
-                        selection-background-color: #b9c6ff;
-                        selection-foreground-color: #16171a;
-                        font-size: 13px;
-                        vertical-alignment: center;
-                        accepted => { root.navigate-path(self.text); }
-                    }
+                    height: root.address-editing && root.address-has-error ? 52px : 38px; horizontal-stretch: 1; background: #ffffff; border-color: root.address-has-error ? #c42b1c : #d7dae0; border-width: root.address-has-error ? 2px : 1px; border-radius: 5px;
+                    if !root.address-editing: Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 2px; InlineIcon { icon-source: @image-url("icons/files/folder.svg"); icon-size: 16px; } for crumb in root.breadcrumbs: BreadcrumbButton { label: crumb.label; current: crumb.current; clicked => { root.navigate-breadcrumb(crumb.index); } } Rectangle { horizontal-stretch: 1; } } TouchArea { mouse-cursor: pointer; clicked => { root.begin-address-edit(); } } }
+                    address-editor := LineEdit { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: root.address-has-error ? 30px : parent.height - 4px; text <=> root.address-input; font-size: 13px; accessible-label: "路径"; accepted(value) => { root.navigate-path(value); } key-pressed(event) => { if event.text == Key.Escape { root.cancel-address-edit(); return accept; } return reject; } }
+                    if root.address-editing && root.address-has-error: Text { x: 10px; y: 32px; width: parent.width - 20px; height: 16px; text: root.address-error-text; color: #a4262c; font-size: 11px; vertical-alignment: center; }
                 }
-                Button { text: root.text-go; clicked => { root.navigate-path(root.current-path); } }
+                IconButton { visible: !root.minimal; icon-source: @image-url("icons/actions/forward.svg"); tip: root.text-go; button-label: root.text-go; clicked => { root.address-editing ? root.navigate-path(root.address-input) : root.begin-address-edit(); } }
             }
         }
 
         HorizontalLayout {
             spacing: 0px;
-            Rectangle {
-                width: 218px;
-                background: #f1f2f5;
-                border-color: #e2e3e7;
-                border-width: 1px;
+            if !root.minimal: Rectangle {
+                width: root.compact ? 184px : 218px; background: #f1f2f5; border-color: #e2e3e7; border-width: 1px;
                 VerticalLayout {
-                    padding-top: 14px;
-                    padding-bottom: 14px;
-                    padding-left: 10px;
-                    padding-right: 10px;
-                    spacing: 3px;
-                    Text { text: root.text-home; height: 28px; font-size: 13px; font-weight: 700; color: #2b2c31; vertical-alignment: center; }
-                    SidebarItem { icon-source: @image-url("icons/locations/home.svg"); label: root.text-home; }
-                    SidebarItem { icon-source: @image-url("icons/locations/desktop.svg"); label: root.text-desktop; }
-                    SidebarItem { icon-source: @image-url("icons/locations/downloads.svg"); label: root.text-downloads; }
-                    SidebarItem { icon-source: @image-url("icons/locations/documents.svg"); label: root.text-documents; }
-                    SidebarItem { icon-source: @image-url("icons/locations/pictures.svg"); label: root.text-pictures; }
-                    Rectangle { height: 10px; }
-                    Text { text: root.text-drives; height: 28px; font-size: 12px; font-weight: 700; color: #777a84; vertical-alignment: center; }
-                    SidebarItem { icon-source: @image-url("icons/locations/drive.svg"); label: "Windows (C:)"; }
+                    padding-top: 12px; padding-bottom: 12px; padding-left: 10px; padding-right: 10px; spacing: 3px;
+                    Text { text: root.text-home; height: 26px; font-size: 12px; font-weight: 700; color: #777a84; vertical-alignment: center; }
+                    for location in root.sidebar-items: Rectangle {
+                        height: 34px; border-radius: 5px; background: location.selected ? #dce6ff : (side-touch.has-hover ? #e5e9f2 : transparent); border-color: location.selected ? #4f6bed : transparent; border-width: location.selected ? 2px : 0px;
+                        HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon-kind == 0 ? @image-url("icons/locations/home.svg") : location.icon-kind == 1 ? @image-url("icons/locations/desktop.svg") : location.icon-kind == 2 ? @image-url("icons/locations/downloads.svg") : location.icon-kind == 3 ? @image-url("icons/locations/documents.svg") : location.icon-kind == 4 ? @image-url("icons/locations/pictures.svg") : @image-url("icons/locations/drive.svg"); } Text { text: location.label; color: #4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
+                        side-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-sidebar(location.index); } }
+                        accessible-role: button; accessible-label: location.label;
+                    }
                     Rectangle { vertical-stretch: 1; }
                 }
             }
@@ -216,52 +263,45 @@ export component AppWindow inherits Window {
             VerticalLayout {
                 spacing: 0px;
                 Rectangle {
-                    height: 38px;
-                    background: #ffffff;
-                    border-color: #e7e8eb;
-                    border-width: 1px;
+                    height: 42px; background: #fbfbfc; border-color: #e7e8eb; border-width: 1px;
                     HorizontalLayout {
-                        padding-left: 16px;
-                        padding-right: 16px;
-                        spacing: 12px;
-                        Text { text: root.text-name; width: 52%; color: #696b74; font-size: 12px; vertical-alignment: center; }
-                        Text { text: root.text-type; width: 16%; color: #696b74; font-size: 12px; vertical-alignment: center; }
-                        Text { text: root.text-modified; width: 18%; color: #696b74; font-size: 12px; vertical-alignment: center; }
-                        Text { text: root.text-size; horizontal-stretch: 1; color: #696b74; font-size: 12px; vertical-alignment: center; }
-                    }
-                }
-
-                list := ListView {
-                    for entry in root.files: Rectangle {
-                        height: 40px;
-                        background: mouse.has-hover ? #eff4ff : #ffffff;
-                        border-color: #f1f1f3;
-                        border-width: 1px;
-                        HorizontalLayout {
-                            padding-left: 16px;
-                            padding-right: 16px;
-                            spacing: 12px;
-                            HorizontalLayout {
-                                width: 52%;
-                                spacing: 9px;
-                                                        InlineIcon { icon-source: entry.is-directory ? @image-url("icons/files/folder.svg") : @image-url("icons/files/document.svg"); }
-                                Text { text: entry.name; color: #24252a; font-size: 13px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
-                            }
-                            Text { text: entry.kind; width: 16%; color: #6f717a; font-size: 12px; vertical-alignment: center; }
-                            Text { text: entry.modified; width: 18%; color: #6f717a; font-size: 12px; vertical-alignment: center; }
-                            Text { text: entry.size; horizontal-stretch: 1; color: #6f717a; font-size: 12px; vertical-alignment: center; horizontal-alignment: right; }
-                        }
-                        mouse := TouchArea { clicked => { if (entry.is-directory) { root.open-entry(entry.id); } } }
+                        padding-left: 12px; padding-right: 12px; spacing: 8px;
+                        CommandButton { icon-source: @image-url("icons/actions/select-all.svg"); label: "全选"; clicked => { root.select-all(); } }
+                        CommandButton { width: 92px; icon-source: @image-url("icons/actions/close.svg"); label: "清除选择"; enabled: root.selected-count > 0; clicked => { root.clear-selection(); } }
+                        Rectangle { horizontal-stretch: 1; }
+                        CommandButton { icon-source: @image-url("icons/actions/sort.svg"); label: root.text-name + (root.sort-field == 0 ? (root.sort-descending ? " ↓" : " ↑") : ""); clicked => { root.change-sort(0); } }
+                        CommandButton { visible: !root.compact; icon-source: @image-url("icons/actions/sort.svg"); label: root.text-type + (root.sort-field == 1 ? (root.sort-descending ? " ↓" : " ↑") : ""); clicked => { root.change-sort(1); } }
+                        CommandButton { visible: !root.minimal; icon-source: @image-url("icons/actions/sort.svg"); label: root.text-size + (root.sort-field == 2 ? (root.sort-descending ? " ↓" : " ↑") : ""); clicked => { root.change-sort(2); } }
+                        CommandButton { visible: !root.compact; width: 104px; icon-source: @image-url("icons/actions/sort.svg"); label: root.text-modified + (root.sort-field == 3 ? (root.sort-descending ? " ↓" : " ↑") : ""); clicked => { root.change-sort(3); } }
                     }
                 }
 
                 Rectangle {
-                    height: 30px;
-                    background: #fafbfc;
-                    border-color: #e7e8eb;
-                    border-width: 1px;
-                    Text { x: 14px; text: root.status-text; color: #72747d; font-size: 11px; vertical-alignment: center; }
+                    height: 38px; background: #ffffff; border-color: #e7e8eb; border-width: 1px;
+                    HorizontalLayout { padding-left: 16px; padding-right: 16px; spacing: 12px; Text { text: root.text-name + (root.sort-field == 0 ? (root.sort-descending ? " ↓" : " ↑") : ""); width: root.compact ? 65% : 52%; color: #555862; font-size: 12px; vertical-alignment: center; } Text { visible: !root.compact; text: root.text-type + (root.sort-field == 1 ? (root.sort-descending ? " ↓" : " ↑") : ""); width: 16%; color: #696b74; font-size: 12px; vertical-alignment: center; } Text { visible: !root.compact; text: root.text-modified + (root.sort-field == 3 ? (root.sort-descending ? " ↓" : " ↑") : ""); width: 18%; color: #696b74; font-size: 12px; vertical-alignment: center; } Text { visible: !root.minimal; text: root.text-size + (root.sort-field == 2 ? (root.sort-descending ? " ↓" : " ↑") : ""); horizontal-stretch: 1; color: #696b74; font-size: 12px; vertical-alignment: center; } }
                 }
+
+                Rectangle {
+                    vertical-stretch: 1; background: #ffffff;
+                    background-touch := TouchArea { enabled: root.files.length > 0; clicked => { root.clear-selection(); } }
+                    list := ListView {
+                        visible: root.files.length > 0;
+                        for entry in root.files: Rectangle {
+                            height: 40px; background: entry.selected ? #dce6ff : (mouse.has-hover ? #eff4ff : #ffffff); border-color: entry.focused ? #4f6bed : #f1f1f3; border-width: entry.focused ? 2px : 1px;
+                            HorizontalLayout { padding-left: 16px; padding-right: 16px; spacing: 12px; HorizontalLayout { width: root.compact ? 65% : 52%; spacing: 9px; InlineIcon { icon-source: entry.is-directory ? @image-url("icons/files/folder.svg") : @image-url("icons/files/document.svg"); } Text { text: entry.name; color: #24252a; font-size: 13px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1;  } } Text { visible: !root.compact; text: entry.kind; width: 16%; color: #6f717a; font-size: 12px; vertical-alignment: center; } Text { visible: !root.compact; text: entry.modified; width: 18%; color: #6f717a; font-size: 12px; vertical-alignment: center; } Text { visible: !root.minimal; text: entry.size; horizontal-stretch: 1; color: #6f717a; font-size: 12px; vertical-alignment: center; horizontal-alignment: right; } }
+                            mouse := TouchArea { mouse-cursor: pointer; clicked => { root.select-entry(entry.id); } double-clicked => { root.open-entry(entry.id); } }
+                            accessible-role: list-item; accessible-label: entry.name;
+                        }
+                    }
+                    if root.files.length == 0: VerticalLayout {
+                        alignment: center; spacing: 8px;
+                        Text { text: root.page-state == 1 ? "正在加载…" : root.page-state == 3 ? "此文件夹为空" : root.page-state == 5 ? "加载已取消" : root.page-state == 6 ? "找不到该位置" : root.page-state == 7 ? "无权访问该位置" : root.page-state == 8 ? "位置已断开" : root.page-state == 9 ? "无法打开该位置" : ""; color: root.page-state >= 6 ? #a4262c : #62656f; font-size: 16px; horizontal-alignment: center; }
+                        if root.page-state >= 5: HorizontalLayout { alignment: center; CommandButton { icon-source: @image-url("icons/actions/refresh.svg"); label: "重试"; enabled: root.can-refresh; clicked => { root.refresh(); } } CommandButton { icon-source: @image-url("icons/actions/back.svg"); label: "返回"; enabled: root.can-navigate-back; clicked => { root.navigate-back(); } } }
+                    }
+
+                }
+
+                Rectangle { height: 30px; background: #fafbfc; border-color: #e7e8eb; border-width: 1px; Text { x: 14px; text: root.status-text; color: #72747d; font-size: 11px; vertical-alignment: center; } }
             }
         }
     }

@@ -1,5 +1,4 @@
 use std::{
-    cmp::Ordering,
     fs, io,
     path::Path,
     sync::{
@@ -76,24 +75,6 @@ pub fn read_directory_batches(
         on_batch(batch);
     }
     Ok(ReadOutcome::Complete { skipped })
-}
-
-pub fn sort_entries(entries: &mut [FileEntry]) {
-    entries.sort_unstable_by(compare_entries);
-}
-
-fn compare_entries(left: &FileEntry, right: &FileEntry) -> Ordering {
-    match (
-        left.kind == EntryKind::Directory,
-        right.kind == EntryKind::Directory,
-    ) {
-        (true, false) => Ordering::Less,
-        (false, true) => Ordering::Greater,
-        _ => left
-            .display_name
-            .to_lowercase()
-            .cmp(&right.display_name.to_lowercase()),
-    }
 }
 
 #[cfg(test)]
