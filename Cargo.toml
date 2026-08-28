@@ -1,0 +1,18 @@
+[package]
+name = "asterfiles"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A fast, modern Windows file manager built with Rust and Slint"
+build = "build.rs"
+
+[dependencies]
+slint = { version = "1.17.1", default-features = false, features = ["std", "backend-winit", "renderer-skia", "accessibility", "compat-1-2"] }
+
+[build-dependencies]
+slint-build = "1.17.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

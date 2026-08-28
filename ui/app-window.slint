@@ -1,0 +1,141 @@
+import { Button, LineEdit, ListView } from "std-widgets.slint";
+
+export struct FileRow {
+    name: string,
+    path: string,
+    kind: string,
+    size: string,
+    modified: string,
+    is-directory: bool,
+}
+
+export component AppWindow inherits Window {
+    title: "AsterFiles";
+    preferred-width: 1180px;
+    preferred-height: 760px;
+    min-width: 820px;
+    min-height: 520px;
+    background: #f5f6f8;
+
+    in-out property <string> current-path: "C:\\";
+    in property <string> status-text: "Ready";
+    in property <[FileRow]> files;
+    callback navigate(string);
+
+    VerticalLayout {
+        spacing: 0px;
+
+        Rectangle {
+            height: 46px;
+            background: #ffffff;
+            border-color: #e7e8eb;
+            border-width: 1px;
+
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 14px;
+                spacing: 8px;
+                Text { text: "✦"; color: #5b5ce2; font-size: 22px; vertical-alignment: center; }
+                Text { text: "AsterFiles"; color: #1e1f24; font-size: 15px; font-weight: 700; vertical-alignment: center; }
+                Rectangle { horizontal-stretch: 1; }
+                Text { text: "Rust + Slint performance prototype"; color: #858792; font-size: 12px; vertical-alignment: center; }
+            }
+        }
+
+        Rectangle {
+            height: 58px;
+            background: #fafbfc;
+            border-color: #e7e8eb;
+            border-width: 1px;
+            HorizontalLayout {
+                padding-top: 10px;
+                padding-bottom: 10px;
+                padding-left: 14px;
+                padding-right: 14px;
+                spacing: 8px;
+                Button { text: "←"; enabled: false; }
+                Button { text: "↑"; enabled: false; }
+                LineEdit {
+                    text <=> root.current-path;
+                    horizontal-stretch: 1;
+                    accepted => { root.navigate(self.text); }
+                }
+                Button { text: "Go"; clicked => { root.navigate(root.current-path); } }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 0px;
+            Rectangle {
+                width: 218px;
+                background: #f1f2f5;
+                border-color: #e2e3e7;
+                border-width: 1px;
+                VerticalLayout {
+                    padding-top: 14px;
+                    padding-bottom: 14px;
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    spacing: 6px;
+                    Text { text: "Home"; font-size: 13px; font-weight: 700; color: #2b2c31; }
+                    Text { text: "Desktop"; font-size: 13px; color: #60626c; }
+                    Text { text: "Downloads"; font-size: 13px; color: #60626c; }
+                    Text { text: "Documents"; font-size: 13px; color: #60626c; }
+                    Text { text: "Pictures"; font-size: 13px; color: #60626c; }
+                    Rectangle { height: 12px; }
+                    Text { text: "Drives"; font-size: 12px; font-weight: 700; color: #8b8d96; }
+                    Text { text: "Windows (C:)"; font-size: 13px; color: #60626c; }
+                    Rectangle { vertical-stretch: 1; }
+                }
+            }
+
+            VerticalLayout {
+                spacing: 0px;
+                Rectangle {
+                    height: 38px;
+                    background: #ffffff;
+                    border-color: #e7e8eb;
+                    border-width: 1px;
+                    HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        spacing: 12px;
+                        Text { text: "Name"; width: 52%; color: #696b74; font-size: 12px; vertical-alignment: center; }
+                        Text { text: "Type"; width: 16%; color: #696b74; font-size: 12px; vertical-alignment: center; }
+                        Text { text: "Modified"; width: 18%; color: #696b74; font-size: 12px; vertical-alignment: center; }
+                        Text { text: "Size"; horizontal-stretch: 1; color: #696b74; font-size: 12px; vertical-alignment: center; }
+                    }
+                }
+
+                list := ListView {
+                    for entry in root.files: Rectangle {
+                        height: 38px;
+                        background: mouse.has-hover ? #eff4ff : #ffffff;
+                        border-color: #f1f1f3;
+                        border-width: 1px;
+                        HorizontalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            spacing: 12px;
+                            Text { text: entry.is-directory ? "▸  " + entry.name : "    " + entry.name; width: 52%; color: #24252a; font-size: 13px; vertical-alignment: center; overflow: elide; }
+                            Text { text: entry.kind; width: 16%; color: #6f717a; font-size: 12px; vertical-alignment: center; }
+                            Text { text: entry.modified; width: 18%; color: #6f717a; font-size: 12px; vertical-alignment: center; }
+                            Text { text: entry.size; horizontal-stretch: 1; color: #6f717a; font-size: 12px; vertical-alignment: center; horizontal-alignment: right; }
+                        }
+                        mouse := TouchArea {
+                            clicked => { if (entry.is-directory) { root.navigate(entry.path); } }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 30px;
+                    background: #fafbfc;
+                    border-color: #e7e8eb;
+                    border-width: 1px;
+                    Text { x: 14px; text: root.status-text; color: #72747d; font-size: 11px; vertical-alignment: center; }
+                }
+            }
+        }
+    }
+}
