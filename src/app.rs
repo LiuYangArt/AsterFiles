@@ -220,14 +220,20 @@ enum DirectoryEvent {
 struct IconRequest {
     tab_id: TabId,
     request_id: RequestId,
-    entry_id: EntryId,
+    target: IconTarget,
     path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IconTarget {
+    Entry(EntryId),
+    Location,
 }
 
 struct IconEvent {
     tab_id: TabId,
     request_id: RequestId,
-    entry_id: EntryId,
+    target: IconTarget,
     path: PathBuf,
     icon: platform::windows_shell_icons::ShellIconRgba,
 }
@@ -1407,7 +1413,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                 icon_requests.extend(entries.iter().map(|entry| IconRequest {
                     tab_id,
                     request_id,
-                    entry_id: entry.id,
+                    target: IconTarget::Entry(entry.id),
                     path: entry.path.clone(),
                 }));
                 tab.append_pending(entries);
@@ -1426,6 +1432,12 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                 tab.commit_pending();
                 tab.commit_path(path);
                 tab.error = (skipped > 0).then(|| skipped.to_string());
+                icon_requests.push(IconRequest {
+                    tab_id,
+                    request_id,
+                    target: IconTarget::Location,
+                    path: tab.current_path.clone().expect("committed path exists"),
+                });
             }
         }
         DirectoryEvent::Cancelled { tab_id, request_id } => {
@@ -1490,7 +1502,7 @@ fn spawn_icon_workers(
                     let _ = events.send(IconEvent {
                         tab_id: request.tab_id,
                         request_id: request.request_id,
-                        entry_id: request.entry_id,
+                        target: request.target,
                         path: request.path,
                         icon,
                     });
@@ -1560,17 +1572,22 @@ fn apply_icon_event(state: &SharedSessions, event: IconEvent) {
     let accepted = icon_event_is_current(&app, &event);
     if accepted {
         app.icon_cache.insert(event.path, event.icon.clone());
-        app.icons
-            .insert((event.tab_id, event.request_id, event.entry_id), event.icon);
+        if let IconTarget::Entry(entry_id) = event.target {
+            app.icons
+                .insert((event.tab_id, event.request_id, entry_id), event.icon);
+        }
     }
 }
 
 fn icon_event_is_current(app: &AppState, event: &IconEvent) -> bool {
     app.tabs.get(&event.tab_id).is_some_and(|tab| {
         tab.latest_request == event.request_id
-            && tab
-                .visible_entry(event.entry_id)
-                .is_some_and(|entry| entry.path == event.path)
+            && match event.target {
+                IconTarget::Entry(entry_id) => tab
+                    .visible_entry(entry_id)
+                    .is_some_and(|entry| entry.path == event.path),
+                IconTarget::Location => tab.visible_path() == Some(event.path.as_path()),
+            }
     })
 }
 
@@ -1625,19 +1642,6 @@ fn update_selection_summary(ui: &AppWindow, state: &SharedSessions) {
     ui.set_selected_count(tab.selected.len() as i32);
     ui.set_status_text(status_text(tab, Texts::new(app.language)).into());
 }
-fn selected_sidebar_index(app: &AppState) -> Option<usize> {
-    let current = app.active().visible_path()?;
-    app.sidebar
-        .iter()
-        .enumerate()
-        .filter(|(_, location)| {
-            current == location.path
-                || (location.kind == KnownLocationKind::Drive
-                    && current.starts_with(&location.path))
-        })
-        .max_by_key(|(_, location)| (current == location.path, location.path.components().count()))
-        .map(|(index, _)| index)
-}
 fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
     let app = state.lock().expect("app state mutex is not poisoned");
     let texts = Texts::new(app.language);
@@ -1662,6 +1666,14 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
         visible_path.clone()
     };
     ui.set_current_path(visible_path.into());
+    let current_location_path = tab.visible_path();
+    ui.set_current_location_icon(
+        current_location_path
+            .and_then(|path| app.icon_cache.get(path))
+            .map(shell_icon_image)
+            .unwrap_or_default(),
+    );
+    ui.set_current_location_is_drive(current_location_path.is_some_and(is_drive_root));
     ui.set_address_input(address_input.into());
     ui.set_address_editing(tab.address_editing);
 
@@ -1686,6 +1698,12 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
                     .into(),
                 active: tab.id == app.active_tab,
                 loading: matches!(tab.load_state, LoadState::Loading | LoadState::Partial),
+                icon: tab
+                    .visible_path()
+                    .and_then(|path| app.icon_cache.get(path))
+                    .map(shell_icon_image)
+                    .unwrap_or_default(),
+                is_drive: tab.visible_path().is_some_and(is_drive_root),
             })
             .collect::<Vec<_>>(),
     )));
@@ -1723,7 +1741,6 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
             })
             .collect::<Vec<_>>(),
     )));
-    let selected_sidebar = selected_sidebar_index(&app);
     ui.set_sidebar_items(ModelRc::new(VecModel::from(
         app.sidebar
             .iter()
@@ -1758,7 +1775,6 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
                     KnownLocationKind::Videos => 6,
                     KnownLocationKind::Drive => 7,
                 },
-                selected: selected_sidebar.is_some_and(|selected| selected == index),
                 is_drive: location.kind == KnownLocationKind::Drive,
                 icon: app
                     .sidebar_icons
@@ -2069,6 +2085,11 @@ fn display_path(path: &Path) -> String {
     path.as_os_str().to_string_lossy().into_owned()
 }
 
+fn is_drive_root(path: &Path) -> bool {
+    let value = path.as_os_str().to_string_lossy();
+    value.len() == 3 && value.as_bytes()[1] == b':' && matches!(value.as_bytes()[2], b'\\' | b'/')
+}
+
 fn initial_path() -> PathBuf {
     std::env::var_os("USERPROFILE")
         .map(PathBuf::from)
@@ -2088,51 +2109,6 @@ mod tests {
         assert_eq!(order, [0, 2, 3, 1]);
         assert!(!reorder_column(&mut order, 9, -1));
         assert!(!reorder_column(&mut order, 2, 0));
-    }
-    #[test]
-    fn sidebar_selection_prefers_exact_known_folder_over_drive() {
-        let mut app = AppState::new_for_test(
-            vec![PathBuf::from(r"C:\Users\Test\Pictures")],
-            0,
-            [0, 1, 2, 3],
-        );
-        app.sidebar = vec![
-            KnownLocation {
-                kind: KnownLocationKind::Pictures,
-                label: "图片".to_owned(),
-                path: PathBuf::from(r"C:\Users\Test\Pictures"),
-            },
-            KnownLocation {
-                kind: KnownLocationKind::Drive,
-                label: "C:".to_owned(),
-                path: PathBuf::from(r"C:\"),
-            },
-        ];
-
-        assert_eq!(selected_sidebar_index(&app), Some(0));
-    }
-
-    #[test]
-    fn sidebar_selection_uses_drive_for_descendant_without_exact_location() {
-        let mut app = AppState::new_for_test(
-            vec![PathBuf::from(r"C:\Projects\AsterFiles")],
-            0,
-            [0, 1, 2, 3],
-        );
-        app.sidebar = vec![
-            KnownLocation {
-                kind: KnownLocationKind::Pictures,
-                label: "图片".to_owned(),
-                path: PathBuf::from(r"C:\Users\Test\Pictures"),
-            },
-            KnownLocation {
-                kind: KnownLocationKind::Drive,
-                label: "C:".to_owned(),
-                path: PathBuf::from(r"C:\"),
-            },
-        ];
-
-        assert_eq!(selected_sidebar_index(&app), Some(1));
     }
     #[test]
     fn closing_a_tab_preserves_another_session() {
@@ -2181,6 +2157,8 @@ mod tests {
     #[test]
     fn root_path_has_no_parent_navigation_target() {
         assert!(Path::new(r"C:\").parent().is_none());
+        assert!(is_drive_root(Path::new(r"C:\")));
+        assert!(!is_drive_root(Path::new(r"C:\Users")));
     }
 
     #[test]
@@ -2201,7 +2179,7 @@ mod tests {
         let event = IconEvent {
             tab_id: TabId(1),
             request_id: RequestId(7),
-            entry_id: EntryId(3),
+            target: IconTarget::Entry(EntryId(3)),
             path: PathBuf::from("same/file.txt"),
             icon: platform::windows_shell_icons::ShellIconRgba {
                 width: 1,
@@ -2210,6 +2188,15 @@ mod tests {
             },
         };
         assert!(icon_event_is_current(&app, &event));
+
+        let location_event = IconEvent {
+            tab_id: TabId(1),
+            request_id: RequestId(7),
+            target: IconTarget::Location,
+            path: PathBuf::from("same"),
+            icon: event.icon.clone(),
+        };
+        assert!(icon_event_is_current(&app, &location_event));
 
         let mut stale_request = event;
         stale_request.request_id = RequestId(6);
