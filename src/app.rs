@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use slint::{
@@ -54,10 +54,13 @@ struct AppState {
     operations: OperationManager,
     operation_errors: Vec<String>,
     rename_target: Option<(TabId, EntryId)>,
-    pending_new_folder: Option<PathBuf>,
+    rename_extension: Option<std::ffi::OsString>,
+    focus_after_refresh: HashMap<TabId, PathBuf>,
     pending_permanent_delete: Vec<OperationItem>,
     exit_after_cancel: bool,
     clipboard_has_files: bool,
+    cut_paths: Vec<PathBuf>,
+    cut_generation: u64,
     conflict_responses:
         HashMap<OperationId, mpsc::Sender<crate::domain::file_operations::ConflictDecision>>,
 }
@@ -120,10 +123,13 @@ impl AppState {
             operations: OperationManager::new(),
             operation_errors: Vec::new(),
             rename_target: None,
-            pending_new_folder: None,
+            rename_extension: None,
+            focus_after_refresh: HashMap::new(),
             pending_permanent_delete: Vec::new(),
             exit_after_cancel: false,
             clipboard_has_files: false,
+            cut_paths: Vec::new(),
+            cut_generation: 0,
             conflict_responses: HashMap::new(),
         }
     }
@@ -342,6 +348,7 @@ enum FileOperationEvent {
         id: OperationId,
         result: OperationResult,
         item_states: Vec<(usize, ItemState, Option<String>)>,
+        completed_paths: Vec<PathBuf>,
     },
 }
 
@@ -353,7 +360,11 @@ enum ClipboardRequest {
 }
 #[derive(Debug)]
 enum ClipboardEvent {
-    Written(Result<(), String>),
+    Written {
+        result: Result<(), String>,
+        paths: Vec<PathBuf>,
+        cut: bool,
+    },
     Paste(Result<Option<(FileOperationKind, Vec<OperationItem>)>, String>),
     Availability(Result<bool, String>),
 }
@@ -452,7 +463,13 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         request_sender.clone(),
         state.clone(),
     );
-    start_clipboard_event_pump(&ui, clipboard_receiver, operation_sender, state.clone());
+    start_clipboard_event_pump(
+        &ui,
+        clipboard_receiver,
+        operation_sender,
+        request_sender.clone(),
+        state.clone(),
+    );
     scan_cleanup_diagnostics(&ui, state.clone());
     {
         let mut app = state.lock().expect("app state mutex is not poisoned");
@@ -593,43 +610,14 @@ fn enqueue_operation(
     }
 }
 
-fn begin_new_folder_ui(weak: &slint::Weak<AppWindow>, state: &SharedSessions) {
-    let name = {
-        let mut app = state.lock().expect("app state mutex is not poisoned");
+fn create_default_folder(state: &SharedSessions, sender: &mpsc::Sender<FileOperationRequest>) {
+    let destination = state.lock().ok().and_then(|app| {
         let name = match app.language {
             Language::Chinese => "新建文件夹",
             Language::English => "New folder",
         };
-        let Some(parent) = app.active().visible_path() else {
-            return;
-        };
-        let path = parent.join(name);
-        app.pending_new_folder = Some(path.clone());
-        path.file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned()
-    };
-    if let Some(ui) = weak.upgrade() {
-        ui.set_rename_entry_id(-2);
-        ui.set_rename_input(name.into());
-        ui.set_rename_editing(true);
-    }
-}
-
-fn commit_new_folder(
-    state: &SharedSessions,
-    sender: &mpsc::Sender<FileOperationRequest>,
-    name: &str,
-) -> bool {
-    let destination = {
-        let app = state.lock().expect("app state mutex is not poisoned");
-        let parent = app
-            .pending_new_folder
-            .as_ref()
-            .and_then(|path| path.parent().map(Path::to_path_buf));
-        parent.map(|parent| parent.join(name))
-    };
+        app.active().visible_path().map(|parent| parent.join(name))
+    });
     if let Some(path) = destination {
         enqueue_operation(
             state,
@@ -637,9 +625,6 @@ fn commit_new_folder(
             FileOperationKind::CreateFolder,
             vec![OperationItem::pending(None, Some(path))],
         );
-        true
-    } else {
-        false
     }
 }
 fn request_clipboard_write(
@@ -672,10 +657,22 @@ fn begin_rename_ui(weak: &slint::Weak<AppWindow>, state: &SharedSessions) {
             return;
         }
         let id = app.active().selected[0];
-        let name = app
-            .active()
-            .visible_entry(id)
-            .map(|entry| entry.display_name.clone());
+        let entry = app.active().visible_entry(id).cloned();
+        let name = entry.as_ref().map(|entry| {
+            if entry.kind == crate::domain::EntryKind::File {
+                entry
+                    .path
+                    .file_stem()
+                    .unwrap_or(&entry.original_name)
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                entry.display_name.clone()
+            }
+        });
+        app.rename_extension = entry
+            .filter(|entry| entry.kind == crate::domain::EntryKind::File)
+            .and_then(|entry| entry.path.extension().map(std::ffi::OsStr::to_os_string));
         app.rename_target = Some((app.active_tab, id));
         name.map(|name| (id, name))
     };
@@ -696,7 +693,12 @@ fn submit_rename(state: &SharedSessions, sender: &mpsc::Sender<FileOperationRequ
             .and_then(|(tab_id, id)| app.tabs.get(&tab_id)?.visible_entry(id))
             .and_then(|entry| {
                 entry.path.parent().map(|parent| {
-                    OperationItem::pending(Some(entry.path.clone()), Some(parent.join(name)))
+                    let mut new_name = std::ffi::OsString::from(name);
+                    if let Some(extension) = app.rename_extension.as_ref() {
+                        new_name.push(".");
+                        new_name.push(extension);
+                    }
+                    OperationItem::pending(Some(entry.path.clone()), Some(parent.join(new_name)))
                 })
             })
     };
@@ -829,6 +831,7 @@ fn project_context_menu(ui: &AppWindow, state: &SharedSessions, background: bool
 fn show_classic_menu(
     weak: slint::Weak<AppWindow>,
     state: &SharedSessions,
+    directory_sender: mpsc::Sender<DirectoryRequest>,
     background: bool,
     owner_window: isize,
     screen_x: i32,
@@ -861,6 +864,17 @@ fn show_classic_menu(
                 owner_window,
             )
         };
+        let affected_folders = if background {
+            folder.iter().cloned().collect::<Vec<_>>()
+        } else {
+            let mut parents = paths
+                .iter()
+                .filter_map(|path| path.parent().map(Path::to_path_buf))
+                .collect::<Vec<_>>();
+            parents.sort();
+            parents.dedup();
+            parents
+        };
         match session.and_then(|session| {
             let _ = session.items()?;
             session.show_native_and_invoke(owner_window, screen_x, screen_y)
@@ -879,7 +893,21 @@ fn show_classic_menu(
                     }
                 });
             }
-            Ok(_) => {}
+            Ok(_) => {
+                if !affected_folders.is_empty() {
+                    let state_for_refresh = state.clone();
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(200));
+                        let _ = slint::invoke_from_event_loop(move || {
+                            refresh_affected_tabs(
+                                &directory_sender,
+                                &state_for_refresh,
+                                &affected_folders,
+                            );
+                        });
+                    });
+                }
+            }
             Err(error) => {
                 let state_for_error = state.clone();
                 let _ = slint::invoke_from_event_loop(move || {
@@ -1533,7 +1561,7 @@ fn wire_callbacks(
     });
 
     let weak = ui.as_weak();
-    let sender_for_refresh = sender;
+    let sender_for_refresh = sender.clone();
     let state_for_refresh = state.clone();
     ui.on_refresh(move || {
         let target = {
@@ -1687,7 +1715,7 @@ fn wire_callbacks(
     let clipboard_for_context = clipboard_sender.clone();
     ui.on_invoke_context_command(move |command| {
         match command {
-            1 => begin_new_folder_ui(&weak, &state_for_context_command),
+            1 => create_default_folder(&state_for_context_command, &sender_for_context_command),
             2 => request_clipboard_write(&state_for_context_command, &clipboard_for_context, false),
             3 => request_clipboard_write(&state_for_context_command, &clipboard_for_context, true),
             4 => request_clipboard_paste(&state_for_context_command, &clipboard_for_context),
@@ -1716,6 +1744,7 @@ fn wire_callbacks(
                     show_classic_menu(
                         weak.clone(),
                         &state_for_context_command,
+                        sender.clone(),
                         background,
                         native_window_handle(&ui),
                         origin.x + (x as f32 * scale).round() as i32,
@@ -1749,16 +1778,14 @@ fn wire_callbacks(
     let state_for_commit_rename = state.clone();
     let sender_for_rename = operation_sender.clone();
     ui.on_commit_rename(move |name| {
-        if !commit_new_folder(&state_for_commit_rename, &sender_for_rename, name.as_str()) {
-            submit_rename(&state_for_commit_rename, &sender_for_rename, name.as_str());
-        }
+        submit_rename(&state_for_commit_rename, &sender_for_rename, name.as_str());
     });
     let weak = ui.as_weak();
     let state_for_cancel_rename = state.clone();
     ui.on_cancel_rename(move || {
         if let Ok(mut app) = state_for_cancel_rename.lock() {
             app.rename_target = None;
-            app.pending_new_folder = None;
+            app.rename_extension = None;
         }
         if let Some(ui) = weak.upgrade() {
             ui.set_rename_editing(false);
@@ -1911,6 +1938,15 @@ fn wire_callbacks(
         }
     });
 }
+fn should_close_context_menu(event: &winit::event::WindowEvent) -> bool {
+    matches!(
+        event,
+        winit::event::WindowEvent::Focused(false)
+            | winit::event::WindowEvent::Occluded(true)
+            | winit::event::WindowEvent::Destroyed
+    )
+}
+
 fn wire_mouse_navigation(ui: &AppWindow, state: SharedSessions) {
     use winit::{
         event::{ElementState, MouseButton, WindowEvent},
@@ -1929,6 +1965,12 @@ fn wire_mouse_navigation(ui: &AppWindow, state: SharedSessions) {
                     ui.set_exit_prompt_open(true);
                 }
                 return EventResult::PreventDefault;
+            }
+            return EventResult::Propagate;
+        }
+        if should_close_context_menu(event) {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_context_menu_open(false);
             }
             return EventResult::Propagate;
         }
@@ -2234,8 +2276,8 @@ fn spawn_clipboard_worker() -> (
     thread::spawn(move || {
         while let Ok(request) = request_receiver.recv() {
             let event = match request {
-                ClipboardRequest::Write { paths, cut } => ClipboardEvent::Written(
-                    platform::windows::clipboard::write_file_list(
+                ClipboardRequest::Write { paths, cut } => ClipboardEvent::Written {
+                    result: platform::windows::clipboard::write_file_list(
                         &paths,
                         if cut {
                             platform::windows::clipboard::ClipboardOperation::Move
@@ -2244,7 +2286,9 @@ fn spawn_clipboard_worker() -> (
                         },
                     )
                     .map_err(|error| error.to_string()),
-                ),
+                    paths,
+                    cut,
+                },
                 ClipboardRequest::CheckAvailability => ClipboardEvent::Availability(
                     platform::windows::clipboard::read_file_list()
                         .map(|clipboard| clipboard.is_some())
@@ -2290,6 +2334,7 @@ fn start_clipboard_event_pump(
     ui: &AppWindow,
     receiver: mpsc::Receiver<ClipboardEvent>,
     operation_sender: mpsc::Sender<FileOperationRequest>,
+    directory_sender: mpsc::Sender<DirectoryRequest>,
     state: SharedSessions,
 ) {
     let weak = ui.as_weak();
@@ -2298,9 +2343,12 @@ fn start_clipboard_event_pump(
             let weak = weak.clone();
             let state = state.clone();
             let operation_sender = operation_sender.clone();
+            let directory_sender = directory_sender.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 match event {
-                    ClipboardEvent::Written(Err(error))
+                    ClipboardEvent::Written {
+                        result: Err(error), ..
+                    }
                     | ClipboardEvent::Paste(Err(error))
                     | ClipboardEvent::Availability(Err(error)) => {
                         if let Ok(mut app) = state.lock() {
@@ -2310,12 +2358,33 @@ fn start_clipboard_event_pump(
                     ClipboardEvent::Paste(Ok(Some((kind, items)))) => {
                         enqueue_operation(&state, &operation_sender, kind, items)
                     }
+                    ClipboardEvent::Written {
+                        result: Ok(()),
+                        paths,
+                        cut,
+                    } => {
+                        let generation = if let Ok(mut app) = state.lock() {
+                            app.cut_generation = app.cut_generation.wrapping_add(1);
+                            app.cut_paths = if cut { paths.clone() } else { Vec::new() };
+                            app.cut_generation
+                        } else {
+                            0
+                        };
+                        if cut && generation != 0 {
+                            monitor_external_cut(
+                                paths,
+                                generation,
+                                directory_sender.clone(),
+                                state.clone(),
+                            );
+                        }
+                    }
                     ClipboardEvent::Availability(Ok(available)) => {
                         if let Ok(mut app) = state.lock() {
                             app.clipboard_has_files = available;
                         }
                     }
-                    ClipboardEvent::Written(Ok(())) | ClipboardEvent::Paste(Ok(None)) => {}
+                    ClipboardEvent::Paste(Ok(None)) => {}
                 }
                 if let Some(ui) = weak.upgrade() {
                     refresh_ui(&ui, &state);
@@ -2327,6 +2396,61 @@ fn start_clipboard_event_pump(
             });
         }
     });
+}
+
+fn monitor_external_cut(
+    mut paths: Vec<PathBuf>,
+    generation: u64,
+    directory_sender: mpsc::Sender<DirectoryRequest>,
+    state: SharedSessions,
+) {
+    thread::spawn(move || {
+        let parents = paths
+            .iter()
+            .filter_map(|path| path.parent().map(Path::to_path_buf))
+            .collect::<Vec<_>>();
+        for _ in 0..1_200 {
+            thread::sleep(Duration::from_millis(250));
+            if state
+                .lock()
+                .map_or(true, |app| app.cut_generation != generation)
+            {
+                return;
+            }
+            let remaining = existing_paths(&paths);
+            if remaining.len() == paths.len() {
+                continue;
+            }
+            let remaining_for_ui = remaining.clone();
+            let parents_for_ui = parents.clone();
+            let directory_sender_for_ui = directory_sender.clone();
+            let state_for_ui = state.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let current = state_for_ui.lock().is_ok_and(|mut app| {
+                    if app.cut_generation != generation {
+                        return false;
+                    }
+                    app.cut_paths = remaining_for_ui;
+                    true
+                });
+                if current {
+                    refresh_affected_tabs(&directory_sender_for_ui, &state_for_ui, &parents_for_ui);
+                }
+            });
+            if remaining.is_empty() {
+                return;
+            }
+            paths = remaining;
+        }
+    });
+}
+
+fn existing_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .filter(|path| std::fs::symlink_metadata(path).is_ok())
+        .cloned()
+        .collect()
 }
 fn spawn_file_operation_worker() -> (
     mpsc::Sender<FileOperationRequest>,
@@ -2341,6 +2465,7 @@ fn spawn_file_operation_worker() -> (
             let mut failed = Vec::new();
             let mut affected = Vec::new();
             let mut indexed_states = Vec::new();
+            let mut completed_paths = Vec::new();
             let started = Instant::now();
             let total_bytes = request
                 .items
@@ -2375,6 +2500,7 @@ fn spawn_file_operation_worker() -> (
                 match outcome {
                     Ok(report) => {
                         processed_bytes = processed_bytes.saturating_add(report.bytes);
+                        completed_paths.extend(report.completed_paths.iter().cloned());
                         let current_item = item
                             .source
                             .clone()
@@ -2426,6 +2552,7 @@ fn spawn_file_operation_worker() -> (
                     affected_directories: affected,
                 },
                 item_states: indexed_states,
+                completed_paths,
             });
         }
     });
@@ -2522,6 +2649,7 @@ fn execute_file_operation_item(
                         skipped: vec![],
                         affected_directories: vec![],
                         cleanup_pending: None,
+                        completed_paths: vec![path.clone()],
                     };
                     if let Some(parent) = path.parent() {
                         report.affected_directories.push(parent.to_path_buf());
@@ -2543,6 +2671,7 @@ fn execute_file_operation_item(
                         skipped: vec![],
                         affected_directories: vec![],
                         cleanup_pending: None,
+                        completed_paths: vec![path.clone()],
                     };
                     if let Some(parent) = path.parent() {
                         report.affected_directories.push(parent.to_path_buf());
@@ -2608,6 +2737,7 @@ fn execute_file_operation_item(
                         .into_iter()
                         .collect(),
                     cleanup_pending: None,
+                    completed_paths: vec![],
                 })
         }
         FileOperationKind::PermanentDelete => {
@@ -2721,6 +2851,7 @@ fn start_file_operation_event_pump(
                         id,
                         result,
                         item_states,
+                        completed_paths,
                     } => {
                         let (affected, next) =
                             {
@@ -2754,6 +2885,12 @@ fn start_file_operation_event_pump(
                                 };
                                 let affected = result.affected_directories.clone();
                                 app.conflict_responses.remove(&id);
+                                if let Some(origin_tab) =
+                                    app.operations.task(id).and_then(|task| task.origin_tab)
+                                    && let Some(target) = completed_paths.last().cloned()
+                                {
+                                    app.focus_after_refresh.insert(origin_tab, target);
+                                }
                                 let _ = app.operations.finish(id, terminal, result);
                                 let next = app.operations.start_next().ok().flatten().and_then(
                                     |next_id| {
@@ -2789,8 +2926,8 @@ fn start_file_operation_event_pump(
                         });
                     if close_editor {
                         if let Ok(mut app) = state.lock() {
-                            app.pending_new_folder = None;
                             app.rename_target = None;
+                            app.rename_extension = None;
                         }
                         ui.set_rename_editing(false);
                     }
@@ -2979,12 +3116,22 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
             path,
             skipped,
         } => {
+            let focus_target = app.focus_after_refresh.remove(&tab_id);
             if let Some(tab) = app.tabs.get_mut(&tab_id)
                 && tab.accepts(request_id)
             {
                 tab.sort_pending();
                 tab.commit_pending();
                 tab.commit_path(path);
+                if let Some(target) = focus_target
+                    && let Some(id) = tab
+                        .entries
+                        .iter()
+                        .find(|entry| entry.path == target)
+                        .map(|entry| entry.id)
+                {
+                    tab.select_entry(id, false, false);
+                }
                 tab.error = (skipped > 0).then(|| skipped.to_string());
                 icon_requests.push(IconRequest {
                     tab_id,
@@ -3622,6 +3769,7 @@ fn file_row(entry: &FileEntry, tab: &TabSession, texts: Texts, app: &AppState) -
         is_directory: entry.kind == crate::domain::EntryKind::Directory,
         selected: tab.selected.contains(&entry.id),
         focused: tab.focused == Some(entry.id),
+        cut: app.cut_paths.contains(&entry.path),
         icon: app
             .icons
             .get(&(tab.id, tab.latest_request, entry.id))
@@ -4166,6 +4314,37 @@ mod tests {
             assert!(description.contains("Windows"));
         }
     }
+    #[test]
+    fn context_menu_closes_on_window_deactivation() {
+        assert!(should_close_context_menu(
+            &winit::event::WindowEvent::Focused(false)
+        ));
+        assert!(should_close_context_menu(
+            &winit::event::WindowEvent::Occluded(true)
+        ));
+        assert!(!should_close_context_menu(
+            &winit::event::WindowEvent::Focused(true)
+        ));
+    }
+
+    #[test]
+    fn external_cut_tracking_keeps_only_sources_still_on_disk() {
+        let temporary = std::env::temp_dir().join(format!(
+            "asterfiles-cut-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&temporary);
+        std::fs::create_dir(&temporary).unwrap();
+        let moved = temporary.join("moved.txt");
+        let remaining = temporary.join("remaining.txt");
+        std::fs::write(&moved, b"moved").unwrap();
+        std::fs::write(&remaining, b"remaining").unwrap();
+        std::fs::remove_file(&moved).unwrap();
+        assert_eq!(existing_paths(&[moved, remaining.clone()]), vec![remaining]);
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
     #[test]
     fn error_kinds_have_distinct_page_states() {
         assert_eq!(classify_error(io::ErrorKind::NotFound), LoadState::NotFound);

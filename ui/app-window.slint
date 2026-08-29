@@ -1,7 +1,7 @@
 import { ListView } from "std-widgets.slint";
 import { IconMap } from "icons/icon-map.slint";
 
-export struct FileRow { id: int, name: string, kind: string, size: string, modified: string, is-directory: bool, selected: bool, focused: bool, icon: image }
+export struct FileRow { id: int, name: string, kind: string, size: string, modified: string, is-directory: bool, selected: bool, focused: bool, cut: bool, icon: image }
 export struct HistoryRow { index: int, label: string }
 export struct BreadcrumbRow { index: int, label: string, current: bool }
 export struct TabRow { id: int, title: string, active: bool, loading: bool, icon: image, is-drive: bool, is-settings: bool }
@@ -676,7 +676,7 @@ export component AppWindow inherits Window {
             }
             HorizontalLayout {
                 x: parent.width - 3 * 46px; y: 0px; width: 3 * 46px; height: 40px; spacing: 0px;
-                WindowButton { kind: 0; label: root.text-window-minimize; clicked => { root.minimized = true; } }
+                WindowButton { kind: 0; label: root.text-window-minimize; clicked => { root.context-menu-open = false; root.minimized = true; } }
                 WindowButton { kind: 1; label: root.maximized ? root.text-window-restore : root.text-window-maximize; clicked => { root.maximized = !root.maximized; } }
                 WindowButton { kind: 2; label: root.text-window-close; clicked => { root.request-close(); } }
             }
@@ -787,10 +787,7 @@ export component AppWindow inherits Window {
                         }
                         clicked => { root.clear-selection(); }
                     }
-                                        if root.rename-editing && root.rename-entry-id == -2: Rectangle {
-                        x: 6px; y: 2px; width: parent.width - 40px; height: 40px; border-radius: 5px; background: VisualStyle.ceff4ff;
-                        HorizontalLayout { padding-left: 10px; padding-right: 10px; spacing: 9px; InlineIcon { icon-source: IconMap.file-folder; } TextInput { text <=> root.rename-input; color: VisualStyle.c24252a; selection-background-color: VisualStyle.cc7d7ff; single-line: true; vertical-alignment: center; horizontal-stretch: 1; accepted => { root.commit-rename(root.rename-input); } key-pressed(event) => { if event.text == Key.Escape { root.cancel-rename(); return accept; } return reject; } accessible-label: root.rename-input; } }
-                    }list := ListView {
+list := ListView {
                         visible: root.files.length > 0;
                         width: parent.width - 28px;
                         vertical-scrollbar-policy: ScrollBarPolicy.always-off;
@@ -798,6 +795,7 @@ export component AppWindow inherits Window {
                             width: list.width;
                             height: 40px;
                             background: VisualStyle.cffffff;
+                            opacity: entry.cut ? 0.52 : 1;
                             Rectangle {
                                 x: 6px; y: 2px; width: parent.width - 12px; height: parent.height - 4px;
                                 border-radius: 5px;
@@ -814,17 +812,57 @@ export component AppWindow inherits Window {
                                         spacing: 9px;
                                         InlineIcon { icon-source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document); }
                                         if !(root.rename-editing && root.rename-entry-id == entry.id): Text { text: entry.name; color: VisualStyle.c24252a; font-size: 13px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
-                                        if root.rename-editing && root.rename-entry-id == entry.id: TextInput {
-                                            text <=> root.rename-input;
-                                            color: VisualStyle.c24252a;
-
-                                            selection-background-color: VisualStyle.cc7d7ff;
-                                            single-line: true;
-                                            vertical-alignment: center;
+                                        if root.rename-editing && root.rename-entry-id == entry.id: Rectangle {
+                                            private property <bool> editor-active: false;
+                                            private property <bool> submitted: false;
+                                            private property <bool> editor-has-focus: rename-editor.has-focus;
                                             horizontal-stretch: 1;
-                                            accepted => { root.commit-rename(root.rename-input); }
-                                            key-pressed(event) => { if event.text == Key.Escape { root.cancel-rename(); return accept; } return reject; }
-                                            accessible-label: entry.name;
+                                            height: 30px;
+                                            background: VisualStyle.cffffff;
+                                            border-color: VisualStyle.c4f6bed;
+                                            border-width: 1px;
+                                            border-radius: 3px;
+                                            init => { self.editor-active = true; }
+                                            changed editor-has-focus => {
+                                                if self.editor-active && !self.editor-has-focus && !self.submitted {
+                                                    self.submitted = true;
+                                                    if root.rename-input == "" {
+                                                        root.cancel-rename();
+                                                    } else {
+                                                        root.commit-rename(root.rename-input);
+                                                    }
+                                                }
+                                            }
+                                            rename-editor := TextInput {
+                                                x: 5px;
+                                                width: parent.width - 10px;
+                                                height: parent.height;
+                                                text <=> root.rename-input;
+                                                color: VisualStyle.c24252a;
+                                                selection-background-color: VisualStyle.cc7d7ff;
+                                                selection-foreground-color: VisualStyle.c24252a;
+                                                font-size: 13px;
+                                                single-line: true;
+                                                vertical-alignment: center;
+                                                init => {
+                                                    self.focus();
+                                                    self.select-all();
+                                                }
+                                                accepted => {
+                                                    parent.submitted = true;
+                                                    root.commit-rename(root.rename-input);
+                                                }
+                                                key-pressed(event) => {
+                                                    if event.text == Key.Escape {
+                                                        parent.submitted = true;
+                                                        root.cancel-rename();
+                                                        return accept;
+                                                    }
+                                                    return reject;
+                                                }
+                                                accessible-role: text-input;
+                                                accessible-label: entry.name;
+                                            }
                                         }
                                     }
                                     if column.kind != 0: Text {
@@ -840,6 +878,7 @@ export component AppWindow inherits Window {
                             }
                             }
                             mouse := TouchArea {
+                                enabled: !(root.rename-editing && root.rename-entry-id == entry.id);
                                 private property <bool> click-control: false;
                                 private property <bool> click-shift: false;
                                 mouse-cursor: pointer;

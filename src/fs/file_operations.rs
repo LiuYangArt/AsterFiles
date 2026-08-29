@@ -28,6 +28,7 @@ pub struct FileOperationReport {
     pub skipped: Vec<PathBuf>,
     pub affected_directories: Vec<PathBuf>,
     pub cleanup_pending: Option<PathBuf>,
+    pub completed_paths: Vec<PathBuf>,
 }
 
 impl FileOperationReport {
@@ -39,6 +40,7 @@ impl FileOperationReport {
             skipped: Vec::new(),
             affected_directories: Vec::new(),
             cleanup_pending: None,
+            completed_paths: Vec::new(),
         }
     }
 
@@ -47,6 +49,9 @@ impl FileOperationReport {
             && !self.affected_directories.iter().any(|item| item == parent)
         {
             self.affected_directories.push(parent.to_path_buf());
+        }
+        if !self.completed_paths.iter().any(|item| item == path) {
+            self.completed_paths.push(path.to_path_buf());
         }
     }
 }
@@ -142,7 +147,12 @@ pub fn keep_both_path(destination: &Path) -> PathBuf {
 
 pub fn create_folder(parent: &Path, name: &OsStr) -> Result<PathBuf, OperationError> {
     validate_name(name).map_err(OperationError::InvalidName)?;
-    let path = parent.join(name);
+    let requested = parent.join(name);
+    let path = if path_exists(&requested) {
+        keep_both_path(&requested)
+    } else {
+        requested
+    };
     fs::create_dir(&path).map_err(|error| OperationError::io(&path, error))?;
     Ok(path)
 }
@@ -579,6 +589,11 @@ fn merge_report(report: &mut FileOperationReport, child: FileOperationReport) {
     report.directories += child.directories;
     report.bytes += child.bytes;
     report.skipped.extend(child.skipped);
+    for path in child.completed_paths {
+        if !report.completed_paths.contains(&path) {
+            report.completed_paths.push(path);
+        }
+    }
     for directory in child.affected_directories {
         if !report.affected_directories.contains(&directory) {
             report.affected_directories.push(directory);
@@ -923,17 +938,15 @@ mod tests {
         assert!(validate_name(OsStr::new("中文 📁.txt")).is_ok());
     }
     #[test]
-    fn creates_folder_and_rejects_existing_name() {
+    fn creates_folder_with_explorer_style_suffix() {
         let temp = TempDir::new();
         let created = create_folder(temp.path(), OsStr::new("New folder")).unwrap();
         assert!(created.is_dir());
-        assert!(matches!(
-            create_folder(temp.path(), OsStr::new("New folder")),
-            Err(OperationError::Io {
-                kind: io::ErrorKind::AlreadyExists,
-                ..
-            })
-        ));
+        let second = create_folder(temp.path(), OsStr::new("New folder")).unwrap();
+        assert_eq!(
+            second.file_name().and_then(OsStr::to_str),
+            Some("New folder (2)")
+        );
     }
     #[test]
     fn generates_windows_style_keep_both_name() {
