@@ -539,6 +539,7 @@ pub struct FileEntry {
     pub display_name: String,
     pub path: PathBuf,
     pub kind: EntryKind,
+    pub open_target: Option<PathBuf>,
     pub size_bytes: Option<u64>,
     pub modified: Option<std::time::SystemTime>,
 }
@@ -561,6 +562,7 @@ mod tests {
             display_name: name.into(),
             path: PathBuf::from(name),
             kind,
+            open_target: None,
             size_bytes: size,
             modified: None,
         }
@@ -750,6 +752,7 @@ mod tests {
             display_name: "📁".into(),
             path: original.clone(),
             kind: EntryKind::Directory,
+            open_target: None,
             size_bytes: None,
             modified: None,
         }]);

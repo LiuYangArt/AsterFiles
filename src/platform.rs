@@ -18,6 +18,11 @@ pub struct KnownLocation {
     pub label: String,
     pub path: PathBuf,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShortcutTarget {
+    pub path: PathBuf,
+    pub is_directory: Option<bool>,
+}
 
 #[cfg(windows)]
 mod windows_impl {
@@ -43,7 +48,21 @@ mod windows_impl {
         core::GUID,
     };
 
-    use super::{KnownLocation, KnownLocationKind, Path, PathBuf};
+    use super::{KnownLocation, KnownLocationKind, Path, PathBuf, ShortcutTarget};
+    use windows::{
+        Win32::{
+            Storage::FileSystem::{
+                FILE_ATTRIBUTE_DIRECTORY, GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
+                WIN32_FIND_DATAW,
+            },
+            System::Com::{
+                CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+                CoUninitialize, IPersistFile, STGM_READ,
+            },
+            UI::Shell::{IShellLinkW, SLGP_RAWPATH, ShellLink},
+        },
+        core::Interface,
+    };
 
     pub fn double_click_interval() -> std::time::Duration {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
@@ -145,6 +164,69 @@ mod windows_impl {
     pub fn open_path(path: &Path) -> std::io::Result<()> {
         shell_execute(path, None)
     }
+    pub fn resolve_shortcut_target(path: &Path) -> std::io::Result<Option<ShortcutTarget>> {
+        if !path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"))
+        {
+            return Ok(None);
+        }
+
+        let link_path = path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        if initialized.is_err() {
+            return Err(std::io::Error::other(format!(
+                "CoInitializeEx failed: {initialized:?}"
+            )));
+        }
+        let result = (|| unsafe {
+            let link: IShellLinkW =
+                CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).map_err(windows_error)?;
+            let persist: IPersistFile = link.cast().map_err(windows_error)?;
+            persist
+                .Load(windows::core::PCWSTR(link_path.as_ptr()), STGM_READ)
+                .map_err(windows_error)?;
+
+            let mut target = vec![0_u16; 32_768];
+            let mut find_data = std::mem::zeroed::<WIN32_FIND_DATAW>();
+            link.GetPath(&mut target, &mut find_data, SLGP_RAWPATH.0 as u32)
+                .map_err(windows_error)?;
+            let length = target
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(target.len());
+            if length == 0 {
+                return Ok(None);
+            }
+            let target_path = PathBuf::from(OsString::from_wide(&target[..length]));
+            let target_wide = target_path
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>();
+            let live_attributes = GetFileAttributesW(windows::core::PCWSTR(target_wide.as_ptr()));
+            let is_directory = if live_attributes == INVALID_FILE_ATTRIBUTES {
+                (find_data.dwFileAttributes != 0)
+                    .then_some(find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0)
+            } else {
+                Some(live_attributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0)
+            };
+            Ok(Some(ShortcutTarget {
+                path: target_path,
+                is_directory,
+            }))
+        })();
+        unsafe { CoUninitialize() };
+        result
+    }
+
+    fn windows_error(error: windows::core::Error) -> std::io::Error {
+        std::io::Error::other(error.to_string())
+    }
 
     pub fn request_folder_access(path: &Path) -> std::io::Result<()> {
         let mut arguments = OsString::from("\"");
@@ -185,7 +267,10 @@ mod windows_impl {
 }
 
 #[cfg(windows)]
-pub use windows_impl::{double_click_interval, known_locations, open_path, request_folder_access};
+pub use windows_impl::{
+    double_click_interval, known_locations, open_path, request_folder_access,
+    resolve_shortcut_target,
+};
 
 #[cfg(not(windows))]
 pub fn double_click_interval() -> std::time::Duration {
@@ -205,6 +290,10 @@ pub fn known_locations() -> Vec<KnownLocation> {
         .unwrap_or_default()
 }
 
+#[cfg(not(windows))]
+pub fn resolve_shortcut_target(_path: &Path) -> std::io::Result<Option<ShortcutTarget>> {
+    Ok(None)
+}
 #[cfg(not(windows))]
 pub fn open_path(path: &Path) -> std::io::Result<()> {
     std::process::Command::new("xdg-open")

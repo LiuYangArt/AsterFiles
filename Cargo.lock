@@ -287,6 +287,7 @@ dependencies = [
  "i-slint-backend-testing",
  "slint",
  "slint-build",
+ "windows",
  "windows-sys 0.60.2",
 ]
 

@@ -374,7 +374,10 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
                 app.active().visible_entry(entry_id).map(|entry| {
                     (
                         app.active_tab,
-                        entry.path.clone(),
+                        entry
+                            .open_target
+                            .clone()
+                            .unwrap_or_else(|| entry.path.clone()),
                         entry.kind == crate::domain::EntryKind::Directory,
                     )
                 })
@@ -487,7 +490,10 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
                 app.active().visible_entry(entry_id).map(|entry| {
                     (
                         app.active_tab,
-                        entry.path.clone(),
+                        entry
+                            .open_target
+                            .clone()
+                            .unwrap_or_else(|| entry.path.clone()),
                         entry.kind == crate::domain::EntryKind::Directory,
                     )
                 })
