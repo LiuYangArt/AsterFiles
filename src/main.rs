@@ -1,5 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod agent_debug;
 mod app;
 mod domain;
 mod fs;
@@ -7,9 +8,29 @@ mod i18n;
 mod platform;
 mod session_store;
 
-fn main() -> Result<(), slint::PlatformError> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The current application surface is light-only; keep native widgets consistent with it.
     unsafe { std::env::set_var("SLINT_STYLE", "fluent-light") };
+
+    let agent_options = agent_debug::AgentOptions::from_env()
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+
+    if let Some(scenario) = agent_options.scenario {
+        let mut session = domain::TabSession::new(domain::TabId(1));
+        agent_debug::apply_scenario(&mut session, scenario);
+        let output = agent_options
+            .state_output()
+            .expect("scenario has a default state output");
+        agent_debug::export_state(&session, scenario, &output)?;
+        println!(
+            "{{\"event\":\"agent_state_exported\",\"scenario\":\"{}\",\"artifact\":{:?}}}",
+            scenario.name(),
+            output.to_string_lossy().as_ref()
+        );
+        if agent_options.no_ui {
+            return Ok(());
+        }
+    }
 
     #[cfg(windows)]
     {
@@ -28,5 +49,6 @@ fn main() -> Result<(), slint::PlatformError> {
             .select()?;
     }
 
-    app::run()
+    app::run(agent_options.scenario)?;
+    Ok(())
 }

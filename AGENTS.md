@@ -6,13 +6,10 @@
 
 ```powershell
 cargo run --release
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo build --release
+python tools/verify.py
 ```
 
-构建产物位于 `target/release/`。运行日志暂时输出到终端；UI 截图写入 `artifacts/ui/`，交互日志写入 `artifacts/logs/`，性能 artifacts 写入 `artifacts/perf/`。
+统一验证覆盖格式、静态检查、测试、无界面 Agent 场景和 Release 构建。机器可读汇总位于 `artifacts/verify/summary.json`；详细规则和确定性 UI 场景见 `docs/agent/debug-validation.md`。构建产物位于 `target/release/`；UI 截图写入 `artifacts/ui/`，日志写入 `artifacts/logs/`，状态导出写入 `artifacts/state/`，性能 artifacts 写入 `artifacts/perf/`。
 
 ## 项目约束
 

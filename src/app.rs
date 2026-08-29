@@ -14,6 +14,7 @@ use slint::{
 };
 
 use crate::{
+    agent_debug::{self, AgentScenario},
     domain::{
         EntryId, FileEntry, LoadState, NavigationKind, RequestId, SortField, TabId, TabSession,
     },
@@ -157,9 +158,12 @@ enum DirectoryEvent {
     },
 }
 
-pub fn run() -> Result<(), slint::PlatformError> {
+pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
-    let restored = session_store::default_path().and_then(|path| session_store::load(&path).ok());
+    let restored = scenario
+        .is_none()
+        .then(|| session_store::default_path().and_then(|path| session_store::load(&path).ok()))
+        .flatten();
     let default_window = session_store::WindowPlacement {
         x: 80,
         y: 80,
@@ -184,6 +188,16 @@ pub fn run() -> Result<(), slint::PlatformError> {
         window.height as f32,
     ));
     let state = Arc::new(Mutex::new(AppState::new(restored_paths, active_index)));
+    if let Some(scenario) = scenario {
+        let mut app = state.lock().expect("app state mutex is not poisoned");
+        let active_tab = app.active_tab;
+        agent_debug::apply_scenario(
+            app.tabs
+                .get_mut(&active_tab)
+                .expect("active tab session exists"),
+            scenario,
+        );
+    }
     let (request_sender, event_receiver) = spawn_directory_workers(WORKER_COUNT);
     let event_receiver = Arc::new(Mutex::new(event_receiver));
 
@@ -208,14 +222,16 @@ pub fn run() -> Result<(), slint::PlatformError> {
             })
             .collect::<Vec<_>>()
     };
-    for (tab_id, path) in initial_tabs {
-        submit_navigation(
-            &request_sender,
-            &state,
-            tab_id,
-            path,
-            NavigationKind::Refresh,
-        );
+    if scenario.is_none() {
+        for (tab_id, path) in initial_tabs {
+            submit_navigation(
+                &request_sender,
+                &state,
+                tab_id,
+                path,
+                NavigationKind::Refresh,
+            );
+        }
     }
 
     let result = ui.run();
@@ -230,7 +246,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
     };
     let position = ui.window().position();
     let size = ui.window().size();
-    if let Some(path) = session_store::default_path()
+    if scenario.is_none()
+        && let Some(path) = session_store::default_path()
         && let Ok(session) = session_store::SessionState::new(
             session_store::WindowPlacement {
                 x: position.x,
@@ -1455,18 +1472,13 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
         SortField::Modified => 3,
     });
     ui.set_sort_descending(tab.sort_direction == crate::domain::SortDirection::Descending);
-    ui.set_page_state(match tab.load_state {
-        LoadState::Idle => 0,
-        LoadState::Loading => 1,
-        LoadState::Partial => 2,
-        LoadState::Complete if tab.entries.is_empty() => 3,
-        LoadState::Complete => 4,
-        LoadState::Cancelled => 5,
-        LoadState::NotFound => 6,
-        LoadState::PermissionDenied => 7,
-        LoadState::Disconnected => 8,
-        LoadState::Failed => 9,
-    });
+    let page_projection = agent_debug::page_projection(tab.load_state, tab.entries.is_empty());
+    ui.set_page_state(page_projection.index);
+    ui.set_show_request_access(
+        page_projection
+            .visible_page_operations
+            .contains(&agent_debug::PageOperation::RequestWindowsAccess),
+    );
     ui.set_can_navigate_back(tab.has_failed_location() || !tab.back_history.is_empty());
     ui.set_can_navigate_forward(!tab.forward_history.is_empty());
     ui.set_can_navigate_up(tab.visible_path().and_then(Path::parent).is_some());

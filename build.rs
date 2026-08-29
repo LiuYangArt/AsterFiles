@@ -1,5 +1,10 @@
 fn main() {
-    slint_build::compile("ui/app-window.slint").expect("failed to compile Slint UI");
+    let emit_debug_info = std::env::var("PROFILE").is_ok_and(|profile| profile != "release");
+    slint_build::compile_with_config(
+        "ui/app-window.slint",
+        slint_build::CompilerConfiguration::new().with_debug_info(emit_debug_info),
+    )
+    .expect("failed to compile Slint UI");
 
     #[cfg(windows)]
     {

@@ -264,6 +264,7 @@ export component AppWindow inherits Window {
     in property <string> error-page-title: "";
     in property <string> error-page-description: "";
     in property <string> text-request-access: "使用 Windows 请求访问权限";
+    in property <bool> show-request-access: false;
 
 
     in property <[FileRow]> files;
@@ -509,11 +510,14 @@ export component AppWindow inherits Window {
                         Text { text: root.error-page-title; color: #30333a; font-size: 20px; font-weight: 600; horizontal-alignment: center; }
                         Text { text: root.error-page-description; color: #62656f; font-size: 13px; horizontal-alignment: center; }
                         Rectangle { height: 4px; }
-                        HorizontalLayout {
-                            alignment: center; spacing: 8px;
-                            if root.page-state == 7: CommandButton { width: 196px; icon-source: @image-url("icons/status/lock-closed.svg"); label: root.text-request-access; clicked => { root.request-folder-access(); } }
-
-
+                        error-page-actions := Rectangle {
+                            height: 32px;
+                            accessible-role: groupbox;
+                            accessible-id: "error-page-actions";
+                            HorizontalLayout {
+                                alignment: center; spacing: 8px;
+                                if root.show-request-access: CommandButton { width: 196px; icon-source: @image-url("icons/status/lock-closed.svg"); label: root.text-request-access; clicked => { root.request-folder-access(); } }
+                            }
                         }
                     }
 

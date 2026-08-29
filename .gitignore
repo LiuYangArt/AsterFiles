@@ -4,6 +4,8 @@
 
 # Generated validation and performance output
 /artifacts/
+__pycache__/
+*.py[cod]
 
 # Local environment and secrets
 .env

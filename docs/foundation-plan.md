@@ -75,9 +75,10 @@
 
 ## 验证与产物
 
-- 常规检查：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test`、`cargo build --release`。
+- 统一检查：`python tools/verify.py`，覆盖格式、静态检查、测试、确定性无界面场景和 Release 构建。
 - 单元测试覆盖请求代次、标签隔离、路径身份和取消状态转换。
-- UI 截图写入 `artifacts/ui/`；加载与取消日志写入 `artifacts/logs/`；性能数据写入 `artifacts/perf/`。
+- 机器可读汇总写入 `artifacts/verify/summary.json`；UI 状态写入 `artifacts/state/`；截图写入 `artifacts/ui/`；加载与取消日志写入 `artifacts/logs/`；性能数据写入 `artifacts/perf/`。
+- Agent 调试入口和状态字段见 [agent/debug-validation.md](agent/debug-validation.md)。
 - 每完成一个切片，同步更新本文和 `docs/task-list.md`，不保留已经失效的设计。
 
 ## 当前完成状态（2026-08-28）
