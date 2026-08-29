@@ -12,6 +12,8 @@ export global VisualStyle {
     out property <color> c24252a: dark-theme ? #f2f2f2 : #24252a;
     out property <color> c303138: dark-theme ? #f2f2f2 : #303138;
     out property <color> c30333a: dark-theme ? #f2f2f2 : #30333a;
+    out property <color> c323437: #323437;
+    out property <color> c57595c: dark-theme ? #57595c : #75787c;
     out property <color> c3b4f83: dark-theme ? #9db5ff : #3b4f83;
     out property <color> c4f535d: dark-theme ? #d0d0d0 : #4f535d;
     out property <color> c4f6bed: dark-theme ? #7fa0ff : #4f6bed;
@@ -484,7 +486,7 @@ export component AppWindow inherits Window {
                 }
                 for tab in root.tabs: Rectangle {
                     width: root.minimal ? 112px : 178px; height: 34px;
-                    background: tab.active ? VisualStyle.cfafbfc : (tab-touch.has-hover ? VisualStyle.ce8eaf0 : VisualStyle.cf1f2f5);
+                    background: tab.active ? VisualStyle.c323437 : (tab-touch.has-hover ? VisualStyle.ce8eaf0 : VisualStyle.cf1f2f5);
                     border-width: 0px;
                     border-radius: tab.active ? 7px : 0px;
                     Path {
@@ -492,7 +494,7 @@ export component AppWindow inherits Window {
                         x: -7px; y: parent.height - 10px; width: parent.width + 14px; height: 10px;
                         viewbox-width: 100; viewbox-height: 10; fit: fill; clip: true;
                         commands: "M 0 10 C 2 10 3.6 8 3.6 5 L 3.6 0 L 96.4 0 L 96.4 5 C 96.4 8 98 10 100 10 Z";
-                        fill: VisualStyle.cfafbfc;
+                        fill: VisualStyle.c323437;
                     }
                     tab-touch := TouchArea {
                         mouse-cursor: pointer;
@@ -539,7 +541,7 @@ export component AppWindow inherits Window {
         }
 
         Rectangle {
-            height: 56px; background: VisualStyle.cfafbfc; border-color: VisualStyle.ce2e4e9; border-width: 0px;
+            height: 56px; background: VisualStyle.c323437; border-width: 0px;
             HorizontalLayout {
                 padding-top: 9px; padding-bottom: 9px; padding-left: 14px; padding-right: 14px; spacing: 7px;
                 ContextMenuArea { width: 38px; height: 38px; IconButton { icon-source: IconMap.action-back; tip: root.text-back + " (Alt+Left)"; enabled: root.can-navigate-back; button-label: root.text-back; clicked => { root.navigate-back(); } } Menu { for history in root.back-history: MenuItem { title: history.label; activated => { root.navigate-history(true, history.index); } } } }
@@ -547,7 +549,7 @@ export component AppWindow inherits Window {
                 IconButton { visible: !root.compact; icon-source: IconMap.action-up; tip: root.text-up + " (Alt+Up)"; enabled: root.can-navigate-up; button-label: root.text-up; clicked => { root.navigate-up(); } }
                 IconButton { visible: !root.compact; icon-source: IconMap.action-refresh; tip: root.text-refresh + " (F5)"; enabled: root.can-refresh; button-label: root.text-refresh; clicked => { root.refresh(); } }
                 Rectangle {
-                    height: 38px; horizontal-stretch: 1; background: VisualStyle.cffffff; border-color: VisualStyle.cd7dae0; border-width: 1px; border-radius: 5px;
+                    height: 38px; horizontal-stretch: 1; background: VisualStyle.cffffff; border-width: 0px; border-radius: 5px;
                     if !root.address-editing: Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; HorizontalLayout { padding-left: 8px; padding-right: 8px; padding-top: 3px; padding-bottom: 3px; spacing: 2px; InlineIcon { icon-source: root.current-location-icon.width != 0 ? root.current-location-icon : (root.current-location-is-drive ? IconMap.location-drive : IconMap.file-folder); icon-size: 16px; } for crumb in root.breadcrumbs: BreadcrumbButton { label: crumb.label; current: crumb.current; clicked => { root.navigate-breadcrumb(crumb.index); } } Rectangle { horizontal-stretch: 1; TouchArea { mouse-cursor: pointer; clicked => { root.begin-address-edit(); } } } } }
                     address-editor := AddressEditor { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: parent.height - 4px; text <=> root.address-input; address-label: root.text-address; cancel-label: root.text-cancel-edit; accepted(value) => { root.navigate-path(value); } cancelled => { root.cancel-address-edit(); } }
 
@@ -559,7 +561,7 @@ export component AppWindow inherits Window {
         HorizontalLayout {
             spacing: 0px;
             if !root.minimal: Rectangle {
-                width: root.compact ? 184px : 218px; background: VisualStyle.cf1f2f5; border-color: VisualStyle.ce2e3e7; border-width: 1px;
+                width: root.compact ? 184px : 218px; background: VisualStyle.c323437; border-width: 0px;
                 VerticalLayout {
                     padding-top: 4px; padding-bottom: 12px; padding-left: 10px; padding-right: 10px; spacing: 0px;
                     SidebarGroupHeader { label: root.text-quick-access; expanded: root.quick-access-expanded; toggled => { root.quick-access-expanded = !root.quick-access-expanded; } }
@@ -585,7 +587,7 @@ export component AppWindow inherits Window {
             VerticalLayout {
                 spacing: 0px;
                 Rectangle {
-                    height: 38px; background: VisualStyle.cffffff; border-color: VisualStyle.ce7e8eb; border-width: 1px;
+                    height: 38px; background: VisualStyle.cffffff; border-width: 0px;
                     HorizontalLayout {
                         padding-left: 16px; padding-right: 16px; spacing: 12px;
                         for column in root.columns: Rectangle {
@@ -593,12 +595,16 @@ export component AppWindow inherits Window {
                             width: column.kind == 0 ? (root.compact ? 65% : 52%) : column.kind == 1 ? 16% : column.kind == 2 ? (root.compact ? 35% : 14%) : 18%;
                             horizontal-stretch: column.kind == 3 ? 1 : 0;
                             opacity: column-touch.dragging ? 0.58 : 1;
+                            Rectangle {
+                                x: 0px; y: 10px; width: 1px; height: 18px;
+                                background: VisualStyle.c57595c;
+                            }
                             Text {
-                                x: column.kind == 0 ? 27px : 0px;
+                                x: column.kind == 0 ? 27px : 8px;
                                 width: parent.width - self.x;
                                 horizontal-alignment: left;
                                 text: (column.kind == 0 ? root.text-name : column.kind == 1 ? root.text-type : column.kind == 2 ? root.text-size : root.text-modified) + (root.sort-field == column.kind ? (root.sort-descending ? " ↓" : " ↑") : "");
-                                color: root.sort-field == column.kind ? VisualStyle.c3b4f83 : VisualStyle.c696b74;
+                                color: VisualStyle.c696b74;
                                 font-size: 12px; font-weight: root.sort-field == column.kind ? 600 : 400; vertical-alignment: center;
                             }
                             column-touch := TouchArea {
@@ -629,9 +635,15 @@ export component AppWindow inherits Window {
                         vertical-scrollbar-policy: ScrollBarPolicy.always-off;
                         for entry in root.files: Rectangle {
                             width: list.width;
-                            height: 40px; background: entry.selected ? VisualStyle.cdce6ff : (mouse.has-hover ? VisualStyle.ceff4ff : VisualStyle.cffffff); border-color: VisualStyle.c4f6bed; border-width: entry.focused ? 2px : 0px;
-                            HorizontalLayout {
-                                padding-left: 16px; padding-right: 16px; spacing: 12px;
+                            height: 40px;
+                            background: VisualStyle.cffffff;
+                            Rectangle {
+                                x: 6px; y: 2px; width: parent.width - 12px; height: parent.height - 4px;
+                                border-radius: 5px;
+                                border-width: 0px;
+                                background: entry.selected ? VisualStyle.cdce6ff : (mouse.has-hover ? VisualStyle.ceff4ff : transparent);
+                                HorizontalLayout {
+                                    padding-left: 10px; padding-right: 10px; spacing: 12px;
                                 for column in root.columns: Rectangle {
                                     visible: column.kind == 0 || (column.kind == 2 && !root.minimal) || ((column.kind == 1 || column.kind == 3) && !root.compact);
                                     width: column.kind == 0 ? (root.compact ? 65% : 52%) : column.kind == 1 ? 16% : column.kind == 2 ? (root.compact ? 35% : 14%) : 18%;
@@ -652,6 +664,7 @@ export component AppWindow inherits Window {
                                         horizontal-alignment: column.kind == 2 ? right : left;
                                     }
                                 }
+                            }
                             }
                             mouse := TouchArea {
                                 private property <bool> click-control: false;
