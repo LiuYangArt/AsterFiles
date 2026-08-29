@@ -106,6 +106,20 @@ impl AppState {
         }
     }
 
+    fn duplicate_active_tab(&mut self) -> Option<TabId> {
+        let source_id = self.active_tab;
+        let source = self.tabs.get(&source_id)?;
+        if source.load_state != LoadState::Complete {
+            return None;
+        }
+        let id = TabId(self.next_tab_id);
+        self.next_tab_id += 1;
+        let tab = TabSession::duplicate_complete(id, source);
+        self.tabs.insert(id, tab);
+        self.tab_order.push(id);
+        self.active_tab = id;
+        Some(id)
+    }
     fn create_tab(&mut self, path: PathBuf) -> TabId {
         let id = TabId(self.next_tab_id);
         self.next_tab_id += 1;
@@ -803,27 +817,36 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
     let sender_for_new = sender.clone();
     let state_for_new = state.clone();
     ui.on_new_tab(move || {
-        let (tab_id, path) = {
+        let reload = {
             let mut app = state_for_new
                 .lock()
                 .expect("app state mutex is not poisoned");
-            let path = app
-                .active()
-                .current_path
-                .clone()
-                .unwrap_or_else(initial_path);
-            let tab_id = app.create_tab(path.clone());
-            (tab_id, path)
+            if app.duplicate_active_tab().is_some() {
+                None
+            } else {
+                let path = app
+                    .active()
+                    .current_path
+                    .clone()
+                    .unwrap_or_else(initial_path);
+                let tab_id = app.create_tab(path.clone());
+                Some((tab_id, path))
+            }
         };
-        submit_navigation(
-            &sender_for_new,
-            &state_for_new,
-            tab_id,
-            path,
-            NavigationKind::Refresh,
-        );
         if let Some(ui) = weak.upgrade() {
             refresh_ui(&ui, &state_for_new);
+        }
+        if let Some((tab_id, path)) = reload {
+            submit_navigation(
+                &sender_for_new,
+                &state_for_new,
+                tab_id,
+                path,
+                NavigationKind::Refresh,
+            );
+            if let Some(ui) = weak.upgrade() {
+                refresh_ui(&ui, &state_for_new);
+            }
         }
     });
 
@@ -1384,11 +1407,21 @@ fn start_event_pump(
             let icon_sender = icon_sender.clone();
             if weak
                 .upgrade_in_event_loop(move |ui| {
+                    let batch = match &event {
+                        DirectoryEvent::Batch {
+                            tab_id, request_id, ..
+                        } => Some((*tab_id, *request_id)),
+                        _ => None,
+                    };
                     let icon_requests = apply_event(&state, event);
                     for request in icon_requests {
                         let _ = icon_sender.send(request);
                     }
-                    refresh_ui(&ui, &state);
+                    if let Some((tab_id, request_id)) = batch {
+                        append_active_file_rows(&ui, &state, tab_id, request_id);
+                    } else {
+                        refresh_ui(&ui, &state);
+                    }
                 })
                 .is_err()
             {
@@ -1407,16 +1440,26 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
             request_id,
             entries,
         } => {
-            if let Some(tab) = app.tabs.get_mut(&tab_id)
-                && tab.accepts(request_id)
-            {
-                icon_requests.extend(entries.iter().map(|entry| IconRequest {
-                    tab_id,
-                    request_id,
-                    target: IconTarget::Entry(entry.id),
-                    path: entry.path.clone(),
-                }));
-                tab.append_pending(entries);
+            let accepted = app
+                .tabs
+                .get(&tab_id)
+                .is_some_and(|tab| tab.accepts(request_id));
+            if accepted {
+                icon_requests.extend(
+                    entries
+                        .iter()
+                        .filter(|entry| !app.icon_cache.contains_key(&entry.path))
+                        .map(|entry| IconRequest {
+                            tab_id,
+                            request_id,
+                            target: IconTarget::Entry(entry.id),
+                            path: entry.path.clone(),
+                        }),
+                );
+                app.tabs
+                    .get_mut(&tab_id)
+                    .expect("accepted tab exists")
+                    .append_pending(entries);
             }
         }
         DirectoryEvent::Finished {
@@ -1498,7 +1541,13 @@ fn spawn_icon_workers(
                 if !is_current {
                     continue;
                 }
-                if let Ok(icon) = platform::windows_shell_icons::shell_icon_rgba(&request.path) {
+                let cached = state
+                    .lock()
+                    .ok()
+                    .and_then(|app| app.icon_cache.get(&request.path).cloned());
+                let icon = cached
+                    .or_else(|| platform::windows_shell_icons::shell_icon_rgba(&request.path).ok());
+                if let Some(icon) = icon {
                     let _ = events.send(IconEvent {
                         tab_id: request.tab_id,
                         request_id: request.request_id,
@@ -1556,8 +1605,9 @@ fn start_icon_event_pump(
             let state = state.clone();
             if weak
                 .upgrade_in_event_loop(move |ui| {
-                    apply_icon_event(&state, event);
-                    refresh_ui(&ui, &state);
+                    if let Some(update) = apply_icon_event(&state, event) {
+                        update_icon_row(&ui, &state, update);
+                    }
                 })
                 .is_err()
             {
@@ -1567,16 +1617,32 @@ fn start_icon_event_pump(
     });
 }
 
-fn apply_icon_event(state: &SharedSessions, event: IconEvent) {
+#[derive(Debug, Clone, Copy)]
+struct IconUpdate {
+    tab_id: TabId,
+    entry_id: Option<EntryId>,
+}
+
+fn apply_icon_event(state: &SharedSessions, event: IconEvent) -> Option<IconUpdate> {
     let mut app = state.lock().expect("app state mutex is not poisoned");
-    let accepted = icon_event_is_current(&app, &event);
-    if accepted {
-        app.icon_cache.insert(event.path, event.icon.clone());
-        if let IconTarget::Entry(entry_id) = event.target {
-            app.icons
-                .insert((event.tab_id, event.request_id, entry_id), event.icon);
-        }
+    if !icon_event_is_current(&app, &event) {
+        return None;
     }
+    let entry_id = match event.target {
+        IconTarget::Entry(entry_id) => {
+            app.icons.insert(
+                (event.tab_id, event.request_id, entry_id),
+                event.icon.clone(),
+            );
+            Some(entry_id)
+        }
+        IconTarget::Location => None,
+    };
+    app.icon_cache.insert(event.path, event.icon);
+    Some(IconUpdate {
+        tab_id: event.tab_id,
+        entry_id,
+    })
 }
 
 fn icon_event_is_current(app: &AppState, event: &IconEvent) -> bool {
@@ -1603,6 +1669,71 @@ fn classify_error(kind: io::ErrorKind) -> LoadState {
     }
 }
 
+fn append_active_file_rows(
+    ui: &AppWindow,
+    state: &SharedSessions,
+    tab_id: TabId,
+    request_id: RequestId,
+) {
+    use slint::Model;
+    let app = state.lock().expect("app state mutex is not poisoned");
+    if app.active_tab != tab_id {
+        return;
+    }
+    let tab = app.active();
+    if tab.latest_request != request_id || tab.load_state != LoadState::Partial {
+        return;
+    }
+    let model = ui.get_files();
+    let Some(model) = model.as_any().downcast_ref::<VecModel<FileRow>>() else {
+        return;
+    };
+    let start = model.row_count();
+    if start > tab.pending_entries.len() {
+        drop(app);
+        refresh_ui(ui, state);
+        return;
+    }
+    let texts = Texts::new(app.language);
+    model.extend(
+        tab.pending_entries[start..]
+            .iter()
+            .map(|entry| file_row(entry, tab, texts, &app)),
+    );
+    ui.set_status_text(status_text(tab, texts).into());
+}
+
+fn update_icon_row(ui: &AppWindow, state: &SharedSessions, update: IconUpdate) {
+    use slint::Model;
+
+    let app = state.lock().expect("app state mutex is not poisoned");
+    if app.active_tab != update.tab_id {
+        return;
+    }
+    let tab = app.active();
+    let Some(entry_id) = update.entry_id else {
+        let path = tab.visible_path();
+        ui.set_current_location_icon(
+            path.and_then(|path| app.icon_cache.get(path))
+                .map(shell_icon_image)
+                .unwrap_or_default(),
+        );
+        return;
+    };
+    let Some(index) = tab.visible_entry_index(entry_id) else {
+        return;
+    };
+    let Some(entry) = tab.visible_entry(entry_id) else {
+        return;
+    };
+    let model = ui.get_files();
+    let Some(model) = model.as_any().downcast_ref::<VecModel<FileRow>>() else {
+        return;
+    };
+    if index < model.row_count() {
+        model.set_row_data(index, file_row(entry, tab, Texts::new(app.language), &app));
+    }
+}
 fn update_file_rows(
     ui: &AppWindow,
     state: &SharedSessions,
@@ -2111,6 +2242,31 @@ mod tests {
         assert!(!reorder_column(&mut order, 2, 0));
     }
     #[test]
+    fn complete_tab_duplication_shares_entries_without_reloading() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("same")], 0, [0, 1, 2, 3]);
+        let source = app.tabs.get_mut(&TabId(1)).unwrap();
+        source.latest_request = RequestId(7);
+        source.load_state = LoadState::Complete;
+        source.replace_entries(vec![FileEntry {
+            id: EntryId(1),
+            original_name: "file.txt".into(),
+            display_name: "file.txt".into(),
+            path: PathBuf::from("same/file.txt"),
+            kind: crate::domain::EntryKind::File,
+            open_target: None,
+            size_bytes: Some(1),
+            modified: None,
+        }]);
+        let source_entries = source.entries.clone();
+
+        let duplicate = app.duplicate_active_tab().expect("complete tab duplicates");
+        let duplicated = app.tabs.get(&duplicate).unwrap();
+
+        assert!(Arc::ptr_eq(&source_entries, &duplicated.entries));
+        assert_eq!(duplicated.latest_request, RequestId(7));
+        assert_eq!(duplicated.load_state, LoadState::Complete);
+    }
+    #[test]
     fn closing_a_tab_preserves_another_session() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
         let second = app.create_tab(PathBuf::from("two"));
@@ -2166,7 +2322,7 @@ mod tests {
         let mut app = AppState::new_for_test(vec![PathBuf::from("same")], 0, [0, 1, 2, 3]);
         let tab = app.tabs.get_mut(&TabId(1)).unwrap();
         tab.latest_request = RequestId(7);
-        tab.entries.push(FileEntry {
+        tab.replace_entries(vec![FileEntry {
             id: EntryId(3),
             original_name: "file.txt".into(),
             display_name: "file.txt".into(),
@@ -2175,7 +2331,7 @@ mod tests {
             open_target: None,
             size_bytes: Some(1),
             modified: None,
-        });
+        }]);
         let event = IconEvent {
             tab_id: TabId(1),
             request_id: RequestId(7),

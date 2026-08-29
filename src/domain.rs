@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::HashSet,
+    collections::HashMap,
     ffi::OsString,
     path::{Path, PathBuf},
     sync::{
@@ -64,9 +64,9 @@ pub struct TabSession {
     pub navigation_kind: NavigationKind,
     pub back_history: Vec<PathBuf>,
     pub forward_history: Vec<PathBuf>,
-    pub entries: Vec<FileEntry>,
+    pub entries: Arc<Vec<FileEntry>>,
     pub pending_entries: Vec<FileEntry>,
-    pub entry_ids: HashSet<EntryId>,
+    pub entry_indices: HashMap<EntryId, usize>,
     pub load_state: LoadState,
     pub error: Option<String>,
     pub selected: Vec<EntryId>,
@@ -89,9 +89,9 @@ impl TabSession {
             navigation_kind: NavigationKind::Normal,
             back_history: Vec::new(),
             forward_history: Vec::new(),
-            entries: Vec::new(),
+            entries: Arc::new(Vec::new()),
             pending_entries: Vec::new(),
-            entry_ids: HashSet::new(),
+            entry_indices: HashMap::new(),
             load_state: LoadState::Idle,
             error: None,
             selected: Vec::new(),
@@ -103,6 +103,31 @@ impl TabSession {
         }
     }
 
+    pub fn duplicate_complete(id: TabId, source: &Self) -> Self {
+        debug_assert_eq!(source.load_state, LoadState::Complete);
+        Self {
+            id,
+            latest_request: source.latest_request,
+            current_path: source.current_path.clone(),
+            requested_path: None,
+            address_editing: false,
+            address_input: String::new(),
+            navigation_kind: NavigationKind::Normal,
+            back_history: source.back_history.clone(),
+            forward_history: source.forward_history.clone(),
+            entries: source.entries.clone(),
+            pending_entries: Vec::new(),
+            entry_indices: source.entry_indices.clone(),
+            load_state: LoadState::Complete,
+            error: source.error.clone(),
+            selected: source.selected.clone(),
+            focused: source.focused,
+            selection_anchor: source.selection_anchor,
+            sort_field: source.sort_field,
+            sort_direction: source.sort_direction,
+            cancel: None,
+        }
+    }
     pub fn begin_address_edit(&mut self) {
         self.address_editing = true;
         self.address_input = self.visible_path().map(display_path).unwrap_or_default();
@@ -232,17 +257,23 @@ impl TabSession {
     }
 
     pub fn replace_entries(&mut self, entries: Vec<FileEntry>) {
-        self.entry_ids = entries.iter().map(|entry| entry.id).collect();
-        self.entries = entries;
+        self.entry_indices = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.id, index))
+            .collect();
+        self.entries = Arc::new(entries);
         self.reconcile_selection();
     }
 
-    pub fn append_pending(&mut self, mut entries: Vec<FileEntry>) {
-        for entry in &entries {
-            self.entry_ids.insert(entry.id);
+    pub fn append_pending(&mut self, mut entries: Vec<FileEntry>) -> usize {
+        let start = self.pending_entries.len();
+        for (offset, entry) in entries.iter().enumerate() {
+            self.entry_indices.insert(entry.id, start + offset);
         }
         self.pending_entries.append(&mut entries);
         self.load_state = LoadState::Partial;
+        start
     }
 
     pub fn commit_pending(&mut self) {
@@ -301,16 +332,25 @@ impl TabSession {
 
     pub fn discard_pending(&mut self) {
         self.pending_entries.clear();
-        self.entry_ids = self.entries.iter().map(|entry| entry.id).collect();
+        self.entry_indices = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.id, index))
+            .collect();
     }
 
-    pub fn visible_entry(&self, entry_id: EntryId) -> Option<&FileEntry> {
-        let entries = if matches!(self.load_state, LoadState::Partial) {
+    pub fn visible_entries(&self) -> &[FileEntry] {
+        if matches!(self.load_state, LoadState::Partial) {
             &self.pending_entries
         } else {
             &self.entries
-        };
-        entries.iter().find(|entry| entry.id == entry_id)
+        }
+    }
+
+    pub fn visible_entry(&self, entry_id: EntryId) -> Option<&FileEntry> {
+        self.visible_entry_index(entry_id)
+            .and_then(|index| self.visible_entries().get(index))
     }
 
     pub fn clear_selection(&mut self) {
@@ -326,7 +366,7 @@ impl TabSession {
     }
 
     pub fn select_entry(&mut self, entry_id: EntryId, toggle: bool, extend: bool) {
-        if !self.entry_ids.contains(&entry_id) {
+        if !self.entry_indices.contains_key(&entry_id) {
             return;
         }
         self.focused = Some(entry_id);
@@ -423,8 +463,9 @@ impl TabSession {
         }
         let field = self.sort_field;
         let direction = self.sort_direction;
-        self.entries
+        Arc::make_mut(&mut self.entries)
             .sort_unstable_by(|left, right| compare_entries(left, right, field, direction));
+        self.rebuild_entry_indices();
     }
 
     pub fn sort_pending(&mut self) {
@@ -446,24 +487,41 @@ impl TabSession {
         } else {
             (right, left)
         };
-        self.entries[start..=end]
+        self.visible_entries()[start..=end]
             .iter()
             .map(|entry| entry.id)
             .collect()
     }
 
+    pub fn visible_entry_index(&self, id: EntryId) -> Option<usize> {
+        self.entry_indices.get(&id).copied()
+    }
+
     fn entry_index(&self, id: EntryId) -> Option<usize> {
-        self.entries.iter().position(|entry| entry.id == id)
+        self.entry_indices.get(&id).copied()
+    }
+
+    fn rebuild_entry_indices(&mut self) {
+        self.entry_indices = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.id, index))
+            .collect();
     }
 
     fn reconcile_selection(&mut self) {
-        self.selected.retain(|id| self.entry_ids.contains(id));
-        if self.focused.is_some_and(|id| !self.entry_ids.contains(&id)) {
+        self.selected
+            .retain(|id| self.entry_indices.contains_key(id));
+        if self
+            .focused
+            .is_some_and(|id| !self.entry_indices.contains_key(&id))
+        {
             self.focused = None;
         }
         if self
             .selection_anchor
-            .is_some_and(|id| !self.entry_ids.contains(&id))
+            .is_some_and(|id| !self.entry_indices.contains_key(&id))
         {
             self.selection_anchor = None;
         }
@@ -547,6 +605,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn partial_selection_uses_the_visible_batch_indices() {
+        let mut session = TabSession::new(TabId(1));
+        session.replace_entries(vec![entry(1, "old", EntryKind::File, Some(1))]);
+        session.append_pending(vec![
+            entry(2, "new-a", EntryKind::File, Some(2)),
+            entry(3, "new-b", EntryKind::File, Some(3)),
+        ]);
+
+        session.select_entry(EntryId(2), false, false);
+        session.select_entry(EntryId(3), false, true);
+
+        assert_eq!(session.selected, vec![EntryId(2), EntryId(3)]);
+    }
     #[test]
     fn visible_entry_uses_pending_entries_during_partial_load() {
         let mut session = TabSession::new(TabId(1));
