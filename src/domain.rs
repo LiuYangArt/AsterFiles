@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::HashMap,
+    collections::HashSet,
     ffi::OsString,
     path::{Path, PathBuf},
     sync::{
@@ -66,7 +66,7 @@ pub struct TabSession {
     pub forward_history: Vec<PathBuf>,
     pub entries: Vec<FileEntry>,
     pub pending_entries: Vec<FileEntry>,
-    pub entry_paths: HashMap<EntryId, PathBuf>,
+    pub entry_ids: HashSet<EntryId>,
     pub load_state: LoadState,
     pub error: Option<String>,
     pub selected: Vec<EntryId>,
@@ -74,10 +74,6 @@ pub struct TabSession {
     pub selection_anchor: Option<EntryId>,
     pub sort_field: SortField,
     pub sort_direction: SortDirection,
-    pub scroll_offset: f32,
-    pub first_batch_ms: Option<u128>,
-    pub cancel_elapsed_ms: Option<u128>,
-    pub discarded_results: u64,
     cancel: Option<Arc<AtomicBool>>,
 }
 
@@ -95,7 +91,7 @@ impl TabSession {
             forward_history: Vec::new(),
             entries: Vec::new(),
             pending_entries: Vec::new(),
-            entry_paths: HashMap::new(),
+            entry_ids: HashSet::new(),
             load_state: LoadState::Idle,
             error: None,
             selected: Vec::new(),
@@ -103,10 +99,6 @@ impl TabSession {
             selection_anchor: None,
             sort_field: SortField::Name,
             sort_direction: SortDirection::Ascending,
-            scroll_offset: 0.0,
-            first_batch_ms: None,
-            cancel_elapsed_ms: None,
-            discarded_results: 0,
             cancel: None,
         }
     }
@@ -216,8 +208,6 @@ impl TabSession {
         self.navigation_kind = kind;
         self.load_state = LoadState::Loading;
         self.error = None;
-        self.first_batch_ms = None;
-        self.cancel_elapsed_ms = None;
         self.pending_entries.clear();
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
@@ -242,17 +232,14 @@ impl TabSession {
     }
 
     pub fn replace_entries(&mut self, entries: Vec<FileEntry>) {
-        self.entry_paths = entries
-            .iter()
-            .map(|entry| (entry.id, entry.path.clone()))
-            .collect();
+        self.entry_ids = entries.iter().map(|entry| entry.id).collect();
         self.entries = entries;
         self.reconcile_selection();
     }
 
     pub fn append_pending(&mut self, mut entries: Vec<FileEntry>) {
         for entry in &entries {
-            self.entry_paths.insert(entry.id, entry.path.clone());
+            self.entry_ids.insert(entry.id);
         }
         self.pending_entries.append(&mut entries);
         self.load_state = LoadState::Partial;
@@ -303,7 +290,6 @@ impl TabSession {
         self.address_input.clear();
         self.navigation_kind = NavigationKind::Normal;
         self.clear_selection();
-        self.scroll_offset = 0.0;
     }
 
     pub fn back_target(&self) -> Option<PathBuf> {
@@ -315,11 +301,7 @@ impl TabSession {
 
     pub fn discard_pending(&mut self) {
         self.pending_entries.clear();
-        self.entry_paths = self
-            .entries
-            .iter()
-            .map(|entry| (entry.id, entry.path.clone()))
-            .collect();
+        self.entry_ids = self.entries.iter().map(|entry| entry.id).collect();
     }
 
     pub fn visible_entry(&self, entry_id: EntryId) -> Option<&FileEntry> {
@@ -344,7 +326,7 @@ impl TabSession {
     }
 
     pub fn select_entry(&mut self, entry_id: EntryId, toggle: bool, extend: bool) {
-        if !self.entry_paths.contains_key(&entry_id) {
+        if !self.entry_ids.contains(&entry_id) {
             return;
         }
         self.focused = Some(entry_id);
@@ -475,16 +457,13 @@ impl TabSession {
     }
 
     fn reconcile_selection(&mut self) {
-        self.selected.retain(|id| self.entry_paths.contains_key(id));
-        if self
-            .focused
-            .is_some_and(|id| !self.entry_paths.contains_key(&id))
-        {
+        self.selected.retain(|id| self.entry_ids.contains(id));
+        if self.focused.is_some_and(|id| !self.entry_ids.contains(&id)) {
             self.focused = None;
         }
         if self
             .selection_anchor
-            .is_some_and(|id| !self.entry_paths.contains_key(&id))
+            .is_some_and(|id| !self.entry_ids.contains(&id))
         {
             self.selection_anchor = None;
         }

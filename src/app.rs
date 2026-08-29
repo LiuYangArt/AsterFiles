@@ -147,7 +147,6 @@ struct DirectoryRequest {
     request_id: RequestId,
     path: PathBuf,
     cancel: Arc<std::sync::atomic::AtomicBool>,
-    started_at: Instant,
 }
 
 #[derive(Debug)]
@@ -156,7 +155,6 @@ enum DirectoryEvent {
         tab_id: TabId,
         request_id: RequestId,
         entries: Vec<FileEntry>,
-        first_batch_ms: u128,
     },
     Finished {
         tab_id: TabId,
@@ -167,7 +165,6 @@ enum DirectoryEvent {
     Cancelled {
         tab_id: TabId,
         request_id: RequestId,
-        elapsed_ms: u128,
     },
     Failed {
         tab_id: TabId,
@@ -315,7 +312,6 @@ fn submit_navigation(
             request_id,
             path,
             cancel,
-            started_at: Instant::now(),
         }
     };
     sender.send(request).is_ok()
@@ -1229,7 +1225,6 @@ fn run_directory_request(request: DirectoryRequest, events: &mpsc::Sender<Direct
             tab_id: request.tab_id,
             request_id: request.request_id,
             entries,
-            first_batch_ms: request.started_at.elapsed().as_millis(),
         });
     });
     let event = match result {
@@ -1242,7 +1237,6 @@ fn run_directory_request(request: DirectoryRequest, events: &mpsc::Sender<Direct
         Ok(ReadOutcome::Cancelled) => DirectoryEvent::Cancelled {
             tab_id: request.tab_id,
             request_id: request.request_id,
-            elapsed_ms: request.started_at.elapsed().as_millis(),
         },
         Err(error) => DirectoryEvent::Failed {
             tab_id: request.tab_id,
@@ -1290,17 +1284,11 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) {
             tab_id,
             request_id,
             entries,
-            first_batch_ms,
         } => {
             if let Some(tab) = app.tabs.get_mut(&tab_id)
                 && tab.accepts(request_id)
             {
                 tab.append_pending(entries);
-                if tab.first_batch_ms.is_none() {
-                    tab.first_batch_ms = Some(first_batch_ms);
-                }
-            } else if let Some(tab) = app.tabs.get_mut(&tab_id) {
-                tab.discarded_results += 1;
             }
         }
         DirectoryEvent::Finished {
@@ -1318,17 +1306,12 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) {
                 tab.error = (skipped > 0).then(|| skipped.to_string());
             }
         }
-        DirectoryEvent::Cancelled {
-            tab_id,
-            request_id,
-            elapsed_ms,
-        } => {
+        DirectoryEvent::Cancelled { tab_id, request_id } => {
             if let Some(tab) = app.tabs.get_mut(&tab_id)
                 && tab.latest_request == request_id
             {
                 tab.discard_pending();
                 tab.load_state = LoadState::Cancelled;
-                tab.cancel_elapsed_ms = Some(elapsed_ms);
             }
         }
         DirectoryEvent::Failed {
