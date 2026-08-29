@@ -771,6 +771,12 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+                    Path {
+                        x: 0px; y: 0px; width: 5px; height: 5px;
+                        viewbox-width: 5; viewbox-height: 5; fit: fill;
+                        commands: "M 0 0 L 5 0 C 2.2 0 0 2.2 0 5 Z";
+                        fill: VisualStyle.c323437;
+                    }
                 }
 
                 content-area := Rectangle {
@@ -947,7 +953,7 @@ list := ListView {
                 }
 
                 Rectangle {
-                    height: 30px; background: VisualStyle.cfafbfc; border-color: VisualStyle.ce7e8eb; border-width: 1px;
+                    height: 30px; background: VisualStyle.cfafbfc;
                     Text { x: 14px; text: root.status-text; color: VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; }
                     Rectangle {
                         visible: root.operations.length > 0;
