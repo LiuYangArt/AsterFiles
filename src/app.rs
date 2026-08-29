@@ -739,14 +739,22 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
     let sender_for_back = sender.clone();
     let state_for_back = state.clone();
     ui.on_navigate_back(move || {
-        let target = {
-            let app = state_for_back
+        let (restored, target) = {
+            let mut app = state_for_back
                 .lock()
                 .expect("app state mutex is not poisoned");
-            app.active()
-                .back_target()
-                .map(|path| (app.active_tab, path))
+            let tab_id = app.active_tab;
+            if app
+                .tabs
+                .get_mut(&tab_id)
+                .is_some_and(TabSession::restore_successful_location)
+            {
+                (true, None)
+            } else {
+                (false, app.active().back_target().map(|path| (tab_id, path)))
+            }
         };
+        let navigated = target.is_some();
         if let Some((tab_id, path)) = target {
             submit_navigation(
                 &sender_for_back,
@@ -755,9 +763,11 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
                 path,
                 NavigationKind::Back,
             );
-            if let Some(ui) = weak.upgrade() {
-                refresh_ui(&ui, &state_for_back);
-            }
+        }
+        if (restored || navigated)
+            && let Some(ui) = weak.upgrade()
+        {
+            refresh_ui(&ui, &state_for_back);
         }
     });
 
@@ -834,8 +844,7 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
                 .lock()
                 .expect("app state mutex is not poisoned");
             app.active()
-                .current_path
-                .as_deref()
+                .visible_path()
                 .and_then(Path::parent)
                 .map(Path::to_path_buf)
                 .map(|path| (app.active_tab, path))
@@ -869,8 +878,9 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
                 None
             } else {
                 app.active()
-                    .current_path
+                    .requested_path
                     .clone()
+                    .or_else(|| app.active().current_path.clone())
                     .map(|path| (app.active_tab, path))
             }
         };
@@ -887,6 +897,29 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
             }
         }
     });
+    let weak = ui.as_weak();
+    let state_for_access = state.clone();
+    ui.on_request_folder_access(move || {
+        let target = {
+            let app = state_for_access
+                .lock()
+                .expect("app state mutex is not poisoned");
+            (app.active().load_state == LoadState::PermissionDenied)
+                .then(|| app.active().requested_path.clone())
+                .flatten()
+        };
+        if let Some(target) = target {
+            thread::spawn(move || {
+                if let Err(error) = platform::request_folder_access(&target) {
+                    eprintln!("unable to request folder access through Windows: {error}");
+                }
+            });
+        }
+        if let Some(ui) = weak.upgrade() {
+            refresh_ui(&ui, &state_for_access);
+        }
+    });
+
     let weak = ui.as_weak();
     ui.on_toggle_language(move || {
         let mut app = state.lock().expect("app state mutex is not poisoned");
@@ -1294,7 +1327,7 @@ fn update_selection_summary(ui: &AppWindow, state: &SharedSessions) {
     ui.set_status_text(status_text(tab, Texts::new(app.language)).into());
 }
 fn selected_sidebar_index(app: &AppState) -> Option<usize> {
-    let current = app.active().current_path.as_deref()?;
+    let current = app.active().visible_path()?;
     app.sidebar
         .iter()
         .enumerate()
@@ -1312,6 +1345,8 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
     let tab = app.active();
     let display_entries = if matches!(tab.load_state, LoadState::Partial) {
         &tab.pending_entries
+    } else if tab.has_failed_location() {
+        &[] as &[FileEntry]
     } else {
         &tab.entries
     };
@@ -1321,41 +1356,20 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
         .collect::<Vec<_>>();
     ui.set_files(ModelRc::new(VecModel::from(file_rows)));
     ui.set_window_width(ui.window().size().width as f32 / ui.window().scale_factor());
-    let successful_path = tab
-        .current_path
-        .as_deref()
-        .map(display_path)
-        .unwrap_or_default();
+    let visible_path = tab.visible_path().map(display_path).unwrap_or_default();
     let address_input = if tab.address_editing {
         tab.address_input.clone()
     } else {
-        successful_path.clone()
+        visible_path.clone()
     };
-    ui.set_current_path(successful_path.into());
+    ui.set_current_path(visible_path.into());
     ui.set_address_input(address_input.into());
     ui.set_address_editing(tab.address_editing);
-    ui.set_address_has_error(matches!(
-        tab.load_state,
-        LoadState::NotFound
-            | LoadState::PermissionDenied
-            | LoadState::Disconnected
-            | LoadState::Failed
-    ));
-    ui.set_address_error_text(
-        if matches!(
-            tab.load_state,
-            LoadState::NotFound
-                | LoadState::PermissionDenied
-                | LoadState::Disconnected
-                | LoadState::Failed
-        ) {
-            texts.state(tab.load_state)
-        } else {
-            ""
-        }
-        .into(),
-    );
+
     ui.set_status_text(status_text(tab, texts).into());
+    let (error_page_title, error_page_description) = error_page_text(tab.load_state, texts);
+    ui.set_error_page_title(error_page_title.into());
+    ui.set_error_page_description(error_page_description.into());
     ui.set_tabs(ModelRc::new(VecModel::from(
         app.tab_order
             .iter()
@@ -1363,13 +1377,12 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
             .map(|tab| TabRow {
                 id: tab.id.0 as i32,
                 title: tab
-                    .current_path
-                    .as_deref()
+                    .visible_path()
                     .and_then(Path::file_name)
                     .map(|name| name.to_string_lossy().into_owned())
                     .filter(|name| !name.is_empty())
                     .unwrap_or_else(|| {
-                        display_path(tab.current_path.as_deref().unwrap_or(Path::new("C:\\")))
+                        display_path(tab.visible_path().unwrap_or(Path::new("C:\\")))
                     })
                     .into(),
                 active: tab.id == app.active_tab,
@@ -1454,9 +1467,9 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
         LoadState::Disconnected => 8,
         LoadState::Failed => 9,
     });
-    ui.set_can_navigate_back(!tab.back_history.is_empty());
+    ui.set_can_navigate_back(tab.has_failed_location() || !tab.back_history.is_empty());
     ui.set_can_navigate_forward(!tab.forward_history.is_empty());
-    ui.set_can_navigate_up(tab.current_path.as_deref().and_then(Path::parent).is_some());
+    ui.set_can_navigate_up(tab.visible_path().and_then(Path::parent).is_some());
     ui.set_can_refresh(!matches!(
         tab.load_state,
         LoadState::Loading | LoadState::Partial
@@ -1507,6 +1520,42 @@ fn status_text(tab: &TabSession, texts: Texts) -> String {
     }
 }
 
+fn error_page_text(state: LoadState, texts: Texts) -> (&'static str, &'static str) {
+    match (texts.language, state) {
+        (Language::Chinese, LoadState::PermissionDenied) => (
+            "无权访问此文件夹",
+            "你当前没有访问此文件夹的权限。可以使用 Windows 请求访问权限。",
+        ),
+        (Language::English, LoadState::PermissionDenied) => (
+            "Access denied",
+            "You don't currently have permission to access this folder. Use Windows to request access.",
+        ),
+        (Language::Chinese, LoadState::NotFound) => {
+            ("找不到该位置", "该位置可能已被移动、重命名或删除。")
+        }
+        (Language::English, LoadState::NotFound) => (
+            "Location not found",
+            "This location may have been moved, renamed, or deleted.",
+        ),
+        (Language::Chinese, LoadState::Disconnected) => {
+            ("位置已断开", "请检查磁盘或网络连接，然后重试。")
+        }
+        (Language::English, LoadState::Disconnected) => (
+            "Location disconnected",
+            "Check the drive or network connection, then try again.",
+        ),
+        (Language::Chinese, LoadState::Cancelled) => ("加载已取消", "你可以重试或返回上一个位置。"),
+        (Language::English, LoadState::Cancelled) => (
+            "Loading cancelled",
+            "Try again or return to the previous location.",
+        ),
+        (Language::Chinese, _) => ("无法打开该位置", "读取此位置时发生错误。你可以重试或返回。"),
+        (Language::English, _) => (
+            "Unable to open location",
+            "An error occurred while reading this location. Try again or go back.",
+        ),
+    }
+}
 fn apply_ui_texts(ui: &AppWindow, language: Language) {
     let (
         go,
@@ -1524,6 +1573,7 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
         kind,
         modified,
         size,
+        request_access,
     ) = match language {
         Language::Chinese => (
             "前往",
@@ -1541,6 +1591,7 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "类型",
             "修改时间",
             "大小",
+            "使用 Windows 请求访问权限",
         ),
         Language::English => (
             "Go",
@@ -1558,6 +1609,7 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "Type",
             "Modified",
             "Size",
+            "Request access with Windows",
         ),
     };
     ui.set_text_go(go.into());
@@ -1575,6 +1627,7 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_type(kind.into());
     ui.set_text_modified(modified.into());
     ui.set_text_size(size.into());
+    ui.set_text_request_access(request_access.into());
 }
 
 fn display_path(path: &Path) -> String {
@@ -1673,6 +1726,16 @@ mod tests {
         assert!(Path::new(r"C:\").parent().is_none());
     }
 
+    #[test]
+    fn permission_page_has_actionable_copy_in_both_languages() {
+        for language in [Language::Chinese, Language::English] {
+            let (title, description) =
+                error_page_text(LoadState::PermissionDenied, Texts::new(language));
+            assert!(!title.is_empty());
+            assert!(!description.is_empty());
+            assert!(description.contains("Windows"));
+        }
+    }
     #[test]
     fn error_kinds_have_distinct_page_states() {
         assert_eq!(classify_error(io::ErrorKind::NotFound), LoadState::NotFound);

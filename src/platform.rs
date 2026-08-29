@@ -143,18 +143,33 @@ mod windows_impl {
     }
 
     pub fn open_path(path: &Path) -> std::io::Result<()> {
-        let path = path
+        shell_execute(path, None)
+    }
+
+    pub fn request_folder_access(path: &Path) -> std::io::Result<()> {
+        let mut arguments = OsString::from("\"");
+        arguments.push(path.as_os_str());
+        arguments.push("\"");
+        shell_execute(Path::new("explorer.exe"), Some(arguments.as_os_str()))
+    }
+
+    fn shell_execute(target: &Path, arguments: Option<&std::ffi::OsStr>) -> std::io::Result<()> {
+        let target = target
             .as_os_str()
             .encode_wide()
             .chain(Some(0))
             .collect::<Vec<_>>();
+        let arguments =
+            arguments.map(|value| value.encode_wide().chain(Some(0)).collect::<Vec<_>>());
         let operation = "open\0".encode_utf16().collect::<Vec<_>>();
         let result = unsafe {
             ShellExecuteW(
                 ptr::null_mut(),
                 operation.as_ptr(),
-                path.as_ptr(),
-                ptr::null(),
+                target.as_ptr(),
+                arguments
+                    .as_ref()
+                    .map_or(ptr::null(), |value| value.as_ptr()),
                 ptr::null(),
                 SW_SHOWNORMAL,
             )
@@ -170,7 +185,7 @@ mod windows_impl {
 }
 
 #[cfg(windows)]
-pub use windows_impl::{double_click_interval, known_locations, open_path};
+pub use windows_impl::{double_click_interval, known_locations, open_path, request_folder_access};
 
 #[cfg(not(windows))]
 pub fn double_click_interval() -> std::time::Duration {
@@ -196,4 +211,8 @@ pub fn open_path(path: &Path) -> std::io::Result<()> {
         .arg(path)
         .spawn()
         .map(|_| ())
+}
+#[cfg(not(windows))]
+pub fn request_folder_access(path: &Path) -> std::io::Result<()> {
+    open_path(path)
 }

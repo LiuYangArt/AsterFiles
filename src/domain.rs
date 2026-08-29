@@ -113,15 +113,61 @@ impl TabSession {
 
     pub fn begin_address_edit(&mut self) {
         self.address_editing = true;
-        self.address_input = self
-            .current_path
-            .as_deref()
-            .map(display_path)
-            .unwrap_or_default();
+        self.address_input = self.visible_path().map(display_path).unwrap_or_default();
+    }
+
+    pub fn visible_path(&self) -> Option<&Path> {
+        if matches!(
+            self.load_state,
+            LoadState::Loading
+                | LoadState::Partial
+                | LoadState::Cancelled
+                | LoadState::NotFound
+                | LoadState::PermissionDenied
+                | LoadState::Disconnected
+                | LoadState::Failed
+        ) {
+            self.requested_path
+                .as_deref()
+                .or(self.current_path.as_deref())
+        } else {
+            self.current_path.as_deref()
+        }
+    }
+
+    pub fn has_failed_location(&self) -> bool {
+        self.requested_path.is_some()
+            && matches!(
+                self.load_state,
+                LoadState::Cancelled
+                    | LoadState::NotFound
+                    | LoadState::PermissionDenied
+                    | LoadState::Disconnected
+                    | LoadState::Failed
+            )
+    }
+
+    pub fn restore_successful_location(&mut self) -> bool {
+        if !self.has_failed_location() || self.current_path.is_none() {
+            return false;
+        }
+        if let Some(failed_path) = self.requested_path.take()
+            && self.forward_history.last() != Some(&failed_path)
+        {
+            self.forward_history.push(failed_path);
+        }
+        self.pending_entries.clear();
+        self.load_state = LoadState::Complete;
+        self.error = None;
+        self.navigation_kind = NavigationKind::Normal;
+        self.address_editing = false;
+        self.address_input.clear();
+        self.cancel = None;
+        true
     }
 
     pub fn breadcrumb_paths(&self) -> Vec<(String, PathBuf)> {
-        let Some(path) = self.current_path.as_deref() else {
+        let Some(path) = self.visible_path() else {
             return Vec::new();
         };
         let mut segments = Vec::new();
@@ -554,6 +600,44 @@ mod tests {
         assert!(session.accepts(second));
     }
 
+    #[test]
+    fn failed_location_is_visible_and_can_return_to_successful_content() {
+        let mut session = TabSession::new(TabId(1));
+        session.current_path = Some(PathBuf::from(r"C:\Users"));
+        session.replace_entries(vec![entry(1, "DevUser", EntryKind::Directory, None)]);
+        session.begin_navigation(PathBuf::from(r"C:\Users\DevUser"), NavigationKind::Normal);
+        session.load_state = LoadState::PermissionDenied;
+
+        assert_eq!(session.visible_path(), Some(Path::new(r"C:\Users\DevUser")));
+        assert!(session.has_failed_location());
+        assert!(session.restore_successful_location());
+        assert_eq!(session.visible_path(), Some(Path::new(r"C:\Users")));
+        assert_eq!(session.entries.len(), 1);
+        assert_eq!(
+            session.forward_target(),
+            Some(PathBuf::from(r"C:\Users\DevUser"))
+        );
+    }
+    #[test]
+    fn retrying_failed_location_can_commit_it_normally() {
+        let mut session = TabSession::new(TabId(1));
+        session.current_path = Some(PathBuf::from(r"C:\Users"));
+        session.begin_navigation(PathBuf::from(r"C:\Users\DevUser"), NavigationKind::Normal);
+        session.load_state = LoadState::PermissionDenied;
+
+        let requested = session
+            .requested_path
+            .clone()
+            .expect("failed target exists");
+        session.begin_navigation(requested.clone(), NavigationKind::Normal);
+        session.commit_pending();
+        session.commit_path(requested.clone());
+
+        assert_eq!(session.visible_path(), Some(requested.as_path()));
+        assert_eq!(session.back_target(), Some(PathBuf::from(r"C:\Users")));
+        assert!(session.requested_path.is_none());
+        assert_eq!(session.load_state, LoadState::Complete);
+    }
     #[test]
     fn failed_navigation_keeps_successful_page_and_history() {
         let mut session = TabSession::new(TabId(1));

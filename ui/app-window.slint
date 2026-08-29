@@ -258,9 +258,14 @@ export component AppWindow inherits Window {
     in property <string> current-path: "C:\\";
     in-out property <string> address-input: "C:\\";
     in property <bool> address-editing: false;
-    in property <bool> address-has-error: false;
-    in property <string> address-error-text: "";
+
+
     in property <string> status-text: "";
+    in property <string> error-page-title: "";
+    in property <string> error-page-description: "";
+    in property <string> text-request-access: "使用 Windows 请求访问权限";
+
+
     in property <[FileRow]> files;
     in property <[TabRow]> tabs;
     in property <[HistoryRow]> back-history;
@@ -302,6 +307,8 @@ export component AppWindow inherits Window {
     callback navigate-history(bool, int);
     callback navigate-up();
     callback refresh();
+    callback request-folder-access();
+
     callback navigate-sidebar(int);
     callback navigate-breadcrumb(int);
     callback select-entry(int, bool, bool);
@@ -405,7 +412,7 @@ export component AppWindow inherits Window {
         }
 
         Rectangle {
-            height: root.address-editing && root.address-has-error ? 70px : 56px; background: #fafbfc; border-color: #e2e4e9; border-width: 1px;
+            height: 56px; background: #fafbfc; border-color: #e2e4e9; border-width: 1px;
             HorizontalLayout {
                 padding-top: 9px; padding-bottom: 9px; padding-left: 14px; padding-right: 14px; spacing: 7px;
                 ContextMenuArea { width: 38px; height: 38px; IconButton { icon-source: @image-url("icons/actions/back.svg"); tip: root.text-back + " (Alt+Left)"; enabled: root.can-navigate-back; button-label: root.text-back; clicked => { root.navigate-back(); } } Menu { for history in root.back-history: MenuItem { title: history.label; activated => { root.navigate-history(true, history.index); } } } }
@@ -413,10 +420,10 @@ export component AppWindow inherits Window {
                 IconButton { visible: !root.compact; icon-source: @image-url("icons/actions/up.svg"); tip: root.text-up + " (Alt+Up)"; enabled: root.can-navigate-up; button-label: root.text-up; clicked => { root.navigate-up(); } }
                 IconButton { visible: !root.compact; icon-source: @image-url("icons/actions/refresh.svg"); tip: root.text-refresh + " (F5)"; enabled: root.can-refresh; button-label: root.text-refresh; clicked => { root.refresh(); } }
                 Rectangle {
-                    height: root.address-editing && root.address-has-error ? 52px : 38px; horizontal-stretch: 1; background: #ffffff; border-color: root.address-has-error ? #c42b1c : #d7dae0; border-width: root.address-has-error ? 2px : 1px; border-radius: 5px;
+                    height: 38px; horizontal-stretch: 1; background: #ffffff; border-color: #d7dae0; border-width: 1px; border-radius: 5px;
                     if !root.address-editing: Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; HorizontalLayout { padding-left: 8px; padding-right: 8px; padding-top: 3px; padding-bottom: 3px; spacing: 2px; InlineIcon { icon-source: @image-url("icons/files/folder.svg"); icon-size: 16px; } for crumb in root.breadcrumbs: BreadcrumbButton { label: crumb.label; current: crumb.current; clicked => { root.navigate-breadcrumb(crumb.index); } } Rectangle { horizontal-stretch: 1; TouchArea { mouse-cursor: pointer; clicked => { root.begin-address-edit(); } } } } }
-                    address-editor := AddressEditor { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: root.address-has-error ? 30px : parent.height - 4px; text <=> root.address-input; has-error: root.address-has-error; accepted(value) => { root.navigate-path(value); } cancelled => { root.cancel-address-edit(); } }
-                    if root.address-editing && root.address-has-error: Text { x: 10px; y: 32px; width: parent.width - 20px; height: 16px; text: root.address-error-text; color: #a4262c; font-size: 11px; vertical-alignment: center; }
+                    address-editor := AddressEditor { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: parent.height - 4px; text <=> root.address-input; accepted(value) => { root.navigate-path(value); } cancelled => { root.cancel-address-edit(); } }
+
                 }
                 IconButton { visible: !root.minimal; icon-source: @image-url("icons/actions/forward.svg"); tip: root.text-go; button-label: root.text-go; clicked => { root.address-editing ? root.navigate-path(root.address-input) : root.begin-address-edit(); } }
             }
@@ -492,10 +499,22 @@ export component AppWindow inherits Window {
                         maximum: max(0px, list.viewport-height - list.visible-height);
                         page-size: list.visible-height;
                     }
-                    if root.files.length == 0: VerticalLayout {
+                    if root.page-state == 1 || root.page-state == 3: VerticalLayout {
                         alignment: center; spacing: 8px;
-                        Text { text: root.page-state == 1 ? "正在加载…" : root.page-state == 3 ? "此文件夹为空" : root.page-state == 5 ? "加载已取消" : root.page-state == 6 ? "找不到该位置" : root.page-state == 7 ? "无权访问该位置" : root.page-state == 8 ? "位置已断开" : root.page-state == 9 ? "无法打开该位置" : ""; color: root.page-state >= 6 ? #a4262c : #62656f; font-size: 16px; horizontal-alignment: center; }
-                        if root.page-state >= 5: HorizontalLayout { alignment: center; CommandButton { icon-source: @image-url("icons/actions/refresh.svg"); label: "重试"; enabled: root.can-refresh; clicked => { root.refresh(); } } CommandButton { icon-source: @image-url("icons/actions/back.svg"); label: "返回"; enabled: root.can-navigate-back; clicked => { root.navigate-back(); } } }
+                        Text { text: root.page-state == 1 ? "正在加载…" : "此文件夹为空"; color: #62656f; font-size: 16px; horizontal-alignment: center; }
+                    }
+                    if root.page-state >= 5: VerticalLayout {
+                        alignment: center; spacing: 12px;
+                        HorizontalLayout { alignment: center; Image { width: 48px; height: 48px; source: @image-url("icons/status/lock-closed.svg"); } }
+                        Text { text: root.error-page-title; color: #30333a; font-size: 20px; font-weight: 600; horizontal-alignment: center; }
+                        Text { text: root.error-page-description; color: #62656f; font-size: 13px; horizontal-alignment: center; }
+                        Rectangle { height: 4px; }
+                        HorizontalLayout {
+                            alignment: center; spacing: 8px;
+                            if root.page-state == 7: CommandButton { width: 196px; icon-source: @image-url("icons/status/lock-closed.svg"); label: root.text-request-access; clicked => { root.request-folder-access(); } }
+
+
+                        }
                     }
 
                 }
@@ -515,18 +534,18 @@ export component AppWindow inherits Window {
         x: 0px;
         y: 59px;
         width: 59px + (!root.minimal ? 45px : 0px) + (!root.compact ? 90px : 0px);
-        height: root.address-has-error ? 52px : 38px;
+        height: 38px;
         TouchArea { clicked => { root.cancel-address-edit(); } }
     }
     if root.address-editing: Rectangle {
         x: parent.width - 59px - (!root.minimal ? 45px : 0px);
         y: 59px;
         width: 59px + (!root.minimal ? 45px : 0px);
-        height: root.address-has-error ? 52px : 38px;
+        height: 38px;
         TouchArea { clicked => { root.cancel-address-edit(); } }
     }
     if root.address-editing: Rectangle {
-        y: root.address-has-error ? 111px : 97px;
+        y: 97px;
         width: parent.width;
         height: parent.height - self.y;
         TouchArea { clicked => { root.cancel-address-edit(); } }
