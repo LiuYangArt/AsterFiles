@@ -9,10 +9,18 @@ pub enum Language {
 }
 
 impl Language {
-    pub fn toggle(self) -> Self {
+    pub const fn storage_code(self) -> u8 {
         match self {
-            Self::Chinese => Self::English,
-            Self::English => Self::Chinese,
+            Self::Chinese => 0,
+            Self::English => 1,
+        }
+    }
+
+    pub const fn from_storage_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Chinese),
+            1 => Some(Self::English),
+            _ => None,
         }
     }
 }
@@ -113,6 +121,16 @@ impl Texts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn language_storage_codes_are_stable() {
+        assert_eq!(Language::Chinese.storage_code(), 0);
+        assert_eq!(Language::English.storage_code(), 1);
+        assert_eq!(Language::from_storage_code(0), Some(Language::Chinese));
+        assert_eq!(Language::from_storage_code(1), Some(Language::English));
+        assert_eq!(Language::from_storage_code(2), None);
+        assert_eq!(Language::from_storage_code(u8::MAX), None);
+    }
 
     #[test]
     fn both_languages_cover_core_states() {

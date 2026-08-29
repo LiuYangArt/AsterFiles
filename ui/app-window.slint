@@ -1,11 +1,53 @@
 import { ListView } from "std-widgets.slint";
+import { IconMap } from "icons/icon-map.slint";
 
-export struct FileRow { id: int, name: string, kind: string, size: string, modified: string, is-directory: bool, selected: bool, focused: bool }
+export struct FileRow { id: int, name: string, kind: string, size: string, modified: string, is-directory: bool, selected: bool, focused: bool, icon: image }
 export struct HistoryRow { index: int, label: string }
 export struct BreadcrumbRow { index: int, label: string, current: bool }
 export struct TabRow { id: int, title: string, active: bool, loading: bool }
-export struct SidebarRow { index: int, label: string, icon-kind: int, selected: bool, is-drive: bool }
+export struct SidebarRow { index: int, label: string, icon-kind: int, selected: bool, is-drive: bool, icon: image }
 export struct ColumnRow { kind: int }
+export global VisualStyle {
+    in-out property <bool> dark-theme: false;
+    out property <color> c24252a: dark-theme ? #f2f2f2 : #24252a;
+    out property <color> c303138: dark-theme ? #f2f2f2 : #303138;
+    out property <color> c30333a: dark-theme ? #f2f2f2 : #30333a;
+    out property <color> c3b4f83: dark-theme ? #9db5ff : #3b4f83;
+    out property <color> c4f535d: dark-theme ? #d0d0d0 : #4f535d;
+    out property <color> c4f6bed: dark-theme ? #7fa0ff : #4f6bed;
+    out property <color> c62656f: dark-theme ? #c6c6c6 : #62656f;
+    out property <color> c666a74: dark-theme ? #bcbcbc : #666a74;
+    out property <color> c696b74: dark-theme ? #bdbdbd : #696b74;
+    out property <color> c6f717a: dark-theme ? #bdbdbd : #6f717a;
+    out property <color> c72747d: dark-theme ? #a9a9a9 : #72747d;
+    out property <color> c777a84: dark-theme ? #b0b0b0 : #777a84;
+    out property <color> c777b85: dark-theme ? #b0b0b0 : #777b85;
+    out property <color> c9a9da3: dark-theme ? #8a8a8a : #9a9da3;
+    out property <color> caeb1b6: dark-theme ? #737373 : #aeb1b6;
+    out property <color> cc42b1c: #c42b1c;
+    out property <color> cc7d7ff: dark-theme ? #35548f : #c7d7ff;
+    out property <color> cd7dae0: dark-theme ? #4a4a4a : #d7dae0;
+    out property <color> cd7dce5: dark-theme ? #4a4a4a : #d7dce5;
+    out property <color> cd9dce2: dark-theme ? #454545 : #d9dce2;
+    out property <color> cdce6ff: dark-theme ? #263d66 : #dce6ff;
+    out property <color> cdde3ed: dark-theme ? #464646 : #dde3ed;
+    out property <color> ce0e2e7: dark-theme ? #4b4b4b : #e0e2e7;
+    out property <color> ce1e4ea: dark-theme ? #4c4c4c : #e1e4ea;
+    out property <color> ce2e3e7: dark-theme ? #484848 : #e2e3e7;
+    out property <color> ce2e4e9: dark-theme ? #444444 : #e2e4e9;
+    out property <color> ce3e7ef: dark-theme ? #424242 : #e3e7ef;
+    out property <color> ce5e9f2: dark-theme ? #414141 : #e5e9f2;
+    out property <color> ce7e8eb: dark-theme ? #404040 : #e7e8eb;
+    out property <color> ce8eaf0: dark-theme ? #3d3d3d : #e8eaf0;
+    out property <color> cedf1f6: dark-theme ? #424242 : #edf1f6;
+    out property <color> ceff4ff: dark-theme ? #303b4d : #eff4ff;
+    out property <color> cf1f2f4: dark-theme ? #343434 : #f1f2f4;
+    out property <color> cf1f2f5: dark-theme ? #292929 : #f1f2f5;
+    out property <color> cf5f6f8: dark-theme ? #202020 : #f5f6f8;
+    out property <color> cf8f8f9: dark-theme ? #303030 : #f8f8f9;
+    out property <color> cfafbfc: dark-theme ? #272727 : #fafbfc;
+    out property <color> cffffff: dark-theme ? #252525 : #ffffff;
+}
 
 component InlineIcon inherits Rectangle {
     in property <image> icon-source;
@@ -24,7 +66,7 @@ component IconButton inherits Rectangle {
     height: 38px;
     border-radius: 5px;
     border-width: 0px;
-    background: !root.enabled ? transparent : icon-touch.pressed ? #dde3ed : icon-touch.has-hover ? #edf1f6 : transparent;
+    background: !root.enabled ? transparent : icon-touch.pressed ? VisualStyle.cdde3ed : icon-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
     opacity: root.enabled ? 1 : 0.46;
     Image {
         width: 20px;
@@ -33,6 +75,7 @@ component IconButton inherits Rectangle {
         y: (parent.height - self.height) / 2;
         source: root.icon-source;
         image-fit: contain;
+        colorize: VisualStyle.c303138;
     }
     icon-touch := TouchArea {
         enabled: root.enabled;
@@ -55,15 +98,15 @@ component CommandButton inherits Rectangle {
     horizontal-stretch: 0;
     border-radius: 5px;
     border-width: 1px;
-    border-color: #e0e2e7;
-    background: !root.enabled ? #f8f8f9 : command-touch.pressed ? #dde3ed : command-touch.has-hover ? #edf1f6 : #ffffff;
+    border-color: VisualStyle.ce0e2e7;
+    background: !root.enabled ? VisualStyle.cf8f8f9 : command-touch.pressed ? VisualStyle.cdde3ed : command-touch.has-hover ? VisualStyle.cedf1f6 : VisualStyle.cffffff;
     opacity: root.enabled ? 1 : 0.5;
     HorizontalLayout {
         padding-left: 9px;
         padding-right: 9px;
         spacing: 6px;
         InlineIcon { icon-source: root.icon-source; icon-size: 16px; }
-        Text { text: root.label; color: #30333a; font-size: 12px; vertical-alignment: center; }
+        Text { text: root.label; color: VisualStyle.c30333a; font-size: 12px; vertical-alignment: center; }
     }
     command-touch := TouchArea {
         enabled: root.enabled;
@@ -80,7 +123,7 @@ component SidebarGroupHeader inherits Rectangle {
     in property <bool> expanded: true;
     callback toggled();
     height: 30px;
-    background: group-touch.has-hover ? #e5e9f2 : transparent;
+    background: group-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
     border-radius: 5px;
     HorizontalLayout {
         padding-left: 7px; padding-right: 7px; spacing: 7px;
@@ -90,10 +133,10 @@ component SidebarGroupHeader inherits Rectangle {
                 x: 2px; y: 2px; width: 8px; height: 8px;
                 viewbox-width: 8; viewbox-height: 8; fit: fill;
                 commands: root.expanded ? "M 1 2.5 L 4 5.5 L 7 2.5" : "M 2.5 1 L 5.5 4 L 2.5 7";
-                stroke: #666a74; stroke-width: 1.2px; stroke-line-cap: round; stroke-line-join: round; fill: transparent;
+                stroke: VisualStyle.c666a74; stroke-width: 1.2px; stroke-line-cap: round; stroke-line-join: round; fill: transparent;
             }
         }
-        Text { text: root.label; color: #777a84; font-size: 12px; font-weight: 700; vertical-alignment: center; }
+        Text { text: root.label; color: VisualStyle.c777a84; font-size: 12px; font-weight: 700; vertical-alignment: center; }
     }
     group-touch := TouchArea { mouse-cursor: pointer; clicked => { root.toggled(); } }
     accessible-role: button;
@@ -106,19 +149,19 @@ component WindowButton inherits Rectangle {
     callback clicked();
     width: 46px;
     height: 40px;
-    background: root.kind == 2 && button-touch.has-hover ? #c42b1c : button-touch.pressed ? #d9dce2 : button-touch.has-hover ? #e8eaf0 : transparent;
+    background: root.kind == 2 && button-touch.has-hover ? VisualStyle.cc42b1c : button-touch.pressed ? VisualStyle.cd9dce2 : button-touch.has-hover ? VisualStyle.ce8eaf0 : transparent;
     Rectangle {
         visible: root.kind == 0;
         width: 10px; height: 1px;
         x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-        background: root.kind == 2 && button-touch.has-hover ? #ffffff : #303138;
+        background: root.kind == 2 && button-touch.has-hover ? VisualStyle.cffffff : VisualStyle.c303138;
     }
     Rectangle {
         visible: root.kind == 1;
         width: 9px; height: 9px;
         x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
         border-width: 1px;
-        border-color: #303138;
+        border-color: VisualStyle.c303138;
         background: transparent;
     }
     Image {
@@ -126,7 +169,8 @@ component WindowButton inherits Rectangle {
         width: 14px; height: 14px;
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
-        source: button-touch.has-hover ? @image-url("icons/actions/close-white.svg") : @image-url("icons/actions/close.svg");
+        source: button-touch.has-hover ? IconMap.action-close-hover : IconMap.action-close;
+        colorize: button-touch.has-hover ? #ffffff : VisualStyle.c303138;
     }
     button-touch := TouchArea { clicked => { root.clicked(); } }
     accessible-role: button;
@@ -141,7 +185,7 @@ component LightScrollBar inherits Rectangle {
 
     width: 12px;
     visible: root.maximum > 0px;
-    background: scroll-touch.has-hover ? #f1f2f4 : transparent;
+    background: scroll-touch.has-hover ? VisualStyle.cf1f2f4 : transparent;
     border-radius: 6px;
 
     private property <length> track-padding: 4px;
@@ -155,7 +199,7 @@ component LightScrollBar inherits Rectangle {
         x: parent.width - self.width - 3px;
         y: root.track-padding + root.thumb-travel * (-root.value / root.maximum);
         border-radius: self.width / 2;
-        background: scroll-touch.has-hover ? #9a9da3 : #aeb1b6;
+        background: scroll-touch.has-hover ? VisualStyle.c9a9da3 : VisualStyle.caeb1b6;
     }
 
     scroll-touch := TouchArea {
@@ -183,13 +227,13 @@ component BreadcrumbButton inherits Rectangle {
     min-width: 42px;
     height: 30px;
     border-radius: 4px;
-    background: !root.current && crumb-touch.has-hover ? #edf1f6 : transparent;
+    background: !root.current && crumb-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
     HorizontalLayout {
         padding-left: 8px;
         padding-right: 8px;
         spacing: 5px;
-        Text { text: root.label; color: #30333a; font-size: 12px; font-weight: root.current ? 600 : 400; vertical-alignment: center; }
-        Text { visible: !root.current; text: "›"; color: #777b85; font-size: 14px; vertical-alignment: center; }
+        Text { text: root.label; color: VisualStyle.c30333a; font-size: 12px; font-weight: root.current ? 600 : 400; vertical-alignment: center; }
+        Text { visible: !root.current; text: "›"; color: VisualStyle.c777b85; font-size: 14px; vertical-alignment: center; }
     }
     crumb-touch := TouchArea {
         mouse-cursor: pointer;
@@ -203,6 +247,8 @@ component BreadcrumbButton inherits Rectangle {
 component AddressEditor inherits Rectangle {
     in-out property <string> text;
     in property <bool> has-error: false;
+    in property <string> address-label;
+    in property <string> cancel-label;
     callback accepted(string);
     callback cancelled();
 
@@ -211,7 +257,7 @@ component AddressEditor inherits Rectangle {
         editor.select-all();
     }
 
-    background: #ffffff;
+    background: VisualStyle.cffffff;
     forward-focus: editor;
     property <bool> editor-has-focus: editor.has-focus;
 
@@ -226,14 +272,14 @@ component AddressEditor inherits Rectangle {
         width: parent.width - 38px;
         height: parent.height;
         text <=> root.text;
-        color: #30333a;
-        selection-background-color: #c7d7ff;
-        selection-foreground-color: #24252a;
+        color: VisualStyle.c30333a;
+        selection-background-color: VisualStyle.cc7d7ff;
+        selection-foreground-color: VisualStyle.c24252a;
         font-size: 13px;
         single-line: true;
         vertical-alignment: center;
         accessible-role: text-input;
-        accessible-label: "路径";
+        accessible-label: root.address-label;
         accepted => { root.accepted(root.text); }
         key-pressed(event) => {
             if event.text == Key.Escape {
@@ -250,20 +296,21 @@ component AddressEditor inherits Rectangle {
         width: 30px;
         height: parent.height;
         border-radius: 4px;
-        background: dismiss-touch.pressed ? #dde3ed : dismiss-touch.has-hover ? #edf1f6 : transparent;
+        background: dismiss-touch.pressed ? VisualStyle.cdde3ed : dismiss-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
         Image {
             width: 16px;
             height: 16px;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
-            source: @image-url("icons/actions/close.svg");
+            source: IconMap.action-close;
+            colorize: VisualStyle.c303138;
         }
         dismiss-touch := TouchArea {
             mouse-cursor: pointer;
             clicked => { root.cancelled(); }
         }
         accessible-role: button;
-        accessible-label: "取消编辑";
+        accessible-label: root.cancel-label;
     }
 }
 
@@ -276,7 +323,8 @@ export component AppWindow inherits Window {
     preferred-height: 760px;
     min-width: 820px;
     min-height: 520px;
-    background: #f5f6f8;
+    background: VisualStyle.cf5f6f8;
+    changed dark-theme => { VisualStyle.dark-theme = root.dark-theme; }
     in property <length> window-width: 1180px;
     default-font-family: "Segoe UI";
 
@@ -311,7 +359,30 @@ export component AppWindow inherits Window {
     in property <int> sort-field: 0;
     in property <bool> sort-descending: false;
     in property <int> page-state: 0;
-    in property <string> language-label: "EN";
+    in property <bool> dark-theme: false;
+    in property <int> theme-mode: 0;
+    in property <int> language-mode: 0;
+    in property <string> text-menu: "菜单";
+    in property <string> text-settings: "设置";
+    in property <string> text-settings-title: "设置";
+    in property <string> text-close-settings: "关闭设置";
+    in property <string> text-theme: "主题";
+    in property <string> text-theme-system: "跟随系统";
+    in property <string> text-theme-light: "浅色";
+    in property <string> text-theme-dark: "深色";
+    in property <string> text-language: "语言";
+    in property <string> text-language-chinese: "中文";
+    in property <string> text-language-english: "English";
+    in property <string> text-loading: "正在加载…";
+    in property <string> text-empty-folder: "此文件夹为空";
+    in property <string> text-new-tab: "新建标签";
+    in property <string> text-close-tab: "关闭标签";
+    in property <string> text-window-minimize: "最小化";
+    in property <string> text-window-restore: "还原";
+    in property <string> text-window-maximize: "最大化";
+    in property <string> text-window-close: "关闭";
+    in property <string> text-cancel-edit: "取消编辑";
+    in property <string> text-address: "路径";
     in property <string> text-go: "前往";
     in property <string> text-back: "后退";
     in property <string> text-forward: "前进";
@@ -357,10 +428,14 @@ export component AppWindow inherits Window {
     callback close-tab(int);
     callback restore-tab();
     callback activate-tab(int);
-    callback toggle-language();
+    callback open-settings();
+    callback change-theme(int);
+    callback change-language(int);
     callback drag-window();
 
     private property <bool> compact: root.window-width < 1000px;
+    private property <bool> menu-open: false;
+    private property <bool> settings-open: false;
     private property <bool> minimal: root.window-width < 900px;
 
     public function focus-address-editor() { address-editor.focus-and-select-all(); }
@@ -394,12 +469,20 @@ export component AppWindow inherits Window {
     VerticalLayout {
         spacing: 0px;
         Rectangle {
-            height: 46px; background: #f1f2f5;
+            height: 46px; background: VisualStyle.cf1f2f5;
             HorizontalLayout {
                 x: 8px; y: 12px; width: parent.width - 8px - 3 * 46px; height: 34px; spacing: 5px;
+                Rectangle {
+                    width: 34px; height: 34px; border-radius: 6px;
+                    background: menu-touch.pressed ? VisualStyle.cd9dce2 : menu-touch.has-hover ? VisualStyle.ce8eaf0 : transparent;
+                    Image { width: 20px; height: 20px; x: 7px; y: 7px; source: IconMap.action-menu; colorize: VisualStyle.c303138; }
+                    menu-touch := TouchArea { mouse-cursor: pointer; clicked => { root.menu-open = !root.menu-open; } }
+                    accessible-role: button; accessible-label: root.text-menu;
+                    Tooltip { text: @markdown("\{root.text-menu}"); }
+                }
                 for tab in root.tabs: Rectangle {
                     width: root.minimal ? 112px : 178px; height: 34px;
-                    background: tab.active ? #fafbfc : (tab-touch.has-hover ? #e8eaf0 : #f1f2f5);
+                    background: tab.active ? VisualStyle.cfafbfc : (tab-touch.has-hover ? VisualStyle.ce8eaf0 : VisualStyle.cf1f2f5);
                     border-width: 0px;
                     border-radius: tab.active ? 7px : 0px;
                     Path {
@@ -407,7 +490,7 @@ export component AppWindow inherits Window {
                         x: -7px; y: parent.height - 10px; width: parent.width + 14px; height: 10px;
                         viewbox-width: 100; viewbox-height: 10; fit: fill; clip: true;
                         commands: "M 0 10 C 2 10 3.6 8 3.6 5 L 3.6 0 L 96.4 0 L 96.4 5 C 96.4 8 98 10 100 10 Z";
-                        fill: #fafbfc;
+                        fill: VisualStyle.cfafbfc;
                     }
                     tab-touch := TouchArea {
                         mouse-cursor: pointer;
@@ -420,23 +503,23 @@ export component AppWindow inherits Window {
                     }
                     HorizontalLayout {
                         padding-left: 10px; padding-right: 7px; spacing: 6px;
-                        InlineIcon { icon-source: @image-url("icons/files/folder.svg"); icon-size: 16px; }
-                        Text { text: tab.title; color: #303138; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
-                        Text { visible: tab.loading && !(root.can-close-tab && tab-touch.has-hover); text: "…"; color: #4f6bed; vertical-alignment: center; }
+                        InlineIcon { icon-source: IconMap.file-folder; icon-size: 16px; }
+                        Text { text: tab.title; color: VisualStyle.c303138; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                        Text { visible: tab.loading && !(root.can-close-tab && tab-touch.has-hover); text: "…"; color: VisualStyle.c4f6bed; vertical-alignment: center; }
                         Rectangle {
                             visible: root.can-close-tab && (tab-touch.has-hover || close-touch.has-hover);
                             width: 24px; height: 34px;
                             Rectangle {
                                 width: 24px; height: 24px; y: 5px; border-radius: 4px;
-                                background: close-touch.pressed ? #d7dae0 : close-touch.has-hover ? #e1e4ea : transparent;
-                                Image { width: 12px; height: 12px; x: 6px; y: 6px; source: @image-url("icons/actions/close.svg"); }
+                                background: close-touch.pressed ? VisualStyle.cd7dae0 : close-touch.has-hover ? VisualStyle.ce1e4ea : transparent;
+                                Image { width: 12px; height: 12px; x: 6px; y: 6px; source: IconMap.action-close; colorize: VisualStyle.c303138; }
                             }
                             close-touch := TouchArea { mouse-cursor: pointer; clicked => { root.close-tab(tab.id); } }
-                            accessible-role: button; accessible-label: "关闭标签";
+                            accessible-role: button; accessible-label: root.text-close-tab;
                         }
                     }
                 }
-                Rectangle { width: 34px; height: 34px; border-radius: 6px; background: add-touch.pressed ? #d9dce2 : add-touch.has-hover ? #e8eaf0 : transparent; Image { width: 20px; height: 20px; x: 9px; y: 9px; source: @image-url("icons/actions/add.svg"); } add-touch := TouchArea { mouse-cursor: pointer; clicked => { root.new-tab(); } } accessible-role: button; accessible-label: "新建标签"; Tooltip { text: @markdown("新建标签 (Ctrl+T)"); } }
+                Rectangle { width: 34px; height: 34px; border-radius: 6px; background: add-touch.pressed ? VisualStyle.cd9dce2 : add-touch.has-hover ? VisualStyle.ce8eaf0 : transparent; Image { width: 20px; height: 20px; x: 9px; y: 9px; source: IconMap.action-add; colorize: VisualStyle.c303138; } add-touch := TouchArea { mouse-cursor: pointer; clicked => { root.new-tab(); } } accessible-role: button; accessible-label: root.text-new-tab; Tooltip { text: @markdown("\{root.text-new-tab} (Ctrl+T)"); } }
                 Rectangle {
                     horizontal-stretch: 1;
                     drag-touch := TouchArea {
@@ -447,68 +530,60 @@ export component AppWindow inherits Window {
             }
             HorizontalLayout {
                 x: parent.width - 3 * 46px; y: 0px; width: 3 * 46px; height: 40px; spacing: 0px;
-                WindowButton { kind: 0; label: "最小化"; clicked => { root.minimized = true; } }
-                WindowButton { kind: 1; label: root.maximized ? "还原" : "最大化"; clicked => { root.maximized = !root.maximized; } }
-                WindowButton { kind: 2; label: "关闭"; clicked => { root.close(); } }
+                WindowButton { kind: 0; label: root.text-window-minimize; clicked => { root.minimized = true; } }
+                WindowButton { kind: 1; label: root.maximized ? root.text-window-restore : root.text-window-maximize; clicked => { root.maximized = !root.maximized; } }
+                WindowButton { kind: 2; label: root.text-window-close; clicked => { root.close(); } }
             }
         }
 
         Rectangle {
-            height: 56px; background: #fafbfc; border-color: #e2e4e9; border-width: 0px;
+            height: 56px; background: VisualStyle.cfafbfc; border-color: VisualStyle.ce2e4e9; border-width: 0px;
             HorizontalLayout {
                 padding-top: 9px; padding-bottom: 9px; padding-left: 14px; padding-right: 14px; spacing: 7px;
-                ContextMenuArea { width: 38px; height: 38px; IconButton { icon-source: @image-url("icons/actions/back.svg"); tip: root.text-back + " (Alt+Left)"; enabled: root.can-navigate-back; button-label: root.text-back; clicked => { root.navigate-back(); } } Menu { for history in root.back-history: MenuItem { title: history.label; activated => { root.navigate-history(true, history.index); } } } }
-                ContextMenuArea { visible: !root.minimal; width: 38px; height: 38px; IconButton { icon-source: @image-url("icons/actions/forward.svg"); tip: root.text-forward + " (Alt+Right)"; enabled: root.can-navigate-forward; button-label: root.text-forward; clicked => { root.navigate-forward(); } } Menu { for history in root.forward-history: MenuItem { title: history.label; activated => { root.navigate-history(false, history.index); } } } }
-                IconButton { visible: !root.compact; icon-source: @image-url("icons/actions/up.svg"); tip: root.text-up + " (Alt+Up)"; enabled: root.can-navigate-up; button-label: root.text-up; clicked => { root.navigate-up(); } }
-                IconButton { visible: !root.compact; icon-source: @image-url("icons/actions/refresh.svg"); tip: root.text-refresh + " (F5)"; enabled: root.can-refresh; button-label: root.text-refresh; clicked => { root.refresh(); } }
+                ContextMenuArea { width: 38px; height: 38px; IconButton { icon-source: IconMap.action-back; tip: root.text-back + " (Alt+Left)"; enabled: root.can-navigate-back; button-label: root.text-back; clicked => { root.navigate-back(); } } Menu { for history in root.back-history: MenuItem { title: history.label; activated => { root.navigate-history(true, history.index); } } } }
+                ContextMenuArea { visible: !root.minimal; width: 38px; height: 38px; IconButton { icon-source: IconMap.action-forward; tip: root.text-forward + " (Alt+Right)"; enabled: root.can-navigate-forward; button-label: root.text-forward; clicked => { root.navigate-forward(); } } Menu { for history in root.forward-history: MenuItem { title: history.label; activated => { root.navigate-history(false, history.index); } } } }
+                IconButton { visible: !root.compact; icon-source: IconMap.action-up; tip: root.text-up + " (Alt+Up)"; enabled: root.can-navigate-up; button-label: root.text-up; clicked => { root.navigate-up(); } }
+                IconButton { visible: !root.compact; icon-source: IconMap.action-refresh; tip: root.text-refresh + " (F5)"; enabled: root.can-refresh; button-label: root.text-refresh; clicked => { root.refresh(); } }
                 Rectangle {
-                    height: 38px; horizontal-stretch: 1; background: #ffffff; border-color: #d7dae0; border-width: 1px; border-radius: 5px;
-                    if !root.address-editing: Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; HorizontalLayout { padding-left: 8px; padding-right: 8px; padding-top: 3px; padding-bottom: 3px; spacing: 2px; InlineIcon { icon-source: @image-url("icons/files/folder.svg"); icon-size: 16px; } for crumb in root.breadcrumbs: BreadcrumbButton { label: crumb.label; current: crumb.current; clicked => { root.navigate-breadcrumb(crumb.index); } } Rectangle { horizontal-stretch: 1; TouchArea { mouse-cursor: pointer; clicked => { root.begin-address-edit(); } } } } }
-                    address-editor := AddressEditor { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: parent.height - 4px; text <=> root.address-input; accepted(value) => { root.navigate-path(value); } cancelled => { root.cancel-address-edit(); } }
+                    height: 38px; horizontal-stretch: 1; background: VisualStyle.cffffff; border-color: VisualStyle.cd7dae0; border-width: 1px; border-radius: 5px;
+                    if !root.address-editing: Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; HorizontalLayout { padding-left: 8px; padding-right: 8px; padding-top: 3px; padding-bottom: 3px; spacing: 2px; InlineIcon { icon-source: IconMap.file-folder; icon-size: 16px; } for crumb in root.breadcrumbs: BreadcrumbButton { label: crumb.label; current: crumb.current; clicked => { root.navigate-breadcrumb(crumb.index); } } Rectangle { horizontal-stretch: 1; TouchArea { mouse-cursor: pointer; clicked => { root.begin-address-edit(); } } } } }
+                    address-editor := AddressEditor { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: parent.height - 4px; text <=> root.address-input; address-label: root.text-address; cancel-label: root.text-cancel-edit; accepted(value) => { root.navigate-path(value); } cancelled => { root.cancel-address-edit(); } }
 
                 }
-                IconButton { visible: !root.minimal; icon-source: @image-url("icons/actions/forward.svg"); tip: root.text-go; button-label: root.text-go; clicked => { root.address-editing ? root.navigate-path(root.address-input) : root.begin-address-edit(); } }
+                IconButton { visible: !root.minimal; icon-source: IconMap.action-forward; tip: root.text-go; button-label: root.text-go; clicked => { root.address-editing ? root.navigate-path(root.address-input) : root.begin-address-edit(); } }
             }
         }
 
         HorizontalLayout {
             spacing: 0px;
             if !root.minimal: Rectangle {
-                width: root.compact ? 184px : 218px; background: #f1f2f5; border-color: #e2e3e7; border-width: 1px;
+                width: root.compact ? 184px : 218px; background: VisualStyle.cf1f2f5; border-color: VisualStyle.ce2e3e7; border-width: 1px;
                 VerticalLayout {
                     padding-top: 4px; padding-bottom: 12px; padding-left: 10px; padding-right: 10px; spacing: 0px;
                     SidebarGroupHeader { label: root.text-quick-access; expanded: root.quick-access-expanded; toggled => { root.quick-access-expanded = !root.quick-access-expanded; } }
                     for location in root.sidebar-items: Rectangle {
                         visible: !location.is-drive && root.quick-access-expanded;
-                        height: self.visible ? 34px : 0px; border-radius: 5px; background: location.selected ? #dce6ff : (side-touch.has-hover ? #e5e9f2 : transparent); border-color: location.selected ? #4f6bed : transparent; border-width: location.selected ? 2px : 0px;
-                        HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon-kind == 0 ? @image-url("icons/locations/home.svg") : location.icon-kind == 1 ? @image-url("icons/locations/desktop.svg") : location.icon-kind == 2 ? @image-url("icons/locations/downloads.svg") : location.icon-kind == 3 ? @image-url("icons/locations/documents.svg") : location.icon-kind == 4 ? @image-url("icons/locations/pictures.svg") : location.icon-kind == 5 ? @image-url("icons/locations/music.svg") : @image-url("icons/locations/video.svg"); } Text { text: location.label; color: #4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
+                        height: self.visible ? 34px : 0px; border-radius: 5px; background: location.selected ? VisualStyle.cdce6ff : (side-touch.has-hover ? VisualStyle.ce5e9f2 : transparent); border-color: location.selected ? VisualStyle.c4f6bed : transparent; border-width: location.selected ? 2px : 0px;
+                        HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : (location.icon-kind == 0 ? IconMap.location-home : location.icon-kind == 1 ? IconMap.location-desktop : location.icon-kind == 2 ? IconMap.location-downloads : location.icon-kind == 3 ? IconMap.location-documents : location.icon-kind == 4 ? IconMap.location-pictures : location.icon-kind == 5 ? IconMap.location-music : IconMap.location-videos); } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         side-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-sidebar(location.index); } }
                         accessible-role: button; accessible-label: location.label;
                     }
                     SidebarGroupHeader { label: root.text-drives; expanded: root.drives-expanded; toggled => { root.drives-expanded = !root.drives-expanded; } }
                     for location in root.sidebar-items: Rectangle {
                         visible: location.is-drive && root.drives-expanded;
-                        height: self.visible ? 34px : 0px; border-radius: 5px; background: location.selected ? #dce6ff : (drive-touch.has-hover ? #e5e9f2 : transparent); border-color: location.selected ? #4f6bed : transparent; border-width: location.selected ? 2px : 0px;
-                        HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: @image-url("icons/locations/drive.svg"); } Text { text: location.label; color: #4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
+                        height: self.visible ? 34px : 0px; border-radius: 5px; background: location.selected ? VisualStyle.cdce6ff : (drive-touch.has-hover ? VisualStyle.ce5e9f2 : transparent); border-color: location.selected ? VisualStyle.c4f6bed : transparent; border-width: location.selected ? 2px : 0px;
+                        HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.location-drive; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         drive-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-sidebar(location.index); } }
                         accessible-role: button; accessible-label: location.label;
                     }
                     Rectangle { vertical-stretch: 1; }
-                    Rectangle {
-                        width: 38px; height: 38px; border-radius: 5px;
-                        background: language-touch.pressed ? #d7dce5 : language-touch.has-hover ? #e3e7ef : transparent;
-                        Image { width: 20px; height: 20px; x: 9px; y: 9px; source: @image-url("icons/actions/language.svg"); }
-                        language-touch := TouchArea { mouse-cursor: pointer; clicked => { root.toggle-language(); } }
-                        accessible-role: button; accessible-label: "切换语言";
-                        Tooltip { text: @markdown("切换语言"); }
-                    }
                 }
             }
 
             VerticalLayout {
                 spacing: 0px;
                 Rectangle {
-                    height: 38px; background: #ffffff; border-color: #e7e8eb; border-width: 1px;
+                    height: 38px; background: VisualStyle.cffffff; border-color: VisualStyle.ce7e8eb; border-width: 1px;
                     HorizontalLayout {
                         padding-left: 16px; padding-right: 16px; spacing: 12px;
                         for column in root.columns: Rectangle {
@@ -521,7 +596,7 @@ export component AppWindow inherits Window {
                                 width: parent.width - self.x;
                                 horizontal-alignment: left;
                                 text: (column.kind == 0 ? root.text-name : column.kind == 1 ? root.text-type : column.kind == 2 ? root.text-size : root.text-modified) + (root.sort-field == column.kind ? (root.sort-descending ? " ↓" : " ↑") : "");
-                                color: root.sort-field == column.kind ? #3b4f83 : #696b74;
+                                color: root.sort-field == column.kind ? VisualStyle.c3b4f83 : VisualStyle.c696b74;
                                 font-size: 12px; font-weight: root.sort-field == column.kind ? 600 : 400; vertical-alignment: center;
                             }
                             column-touch := TouchArea {
@@ -545,14 +620,14 @@ export component AppWindow inherits Window {
                 }
 
                 Rectangle {
-                    vertical-stretch: 1; background: #ffffff;
+                    vertical-stretch: 1; background: VisualStyle.cffffff;
                     background-touch := TouchArea { enabled: root.files.length > 0; clicked => { root.clear-selection(); } }
                     list := ListView {
                         visible: root.files.length > 0;
                         vertical-scrollbar-policy: ScrollBarPolicy.always-off;
                         for entry in root.files: Rectangle {
                             width: list.width;
-                            height: 40px; background: entry.selected ? #dce6ff : (mouse.has-hover ? #eff4ff : #ffffff); border-color: #4f6bed; border-width: entry.focused ? 2px : 0px;
+                            height: 40px; background: entry.selected ? VisualStyle.cdce6ff : (mouse.has-hover ? VisualStyle.ceff4ff : VisualStyle.cffffff); border-color: VisualStyle.c4f6bed; border-width: entry.focused ? 2px : 0px;
                             HorizontalLayout {
                                 padding-left: 16px; padding-right: 16px; spacing: 12px;
                                 for column in root.columns: HorizontalLayout {
@@ -560,8 +635,8 @@ export component AppWindow inherits Window {
                                     width: column.kind == 0 ? (root.compact ? 65% : 52%) : column.kind == 1 ? 16% : column.kind == 2 ? (root.compact ? 35% : 14%) : 18%;
                             horizontal-stretch: column.kind == 3 ? 1 : 0;
                                     spacing: column.kind == 0 ? 9px : 0px;
-                                    InlineIcon { visible: column.kind == 0; icon-source: entry.is-directory ? @image-url("icons/files/folder.svg") : @image-url("icons/files/document.svg"); }
-                                    Text { text: column.kind == 0 ? entry.name : column.kind == 1 ? entry.kind : column.kind == 2 ? entry.size : entry.modified; color: column.kind == 0 ? #24252a : #6f717a; font-size: column.kind == 0 ? 13px : 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; horizontal-alignment: column.kind == 2 ? right : left; }
+                                    InlineIcon { visible: column.kind == 0; icon-source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document); }
+                                    Text { text: column.kind == 0 ? entry.name : column.kind == 1 ? entry.kind : column.kind == 2 ? entry.size : entry.modified; color: column.kind == 0 ? VisualStyle.c24252a : VisualStyle.c6f717a; font-size: column.kind == 0 ? 13px : 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; horizontal-alignment: column.kind == 2 ? right : left; }
                                 }
                             }
                             mouse := TouchArea {
@@ -588,13 +663,13 @@ export component AppWindow inherits Window {
                     }
                     if root.page-state == 1 || root.page-state == 3: VerticalLayout {
                         alignment: center; spacing: 8px;
-                        Text { text: root.page-state == 1 ? "正在加载…" : "此文件夹为空"; color: #62656f; font-size: 16px; horizontal-alignment: center; }
+                        Text { text: root.page-state == 1 ? root.text-loading : root.text-empty-folder; color: VisualStyle.c62656f; font-size: 16px; horizontal-alignment: center; }
                     }
                     if root.page-state >= 5: VerticalLayout {
                         alignment: center; spacing: 12px;
-                        HorizontalLayout { alignment: center; Image { width: 48px; height: 48px; source: @image-url("icons/status/lock-closed.svg"); } }
-                        Text { text: root.error-page-title; color: #30333a; font-size: 20px; font-weight: 600; horizontal-alignment: center; }
-                        Text { text: root.error-page-description; color: #62656f; font-size: 13px; horizontal-alignment: center; }
+                        HorizontalLayout { alignment: center; Image { width: 48px; height: 48px; source: IconMap.status-locked; } }
+                        Text { text: root.error-page-title; color: VisualStyle.c30333a; font-size: 20px; font-weight: 600; horizontal-alignment: center; }
+                        Text { text: root.error-page-description; color: VisualStyle.c62656f; font-size: 13px; horizontal-alignment: center; }
                         Rectangle { height: 4px; }
                         error-page-actions := Rectangle {
                             height: 32px;
@@ -602,18 +677,87 @@ export component AppWindow inherits Window {
                             accessible-id: "error-page-actions";
                             HorizontalLayout {
                                 alignment: center; spacing: 8px;
-                                if root.show-request-access: CommandButton { width: 196px; icon-source: @image-url("icons/status/lock-closed.svg"); label: root.text-request-access; clicked => { root.request-folder-access(); } }
+                                if root.show-request-access: CommandButton { width: 196px; icon-source: IconMap.status-locked; label: root.text-request-access; clicked => { root.request-folder-access(); } }
                             }
                         }
                     }
 
                 }
 
-                Rectangle { height: 30px; background: #fafbfc; border-color: #e7e8eb; border-width: 1px; Text { x: 14px; text: root.status-text; color: #72747d; font-size: 11px; vertical-alignment: center; } }
+                Rectangle { height: 30px; background: VisualStyle.cfafbfc; border-color: VisualStyle.ce7e8eb; border-width: 1px; Text { x: 14px; text: root.status-text; color: VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; } }
             }
         }
     }
 
+    if root.menu-open: Rectangle {
+        x: 8px; y: 46px; width: 190px; height: 54px; z: 20;
+        background: VisualStyle.cffffff; border-color: VisualStyle.ce0e2e7; border-width: 1px; border-radius: 7px;
+        Rectangle {
+            x: 6px; y: 6px; width: parent.width - 12px; height: 42px; border-radius: 5px;
+            background: settings-menu-touch.pressed ? VisualStyle.cdde3ed : settings-menu-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
+            HorizontalLayout {
+                padding-left: 10px; padding-right: 10px; spacing: 10px;
+                Image { width: 18px; height: 18px; source: IconMap.action-settings; colorize: VisualStyle.c303138; }
+                Text { text: root.text-settings; color: VisualStyle.c30333a; font-size: 13px; vertical-alignment: center; }
+            }
+            settings-menu-touch := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.menu-open = false; root.settings-open = true; root.open-settings(); }
+            }
+            accessible-role: button; accessible-label: root.text-settings;
+        }
+    }
+
+    if root.settings-open: Rectangle {
+        z: 30; width: parent.width; height: parent.height; background: #00000066;
+        TouchArea { clicked => { root.settings-open = false; } }
+        Rectangle {
+            width: min(600px, parent.width - 48px); height: min(520px, parent.height - 48px);
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            background: VisualStyle.cffffff; border-color: VisualStyle.ce0e2e7; border-width: 1px; border-radius: 10px;
+            TouchArea { }
+            VerticalLayout {
+                padding-left: 28px; padding-right: 28px; padding-top: 22px; padding-bottom: 24px; spacing: 18px;
+                HorizontalLayout {
+                    height: 38px; spacing: 10px;
+                    Text { text: root.text-settings-title; color: VisualStyle.c30333a; font-size: 22px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; }
+                    Rectangle {
+                        width: 38px; height: 38px; border-radius: 5px;
+                        background: settings-close-touch.pressed ? VisualStyle.cdde3ed : settings-close-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
+                        Image { width: 16px; height: 16px; x: 11px; y: 11px; source: IconMap.action-close; colorize: VisualStyle.c303138; }
+                        settings-close-touch := TouchArea { mouse-cursor: pointer; clicked => { root.settings-open = false; } }
+                        accessible-role: button; accessible-label: root.text-close-settings;
+                    }
+                }
+                Text { text: root.text-theme; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
+                HorizontalLayout {
+                    height: 44px; spacing: 8px;
+                    for theme-option[index] in [root.text-theme-system, root.text-theme-light, root.text-theme-dark]: Rectangle {
+                        horizontal-stretch: 1; height: 40px; border-radius: 6px; border-width: root.theme-mode == index ? 2px : 1px;
+                        border-color: root.theme-mode == index ? VisualStyle.c4f6bed : VisualStyle.ce0e2e7;
+                        background: theme-touch.pressed ? VisualStyle.cdde3ed : theme-touch.has-hover ? VisualStyle.cedf1f6 : VisualStyle.cffffff;
+                        Text { text: theme-option; color: VisualStyle.c30333a; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                        theme-touch := TouchArea { mouse-cursor: pointer; clicked => { root.change-theme(index); } }
+                        accessible-role: button; accessible-label: theme-option;
+                    }
+                }
+                Rectangle { height: 1px; background: VisualStyle.ce7e8eb; }
+                Text { text: root.text-language; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
+                HorizontalLayout {
+                    height: 44px; spacing: 8px;
+                    for language-option[index] in [root.text-language-chinese, root.text-language-english]: Rectangle {
+                        horizontal-stretch: 1; height: 40px; border-radius: 6px; border-width: root.language-mode == index ? 2px : 1px;
+                        border-color: root.language-mode == index ? VisualStyle.c4f6bed : VisualStyle.ce0e2e7;
+                        background: language-option-touch.pressed ? VisualStyle.cdde3ed : language-option-touch.has-hover ? VisualStyle.cedf1f6 : VisualStyle.cffffff;
+                        Text { text: language-option; color: VisualStyle.c30333a; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                        language-option-touch := TouchArea { mouse-cursor: pointer; clicked => { root.change-language(index); } }
+                        accessible-role: button; accessible-label: language-option;
+                    }
+                }
+                Rectangle { vertical-stretch: 1; }
+            }
+        }
+    }
     if root.address-editing: Rectangle {
         y: 0px;
         width: parent.width;

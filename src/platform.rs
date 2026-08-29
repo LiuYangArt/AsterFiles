@@ -1,3 +1,5 @@
+pub mod windows_shell_icons;
+
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +24,39 @@ pub struct KnownLocation {
 pub struct ShortcutTarget {
     pub path: PathBuf,
     pub is_directory: Option<bool>,
+}
+
+#[cfg(windows)]
+pub fn system_uses_dark_theme() -> bool {
+    use std::{ffi::c_void, ptr};
+    use windows_sys::Win32::{
+        Foundation::ERROR_SUCCESS,
+        System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
+    };
+
+    let subkey = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    let value_name = "AppsUseLightTheme\0".encode_utf16().collect::<Vec<_>>();
+    let mut value = 1_u32;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value_name.as_ptr(),
+            RRF_RT_REG_DWORD,
+            ptr::null_mut(),
+            (&mut value as *mut u32).cast::<c_void>(),
+            &mut size,
+        )
+    };
+    result == ERROR_SUCCESS && value == 0
+}
+
+#[cfg(not(windows))]
+pub fn system_uses_dark_theme() -> bool {
+    false
 }
 
 #[cfg(windows)]

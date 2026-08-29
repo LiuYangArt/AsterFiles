@@ -4,10 +4,39 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::i18n::Language;
+
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-const MAGIC: &[u8; 5] = b"ASTF3";
+const MAGIC: &[u8; 5] = b"ASTF4";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ThemeMode {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemeMode {
+    pub const fn storage_code(self) -> u8 {
+        match self {
+            Self::System => 0,
+            Self::Light => 1,
+            Self::Dark => 2,
+        }
+    }
+
+    pub const fn from_storage_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::System),
+            1 => Some(Self::Light),
+            2 => Some(Self::Dark),
+            _ => None,
+        }
+    }
+}
 pub type ColumnOrder = [u8; 4];
 pub const DEFAULT_COLUMN_ORDER: ColumnOrder = [0, 1, 2, 3];
 const MAX_TABS: usize = 1_024;
@@ -31,14 +60,35 @@ pub struct SessionState {
     pub active_tab: usize,
     pub tab_paths: Vec<PathBuf>,
     pub column_order: ColumnOrder,
+    pub theme_mode: ThemeMode,
+    pub language: Language,
 }
 
 impl SessionState {
+    #[cfg(test)]
     pub fn new(
         window: WindowPlacement,
         active_tab: usize,
         tab_paths: Vec<PathBuf>,
         column_order: ColumnOrder,
+    ) -> io::Result<Self> {
+        Self::with_settings(
+            window,
+            active_tab,
+            tab_paths,
+            column_order,
+            ThemeMode::System,
+            Language::Chinese,
+        )
+    }
+
+    pub fn with_settings(
+        window: WindowPlacement,
+        active_tab: usize,
+        tab_paths: Vec<PathBuf>,
+        column_order: ColumnOrder,
+        theme_mode: ThemeMode,
+        language: Language,
     ) -> io::Result<Self> {
         validate_window(window)?;
         validate_column_order(column_order)?;
@@ -57,6 +107,8 @@ impl SessionState {
             active_tab,
             tab_paths,
             column_order,
+            theme_mode,
+            language,
         })
     }
 }
@@ -80,11 +132,13 @@ pub fn save(path: &Path, state: &SessionState) -> io::Result<()> {
 }
 
 fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
-    let state = SessionState::new(
+    let state = SessionState::with_settings(
         state.window,
         state.active_tab,
         state.tab_paths.clone(),
         state.column_order,
+        state.theme_mode,
+        state.language,
     )?;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(MAGIC);
@@ -95,6 +149,8 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
     bytes.extend_from_slice(&(state.active_tab as u32).to_le_bytes());
     bytes.extend_from_slice(&(state.tab_paths.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&state.column_order);
+    bytes.push(state.theme_mode.storage_code());
+    bytes.push(state.language.storage_code());
 
     for path in &state.tab_paths {
         let units = encode_os(path.as_os_str());
@@ -127,6 +183,10 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
         return Err(invalid_data("too many session tabs"));
     }
     let column_order = read_four(bytes, &mut offset)?;
+    let theme_mode = ThemeMode::from_storage_code(read_u8(bytes, &mut offset)?)
+        .ok_or_else(|| invalid_data("invalid session theme mode"))?;
+    let language = Language::from_storage_code(read_u8(bytes, &mut offset)?)
+        .ok_or_else(|| invalid_data("invalid session language"))?;
 
     let mut tab_paths = Vec::with_capacity(count);
     for _ in 0..count {
@@ -153,7 +213,14 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
         return Err(invalid_data("unexpected trailing session data"));
     }
 
-    SessionState::new(window, active_tab, tab_paths, column_order)
+    SessionState::with_settings(
+        window,
+        active_tab,
+        tab_paths,
+        column_order,
+        theme_mode,
+        language,
+    )
 }
 
 fn validate_column_order(column_order: ColumnOrder) -> io::Result<()> {
@@ -177,6 +244,15 @@ fn validate_window(window: WindowPlacement) -> io::Result<()> {
         return Err(invalid_data("invalid session window size"));
     }
     Ok(())
+}
+
+fn read_u8(bytes: &[u8], offset: &mut usize) -> io::Result<u8> {
+    let value = bytes
+        .get(*offset)
+        .copied()
+        .ok_or_else(|| invalid_data("truncated session"))?;
+    *offset += 1;
+    Ok(value)
 }
 
 fn read_i32(bytes: &[u8], offset: &mut usize) -> io::Result<i32> {
@@ -228,7 +304,7 @@ mod tests {
     use super::*;
 
     fn sample_state() -> SessionState {
-        SessionState::new(
+        SessionState::with_settings(
             WindowPlacement {
                 x: -120,
                 y: 84,
@@ -241,6 +317,8 @@ mod tests {
                 PathBuf::from(r"\\server\共享\資料"),
             ],
             [2, 0, 3, 1],
+            ThemeMode::Dark,
+            Language::English,
         )
         .expect("valid state")
     }
@@ -249,6 +327,54 @@ mod tests {
     fn round_trips_complete_session() {
         let state = sample_state();
         assert_eq!(decode(&encode(&state).expect("encodable")).unwrap(), state);
+    }
+
+    #[test]
+    fn default_constructor_uses_system_theme_and_chinese() {
+        let state = SessionState::new(
+            WindowPlacement {
+                x: 0,
+                y: 0,
+                width: 900,
+                height: 600,
+            },
+            0,
+            Vec::new(),
+            DEFAULT_COLUMN_ORDER,
+        )
+        .unwrap();
+
+        assert_eq!(state.theme_mode, ThemeMode::System);
+        assert_eq!(state.language, Language::Chinese);
+    }
+
+    #[test]
+    fn setting_storage_codes_are_stable() {
+        assert_eq!(ThemeMode::System.storage_code(), 0);
+        assert_eq!(ThemeMode::Light.storage_code(), 1);
+        assert_eq!(ThemeMode::Dark.storage_code(), 2);
+        assert_eq!(ThemeMode::from_storage_code(0), Some(ThemeMode::System));
+        assert_eq!(ThemeMode::from_storage_code(1), Some(ThemeMode::Light));
+        assert_eq!(ThemeMode::from_storage_code(2), Some(ThemeMode::Dark));
+        assert_eq!(ThemeMode::from_storage_code(3), None);
+        assert_eq!(ThemeMode::from_storage_code(u8::MAX), None);
+    }
+
+    #[test]
+    fn rejects_invalid_setting_codes() {
+        let mut invalid_theme = encode(&sample_state()).unwrap();
+        invalid_theme[33] = u8::MAX;
+        assert_eq!(
+            decode(&invalid_theme).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut invalid_language = encode(&sample_state()).unwrap();
+        invalid_language[34] = u8::MAX;
+        assert_eq!(
+            decode(&invalid_language).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[cfg(windows)]
@@ -421,7 +547,11 @@ mod tests {
 
     #[test]
     fn rejects_old_format() {
-        for bytes in [b"ASTF1\0\0\0\0".as_slice(), b"ASTF2\0\0\0\0".as_slice()] {
+        for bytes in [
+            b"ASTF1\0\0\0\0".as_slice(),
+            b"ASTF2\0\0\0\0".as_slice(),
+            b"ASTF3\0\0\0\0".as_slice(),
+        ] {
             assert_eq!(
                 decode(bytes).unwrap_err().kind(),
                 io::ErrorKind::InvalidData

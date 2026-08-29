@@ -9,7 +9,7 @@ use std::{
 };
 
 use slint::{
-    ModelRc, VecModel,
+    Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel,
     winit_030::{EventResult, WinitWindowAccessor, winit},
 };
 
@@ -27,6 +27,7 @@ use crate::{
 slint::include_modules!();
 
 const WORKER_COUNT: usize = 4;
+const ICON_WORKER_COUNT: usize = 2;
 
 type SharedSessions = Arc<Mutex<AppState>>;
 
@@ -38,12 +39,40 @@ struct AppState {
     closed_tabs: VecDeque<PathBuf>,
     next_tab_id: u32,
     language: Language,
+    theme_mode: session_store::ThemeMode,
+    system_dark_theme: bool,
+    icons: HashMap<(TabId, RequestId, EntryId), platform::windows_shell_icons::ShellIconRgba>,
+    icon_cache: HashMap<PathBuf, platform::windows_shell_icons::ShellIconRgba>,
+    sidebar_icons: HashMap<PathBuf, platform::windows_shell_icons::ShellIconRgba>,
     sidebar: Vec<KnownLocation>,
     column_order: [u8; 4],
 }
 
 impl AppState {
-    fn new(initial_paths: Vec<PathBuf>, active_index: usize, column_order: [u8; 4]) -> Self {
+    #[cfg(test)]
+    fn new_for_test(
+        initial_paths: Vec<PathBuf>,
+        active_index: usize,
+        column_order: [u8; 4],
+    ) -> Self {
+        Self::new(
+            initial_paths,
+            active_index,
+            column_order,
+            session_store::ThemeMode::System,
+            Language::Chinese,
+            false,
+        )
+    }
+
+    fn new(
+        initial_paths: Vec<PathBuf>,
+        active_index: usize,
+        column_order: [u8; 4],
+        theme_mode: session_store::ThemeMode,
+        language: Language,
+        system_dark_theme: bool,
+    ) -> Self {
         let initial_paths = if initial_paths.is_empty() {
             vec![initial_path()]
         } else {
@@ -66,7 +95,12 @@ impl AppState {
             active_tab,
             closed_tabs: VecDeque::new(),
             next_tab_id,
-            language: Language::Chinese,
+            language,
+            theme_mode,
+            system_dark_theme,
+            icons: HashMap::new(),
+            icon_cache: HashMap::new(),
+            sidebar_icons: HashMap::new(),
             sidebar: Vec::new(),
             column_order,
         }
@@ -91,6 +125,7 @@ impl AppState {
         let closing_was_active = closing == self.active_tab;
         if let Some(mut tab) = self.tabs.remove(&closing) {
             tab.cancel_pending();
+            self.icons.retain(|(tab_id, _, _), _| *tab_id != closing);
             if let Some(path) = tab.current_path.take() {
                 self.closed_tabs.push_front(path);
                 self.closed_tabs.truncate(10);
@@ -121,6 +156,14 @@ impl AppState {
             .filter_map(|id| self.tabs.get(id))
             .filter_map(|tab| tab.current_path.clone())
             .collect()
+    }
+
+    fn dark_theme(&self) -> bool {
+        match self.theme_mode {
+            session_store::ThemeMode::System => self.system_dark_theme,
+            session_store::ThemeMode::Light => false,
+            session_store::ThemeMode::Dark => true,
+        }
     }
 }
 
@@ -174,6 +217,21 @@ enum DirectoryEvent {
     },
 }
 
+struct IconRequest {
+    tab_id: TabId,
+    request_id: RequestId,
+    entry_id: EntryId,
+    path: PathBuf,
+}
+
+struct IconEvent {
+    tab_id: TabId,
+    request_id: RequestId,
+    entry_id: EntryId,
+    path: PathBuf,
+    icon: platform::windows_shell_icons::ShellIconRgba,
+}
+
 pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
     let restored = scenario
@@ -186,7 +244,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         width: 1180,
         height: 760,
     };
-    let (restored_paths, active_index, window, column_order) = restored
+    let (restored_paths, active_index, window, column_order, theme_mode, language) = restored
         .filter(|session| !session.tab_paths.is_empty())
         .map(|session| {
             let window = if session.window.width > 7_680 || session.window.height > 4_320 {
@@ -199,9 +257,20 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 session.active_tab,
                 window,
                 session.column_order,
+                session.theme_mode,
+                session.language,
             )
         })
-        .unwrap_or_else(|| (vec![initial_path()], 0, default_window, [0, 1, 2, 3]));
+        .unwrap_or_else(|| {
+            (
+                vec![initial_path()],
+                0,
+                default_window,
+                [0, 1, 2, 3],
+                session_store::ThemeMode::System,
+                Language::Chinese,
+            )
+        });
     ui.window()
         .set_position(slint::PhysicalPosition::new(window.x, window.y));
     ui.window().set_size(slint::LogicalSize::new(
@@ -212,6 +281,9 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         restored_paths,
         active_index,
         column_order,
+        theme_mode,
+        language,
+        platform::system_uses_dark_theme(),
     )));
     if let Some(scenario) = scenario {
         let mut app = state.lock().expect("app state mutex is not poisoned");
@@ -225,15 +297,18 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     }
     let (request_sender, event_receiver) = spawn_directory_workers(WORKER_COUNT);
     let event_receiver = Arc::new(Mutex::new(event_receiver));
+    let (icon_sender, icon_receiver) = spawn_icon_workers(ICON_WORKER_COUNT, state.clone());
 
     wire_callbacks(&ui, request_sender.clone(), state.clone());
     wire_mouse_navigation(&ui);
     wire_window_controls(&ui);
-    start_event_pump(&ui, event_receiver, state.clone());
+    start_event_pump(&ui, event_receiver, icon_sender, state.clone());
+    start_icon_event_pump(&ui, icon_receiver, state.clone());
     {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         app.sidebar = platform::known_locations();
     }
+    start_sidebar_icon_loader(&ui, state.clone());
     refresh_ui(&ui, &state);
     let initial_tabs = {
         let app = state.lock().expect("app state mutex is not poisoned");
@@ -260,20 +335,26 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     }
 
     let result = ui.run();
-    let (paths, active_tab, column_order) = {
+    let (paths, active_tab, column_order, theme_mode, language) = {
         let app = state.lock().expect("app state mutex is not poisoned");
         let active_tab = app
             .tab_order
             .iter()
             .position(|id| *id == app.active_tab)
             .unwrap_or(0);
-        (app.stable_paths(), active_tab, app.column_order)
+        (
+            app.stable_paths(),
+            active_tab,
+            app.column_order,
+            app.theme_mode,
+            app.language,
+        )
     };
     let position = ui.window().position();
     let size = ui.window().size();
     if scenario.is_none()
         && let Some(path) = session_store::default_path()
-        && let Ok(session) = session_store::SessionState::new(
+        && let Ok(session) = session_store::SessionState::with_settings(
             session_store::WindowPlacement {
                 x: position.x,
                 y: position.y,
@@ -283,6 +364,8 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             active_tab,
             paths,
             column_order,
+            theme_mode,
+            language,
         )
     {
         let _ = session_store::save(&path, &session);
@@ -299,6 +382,7 @@ fn submit_navigation(
 ) -> bool {
     let request = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
+        app.icons.retain(|(icon_tab, _, _), _| *icon_tab != tab_id);
         let Some(tab) = app.tabs.get_mut(&tab_id) else {
             return false;
         };
@@ -981,14 +1065,40 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
     });
 
     let weak = ui.as_weak();
-    ui.on_toggle_language(move || {
-        let mut app = state.lock().expect("app state mutex is not poisoned");
-        app.language = app.language.toggle();
+    let state_for_language = state.clone();
+    ui.on_change_language(move |language| {
+        let mut app = state_for_language
+            .lock()
+            .expect("app state mutex is not poisoned");
+        app.language = if language == 1 {
+            Language::English
+        } else {
+            Language::Chinese
+        };
         drop(app);
         if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state);
+            refresh_ui(&ui, &state_for_language);
         }
     });
+
+    let weak = ui.as_weak();
+    let state_for_theme = state.clone();
+    ui.on_change_theme(move |theme| {
+        let mut app = state_for_theme
+            .lock()
+            .expect("app state mutex is not poisoned");
+        app.theme_mode = match theme {
+            1 => session_store::ThemeMode::Light,
+            2 => session_store::ThemeMode::Dark,
+            _ => session_store::ThemeMode::System,
+        };
+        drop(app);
+        if let Some(ui) = weak.upgrade() {
+            refresh_ui(&ui, &state_for_theme);
+        }
+    });
+
+    ui.on_open_settings(|| {});
 }
 
 fn wire_mouse_navigation(ui: &AppWindow) {
@@ -1251,6 +1361,7 @@ fn run_directory_request(request: DirectoryRequest, events: &mpsc::Sender<Direct
 fn start_event_pump(
     ui: &AppWindow,
     receiver: Arc<Mutex<mpsc::Receiver<DirectoryEvent>>>,
+    icon_sender: mpsc::Sender<IconRequest>,
     state: SharedSessions,
 ) {
     let weak = ui.as_weak();
@@ -1264,9 +1375,13 @@ fn start_event_pump(
                 break;
             };
             let state = state.clone();
+            let icon_sender = icon_sender.clone();
             if weak
                 .upgrade_in_event_loop(move |ui| {
-                    apply_event(&state, event);
+                    let icon_requests = apply_event(&state, event);
+                    for request in icon_requests {
+                        let _ = icon_sender.send(request);
+                    }
                     refresh_ui(&ui, &state);
                 })
                 .is_err()
@@ -1277,8 +1392,9 @@ fn start_event_pump(
     });
 }
 
-fn apply_event(state: &SharedSessions, event: DirectoryEvent) {
+fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest> {
     let mut app = state.lock().expect("app state mutex is not poisoned");
+    let mut icon_requests = Vec::new();
     match event {
         DirectoryEvent::Batch {
             tab_id,
@@ -1288,6 +1404,12 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) {
             if let Some(tab) = app.tabs.get_mut(&tab_id)
                 && tab.accepts(request_id)
             {
+                icon_requests.extend(entries.iter().map(|entry| IconRequest {
+                    tab_id,
+                    request_id,
+                    entry_id: entry.id,
+                    path: entry.path.clone(),
+                }));
                 tab.append_pending(entries);
             }
         }
@@ -1329,6 +1451,127 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) {
             }
         }
     }
+    icon_requests
+}
+
+fn spawn_icon_workers(
+    worker_count: usize,
+    state: SharedSessions,
+) -> (mpsc::Sender<IconRequest>, mpsc::Receiver<IconEvent>) {
+    let (request_sender, request_receiver) = mpsc::channel::<IconRequest>();
+    let request_receiver = Arc::new(Mutex::new(request_receiver));
+    let (event_sender, event_receiver) = mpsc::channel::<IconEvent>();
+    for _ in 0..worker_count {
+        let requests = request_receiver.clone();
+        let events = event_sender.clone();
+        let state = state.clone();
+        thread::spawn(move || {
+            loop {
+                let request = requests
+                    .lock()
+                    .expect("icon request receiver mutex is not poisoned")
+                    .recv();
+                let Ok(request) = request else {
+                    break;
+                };
+                let is_current = state
+                    .lock()
+                    .ok()
+                    .and_then(|app| {
+                        app.tabs
+                            .get(&request.tab_id)
+                            .map(|tab| tab.latest_request == request.request_id)
+                    })
+                    .unwrap_or(false);
+                if !is_current {
+                    continue;
+                }
+                if let Ok(icon) = platform::windows_shell_icons::shell_icon_rgba(&request.path) {
+                    let _ = events.send(IconEvent {
+                        tab_id: request.tab_id,
+                        request_id: request.request_id,
+                        entry_id: request.entry_id,
+                        path: request.path,
+                        icon,
+                    });
+                }
+            }
+        });
+    }
+    (request_sender, event_receiver)
+}
+
+fn start_sidebar_icon_loader(ui: &AppWindow, state: SharedSessions) {
+    let locations = state
+        .lock()
+        .expect("app state mutex is not poisoned")
+        .sidebar
+        .iter()
+        .map(|location| location.path.clone())
+        .collect::<Vec<_>>();
+    let weak = ui.as_weak();
+    thread::spawn(move || {
+        for path in locations {
+            let Ok(icon) = platform::windows_shell_icons::shell_icon_rgba(&path) else {
+                continue;
+            };
+            let state = state.clone();
+            if weak
+                .upgrade_in_event_loop(move |ui| {
+                    state
+                        .lock()
+                        .expect("app state mutex is not poisoned")
+                        .sidebar_icons
+                        .insert(path, icon);
+                    refresh_ui(&ui, &state);
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+}
+
+fn start_icon_event_pump(
+    ui: &AppWindow,
+    receiver: mpsc::Receiver<IconEvent>,
+    state: SharedSessions,
+) {
+    let weak = ui.as_weak();
+    thread::spawn(move || {
+        while let Ok(event) = receiver.recv() {
+            let state = state.clone();
+            if weak
+                .upgrade_in_event_loop(move |ui| {
+                    apply_icon_event(&state, event);
+                    refresh_ui(&ui, &state);
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+}
+
+fn apply_icon_event(state: &SharedSessions, event: IconEvent) {
+    let mut app = state.lock().expect("app state mutex is not poisoned");
+    let accepted = icon_event_is_current(&app, &event);
+    if accepted {
+        app.icon_cache.insert(event.path, event.icon.clone());
+        app.icons
+            .insert((event.tab_id, event.request_id, event.entry_id), event.icon);
+    }
+}
+
+fn icon_event_is_current(app: &AppState, event: &IconEvent) -> bool {
+    app.tabs.get(&event.tab_id).is_some_and(|tab| {
+        tab.latest_request == event.request_id
+            && tab
+                .visible_entry(event.entry_id)
+                .is_some_and(|entry| entry.path == event.path)
+    })
 }
 
 fn classify_error(kind: io::ErrorKind) -> LoadState {
@@ -1362,7 +1605,7 @@ fn update_file_rows(
     };
     for (index, entry) in tab.entries.iter().enumerate() {
         if changed.contains(&entry.id) {
-            model.set_row_data(index, file_row(entry, tab, texts));
+            model.set_row_data(index, file_row(entry, tab, texts, &app));
         }
     }
 }
@@ -1408,7 +1651,7 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
     };
     let file_rows = display_entries
         .iter()
-        .map(|entry| file_row(entry, tab, texts))
+        .map(|entry| file_row(entry, tab, texts, &app))
         .collect::<Vec<_>>();
     ui.set_files(ModelRc::new(VecModel::from(file_rows)));
     ui.set_window_width(ui.window().size().width as f32 / ui.window().scale_factor());
@@ -1517,6 +1760,11 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
                 },
                 selected: selected_sidebar.is_some_and(|selected| selected == index),
                 is_drive: location.kind == KnownLocationKind::Drive,
+                icon: app
+                    .sidebar_icons
+                    .get(&location.path)
+                    .map(shell_icon_image)
+                    .unwrap_or_default(),
             })
             .collect::<Vec<_>>(),
     )));
@@ -1552,14 +1800,20 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
     ));
     ui.set_can_close_tab(app.tab_order.len() > 1);
     ui.set_can_restore_tab(!app.closed_tabs.is_empty());
-    ui.set_language_label(match app.language {
-        Language::Chinese => "EN".into(),
-        Language::English => "中文".into(),
+    ui.set_language_mode(match app.language {
+        Language::Chinese => 0,
+        Language::English => 1,
     });
+    ui.set_theme_mode(match app.theme_mode {
+        session_store::ThemeMode::System => 0,
+        session_store::ThemeMode::Light => 1,
+        session_store::ThemeMode::Dark => 2,
+    });
+    ui.set_dark_theme(app.dark_theme());
     apply_ui_texts(ui, app.language);
 }
 
-fn file_row(entry: &FileEntry, tab: &TabSession, texts: Texts) -> FileRow {
+fn file_row(entry: &FileEntry, tab: &TabSession, texts: Texts, app: &AppState) -> FileRow {
     debug_assert_eq!(
         entry.path.file_name(),
         Some(entry.original_name.as_os_str()),
@@ -1574,7 +1828,19 @@ fn file_row(entry: &FileEntry, tab: &TabSession, texts: Texts) -> FileRow {
         is_directory: entry.kind == crate::domain::EntryKind::Directory,
         selected: tab.selected.contains(&entry.id),
         focused: tab.focused == Some(entry.id),
+        icon: app
+            .icons
+            .get(&(tab.id, tab.latest_request, entry.id))
+            .or_else(|| app.icon_cache.get(&entry.path))
+            .map(shell_icon_image)
+            .unwrap_or_default(),
     }
+}
+
+fn shell_icon_image(icon: &platform::windows_shell_icons::ShellIconRgba) -> Image {
+    let buffer =
+        SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&icon.pixels, icon.width, icon.height);
+    Image::from_rgba8(buffer)
 }
 
 fn status_text(tab: &TabSession, texts: Texts) -> String {
@@ -1653,6 +1919,26 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
         modified,
         size,
         request_access,
+        menu,
+        settings,
+        close_settings,
+        theme,
+        theme_system,
+        theme_light,
+        theme_dark,
+        language_label,
+        chinese,
+        english,
+        loading,
+        empty_folder,
+        new_tab,
+        close_tab,
+        minimize,
+        restore,
+        maximize,
+        close,
+        address,
+        cancel_edit,
     ) = match language {
         Language::Chinese => (
             "前往",
@@ -1674,6 +1960,26 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "修改时间",
             "大小",
             "使用 Windows 请求访问权限",
+            "菜单",
+            "设置",
+            "关闭设置",
+            "主题",
+            "跟随系统",
+            "浅色",
+            "深色",
+            "语言",
+            "中文",
+            "English",
+            "正在加载…",
+            "此文件夹为空",
+            "新建标签",
+            "关闭标签",
+            "最小化",
+            "还原",
+            "最大化",
+            "关闭",
+            "路径",
+            "取消编辑",
         ),
         Language::English => (
             "Go",
@@ -1695,6 +2001,26 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "Modified",
             "Size",
             "Request access with Windows",
+            "Menu",
+            "Settings",
+            "Close settings",
+            "Theme",
+            "Use system setting",
+            "Light",
+            "Dark",
+            "Language",
+            "中文",
+            "English",
+            "Loading…",
+            "This folder is empty",
+            "New tab",
+            "Close tab",
+            "Minimize",
+            "Restore",
+            "Maximize",
+            "Close",
+            "Path",
+            "Cancel editing",
         ),
     };
     ui.set_text_go(go.into());
@@ -1716,6 +2042,27 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_modified(modified.into());
     ui.set_text_size(size.into());
     ui.set_text_request_access(request_access.into());
+    ui.set_text_menu(menu.into());
+    ui.set_text_settings(settings.into());
+    ui.set_text_settings_title(settings.into());
+    ui.set_text_close_settings(close_settings.into());
+    ui.set_text_theme(theme.into());
+    ui.set_text_theme_system(theme_system.into());
+    ui.set_text_theme_light(theme_light.into());
+    ui.set_text_theme_dark(theme_dark.into());
+    ui.set_text_language(language_label.into());
+    ui.set_text_language_chinese(chinese.into());
+    ui.set_text_language_english(english.into());
+    ui.set_text_loading(loading.into());
+    ui.set_text_empty_folder(empty_folder.into());
+    ui.set_text_new_tab(new_tab.into());
+    ui.set_text_close_tab(close_tab.into());
+    ui.set_text_window_minimize(minimize.into());
+    ui.set_text_window_restore(restore.into());
+    ui.set_text_window_maximize(maximize.into());
+    ui.set_text_window_close(close.into());
+    ui.set_text_address(address.into());
+    ui.set_text_cancel_edit(cancel_edit.into());
 }
 
 fn display_path(path: &Path) -> String {
@@ -1744,7 +2091,7 @@ mod tests {
     }
     #[test]
     fn sidebar_selection_prefers_exact_known_folder_over_drive() {
-        let mut app = AppState::new(
+        let mut app = AppState::new_for_test(
             vec![PathBuf::from(r"C:\Users\Test\Pictures")],
             0,
             [0, 1, 2, 3],
@@ -1767,7 +2114,7 @@ mod tests {
 
     #[test]
     fn sidebar_selection_uses_drive_for_descendant_without_exact_location() {
-        let mut app = AppState::new(
+        let mut app = AppState::new_for_test(
             vec![PathBuf::from(r"C:\Projects\AsterFiles")],
             0,
             [0, 1, 2, 3],
@@ -1789,7 +2136,7 @@ mod tests {
     }
     #[test]
     fn closing_a_tab_preserves_another_session() {
-        let mut app = AppState::new(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
+        let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
         let second = app.create_tab(PathBuf::from("two"));
         assert_eq!(app.active_tab, second);
         assert_eq!(app.close_tab(TabId(2)), Some(TabId(1)));
@@ -1798,7 +2145,7 @@ mod tests {
 
     #[test]
     fn closing_an_inactive_tab_keeps_the_active_tab() {
-        let mut app = AppState::new(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
+        let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
         let second = app.create_tab(PathBuf::from("two"));
         let third = app.create_tab(PathBuf::from("three"));
         assert_eq!(app.active_tab, third);
@@ -1811,7 +2158,7 @@ mod tests {
 
     #[test]
     fn same_path_normal_navigation_is_ignored_without_new_request() {
-        let state = Arc::new(Mutex::new(AppState::new(
+        let state = Arc::new(Mutex::new(AppState::new_for_test(
             vec![PathBuf::from("same")],
             0,
             [0, 1, 2, 3],
@@ -1834,6 +2181,44 @@ mod tests {
     #[test]
     fn root_path_has_no_parent_navigation_target() {
         assert!(Path::new(r"C:\").parent().is_none());
+    }
+
+    #[test]
+    fn icon_events_require_matching_tab_request_entry_and_path() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("same")], 0, [0, 1, 2, 3]);
+        let tab = app.tabs.get_mut(&TabId(1)).unwrap();
+        tab.latest_request = RequestId(7);
+        tab.entries.push(FileEntry {
+            id: EntryId(3),
+            original_name: "file.txt".into(),
+            display_name: "file.txt".into(),
+            path: PathBuf::from("same/file.txt"),
+            kind: crate::domain::EntryKind::File,
+            open_target: None,
+            size_bytes: Some(1),
+            modified: None,
+        });
+        let event = IconEvent {
+            tab_id: TabId(1),
+            request_id: RequestId(7),
+            entry_id: EntryId(3),
+            path: PathBuf::from("same/file.txt"),
+            icon: platform::windows_shell_icons::ShellIconRgba {
+                width: 1,
+                height: 1,
+                pixels: vec![0, 0, 0, 0],
+            },
+        };
+        assert!(icon_event_is_current(&app, &event));
+
+        let mut stale_request = event;
+        stale_request.request_id = RequestId(6);
+        assert!(!icon_event_is_current(&app, &stale_request));
+        stale_request.request_id = RequestId(7);
+        stale_request.path = PathBuf::from("same/other.txt");
+        assert!(!icon_event_is_current(&app, &stale_request));
+        app.tabs.remove(&TabId(1));
+        assert!(!icon_event_is_current(&app, &stale_request));
     }
 
     #[test]

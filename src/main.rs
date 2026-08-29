@@ -9,8 +9,17 @@ mod platform;
 mod session_store;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // The current application surface is light-only; keep native widgets consistent with it.
-    unsafe { std::env::set_var("SLINT_STYLE", "fluent-light") };
+    // The application owns its colors; keep native popup styling aligned with the startup system theme.
+    unsafe {
+        std::env::set_var(
+            "SLINT_STYLE",
+            if platform::system_uses_dark_theme() {
+                "fluent-dark"
+            } else {
+                "fluent-light"
+            },
+        )
+    };
 
     let agent_options = agent_debug::AgentOptions::from_env()
         .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;

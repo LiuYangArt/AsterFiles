@@ -1,6 +1,6 @@
 # 图标许可
 
-本目录使用 Microsoft Fluent UI System Icons 的 20px Regular SVG 图标。
+本目录使用 Microsoft Fluent UI System Icons 的 20px Regular SVG 图标，并由 `icon-map.slint` 统一映射为界面语义名称。
 
 - 来源：https://github.com/microsoft/fluentui-system-icons
 - 许可证：MIT
