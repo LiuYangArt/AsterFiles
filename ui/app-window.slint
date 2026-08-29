@@ -4,7 +4,7 @@ import { IconMap } from "icons/icon-map.slint";
 export struct FileRow { id: int, name: string, kind: string, size: string, modified: string, is-directory: bool, selected: bool, focused: bool, icon: image }
 export struct HistoryRow { index: int, label: string }
 export struct BreadcrumbRow { index: int, label: string, current: bool }
-export struct TabRow { id: int, title: string, active: bool, loading: bool, icon: image, is-drive: bool }
+export struct TabRow { id: int, title: string, active: bool, loading: bool, icon: image, is-drive: bool, is-settings: bool }
 export struct SidebarRow { index: int, label: string, icon-kind: int, is-drive: bool, icon: image }
 export struct ColumnRow { kind: int }
 export global VisualStyle {
@@ -366,10 +366,10 @@ export component AppWindow inherits Window {
     in property <bool> dark-theme: false;
     in property <int> theme-mode: 0;
     in property <int> language-mode: 0;
+    in property <bool> active-is-settings: false;
     in property <string> text-menu: "菜单";
     in property <string> text-settings: "设置";
     in property <string> text-settings-title: "设置";
-    in property <string> text-close-settings: "关闭设置";
     in property <string> text-theme: "主题";
     in property <string> text-theme-system: "跟随系统";
     in property <string> text-theme-light: "浅色";
@@ -377,6 +377,8 @@ export component AppWindow inherits Window {
     in property <string> text-language: "语言";
     in property <string> text-language-chinese: "中文";
     in property <string> text-language-english: "English";
+    in property <string> text-settings-general: "常规";
+    in property <string> text-settings-appearance: "外观";
     in property <string> text-loading: "正在加载…";
     in property <string> text-empty-folder: "此文件夹为空";
     in property <string> text-new-tab: "新建标签";
@@ -440,7 +442,7 @@ export component AppWindow inherits Window {
 
     private property <bool> compact: root.window-width < 1000px;
     private property <bool> menu-open: false;
-    private property <bool> settings-open: false;
+    private property <int> settings-section: 0;
     private property <bool> minimal: root.window-width < 900px;
     // Keep a compact drag target between the add button and window controls.
     private property <length> max-tab-cluster-width: max(80px, root.window-width - 8px - 34px - 34px - 36px - 3 * 46px - 12px);
@@ -477,20 +479,20 @@ export component AppWindow inherits Window {
         KeyBinding { keys: @keys(Alt + UpArrow); enabled: root.can-navigate-up; activated => { root.navigate-up(); } }
         KeyBinding { keys: @keys(F5); enabled: root.can-refresh; activated => { root.refresh(); } }
         KeyBinding { keys: @keys(Control + R); enabled: root.can-refresh; activated => { root.refresh(); } }
-        KeyBinding { keys: @keys(Control + L); activated => { root.begin-address-edit(); } }
-        KeyBinding { keys: @keys(Alt + D); activated => { root.begin-address-edit(); } }
-        KeyBinding { keys: @keys(Control + A); enabled: !root.address-editing; activated => { root.select-all(); } }
-        KeyBinding { keys: @keys(Control + Space); enabled: !root.address-editing; activated => { root.toggle-focused(); } }
-        KeyBinding { keys: @keys(UpArrow); enabled: !root.address-editing; activated => { root.move-focus(-1, false); } }
-        KeyBinding { keys: @keys(DownArrow); enabled: !root.address-editing; activated => { root.move-focus(1, false); } }
-        KeyBinding { keys: @keys(Shift + UpArrow); enabled: !root.address-editing; activated => { root.move-focus(-1, true); } }
-        KeyBinding { keys: @keys(Shift + DownArrow); enabled: !root.address-editing; activated => { root.move-focus(1, true); } }
-        KeyBinding { keys: @keys(Home); enabled: !root.address-editing; activated => { root.focus-boundary(false, false); } }
-        KeyBinding { keys: @keys(End); enabled: !root.address-editing; activated => { root.focus-boundary(true, false); } }
-        KeyBinding { keys: @keys(Shift + Home); enabled: !root.address-editing; activated => { root.focus-boundary(false, true); } }
-        KeyBinding { keys: @keys(Shift + End); enabled: !root.address-editing; activated => { root.focus-boundary(true, true); } }
-        KeyBinding { keys: @keys(Return); enabled: !root.address-editing; activated => { root.open-entry(-1); } }
-        KeyBinding { keys: @keys(Escape); enabled: !root.address-editing; activated => { root.clear-selection(); } }
+        KeyBinding { keys: @keys(Control + L); enabled: !root.active-is-settings; activated => { root.begin-address-edit(); } }
+        KeyBinding { keys: @keys(Alt + D); enabled: !root.active-is-settings; activated => { root.begin-address-edit(); } }
+        KeyBinding { keys: @keys(Control + A); enabled: !root.active-is-settings && !root.address-editing; activated => { root.select-all(); } }
+        KeyBinding { keys: @keys(Control + Space); enabled: !root.active-is-settings && !root.address-editing; activated => { root.toggle-focused(); } }
+        KeyBinding { keys: @keys(UpArrow); enabled: !root.active-is-settings && !root.address-editing; activated => { root.move-focus(-1, false); } }
+        KeyBinding { keys: @keys(DownArrow); enabled: !root.active-is-settings && !root.address-editing; activated => { root.move-focus(1, false); } }
+        KeyBinding { keys: @keys(Shift + UpArrow); enabled: !root.active-is-settings && !root.address-editing; activated => { root.move-focus(-1, true); } }
+        KeyBinding { keys: @keys(Shift + DownArrow); enabled: !root.active-is-settings && !root.address-editing; activated => { root.move-focus(1, true); } }
+        KeyBinding { keys: @keys(Home); enabled: !root.active-is-settings && !root.address-editing; activated => { root.focus-boundary(false, false); } }
+        KeyBinding { keys: @keys(End); enabled: !root.active-is-settings && !root.address-editing; activated => { root.focus-boundary(true, false); } }
+        KeyBinding { keys: @keys(Shift + Home); enabled: !root.active-is-settings && !root.address-editing; activated => { root.focus-boundary(false, true); } }
+        KeyBinding { keys: @keys(Shift + End); enabled: !root.active-is-settings && !root.address-editing; activated => { root.focus-boundary(true, true); } }
+        KeyBinding { keys: @keys(Return); enabled: !root.active-is-settings && !root.address-editing; activated => { root.open-entry(-1); } }
+        KeyBinding { keys: @keys(Escape); enabled: !root.active-is-settings && !root.address-editing; activated => { root.clear-selection(); } }
         KeyBinding { keys: @keys(Control + T); activated => { root.new-tab(); } }
         KeyBinding { keys: @keys(Control + W); enabled: root.can-close-tab; activated => { root.close-tab(-1); } }
 
@@ -548,7 +550,7 @@ export component AppWindow inherits Window {
                             }
                             HorizontalLayout {
                                 padding-left: 10px; padding-right: 7px; spacing: 6px;
-                                InlineIcon { icon-source: tab.icon.width != 0 ? tab.icon : (tab.is-drive ? IconMap.location-drive : IconMap.file-folder); icon-size: 16px; }
+                                InlineIcon { icon-source: tab.is-settings ? IconMap.action-settings : (tab.icon.width != 0 ? tab.icon : (tab.is-drive ? IconMap.location-drive : IconMap.file-folder)); icon-size: 16px; }
                                 Text { text: tab.title; color: VisualStyle.c303138; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
                                 Text { visible: tab.loading && !(root.can-close-tab && tab-touch.has-hover); text: "…"; color: VisualStyle.c4f6bed; vertical-alignment: center; }
                                 Rectangle {
@@ -596,7 +598,8 @@ export component AppWindow inherits Window {
         }
 
         Rectangle {
-            height: 56px; background: VisualStyle.c323437; border-width: 0px;
+            visible: !root.active-is-settings;
+            height: self.visible ? 56px : 0px; background: VisualStyle.c323437; border-width: 0px;
             HorizontalLayout {
                 padding-top: 9px; padding-bottom: 9px; padding-left: 14px; padding-right: 14px; spacing: 7px;
                 ContextMenuArea { width: 38px; height: 38px; IconButton { icon-source: IconMap.action-back; tip: root.text-back + " (Alt+Left)"; enabled: root.can-navigate-back; button-label: root.text-back; clicked => { root.navigate-back(); } } Menu { for history in root.back-history: MenuItem { title: history.label; activated => { root.navigate-history(true, history.index); } } } }
@@ -613,7 +616,7 @@ export component AppWindow inherits Window {
             }
         }
 
-        HorizontalLayout {
+        if !root.active-is-settings: HorizontalLayout {
             spacing: 0px;
             if !root.minimal: Rectangle {
                 width: root.compact ? 184px : 218px; background: VisualStyle.c323437; border-width: 0px;
@@ -770,6 +773,92 @@ export component AppWindow inherits Window {
                 Rectangle { height: 30px; background: VisualStyle.cfafbfc; border-color: VisualStyle.ce7e8eb; border-width: 1px; Text { x: 14px; text: root.status-text; color: VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; } }
             }
         }
+
+        if root.active-is-settings: Rectangle {
+            vertical-stretch: 1;
+            background: VisualStyle.c323437;
+            HorizontalLayout {
+                padding-left: root.minimal ? 16px : 28px;
+                padding-right: root.minimal ? 16px : 28px;
+                padding-top: 24px;
+                padding-bottom: 24px;
+                spacing: root.minimal ? 16px : 28px;
+                Rectangle {
+                    width: root.minimal ? 150px : 236px;
+                    background: VisualStyle.cfafbfc;
+                    border-radius: 9px;
+                    VerticalLayout {
+                        padding-left: 12px; padding-right: 12px; padding-top: 18px; padding-bottom: 18px; spacing: 6px;
+                        Text { text: root.text-settings-title; color: VisualStyle.c30333a; font-size: 22px; font-weight: 600; height: 42px; }
+                        for section[index] in [root.text-settings-general, root.text-settings-appearance]: Rectangle {
+                            height: 42px; border-radius: 6px;
+                            background: root.settings-section == index ? VisualStyle.cdce6ff : (settings-nav-touch.has-hover ? VisualStyle.cedf1f6 : transparent);
+                            Rectangle { visible: root.settings-section == index; x: 0px; y: 9px; width: 3px; height: 24px; border-radius: 2px; background: VisualStyle.c4f6bed; }
+                            HorizontalLayout {
+                                padding-left: 13px; padding-right: 10px; spacing: 10px;
+                                InlineIcon { icon-source: index == 0 ? IconMap.action-language : IconMap.action-settings; icon-size: 18px; }
+                                Text { text: section; color: VisualStyle.c30333a; font-size: 14px; vertical-alignment: center; overflow: elide; }
+                            }
+                            settings-nav-touch := TouchArea { mouse-cursor: pointer; clicked => { root.settings-section = index; } }
+                            accessible-role: button; accessible-label: section;
+                        }
+                        Rectangle { vertical-stretch: 1; }
+                    }
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    background: VisualStyle.c323437;
+                    settings-scroll := Flickable {
+                        width: parent.width; height: parent.height;
+                        viewport-width: self.width;
+                        viewport-height: max(self.height, 188px);
+                        VerticalLayout {
+                            width: settings-scroll.width;
+                            height: settings-scroll.viewport-height;
+                            spacing: 16px;
+                            Text { text: root.settings-section == 0 ? root.text-settings-general : root.text-settings-appearance; color: VisualStyle.c30333a; font-size: 22px; font-weight: 600; height: 44px; }
+                            if root.settings-section == 0: Rectangle {
+                                height: 112px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                VerticalLayout {
+                                    padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 12px;
+                                    Text { text: root.text-language; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
+                                    HorizontalLayout {
+                                        height: 42px; spacing: 8px;
+                                        for language-option[index] in [root.text-language-chinese, root.text-language-english]: Rectangle {
+                                            horizontal-stretch: 1; border-radius: 6px; border-width: root.language-mode == index ? 2px : 1px;
+                                            border-color: root.language-mode == index ? VisualStyle.c4f6bed : VisualStyle.ce0e2e7;
+                                            background: language-card-touch.pressed ? VisualStyle.cdde3ed : language-card-touch.has-hover ? VisualStyle.cedf1f6 : VisualStyle.cffffff;
+                                            Text { text: language-option; color: VisualStyle.c30333a; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                                            language-card-touch := TouchArea { mouse-cursor: pointer; clicked => { root.change-language(index); } }
+                                            accessible-role: button; accessible-label: language-option;
+                                        }
+                                    }
+                                }
+                            }
+                            if root.settings-section == 1: Rectangle {
+                                height: 112px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                VerticalLayout {
+                                    padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 12px;
+                                    Text { text: root.text-theme; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
+                                    HorizontalLayout {
+                                        height: 42px; spacing: 8px;
+                                        for theme-option[index] in [root.text-theme-system, root.text-theme-light, root.text-theme-dark]: Rectangle {
+                                            horizontal-stretch: 1; border-radius: 6px; border-width: root.theme-mode == index ? 2px : 1px;
+                                            border-color: root.theme-mode == index ? VisualStyle.c4f6bed : VisualStyle.ce0e2e7;
+                                            background: theme-card-touch.pressed ? VisualStyle.cdde3ed : theme-card-touch.has-hover ? VisualStyle.cedf1f6 : VisualStyle.cffffff;
+                                            Text { text: theme-option; color: VisualStyle.c30333a; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                                            theme-card-touch := TouchArea { mouse-cursor: pointer; clicked => { root.change-theme(index); } }
+                                            accessible-role: button; accessible-label: theme-option;
+                                        }
+                                    }
+                                }
+                            }
+                            Rectangle { height: 16px; }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     if root.tabs-menu-open: TouchArea {
@@ -792,7 +881,7 @@ export component AppWindow inherits Window {
                 background: tab.active ? VisualStyle.cdce6ff : (tabs-menu-touch.has-hover ? VisualStyle.cedf1f6 : transparent);
                 HorizontalLayout {
                     padding-left: 8px; padding-right: 8px; spacing: 8px;
-                    InlineIcon { icon-source: tab.icon.width != 0 ? tab.icon : (tab.is-drive ? IconMap.location-drive : IconMap.file-folder); icon-size: 16px; }
+                    InlineIcon { icon-source: tab.is-settings ? IconMap.action-settings : (tab.icon.width != 0 ? tab.icon : (tab.is-drive ? IconMap.location-drive : IconMap.file-folder)); icon-size: 16px; }
                     Text { text: tab.title; color: VisualStyle.c303138; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; font-weight: tab.active ? 600 : 400; }
                 }
                 tabs-menu-touch := TouchArea {
@@ -831,83 +920,33 @@ export component AppWindow inherits Window {
             }
             settings-menu-touch := TouchArea {
                 mouse-cursor: pointer;
-                clicked => { root.menu-open = false; root.settings-open = true; root.open-settings(); }
+                clicked => { root.menu-open = false; root.open-settings(); }
             }
             accessible-role: button; accessible-label: root.text-settings;
         }
     }
 
-    if root.settings-open: Rectangle {
-        z: 30; width: parent.width; height: parent.height; background: #00000066;
-        TouchArea { clicked => { root.settings-open = false; } }
-        Rectangle {
-            width: min(600px, parent.width - 48px); height: min(520px, parent.height - 48px);
-            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-            background: VisualStyle.cffffff; border-color: VisualStyle.ce0e2e7; border-width: 1px; border-radius: 10px;
-            TouchArea { }
-            VerticalLayout {
-                padding-left: 28px; padding-right: 28px; padding-top: 22px; padding-bottom: 24px; spacing: 18px;
-                HorizontalLayout {
-                    height: 38px; spacing: 10px;
-                    Text { text: root.text-settings-title; color: VisualStyle.c30333a; font-size: 22px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; }
-                    Rectangle {
-                        width: 38px; height: 38px; border-radius: 5px;
-                        background: settings-close-touch.pressed ? VisualStyle.cdde3ed : settings-close-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
-                        Image { width: 16px; height: 16px; x: 11px; y: 11px; source: IconMap.action-close; colorize: VisualStyle.c303138; }
-                        settings-close-touch := TouchArea { mouse-cursor: pointer; clicked => { root.settings-open = false; } }
-                        accessible-role: button; accessible-label: root.text-close-settings;
-                    }
-                }
-                Text { text: root.text-theme; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
-                HorizontalLayout {
-                    height: 44px; spacing: 8px;
-                    for theme-option[index] in [root.text-theme-system, root.text-theme-light, root.text-theme-dark]: Rectangle {
-                        horizontal-stretch: 1; height: 40px; border-radius: 6px; border-width: root.theme-mode == index ? 2px : 1px;
-                        border-color: root.theme-mode == index ? VisualStyle.c4f6bed : VisualStyle.ce0e2e7;
-                        background: theme-touch.pressed ? VisualStyle.cdde3ed : theme-touch.has-hover ? VisualStyle.cedf1f6 : VisualStyle.cffffff;
-                        Text { text: theme-option; color: VisualStyle.c30333a; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
-                        theme-touch := TouchArea { mouse-cursor: pointer; clicked => { root.change-theme(index); } }
-                        accessible-role: button; accessible-label: theme-option;
-                    }
-                }
-                Rectangle { height: 1px; background: VisualStyle.ce7e8eb; }
-                Text { text: root.text-language; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
-                HorizontalLayout {
-                    height: 44px; spacing: 8px;
-                    for language-option[index] in [root.text-language-chinese, root.text-language-english]: Rectangle {
-                        horizontal-stretch: 1; height: 40px; border-radius: 6px; border-width: root.language-mode == index ? 2px : 1px;
-                        border-color: root.language-mode == index ? VisualStyle.c4f6bed : VisualStyle.ce0e2e7;
-                        background: language-option-touch.pressed ? VisualStyle.cdde3ed : language-option-touch.has-hover ? VisualStyle.cedf1f6 : VisualStyle.cffffff;
-                        Text { text: language-option; color: VisualStyle.c30333a; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
-                        language-option-touch := TouchArea { mouse-cursor: pointer; clicked => { root.change-language(index); } }
-                        accessible-role: button; accessible-label: language-option;
-                    }
-                }
-                Rectangle { vertical-stretch: 1; }
-            }
-        }
-    }
-    if root.address-editing: Rectangle {
+    if root.address-editing && !root.active-is-settings: Rectangle {
         y: 0px;
         width: parent.width;
         height: 59px;
         TouchArea { clicked => { root.cancel-address-edit(); } }
     }
-    if root.address-editing: Rectangle {
+    if root.address-editing && !root.active-is-settings: Rectangle {
         x: 0px;
         y: 59px;
         width: 59px + (!root.minimal ? 45px : 0px) + (!root.compact ? 90px : 0px);
         height: 38px;
         TouchArea { clicked => { root.cancel-address-edit(); } }
     }
-    if root.address-editing: Rectangle {
+    if root.address-editing && !root.active-is-settings: Rectangle {
         x: parent.width - 59px - (!root.minimal ? 45px : 0px);
         y: 59px;
         width: 59px + (!root.minimal ? 45px : 0px);
         height: 38px;
         TouchArea { clicked => { root.cancel-address-edit(); } }
     }
-    if root.address-editing: Rectangle {
+    if root.address-editing && !root.active-is-settings: Rectangle {
         y: 97px;
         width: parent.width;
         height: parent.height - self.y;

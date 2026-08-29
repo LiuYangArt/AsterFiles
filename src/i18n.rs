@@ -39,6 +39,10 @@ impl Texts {
         self.choose("正在加载…", "Loading…")
     }
 
+    pub fn settings(self) -> &'static str {
+        self.choose("设置", "Settings")
+    }
+
     pub fn state(self, state: LoadState) -> &'static str {
         match state {
             LoadState::Idle => self.choose("就绪", "Ready"),

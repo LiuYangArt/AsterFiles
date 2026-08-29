@@ -16,7 +16,8 @@ use slint::{
 use crate::{
     agent_debug::{self, AgentScenario},
     domain::{
-        EntryId, FileEntry, LoadState, NavigationKind, RequestId, SortField, TabId, TabSession,
+        EntryId, FileEntry, LoadState, NavigationKind, RequestId, SortField, TabId, TabKind,
+        TabSession,
     },
     fs::{ReadOutcome, read_directory_batches},
     i18n::{Language, Texts},
@@ -109,7 +110,7 @@ impl AppState {
     fn duplicate_active_tab(&mut self) -> Option<TabId> {
         let source_id = self.active_tab;
         let source = self.tabs.get(&source_id)?;
-        if source.load_state != LoadState::Complete {
+        if source.kind != TabKind::Files || source.load_state != LoadState::Complete {
             return None;
         }
         let id = TabId(self.next_tab_id);
@@ -131,8 +132,36 @@ impl AppState {
         id
     }
 
+    fn open_settings(&mut self) -> TabId {
+        if let Some(id) = self.tab_order.iter().copied().find(|id| {
+            self.tabs
+                .get(id)
+                .is_some_and(|tab| tab.kind == TabKind::Settings)
+        }) {
+            self.active_tab = id;
+            return id;
+        }
+        let id = TabId(self.next_tab_id);
+        self.next_tab_id += 1;
+        self.tabs.insert(id, TabSession::new_settings(id));
+        self.tab_order.push(id);
+        self.active_tab = id;
+        id
+    }
+
     fn close_tab(&mut self, closing: TabId) -> Option<TabId> {
         if self.tab_order.len() == 1 {
+            return None;
+        }
+        let closing_kind = self.tabs.get(&closing)?.kind;
+        if closing_kind == TabKind::Files
+            && self
+                .tabs
+                .values()
+                .filter(|tab| tab.kind == TabKind::Files)
+                .count()
+                == 1
+        {
             return None;
         }
         let index = self.tab_order.iter().position(|id| *id == closing)?;
@@ -140,7 +169,9 @@ impl AppState {
         if let Some(mut tab) = self.tabs.remove(&closing) {
             tab.cancel_pending();
             self.icons.retain(|(tab_id, _, _), _| *tab_id != closing);
-            if let Some(path) = tab.current_path.take() {
+            if tab.kind == TabKind::Files
+                && let Some(path) = tab.current_path.take()
+            {
                 self.closed_tabs.push_front(path);
                 self.closed_tabs.truncate(10);
             }
@@ -170,6 +201,24 @@ impl AppState {
             .filter_map(|id| self.tabs.get(id))
             .filter_map(|tab| tab.current_path.clone())
             .collect()
+    }
+
+    fn stable_active_path_index(&self) -> usize {
+        let active = self.active_tab;
+        let mut file_index = 0;
+        for id in &self.tab_order {
+            let Some(tab) = self.tabs.get(id) else {
+                continue;
+            };
+            if tab.kind != TabKind::Files {
+                continue;
+            }
+            if *id == active {
+                return file_index;
+            }
+            file_index += 1;
+        }
+        file_index.saturating_sub(1)
     }
 
     fn dark_theme(&self) -> bool {
@@ -357,11 +406,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     let result = ui.run();
     let (paths, active_tab, column_order, theme_mode, language) = {
         let app = state.lock().expect("app state mutex is not poisoned");
-        let active_tab = app
-            .tab_order
-            .iter()
-            .position(|id| *id == app.active_tab)
-            .unwrap_or(0);
+        let active_tab = app.stable_active_path_index();
         (
             app.stable_paths(),
             active_tab,
@@ -406,6 +451,9 @@ fn submit_navigation(
         let Some(tab) = app.tabs.get_mut(&tab_id) else {
             return false;
         };
+        if tab.kind != TabKind::Files {
+            return false;
+        }
         if kind == NavigationKind::Normal && tab.current_path.as_ref() == Some(&path) {
             tab.cancel_address_edit();
             return false;
@@ -1127,7 +1175,17 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
         }
     });
 
-    ui.on_open_settings(|| {});
+    let weak = ui.as_weak();
+    let state_for_settings = state.clone();
+    ui.on_open_settings(move || {
+        state_for_settings
+            .lock()
+            .expect("app state mutex is not poisoned")
+            .open_settings();
+        if let Some(ui) = weak.upgrade() {
+            refresh_ui(&ui, &state_for_settings);
+        }
+    });
 }
 
 fn wire_mouse_navigation(ui: &AppWindow) {
@@ -1159,6 +1217,7 @@ fn wire_mouse_navigation(ui: &AppWindow) {
                 let alt = modifiers.alt_key();
                 let shift = modifiers.shift_key();
                 let editing_address = ui.get_address_editing();
+                let settings_active = ui.get_active_is_settings();
                 let character = match &event.logical_key {
                     Key::Character(value) => Some(value.as_str()),
                     _ => None,
@@ -1204,12 +1263,14 @@ fn wire_mouse_navigation(ui: &AppWindow) {
                         || (alt
                             && !control
                             && character.is_some_and(|value| value.eq_ignore_ascii_case("d"))))
-                        && !shift =>
+                        && !shift
+                        && !settings_active =>
                     {
                         ui.invoke_begin_address_edit();
                         true
                     }
-                    _ if !editing_address
+                    _ if !settings_active
+                        && !editing_address
                         && control
                         && !alt
                         && !shift
@@ -1219,35 +1280,43 @@ fn wire_mouse_navigation(ui: &AppWindow) {
                         true
                     }
                     Key::Named(NamedKey::Space)
-                        if !editing_address && control && !alt && !shift =>
+                        if !settings_active && !editing_address && control && !alt && !shift =>
                     {
                         ui.invoke_toggle_focused();
                         true
                     }
-                    Key::Named(NamedKey::ArrowUp) if !editing_address && !control && !alt => {
+                    Key::Named(NamedKey::ArrowUp)
+                        if !settings_active && !editing_address && !control && !alt =>
+                    {
                         ui.invoke_move_focus(-1, shift);
                         true
                     }
-                    Key::Named(NamedKey::ArrowDown) if !editing_address && !control && !alt => {
+                    Key::Named(NamedKey::ArrowDown)
+                        if !settings_active && !editing_address && !control && !alt =>
+                    {
                         ui.invoke_move_focus(1, shift);
                         true
                     }
-                    Key::Named(NamedKey::Home) if !editing_address && !control && !alt => {
+                    Key::Named(NamedKey::Home)
+                        if !settings_active && !editing_address && !control && !alt =>
+                    {
                         ui.invoke_focus_boundary(false, shift);
                         true
                     }
-                    Key::Named(NamedKey::End) if !editing_address && !control && !alt => {
+                    Key::Named(NamedKey::End)
+                        if !settings_active && !editing_address && !control && !alt =>
+                    {
                         ui.invoke_focus_boundary(true, shift);
                         true
                     }
                     Key::Named(NamedKey::Enter)
-                        if !editing_address && !control && !alt && !shift =>
+                        if !settings_active && !editing_address && !control && !alt && !shift =>
                     {
                         ui.invoke_open_entry(-1);
                         true
                     }
                     Key::Named(NamedKey::Escape)
-                        if !editing_address && !control && !alt && !shift =>
+                        if !settings_active && !editing_address && !control && !alt && !shift =>
                     {
                         ui.invoke_clear_selection();
                         true
@@ -1781,6 +1850,8 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
     let app = state.lock().expect("app state mutex is not poisoned");
     let texts = Texts::new(app.language);
     let tab = app.active();
+    let active_is_settings = tab.kind == TabKind::Settings;
+    ui.set_active_is_settings(active_is_settings);
     let display_entries = if matches!(tab.load_state, LoadState::Partial) {
         &tab.pending_entries
     } else if tab.has_failed_location() {
@@ -1828,15 +1899,18 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
             .filter_map(|id| app.tabs.get(id))
             .map(|tab| TabRow {
                 id: tab.id.0 as i32,
-                title: tab
-                    .visible_path()
-                    .and_then(Path::file_name)
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or_else(|| {
-                        display_path(tab.visible_path().unwrap_or(Path::new("C:\\")))
-                    })
-                    .into(),
+                title: if tab.kind == TabKind::Settings {
+                    texts.settings().to_owned()
+                } else {
+                    tab.visible_path()
+                        .and_then(Path::file_name)
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| {
+                            display_path(tab.visible_path().unwrap_or(Path::new("C:\\")))
+                        })
+                }
+                .into(),
                 active: tab.id == app.active_tab,
                 loading: matches!(tab.load_state, LoadState::Loading | LoadState::Partial),
                 icon: tab
@@ -1845,6 +1919,7 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
                     .map(shell_icon_image)
                     .unwrap_or_default(),
                 is_drive: tab.visible_path().is_some_and(is_drive_root),
+                is_settings: tab.kind == TabKind::Settings,
             })
             .collect::<Vec<_>>(),
     )));
@@ -1948,13 +2023,16 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
             .visible_page_operations
             .contains(&agent_debug::PageOperation::RequestWindowsAccess),
     );
-    ui.set_can_navigate_back(tab.has_failed_location() || !tab.back_history.is_empty());
-    ui.set_can_navigate_forward(!tab.forward_history.is_empty());
-    ui.set_can_navigate_up(tab.visible_path().and_then(Path::parent).is_some());
-    ui.set_can_refresh(!matches!(
-        tab.load_state,
-        LoadState::Loading | LoadState::Partial
-    ));
+    ui.set_can_navigate_back(
+        !active_is_settings && (tab.has_failed_location() || !tab.back_history.is_empty()),
+    );
+    ui.set_can_navigate_forward(!active_is_settings && !tab.forward_history.is_empty());
+    ui.set_can_navigate_up(
+        !active_is_settings && tab.visible_path().and_then(Path::parent).is_some(),
+    );
+    ui.set_can_refresh(
+        !active_is_settings && !matches!(tab.load_state, LoadState::Loading | LoadState::Partial),
+    );
     ui.set_can_close_tab(app.tab_order.len() > 1);
     ui.set_can_restore_tab(!app.closed_tabs.is_empty());
     ui.set_language_mode(match app.language {
@@ -2078,7 +2156,6 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
         request_access,
         menu,
         settings,
-        close_settings,
         theme,
         theme_system,
         theme_light,
@@ -2086,6 +2163,8 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
         language_label,
         chinese,
         english,
+        settings_general,
+        settings_appearance,
         loading,
         empty_folder,
         new_tab,
@@ -2120,7 +2199,6 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "使用 Windows 请求访问权限",
             "菜单",
             "设置",
-            "关闭设置",
             "主题",
             "跟随系统",
             "浅色",
@@ -2128,6 +2206,8 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "语言",
             "中文",
             "English",
+            "常规",
+            "外观",
             "正在加载…",
             "此文件夹为空",
             "新建标签",
@@ -2162,7 +2242,6 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "Request access with Windows",
             "Menu",
             "Settings",
-            "Close settings",
             "Theme",
             "Use system setting",
             "Light",
@@ -2170,6 +2249,8 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "Language",
             "中文",
             "English",
+            "General",
+            "Appearance",
             "Loading…",
             "This folder is empty",
             "New tab",
@@ -2205,7 +2286,6 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_menu(menu.into());
     ui.set_text_settings(settings.into());
     ui.set_text_settings_title(settings.into());
-    ui.set_text_close_settings(close_settings.into());
     ui.set_text_theme(theme.into());
     ui.set_text_theme_system(theme_system.into());
     ui.set_text_theme_light(theme_light.into());
@@ -2213,6 +2293,8 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_language(language_label.into());
     ui.set_text_language_chinese(chinese.into());
     ui.set_text_language_english(english.into());
+    ui.set_text_settings_general(settings_general.into());
+    ui.set_text_settings_appearance(settings_appearance.into());
     ui.set_text_loading(loading.into());
     ui.set_text_empty_folder(empty_folder.into());
     ui.set_text_new_tab(new_tab.into());
@@ -2300,6 +2382,68 @@ mod tests {
         assert_eq!(app.active_tab, third);
         assert_eq!(app.active().current_path, Some(PathBuf::from("three")));
         assert!(!app.tabs.contains_key(&second));
+    }
+
+    #[test]
+    fn settings_tab_is_singleton_and_does_not_restore() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
+
+        let settings = app.open_settings();
+        assert_eq!(app.open_settings(), settings);
+        assert_eq!(app.tab_order.len(), 2);
+        assert_eq!(app.active().kind, TabKind::Settings);
+
+        assert_eq!(app.close_tab(settings), Some(TabId(1)));
+        assert!(app.closed_tabs.is_empty());
+        assert!(app.restore_closed().is_none());
+    }
+
+    #[test]
+    fn settings_tab_is_excluded_from_saved_paths_and_active_index() {
+        let mut app = AppState::new_for_test(
+            vec![PathBuf::from("one"), PathBuf::from("two")],
+            0,
+            [0, 1, 2, 3],
+        );
+
+        app.open_settings();
+        assert_eq!(
+            app.stable_paths(),
+            [PathBuf::from("one"), PathBuf::from("two")]
+        );
+        assert_eq!(app.stable_active_path_index(), 1);
+    }
+
+    #[test]
+    fn last_file_tab_cannot_be_closed_while_settings_is_open() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
+        app.open_settings();
+
+        assert_eq!(app.close_tab(TabId(1)), None);
+        assert!(app.tabs.contains_key(&TabId(1)));
+    }
+
+    #[test]
+    fn settings_tab_never_submits_directory_navigation() {
+        let state = Arc::new(Mutex::new(AppState::new_for_test(
+            vec![PathBuf::from("one")],
+            0,
+            [0, 1, 2, 3],
+        )));
+        let settings = state
+            .lock()
+            .expect("app state mutex is not poisoned")
+            .open_settings();
+        let (sender, receiver) = mpsc::channel();
+
+        assert!(!submit_navigation(
+            &sender,
+            &state,
+            settings,
+            PathBuf::from("ignored"),
+            NavigationKind::Refresh,
+        ));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]

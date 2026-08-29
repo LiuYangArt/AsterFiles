@@ -19,6 +19,12 @@ pub struct RequestId(pub u64);
 pub struct EntryId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabKind {
+    Files,
+    Settings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadState {
     Idle,
     Loading,
@@ -56,6 +62,7 @@ pub enum SortDirection {
 #[derive(Debug)]
 pub struct TabSession {
     pub id: TabId,
+    pub kind: TabKind,
     pub latest_request: RequestId,
     pub current_path: Option<PathBuf>,
     pub requested_path: Option<PathBuf>,
@@ -81,6 +88,7 @@ impl TabSession {
     pub fn new(id: TabId) -> Self {
         Self {
             id,
+            kind: TabKind::Files,
             latest_request: RequestId(0),
             current_path: None,
             requested_path: None,
@@ -103,10 +111,17 @@ impl TabSession {
         }
     }
 
+    pub fn new_settings(id: TabId) -> Self {
+        let mut tab = Self::new(id);
+        tab.kind = TabKind::Settings;
+        tab
+    }
+
     pub fn duplicate_complete(id: TabId, source: &Self) -> Self {
         debug_assert_eq!(source.load_state, LoadState::Complete);
         Self {
             id,
+            kind: TabKind::Files,
             latest_request: source.latest_request,
             current_path: source.current_path.clone(),
             requested_path: None,
