@@ -387,15 +387,21 @@ export component AppWindow inherits Window {
     VerticalLayout {
         spacing: 0px;
         Rectangle {
-            height: 46px; background: #f5f6f8; border-color: #d9dce2; border-width: 1px;
+            height: 46px; background: #f1f2f5;
             HorizontalLayout {
                 x: 8px; y: 12px; width: parent.width - 8px - 3 * 46px; height: 34px; spacing: 5px;
                 for tab in root.tabs: Rectangle {
                     width: root.minimal ? 112px : 178px; height: 34px;
-                    background: tab.active ? #ffffff : (tab-touch.has-hover ? #ebeef4 : transparent);
-                    border-color: tab.active ? #d7dae0 : transparent;
-                    border-width: tab.active ? 1px : 0px;
-                    border-radius: 7px;
+                    background: tab.active ? #fafbfc : (tab-touch.has-hover ? #e8eaf0 : #f1f2f5);
+                    border-width: 0px;
+                    border-radius: tab.active ? 7px : 0px;
+                    Path {
+                        visible: tab.active;
+                        x: -7px; y: parent.height - 10px; width: parent.width + 14px; height: 10px;
+                        viewbox-width: 100; viewbox-height: 10; fit: fill; clip: true;
+                        commands: "M 0 10 C 2 10 3.6 8 3.6 5 L 3.6 0 L 96.4 0 L 96.4 5 C 96.4 8 98 10 100 10 Z";
+                        fill: #fafbfc;
+                    }
                     tab-touch := TouchArea {
                         mouse-cursor: pointer;
                         clicked => { root.activate-tab(tab.id); }
@@ -441,7 +447,7 @@ export component AppWindow inherits Window {
         }
 
         Rectangle {
-            height: 56px; background: #fafbfc; border-color: #e2e4e9; border-width: 1px;
+            height: 56px; background: #fafbfc; border-color: #e2e4e9; border-width: 0px;
             HorizontalLayout {
                 padding-top: 9px; padding-bottom: 9px; padding-left: 14px; padding-right: 14px; spacing: 7px;
                 ContextMenuArea { width: 38px; height: 38px; IconButton { icon-source: @image-url("icons/actions/back.svg"); tip: root.text-back + " (Alt+Left)"; enabled: root.can-navigate-back; button-label: root.text-back; clicked => { root.navigate-back(); } } Menu { for history in root.back-history: MenuItem { title: history.label; activated => { root.navigate-history(true, history.index); } } } }
