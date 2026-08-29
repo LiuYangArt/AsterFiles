@@ -320,7 +320,7 @@ export component AppWindow inherits Window {
     title: "AsterFiles";
     icon: @image-url("../assets/app-icon.png");
     no-frame: true;
-    resize-border-width: 10px;
+    resize-border-width: 14px;
     preferred-width: 1180px;
     preferred-height: 760px;
     min-width: 820px;
@@ -381,6 +381,7 @@ export component AppWindow inherits Window {
     in property <string> text-empty-folder: "此文件夹为空";
     in property <string> text-new-tab: "新建标签";
     in property <string> text-close-tab: "关闭标签";
+    in property <string> text-all-tabs: "全部标签";
     in property <string> text-window-minimize: "最小化";
     in property <string> text-window-restore: "还原";
     in property <string> text-window-maximize: "最大化";
@@ -441,8 +442,31 @@ export component AppWindow inherits Window {
     private property <bool> menu-open: false;
     private property <bool> settings-open: false;
     private property <bool> minimal: root.window-width < 900px;
+    // Keep a compact drag target between the add button and window controls.
+    private property <length> max-tab-cluster-width: max(80px, root.window-width - 8px - 34px - 34px - 36px - 3 * 46px - 12px);
+    private property <bool> tabs-overflow: root.tabs.length * 80px + 5px * max(0, root.tabs.length - 1) > root.max-tab-cluster-width;
+    private property <length> max-tab-strip-width: max(80px, root.max-tab-cluster-width - (root.tabs-overflow ? 33px : 0px));
+    private property <length> tab-width: root.tabs.length == 0 ? 178px : max(80px, min(178px, (root.max-tab-strip-width - 5px * max(0, root.tabs.length - 1)) / root.tabs.length));
+    private property <length> tab-content-width: root.tabs.length * root.tab-width + 5px * max(0, root.tabs.length - 1);
+    private property <length> tab-strip-width: min(root.max-tab-strip-width, root.tab-content-width);
+    private property <bool> tabs-menu-open: false;
+    in property <int> active-tab-index: 0;
+    changed active-tab-index => { root.reveal-tab(root.active-tab-index); }
 
     public function focus-address-editor() { address-editor.focus-and-select-all(); }
+    function reveal-tab(index: int) {
+        if !root.tabs-overflow {
+            tab-strip.viewport-x = 0px;
+        } else {
+            if index * (root.tab-width + 5px) + tab-strip.viewport-x < 0px {
+                tab-strip.viewport-x = -index * (root.tab-width + 5px);
+            }
+            if index * (root.tab-width + 5px) + root.tab-width + tab-strip.viewport-x > tab-strip.width {
+                tab-strip.viewport-x = tab-strip.width - index * (root.tab-width + 5px) - root.tab-width;
+            }
+            tab-strip.viewport-x = max(tab-strip.width - tab-strip.viewport-width, min(0px, tab-strip.viewport-x));
+        }
+    }
 
     forward-focus: shortcut-handler;
     shortcut-handler := FocusScope {
@@ -484,44 +508,75 @@ export component AppWindow inherits Window {
                     accessible-role: button; accessible-label: root.text-menu;
                     Tooltip { text: @markdown("\{root.text-menu}"); }
                 }
-                for tab in root.tabs: Rectangle {
-                    width: root.minimal ? 112px : 178px; height: 34px;
-                    background: tab.active ? VisualStyle.c323437 : (tab-touch.has-hover ? VisualStyle.ce8eaf0 : VisualStyle.cf1f2f5);
-                    border-width: 0px;
-                    border-radius: tab.active ? 7px : 0px;
-                    Path {
-                        visible: tab.active;
-                        x: -7px; y: parent.height - 10px; width: parent.width + 14px; height: 10px;
-                        viewbox-width: 100; viewbox-height: 10; fit: fill; clip: true;
-                        commands: "M 0 10 C 2 10 3.6 8 3.6 5 L 3.6 0 L 96.4 0 L 96.4 5 C 96.4 8 98 10 100 10 Z";
-                        fill: VisualStyle.c323437;
-                    }
-                    tab-touch := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => { root.activate-tab(tab.id); }
-                        pointer-event(event) => {
-                            if (event.button == PointerEventButton.middle && event.kind == PointerEventKind.up && root.can-close-tab) {
-                                root.close-tab(tab.id);
+                Rectangle {
+                    width: root.tab-strip-width; height: 34px; clip: true;
+                    tab-strip := Flickable {
+                    width: parent.width; height: parent.height;
+                    interactive: false;
+                    viewport-width: root.tab-content-width;
+                    viewport-height: self.height;
+                    changed width => { root.reveal-tab(root.active-tab-index); }
+                    Rectangle {
+                        width: root.tab-content-width; height: 34px;
+                        HorizontalLayout {
+                        width: parent.width; height: parent.height; spacing: 5px;
+                        for tab[index] in root.tabs: Rectangle {
+                            width: root.tab-width; height: 34px;
+
+                            background: tab.active ? VisualStyle.c323437 : (tab-touch.has-hover ? VisualStyle.ce8eaf0 : VisualStyle.cf1f2f5);
+                            border-width: 0px;
+                            border-radius: tab.active ? 7px : 0px;
+                            Path {
+                                visible: tab.active;
+                                x: -7px; y: parent.height - 10px; width: parent.width + 14px; height: 10px;
+                                viewbox-width: 100; viewbox-height: 10; fit: fill; clip: true;
+                                commands: "M 0 10 C 2 10 3.6 8 3.6 5 L 3.6 0 L 96.4 0 L 96.4 5 C 96.4 8 98 10 100 10 Z";
+                                fill: VisualStyle.c323437;
                             }
+                            tab-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.activate-tab(tab.id); root.reveal-tab(index); }
+                                pointer-event(event) => {
+                                    if (event.button == PointerEventButton.middle && event.kind == PointerEventKind.up && root.can-close-tab) {
+                                        root.close-tab(tab.id);
+                                    }
+                                }
+                                scroll-event(event) => {
+                                    tab-strip.viewport-x = max(tab-strip.width - tab-strip.viewport-width, min(0px, tab-strip.viewport-x + (event.delta-x != 0px ? event.delta-x : event.delta-y)));
+                                    return accept;
+                                }
+                            }
+                            HorizontalLayout {
+                                padding-left: 10px; padding-right: 7px; spacing: 6px;
+                                InlineIcon { icon-source: tab.icon.width != 0 ? tab.icon : (tab.is-drive ? IconMap.location-drive : IconMap.file-folder); icon-size: 16px; }
+                                Text { text: tab.title; color: VisualStyle.c303138; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                                Text { visible: tab.loading && !(root.can-close-tab && tab-touch.has-hover); text: "…"; color: VisualStyle.c4f6bed; vertical-alignment: center; }
+                                Rectangle {
+                                    visible: root.can-close-tab && (tab-touch.has-hover || close-touch.has-hover);
+                                    width: 24px; height: 34px;
+                                    Rectangle {
+                                        width: 24px; height: 24px; y: 5px; border-radius: 4px;
+                                        background: close-touch.pressed ? VisualStyle.cd7dae0 : close-touch.has-hover ? VisualStyle.ce1e4ea : transparent;
+                                        Image { width: 12px; height: 12px; x: 6px; y: 6px; source: IconMap.action-close; colorize: VisualStyle.c303138; }
+                                    }
+                                    close-touch := TouchArea { mouse-cursor: pointer; clicked => { root.close-tab(tab.id); } }
+                                    accessible-role: button; accessible-label: root.text-close-tab;
+                                }
+                            }
+                            Tooltip { text: @markdown("\{tab.title}"); }
+                        }
                         }
                     }
-                    HorizontalLayout {
-                        padding-left: 10px; padding-right: 7px; spacing: 6px;
-                        InlineIcon { icon-source: tab.icon.width != 0 ? tab.icon : (tab.is-drive ? IconMap.location-drive : IconMap.file-folder); icon-size: 16px; }
-                        Text { text: tab.title; color: VisualStyle.c303138; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
-                        Text { visible: tab.loading && !(root.can-close-tab && tab-touch.has-hover); text: "…"; color: VisualStyle.c4f6bed; vertical-alignment: center; }
-                        Rectangle {
-                            visible: root.can-close-tab && (tab-touch.has-hover || close-touch.has-hover);
-                            width: 24px; height: 34px;
-                            Rectangle {
-                                width: 24px; height: 24px; y: 5px; border-radius: 4px;
-                                background: close-touch.pressed ? VisualStyle.cd7dae0 : close-touch.has-hover ? VisualStyle.ce1e4ea : transparent;
-                                Image { width: 12px; height: 12px; x: 6px; y: 6px; source: IconMap.action-close; colorize: VisualStyle.c303138; }
-                            }
-                            close-touch := TouchArea { mouse-cursor: pointer; clicked => { root.close-tab(tab.id); } }
-                            accessible-role: button; accessible-label: root.text-close-tab;
-                        }
                     }
+                }
+                Rectangle {
+                    visible: root.tabs-overflow;
+                    width: self.visible ? 28px : 0px; height: 34px; border-radius: 6px;
+                    background: all-tabs-touch.pressed ? VisualStyle.cd9dce2 : all-tabs-touch.has-hover ? VisualStyle.ce8eaf0 : transparent;
+                    Text { text: "⌄"; color: VisualStyle.c303138; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; }
+                    all-tabs-touch := TouchArea { mouse-cursor: pointer; clicked => { root.tabs-menu-open = !root.tabs-menu-open; } }
+                    accessible-role: button; accessible-label: root.text-all-tabs;
+                    Tooltip { text: @markdown("\{root.text-all-tabs}"); }
                 }
                 Rectangle { width: 34px; height: 34px; border-radius: 6px; background: add-touch.pressed ? VisualStyle.cd9dce2 : add-touch.has-hover ? VisualStyle.ce8eaf0 : transparent; Image { width: 20px; height: 20px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; source: IconMap.action-add; colorize: VisualStyle.c303138; } add-touch := TouchArea { mouse-cursor: pointer; clicked => { root.new-tab(); } } accessible-role: button; accessible-label: root.text-new-tab; Tooltip { text: @markdown("\{root.text-new-tab} (Ctrl+T)"); } }
                 Rectangle {
@@ -545,16 +600,16 @@ export component AppWindow inherits Window {
             HorizontalLayout {
                 padding-top: 9px; padding-bottom: 9px; padding-left: 14px; padding-right: 14px; spacing: 7px;
                 ContextMenuArea { width: 38px; height: 38px; IconButton { icon-source: IconMap.action-back; tip: root.text-back + " (Alt+Left)"; enabled: root.can-navigate-back; button-label: root.text-back; clicked => { root.navigate-back(); } } Menu { for history in root.back-history: MenuItem { title: history.label; activated => { root.navigate-history(true, history.index); } } } }
-                ContextMenuArea { visible: !root.minimal; width: 38px; height: 38px; IconButton { icon-source: IconMap.action-forward; tip: root.text-forward + " (Alt+Right)"; enabled: root.can-navigate-forward; button-label: root.text-forward; clicked => { root.navigate-forward(); } } Menu { for history in root.forward-history: MenuItem { title: history.label; activated => { root.navigate-history(false, history.index); } } } }
-                IconButton { visible: !root.compact; icon-source: IconMap.action-up; tip: root.text-up + " (Alt+Up)"; enabled: root.can-navigate-up; button-label: root.text-up; clicked => { root.navigate-up(); } }
-                IconButton { visible: !root.compact; icon-source: IconMap.action-refresh; tip: root.text-refresh + " (F5)"; enabled: root.can-refresh; button-label: root.text-refresh; clicked => { root.refresh(); } }
+                if !root.minimal: ContextMenuArea { width: 38px; height: 38px; IconButton { icon-source: IconMap.action-forward; tip: root.text-forward + " (Alt+Right)"; enabled: root.can-navigate-forward; button-label: root.text-forward; clicked => { root.navigate-forward(); } } Menu { for history in root.forward-history: MenuItem { title: history.label; activated => { root.navigate-history(false, history.index); } } } }
+                if !root.compact: IconButton { icon-source: IconMap.action-up; tip: root.text-up + " (Alt+Up)"; enabled: root.can-navigate-up; button-label: root.text-up; clicked => { root.navigate-up(); } }
+                if !root.compact: IconButton { icon-source: IconMap.action-refresh; tip: root.text-refresh + " (F5)"; enabled: root.can-refresh; button-label: root.text-refresh; clicked => { root.refresh(); } }
                 Rectangle {
                     height: 38px; horizontal-stretch: 1; background: VisualStyle.cffffff; border-width: 0px; border-radius: 5px;
                     if !root.address-editing: Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; HorizontalLayout { padding-left: 8px; padding-right: 8px; padding-top: 3px; padding-bottom: 3px; spacing: 2px; InlineIcon { icon-source: root.current-location-icon.width != 0 ? root.current-location-icon : (root.current-location-is-drive ? IconMap.location-drive : IconMap.file-folder); icon-size: 16px; } for crumb in root.breadcrumbs: BreadcrumbButton { label: crumb.label; current: crumb.current; clicked => { root.navigate-breadcrumb(crumb.index); } } Rectangle { horizontal-stretch: 1; TouchArea { mouse-cursor: pointer; clicked => { root.begin-address-edit(); } } } } }
                     address-editor := AddressEditor { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: parent.height - 4px; text <=> root.address-input; address-label: root.text-address; cancel-label: root.text-cancel-edit; accepted(value) => { root.navigate-path(value); } cancelled => { root.cancel-address-edit(); } }
 
                 }
-                IconButton { visible: !root.minimal; icon-source: IconMap.action-forward; tip: root.text-go; button-label: root.text-go; clicked => { root.address-editing ? root.navigate-path(root.address-input) : root.begin-address-edit(); } }
+                IconButton { icon-source: IconMap.action-forward; tip: root.text-go; button-label: root.text-go; clicked => { root.address-editing ? root.navigate-path(root.address-input) : root.begin-address-edit(); } }
             }
         }
 
@@ -589,10 +644,10 @@ export component AppWindow inherits Window {
                 Rectangle {
                     height: 38px; background: VisualStyle.cffffff; border-width: 0px;
                     HorizontalLayout {
-                        padding-left: 16px; padding-right: 16px; spacing: 12px;
+                        padding-left: 16px; padding-right: 44px; spacing: 12px;
                         for column in root.columns: Rectangle {
-                            visible: column.kind == 0 || (column.kind == 2 && !root.minimal) || ((column.kind == 1 || column.kind == 3) && !root.compact);
-                            width: column.kind == 0 ? (root.compact ? 65% : 52%) : column.kind == 1 ? 16% : column.kind == 2 ? (root.compact ? 35% : 14%) : 18%;
+                            visible: true;
+                            width: column.kind == 0 ? (root.compact ? 48% : 52%) : column.kind == 1 ? (root.compact ? 17% : 16%) : column.kind == 2 ? (root.compact ? 13% : 14%) : (root.compact ? 22% : 18%);
                             horizontal-stretch: column.kind == 3 ? 1 : 0;
                             opacity: column-touch.dragging ? 0.58 : 1;
                             Rectangle {
@@ -632,6 +687,7 @@ export component AppWindow inherits Window {
                     background-touch := TouchArea { enabled: root.files.length > 0; clicked => { root.clear-selection(); } }
                     list := ListView {
                         visible: root.files.length > 0;
+                        width: parent.width - 28px;
                         vertical-scrollbar-policy: ScrollBarPolicy.always-off;
                         for entry in root.files: Rectangle {
                             width: list.width;
@@ -645,8 +701,8 @@ export component AppWindow inherits Window {
                                 HorizontalLayout {
                                     padding-left: 10px; padding-right: 10px; spacing: 12px;
                                 for column in root.columns: Rectangle {
-                                    visible: column.kind == 0 || (column.kind == 2 && !root.minimal) || ((column.kind == 1 || column.kind == 3) && !root.compact);
-                                    width: column.kind == 0 ? (root.compact ? 65% : 52%) : column.kind == 1 ? 16% : column.kind == 2 ? (root.compact ? 35% : 14%) : 18%;
+                                    visible: true;
+                                    width: column.kind == 0 ? (root.compact ? 48% : 52%) : column.kind == 1 ? (root.compact ? 17% : 16%) : column.kind == 2 ? (root.compact ? 13% : 14%) : (root.compact ? 22% : 18%);
                                     horizontal-stretch: column.kind == 3 ? 1 : 0;
                                     if column.kind == 0: HorizontalLayout {
                                         width: parent.width;
@@ -682,7 +738,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     LightScrollBar {
-                        x: parent.width - self.width;
+                        x: parent.width - self.width - 9px;
                         height: parent.height;
                         value <=> list.viewport-y;
                         maximum: max(0px, list.viewport-height - list.visible-height);
@@ -716,6 +772,37 @@ export component AppWindow inherits Window {
         }
     }
 
+    if root.tabs-menu-open: TouchArea {
+        z: 19;
+        width: parent.width;
+        height: parent.height;
+        clicked => { root.tabs-menu-open = false; }
+    }
+
+    if root.tabs-menu-open: Rectangle {
+        x: max(8px, parent.width - 3 * 46px - 270px); y: 46px;
+        width: 260px; height: min(354px, 12px + min(root.tabs.length, 9) * 38px); z: 20;
+        background: VisualStyle.cffffff; border-color: VisualStyle.ce0e2e7; border-width: 1px; border-radius: 7px;
+        clip: true;
+        ListView {
+            x: 6px; y: 6px; width: parent.width - 12px; height: parent.height - 12px;
+            vertical-scrollbar-policy: ScrollBarPolicy.as-needed;
+            for tab[index] in root.tabs: Rectangle {
+                height: 38px; border-radius: 5px;
+                background: tab.active ? VisualStyle.cdce6ff : (tabs-menu-touch.has-hover ? VisualStyle.cedf1f6 : transparent);
+                HorizontalLayout {
+                    padding-left: 8px; padding-right: 8px; spacing: 8px;
+                    InlineIcon { icon-source: tab.icon.width != 0 ? tab.icon : (tab.is-drive ? IconMap.location-drive : IconMap.file-folder); icon-size: 16px; }
+                    Text { text: tab.title; color: VisualStyle.c303138; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; font-weight: tab.active ? 600 : 400; }
+                }
+                tabs-menu-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.tabs-menu-open = false; root.activate-tab(tab.id); root.reveal-tab(index); }
+                }
+                accessible-role: button; accessible-label: tab.title;
+            }
+        }
+    }
     if root.menu-open: TouchArea {
         z: 19;
         width: parent.width;

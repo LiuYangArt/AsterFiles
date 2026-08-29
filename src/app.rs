@@ -1146,6 +1146,10 @@ fn wire_mouse_navigation(ui: &AppWindow) {
         let Some(ui) = weak.upgrade() else {
             return EventResult::Propagate;
         };
+        if let WindowEvent::Resized(size) = event {
+            ui.set_window_width(size.width as f32 / ui.window().scale_factor());
+            return EventResult::Propagate;
+        }
         match event {
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && !event.repeat =>
@@ -1812,6 +1816,12 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
     let (error_page_title, error_page_description) = error_page_text(tab.load_state, texts);
     ui.set_error_page_title(error_page_title.into());
     ui.set_error_page_description(error_page_description.into());
+    ui.set_active_tab_index(
+        app.tab_order
+            .iter()
+            .position(|id| *id == app.active_tab)
+            .unwrap_or(0) as i32,
+    );
     ui.set_tabs(ModelRc::new(VecModel::from(
         app.tab_order
             .iter()
@@ -2080,6 +2090,7 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
         empty_folder,
         new_tab,
         close_tab,
+        all_tabs,
         minimize,
         restore,
         maximize,
@@ -2121,6 +2132,7 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "此文件夹为空",
             "新建标签",
             "关闭标签",
+            "全部标签",
             "最小化",
             "还原",
             "最大化",
@@ -2162,6 +2174,7 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "This folder is empty",
             "New tab",
             "Close tab",
+            "All tabs",
             "Minimize",
             "Restore",
             "Maximize",
@@ -2204,6 +2217,7 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_empty_folder(empty_folder.into());
     ui.set_text_new_tab(new_tab.into());
     ui.set_text_close_tab(close_tab.into());
+    ui.set_text_all_tabs(all_tabs.into());
     ui.set_text_window_minimize(minimize.into());
     ui.set_text_window_restore(restore.into());
     ui.set_text_window_maximize(maximize.into());
