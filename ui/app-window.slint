@@ -355,6 +355,8 @@ export component AppWindow inherits Window {
     in property <[ColumnRow]> columns;
     in property <[ContextCommandRow]> context-commands;
     in property <[OperationRow]> operations;
+    in-out property <length> file-viewport-y: 0px;
+    out property <length> file-list-top: 0px;
     in-out property <bool> context-menu-open: false;
     in property <bool> context-menu-on-background: false;
     in-out property <bool> task-center-open: false;
@@ -476,6 +478,7 @@ export component AppWindow inherits Window {
     callback drag-window();
     callback show-entry-menu(int, float, float);
     callback show-background-menu(float, float);
+    callback reopen-context-menu(float, float);
     callback invoke-context-command(int);
     callback copy-selection(bool);
     callback paste-files();
@@ -493,8 +496,8 @@ export component AppWindow inherits Window {
     callback cancel-tasks-and-close();
 
     private property <bool> compact: root.window-width < 1000px;
-    private property <length> context-menu-anchor-x: 24px;
-    private property <length> context-menu-anchor-y: 140px;
+    in-out property <length> context-menu-anchor-x: 24px;
+    in-out property <length> context-menu-anchor-y: 140px;
     private property <length> keyboard-menu-anchor-x: 24px;
     private property <length> keyboard-menu-anchor-y: 140px;
     private property <bool> menu-open: false;
@@ -791,6 +794,8 @@ list := ListView {
                         visible: root.files.length > 0;
                         width: parent.width - 28px;
                         vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+                        viewport-y <=> root.file-viewport-y;
+                        init => { root.file-list-top = self.absolute-position.y - root.absolute-position.y; }
                         for entry in root.files: Rectangle {
                             width: list.width;
                             height: 40px;
@@ -1043,9 +1048,25 @@ list := ListView {
         }
     }
 
-        if root.context-menu-open: TouchArea {
+    if root.context-menu-open: TouchArea {
         z: 28; width: parent.width; height: parent.height;
-        clicked => { root.context-menu-open = false; }
+        private property <bool> reopened-by-right-click: false;
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down && event.button == PointerEventButton.right {
+                self.reopened-by-right-click = true;
+                root.context-menu-open = false;
+                root.reopen-context-menu(
+                    (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
+                    (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px
+                );
+            }
+        }
+        clicked => {
+            if !self.reopened-by-right-click {
+                root.context-menu-open = false;
+            }
+            self.reopened-by-right-click = false;
+        }
     }
     if root.context-menu-open: Rectangle {
         z: 29;

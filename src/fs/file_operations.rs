@@ -199,6 +199,9 @@ pub fn copy_path_with_progress(
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
     progress: &mut FileProgressCallback<'_>,
 ) -> Result<FileOperationReport, OperationError> {
+    let same_location = source == destination;
+    let kept_destination = same_location.then(|| keep_both_path(destination));
+    let destination = kept_destination.as_deref().unwrap_or(destination);
     reject_destination_inside_source(source, destination)?;
     let mut report = FileOperationReport::new();
     copy_entry(
@@ -229,6 +232,11 @@ pub fn move_path_with_progress(
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
     progress: &mut FileProgressCallback<'_>,
 ) -> Result<FileOperationReport, OperationError> {
+    if source == destination {
+        let mut report = FileOperationReport::new();
+        report.affect(source);
+        return Ok(report);
+    }
     reject_destination_inside_source(source, destination)?;
     check_cancel(cancel)?;
     if !path_exists(destination) {
@@ -1009,6 +1017,41 @@ mod tests {
             fs::read(temp.path().join("target (2).txt")).unwrap(),
             b"source"
         );
+    }
+    #[test]
+    fn copy_pasted_into_same_folder_creates_numbered_file_copies() {
+        let temp = TempDir::new();
+        let source = temp.path().join("中文报告.txt");
+        write(&source, b"source");
+        for expected in ["中文报告 (2).txt", "中文报告 (3).txt"] {
+            let report =
+                copy_path(&source, &source, &CancellationToken::new(), &mut replace).unwrap();
+            let copy = temp.path().join(expected);
+            assert_eq!(fs::read(&copy).unwrap(), b"source");
+            assert_eq!(report.completed_paths.last(), Some(&copy));
+        }
+    }
+
+    #[test]
+    fn copy_pasted_into_same_folder_creates_numbered_directory_copies() {
+        let temp = TempDir::new();
+        let source = temp.path().join("资料");
+        fs::create_dir(&source).unwrap();
+        write(&source.join("内容.txt"), b"source");
+        copy_path(&source, &source, &CancellationToken::new(), &mut replace).unwrap();
+        assert_eq!(
+            fs::read(temp.path().join("资料 (2)").join("内容.txt")).unwrap(),
+            b"source"
+        );
+    }
+
+    #[test]
+    fn move_pasted_into_same_folder_is_a_no_op() {
+        let temp = TempDir::new();
+        let source = temp.path().join("keep.txt");
+        write(&source, b"source");
+        move_path(&source, &source, &CancellationToken::new(), &mut replace).unwrap();
+        assert_eq!(fs::read(source).unwrap(), b"source");
     }
     #[test]
     fn replacing_file_preserves_old_destination_when_copy_is_cancelled() {

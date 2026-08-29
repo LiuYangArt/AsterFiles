@@ -579,6 +579,26 @@ fn selected_paths(app: &AppState) -> Vec<PathBuf> {
         .collect()
 }
 
+fn context_target_at(
+    state: &SharedSessions,
+    window_y: f32,
+    list_top: f32,
+    viewport_y: f32,
+) -> (Option<EntryId>, bool) {
+    const ROW_HEIGHT: f32 = 40.0;
+    let app = state.lock().expect("app state mutex is not poisoned");
+    if window_y < list_top {
+        return (None, true);
+    }
+    let index = ((window_y - list_top + viewport_y.max(0.0)) / ROW_HEIGHT).floor() as usize;
+    let entry = app
+        .active()
+        .visible_entries()
+        .get(index)
+        .map(|entry| entry.id);
+    (entry, entry.is_none())
+}
+
 fn enqueue_operation(
     state: &SharedSessions,
     sender: &mpsc::Sender<FileOperationRequest>,
@@ -1710,6 +1730,39 @@ fn wire_callbacks(
     });
 
     let weak = ui.as_weak();
+    let state_for_reopen_menu = state.clone();
+    let anchor_for_reopen = context_anchor.clone();
+    let clipboard_for_reopen = clipboard_sender.clone();
+    ui.on_reopen_context_menu(move |x, y| {
+        let (entry_id, background) = context_target_at(
+            &state_for_reopen_menu,
+            y,
+            weak.upgrade().map_or(0.0, |ui| ui.get_file_list_top()),
+            weak.upgrade().map_or(0.0, |ui| ui.get_file_viewport_y()),
+        );
+        *anchor_for_reopen.lock().expect("context anchor mutex") =
+            (background, x.round() as i32, y.round() as i32);
+        let _ = clipboard_for_reopen.send(ClipboardRequest::CheckAvailability);
+        if let Ok(mut app) = state_for_reopen_menu.lock() {
+            let tab_id = app.active_tab;
+            if let Some(tab) = app.tabs.get_mut(&tab_id) {
+                if let Some(id) = entry_id {
+                    if !tab.selected.contains(&id) {
+                        tab.select_entry(id, false, false);
+                    }
+                } else {
+                    tab.clear_selection();
+                }
+            }
+        }
+        if let Some(ui) = weak.upgrade() {
+            ui.set_context_menu_anchor_x(x);
+            ui.set_context_menu_anchor_y(y);
+            project_context_menu(&ui, &state_for_reopen_menu, background);
+        }
+    });
+
+    let weak = ui.as_weak();
     let state_for_context_command = state.clone();
     let sender_for_context_command = operation_sender.clone();
     let clipboard_for_context = clipboard_sender.clone();
@@ -1947,6 +2000,10 @@ fn should_close_context_menu(event: &winit::event::WindowEvent) -> bool {
     )
 }
 
+fn keyboard_shortcuts_suppressed(rename_editing: bool) -> bool {
+    rename_editing
+}
+
 fn wire_mouse_navigation(ui: &AppWindow, state: SharedSessions) {
     use winit::{
         event::{ElementState, MouseButton, WindowEvent},
@@ -1983,6 +2040,11 @@ fn wire_mouse_navigation(ui: &AppWindow, state: SharedSessions) {
         };
         if let WindowEvent::Resized(size) = event {
             ui.set_window_width(size.width as f32 / ui.window().scale_factor());
+            return EventResult::Propagate;
+        }
+        if matches!(event, WindowEvent::KeyboardInput { .. })
+            && keyboard_shortcuts_suppressed(ui.get_rename_editing())
+        {
             return EventResult::Propagate;
         }
         match event {
@@ -2853,47 +2915,70 @@ fn start_file_operation_event_pump(
                         item_states,
                         completed_paths,
                     } => {
-                        let (affected, next) =
-                            {
-                                let mut app =
-                                    state.lock().expect("app state mutex is not poisoned");
-                                if let Some(task) = app.operations.task_mut(id) {
-                                    for (index, status, error) in item_states {
-                                        if let Some(item) = task.items.get_mut(index) {
-                                            item.state = status;
-                                            item.error = error;
-                                        }
+                        let (affected, next) = {
+                            let mut app = state.lock().expect("app state mutex is not poisoned");
+                            if let Some(task) = app.operations.task_mut(id) {
+                                for (index, status, error) in item_states {
+                                    if let Some(item) = task.items.get_mut(index) {
+                                        item.state = status;
+                                        item.error = error;
                                     }
                                 }
-                                let cancelled = app
-                                    .operations
-                                    .task(id)
-                                    .is_some_and(|task| task.cancellation.is_cancelled());
-                                let terminal = if cancelled
-                                    && result.succeeded.is_empty()
-                                    && result.failed.is_empty()
-                                {
-                                    OperationState::Cancelled
-                                } else if cancelled
-                                    || (!result.failed.is_empty() && !result.succeeded.is_empty())
-                                {
-                                    OperationState::PartiallyCompleted
-                                } else if result.failed.is_empty() {
-                                    OperationState::Completed
-                                } else {
-                                    OperationState::Failed
-                                };
-                                let affected = result.affected_directories.clone();
-                                app.conflict_responses.remove(&id);
-                                if let Some(origin_tab) =
-                                    app.operations.task(id).and_then(|task| task.origin_tab)
-                                    && let Some(target) = completed_paths.last().cloned()
-                                {
+                            }
+                            let cancelled = app
+                                .operations
+                                .task(id)
+                                .is_some_and(|task| task.cancellation.is_cancelled());
+                            let terminal = if cancelled
+                                && result.succeeded.is_empty()
+                                && result.failed.is_empty()
+                            {
+                                OperationState::Cancelled
+                            } else if cancelled
+                                || (!result.failed.is_empty() && !result.succeeded.is_empty())
+                            {
+                                OperationState::PartiallyCompleted
+                            } else if result.failed.is_empty() {
+                                OperationState::Completed
+                            } else {
+                                OperationState::Failed
+                            };
+                            let affected = result.affected_directories.clone();
+                            app.conflict_responses.remove(&id);
+                            if let Some(origin_tab) =
+                                app.operations.task(id).and_then(|task| task.origin_tab)
+                                && let Some(target) = completed_paths.last().cloned()
+                            {
+                                let visible_path =
+                                    app.tabs.get(&origin_tab).and_then(|tab| tab.visible_path());
+                                if target.parent().is_some_and(|parent| {
+                                    visible_path.is_some_and(|path| path == parent)
+                                }) {
                                     app.focus_after_refresh.insert(origin_tab, target);
                                 }
-                                let _ = app.operations.finish(id, terminal, result);
-                                let next = app.operations.start_next().ok().flatten().and_then(
-                                    |next_id| {
+                            }
+                            if let Some(target) = completed_paths.last() {
+                                let matching_tabs = app
+                                    .tabs
+                                    .values()
+                                    .filter(|tab| {
+                                        target.parent().is_some_and(|parent| {
+                                            tab.visible_path().is_some_and(|path| path == parent)
+                                        })
+                                    })
+                                    .map(|tab| tab.id)
+                                    .collect::<Vec<_>>();
+                                for tab_id in matching_tabs {
+                                    app.focus_after_refresh.insert(tab_id, target.clone());
+                                }
+                            }
+                            let _ = app.operations.finish(id, terminal, result);
+                            let next =
+                                app.operations
+                                    .start_next()
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|next_id| {
                                         let _ = app.operations.mark_running(next_id);
                                         app.operations.task(next_id).map(|task| {
                                             FileOperationRequest {
@@ -2903,10 +2988,9 @@ fn start_file_operation_event_pump(
                                                 cancellation: task.cancellation.clone(),
                                             }
                                         })
-                                    },
-                                );
-                                (affected, next)
-                            };
+                                    });
+                            (affected, next)
+                        };
                         if let Some(request) = next {
                             let _ = sender.send(request);
                         }
@@ -4325,6 +4409,40 @@ mod tests {
         assert!(!should_close_context_menu(
             &winit::event::WindowEvent::Focused(true)
         ));
+    }
+
+    #[test]
+    fn rename_editor_owns_keyboard_input_before_window_shortcuts() {
+        assert!(keyboard_shortcuts_suppressed(true));
+        assert!(!keyboard_shortcuts_suppressed(false));
+    }
+
+    #[test]
+    fn repeated_context_menu_hit_test_switches_between_entry_and_background() {
+        let state = Arc::new(Mutex::new(AppState::new_for_test(
+            vec![PathBuf::from("C:/test")],
+            0,
+            [0, 1, 2, 3],
+        )));
+        {
+            let mut app = state.lock().unwrap();
+            let tab = app.tabs.get_mut(&TabId(1)).unwrap();
+            tab.replace_entries(vec![FileEntry {
+                id: EntryId(1),
+                path: PathBuf::from("C:/test/item.txt"),
+                original_name: std::ffi::OsString::from("item.txt"),
+                display_name: "item.txt".into(),
+                kind: crate::domain::EntryKind::File,
+                open_target: None,
+                size_bytes: Some(1),
+                modified: None,
+            }]);
+        }
+        assert_eq!(
+            context_target_at(&state, 170.0, 166.0, 0.0),
+            (Some(EntryId(1)), false)
+        );
+        assert_eq!(context_target_at(&state, 250.0, 166.0, 0.0), (None, true));
     }
 
     #[test]
