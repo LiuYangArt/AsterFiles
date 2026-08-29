@@ -1,3 +1,5 @@
+#[cfg(windows)]
+pub mod windows;
 pub mod windows_shell_icons;
 
 use std::path::{Path, PathBuf};

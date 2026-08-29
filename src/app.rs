@@ -18,6 +18,10 @@ use crate::{
     domain::{
         EntryId, FileEntry, LoadState, NavigationKind, RequestId, SortField, TabId, TabKind,
         TabSession,
+        file_operations::{
+            FileOperationKind, ItemState, OperationId, OperationItem, OperationManager,
+            OperationResult, OperationState,
+        },
     },
     fs::{ReadOutcome, read_directory_batches},
     i18n::{Language, Texts},
@@ -47,6 +51,15 @@ struct AppState {
     sidebar_icons: HashMap<PathBuf, platform::windows_shell_icons::ShellIconRgba>,
     sidebar: Vec<KnownLocation>,
     column_order: [u8; 4],
+    operations: OperationManager,
+    operation_errors: Vec<String>,
+    rename_target: Option<(TabId, EntryId)>,
+    pending_new_folder: Option<PathBuf>,
+    pending_permanent_delete: Vec<OperationItem>,
+    exit_after_cancel: bool,
+    clipboard_has_files: bool,
+    conflict_responses:
+        HashMap<OperationId, mpsc::Sender<crate::domain::file_operations::ConflictDecision>>,
 }
 
 impl AppState {
@@ -104,6 +117,14 @@ impl AppState {
             sidebar_icons: HashMap::new(),
             sidebar: Vec::new(),
             column_order,
+            operations: OperationManager::new(),
+            operation_errors: Vec::new(),
+            rename_target: None,
+            pending_new_folder: None,
+            pending_permanent_delete: Vec::new(),
+            exit_after_cancel: false,
+            clipboard_has_files: false,
+            conflict_responses: HashMap::new(),
         }
     }
 
@@ -293,6 +314,49 @@ enum IconTarget {
     Location,
 }
 
+#[derive(Debug)]
+struct FileOperationRequest {
+    id: OperationId,
+    kind: FileOperationKind,
+    items: Vec<OperationItem>,
+    cancellation: crate::domain::file_operations::CancellationToken,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+enum FileOperationEvent {
+    Progress {
+        id: OperationId,
+        completed_items: usize,
+        processed_bytes: u64,
+        total_bytes: Option<u64>,
+        current_item: PathBuf,
+        started: Instant,
+    },
+    Conflict {
+        id: OperationId,
+        conflict: crate::domain::file_operations::OperationConflict,
+        response: mpsc::Sender<crate::domain::file_operations::ConflictDecision>,
+    },
+    Finished {
+        id: OperationId,
+        result: OperationResult,
+        item_states: Vec<(usize, ItemState, Option<String>)>,
+    },
+}
+
+#[derive(Debug)]
+enum ClipboardRequest {
+    Write { paths: Vec<PathBuf>, cut: bool },
+    ReadPaste { target: PathBuf },
+    CheckAvailability,
+}
+#[derive(Debug)]
+enum ClipboardEvent {
+    Written(Result<(), String>),
+    Paste(Result<Option<(FileOperationKind, Vec<OperationItem>)>, String>),
+    Availability(Result<bool, String>),
+}
 struct IconEvent {
     tab_id: TabId,
     request_id: RequestId,
@@ -367,12 +431,29 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     let (request_sender, event_receiver) = spawn_directory_workers(WORKER_COUNT);
     let event_receiver = Arc::new(Mutex::new(event_receiver));
     let (icon_sender, icon_receiver) = spawn_icon_workers(ICON_WORKER_COUNT, state.clone());
+    let (operation_sender, operation_receiver) = spawn_file_operation_worker();
+    let (clipboard_sender, clipboard_receiver) = spawn_clipboard_worker();
 
-    wire_callbacks(&ui, request_sender.clone(), state.clone());
-    wire_mouse_navigation(&ui);
+    wire_callbacks(
+        &ui,
+        request_sender.clone(),
+        operation_sender.clone(),
+        clipboard_sender,
+        state.clone(),
+    );
+    wire_mouse_navigation(&ui, state.clone());
     wire_window_controls(&ui);
     start_event_pump(&ui, event_receiver, icon_sender, state.clone());
     start_icon_event_pump(&ui, icon_receiver, state.clone());
+    start_file_operation_event_pump(
+        &ui,
+        operation_receiver,
+        operation_sender.clone(),
+        request_sender.clone(),
+        state.clone(),
+    );
+    start_clipboard_event_pump(&ui, clipboard_receiver, operation_sender, state.clone());
+    scan_cleanup_diagnostics(&ui, state.clone());
     {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         app.sidebar = platform::known_locations();
@@ -469,7 +550,374 @@ fn submit_navigation(
     sender.send(request).is_ok()
 }
 
-fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state: SharedSessions) {
+fn selected_paths(app: &AppState) -> Vec<PathBuf> {
+    app.active()
+        .selected
+        .iter()
+        .filter_map(|id| {
+            app.active()
+                .visible_entry(*id)
+                .map(|entry| entry.path.clone())
+        })
+        .collect()
+}
+
+fn enqueue_operation(
+    state: &SharedSessions,
+    sender: &mpsc::Sender<FileOperationRequest>,
+    kind: FileOperationKind,
+    items: Vec<OperationItem>,
+) {
+    if items.is_empty() {
+        return;
+    }
+    let request = {
+        let mut app = state.lock().expect("app state mutex is not poisoned");
+        let tab = app.active_tab;
+        app.operations.submit(kind, Some(tab), items);
+        if app.operations.active_id().is_some() {
+            return;
+        }
+        app.operations.start_next().ok().flatten().and_then(|id| {
+            let _ = app.operations.mark_running(id);
+            app.operations.task(id).map(|task| FileOperationRequest {
+                id,
+                kind: task.kind,
+                items: task.items.clone(),
+                cancellation: task.cancellation.clone(),
+            })
+        })
+    };
+    if let Some(request) = request {
+        let _ = sender.send(request);
+    }
+}
+
+fn begin_new_folder_ui(weak: &slint::Weak<AppWindow>, state: &SharedSessions) {
+    let name = {
+        let mut app = state.lock().expect("app state mutex is not poisoned");
+        let name = match app.language {
+            Language::Chinese => "新建文件夹",
+            Language::English => "New folder",
+        };
+        let Some(parent) = app.active().visible_path() else {
+            return;
+        };
+        let path = parent.join(name);
+        app.pending_new_folder = Some(path.clone());
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    };
+    if let Some(ui) = weak.upgrade() {
+        ui.set_rename_entry_id(-2);
+        ui.set_rename_input(name.into());
+        ui.set_rename_editing(true);
+    }
+}
+
+fn commit_new_folder(
+    state: &SharedSessions,
+    sender: &mpsc::Sender<FileOperationRequest>,
+    name: &str,
+) -> bool {
+    let destination = {
+        let app = state.lock().expect("app state mutex is not poisoned");
+        let parent = app
+            .pending_new_folder
+            .as_ref()
+            .and_then(|path| path.parent().map(Path::to_path_buf));
+        parent.map(|parent| parent.join(name))
+    };
+    if let Some(path) = destination {
+        enqueue_operation(
+            state,
+            sender,
+            FileOperationKind::CreateFolder,
+            vec![OperationItem::pending(None, Some(path))],
+        );
+        true
+    } else {
+        false
+    }
+}
+fn request_clipboard_write(
+    state: &SharedSessions,
+    sender: &mpsc::Sender<ClipboardRequest>,
+    cut: bool,
+) {
+    let paths = state
+        .lock()
+        .map(|app| selected_paths(&app))
+        .unwrap_or_default();
+    if !paths.is_empty() {
+        let _ = sender.send(ClipboardRequest::Write { paths, cut });
+    }
+}
+
+fn request_clipboard_paste(state: &SharedSessions, sender: &mpsc::Sender<ClipboardRequest>) {
+    let target = state
+        .lock()
+        .ok()
+        .and_then(|app| app.active().visible_path().map(Path::to_path_buf));
+    if let Some(target) = target {
+        let _ = sender.send(ClipboardRequest::ReadPaste { target });
+    }
+}
+fn begin_rename_ui(weak: &slint::Weak<AppWindow>, state: &SharedSessions) {
+    let target = {
+        let mut app = state.lock().expect("app state mutex is not poisoned");
+        if app.active().selected.len() != 1 {
+            return;
+        }
+        let id = app.active().selected[0];
+        let name = app
+            .active()
+            .visible_entry(id)
+            .map(|entry| entry.display_name.clone());
+        app.rename_target = Some((app.active_tab, id));
+        name.map(|name| (id, name))
+    };
+    if let Some((id, name)) = target
+        && let Some(ui) = weak.upgrade()
+    {
+        ui.set_rename_entry_id(id.0 as i32);
+        ui.set_rename_input(name.into());
+        ui.set_rename_editing(true);
+    }
+}
+
+fn submit_rename(state: &SharedSessions, sender: &mpsc::Sender<FileOperationRequest>, name: &str) {
+    let item = {
+        let app = state.lock().expect("app state mutex is not poisoned");
+        let target = app.rename_target;
+        target
+            .and_then(|(tab_id, id)| app.tabs.get(&tab_id)?.visible_entry(id))
+            .and_then(|entry| {
+                entry.path.parent().map(|parent| {
+                    OperationItem::pending(Some(entry.path.clone()), Some(parent.join(name)))
+                })
+            })
+    };
+    if let Some(item) = item {
+        enqueue_operation(state, sender, FileOperationKind::Rename, vec![item]);
+    }
+}
+
+fn should_fast_remove(path: &Path) -> bool {
+    let protected = path.parent().is_none()
+        || std::env::var_os("USERPROFILE").is_some_and(|home| Path::new(&home) == path)
+        || std::env::current_dir().is_ok_and(|workspace| workspace == path);
+    !protected
+        && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+        && std::fs::read_dir(path)
+            .ok()
+            .and_then(|mut entries| entries.nth(999))
+            .is_some()
+}
+
+fn selected_delete_items(state: &SharedSessions) -> Vec<OperationItem> {
+    state
+        .lock()
+        .map(|app| {
+            selected_paths(&app)
+                .into_iter()
+                .map(|path| OperationItem::pending(Some(path), None))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn submit_delete_items(
+    state: &SharedSessions,
+    sender: &mpsc::Sender<FileOperationRequest>,
+    permanent: bool,
+    items: Vec<OperationItem>,
+) {
+    if permanent {
+        enqueue_operation(state, sender, FileOperationKind::PermanentDelete, items);
+    } else {
+        enqueue_operation(state, sender, FileOperationKind::RecycleDelete, items);
+    }
+}
+
+fn submit_delete(
+    state: &SharedSessions,
+    sender: &mpsc::Sender<FileOperationRequest>,
+    permanent: bool,
+) {
+    submit_delete_items(state, sender, permanent, selected_delete_items(state));
+}
+
+fn project_context_menu(ui: &AppWindow, state: &SharedSessions, background: bool) {
+    let (language, selected, can_paste) = {
+        let app = state.lock().expect("app state mutex is not poisoned");
+        (
+            app.language,
+            app.active().selected.len(),
+            app.clipboard_has_files,
+        )
+    };
+    let label = |zh: &'static str, en: &'static str| -> &'static str {
+        if language == Language::Chinese {
+            zh
+        } else {
+            en
+        }
+    };
+    let mut rows = Vec::new();
+    if background {
+        rows.push(ContextCommandRow {
+            id: 1,
+            label: label("新建文件夹", "New folder").into(),
+            enabled: true,
+            separator: false,
+        });
+    }
+    if !background {
+        rows.push(ContextCommandRow {
+            id: 2,
+            label: label("复制", "Copy").into(),
+            enabled: selected > 0,
+            separator: false,
+        });
+        rows.push(ContextCommandRow {
+            id: 3,
+            label: label("剪切", "Cut").into(),
+            enabled: selected > 0,
+            separator: false,
+        });
+    }
+    rows.push(ContextCommandRow {
+        id: 4,
+        label: label("粘贴", "Paste").into(),
+        enabled: can_paste,
+        separator: false,
+    });
+    if !background {
+        rows.push(ContextCommandRow {
+            id: 5,
+            label: label("重命名", "Rename").into(),
+            enabled: selected == 1,
+            separator: false,
+        });
+        rows.push(ContextCommandRow {
+            id: 6,
+            label: label("删除", "Delete").into(),
+            enabled: selected > 0,
+            separator: false,
+        });
+        rows.push(ContextCommandRow {
+            id: 7,
+            label: label("永久删除", "Delete permanently").into(),
+            enabled: selected > 0,
+            separator: false,
+        });
+    }
+    rows.push(ContextCommandRow {
+        id: 8,
+        label: label("显示完整经典菜单", "Show full classic menu").into(),
+        enabled: background || selected > 0,
+        separator: false,
+    });
+    ui.set_context_commands(ModelRc::new(VecModel::from(rows)));
+    ui.set_context_menu_on_background(background);
+    ui.set_context_menu_open(true);
+}
+
+fn show_classic_menu(
+    weak: slint::Weak<AppWindow>,
+    state: &SharedSessions,
+    background: bool,
+    owner_window: isize,
+    screen_x: i32,
+    screen_y: i32,
+) {
+    let (paths, folder) = state
+        .lock()
+        .map(|app| {
+            (
+                selected_paths(&app),
+                app.active().visible_path().map(Path::to_path_buf),
+            )
+        })
+        .unwrap_or_default();
+    if background && folder.is_none() || !background && paths.is_empty() {
+        return;
+    }
+    let state = state.clone();
+    thread::spawn(move || {
+        let session = if background {
+            platform::windows::context_menu::ClassicMenuSession::for_background_with_owner(
+                folder.as_deref().expect("background folder"),
+                true,
+                owner_window,
+            )
+        } else {
+            platform::windows::context_menu::ClassicMenuSession::for_paths_with_owner(
+                &paths,
+                true,
+                owner_window,
+            )
+        };
+        match session.and_then(|session| {
+            let _ = session.items()?;
+            session.show_native_and_invoke(owner_window, screen_x, screen_y)
+        }) {
+            Ok(Some(platform::windows::context_menu::ClassicMenuInvocation::BuiltIn { verb })) => {
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = weak.upgrade() {
+                        match verb.as_str() {
+                            "copy" => ui.invoke_copy_selection(false),
+                            "cut" => ui.invoke_copy_selection(true),
+                            "paste" => ui.invoke_paste_files(),
+                            "delete" => ui.invoke_request_delete(false),
+                            "rename" => ui.invoke_begin_rename(),
+                            _ => {}
+                        }
+                    }
+                });
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let state_for_error = state.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Ok(mut app) = state_for_error.lock() {
+                        app.operation_errors
+                            .push(format!("Classic menu failed: {error}"));
+                    }
+                    if let Some(ui) = weak.upgrade() {
+                        refresh_ui(&ui, &state_for_error);
+                    }
+                });
+            }
+        }
+    });
+}
+
+fn native_window_handle(ui: &AppWindow) -> isize {
+    use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    ui.window()
+        .with_winit_window(|window| {
+            window
+                .window_handle()
+                .ok()
+                .and_then(|handle| match handle.as_raw() {
+                    RawWindowHandle::Win32(handle) => Some(handle.hwnd.get()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+fn wire_callbacks(
+    ui: &AppWindow,
+    sender: mpsc::Sender<DirectoryRequest>,
+    operation_sender: mpsc::Sender<FileOperationRequest>,
+    clipboard_sender: mpsc::Sender<ClipboardRequest>,
+    state: SharedSessions,
+) {
     let weak = ui.as_weak();
     let sender_for_path = sender.clone();
     let state_for_path = state.clone();
@@ -1186,9 +1634,284 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
             refresh_ui(&ui, &state_for_settings);
         }
     });
-}
 
-fn wire_mouse_navigation(ui: &AppWindow) {
+    let context_anchor = Arc::new(Mutex::new((false, 240_i32, 180_i32)));
+    let weak = ui.as_weak();
+    let state_for_entry_menu = state.clone();
+    let anchor_for_entry = context_anchor.clone();
+    let clipboard_for_entry = clipboard_sender.clone();
+    ui.on_show_entry_menu(move |entry_id, x, y| {
+        *anchor_for_entry.lock().expect("context anchor mutex") =
+            (false, x.round() as i32, y.round() as i32);
+        let _ = clipboard_for_entry.send(ClipboardRequest::CheckAvailability);
+        let mut app = state_for_entry_menu
+            .lock()
+            .expect("app state mutex is not poisoned");
+        let tab_id = app.active_tab;
+        if entry_id >= 0 {
+            let id = EntryId(entry_id as u32);
+            if let Some(tab) = app.tabs.get_mut(&tab_id)
+                && !tab.selected.contains(&id)
+            {
+                tab.select_entry(id, false, false);
+            }
+        }
+        drop(app);
+        if let Some(ui) = weak.upgrade() {
+            project_context_menu(&ui, &state_for_entry_menu, false);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let state_for_background_menu = state.clone();
+    let anchor_for_background = context_anchor.clone();
+    let clipboard_for_background = clipboard_sender.clone();
+    ui.on_show_background_menu(move |x, y| {
+        *anchor_for_background.lock().expect("context anchor mutex") =
+            (true, x.round() as i32, y.round() as i32);
+        let _ = clipboard_for_background.send(ClipboardRequest::CheckAvailability);
+        if let Ok(mut app) = state_for_background_menu.lock() {
+            let tab_id = app.active_tab;
+            if let Some(tab) = app.tabs.get_mut(&tab_id) {
+                tab.clear_selection();
+            }
+        }
+        if let Some(ui) = weak.upgrade() {
+            project_context_menu(&ui, &state_for_background_menu, true);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let state_for_context_command = state.clone();
+    let sender_for_context_command = operation_sender.clone();
+    let clipboard_for_context = clipboard_sender.clone();
+    ui.on_invoke_context_command(move |command| {
+        match command {
+            1 => begin_new_folder_ui(&weak, &state_for_context_command),
+            2 => request_clipboard_write(&state_for_context_command, &clipboard_for_context, false),
+            3 => request_clipboard_write(&state_for_context_command, &clipboard_for_context, true),
+            4 => request_clipboard_paste(&state_for_context_command, &clipboard_for_context),
+            5 => begin_rename_ui(&weak, &state_for_context_command),
+            6 => submit_delete(
+                &state_for_context_command,
+                &sender_for_context_command,
+                false,
+            ),
+            7 => {
+                if let Ok(mut app) = state_for_context_command.lock() {
+                    app.pending_permanent_delete = selected_paths(&app)
+                        .into_iter()
+                        .map(|path| OperationItem::pending(Some(path), None))
+                        .collect();
+                }
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_confirm_permanent_delete_open(true);
+                }
+            }
+            8 => {
+                let (background, x, y) = *context_anchor.lock().expect("context anchor mutex");
+                if let Some(ui) = weak.upgrade() {
+                    let origin = ui.window().position();
+                    let scale = ui.window().scale_factor();
+                    show_classic_menu(
+                        weak.clone(),
+                        &state_for_context_command,
+                        background,
+                        native_window_handle(&ui),
+                        origin.x + (x as f32 * scale).round() as i32,
+                        origin.y + (y as f32 * scale).round() as i32,
+                    );
+                }
+            }
+            _ => {}
+        }
+        if let Some(ui) = weak.upgrade() {
+            refresh_ui(&ui, &state_for_context_command);
+        }
+    });
+
+    let state_for_copy = state.clone();
+    let clipboard_for_copy = clipboard_sender.clone();
+    ui.on_copy_selection(move |cut| {
+        request_clipboard_write(&state_for_copy, &clipboard_for_copy, cut);
+    });
+    let state_for_paste = state.clone();
+    let clipboard_for_paste = clipboard_sender;
+    ui.on_paste_files(move || {
+        request_clipboard_paste(&state_for_paste, &clipboard_for_paste);
+    });
+
+    let weak = ui.as_weak();
+    let state_for_rename = state.clone();
+    ui.on_begin_rename(move || {
+        begin_rename_ui(&weak, &state_for_rename);
+    });
+    let state_for_commit_rename = state.clone();
+    let sender_for_rename = operation_sender.clone();
+    ui.on_commit_rename(move |name| {
+        if !commit_new_folder(&state_for_commit_rename, &sender_for_rename, name.as_str()) {
+            submit_rename(&state_for_commit_rename, &sender_for_rename, name.as_str());
+        }
+    });
+    let weak = ui.as_weak();
+    let state_for_cancel_rename = state.clone();
+    ui.on_cancel_rename(move || {
+        if let Ok(mut app) = state_for_cancel_rename.lock() {
+            app.rename_target = None;
+            app.pending_new_folder = None;
+        }
+        if let Some(ui) = weak.upgrade() {
+            ui.set_rename_editing(false);
+            refresh_ui(&ui, &state_for_cancel_rename);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let state_for_delete = state.clone();
+    let sender_for_delete = operation_sender.clone();
+    ui.on_request_delete(move |permanent| {
+        if permanent {
+            if let Ok(mut app) = state_for_delete.lock() {
+                app.pending_permanent_delete = selected_paths(&app)
+                    .into_iter()
+                    .map(|path| OperationItem::pending(Some(path), None))
+                    .collect();
+            }
+            if let Some(ui) = weak.upgrade() {
+                ui.set_confirm_permanent_delete_open(true);
+            }
+        } else {
+            submit_delete(&state_for_delete, &sender_for_delete, false);
+        }
+    });
+    let weak = ui.as_weak();
+    let state_for_confirm_delete = state.clone();
+    let sender_for_confirm_delete = operation_sender.clone();
+    ui.on_confirm_permanent_delete(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_confirm_permanent_delete_open(false);
+        }
+        let items = state_for_confirm_delete
+            .lock()
+            .map(|mut app| std::mem::take(&mut app.pending_permanent_delete))
+            .unwrap_or_default();
+        submit_delete_items(
+            &state_for_confirm_delete,
+            &sender_for_confirm_delete,
+            true,
+            items,
+        );
+    });
+    let weak = ui.as_weak();
+    let state_for_cancel_permanent = state.clone();
+    ui.on_cancel_permanent_delete(move || {
+        if let Ok(mut app) = state_for_cancel_permanent.lock() {
+            app.pending_permanent_delete.clear();
+        }
+        if let Some(ui) = weak.upgrade() {
+            ui.set_confirm_permanent_delete_open(false);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let state_for_cancel_operation = state.clone();
+    ui.on_cancel_operation(move |id| {
+        if let Ok(mut app) = state_for_cancel_operation.lock() {
+            let operation_id = OperationId(id as u64);
+            let _ = app.operations.cancel(operation_id);
+            if let Some(response) = app.conflict_responses.remove(&operation_id) {
+                let _ = response.send(crate::domain::file_operations::ConflictDecision {
+                    action: crate::domain::file_operations::ConflictAction::Skip,
+                    apply_to_all: false,
+                });
+            }
+        }
+        if let Some(ui) = weak.upgrade() {
+            refresh_ui(&ui, &state_for_cancel_operation);
+        }
+    });
+    let state_for_retry = state.clone();
+    let sender_for_retry = operation_sender.clone();
+    ui.on_retry_operation(move |id| {
+        if let Some(request) = prepare_retry(&state_for_retry, OperationId(id as u64)) {
+            let _ = sender_for_retry.send(request);
+        }
+    });
+    let weak = ui.as_weak();
+    let state_for_conflict = state.clone();
+    ui.on_resolve_conflict(move |action, apply_to_all| {
+        let decision = crate::domain::file_operations::ConflictDecision {
+            action: match action {
+                0 => crate::domain::file_operations::ConflictAction::Replace,
+                1 => crate::domain::file_operations::ConflictAction::Skip,
+                _ => crate::domain::file_operations::ConflictAction::KeepBoth,
+            },
+            apply_to_all,
+        };
+        if let Ok(mut app) = state_for_conflict.lock()
+            && let Some(id) = app.operations.active_id()
+        {
+            if let Some(task) = app.operations.task_mut(id) {
+                let _ = task.resolve_conflict(decision);
+            }
+            if let Some(response) = app.conflict_responses.remove(&id) {
+                let _ = response.send(decision);
+            }
+        }
+        if let Some(ui) = weak.upgrade() {
+            ui.set_conflict_prompt_open(false);
+            ui.set_conflict_apply_all(false);
+            refresh_ui(&ui, &state_for_conflict);
+        }
+    });
+    let weak = ui.as_weak();
+    let state_for_close = state.clone();
+    ui.on_request_close(move || {
+        if state_for_close
+            .lock()
+            .is_ok_and(|app| app.operations.has_active_tasks())
+        {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_exit_prompt_open(true);
+            }
+        } else if let Some(ui) = weak.upgrade() {
+            let _ = ui.hide();
+        }
+    });
+    let weak = ui.as_weak();
+    ui.on_wait_on_close(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_exit_prompt_open(false);
+            ui.set_task_center_open(true);
+        }
+    });
+    let weak = ui.as_weak();
+    let state_for_cancel_close = state.clone();
+    ui.on_cancel_tasks_and_close(move || {
+        if let Ok(mut app) = state_for_cancel_close.lock() {
+            app.exit_after_cancel = true;
+            let ids = app
+                .operations
+                .iter()
+                .filter(|task| task.state.is_active())
+                .map(|task| task.id)
+                .collect::<Vec<_>>();
+            for id in ids {
+                let _ = app.operations.cancel(id);
+                if let Some(response) = app.conflict_responses.remove(&id) {
+                    let _ = response.send(crate::domain::file_operations::ConflictDecision {
+                        action: crate::domain::file_operations::ConflictAction::Skip,
+                        apply_to_all: false,
+                    });
+                }
+            }
+        }
+        if let Some(ui) = weak.upgrade() {
+            ui.set_exit_prompt_open(false);
+        }
+    });
+}
+fn wire_mouse_navigation(ui: &AppWindow, state: SharedSessions) {
     use winit::{
         event::{ElementState, MouseButton, WindowEvent},
         keyboard::{Key, ModifiersState, NamedKey},
@@ -1197,6 +1920,18 @@ fn wire_mouse_navigation(ui: &AppWindow) {
     let weak = ui.as_weak();
     let modifiers = Cell::new(ModifiersState::empty());
     ui.window().on_winit_window_event(move |_, event| {
+        if matches!(event, WindowEvent::CloseRequested) {
+            if state
+                .lock()
+                .is_ok_and(|app| app.operations.has_active_tasks())
+            {
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_exit_prompt_open(true);
+                }
+                return EventResult::PreventDefault;
+            }
+            return EventResult::Propagate;
+        }
         if let WindowEvent::ModifiersChanged(changed) = event {
             modifiers.set(changed.state());
             return EventResult::Propagate;
@@ -1324,6 +2059,60 @@ fn wire_mouse_navigation(ui: &AppWindow) {
                     _ if control
                         && !alt
                         && !shift
+                        && !settings_active
+                        && !editing_address
+                        && character.is_some_and(|value| value.eq_ignore_ascii_case("c")) =>
+                    {
+                        ui.invoke_copy_selection(false);
+                        true
+                    }
+                    _ if control
+                        && !alt
+                        && !shift
+                        && !settings_active
+                        && !editing_address
+                        && character.is_some_and(|value| value.eq_ignore_ascii_case("x")) =>
+                    {
+                        ui.invoke_copy_selection(true);
+                        true
+                    }
+                    _ if control
+                        && !alt
+                        && !shift
+                        && !settings_active
+                        && !editing_address
+                        && character.is_some_and(|value| value.eq_ignore_ascii_case("v")) =>
+                    {
+                        ui.invoke_paste_files();
+                        true
+                    }
+                    Key::Named(NamedKey::F2)
+                        if !control && !alt && !shift && !settings_active && !editing_address =>
+                    {
+                        ui.invoke_begin_rename();
+                        true
+                    }
+                    Key::Named(NamedKey::Delete)
+                        if !control && !alt && !settings_active && !editing_address =>
+                    {
+                        ui.invoke_request_delete(shift);
+                        true
+                    }
+                    Key::Named(NamedKey::F10)
+                        if shift && !control && !alt && !settings_active && !editing_address =>
+                    {
+                        ui.invoke_show_keyboard_context_menu();
+                        true
+                    }
+                    Key::Named(NamedKey::ContextMenu)
+                        if !control && !alt && !settings_active && !editing_address =>
+                    {
+                        ui.invoke_show_keyboard_context_menu();
+                        true
+                    }
+                    _ if control
+                        && !alt
+                        && !shift
                         && character.is_some_and(|value| value.eq_ignore_ascii_case("t")) =>
                     {
                         ui.invoke_new_tab();
@@ -1402,6 +2191,655 @@ fn wire_window_controls(ui: &AppWindow) {
             let _ = window.drag_window();
         });
     });
+}
+fn scan_cleanup_diagnostics(ui: &AppWindow, state: SharedSessions) {
+    let weak = ui.as_weak();
+    let roots = state
+        .lock()
+        .map(|app| app.stable_paths())
+        .unwrap_or_default();
+    thread::spawn(move || {
+        let pending = roots
+            .into_iter()
+            .map(|path| path.join(".asterfiles-cleanup"))
+            .find(|path| {
+                std::fs::read_dir(path)
+                    .ok()
+                    .and_then(|mut entries| entries.next())
+                    .is_some()
+            });
+        if let Some(path) = pending {
+            let state_for_ui = state.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Ok(mut app) = state_for_ui.lock() {
+                    app.operation_errors.push(format!(
+                        "Pending cleanup requires attention: {}",
+                        display_path(&path)
+                    ));
+                }
+                if let Some(ui) = weak.upgrade() {
+                    refresh_ui(&ui, &state_for_ui);
+                }
+            });
+        }
+    });
+}
+
+fn spawn_clipboard_worker() -> (
+    mpsc::Sender<ClipboardRequest>,
+    mpsc::Receiver<ClipboardEvent>,
+) {
+    let (request_sender, request_receiver) = mpsc::channel();
+    let (event_sender, event_receiver) = mpsc::channel();
+    thread::spawn(move || {
+        while let Ok(request) = request_receiver.recv() {
+            let event = match request {
+                ClipboardRequest::Write { paths, cut } => ClipboardEvent::Written(
+                    platform::windows::clipboard::write_file_list(
+                        &paths,
+                        if cut {
+                            platform::windows::clipboard::ClipboardOperation::Move
+                        } else {
+                            platform::windows::clipboard::ClipboardOperation::Copy
+                        },
+                    )
+                    .map_err(|error| error.to_string()),
+                ),
+                ClipboardRequest::CheckAvailability => ClipboardEvent::Availability(
+                    platform::windows::clipboard::read_file_list()
+                        .map(|clipboard| clipboard.is_some())
+                        .map_err(|error| error.to_string()),
+                ),
+                ClipboardRequest::ReadPaste { target } => ClipboardEvent::Paste(
+                    platform::windows::clipboard::read_file_list()
+                        .map(|clipboard| {
+                            clipboard.map(|clipboard| {
+                                let kind = match clipboard.operation {
+                                    platform::windows::clipboard::ClipboardOperation::Copy => {
+                                        FileOperationKind::Copy
+                                    }
+                                    platform::windows::clipboard::ClipboardOperation::Move => {
+                                        FileOperationKind::Move
+                                    }
+                                };
+                                let items = clipboard
+                                    .paths
+                                    .into_iter()
+                                    .filter_map(|source| {
+                                        source.file_name().map(|name| {
+                                            OperationItem::pending(
+                                                Some(source.clone()),
+                                                Some(target.join(name)),
+                                            )
+                                        })
+                                    })
+                                    .collect();
+                                (kind, items)
+                            })
+                        })
+                        .map_err(|error| error.to_string()),
+                ),
+            };
+            let _ = event_sender.send(event);
+        }
+    });
+    (request_sender, event_receiver)
+}
+
+fn start_clipboard_event_pump(
+    ui: &AppWindow,
+    receiver: mpsc::Receiver<ClipboardEvent>,
+    operation_sender: mpsc::Sender<FileOperationRequest>,
+    state: SharedSessions,
+) {
+    let weak = ui.as_weak();
+    thread::spawn(move || {
+        while let Ok(event) = receiver.recv() {
+            let weak = weak.clone();
+            let state = state.clone();
+            let operation_sender = operation_sender.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                match event {
+                    ClipboardEvent::Written(Err(error))
+                    | ClipboardEvent::Paste(Err(error))
+                    | ClipboardEvent::Availability(Err(error)) => {
+                        if let Ok(mut app) = state.lock() {
+                            app.operation_errors.push(error);
+                        }
+                    }
+                    ClipboardEvent::Paste(Ok(Some((kind, items)))) => {
+                        enqueue_operation(&state, &operation_sender, kind, items)
+                    }
+                    ClipboardEvent::Availability(Ok(available)) => {
+                        if let Ok(mut app) = state.lock() {
+                            app.clipboard_has_files = available;
+                        }
+                    }
+                    ClipboardEvent::Written(Ok(())) | ClipboardEvent::Paste(Ok(None)) => {}
+                }
+                if let Some(ui) = weak.upgrade() {
+                    refresh_ui(&ui, &state);
+                    if ui.get_context_menu_open() {
+                        let background = ui.get_context_menu_on_background();
+                        project_context_menu(&ui, &state, background);
+                    }
+                }
+            });
+        }
+    });
+}
+fn spawn_file_operation_worker() -> (
+    mpsc::Sender<FileOperationRequest>,
+    mpsc::Receiver<FileOperationEvent>,
+) {
+    let (request_sender, request_receiver) = mpsc::channel::<FileOperationRequest>();
+    let (event_sender, event_receiver) = mpsc::channel::<FileOperationEvent>();
+    thread::spawn(move || {
+        while let Ok(request) = request_receiver.recv() {
+            let mut succeeded = Vec::new();
+            let mut skipped = Vec::new();
+            let mut failed = Vec::new();
+            let mut affected = Vec::new();
+            let mut indexed_states = Vec::new();
+            let started = Instant::now();
+            let total_bytes = request
+                .items
+                .iter()
+                .filter(|item| item.state == ItemState::Pending)
+                .filter_map(|item| item.source.as_deref())
+                .try_fold(0_u64, |sum, path| {
+                    tree_bytes(path).map(|value| sum.saturating_add(value))
+                });
+            let mut processed_bytes = 0_u64;
+            let mut conflict_defaults = HashMap::new();
+            for (item_index, item) in request.items.iter().enumerate() {
+                if item.state != ItemState::Pending {
+                    continue;
+                }
+                if request.cancellation.is_cancelled() {
+                    indexed_states.push((item_index, ItemState::Cancelled, None));
+                    continue;
+                }
+                let outcome = execute_file_operation_item(
+                    request.id,
+                    request.kind,
+                    item,
+                    &request.cancellation,
+                    &event_sender,
+                    item_index,
+                    processed_bytes,
+                    total_bytes,
+                    started,
+                    &mut conflict_defaults,
+                );
+                match outcome {
+                    Ok(report) => {
+                        processed_bytes = processed_bytes.saturating_add(report.bytes);
+                        let current_item = item
+                            .source
+                            .clone()
+                            .or_else(|| item.destination.clone())
+                            .unwrap_or_default();
+                        let _ = event_sender.send(FileOperationEvent::Progress {
+                            id: request.id,
+                            completed_items: item_index + 1,
+                            processed_bytes,
+                            total_bytes,
+                            current_item,
+                            started,
+                        });
+                        let identity = item
+                            .destination
+                            .clone()
+                            .or_else(|| item.source.clone())
+                            .unwrap_or_default();
+                        if report.skipped.is_empty() {
+                            succeeded.push(identity);
+                            indexed_states.push((item_index, ItemState::Succeeded, None));
+                        } else {
+                            skipped.extend(report.skipped);
+                            indexed_states.push((item_index, ItemState::Skipped, None));
+                        }
+                        for directory in report.affected_directories {
+                            if !affected.contains(&directory) {
+                                affected.push(directory);
+                            }
+                        }
+                    }
+                    Err(message) => {
+                        let identity = item
+                            .source
+                            .clone()
+                            .or_else(|| item.destination.clone())
+                            .unwrap_or_default();
+                        failed.push((identity, message.clone()));
+                        indexed_states.push((item_index, ItemState::Failed, Some(message)));
+                    }
+                }
+            }
+            let _ = event_sender.send(FileOperationEvent::Finished {
+                id: request.id,
+                result: OperationResult {
+                    succeeded,
+                    skipped,
+                    failed,
+                    affected_directories: affected,
+                },
+                item_states: indexed_states,
+            });
+        }
+    });
+    (request_sender, event_receiver)
+}
+
+fn tree_bytes(path: &Path) -> Option<u64> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() {
+        return Some(0);
+    }
+    if metadata.is_file() {
+        return Some(metadata.len());
+    }
+    let mut total = 0_u64;
+    for entry in std::fs::read_dir(path).ok()? {
+        total = total.saturating_add(tree_bytes(&entry.ok()?.path())?);
+    }
+    Some(total)
+}
+
+fn file_snapshot(path: &Path) -> crate::domain::file_operations::FileSnapshot {
+    let metadata = std::fs::symlink_metadata(path).ok();
+    crate::domain::file_operations::FileSnapshot {
+        path: path.to_path_buf(),
+        is_directory: metadata
+            .as_ref()
+            .is_some_and(|value| value.file_type().is_dir()),
+        size_bytes: metadata
+            .as_ref()
+            .filter(|value| value.is_file())
+            .map(|value| value.len()),
+        modified: metadata.and_then(|value| value.modified().ok()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_file_operation_item(
+    id: OperationId,
+    kind: FileOperationKind,
+    item: &OperationItem,
+    cancel: &crate::domain::file_operations::CancellationToken,
+    events: &mpsc::Sender<FileOperationEvent>,
+    completed_items: usize,
+    base_processed_bytes: u64,
+    operation_total_bytes: Option<u64>,
+    started: Instant,
+    conflict_defaults: &mut HashMap<
+        crate::domain::file_operations::ConflictCategory,
+        crate::domain::file_operations::ConflictAction,
+    >,
+) -> Result<crate::fs::file_operations::FileOperationReport, String> {
+    let replace = &mut |category, source: &Path, destination: &Path| {
+        if let Some(action) = conflict_defaults.get(&category).copied() {
+            return action;
+        }
+        let (response_sender, response_receiver) = mpsc::channel();
+        let conflict = crate::domain::file_operations::OperationConflict {
+            category,
+            source: file_snapshot(source),
+            destination: file_snapshot(destination),
+        };
+        if events
+            .send(FileOperationEvent::Conflict {
+                id,
+                conflict,
+                response: response_sender,
+            })
+            .is_err()
+        {
+            return crate::domain::file_operations::ConflictAction::Skip;
+        }
+        match response_receiver.recv() {
+            Ok(decision) => {
+                if decision.apply_to_all {
+                    conflict_defaults.insert(category, decision.action);
+                }
+                decision.action
+            }
+            Err(_) => crate::domain::file_operations::ConflictAction::Skip,
+        }
+    };
+    match kind {
+        FileOperationKind::CreateFolder => {
+            let destination = item.destination.as_ref().ok_or("missing destination")?;
+            let parent = destination.parent().ok_or("missing parent")?;
+            let name = destination.file_name().ok_or("missing name")?;
+            crate::fs::file_operations::create_folder(parent, name)
+                .map(|path| {
+                    let mut report = crate::fs::file_operations::FileOperationReport {
+                        files: 0,
+                        directories: 1,
+                        bytes: 0,
+                        skipped: vec![],
+                        affected_directories: vec![],
+                        cleanup_pending: None,
+                    };
+                    if let Some(parent) = path.parent() {
+                        report.affected_directories.push(parent.to_path_buf());
+                    }
+                    report
+                })
+                .map_err(|error| format!("{error:?}"))
+        }
+        FileOperationKind::Rename => {
+            let source = item.source.as_ref().ok_or("missing source")?;
+            let destination = item.destination.as_ref().ok_or("missing destination")?;
+            let name = destination.file_name().ok_or("missing name")?;
+            crate::fs::file_operations::rename_path(source, name)
+                .map(|path| {
+                    let mut report = crate::fs::file_operations::FileOperationReport {
+                        files: 1,
+                        directories: 0,
+                        bytes: 0,
+                        skipped: vec![],
+                        affected_directories: vec![],
+                        cleanup_pending: None,
+                    };
+                    if let Some(parent) = path.parent() {
+                        report.affected_directories.push(parent.to_path_buf());
+                    }
+                    report
+                })
+                .map_err(|error| format!("{error:?}"))
+        }
+        FileOperationKind::Copy | FileOperationKind::Move => {
+            let source = item.source.as_ref().ok_or("missing source")?;
+            let destination = item.destination.as_ref().ok_or("missing destination")?;
+            let mut processed = base_processed_bytes;
+            let current = source.clone();
+            let mut progress = |bytes| {
+                processed = processed.saturating_add(bytes);
+                let _ = events.send(FileOperationEvent::Progress {
+                    id,
+                    completed_items,
+                    processed_bytes: processed,
+                    total_bytes: operation_total_bytes,
+                    current_item: current.clone(),
+                    started,
+                });
+            };
+            let result = if kind == FileOperationKind::Copy {
+                crate::fs::file_operations::copy_path_with_progress(
+                    source,
+                    destination,
+                    cancel,
+                    replace,
+                    &mut progress,
+                )
+            } else {
+                crate::fs::file_operations::move_path_with_progress(
+                    source,
+                    destination,
+                    cancel,
+                    replace,
+                    &mut progress,
+                )
+            };
+            result.map_err(|error| format!("{error:?}"))
+        }
+        FileOperationKind::RecycleDelete => {
+            let path = item.source.as_ref().ok_or("missing source")?.clone();
+            let result = platform::windows::file_operation::recycle(&[path]);
+            let first = result
+                .items
+                .into_iter()
+                .next()
+                .ok_or("missing recycle result")?;
+            first
+                .result
+                .map(|_| crate::fs::file_operations::FileOperationReport {
+                    files: 1,
+                    directories: 0,
+                    bytes: 0,
+                    skipped: vec![],
+                    affected_directories: first
+                        .path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .into_iter()
+                        .collect(),
+                    cleanup_pending: None,
+                })
+        }
+        FileOperationKind::PermanentDelete => {
+            let path = item.source.as_ref().ok_or("missing source")?;
+            if should_fast_remove(path) {
+                let parent = path.parent().ok_or("missing parent")?;
+                let report = crate::fs::file_operations::fast_remove(
+                    path,
+                    &parent.join(".asterfiles-cleanup"),
+                    cancel,
+                )
+                .map_err(|error| format!("{error:?}"))?;
+                if let Some(pending) = report.cleanup_pending.as_ref()
+                    && let Err(error) = crate::fs::file_operations::clean_pending(pending, cancel)
+                {
+                    let _ = std::fs::rename(pending, path);
+                    return Err(format!(
+                        "cleanup pending at {}: {error:?}",
+                        display_path(pending)
+                    ));
+                }
+                Ok(report)
+            } else {
+                crate::fs::file_operations::permanently_delete(path, cancel)
+                    .map_err(|error| format!("{error:?}"))
+            }
+        }
+        FileOperationKind::FastRemove => {
+            let path = item.source.as_ref().ok_or("missing source")?;
+            let parent = path.parent().ok_or("missing parent")?;
+            let report = crate::fs::file_operations::fast_remove(
+                path,
+                &parent.join(".asterfiles-cleanup"),
+                cancel,
+            )
+            .map_err(|error| format!("{error:?}"))?;
+            if let Some(pending) = report.cleanup_pending.as_ref()
+                && let Err(error) = crate::fs::file_operations::clean_pending(pending, cancel)
+            {
+                let _ = std::fs::rename(pending, path);
+                return Err(format!(
+                    "cleanup pending at {}: {error:?}",
+                    display_path(pending)
+                ));
+            }
+            Ok(report)
+        }
+    }
+}
+
+fn start_file_operation_event_pump(
+    ui: &AppWindow,
+    receiver: mpsc::Receiver<FileOperationEvent>,
+    sender: mpsc::Sender<FileOperationRequest>,
+    directory_sender: mpsc::Sender<DirectoryRequest>,
+    state: SharedSessions,
+) {
+    let weak = ui.as_weak();
+    thread::spawn(move || {
+        while let Ok(event) = receiver.recv() {
+            let weak = weak.clone();
+            let sender = sender.clone();
+            let directory_sender = directory_sender.clone();
+            let state = state.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let event_operation_id = match &event {
+                    FileOperationEvent::Progress { id, .. }
+                    | FileOperationEvent::Conflict { id, .. }
+                    | FileOperationEvent::Finished { id, .. } => *id,
+                };
+                match event {
+                    FileOperationEvent::Progress {
+                        id,
+                        completed_items,
+                        processed_bytes,
+                        total_bytes,
+                        current_item,
+                        started,
+                    } => {
+                        if let Ok(mut app) = state.lock()
+                            && let Some(task) = app.operations.task_mut(id)
+                        {
+                            task.progress.completed_items = completed_items;
+                            task.progress.processed_bytes = processed_bytes;
+                            task.progress.total_bytes = total_bytes;
+                            task.progress.current_item = Some(current_item);
+                            let _elapsed = started.elapsed();
+                        }
+                    }
+                    FileOperationEvent::Conflict {
+                        id,
+                        conflict,
+                        response,
+                    } => {
+                        let source = display_path(&conflict.source.path);
+                        let destination = display_path(&conflict.destination.path);
+                        if let Ok(mut app) = state.lock() {
+                            if let Some(task) = app.operations.task_mut(id) {
+                                let _ = task.set_conflict(conflict);
+                            }
+                            app.conflict_responses.insert(id, response);
+                        }
+                        if let Some(ui) = weak.upgrade() {
+                            ui.set_conflict_source(source.into());
+                            ui.set_conflict_destination(destination.into());
+                            ui.set_conflict_apply_all(false);
+                            ui.set_conflict_prompt_open(true);
+                        }
+                    }
+                    FileOperationEvent::Finished {
+                        id,
+                        result,
+                        item_states,
+                    } => {
+                        let (affected, next) =
+                            {
+                                let mut app =
+                                    state.lock().expect("app state mutex is not poisoned");
+                                if let Some(task) = app.operations.task_mut(id) {
+                                    for (index, status, error) in item_states {
+                                        if let Some(item) = task.items.get_mut(index) {
+                                            item.state = status;
+                                            item.error = error;
+                                        }
+                                    }
+                                }
+                                let cancelled = app
+                                    .operations
+                                    .task(id)
+                                    .is_some_and(|task| task.cancellation.is_cancelled());
+                                let terminal = if cancelled
+                                    && result.succeeded.is_empty()
+                                    && result.failed.is_empty()
+                                {
+                                    OperationState::Cancelled
+                                } else if cancelled
+                                    || (!result.failed.is_empty() && !result.succeeded.is_empty())
+                                {
+                                    OperationState::PartiallyCompleted
+                                } else if result.failed.is_empty() {
+                                    OperationState::Completed
+                                } else {
+                                    OperationState::Failed
+                                };
+                                let affected = result.affected_directories.clone();
+                                app.conflict_responses.remove(&id);
+                                let _ = app.operations.finish(id, terminal, result);
+                                let next = app.operations.start_next().ok().flatten().and_then(
+                                    |next_id| {
+                                        let _ = app.operations.mark_running(next_id);
+                                        app.operations.task(next_id).map(|task| {
+                                            FileOperationRequest {
+                                                id: next_id,
+                                                kind: task.kind,
+                                                items: task.items.clone(),
+                                                cancellation: task.cancellation.clone(),
+                                            }
+                                        })
+                                    },
+                                );
+                                (affected, next)
+                            };
+                        if let Some(request) = next {
+                            let _ = sender.send(request);
+                        }
+                        refresh_affected_tabs(&directory_sender, &state, &affected);
+                    }
+                }
+                if let Some(ui) = weak.upgrade() {
+                    let close_editor = state
+                        .lock()
+                        .ok()
+                        .and_then(|app| app.operations.task(event_operation_id).cloned())
+                        .is_some_and(|task| {
+                            matches!(
+                                task.kind,
+                                FileOperationKind::CreateFolder | FileOperationKind::Rename
+                            ) && task.state == OperationState::Completed
+                        });
+                    if close_editor {
+                        if let Ok(mut app) = state.lock() {
+                            app.pending_new_folder = None;
+                            app.rename_target = None;
+                        }
+                        ui.set_rename_editing(false);
+                    }
+                    refresh_ui(&ui, &state);
+                    if state.lock().is_ok_and(|app| {
+                        app.exit_after_cancel && !app.operations.has_active_tasks()
+                    }) {
+                        let _ = ui.hide();
+                    }
+                }
+            });
+        }
+    });
+}
+fn refresh_affected_tabs(
+    sender: &mpsc::Sender<DirectoryRequest>,
+    state: &SharedSessions,
+    directories: &[PathBuf],
+) {
+    let targets = {
+        let app = state.lock().expect("app state mutex is not poisoned");
+        app.tabs
+            .values()
+            .filter_map(|tab| {
+                tab.visible_path()
+                    .filter(|path| directories.iter().any(|directory| directory == *path))
+                    .map(|path| (tab.id, path.to_path_buf()))
+            })
+            .collect::<Vec<_>>()
+    };
+    for (tab, path) in targets {
+        submit_navigation(sender, state, tab, path, NavigationKind::Refresh);
+    }
+}
+
+fn prepare_retry(state: &SharedSessions, id: OperationId) -> Option<FileOperationRequest> {
+    let mut app = state.lock().ok()?;
+    if !app.operations.retry(id) {
+        return None;
+    }
+    let started = app.operations.start_next().ok().flatten()?;
+    app.operations.mark_running(started).ok()?;
+    let task = app.operations.task(started)?;
+    Some(FileOperationRequest {
+        id: started,
+        kind: task.kind,
+        items: task.items.clone(),
+        cancellation: task.cancellation.clone(),
+    })
 }
 fn spawn_directory_workers(
     worker_count: usize,
@@ -1843,7 +3281,115 @@ fn update_selection_summary(ui: &AppWindow, state: &SharedSessions) {
             })
             .collect::<Vec<_>>(),
     )));
+    let operation_rows = app
+        .operations
+        .iter()
+        .map(|task| {
+            let completed = task
+                .items
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item.state,
+                        ItemState::Succeeded
+                            | ItemState::Skipped
+                            | ItemState::Failed
+                            | ItemState::Cancelled
+                    )
+                })
+                .count();
+            let title = match (app.language, task.kind) {
+                (Language::Chinese, FileOperationKind::CreateFolder) => "新建文件夹",
+                (Language::Chinese, FileOperationKind::Rename) => "重命名",
+                (Language::Chinese, FileOperationKind::Copy) => "复制",
+                (Language::Chinese, FileOperationKind::Move) => "移动",
+                (Language::Chinese, FileOperationKind::RecycleDelete) => "移到回收站",
+                (Language::Chinese, FileOperationKind::PermanentDelete) => "永久删除",
+                (Language::Chinese, FileOperationKind::FastRemove) => "释放空间",
+                (Language::English, FileOperationKind::CreateFolder) => "New folder",
+                (Language::English, FileOperationKind::Rename) => "Rename",
+                (Language::English, FileOperationKind::Copy) => "Copy",
+                (Language::English, FileOperationKind::Move) => "Move",
+                (Language::English, FileOperationKind::RecycleDelete) => "Move to Recycle Bin",
+                (Language::English, FileOperationKind::PermanentDelete) => "Delete permanently",
+                (Language::English, FileOperationKind::FastRemove) => "Free space",
+            };
+            let progress = task
+                .progress
+                .total_bytes
+                .filter(|total| *total > 0)
+                .map(|total| task.progress.processed_bytes as f32 / total as f32)
+                .unwrap_or_else(|| {
+                    if task.items.is_empty() {
+                        0.0
+                    } else {
+                        completed as f32 / task.items.len() as f32
+                    }
+                });
+            let byte_detail = task
+                .progress
+                .total_bytes
+                .filter(|total| *total > 0)
+                .map(|total| {
+                    let elapsed = task
+                        .created_at
+                        .elapsed()
+                        .unwrap_or_default()
+                        .as_secs_f64()
+                        .max(0.001);
+                    let speed = task.progress.processed_bytes as f64 / elapsed;
+                    let remaining = total.saturating_sub(task.progress.processed_bytes);
+                    let eta = if speed > 0.0 {
+                        remaining as f64 / speed
+                    } else {
+                        0.0
+                    };
+                    format!(
+                        " · {:.1}/{:.1} MB · {:.1} MB/s · {:.0}s",
+                        task.progress.processed_bytes as f64 / 1_048_576.0,
+                        total as f64 / 1_048_576.0,
+                        speed / 1_048_576.0,
+                        eta
+                    )
+                })
+                .unwrap_or_default();
+            let error_detail = task
+                .result
+                .as_ref()
+                .and_then(|result| result.failed.first())
+                .map(|(_, error)| format!(" · {error}"))
+                .unwrap_or_default();
+            OperationRow {
+                id: task.id.0 as i32,
+                title: title.into(),
+                detail: format!(
+                    "{completed}/{}{byte_detail}{error_detail}",
+                    task.items.len()
+                )
+                .into(),
+                progress,
+                state: operation_state_index(task.state),
+                can_cancel: task.state.is_active(),
+                can_retry: task.state.is_terminal()
+                    && task.items.iter().any(|item| {
+                        matches!(
+                            item.state,
+                            ItemState::Failed | ItemState::Cancelled | ItemState::Pending
+                        )
+                    }),
+            }
+        })
+        .collect::<Vec<_>>();
+    ui.set_operations(ModelRc::new(VecModel::from(operation_rows)));
+    ui.set_operation_error(
+        app.operation_errors
+            .last()
+            .cloned()
+            .unwrap_or_default()
+            .into(),
+    );
     ui.set_selected_count(tab.selected.len() as i32);
+    ui.set_context_menu_has_entry(!tab.selected.is_empty() || tab.focused.is_some());
     ui.set_status_text(status_text(tab, Texts::new(app.language)).into());
 }
 fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
@@ -2048,6 +3594,19 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
     apply_ui_texts(ui, app.language);
 }
 
+fn operation_state_index(state: OperationState) -> i32 {
+    match state {
+        OperationState::Queued => 0,
+        OperationState::Preflight => 1,
+        OperationState::Running => 2,
+        OperationState::WaitingConflict => 3,
+        OperationState::Cancelling => 4,
+        OperationState::Completed => 5,
+        OperationState::Cancelled => 6,
+        OperationState::PartiallyCompleted => 7,
+        OperationState::Failed => 8,
+    }
+}
 fn file_row(entry: &FileEntry, tab: &TabSession, texts: Texts, app: &AppState) -> FileRow {
     debug_assert_eq!(
         entry.path.file_name(),
@@ -2306,6 +3865,81 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_window_close(close.into());
     ui.set_text_address(address.into());
     ui.set_text_cancel_edit(cancel_edit.into());
+    let (
+        file_operations,
+        task_count,
+        cancel_operation,
+        retry_operation,
+        permanent_title,
+        permanent_detail,
+        delete,
+        exit_title,
+        exit_detail,
+        cancel_and_exit,
+        wait,
+        conflict_title,
+        conflict_detail,
+        replace,
+        skip,
+        keep_both,
+        apply_all,
+    ) = match language {
+        Language::Chinese => (
+            "文件操作",
+            "个任务",
+            "取消",
+            "重试",
+            "永久删除所选项目？",
+            "此操作无法撤销。",
+            "删除",
+            "文件操作仍在进行",
+            "等待任务完成，或取消任务后退出。",
+            "取消任务并退出",
+            "等待完成",
+            "目标位置已有同名项目",
+            "请选择如何处理当前冲突。",
+            "替换",
+            "跳过",
+            "保留两者",
+            "对这类冲突全部应用",
+        ),
+        Language::English => (
+            "File operations",
+            "tasks",
+            "Cancel",
+            "Retry",
+            "Permanently delete selected items?",
+            "This action cannot be undone.",
+            "Delete",
+            "File operations are still running",
+            "Wait for them to finish, or cancel the tasks before exiting.",
+            "Cancel tasks and exit",
+            "Wait",
+            "An item with the same name already exists",
+            "Choose how to handle this conflict.",
+            "Replace",
+            "Skip",
+            "Keep both",
+            "Apply to all conflicts of this type",
+        ),
+    };
+    ui.set_text_file_operations(file_operations.into());
+    ui.set_text_task_count(task_count.into());
+    ui.set_text_cancel_operation(cancel_operation.into());
+    ui.set_text_retry_operation(retry_operation.into());
+    ui.set_text_permanent_delete_title(permanent_title.into());
+    ui.set_text_permanent_delete_detail(permanent_detail.into());
+    ui.set_text_delete(delete.into());
+    ui.set_text_exit_title(exit_title.into());
+    ui.set_text_exit_detail(exit_detail.into());
+    ui.set_text_cancel_and_exit(cancel_and_exit.into());
+    ui.set_text_wait(wait.into());
+    ui.set_text_conflict_title(conflict_title.into());
+    ui.set_text_conflict_detail(conflict_detail.into());
+    ui.set_text_replace(replace.into());
+    ui.set_text_skip(skip.into());
+    ui.set_text_keep_both(keep_both.into());
+    ui.set_text_apply_all(apply_all.into());
 }
 
 fn display_path(path: &Path) -> String {

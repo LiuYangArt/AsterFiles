@@ -7,6 +7,8 @@ export struct BreadcrumbRow { index: int, label: string, current: bool }
 export struct TabRow { id: int, title: string, active: bool, loading: bool, icon: image, is-drive: bool, is-settings: bool }
 export struct SidebarRow { index: int, label: string, icon-kind: int, is-drive: bool, icon: image }
 export struct ColumnRow { kind: int }
+export struct ContextCommandRow { id: int, label: string, enabled: bool, separator: bool }
+export struct OperationRow { id: int, title: string, detail: string, progress: float, state: int, can-cancel: bool, can-retry: bool }
 export global VisualStyle {
     in-out property <bool> dark-theme: false;
     out property <color> c24252a: dark-theme ? #f2f2f2 : #24252a;
@@ -351,6 +353,28 @@ export component AppWindow inherits Window {
     in property <[BreadcrumbRow]> breadcrumbs;
     in property <[SidebarRow]> sidebar-items;
     in property <[ColumnRow]> columns;
+    in property <[ContextCommandRow]> context-commands;
+    in property <[OperationRow]> operations;
+    in-out property <bool> context-menu-open: false;
+    in property <bool> context-menu-on-background: false;
+    in-out property <bool> task-center-open: false;
+    in property <bool> confirm-permanent-delete-open: false;
+    in property <bool> exit-prompt-open: false;
+    in property <bool> conflict-prompt-open: false;
+    in property <string> conflict-source: "";
+    in property <string> conflict-destination: "";
+    in property <string> text-conflict-title: "目标位置已有同名项目";
+    in property <string> text-conflict-detail: "请选择如何处理当前冲突。";
+    in property <string> text-replace: "替换";
+    in property <string> text-skip: "跳过";
+    in property <string> text-keep-both: "保留两者";
+    in property <string> text-apply-all: "对这类冲突全部应用";
+    in-out property <bool> conflict-apply-all: false;
+    in-out property <string> rename-input: "";
+    in property <int> rename-entry-id: -1;
+    in property <bool> rename-editing: false;
+    in property <string> operation-error: "";
+    in property <bool> context-menu-has-entry: false;
     in-out property <bool> quick-access-expanded: true;
     in-out property <bool> drives-expanded: true;
     in property <bool> can-navigate-back: false;
@@ -408,6 +432,17 @@ export component AppWindow inherits Window {
     in property <string> text-type: "类型";
     in property <string> text-modified: "修改时间";
     in property <string> text-size: "大小";
+    in property <string> text-file-operations: "文件操作";
+    in property <string> text-task-count: "个任务";
+    in property <string> text-cancel-operation: "取消";
+    in property <string> text-retry-operation: "重试";
+    in property <string> text-permanent-delete-title: "永久删除所选项目？";
+    in property <string> text-permanent-delete-detail: "此操作无法撤销。";
+    in property <string> text-delete: "删除";
+    in property <string> text-exit-title: "文件操作仍在进行";
+    in property <string> text-exit-detail: "等待任务完成，或取消任务后退出。";
+    in property <string> text-cancel-and-exit: "取消任务并退出";
+    in property <string> text-wait: "等待完成";
 
     callback navigate-path(string);
     callback begin-address-edit();
@@ -439,8 +474,29 @@ export component AppWindow inherits Window {
     callback change-theme(int);
     callback change-language(int);
     callback drag-window();
+    callback show-entry-menu(int, float, float);
+    callback show-background-menu(float, float);
+    callback invoke-context-command(int);
+    callback copy-selection(bool);
+    callback paste-files();
+    callback begin-rename();
+    callback commit-rename(string);
+    callback cancel-rename();
+    callback request-delete(bool);
+    callback confirm-permanent-delete();
+    callback cancel-permanent-delete();
+    callback cancel-operation(int);
+    callback retry-operation(int);
+    callback resolve-conflict(int, bool);
+    callback request-close();
+    callback wait-on-close();
+    callback cancel-tasks-and-close();
 
     private property <bool> compact: root.window-width < 1000px;
+    private property <length> context-menu-anchor-x: 24px;
+    private property <length> context-menu-anchor-y: 140px;
+    private property <length> keyboard-menu-anchor-x: 24px;
+    private property <length> keyboard-menu-anchor-y: 140px;
     private property <bool> menu-open: false;
     private property <int> settings-section: 0;
     private property <bool> minimal: root.window-width < 900px;
@@ -456,6 +512,24 @@ export component AppWindow inherits Window {
     changed active-tab-index => { root.reveal-tab(root.active-tab-index); }
 
     public function focus-address-editor() { address-editor.focus-and-select-all(); }
+    public function show-keyboard-context-menu() {
+        root.context-menu-anchor-x = root.keyboard-menu-anchor-x;
+        root.context-menu-anchor-y = root.keyboard-menu-anchor-y;
+        if root.context-menu-has-entry {
+            root.show-entry-menu(
+                -1,
+                root.context-menu-anchor-x / 1px,
+                root.context-menu-anchor-y / 1px
+            );
+        } else {
+            root.show-background-menu(
+                root.context-menu-anchor-x / 1px,
+                root.context-menu-anchor-y / 1px
+            );
+        }
+    }
+    public function context-menu-x() -> float { return root.context-menu-anchor-x / 1px; }
+    public function context-menu-y() -> float { return root.context-menu-anchor-y / 1px; }
     function reveal-tab(index: int) {
         if !root.tabs-overflow {
             tab-strip.viewport-x = 0px;
@@ -495,6 +569,17 @@ export component AppWindow inherits Window {
         KeyBinding { keys: @keys(Escape); enabled: !root.active-is-settings && !root.address-editing; activated => { root.clear-selection(); } }
         KeyBinding { keys: @keys(Control + T); activated => { root.new-tab(); } }
         KeyBinding { keys: @keys(Control + W); enabled: root.can-close-tab; activated => { root.close-tab(-1); } }
+        KeyBinding { keys: @keys(Control + C); enabled: !root.active-is-settings && !root.address-editing; activated => { root.copy-selection(false); } }
+        KeyBinding { keys: @keys(Control + X); enabled: !root.active-is-settings && !root.address-editing; activated => { root.copy-selection(true); } }
+        KeyBinding { keys: @keys(Control + V); enabled: !root.active-is-settings && !root.address-editing; activated => { root.paste-files(); } }
+        KeyBinding { keys: @keys(F2); enabled: !root.active-is-settings && !root.address-editing; activated => { root.begin-rename(); } }
+        KeyBinding { keys: @keys(Delete); enabled: !root.active-is-settings && !root.address-editing; activated => { root.request-delete(false); } }
+        KeyBinding { keys: @keys(Shift + Delete); enabled: !root.active-is-settings && !root.address-editing; activated => { root.request-delete(true); } }
+        KeyBinding {
+            keys: @keys(Shift + F10);
+            enabled: !root.active-is-settings && !root.address-editing;
+            activated => { root.show-keyboard-context-menu(); }
+        }
 
     VerticalLayout {
         spacing: 0px;
@@ -593,7 +678,7 @@ export component AppWindow inherits Window {
                 x: parent.width - 3 * 46px; y: 0px; width: 3 * 46px; height: 40px; spacing: 0px;
                 WindowButton { kind: 0; label: root.text-window-minimize; clicked => { root.minimized = true; } }
                 WindowButton { kind: 1; label: root.maximized ? root.text-window-restore : root.text-window-maximize; clicked => { root.maximized = !root.maximized; } }
-                WindowButton { kind: 2; label: root.text-window-close; clicked => { root.close(); } }
+                WindowButton { kind: 2; label: root.text-window-close; clicked => { root.request-close(); } }
             }
         }
 
@@ -685,10 +770,27 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                Rectangle {
+                content-area := Rectangle {
                     vertical-stretch: 1; background: VisualStyle.cffffff;
-                    background-touch := TouchArea { enabled: root.files.length > 0; clicked => { root.clear-selection(); } }
-                    list := ListView {
+                    background-touch := TouchArea {
+                        pointer-event(event) => {
+                            if event.kind == PointerEventKind.down && event.button == PointerEventButton.right {
+                                root.context-menu-anchor-x = self.absolute-position.x + self.mouse-x - root.absolute-position.x;
+                                root.context-menu-anchor-y = self.absolute-position.y + self.mouse-y - root.absolute-position.y;
+                                root.keyboard-menu-anchor-x = self.absolute-position.x + 24px - root.absolute-position.x;
+                                root.keyboard-menu-anchor-y = self.absolute-position.y + 24px - root.absolute-position.y;
+                                root.show-background-menu(
+                                    root.context-menu-anchor-x / 1px,
+                                    root.context-menu-anchor-y / 1px
+                                );
+                            }
+                        }
+                        clicked => { root.clear-selection(); }
+                    }
+                                        if root.rename-editing && root.rename-entry-id == -2: Rectangle {
+                        x: 6px; y: 2px; width: parent.width - 40px; height: 40px; border-radius: 5px; background: VisualStyle.ceff4ff;
+                        HorizontalLayout { padding-left: 10px; padding-right: 10px; spacing: 9px; InlineIcon { icon-source: IconMap.file-folder; } TextInput { text <=> root.rename-input; color: VisualStyle.c24252a; selection-background-color: VisualStyle.cc7d7ff; single-line: true; vertical-alignment: center; horizontal-stretch: 1; accepted => { root.commit-rename(root.rename-input); } key-pressed(event) => { if event.text == Key.Escape { root.cancel-rename(); return accept; } return reject; } accessible-label: root.rename-input; } }
+                    }list := ListView {
                         visible: root.files.length > 0;
                         width: parent.width - 28px;
                         vertical-scrollbar-policy: ScrollBarPolicy.always-off;
@@ -711,7 +813,19 @@ export component AppWindow inherits Window {
                                         width: parent.width;
                                         spacing: 9px;
                                         InlineIcon { icon-source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document); }
-                                        Text { text: entry.name; color: VisualStyle.c24252a; font-size: 13px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                                        if !(root.rename-editing && root.rename-entry-id == entry.id): Text { text: entry.name; color: VisualStyle.c24252a; font-size: 13px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                                        if root.rename-editing && root.rename-entry-id == entry.id: TextInput {
+                                            text <=> root.rename-input;
+                                            color: VisualStyle.c24252a;
+
+                                            selection-background-color: VisualStyle.cc7d7ff;
+                                            single-line: true;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                            accepted => { root.commit-rename(root.rename-input); }
+                                            key-pressed(event) => { if event.text == Key.Escape { root.cancel-rename(); return accept; } return reject; }
+                                            accessible-label: entry.name;
+                                        }
                                     }
                                     if column.kind != 0: Text {
                                         width: parent.width;
@@ -730,12 +844,30 @@ export component AppWindow inherits Window {
                                 private property <bool> click-shift: false;
                                 mouse-cursor: pointer;
                                 pointer-event(event) => {
-                                    if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                                    if event.kind == PointerEventKind.down {
                                         self.click-control = event.modifiers.control;
                                         self.click-shift = event.modifiers.shift;
+                                        if event.button == PointerEventButton.right {
+                                            root.context-menu-anchor-x = self.absolute-position.x + self.mouse-x - root.absolute-position.x;
+                                            root.context-menu-anchor-y = self.absolute-position.y + self.mouse-y - root.absolute-position.y;
+                                            root.keyboard-menu-anchor-x = root.context-menu-anchor-x;
+                                            root.keyboard-menu-anchor-y = root.context-menu-anchor-y;
+                                            root.show-entry-menu(
+                                                entry.id,
+                                                root.context-menu-anchor-x / 1px,
+                                                root.context-menu-anchor-y / 1px
+                                            );
+                                        }
                                     }
+
                                 }
                                 clicked => { root.activate-entry(entry.id, self.click-control, self.click-shift); }
+                            }
+                            if entry.focused: Rectangle {
+                                init => {
+                                    root.keyboard-menu-anchor-x = parent.absolute-position.x + 32px - root.absolute-position.x;
+                                    root.keyboard-menu-anchor-y = parent.absolute-position.y + parent.height / 2 - root.absolute-position.y;
+                                }
                             }
                             accessible-role: list-item; accessible-label: entry.name;
                         }
@@ -770,7 +902,18 @@ export component AppWindow inherits Window {
 
                 }
 
-                Rectangle { height: 30px; background: VisualStyle.cfafbfc; border-color: VisualStyle.ce7e8eb; border-width: 1px; Text { x: 14px; text: root.status-text; color: VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; } }
+                Rectangle {
+                    height: 30px; background: VisualStyle.cfafbfc; border-color: VisualStyle.ce7e8eb; border-width: 1px;
+                    Text { x: 14px; text: root.status-text; color: VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; }
+                    Rectangle {
+                        visible: root.operations.length > 0;
+                        x: parent.width - 126px; width: 118px; height: 26px; y: 2px; border-radius: 5px;
+                        background: task-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
+                        Text { text: root.operations.length + " " + root.text-task-count; color: VisualStyle.c30333a; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                        task-touch := TouchArea { clicked => { root.task-center-open = !root.task-center-open; } mouse-cursor: pointer; }
+                        accessible-role: button; accessible-label: "File operations";
+                    }
+                }
             }
         }
 
@@ -861,7 +1004,77 @@ export component AppWindow inherits Window {
         }
     }
 
-    if root.tabs-menu-open: TouchArea {
+        if root.context-menu-open: TouchArea {
+        z: 28; width: parent.width; height: parent.height;
+        clicked => { root.context-menu-open = false; }
+    }
+    if root.context-menu-open: Rectangle {
+        z: 29;
+        x: min(
+            max(12px, root.context-menu-anchor-x + self.width + 12px <= parent.width ? root.context-menu-anchor-x : root.context-menu-anchor-x - self.width),
+            max(12px, parent.width - self.width - 12px)
+        );
+        y: min(
+            max(12px, root.context-menu-anchor-y + self.height + 12px <= parent.height ? root.context-menu-anchor-y : root.context-menu-anchor-y - self.height),
+            max(12px, parent.height - self.height - 12px)
+        );
+        width: 240px; height: 12px + root.context-commands.length * 36px;
+        background: VisualStyle.cffffff; border-color: VisualStyle.ce0e2e7; border-width: 1px; border-radius: 7px;
+        VerticalLayout { padding: 6px;
+            for command in root.context-commands: Rectangle {
+                height: 36px; border-radius: 5px;
+                background: command.enabled && command-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
+                Rectangle { visible: command.separator; x: 4px; width: parent.width - 8px; height: 1px; y: 17px; background: VisualStyle.ce0e2e7; }
+                Text { visible: !command.separator; x: 10px; text: command.label; color: command.enabled ? VisualStyle.c30333a : VisualStyle.c9a9da3; font-size: 12px; vertical-alignment: center; }
+                command-touch := TouchArea { enabled: command.enabled && !command.separator; clicked => { root.context-menu-open = false; root.invoke-context-command(command.id); } }
+                accessible-role: button; accessible-label: command.label; accessible-enabled: command.enabled;
+            }
+        }
+    }
+    if root.task-center-open: TouchArea { z: 30; width: parent.width; height: parent.height; clicked => { root.task-center-open = false; } }
+    if root.task-center-open: Rectangle {
+        z: 31; x: parent.width - 390px; y: 50px; width: 374px; height: min(parent.height - 70px, 80px + root.operations.length * 82px);
+        background: VisualStyle.cffffff; border-color: VisualStyle.ce0e2e7; border-width: 1px; border-radius: 8px;
+        VerticalLayout { padding: 12px; spacing: 8px;
+            Text { text: root.text-file-operations; color: VisualStyle.c30333a; font-size: 16px; font-weight: 600; height: 26px; }
+            Text { visible: root.operation-error != ""; text: root.operation-error; color: #b3261e; font-size: 11px; wrap: word-wrap; }
+            for operation in root.operations: Rectangle {
+                height: 74px; background: VisualStyle.cfafbfc; border-radius: 6px; border-width: 1px; border-color: VisualStyle.ce0e2e7;
+                VerticalLayout { padding: 8px; spacing: 4px;
+                    HorizontalLayout { Text { text: operation.title; color: VisualStyle.c30333a; font-size: 12px; font-weight: 600; horizontal-stretch: 1; } Text { text: operation.detail; color: VisualStyle.c72747d; font-size: 11px; } }
+                    Rectangle { height: 5px; border-radius: 3px; background: VisualStyle.ce0e2e7; Rectangle { width: max(0px, min(parent.width, parent.width * operation.progress)); height: parent.height; border-radius: 3px; background: VisualStyle.c4f6bed; } }
+                    HorizontalLayout { Rectangle { horizontal-stretch: 1; } CommandButton { visible: operation.can-cancel; width: 68px; label: root.text-cancel-operation; clicked => { root.cancel-operation(operation.id); } } CommandButton { visible: operation.can-retry; width: 68px; label: root.text-retry-operation; clicked => { root.retry-operation(operation.id); } } }
+                }
+            }
+        }
+    }
+    if root.confirm-permanent-delete-open || root.exit-prompt-open || root.conflict-prompt-open: TouchArea { z: 38; width: parent.width; height: parent.height; }
+    if root.conflict-prompt-open: Rectangle {
+        z: 39; x: (parent.width - 520px) / 2; y: (parent.height - 240px) / 2; width: 520px; height: 240px; background: VisualStyle.cffffff; border-radius: 9px; border-width: 1px; border-color: VisualStyle.ce0e2e7;
+        VerticalLayout {
+            padding: 20px; spacing: 10px;
+            Text { text: root.text-conflict-title; color: VisualStyle.c30333a; font-size: 18px; font-weight: 600; }
+            Text { text: root.text-conflict-detail; color: VisualStyle.c62656f; font-size: 13px; }
+            Text { text: root.conflict-source; color: VisualStyle.c30333a; font-size: 12px; overflow: elide; }
+            Text { text: root.conflict-destination; color: VisualStyle.c62656f; font-size: 12px; overflow: elide; }
+            CommandButton { width: 280px; label: (root.conflict-apply-all ? "☑ " : "☐ ") + root.text-apply-all; clicked => { root.conflict-apply-all = !root.conflict-apply-all; } }
+            HorizontalLayout {
+                alignment: end; spacing: 8px;
+                CommandButton { width: 96px; label: root.text-skip; clicked => { root.resolve-conflict(1, root.conflict-apply-all); } }
+                CommandButton { width: 108px; label: root.text-keep-both; clicked => { root.resolve-conflict(2, root.conflict-apply-all); } }
+                CommandButton { width: 96px; label: root.text-replace; clicked => { root.resolve-conflict(0, root.conflict-apply-all); } }
+            }
+        }
+    }
+    if root.confirm-permanent-delete-open: Rectangle {
+        z: 39; x: (parent.width - 420px) / 2; y: (parent.height - 170px) / 2; width: 420px; height: 170px; background: VisualStyle.cffffff; border-radius: 9px; border-width: 1px; border-color: VisualStyle.ce0e2e7;
+        VerticalLayout { padding: 20px; spacing: 12px; Text { text: root.text-permanent-delete-title; color: VisualStyle.c30333a; font-size: 18px; font-weight: 600; } Text { text: root.text-permanent-delete-detail; color: VisualStyle.c62656f; font-size: 13px; } HorizontalLayout { alignment: end; spacing: 8px; CommandButton { label: root.text-cancel-operation; clicked => { root.cancel-permanent-delete(); } } CommandButton { label: root.text-delete; clicked => { root.confirm-permanent-delete(); } } } }
+    }
+    if root.exit-prompt-open: Rectangle {
+        z: 39; x: (parent.width - 460px) / 2; y: (parent.height - 186px) / 2; width: 460px; height: 186px; background: VisualStyle.cffffff; border-radius: 9px; border-width: 1px; border-color: VisualStyle.ce0e2e7;
+        VerticalLayout { padding: 20px; spacing: 12px; Text { text: root.text-exit-title; color: VisualStyle.c30333a; font-size: 18px; font-weight: 600; } Text { text: root.text-exit-detail; color: VisualStyle.c62656f; font-size: 13px; } HorizontalLayout { alignment: end; spacing: 8px; CommandButton { width: 150px; label: root.text-cancel-and-exit; clicked => { root.cancel-tasks-and-close(); } } CommandButton { width: 120px; label: root.text-wait; clicked => { root.wait-on-close(); } } } }
+    }
+if root.tabs-menu-open: TouchArea {
         z: 19;
         width: parent.width;
         height: parent.height;

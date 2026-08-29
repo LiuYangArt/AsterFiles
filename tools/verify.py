@@ -72,6 +72,18 @@ def main() -> int:
             "cargo", "run", "--", "--agent-scenario", "permission-denied",
             "--no-ui", "--agent-state-out", str(STATE_DIR / "permission-denied.json"),
         ]),
+        ("agent-file-operation-running", [
+            "cargo", "run", "--", "--agent-scenario", "file-operation-running",
+            "--no-ui", "--agent-state-out", str(STATE_DIR / "file-operations" / "running.json"),
+        ]),
+        ("agent-file-operation-conflict", [
+            "cargo", "run", "--", "--agent-scenario", "file-operation-conflict",
+            "--no-ui", "--agent-state-out", str(STATE_DIR / "file-operations" / "conflict.json"),
+        ]),
+        ("agent-file-operation-partial", [
+            "cargo", "run", "--", "--agent-scenario", "file-operation-partial",
+            "--no-ui", "--agent-state-out", str(STATE_DIR / "file-operations" / "partial.json"),
+        ]),
         ("release", ["cargo", "build", "--release"]),
     ]
     results = []

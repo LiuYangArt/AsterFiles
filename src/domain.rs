@@ -1,3 +1,4 @@
+pub mod file_operations;
 use std::{
     cmp::Ordering,
     collections::HashMap,

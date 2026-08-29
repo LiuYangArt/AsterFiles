@@ -32,3 +32,14 @@ cargo run -- --agent-scenario permission-denied --no-ui
 - `error_type`：稳定的错误分类。
 
 权限页的页面内部操作只能是 `request_windows_access`。该状态与 UI 显示条件共用同一动作模型，并通过 Slint 无窗口测试后端检查实际可见组件树。顶部后退、刷新继续属于全局导航，不得被误报为页面内“返回”或“重试”。
+## P2 文件任务状态
+
+文件任务提供三个确定性无界面场景，不执行真实磁盘写入：
+
+```powershell
+cargo run -- --agent-scenario file-operation-running --no-ui
+cargo run -- --agent-scenario file-operation-conflict --no-ui
+cargo run -- --agent-scenario file-operation-partial --no-ui
+```
+
+统一验证把结果写入 `artifacts/state/file-operations/`。稳定状态名分别为 `running`、`waiting_conflict` 和 `partially_completed`，用于任务中心、冲突等待与部分完成回归检查。

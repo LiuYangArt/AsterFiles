@@ -3,7 +3,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::domain::{LoadState, TabSession};
+use crate::domain::{
+    LoadState, TabId, TabSession,
+    file_operations::{
+        ConflictCategory, FileOperationKind, FileSnapshot, ItemState, OperationConflict,
+        OperationItem, OperationManager, OperationResult, OperationState,
+    },
+};
 
 const DEFAULT_STATE_DIR: &str = "artifacts/state";
 
@@ -23,12 +29,18 @@ impl PageOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentScenario {
     PermissionDenied,
+    FileOperationRunning,
+    FileOperationConflict,
+    FileOperationPartial,
 }
 
 impl AgentScenario {
     pub fn name(self) -> &'static str {
         match self {
             Self::PermissionDenied => "permission-denied",
+            Self::FileOperationRunning => "file-operation-running",
+            Self::FileOperationConflict => "file-operation-conflict",
+            Self::FileOperationPartial => "file-operation-partial",
         }
     }
 
@@ -87,6 +99,9 @@ impl AgentOptions {
 fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
     match value {
         "permission-denied" => Ok(AgentScenario::PermissionDenied),
+        "file-operation-running" => Ok(AgentScenario::FileOperationRunning),
+        "file-operation-conflict" => Ok(AgentScenario::FileOperationConflict),
+        "file-operation-partial" => Ok(AgentScenario::FileOperationPartial),
         _ => Err(format!("unknown agent scenario: {value}")),
     }
 }
@@ -98,6 +113,13 @@ pub fn apply_scenario(session: &mut TabSession, scenario: AgentScenario) {
             session.requested_path = Some(PathBuf::from(r"C:\AgentScenarios\PermissionDenied"));
             session.load_state = LoadState::PermissionDenied;
             session.error = Some("permission denied".to_owned());
+        }
+        AgentScenario::FileOperationRunning
+        | AgentScenario::FileOperationConflict
+        | AgentScenario::FileOperationPartial => {
+            session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\FileOperations"));
+            session.load_state = LoadState::Complete;
+            session.error = Some(scenario.name().to_owned());
         }
     }
 }
@@ -126,6 +148,7 @@ struct AgentState {
 impl AgentState {
     fn from_session(session: &TabSession, scenario: AgentScenario) -> Self {
         let projection = page_projection(session.load_state, session.entries.is_empty());
+        let operation_state = operation_state_for_scenario(scenario);
         Self {
             scenario: scenario.name(),
             current_path: session
@@ -139,7 +162,7 @@ impl AgentState {
                 .copied()
                 .map(PageOperation::name)
                 .collect(),
-            error_type: projection.error_type,
+            error_type: operation_state.or(projection.error_type),
         }
     }
 
@@ -165,6 +188,66 @@ impl AgentState {
     }
 }
 
+fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str> {
+    if scenario == AgentScenario::PermissionDenied {
+        return None;
+    }
+    let mut manager = OperationManager::new();
+    let id = manager.submit(
+        FileOperationKind::Copy,
+        Some(TabId(1)),
+        vec![OperationItem::pending(
+            Some(PathBuf::from(r"C:AgentScenariossource.txt")),
+            Some(PathBuf::from(r"C:AgentScenarios	arget.txt")),
+        )],
+    );
+    let _ = manager.start_next();
+    let _ = manager.mark_running(id);
+    match scenario {
+        AgentScenario::FileOperationRunning => {}
+        AgentScenario::FileOperationConflict => {
+            let task = manager.task_mut(id).expect("scenario task exists");
+            let _ = task.set_conflict(OperationConflict {
+                category: ConflictCategory::ExistingFile,
+                source: FileSnapshot {
+                    path: PathBuf::from(r"C:AgentScenariossource.txt"),
+                    is_directory: false,
+                    size_bytes: Some(64),
+                    modified: None,
+                },
+                destination: FileSnapshot {
+                    path: PathBuf::from(r"C:AgentScenarios	arget.txt"),
+                    is_directory: false,
+                    size_bytes: Some(32),
+                    modified: None,
+                },
+            });
+        }
+        AgentScenario::FileOperationPartial => {
+            manager.task_mut(id).expect("scenario task exists").items[0].state = ItemState::Failed;
+            let _ = manager.finish(
+                id,
+                OperationState::PartiallyCompleted,
+                OperationResult {
+                    succeeded: vec![PathBuf::from(r"C:AgentScenarioscopied.txt")],
+                    skipped: vec![],
+                    failed: vec![(
+                        PathBuf::from(r"C:AgentScenariossource.txt"),
+                        "locked".to_owned(),
+                    )],
+                    affected_directories: vec![PathBuf::from(r"C:AgentScenarios")],
+                },
+            );
+        }
+        AgentScenario::PermissionDenied => unreachable!(),
+    }
+    manager.task(id).map(|task| match task.state {
+        OperationState::Running => "running",
+        OperationState::WaitingConflict => "waiting_conflict",
+        OperationState::PartiallyCompleted => "partially_completed",
+        _ => "unexpected",
+    })
+}
 pub struct PageProjection {
     pub index: i32,
     name: &'static str,
