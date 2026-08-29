@@ -79,6 +79,12 @@ P2 的完整设计见 [P2 基础文件操作与右键菜单实施方案](p2-file
 
 文件操作完成后发出基于原始路径的变化事件，应用协调层更新所有显示源目录或目标目录的标签；无法安全局部投影时，只为受影响标签生成新的目录 `RequestId` 并定向刷新。复制、移动、回收站删除和永久删除的取消只停止未开始工作，不回滚已经完成的项目；界面必须准确显示部分完成。右键菜单是 P2 的主要功能入口，基础文件命令进入 AsterFiles 任务中心，其他 Shell 命令通过 Windows 执行，第三方扩展隔离和超时强化留到 P3。
 
+## P3 Windows 拖放接入边界
+
+双向文件拖放的完整设计见 [P3 Windows 文件拖放实施方案](p3-windows-drag-drop-plan.md)。拖入 AsterFiles 的真实文件系统对象只产生用户意图和原始路径快照，复制、移动、冲突、取消和进度继续由 P2 窗口级 `OperationManager` 执行；不得建立第二套文件操作引擎。拖出到 Explorer 时，AsterFiles 只提供标准 Shell 数据对象和允许效果，最终复制、移动或创建快捷方式由目标应用执行。
+
+OLE 的 `IDataObject`、`IDropSource`、`IDropTarget`、窗口注册和拖放循环集中在 `platform/windows/drag_drop`。COM 对象遵守 STA 与窗口线程亲和，UI 不枚举目录、读取元数据或执行磁盘操作。拖动开始时由应用协调层把 `TabId + EntryId` 固定为原始路径快照；拖入任务沿用独立 `OperationId`，拖放不得复用导航 `RequestId`。操作后的路径变化继续广播给所有相关标签，外部目标无法返回可靠结果时只定向刷新，不猜测或伪造移动成功。
+
 ## 验证与产物
 
 - 统一检查：`python tools/verify.py`，覆盖格式、静态检查、测试、确定性无界面场景和 Release 构建。
