@@ -7,7 +7,9 @@ use std::{
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-const MAGIC: &[u8; 5] = b"ASTF2";
+const MAGIC: &[u8; 5] = b"ASTF3";
+pub type ColumnOrder = [u8; 4];
+pub const DEFAULT_COLUMN_ORDER: ColumnOrder = [0, 1, 2, 3];
 const MAX_TABS: usize = 1_024;
 const MAX_PATH_UNITS: usize = 32_767;
 const MIN_WINDOW_WIDTH: u32 = 820;
@@ -28,6 +30,7 @@ pub struct SessionState {
     pub window: WindowPlacement,
     pub active_tab: usize,
     pub tab_paths: Vec<PathBuf>,
+    pub column_order: ColumnOrder,
 }
 
 impl SessionState {
@@ -35,8 +38,10 @@ impl SessionState {
         window: WindowPlacement,
         active_tab: usize,
         tab_paths: Vec<PathBuf>,
+        column_order: ColumnOrder,
     ) -> io::Result<Self> {
         validate_window(window)?;
+        validate_column_order(column_order)?;
         if tab_paths.len() > MAX_TABS {
             return Err(invalid_data("too many session tabs"));
         }
@@ -51,6 +56,7 @@ impl SessionState {
             window,
             active_tab,
             tab_paths,
+            column_order,
         })
     }
 }
@@ -70,13 +76,16 @@ pub fn save(path: &Path, state: &SessionState) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, encode(state)?)?;
-    fs::rename(temporary, path)
+    fs::write(path, encode(state)?)
 }
 
 fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
-    let state = SessionState::new(state.window, state.active_tab, state.tab_paths.clone())?;
+    let state = SessionState::new(
+        state.window,
+        state.active_tab,
+        state.tab_paths.clone(),
+        state.column_order,
+    )?;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(MAGIC);
     bytes.extend_from_slice(&state.window.x.to_le_bytes());
@@ -85,6 +94,7 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
     bytes.extend_from_slice(&state.window.height.to_le_bytes());
     bytes.extend_from_slice(&(state.active_tab as u32).to_le_bytes());
     bytes.extend_from_slice(&(state.tab_paths.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&state.column_order);
 
     for path in &state.tab_paths {
         let units = encode_os(path.as_os_str());
@@ -116,6 +126,7 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
     if count > MAX_TABS {
         return Err(invalid_data("too many session tabs"));
     }
+    let column_order = read_four(bytes, &mut offset)?;
 
     let mut tab_paths = Vec::with_capacity(count);
     for _ in 0..count {
@@ -142,7 +153,19 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
         return Err(invalid_data("unexpected trailing session data"));
     }
 
-    SessionState::new(window, active_tab, tab_paths)
+    SessionState::new(window, active_tab, tab_paths, column_order)
+}
+
+fn validate_column_order(column_order: ColumnOrder) -> io::Result<()> {
+    let mut seen = [false; DEFAULT_COLUMN_ORDER.len()];
+    for column in column_order {
+        let index = usize::from(column);
+        if index >= seen.len() || seen[index] {
+            return Err(invalid_data("invalid session column order"));
+        }
+        seen[index] = true;
+    }
+    Ok(())
 }
 
 fn validate_window(window: WindowPlacement) -> io::Result<()> {
@@ -217,6 +240,7 @@ mod tests {
                 PathBuf::from(r"C:\中文\📁"),
                 PathBuf::from(r"\\server\共享\資料"),
             ],
+            [2, 0, 3, 1],
         )
         .expect("valid state")
     }
@@ -241,12 +265,28 @@ mod tests {
             },
             0,
             vec![PathBuf::from(raw_path)],
+            DEFAULT_COLUMN_ORDER,
         )
         .unwrap();
 
         assert_eq!(decode(&encode(&state).unwrap()).unwrap(), state);
     }
 
+    #[test]
+    fn saves_over_an_existing_session_file() {
+        let directory =
+            std::env::temp_dir().join(format!("asterfiles-session-store-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("session.bin");
+        fs::write(&path, b"ASTF2 stale session").unwrap();
+
+        let state = sample_state();
+        save(&path, &state).unwrap();
+        assert_eq!(load(&path).unwrap(), state);
+
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
     #[test]
     fn rejects_truncated_data() {
         let encoded = encode(&sample_state()).unwrap();
@@ -305,7 +345,7 @@ mod tests {
             },
         ] {
             assert_eq!(
-                SessionState::new(window, 0, vec![PathBuf::from(r"C:\")])
+                SessionState::new(window, 0, vec![PathBuf::from(r"C:\")], DEFAULT_COLUMN_ORDER,)
                     .unwrap_err()
                     .kind(),
                 io::ErrorKind::InvalidData
@@ -323,6 +363,7 @@ mod tests {
             },
             99,
             vec![PathBuf::from(r"C:\one"), PathBuf::from(r"C:\two")],
+            DEFAULT_COLUMN_ORDER,
         )
         .unwrap();
         assert_eq!(state.active_tab, 1);
@@ -343,16 +384,48 @@ mod tests {
             },
             99,
             Vec::new(),
+            DEFAULT_COLUMN_ORDER,
         )
         .unwrap();
         assert_eq!(state.active_tab, 0);
     }
 
     #[test]
-    fn rejects_old_format() {
+    fn rejects_invalid_column_orders() {
+        for column_order in [[0, 1, 2, 2], [0, 1, 2, 4]] {
+            assert_eq!(
+                SessionState::new(
+                    WindowPlacement {
+                        x: 0,
+                        y: 0,
+                        width: 900,
+                        height: 600,
+                    },
+                    0,
+                    Vec::new(),
+                    column_order,
+                )
+                .unwrap_err()
+                .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+
+        let mut bytes = encode(&sample_state()).unwrap();
+        bytes[29..33].copy_from_slice(&[0, 1, 1, 3]);
         assert_eq!(
-            decode(b"ASTF1\0\0\0\0").unwrap_err().kind(),
+            decode(&bytes).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn rejects_old_format() {
+        for bytes in [b"ASTF1\0\0\0\0".as_slice(), b"ASTF2\0\0\0\0".as_slice()] {
+            assert_eq!(
+                decode(bytes).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
     }
 }

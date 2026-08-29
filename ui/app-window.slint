@@ -5,6 +5,7 @@ export struct HistoryRow { index: int, label: string }
 export struct BreadcrumbRow { index: int, label: string, current: bool }
 export struct TabRow { id: int, title: string, active: bool, loading: bool }
 export struct SidebarRow { index: int, label: string, icon-kind: int, selected: bool, is-drive: bool }
+export struct ColumnRow { kind: int }
 
 component InlineIcon inherits Rectangle {
     in property <image> icon-source;
@@ -73,6 +74,23 @@ component CommandButton inherits Rectangle {
     accessible-role: button;
     accessible-label: root.label;
     accessible-enabled: root.enabled;
+}
+
+component SidebarGroupHeader inherits Rectangle {
+    in property <string> label;
+    in property <bool> expanded: true;
+    callback toggled();
+    height: 30px;
+    background: group-touch.has-hover ? #e5e9f2 : transparent;
+    border-radius: 5px;
+    HorizontalLayout {
+        padding-left: 7px; padding-right: 7px; spacing: 7px;
+        Text { text: root.expanded ? "⌄" : "›"; width: 12px; color: #666a74; font-size: 14px; vertical-alignment: center; horizontal-alignment: center; }
+        Text { text: root.label; color: #777a84; font-size: 12px; font-weight: 700; vertical-alignment: center; }
+    }
+    group-touch := TouchArea { mouse-cursor: pointer; clicked => { root.toggled(); } }
+    accessible-role: button;
+    accessible-label: root.label;
 }
 
 component WindowButton inherits Rectangle {
@@ -273,6 +291,9 @@ export component AppWindow inherits Window {
     in property <[HistoryRow]> forward-history;
     in property <[BreadcrumbRow]> breadcrumbs;
     in property <[SidebarRow]> sidebar-items;
+    in property <[ColumnRow]> columns;
+    in-out property <bool> quick-access-expanded: true;
+    in-out property <bool> drives-expanded: true;
     in property <bool> can-navigate-back: false;
     in property <bool> can-navigate-forward: false;
     in property <bool> can-navigate-up: false;
@@ -294,6 +315,9 @@ export component AppWindow inherits Window {
     in property <string> text-downloads: "下载";
     in property <string> text-documents: "文档";
     in property <string> text-pictures: "图片";
+    in property <string> text-music: "音乐";
+    in property <string> text-videos: "视频";
+    in property <string> text-quick-access: "快速访问";
     in property <string> text-drives: "磁盘";
     in property <string> text-name: "名称";
     in property <string> text-type: "类型";
@@ -319,6 +343,7 @@ export component AppWindow inherits Window {
     callback focus-boundary(bool, bool);
     callback toggle-focused();
     callback change-sort(int);
+    callback reorder-column(int, int);
     callback open-entry(int);
     callback activate-entry(int, bool, bool);
     callback new-tab();
@@ -362,11 +387,11 @@ export component AppWindow inherits Window {
     VerticalLayout {
         spacing: 0px;
         Rectangle {
-            height: 48px; background: #f5f6f8; border-color: #d9dce2; border-width: 1px;
+            height: 46px; background: #f5f6f8; border-color: #d9dce2; border-width: 1px;
             HorizontalLayout {
-                padding-left: 8px; padding-top: 5px; padding-bottom: 3px; spacing: 5px;
+                x: 8px; y: 12px; width: parent.width - 8px - 3 * 46px; height: 34px; spacing: 5px;
                 for tab in root.tabs: Rectangle {
-                    width: root.minimal ? 112px : 178px; height: 38px;
+                    width: root.minimal ? 112px : 178px; height: 34px;
                     background: tab.active ? #ffffff : (tab-touch.has-hover ? #ebeef4 : transparent);
                     border-color: tab.active ? #d7dae0 : transparent;
                     border-width: tab.active ? 1px : 0px;
@@ -387,9 +412,9 @@ export component AppWindow inherits Window {
                         Text { visible: tab.loading && !(root.can-close-tab && tab-touch.has-hover); text: "…"; color: #4f6bed; vertical-alignment: center; }
                         Rectangle {
                             visible: root.can-close-tab && (tab-touch.has-hover || close-touch.has-hover);
-                            width: 24px; height: 38px;
+                            width: 24px; height: 34px;
                             Rectangle {
-                                width: 24px; height: 24px; y: 7px; border-radius: 4px;
+                                width: 24px; height: 24px; y: 5px; border-radius: 4px;
                                 background: close-touch.pressed ? #d7dae0 : close-touch.has-hover ? #e1e4ea : transparent;
                                 Image { width: 12px; height: 12px; x: 6px; y: 6px; source: @image-url("icons/actions/close.svg"); }
                             }
@@ -398,7 +423,7 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                Rectangle { width: 38px; height: 38px; border-radius: 6px; background: add-touch.pressed ? #d9dce2 : add-touch.has-hover ? #e8eaf0 : transparent; Image { width: 20px; height: 20px; x: 9px; y: 9px; source: @image-url("icons/actions/add.svg"); } add-touch := TouchArea { mouse-cursor: pointer; clicked => { root.new-tab(); } } accessible-role: button; accessible-label: "新建标签"; Tooltip { text: @markdown("新建标签 (Ctrl+T)"); } }
+                Rectangle { width: 34px; height: 34px; border-radius: 6px; background: add-touch.pressed ? #d9dce2 : add-touch.has-hover ? #e8eaf0 : transparent; Image { width: 20px; height: 20px; x: 9px; y: 9px; source: @image-url("icons/actions/add.svg"); } add-touch := TouchArea { mouse-cursor: pointer; clicked => { root.new-tab(); } } accessible-role: button; accessible-label: "新建标签"; Tooltip { text: @markdown("新建标签 (Ctrl+T)"); } }
                 Rectangle {
                     horizontal-stretch: 1;
                     drag-touch := TouchArea {
@@ -406,6 +431,9 @@ export component AppWindow inherits Window {
                         double-clicked => { root.maximized = !root.maximized; }
                     }
                 }
+            }
+            HorizontalLayout {
+                x: parent.width - 3 * 46px; y: 0px; width: 3 * 46px; height: 40px; spacing: 0px;
                 WindowButton { kind: 0; label: "最小化"; clicked => { root.minimized = true; } }
                 WindowButton { kind: 1; label: root.maximized ? "还原" : "最大化"; clicked => { root.maximized = !root.maximized; } }
                 WindowButton { kind: 2; label: "关闭"; clicked => { root.close(); } }
@@ -435,12 +463,21 @@ export component AppWindow inherits Window {
             if !root.minimal: Rectangle {
                 width: root.compact ? 184px : 218px; background: #f1f2f5; border-color: #e2e3e7; border-width: 1px;
                 VerticalLayout {
-                    padding-top: 12px; padding-bottom: 12px; padding-left: 10px; padding-right: 10px; spacing: 3px;
-                    Text { text: root.text-home; height: 26px; font-size: 12px; font-weight: 700; color: #777a84; vertical-alignment: center; }
+                    padding-top: 4px; padding-bottom: 12px; padding-left: 10px; padding-right: 10px; spacing: 0px;
+                    SidebarGroupHeader { label: root.text-quick-access; expanded: root.quick-access-expanded; toggled => { root.quick-access-expanded = !root.quick-access-expanded; } }
                     for location in root.sidebar-items: Rectangle {
-                        height: 34px; border-radius: 5px; background: location.selected ? #dce6ff : (side-touch.has-hover ? #e5e9f2 : transparent); border-color: location.selected ? #4f6bed : transparent; border-width: location.selected ? 2px : 0px;
-                        HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon-kind == 0 ? @image-url("icons/locations/home.svg") : location.icon-kind == 1 ? @image-url("icons/locations/desktop.svg") : location.icon-kind == 2 ? @image-url("icons/locations/downloads.svg") : location.icon-kind == 3 ? @image-url("icons/locations/documents.svg") : location.icon-kind == 4 ? @image-url("icons/locations/pictures.svg") : @image-url("icons/locations/drive.svg"); } Text { text: location.label; color: #4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
+                        visible: !location.is-drive && root.quick-access-expanded;
+                        height: self.visible ? 34px : 0px; border-radius: 5px; background: location.selected ? #dce6ff : (side-touch.has-hover ? #e5e9f2 : transparent); border-color: location.selected ? #4f6bed : transparent; border-width: location.selected ? 2px : 0px;
+                        HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon-kind == 0 ? @image-url("icons/locations/home.svg") : location.icon-kind == 1 ? @image-url("icons/locations/desktop.svg") : location.icon-kind == 2 ? @image-url("icons/locations/downloads.svg") : location.icon-kind == 3 ? @image-url("icons/locations/documents.svg") : location.icon-kind == 4 ? @image-url("icons/locations/pictures.svg") : location.icon-kind == 5 ? @image-url("icons/locations/music.svg") : @image-url("icons/locations/video.svg"); } Text { text: location.label; color: #4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         side-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-sidebar(location.index); } }
+                        accessible-role: button; accessible-label: location.label;
+                    }
+                    SidebarGroupHeader { label: root.text-drives; expanded: root.drives-expanded; toggled => { root.drives-expanded = !root.drives-expanded; } }
+                    for location in root.sidebar-items: Rectangle {
+                        visible: location.is-drive && root.drives-expanded;
+                        height: self.visible ? 34px : 0px; border-radius: 5px; background: location.selected ? #dce6ff : (drive-touch.has-hover ? #e5e9f2 : transparent); border-color: location.selected ? #4f6bed : transparent; border-width: location.selected ? 2px : 0px;
+                        HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: @image-url("icons/locations/drive.svg"); } Text { text: location.label; color: #4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
+                        drive-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-sidebar(location.index); } }
                         accessible-role: button; accessible-label: location.label;
                     }
                     Rectangle { vertical-stretch: 1; }
@@ -461,10 +498,36 @@ export component AppWindow inherits Window {
                     height: 38px; background: #ffffff; border-color: #e7e8eb; border-width: 1px;
                     HorizontalLayout {
                         padding-left: 16px; padding-right: 16px; spacing: 12px;
-                        Rectangle { width: root.compact ? 65% : 52%; Text { x: 27px; width: parent.width - 27px; horizontal-alignment: left; text: root.text-name + (root.sort-field == 0 ? (root.sort-descending ? " ↓" : " ↑") : ""); color: root.sort-field == 0 ? #3b4f83 : #555862; font-size: 12px; font-weight: root.sort-field == 0 ? 600 : 400; vertical-alignment: center; } TouchArea { mouse-cursor: pointer; clicked => { root.change-sort(0); } } }
-                        Rectangle { visible: !root.compact; width: 16%; Text { width: parent.width; horizontal-alignment: left; text: root.text-type + (root.sort-field == 1 ? (root.sort-descending ? " ↓" : " ↑") : ""); color: root.sort-field == 1 ? #3b4f83 : #696b74; font-size: 12px; font-weight: root.sort-field == 1 ? 600 : 400; vertical-alignment: center; } TouchArea { mouse-cursor: pointer; clicked => { root.change-sort(1); } } }
-                        Rectangle { visible: !root.minimal; width: root.compact ? 35% : 14%; Text { width: parent.width; horizontal-alignment: left; text: root.text-size + (root.sort-field == 2 ? (root.sort-descending ? " ↓" : " ↑") : ""); color: root.sort-field == 2 ? #3b4f83 : #696b74; font-size: 12px; font-weight: root.sort-field == 2 ? 600 : 400; vertical-alignment: center; } TouchArea { mouse-cursor: pointer; clicked => { root.change-sort(2); } } }
-                        Rectangle { visible: !root.compact; horizontal-stretch: 1; Text { width: parent.width; horizontal-alignment: left; text: root.text-modified + (root.sort-field == 3 ? (root.sort-descending ? " ↓" : " ↑") : ""); color: root.sort-field == 3 ? #3b4f83 : #696b74; font-size: 12px; font-weight: root.sort-field == 3 ? 600 : 400; vertical-alignment: center; } TouchArea { mouse-cursor: pointer; clicked => { root.change-sort(3); } } }
+                        for column in root.columns: Rectangle {
+                            visible: column.kind == 0 || (column.kind == 2 && !root.minimal) || ((column.kind == 1 || column.kind == 3) && !root.compact);
+                            width: column.kind == 0 ? (root.compact ? 65% : 52%) : column.kind == 1 ? 16% : column.kind == 2 ? (root.compact ? 35% : 14%) : 18%;
+                            horizontal-stretch: column.kind == 3 ? 1 : 0;
+                            opacity: column-touch.dragging ? 0.58 : 1;
+                            Text {
+                                x: column.kind == 0 ? 27px : 0px;
+                                width: parent.width - self.x;
+                                horizontal-alignment: left;
+                                text: (column.kind == 0 ? root.text-name : column.kind == 1 ? root.text-type : column.kind == 2 ? root.text-size : root.text-modified) + (root.sort-field == column.kind ? (root.sort-descending ? " ↓" : " ↑") : "");
+                                color: root.sort-field == column.kind ? #3b4f83 : #696b74;
+                                font-size: 12px; font-weight: root.sort-field == column.kind ? 600 : 400; vertical-alignment: center;
+                            }
+                            column-touch := TouchArea {
+                                private property <length> press-x;
+                                property <bool> dragging: false;
+                                mouse-cursor: self.dragging ? grabbing : grab;
+                                pointer-event(event) => {
+                                    if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                                        self.press-x = self.mouse-x;
+                                        self.dragging = false;
+                                    }
+                                    if event.button == PointerEventButton.left && event.kind == PointerEventKind.up && self.dragging {
+                                        root.reorder-column(column.kind, self.mouse-x - self.press-x < -2 * parent.width ? -3 : self.mouse-x - self.press-x < -parent.width ? -2 : self.mouse-x - self.press-x < -8px ? -1 : self.mouse-x - self.press-x > 2 * parent.width ? 3 : self.mouse-x - self.press-x > parent.width ? 2 : 1);
+                                    }
+                                }
+                                moved => { if self.pressed && abs(self.mouse-x - self.press-x) > 8px { self.dragging = true; } }
+                                clicked => { if !self.dragging { root.change-sort(column.kind); } }
+                            }
+                        }
                     }
                 }
 
@@ -477,7 +540,17 @@ export component AppWindow inherits Window {
                         for entry in root.files: Rectangle {
                             width: list.width;
                             height: 40px; background: entry.selected ? #dce6ff : (mouse.has-hover ? #eff4ff : #ffffff); border-color: entry.focused ? #4f6bed : #f1f1f3; border-width: entry.focused ? 2px : 1px;
-                            HorizontalLayout { padding-left: 16px; padding-right: 16px; spacing: 12px; HorizontalLayout { width: root.compact ? 65% : 52%; spacing: 9px; InlineIcon { icon-source: entry.is-directory ? @image-url("icons/files/folder.svg") : @image-url("icons/files/document.svg"); } Text { text: entry.name; color: #24252a; font-size: 13px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1;  } } Text { visible: !root.compact; text: entry.kind; width: 16%; color: #6f717a; font-size: 12px; vertical-alignment: center; } Text { visible: !root.minimal; text: entry.size; width: root.compact ? 35% : 14%; color: #6f717a; font-size: 12px; vertical-alignment: center; horizontal-alignment: right; } Text { visible: !root.compact; text: entry.modified; horizontal-stretch: 1; color: #6f717a; font-size: 12px; vertical-alignment: center; } }
+                            HorizontalLayout {
+                                padding-left: 16px; padding-right: 16px; spacing: 12px;
+                                for column in root.columns: HorizontalLayout {
+                                    visible: column.kind == 0 || (column.kind == 2 && !root.minimal) || ((column.kind == 1 || column.kind == 3) && !root.compact);
+                                    width: column.kind == 0 ? (root.compact ? 65% : 52%) : column.kind == 1 ? 16% : column.kind == 2 ? (root.compact ? 35% : 14%) : 18%;
+                            horizontal-stretch: column.kind == 3 ? 1 : 0;
+                                    spacing: column.kind == 0 ? 9px : 0px;
+                                    InlineIcon { visible: column.kind == 0; icon-source: entry.is-directory ? @image-url("icons/files/folder.svg") : @image-url("icons/files/document.svg"); }
+                                    Text { text: column.kind == 0 ? entry.name : column.kind == 1 ? entry.kind : column.kind == 2 ? entry.size : entry.modified; color: column.kind == 0 ? #24252a : #6f717a; font-size: column.kind == 0 ? 13px : 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; horizontal-alignment: column.kind == 2 ? right : left; }
+                                }
+                            }
                             mouse := TouchArea {
                                 private property <bool> click-control: false;
                                 private property <bool> click-shift: false;

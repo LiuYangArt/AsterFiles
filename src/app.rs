@@ -39,10 +39,11 @@ struct AppState {
     next_tab_id: u32,
     language: Language,
     sidebar: Vec<KnownLocation>,
+    column_order: [u8; 4],
 }
 
 impl AppState {
-    fn new(initial_paths: Vec<PathBuf>, active_index: usize) -> Self {
+    fn new(initial_paths: Vec<PathBuf>, active_index: usize, column_order: [u8; 4]) -> Self {
         let initial_paths = if initial_paths.is_empty() {
             vec![initial_path()]
         } else {
@@ -67,6 +68,7 @@ impl AppState {
             next_tab_id,
             language: Language::Chinese,
             sidebar: Vec::new(),
+            column_order,
         }
     }
 
@@ -122,6 +124,23 @@ impl AppState {
     }
 }
 
+fn reorder_column(order: &mut [u8; 4], kind: u8, offset: i32) -> bool {
+    let Some(from) = order.iter().position(|candidate| *candidate == kind) else {
+        return false;
+    };
+    let target = (from as i32 + offset).clamp(0, order.len() as i32 - 1) as usize;
+    if from == target {
+        return false;
+    }
+    let moved = order[from];
+    if from < target {
+        order.copy_within(from + 1..=target, from);
+    } else {
+        order.copy_within(target..from, target + 1);
+    }
+    order[target] = moved;
+    true
+}
 #[derive(Debug)]
 struct DirectoryRequest {
     tab_id: TabId,
@@ -170,7 +189,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         width: 1180,
         height: 760,
     };
-    let (restored_paths, active_index, window) = restored
+    let (restored_paths, active_index, window, column_order) = restored
         .filter(|session| !session.tab_paths.is_empty())
         .map(|session| {
             let window = if session.window.width > 7_680 || session.window.height > 4_320 {
@@ -178,16 +197,25 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             } else {
                 session.window
             };
-            (session.tab_paths, session.active_tab, window)
+            (
+                session.tab_paths,
+                session.active_tab,
+                window,
+                session.column_order,
+            )
         })
-        .unwrap_or_else(|| (vec![initial_path()], 0, default_window));
+        .unwrap_or_else(|| (vec![initial_path()], 0, default_window, [0, 1, 2, 3]));
     ui.window()
         .set_position(slint::PhysicalPosition::new(window.x, window.y));
     ui.window().set_size(slint::LogicalSize::new(
         window.width as f32,
         window.height as f32,
     ));
-    let state = Arc::new(Mutex::new(AppState::new(restored_paths, active_index)));
+    let state = Arc::new(Mutex::new(AppState::new(
+        restored_paths,
+        active_index,
+        column_order,
+    )));
     if let Some(scenario) = scenario {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         let active_tab = app.active_tab;
@@ -235,14 +263,14 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     }
 
     let result = ui.run();
-    let (paths, active_tab) = {
+    let (paths, active_tab, column_order) = {
         let app = state.lock().expect("app state mutex is not poisoned");
         let active_tab = app
             .tab_order
             .iter()
             .position(|id| *id == app.active_tab)
             .unwrap_or(0);
-        (app.stable_paths(), active_tab)
+        (app.stable_paths(), active_tab, app.column_order)
     };
     let position = ui.window().position();
     let size = ui.window().size();
@@ -257,6 +285,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             },
             active_tab,
             paths,
+            column_order,
         )
     {
         let _ = session_store::save(&path, &session);
@@ -670,6 +699,18 @@ fn wire_callbacks(ui: &AppWindow, sender: mpsc::Sender<DirectoryRequest>, state:
         drop(app);
         if let Some(ui) = weak.upgrade() {
             refresh_ui(&ui, &state_for_sort);
+        }
+    });
+    let weak = ui.as_weak();
+    let state_for_columns = state.clone();
+    ui.on_reorder_column(move |kind, offset| {
+        let mut app = state_for_columns
+            .lock()
+            .expect("app state mutex is not poisoned");
+        reorder_column(&mut app.column_order, kind as u8, offset);
+        drop(app);
+        if let Some(ui) = weak.upgrade() {
+            refresh_ui(&ui, &state_for_columns);
         }
     });
     let weak = ui.as_weak();
@@ -1346,6 +1387,15 @@ fn update_file_rows(
 fn update_selection_summary(ui: &AppWindow, state: &SharedSessions) {
     let app = state.lock().expect("app state mutex is not poisoned");
     let tab = app.active();
+
+    ui.set_columns(ModelRc::new(VecModel::from(
+        app.column_order
+            .iter()
+            .map(|kind| ColumnRow {
+                kind: i32::from(*kind),
+            })
+            .collect::<Vec<_>>(),
+    )));
     ui.set_selected_count(tab.selected.len() as i32);
     ui.set_status_text(status_text(tab, Texts::new(app.language)).into());
 }
@@ -1454,7 +1504,24 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
             .enumerate()
             .map(|(index, location)| SidebarRow {
                 index: index as i32,
-                label: location.label.clone().into(),
+                label: match (app.language, location.kind) {
+                    (Language::Chinese, KnownLocationKind::Home) => "主页",
+                    (Language::Chinese, KnownLocationKind::Desktop) => "桌面",
+                    (Language::Chinese, KnownLocationKind::Downloads) => "下载",
+                    (Language::Chinese, KnownLocationKind::Documents) => "文档",
+                    (Language::Chinese, KnownLocationKind::Pictures) => "图片",
+                    (Language::Chinese, KnownLocationKind::Music) => "音乐",
+                    (Language::Chinese, KnownLocationKind::Videos) => "视频",
+                    (Language::English, KnownLocationKind::Home) => "Home",
+                    (Language::English, KnownLocationKind::Desktop) => "Desktop",
+                    (Language::English, KnownLocationKind::Downloads) => "Downloads",
+                    (Language::English, KnownLocationKind::Documents) => "Documents",
+                    (Language::English, KnownLocationKind::Pictures) => "Pictures",
+                    (Language::English, KnownLocationKind::Music) => "Music",
+                    (Language::English, KnownLocationKind::Videos) => "Videos",
+                    (_, KnownLocationKind::Drive) => location.label.as_str(),
+                }
+                .into(),
                 icon_kind: match location.kind {
                     KnownLocationKind::Home => 0,
                     KnownLocationKind::Desktop => 1,
@@ -1471,6 +1538,14 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
             .collect::<Vec<_>>(),
     )));
     ui.set_selected_count(tab.selected.len() as i32);
+    ui.set_columns(ModelRc::new(VecModel::from(
+        app.column_order
+            .iter()
+            .map(|kind| ColumnRow {
+                kind: i32::from(*kind),
+            })
+            .collect::<Vec<_>>(),
+    )));
     ui.set_sort_field(match tab.sort_field {
         SortField::Name => 0,
         SortField::Kind => 1,
@@ -1586,6 +1661,9 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
         downloads,
         documents,
         pictures,
+        music,
+        videos,
+        quick_access,
         drives,
         name,
         kind,
@@ -1604,6 +1682,9 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "下载",
             "文档",
             "图片",
+            "音乐",
+            "视频",
+            "快速访问",
             "磁盘",
             "名称",
             "类型",
@@ -1622,6 +1703,9 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "Downloads",
             "Documents",
             "Pictures",
+            "Music",
+            "Videos",
+            "Quick access",
             "Drives",
             "Name",
             "Type",
@@ -1640,6 +1724,9 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_downloads(downloads.into());
     ui.set_text_documents(documents.into());
     ui.set_text_pictures(pictures.into());
+    ui.set_text_music(music.into());
+    ui.set_text_videos(videos.into());
+    ui.set_text_quick_access(quick_access.into());
     ui.set_text_drives(drives.into());
     ui.set_text_name(name.into());
     ui.set_text_type(kind.into());
@@ -1663,8 +1750,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reorders_columns_in_both_directions_and_clamps_edges() {
+        let mut order = [0, 1, 2, 3];
+        assert!(reorder_column(&mut order, 1, -3));
+        assert_eq!(order, [1, 0, 2, 3]);
+        assert!(reorder_column(&mut order, 1, 8));
+        assert_eq!(order, [0, 2, 3, 1]);
+        assert!(!reorder_column(&mut order, 9, -1));
+        assert!(!reorder_column(&mut order, 2, 0));
+    }
+    #[test]
     fn sidebar_selection_prefers_exact_known_folder_over_drive() {
-        let mut app = AppState::new(vec![PathBuf::from(r"C:\Users\Test\Pictures")], 0);
+        let mut app = AppState::new(
+            vec![PathBuf::from(r"C:\Users\Test\Pictures")],
+            0,
+            [0, 1, 2, 3],
+        );
         app.sidebar = vec![
             KnownLocation {
                 kind: KnownLocationKind::Pictures,
@@ -1683,7 +1784,11 @@ mod tests {
 
     #[test]
     fn sidebar_selection_uses_drive_for_descendant_without_exact_location() {
-        let mut app = AppState::new(vec![PathBuf::from(r"C:\Projects\AsterFiles")], 0);
+        let mut app = AppState::new(
+            vec![PathBuf::from(r"C:\Projects\AsterFiles")],
+            0,
+            [0, 1, 2, 3],
+        );
         app.sidebar = vec![
             KnownLocation {
                 kind: KnownLocationKind::Pictures,
@@ -1701,7 +1806,7 @@ mod tests {
     }
     #[test]
     fn closing_a_tab_preserves_another_session() {
-        let mut app = AppState::new(vec![PathBuf::from("one")], 0);
+        let mut app = AppState::new(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
         let second = app.create_tab(PathBuf::from("two"));
         assert_eq!(app.active_tab, second);
         assert_eq!(app.close_tab(TabId(2)), Some(TabId(1)));
@@ -1710,7 +1815,7 @@ mod tests {
 
     #[test]
     fn closing_an_inactive_tab_keeps_the_active_tab() {
-        let mut app = AppState::new(vec![PathBuf::from("one")], 0);
+        let mut app = AppState::new(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
         let second = app.create_tab(PathBuf::from("two"));
         let third = app.create_tab(PathBuf::from("three"));
         assert_eq!(app.active_tab, third);
@@ -1723,7 +1828,11 @@ mod tests {
 
     #[test]
     fn same_path_normal_navigation_is_ignored_without_new_request() {
-        let state = Arc::new(Mutex::new(AppState::new(vec![PathBuf::from("same")], 0)));
+        let state = Arc::new(Mutex::new(AppState::new(
+            vec![PathBuf::from("same")],
+            0,
+            [0, 1, 2, 3],
+        )));
         let (sender, receiver) = mpsc::channel();
 
         assert!(!submit_navigation(
