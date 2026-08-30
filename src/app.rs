@@ -385,6 +385,12 @@ struct IconEvent {
 pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
     let operation_ui = OperationWindow::new()?;
+    let delete_ui = ConfirmationWindow::new()?;
+    let conflict_ui = ConfirmationWindow::new()?;
+    let exit_ui = ConfirmationWindow::new()?;
+    let delete_weak = delete_ui.as_weak();
+    let conflict_weak = conflict_ui.as_weak();
+    let exit_weak = exit_ui.as_weak();
     let restored = scenario
         .is_none()
         .then(|| session_store::default_path().and_then(|path| session_store::load(&path).ok()))
@@ -454,13 +460,25 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
 
     wire_callbacks(
         &ui,
+        &delete_ui,
+        &conflict_ui,
+        &exit_ui,
         request_sender.clone(),
         operation_sender.clone(),
         clipboard_sender,
         state.clone(),
     );
-    wire_mouse_navigation(&ui, state.clone());
+    wire_mouse_navigation(&ui, &exit_ui, state.clone());
     wire_window_controls(&ui);
+    wire_confirmation_windows(
+        &ui,
+        &operation_ui,
+        &delete_ui,
+        &conflict_ui,
+        &exit_ui,
+        operation_sender.clone(),
+        state.clone(),
+    );
     let _operation_timer =
         wire_operation_window(&ui, &operation_ui, operation_sender.clone(), state.clone());
     start_event_pump(&ui, event_receiver, icon_sender, state.clone());
@@ -468,6 +486,9 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     start_file_operation_event_pump(
         &ui,
         &operation_ui,
+        &delete_ui,
+        &conflict_ui,
+        &exit_ui,
         operation_receiver,
         operation_sender.clone(),
         request_sender.clone(),
@@ -488,6 +509,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     start_sidebar_icon_loader(&ui, state.clone());
     refresh_ui(&ui, &state);
     refresh_operation_window(&operation_ui, &state);
+    refresh_confirmation_windows(&delete_ui, &conflict_ui, &exit_ui, &state);
     let initial_tabs = {
         let app = state.lock().expect("app state mutex is not poisoned");
         app.tab_order
@@ -513,6 +535,11 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     }
 
     let result = ui.run();
+    for weak in [delete_weak, conflict_weak, exit_weak] {
+        if let Some(window) = weak.upgrade() {
+            let _ = window.hide();
+        }
+    }
     let (paths, active_tab, column_order, theme_mode, language) = {
         let app = state.lock().expect("app state mutex is not poisoned");
         let active_tab = app.stable_active_path_index();
@@ -970,8 +997,12 @@ fn native_window_handle(ui: &AppWindow) -> isize {
         })
         .unwrap_or_default()
 }
+#[allow(clippy::too_many_arguments)]
 fn wire_callbacks(
     ui: &AppWindow,
+    delete_ui: &ConfirmationWindow,
+    conflict_ui: &ConfirmationWindow,
+    exit_ui: &ConfirmationWindow,
     sender: mpsc::Sender<DirectoryRequest>,
     operation_sender: mpsc::Sender<FileOperationRequest>,
     clipboard_sender: mpsc::Sender<ClipboardRequest>,
@@ -1649,6 +1680,9 @@ fn wire_callbacks(
     });
 
     let weak = ui.as_weak();
+    let delete_weak_for_language = delete_ui.as_weak();
+    let conflict_weak_for_language = conflict_ui.as_weak();
+    let exit_weak_for_language = exit_ui.as_weak();
     let state_for_language = state.clone();
     ui.on_change_language(move |language| {
         let mut app = state_for_language
@@ -1663,9 +1697,19 @@ fn wire_callbacks(
         if let Some(ui) = weak.upgrade() {
             refresh_ui(&ui, &state_for_language);
         }
+        if let (Some(delete_ui), Some(conflict_ui), Some(exit_ui)) = (
+            delete_weak_for_language.upgrade(),
+            conflict_weak_for_language.upgrade(),
+            exit_weak_for_language.upgrade(),
+        ) {
+            refresh_confirmation_windows(&delete_ui, &conflict_ui, &exit_ui, &state_for_language);
+        }
     });
 
     let weak = ui.as_weak();
+    let delete_weak_for_theme = delete_ui.as_weak();
+    let conflict_weak_for_theme = conflict_ui.as_weak();
+    let exit_weak_for_theme = exit_ui.as_weak();
     let state_for_theme = state.clone();
     ui.on_change_theme(move |theme| {
         let mut app = state_for_theme
@@ -1679,6 +1723,13 @@ fn wire_callbacks(
         drop(app);
         if let Some(ui) = weak.upgrade() {
             refresh_ui(&ui, &state_for_theme);
+        }
+        if let (Some(delete_ui), Some(conflict_ui), Some(exit_ui)) = (
+            delete_weak_for_theme.upgrade(),
+            conflict_weak_for_theme.upgrade(),
+            exit_weak_for_theme.upgrade(),
+        ) {
+            refresh_confirmation_windows(&delete_ui, &conflict_ui, &exit_ui, &state_for_theme);
         }
     });
 
@@ -1776,6 +1827,7 @@ fn wire_callbacks(
     let weak = ui.as_weak();
     let state_for_context_command = state.clone();
     let sender_for_context_command = operation_sender.clone();
+    let delete_weak_for_context = delete_ui.as_weak();
     let clipboard_for_context = clipboard_sender.clone();
     ui.on_invoke_context_command(move |command| {
         match command {
@@ -1790,14 +1842,27 @@ fn wire_callbacks(
                 false,
             ),
             7 => {
+                if delete_weak_for_context
+                    .upgrade()
+                    .is_some_and(|window| window.window().is_visible())
+                {
+                    if let (Some(ui), Some(delete_ui)) =
+                        (weak.upgrade(), delete_weak_for_context.upgrade())
+                    {
+                        show_confirmation_window(&ui, None, &delete_ui);
+                    }
+                    return;
+                }
                 if let Ok(mut app) = state_for_context_command.lock() {
                     app.pending_permanent_delete = selected_paths(&app)
                         .into_iter()
                         .map(|path| OperationItem::pending(Some(path), None))
                         .collect();
                 }
-                if let Some(ui) = weak.upgrade() {
-                    ui.set_confirm_permanent_delete_open(true);
+                if let (Some(ui), Some(delete_ui)) =
+                    (weak.upgrade(), delete_weak_for_context.upgrade())
+                {
+                    show_confirmation_window(&ui, None, &delete_ui);
                 }
             }
             8 => {
@@ -1860,50 +1925,31 @@ fn wire_callbacks(
     let weak = ui.as_weak();
     let state_for_delete = state.clone();
     let sender_for_delete = operation_sender.clone();
+    let delete_weak = delete_ui.as_weak();
     ui.on_request_delete(move |permanent| {
         if permanent {
+            if delete_weak
+                .upgrade()
+                .is_some_and(|window| window.window().is_visible())
+            {
+                if let (Some(ui), Some(delete_ui)) = (weak.upgrade(), delete_weak.upgrade()) {
+                    show_confirmation_window(&ui, None, &delete_ui);
+                }
+                return;
+            }
             if let Ok(mut app) = state_for_delete.lock() {
                 app.pending_permanent_delete = selected_paths(&app)
                     .into_iter()
                     .map(|path| OperationItem::pending(Some(path), None))
                     .collect();
             }
-            if let Some(ui) = weak.upgrade() {
-                ui.set_confirm_permanent_delete_open(true);
+            if let (Some(ui), Some(delete_ui)) = (weak.upgrade(), delete_weak.upgrade()) {
+                show_confirmation_window(&ui, None, &delete_ui);
             }
         } else {
             submit_delete(&state_for_delete, &sender_for_delete, false);
         }
     });
-    let weak = ui.as_weak();
-    let state_for_confirm_delete = state.clone();
-    let sender_for_confirm_delete = operation_sender.clone();
-    ui.on_confirm_permanent_delete(move || {
-        if let Some(ui) = weak.upgrade() {
-            ui.set_confirm_permanent_delete_open(false);
-        }
-        let items = state_for_confirm_delete
-            .lock()
-            .map(|mut app| std::mem::take(&mut app.pending_permanent_delete))
-            .unwrap_or_default();
-        submit_delete_items(
-            &state_for_confirm_delete,
-            &sender_for_confirm_delete,
-            true,
-            items,
-        );
-    });
-    let weak = ui.as_weak();
-    let state_for_cancel_permanent = state.clone();
-    ui.on_cancel_permanent_delete(move || {
-        if let Ok(mut app) = state_for_cancel_permanent.lock() {
-            app.pending_permanent_delete.clear();
-        }
-        if let Some(ui) = weak.upgrade() {
-            ui.set_confirm_permanent_delete_open(false);
-        }
-    });
-
     let weak = ui.as_weak();
     let state_for_cancel_operation = state.clone();
     ui.on_cancel_operation(move |id| {
@@ -1929,76 +1975,18 @@ fn wire_callbacks(
         }
     });
     let weak = ui.as_weak();
-    let state_for_conflict = state.clone();
-    ui.on_resolve_conflict(move |action, apply_to_all| {
-        let decision = crate::domain::file_operations::ConflictDecision {
-            action: match action {
-                0 => crate::domain::file_operations::ConflictAction::Replace,
-                1 => crate::domain::file_operations::ConflictAction::Skip,
-                _ => crate::domain::file_operations::ConflictAction::KeepBoth,
-            },
-            apply_to_all,
-        };
-        if let Ok(mut app) = state_for_conflict.lock()
-            && let Some(id) = app.operations.active_id()
-        {
-            if let Some(task) = app.operations.task_mut(id) {
-                let _ = task.resolve_conflict(decision);
-            }
-            if let Some(response) = app.conflict_responses.remove(&id) {
-                let _ = response.send(decision);
-            }
-        }
-        if let Some(ui) = weak.upgrade() {
-            ui.set_conflict_prompt_open(false);
-            ui.set_conflict_apply_all(false);
-            refresh_ui(&ui, &state_for_conflict);
-        }
-    });
-    let weak = ui.as_weak();
     let state_for_close = state.clone();
+    let exit_weak = exit_ui.as_weak();
     ui.on_request_close(move || {
         if state_for_close
             .lock()
             .is_ok_and(|app| app.operations.has_active_tasks())
         {
-            if let Some(ui) = weak.upgrade() {
-                ui.set_exit_prompt_open(true);
+            if let (Some(ui), Some(exit_ui)) = (weak.upgrade(), exit_weak.upgrade()) {
+                show_confirmation_window(&ui, None, &exit_ui);
             }
         } else if let Some(ui) = weak.upgrade() {
             let _ = ui.hide();
-        }
-    });
-    let weak = ui.as_weak();
-    ui.on_wait_on_close(move || {
-        if let Some(ui) = weak.upgrade() {
-            ui.set_exit_prompt_open(false);
-            ui.set_task_center_open(true);
-        }
-    });
-    let weak = ui.as_weak();
-    let state_for_cancel_close = state.clone();
-    ui.on_cancel_tasks_and_close(move || {
-        if let Ok(mut app) = state_for_cancel_close.lock() {
-            app.exit_after_cancel = true;
-            let ids = app
-                .operations
-                .iter()
-                .filter(|task| task.state.is_active())
-                .map(|task| task.id)
-                .collect::<Vec<_>>();
-            for id in ids {
-                let _ = app.operations.cancel(id);
-                if let Some(response) = app.conflict_responses.remove(&id) {
-                    let _ = response.send(crate::domain::file_operations::ConflictDecision {
-                        action: crate::domain::file_operations::ConflictAction::Skip,
-                        apply_to_all: false,
-                    });
-                }
-            }
-        }
-        if let Some(ui) = weak.upgrade() {
-            ui.set_exit_prompt_open(false);
         }
     });
 }
@@ -2015,13 +2003,14 @@ fn keyboard_shortcuts_suppressed(rename_editing: bool) -> bool {
     rename_editing
 }
 
-fn wire_mouse_navigation(ui: &AppWindow, state: SharedSessions) {
+fn wire_mouse_navigation(ui: &AppWindow, exit_ui: &ConfirmationWindow, state: SharedSessions) {
     use winit::{
         event::{ElementState, MouseButton, WindowEvent},
         keyboard::{Key, ModifiersState, NamedKey},
     };
 
     let weak = ui.as_weak();
+    let exit_weak = exit_ui.as_weak();
     let modifiers = Cell::new(ModifiersState::empty());
     ui.window().on_winit_window_event(move |_, event| {
         if matches!(event, WindowEvent::CloseRequested) {
@@ -2029,8 +2018,10 @@ fn wire_mouse_navigation(ui: &AppWindow, state: SharedSessions) {
                 .lock()
                 .is_ok_and(|app| app.operations.has_active_tasks())
             {
-                if let Some(ui) = weak.upgrade() {
-                    ui.set_exit_prompt_open(true);
+                if let Some(ui) = weak.upgrade()
+                    && let Some(exit_ui) = exit_weak.upgrade()
+                {
+                    show_confirmation_window(&ui, None, &exit_ui);
                 }
                 return EventResult::PreventDefault;
             }
@@ -2308,6 +2299,280 @@ fn wire_window_controls(ui: &AppWindow) {
     });
 }
 
+fn configure_confirmation_window(ui: &ConfirmationWindow) {
+    #[cfg(windows)]
+    use winit::platform::windows::{CornerPreference, WindowExtWindows};
+
+    ui.window().on_close_requested({
+        let weak = ui.as_weak();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.invoke_safe_cancel();
+            }
+            slint::CloseRequestResponse::KeepWindowShown
+        }
+    });
+    let weak = ui.as_weak();
+    ui.on_drag_window(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.window().with_winit_window(|window| {
+                let _ = window.drag_window();
+            });
+        }
+    });
+    ui.window().with_winit_window(|window| {
+        window.set_resizable(false);
+        window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
+        #[cfg(windows)]
+        {
+            window.set_corner_preference(CornerPreference::Round);
+            window.set_undecorated_shadow(true);
+        }
+    });
+}
+
+fn wire_confirmation_windows(
+    ui: &AppWindow,
+    operation_ui: &OperationWindow,
+    delete_ui: &ConfirmationWindow,
+    conflict_ui: &ConfirmationWindow,
+    exit_ui: &ConfirmationWindow,
+    operation_sender: mpsc::Sender<FileOperationRequest>,
+    state: SharedSessions,
+) {
+    for confirmation in [delete_ui, conflict_ui, exit_ui] {
+        configure_confirmation_window(confirmation);
+    }
+
+    let delete_weak = delete_ui.as_weak();
+    let state_for_delete = state.clone();
+    delete_ui.on_safe_cancel(move || {
+        if let Ok(mut app) = state_for_delete.lock() {
+            app.pending_permanent_delete.clear();
+        }
+        if let Some(ui) = delete_weak.upgrade() {
+            let _ = ui.hide();
+        }
+    });
+    let delete_weak = delete_ui.as_weak();
+    let state_for_delete = state.clone();
+    let sender_for_delete = operation_sender.clone();
+    delete_ui.on_primary_action(move || {
+        let items = state_for_delete
+            .lock()
+            .map(|mut app| std::mem::take(&mut app.pending_permanent_delete))
+            .unwrap_or_default();
+        if let Some(ui) = delete_weak.upgrade() {
+            let _ = ui.hide();
+        }
+        submit_delete_items(&state_for_delete, &sender_for_delete, true, items);
+    });
+
+    let resolve_conflict = |operation_id: &str, action, apply_to_all, state: &SharedSessions| {
+        let decision = crate::domain::file_operations::ConflictDecision {
+            action,
+            apply_to_all,
+        };
+        if let Ok(mut app) = state.lock()
+            && let Ok(operation_id) = operation_id.parse::<u64>()
+        {
+            let id = OperationId(operation_id);
+            if let Some(task) = app.operations.task_mut(id) {
+                let _ = task.resolve_conflict(decision);
+            }
+            if let Some(response) = app.conflict_responses.remove(&id) {
+                let _ = response.send(decision);
+            }
+        }
+    };
+    let conflict_weak = conflict_ui.as_weak();
+    let ui_weak = ui.as_weak();
+    let state_for_conflict = state.clone();
+    conflict_ui.on_safe_cancel(move || {
+        let (operation_id, apply_to_all) = conflict_weak
+            .upgrade()
+            .map(|ui| (ui.get_operation_id(), ui.get_apply_all()))
+            .unwrap_or_default();
+        resolve_conflict(
+            operation_id.as_str(),
+            crate::domain::file_operations::ConflictAction::Skip,
+            apply_to_all,
+            &state_for_conflict,
+        );
+        if let Some(conflict_ui) = conflict_weak.upgrade() {
+            conflict_ui.set_apply_all(false);
+            conflict_ui.set_operation_id("".into());
+            let _ = conflict_ui.hide();
+        }
+        if let Some(ui) = ui_weak.upgrade() {
+            refresh_ui(&ui, &state_for_conflict);
+        }
+    });
+    for (action_index, action) in [
+        crate::domain::file_operations::ConflictAction::Replace,
+        crate::domain::file_operations::ConflictAction::Skip,
+        crate::domain::file_operations::ConflictAction::KeepBoth,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let conflict_weak = conflict_ui.as_weak();
+        let ui_weak = ui.as_weak();
+        let state_for_conflict = state.clone();
+        let callback = move || {
+            let (operation_id, apply_to_all) = conflict_weak
+                .upgrade()
+                .map(|ui| (ui.get_operation_id(), ui.get_apply_all()))
+                .unwrap_or_default();
+            resolve_conflict(
+                operation_id.as_str(),
+                action,
+                apply_to_all,
+                &state_for_conflict,
+            );
+            if let Some(conflict_ui) = conflict_weak.upgrade() {
+                conflict_ui.set_apply_all(false);
+                conflict_ui.set_operation_id("".into());
+                let _ = conflict_ui.hide();
+            }
+            if let Some(ui) = ui_weak.upgrade() {
+                refresh_ui(&ui, &state_for_conflict);
+            }
+        };
+        match action_index {
+            0 => conflict_ui.on_primary_action(callback),
+            1 => conflict_ui.on_secondary_action(callback),
+            _ => conflict_ui.on_tertiary_action(callback),
+        }
+    }
+
+    let exit_weak = exit_ui.as_weak();
+    let ui_weak = ui.as_weak();
+    exit_ui.on_safe_cancel(move || {
+        if let Some(exit_ui) = exit_weak.upgrade() {
+            let _ = exit_ui.hide();
+        }
+        if let Some(ui) = ui_weak.upgrade() {
+            ui.set_task_center_open(true);
+        }
+    });
+    let exit_weak = exit_ui.as_weak();
+    let ui_weak = ui.as_weak();
+    let operation_weak = operation_ui.as_weak();
+    let conflict_weak_for_exit = conflict_ui.as_weak();
+    let delete_weak_for_exit = delete_ui.as_weak();
+    let state_for_exit = state.clone();
+    exit_ui.on_primary_action(move || {
+        if let Ok(mut app) = state_for_exit.lock() {
+            app.exit_after_cancel = true;
+            let ids = app
+                .operations
+                .iter()
+                .filter(|task| task.state.is_active())
+                .map(|task| task.id)
+                .collect::<Vec<_>>();
+            for id in ids {
+                let _ = app.operations.cancel(id);
+                if let Some(response) = app.conflict_responses.remove(&id) {
+                    let _ = response.send(crate::domain::file_operations::ConflictDecision {
+                        action: crate::domain::file_operations::ConflictAction::Skip,
+                        apply_to_all: false,
+                    });
+                }
+            }
+        }
+        if let Some(exit_ui) = exit_weak.upgrade() {
+            let _ = exit_ui.hide();
+        }
+        if let Some(conflict_ui) = conflict_weak_for_exit.upgrade() {
+            conflict_ui.set_operation_id("".into());
+            conflict_ui.set_apply_all(false);
+            let _ = conflict_ui.hide();
+        }
+        if let Some(delete_ui) = delete_weak_for_exit.upgrade() {
+            let _ = delete_ui.hide();
+        }
+        if let Some(operation_ui) = operation_weak.upgrade() {
+            let _ = operation_ui.hide();
+        }
+        if !state_for_exit
+            .lock()
+            .is_ok_and(|app| app.operations.has_active_tasks())
+            && let Some(ui) = ui_weak.upgrade()
+        {
+            let _ = ui.hide();
+        }
+    });
+    let exit_weak = exit_ui.as_weak();
+    let ui_weak = ui.as_weak();
+    exit_ui.on_secondary_action(move || {
+        if let Some(exit_ui) = exit_weak.upgrade() {
+            let _ = exit_ui.hide();
+        }
+        if let Some(ui) = ui_weak.upgrade() {
+            ui.set_task_center_open(true);
+        }
+    });
+}
+
+fn show_confirmation_window(
+    ui: &AppWindow,
+    operation_ui: Option<&OperationWindow>,
+    confirmation_ui: &ConfirmationWindow,
+) {
+    if confirmation_ui.window().is_visible() {
+        confirmation_ui
+            .window()
+            .with_winit_window(|window| window.focus_window());
+        return;
+    }
+    position_window_centered(ui, operation_ui, confirmation_ui);
+    let _ = confirmation_ui.show();
+    confirmation_ui
+        .window()
+        .with_winit_window(|window| window.focus_window());
+}
+
+fn position_window_centered(
+    ui: &AppWindow,
+    operation_ui: Option<&OperationWindow>,
+    target_ui: &ConfirmationWindow,
+) {
+    let target_size = target_ui.window().size();
+    let operation_visible = operation_ui.is_some_and(|window| window.window().is_visible());
+    let mut target = None;
+    let mut calculate = |source: &winit::window::Window| {
+        let Some(monitor) = source.current_monitor() else {
+            return;
+        };
+        let monitor_position = monitor.position();
+        let monitor_size = monitor.size();
+        let source_position = source.outer_position().unwrap_or(monitor_position);
+        let source_size = source.outer_size();
+        let centered_x =
+            source_position.x + (source_size.width as i32 - target_size.width as i32) / 2;
+        let centered_y =
+            source_position.y + (source_size.height as i32 - target_size.height as i32) / 2;
+        let max_x = monitor_position.x + monitor_size.width as i32 - target_size.width as i32;
+        let max_y = monitor_position.y + monitor_size.height as i32 - target_size.height as i32;
+        target = Some(slint::PhysicalPosition::new(
+            centered_x.clamp(monitor_position.x, max_x.max(monitor_position.x)),
+            centered_y.clamp(monitor_position.y, max_y.max(monitor_position.y)),
+        ));
+    };
+    if operation_visible {
+        operation_ui
+            .expect("visible operation window exists")
+            .window()
+            .with_winit_window(&mut calculate);
+    } else {
+        ui.window().with_winit_window(calculate);
+    }
+    if let Some(position) = target {
+        target_ui.window().set_position(position);
+    }
+}
+
 fn wire_operation_window(
     ui: &AppWindow,
     operation_ui: &OperationWindow,
@@ -2321,26 +2586,6 @@ fn wire_operation_window(
     operation_ui.on_request_hide(move || {
         if let Some(operation_ui) = operation_weak.upgrade() {
             let _ = operation_ui.hide();
-        }
-    });
-    let ui_weak = ui.as_weak();
-    let operation_weak = operation_ui.as_weak();
-    let state_for_close = state.clone();
-    ui.on_request_close(move || {
-        if state_for_close
-            .lock()
-            .is_ok_and(|app| app.operations.has_active_tasks())
-        {
-            if let Some(ui) = ui_weak.upgrade() {
-                ui.set_exit_prompt_open(true);
-            }
-        } else {
-            if let Some(operation_ui) = operation_weak.upgrade() {
-                let _ = operation_ui.hide();
-            }
-            if let Some(ui) = ui_weak.upgrade() {
-                let _ = ui.hide();
-            }
         }
     });
     let operation_weak = operation_ui.as_weak();
@@ -2540,6 +2785,99 @@ fn refresh_operation_window(ui: &OperationWindow, state: &SharedSessions) {
     ui.set_text_no_operations(empty.into());
     ui.set_text_window_minimize(minimize.into());
     ui.set_text_window_close(close.into());
+}
+
+fn refresh_confirmation_windows(
+    delete_ui: &ConfirmationWindow,
+    conflict_ui: &ConfirmationWindow,
+    exit_ui: &ConfirmationWindow,
+    state: &SharedSessions,
+) {
+    let Ok(app) = state.lock() else {
+        return;
+    };
+    let (
+        cancel,
+        close,
+        delete_title,
+        delete_detail,
+        delete,
+        exit_title,
+        exit_detail,
+        cancel_exit,
+        wait,
+        conflict_title,
+        conflict_detail,
+        replace,
+        skip,
+        keep_both,
+        apply_all,
+        source_label,
+        destination_label,
+    ) = match app.language {
+        Language::Chinese => (
+            "取消",
+            "关闭",
+            "永久删除所选项目？",
+            "此操作无法撤销。",
+            "删除",
+            "文件操作仍在进行",
+            "等待任务完成，或取消任务后退出。",
+            "取消任务并退出",
+            "等待完成",
+            "目标位置已有同名项目",
+            "请选择如何处理当前冲突。",
+            "替换",
+            "跳过",
+            "保留两者",
+            "对这类冲突全部应用",
+            "来源：",
+            "目标：",
+        ),
+        Language::English => (
+            "Cancel",
+            "Close",
+            "Permanently delete selected items?",
+            "This action cannot be undone.",
+            "Delete",
+            "File operations are still running",
+            "Wait for them to finish, or cancel the tasks before exiting.",
+            "Cancel tasks and exit",
+            "Wait",
+            "An item with the same name already exists",
+            "Choose how to handle this conflict.",
+            "Replace",
+            "Skip",
+            "Keep both",
+            "Apply to all conflicts of this type",
+            "From: ",
+            "To: ",
+        ),
+    };
+    for window in [delete_ui, conflict_ui, exit_ui] {
+        window.set_dark_theme(app.dark_theme());
+        window.set_close_text(close.into());
+    }
+    delete_ui.set_kind(0);
+    delete_ui.set_title_text(delete_title.into());
+    delete_ui.set_detail_text(delete_detail.into());
+    delete_ui.set_cancel_text(cancel.into());
+    delete_ui.set_primary_text(delete.into());
+    conflict_ui.set_kind(1);
+    conflict_ui.set_title_text(conflict_title.into());
+    conflict_ui.set_detail_text(conflict_detail.into());
+    conflict_ui.set_cancel_text(cancel.into());
+    conflict_ui.set_primary_text(replace.into());
+    conflict_ui.set_secondary_text(skip.into());
+    conflict_ui.set_tertiary_text(keep_both.into());
+    conflict_ui.set_apply_all_text(apply_all.into());
+    conflict_ui.set_source_label(source_label.into());
+    conflict_ui.set_destination_label(destination_label.into());
+    exit_ui.set_kind(2);
+    exit_ui.set_title_text(exit_title.into());
+    exit_ui.set_detail_text(exit_detail.into());
+    exit_ui.set_primary_text(cancel_exit.into());
+    exit_ui.set_secondary_text(wait.into());
 }
 fn scan_cleanup_diagnostics(ui: &AppWindow, state: SharedSessions) {
     let weak = ui.as_weak();
@@ -3154,9 +3492,13 @@ fn execute_file_operation_item(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_file_operation_event_pump(
     ui: &AppWindow,
     operation_ui: &OperationWindow,
+    delete_ui: &ConfirmationWindow,
+    conflict_ui: &ConfirmationWindow,
+    exit_ui: &ConfirmationWindow,
     receiver: mpsc::Receiver<FileOperationEvent>,
     sender: mpsc::Sender<FileOperationRequest>,
     directory_sender: mpsc::Sender<DirectoryRequest>,
@@ -3164,10 +3506,16 @@ fn start_file_operation_event_pump(
 ) {
     let weak = ui.as_weak();
     let operation_weak = operation_ui.as_weak();
+    let conflict_weak = conflict_ui.as_weak();
+    let delete_weak = delete_ui.as_weak();
+    let exit_weak = exit_ui.as_weak();
     thread::spawn(move || {
         while let Ok(event) = receiver.recv() {
             let weak = weak.clone();
             let operation_weak = operation_weak.clone();
+            let conflict_weak = conflict_weak.clone();
+            let delete_weak = delete_weak.clone();
+            let exit_weak = exit_weak.clone();
             let sender = sender.clone();
             let directory_sender = directory_sender.clone();
             let state = state.clone();
@@ -3233,11 +3581,18 @@ fn start_file_operation_event_pump(
                             }
                             app.conflict_responses.insert(id, response);
                         }
-                        if let Some(ui) = weak.upgrade() {
-                            ui.set_conflict_source(source.into());
-                            ui.set_conflict_destination(destination.into());
-                            ui.set_conflict_apply_all(false);
-                            ui.set_conflict_prompt_open(true);
+                        if let (Some(ui), Some(conflict_ui)) =
+                            (weak.upgrade(), conflict_weak.upgrade())
+                        {
+                            conflict_ui.set_source_text(source.into());
+                            conflict_ui.set_destination_text(destination.into());
+                            conflict_ui.set_operation_id(id.0.to_string().into());
+                            conflict_ui.set_apply_all(false);
+                            show_confirmation_window(
+                                &ui,
+                                operation_weak.upgrade().as_ref(),
+                                &conflict_ui,
+                            );
                         }
                     }
                     FileOperationEvent::Finished {
@@ -3353,6 +3708,18 @@ fn start_file_operation_event_pump(
                     if state.lock().is_ok_and(|app| {
                         app.exit_after_cancel && !app.operations.has_active_tasks()
                     }) {
+                        if let Some(operation_ui) = operation_weak.upgrade() {
+                            let _ = operation_ui.hide();
+                        }
+                        if let Some(delete_ui) = delete_weak.upgrade() {
+                            let _ = delete_ui.hide();
+                        }
+                        if let Some(conflict_ui) = conflict_weak.upgrade() {
+                            let _ = conflict_ui.hide();
+                        }
+                        if let Some(exit_ui) = exit_weak.upgrade() {
+                            let _ = exit_ui.hide();
+                        }
                         let _ = ui.hide();
                     }
                 }
@@ -4526,81 +4893,14 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_window_close(close.into());
     ui.set_text_address(address.into());
     ui.set_text_cancel_edit(cancel_edit.into());
-    let (
-        file_operations,
-        task_count,
-        cancel_operation,
-        retry_operation,
-        permanent_title,
-        permanent_detail,
-        delete,
-        exit_title,
-        exit_detail,
-        cancel_and_exit,
-        wait,
-        conflict_title,
-        conflict_detail,
-        replace,
-        skip,
-        keep_both,
-        apply_all,
-    ) = match language {
-        Language::Chinese => (
-            "文件操作",
-            "个任务",
-            "取消",
-            "重试",
-            "永久删除所选项目？",
-            "此操作无法撤销。",
-            "删除",
-            "文件操作仍在进行",
-            "等待任务完成，或取消任务后退出。",
-            "取消任务并退出",
-            "等待完成",
-            "目标位置已有同名项目",
-            "请选择如何处理当前冲突。",
-            "替换",
-            "跳过",
-            "保留两者",
-            "对这类冲突全部应用",
-        ),
-        Language::English => (
-            "File operations",
-            "tasks",
-            "Cancel",
-            "Retry",
-            "Permanently delete selected items?",
-            "This action cannot be undone.",
-            "Delete",
-            "File operations are still running",
-            "Wait for them to finish, or cancel the tasks before exiting.",
-            "Cancel tasks and exit",
-            "Wait",
-            "An item with the same name already exists",
-            "Choose how to handle this conflict.",
-            "Replace",
-            "Skip",
-            "Keep both",
-            "Apply to all conflicts of this type",
-        ),
+    let (file_operations, task_count, cancel_operation, retry_operation) = match language {
+        Language::Chinese => ("文件操作", "个任务", "取消", "重试"),
+        Language::English => ("File operations", "tasks", "Cancel", "Retry"),
     };
     ui.set_text_file_operations(file_operations.into());
     ui.set_text_task_count(task_count.into());
     ui.set_text_cancel_operation(cancel_operation.into());
     ui.set_text_retry_operation(retry_operation.into());
-    ui.set_text_permanent_delete_title(permanent_title.into());
-    ui.set_text_permanent_delete_detail(permanent_detail.into());
-    ui.set_text_delete(delete.into());
-    ui.set_text_exit_title(exit_title.into());
-    ui.set_text_exit_detail(exit_detail.into());
-    ui.set_text_cancel_and_exit(cancel_and_exit.into());
-    ui.set_text_wait(wait.into());
-    ui.set_text_conflict_title(conflict_title.into());
-    ui.set_text_conflict_detail(conflict_detail.into());
-    ui.set_text_replace(replace.into());
-    ui.set_text_skip(skip.into());
-    ui.set_text_keep_both(keep_both.into());
-    ui.set_text_apply_all(apply_all.into());
 }
 
 fn display_path(path: &Path) -> String {
