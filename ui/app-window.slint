@@ -2,7 +2,7 @@ import { ListView } from "std-widgets.slint";
 import { IconMap } from "icons/icon-map.slint";
 
 export struct HighlightSegment { text: string, highlighted: bool }
-export struct FileRow { id: int, name: string, name-segments: [HighlightSegment], kind: string, parent-path: string, size: string, modified: string, is-directory: bool, selected: bool, focused: bool, cut: bool, icon: image }
+export struct FileRow { id: int, loaded: bool, name: string, name-segments: [HighlightSegment], kind: string, parent-path: string, size: string, modified: string, is-directory: bool, selected: bool, focused: bool, cut: bool, icon: image }
 export struct HistoryRow { index: int, label: string }
 export struct BreadcrumbRow { index: int, label: string, current: bool }
 export struct TabRow { id: int, title: string, active: bool, loading: bool, icon: image, is-drive: bool, is-settings: bool }
@@ -409,7 +409,7 @@ component LightScrollBar inherits Rectangle {
     in-out property <length> value;
     in property <length> maximum;
     in property <length> page-size;
-    callback scrolled();
+    callback scrolled(length);
 
     width: 12px;
     visible: root.maximum > 0px;
@@ -442,7 +442,7 @@ component LightScrollBar inherits Rectangle {
         moved => {
             if self.pressed && root.thumb-travel > 0px {
                 root.value = max(-root.maximum, min(0px, self.press-value - (self.mouse-y - self.press-y) * root.maximum / root.thumb-travel));
-                root.scrolled();
+                root.scrolled(root.value);
             }
         }
     }
@@ -680,7 +680,7 @@ export component AppWindow inherits Window {
 
     callback navigate-path(string);
     callback address-input-changed(string);
-    callback request-next-search-page();
+    callback request-search-page(int);
     callback begin-search();
 
     callback cancel-address-edit();
@@ -766,6 +766,11 @@ export component AppWindow inherits Window {
     }
     function clamp-file-viewport(available: length) {
         root.file-viewport-x = max(min(0px, available - root.file-columns-width), min(0px, root.file-viewport-x));
+    }
+    function request-visible-search-page(viewport-y: length) {
+        if root.search-results-mode {
+            root.request-search-page(floor(max(0px, -viewport-y) / 40px / 256) * 256);
+        }
     }
     in-out property <length> context-menu-anchor-x: 24px;
     in-out property <length> context-menu-anchor-y: 140px;
@@ -1109,7 +1114,7 @@ list := ListView {
                             x: 0px;
                             height: 40px;
                             background: VisualStyle.cffffff;
-                            opacity: entry.cut ? 0.52 : 1;
+                            opacity: !entry.loaded ? 0 : (entry.cut ? 0.52 : 1);
                             Rectangle {
                                 x: 6px; y: 2px; width: parent.width - 12px; height: parent.height - 4px;
                                 border-radius: 5px;
@@ -1223,7 +1228,7 @@ accessible-label: entry.name;
                             }
                             }
                             mouse := TouchArea {
-                                enabled: !(root.rename-editing && root.rename-entry-id == entry.id);
+                                enabled: entry.loaded && !(root.rename-editing && root.rename-entry-id == entry.id);
                                 private property <bool> click-control: false;
                                 private property <bool> click-shift: false;
                                 mouse-cursor: pointer;
@@ -1244,6 +1249,11 @@ root.context-menu-anchor-y / 1px
                                         }
                                     }
 
+                                }
+                                scroll-event(event) => {
+                                    list.viewport-y = max(-(list.viewport-height - list.visible-height), min(0px, list.viewport-y + event.delta-y));
+                                    root.request-visible-search-page(list.viewport-y);
+                                    return accept;
                                 }
                                 clicked => { root.activate-entry(entry.id, self.click-control, self.click-shift); }
                             }
@@ -1293,10 +1303,8 @@ root.context-menu-anchor-y / 1px
                         value <=> list.viewport-y;
                         maximum: max(0px, list.viewport-height - list.visible-height);
                         page-size: list.visible-height;
-                        scrolled => {
-                            if root.search-results-mode && self.maximum > 0px && self.value <= -self.maximum + self.page-size {
-                                root.request-next-search-page();
-                            }
+                        scrolled(viewport-y) => {
+                            root.request-visible-search-page(viewport-y);
                         }
                     }
                     if root.page-state == 1 || root.page-state == 3: VerticalLayout {

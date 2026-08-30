@@ -101,6 +101,8 @@ Everything 使用后台工作线程和 Query2 专用消息窗口，不占目录�
 验证命令为 `cargo test --no-fail-fast`、`python tools/verify.py`、`cargo build`；汇总位于 `artifacts/verify/summary.json`，Everything 实证日志写入 `artifacts/logs/`。
 ## 验证与产物
 
+Issue #4 将 Everything 搜索投影改为总数驱动的稀疏虚拟模型：首批仍为 256 项，滚动到任意位置优先请求目标 offset，并依次预取前后相邻页；滑块拖动以本次输入刚计算出的目标视口直接换算 offset，不读取双向绑定尚未同步的旧位置，因此首次拖动无需再点击列表激活。快速连续拖动只保留最新目标附近的待请求页，不从第一页顺序补齐，也不因可见区域跨页而留下大片空白。未加载位置只提供不可交互的轻量占位；页面返回只更新对应行。缓存最多保留最近 7 页，选中项所在页暂不淘汰。页请求按 `TabId + RequestId + offset` 去重；导航、切换标签、新查询和排序继续生成新代次，文件/文件夹分组边界变化也会废弃旧缓存。窗口事件入口直接消费滚轮行/像素位移，避免进入 Slint 固定约 180ms 的平滑动画。自动验证只证明模型、缓存和请求隔离；小列表滑块、鼠标、触控板及十万级结果的真实手感仍由用户在 Release 中人工验收，性能数据后续写入 `artifacts/perf/`。
+
 - 统一检查：`python tools/verify.py`，覆盖格式、静态检查、测试、确定性无界面场景和 Debug 构建；正式 Release 由用户明确要求后通过 `python tools/verify.py --release` 触发。
 - 单元测试覆盖请求代次、标签隔离、路径身份和取消状态转换。
 - 机器可读汇总写入 `artifacts/verify/summary.json`；UI 状态写入 `artifacts/state/`；截图写入 `artifacts/ui/`；加载与取消日志写入 `artifacts/logs/`；性能数据写入 `artifacts/perf/`。
