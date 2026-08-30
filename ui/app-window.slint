@@ -51,6 +51,8 @@ export global VisualStyle {
     out property <color> cf8f8f9: dark-theme ? #303030 : #f8f8f9;
     out property <color> cfafbfc: dark-theme ? #272727 : #fafbfc;
     out property <color> cffffff: dark-theme ? #252525 : #ffffff;
+    out property <length> tab-shoulder-width: 7px;
+    out property <length> tab-shoulder-span: 14px;
 }
 
 component StandaloneActionButton inherits Rectangle {
@@ -268,6 +270,47 @@ component InlineIcon inherits Rectangle {
     in property <length> icon-size: 18px;
     width: root.icon-size;
     Image { width: root.icon-size; height: root.icon-size; y: (parent.height - self.height) / 2; source: root.icon-source; }
+}
+
+component ActiveTabShape inherits Rectangle {
+    in property <color> shape-color;
+    background: transparent;
+
+    // Fixed shoulders keep the join stable while only the center follows tab width.
+    Rectangle {
+        x: VisualStyle.tab-shoulder-width;
+        width: parent.width - VisualStyle.tab-shoulder-span;
+        height: parent.height;
+        border-radius: VisualStyle.tab-shoulder-width;
+        background: root.shape-color;
+    }
+    Rectangle {
+        x: VisualStyle.tab-shoulder-width;
+        y: parent.height - 10px;
+        width: parent.width - VisualStyle.tab-shoulder-span;
+        height: 10px;
+        background: root.shape-color;
+    }
+    Path {
+        x: 0px;
+        y: parent.height - 10px;
+        width: VisualStyle.tab-shoulder-width;
+        height: 10px;
+        viewbox-width: 7;
+        viewbox-height: 10;
+        commands: "M 0 10 C 4 10 7 7 7 3 L 7 0 L 7 10 Z";
+        fill: root.shape-color;
+    }
+    Path {
+        x: parent.width - VisualStyle.tab-shoulder-width;
+        y: parent.height - 10px;
+        width: VisualStyle.tab-shoulder-width;
+        height: 10px;
+        viewbox-width: 7;
+        viewbox-height: 10;
+        commands: "M 0 0 L 0 3 C 0 7 3 10 7 10 L 0 10 Z";
+        fill: root.shape-color;
+    }
 }
 
 component IconButton inherits Rectangle {
@@ -780,16 +823,13 @@ export component AppWindow inherits Window {
                         width: parent.width; height: parent.height; spacing: 5px;
                         for tab[index] in root.tabs: Rectangle {
                             width: root.tab-width; height: 34px;
-
-                            background: tab.active ? VisualStyle.c323437 : (tab-touch.has-hover ? VisualStyle.ce8eaf0 : VisualStyle.cf1f2f5);
+                            background: tab.active ? transparent : (tab-touch.has-hover ? VisualStyle.ce8eaf0 : VisualStyle.cf1f2f5);
                             border-width: 0px;
-                            border-radius: tab.active ? 7px : 0px;
-                            Path {
+                            ActiveTabShape {
                                 visible: tab.active;
-                                x: -7px; y: parent.height - 10px; width: parent.width + 14px; height: 10px;
-                                viewbox-width: 100; viewbox-height: 10; fit: fill; clip: true;
-                                commands: "M 0 10 C 2 10 3.6 8 3.6 5 L 3.6 0 L 96.4 0 L 96.4 5 C 96.4 8 98 10 100 10 Z";
-                                fill: VisualStyle.c323437;
+                                width: parent.width;
+                                height: parent.height;
+                                shape-color: VisualStyle.c323437;
                             }
                             tab-touch := TouchArea {
                                 mouse-cursor: pointer;
@@ -805,6 +845,8 @@ export component AppWindow inherits Window {
                                 }
                             }
                             HorizontalLayout {
+                                x: VisualStyle.tab-shoulder-width;
+                                width: parent.width - VisualStyle.tab-shoulder-span;
                                 padding-left: 10px; padding-right: 7px; spacing: 6px;
                                 InlineIcon { icon-source: tab.is-settings ? IconMap.action-settings : (tab.icon.width != 0 ? tab.icon : (tab.is-drive ? IconMap.location-drive : IconMap.file-folder)); icon-size: 16px; }
                                 Text { text: tab.title; color: VisualStyle.c303138; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
