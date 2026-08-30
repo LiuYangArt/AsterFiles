@@ -86,6 +86,10 @@ P2 的完整设计见 [P2 基础文件操作与右键菜单实施方案](p2-file
 
 OLE 的 `IDataObject`、`IDropSource`、`IDropTarget`、窗口注册和拖放循环集中在 `platform/windows/drag_drop`。COM 对象遵守 STA 与窗口线程亲和，UI 不枚举目录、读取元数据或执行磁盘操作。拖动开始时由应用协调层把 `TabId + EntryId` 固定为原始路径快照；拖入任务沿用独立 `OperationId`，拖放不得复用导航 `RequestId`。操作后的路径变化继续广播给所有相关标签，外部目标无法返回可靠结果时只定向刷新，不猜测或伪造移动成功。
 
+P3 产品决策汇总见 [P3 Windows 原生集成决策摘要](p3-windows-integration-decisions.md)。Windows 隐藏文件和系统文件使用独立持久化开关：默认显示隐藏文件、不显示系统文件，显示时不使用弱化样式。系统缩略图整体移到 P4，与详细信息、列表、网格和大图标视图统一设计；P3 继续使用现有 Shell 图标链路。
+
+第三方 Shell 扩展必须在隔离边界内加载，AsterFiles 自带命令不等待扩展。慢、超时或异常扩展必须按具体扩展名称显示“正在加载”“加载超时”或“加载失败”，并记录稳定标识、耗时、结果、错误和日志入口；不得只显示无法定位问题的笼统状态。Windows 完整菜单始终保留为兼容入口。
+
 ## Everything 平台边界（2026-08-30）
 
 Everything 适配统一位于 `platform/windows/everything.rs`，不分发 SDK DLL。搜索、状态、分页和排序使用官方 WM_COPYDATA Query2；文件夹大小使用 Everything 1.5 的 Everything3 命名管道命令 18，直接按完整 UTF-8 原始路径读取索引值。两条官方 IPC 通道严格分工，大小不再通过搜索结果间接推导。
