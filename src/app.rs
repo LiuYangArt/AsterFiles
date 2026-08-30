@@ -4279,10 +4279,15 @@ fn append_active_file_rows(
     }
     let model = ui.get_files();
     let Some(model) = model.as_any().downcast_ref::<VecModel<FileRow>>() else {
+        drop(app);
+        refresh_ui(ui, state);
         return;
     };
     let start = model.row_count();
-    if start > tab.pending_entries.len() {
+    if ui.get_projected_file_tab_id() != tab_id.0 as i32
+        || ui.get_projected_file_request_id() != request_id.0 as i32
+        || start > tab.pending_entries.len()
+    {
         drop(app);
         refresh_ui(ui, state);
         return;
@@ -4563,6 +4568,15 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
         .iter()
         .map(|entry| file_row(entry, tab, texts, &app))
         .collect::<Vec<_>>();
+    let projected_tab_id = tab.id.0 as i32;
+    let projected_request_id = tab.latest_request.0 as i32;
+    if ui.get_projected_file_tab_id() != projected_tab_id
+        || ui.get_projected_file_request_id() != projected_request_id
+    {
+        ui.set_file_viewport_y(0.0);
+        ui.set_projected_file_tab_id(projected_tab_id);
+        ui.set_projected_file_request_id(projected_request_id);
+    }
     ui.set_files(ModelRc::new(VecModel::from(file_rows)));
     ui.set_window_width(ui.window().size().width as f32 / ui.window().scale_factor());
     let visible_path = tab.visible_path().map(display_path).unwrap_or_default();

@@ -523,6 +523,8 @@ export component AppWindow inherits Window {
 
 
     in property <[FileRow]> files;
+    in-out property <int> projected-file-tab-id: -1;
+    in-out property <int> projected-file-request-id: -1;
     in property <[TabRow]> tabs;
     in property <[HistoryRow]> back-history;
     in property <[HistoryRow]> forward-history;
