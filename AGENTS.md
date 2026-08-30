@@ -11,6 +11,13 @@ python tools/verify.py
 
 日常启动使用 `cargo run`，统一验证覆盖格式、静态检查、测试、无界面 Agent 场景和 Debug 构建。机器可读汇总位于 `artifacts/verify/summary.json`；详细规则和确定性 UI 场景见 `docs/agent/debug-validation.md`。Debug 构建产物位于 `target/debug/`；只有用户明确要求正式构建时才运行 `python tools/verify.py --release` 或 `cargo build --release`。UI 截图写入 `artifacts/ui/`，日志写入 `artifacts/logs/`，状态导出写入 `artifacts/state/`，性能 artifacts 写入 `artifacts/perf/`。
 
+## UI 操作与验证
+
+- 禁止 Codex 操作、自动化或尝试控制 AsterFiles 的 UI，包括通过内置浏览器、Chrome、Computer Use、Playwright、agent-browser、截图点击或键鼠模拟等方式。
+- 不得为排查或验证而启动交互式 UI 操作流程；允许编译、自动化测试、无界面场景、日志和状态导出等非 UI 验证。
+- 需要确认视觉效果、交互行为或真实桌面窗口能力时，必须停止 UI 验证，向用户说明需要验证的内容，并提供简短、明确的手动验证步骤，由用户执行并反馈结果。
+- 不得因 UI 验证失败或工具不稳定而反复尝试其他 UI 工具。
+
 ## 项目约束
 
 - 不在 UI 线程读取目录、提取缩略图或执行文件操作。
@@ -21,7 +28,8 @@ python tools/verify.py
 - 不增加网络协议、插件或索引服务，除非当前里程碑明确需要。
 - 注释说明目的、性能约束或 Windows 平台决策，不复述代码。
 - 修改完成后至少运行与变更范围相符的最小验证，并保留可读取的错误输出。
-- 每个开发任务完成后必须运行 `cargo build`，确保 `target/debug/asterfiles.exe` 已更新，供用户直接测试；交付时报告 Debug 文件时间与 SHA-256。只有用户明确要求正式构建或发布验证时才运行 Release 构建并报告其时间与 SHA-256。
+- 每个开发任务完成后必须运行 `cargo build`，确保 `target/debug/asterfiles.exe` 已更新，供用户直接测试；交付时报告 Debug 文件时间与 SHA-256。只有用户明确要求正式构建、发布验证，或用户确认某个 issue 已完成时，才运行 Release 构建并报告其时间与 SHA-256。
+- 每个 issue 经用户明确确认完成后，必须构建一版 Release；用户确认前不得因该规则提前构建 Release。
 
 ## task
 @docs/task-list.md
