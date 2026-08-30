@@ -7,7 +7,7 @@ AsterFiles 是一个面向 Windows 的高性能现代文件管理器原型。视
 ## 启动
 
 ```powershell
-cargo run --release
+cargo run
 ```
 
 ## 验证
@@ -16,8 +16,10 @@ cargo run --release
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
-cargo build --release
+python tools/verify.py
 ```
+
+日常验证生成 `target/debug/asterfiles.exe`。只有需要正式 Release 时运行 `python tools/verify.py --release`。
 
 ## 设计原则
 

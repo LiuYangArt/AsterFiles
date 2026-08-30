@@ -8,9 +8,11 @@
 python tools/verify.py
 ```
 
-命令依次检查格式、静态问题、测试、无界面 Agent 场景和 Release 构建；某一步失败后仍继续执行其余独立检查，确保始终尝试生成 Release。终端输出 JSON Lines；汇总写入 `artifacts/verify/summary.json`，完整命令日志写入 `artifacts/logs/`，状态导出写入 `artifacts/state/`。
+Debug 程序的设置页包含仅开发构建可见的“开发工具 / UI 陈列室”，可直接打开永久删除、文件冲突、退出任务确认和文件进度窗口。陈列室复用正式窗口组件，演示按钮只关闭演示窗口，不修改真实文件或任务；Release 构建不显示该入口。
 
-验证失败后先读取汇总中的失败步骤，再打开对应日志，避免加载无关的大日志。成功汇总包含 `target/release/asterfiles.exe` 的 UTC 文件时间和 SHA-256。
+命令依次检查格式、静态问题、测试、无界面 Agent 场景和 Debug 构建；某一步失败后仍继续执行其余独立检查，确保始终尝试生成 Debug 程序。用户明确要求正式构建时运行 `python tools/verify.py --release`。终端输出 JSON Lines；汇总写入 `artifacts/verify/summary.json`，完整命令日志写入 `artifacts/logs/`，状态导出写入 `artifacts/state/`。
+
+验证失败后先读取汇总中的失败步骤，再打开对应日志，避免加载无关的大日志。成功汇总包含当前构建配置、对应程序的 UTC 文件时间和 SHA-256。
 
 ## 确定性 UI 场景
 

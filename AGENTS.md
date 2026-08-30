@@ -5,11 +5,11 @@
 ## 启动与验证
 
 ```powershell
-cargo run --release
+cargo run
 python tools/verify.py
 ```
 
-统一验证覆盖格式、静态检查、测试、无界面 Agent 场景和 Release 构建。机器可读汇总位于 `artifacts/verify/summary.json`；详细规则和确定性 UI 场景见 `docs/agent/debug-validation.md`。构建产物位于 `target/release/`；UI 截图写入 `artifacts/ui/`，日志写入 `artifacts/logs/`，状态导出写入 `artifacts/state/`，性能 artifacts 写入 `artifacts/perf/`。
+日常启动使用 `cargo run`，统一验证覆盖格式、静态检查、测试、无界面 Agent 场景和 Debug 构建。机器可读汇总位于 `artifacts/verify/summary.json`；详细规则和确定性 UI 场景见 `docs/agent/debug-validation.md`。Debug 构建产物位于 `target/debug/`；只有用户明确要求正式构建时才运行 `python tools/verify.py --release` 或 `cargo build --release`。UI 截图写入 `artifacts/ui/`，日志写入 `artifacts/logs/`，状态导出写入 `artifacts/state/`，性能 artifacts 写入 `artifacts/perf/`。
 
 ## 项目约束
 
@@ -21,7 +21,7 @@ python tools/verify.py
 - 不增加网络协议、插件或索引服务，除非当前里程碑明确需要。
 - 注释说明目的、性能约束或 Windows 平台决策，不复述代码。
 - 修改完成后至少运行与变更范围相符的最小验证，并保留可读取的错误输出。
-- 每个开发任务完成后必须运行 `cargo build --release`，确保 `target/release/asterfiles.exe` 已更新，供用户直接测试；交付时报告 Release 文件时间与 SHA-256。
+- 每个开发任务完成后必须运行 `cargo build`，确保 `target/debug/asterfiles.exe` 已更新，供用户直接测试；交付时报告 Debug 文件时间与 SHA-256。只有用户明确要求正式构建或发布验证时才运行 Release 构建并报告其时间与 SHA-256。
 
 ## task
 @docs/task-list.md

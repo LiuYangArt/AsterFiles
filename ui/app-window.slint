@@ -54,6 +54,7 @@ export global VisualStyle {
 }
 
 component StandaloneActionButton inherits Rectangle {
+    in property <image> icon-source;
     in property <string> label;
     in property <bool> enabled: true;
     in property <bool> dangerous: false;
@@ -66,7 +67,11 @@ component StandaloneActionButton inherits Rectangle {
     border-color: root.dangerous ? VisualStyle.cc42b1c : VisualStyle.ce0e2e7;
     background: !root.enabled ? VisualStyle.cf8f8f9 : button-touch.pressed ? (root.dangerous ? #a4261a : VisualStyle.cdce6ff) : button-touch.has-hover ? (root.dangerous ? VisualStyle.cc42b1c : VisualStyle.ceff4ff) : (root.dangerous ? #b3261e : VisualStyle.cffffff);
     opacity: root.enabled ? 1 : 0.5;
-    Text { text: root.label; color: root.dangerous ? #ffffff : VisualStyle.c30333a; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+    HorizontalLayout {
+        padding-left: 10px; padding-right: 10px; spacing: 6px; alignment: center;
+        if root.icon-source.width != 0: Image { width: 16px; height: 16px; source: root.icon-source; image-fit: contain; colorize: VisualStyle.c303138; }
+        Text { text: root.label; color: root.dangerous ? #ffffff : VisualStyle.c30333a; font-size: 12px; vertical-alignment: center; overflow: elide; }
+    }
     button-touch := TouchArea { enabled: root.enabled; mouse-cursor: pointer; clicked => { root.clicked(); } }
     accessible-role: button;
     accessible-label: root.label;
@@ -206,6 +211,7 @@ export component ConfirmationWindow inherits Window {
 
     in property <int> kind: 0;
     in property <string> operation-id: "";
+    in property <bool> demo-mode: false;
     in property <bool> dark-theme: false;
     in property <string> title-text: "";
     in property <string> detail-text: "";
@@ -290,36 +296,6 @@ component IconButton inherits Rectangle {
     accessible-label: root.button-label;
     accessible-enabled: root.enabled;
     Tooltip { text: @markdown("\{root.tip}"); }
-}
-
-component CommandButton inherits Rectangle {
-    in property <image> icon-source;
-    in property <string> label;
-    in property <bool> enabled: true;
-    callback clicked();
-    width: 76px;
-    height: 32px;
-    horizontal-stretch: 0;
-    border-radius: 5px;
-    border-width: 1px;
-    border-color: VisualStyle.ce0e2e7;
-    background: !root.enabled ? VisualStyle.cf8f8f9 : command-touch.pressed ? VisualStyle.cdde3ed : command-touch.has-hover ? VisualStyle.cedf1f6 : VisualStyle.cffffff;
-    opacity: root.enabled ? 1 : 0.5;
-    HorizontalLayout {
-        padding-left: 9px;
-        padding-right: 9px;
-        spacing: 6px;
-        InlineIcon { icon-source: root.icon-source; icon-size: 16px; }
-        Text { text: root.label; color: VisualStyle.c30333a; font-size: 12px; vertical-alignment: center; }
-    }
-    command-touch := TouchArea {
-        enabled: root.enabled;
-        mouse-cursor: pointer;
-        clicked => { root.clicked(); }
-    }
-    accessible-role: button;
-    accessible-label: root.label;
-    accessible-enabled: root.enabled;
 }
 
 component SidebarGroupHeader inherits Rectangle {
@@ -581,6 +557,7 @@ export component AppWindow inherits Window {
     in property <int> theme-mode: 0;
     in property <int> language-mode: 0;
     in property <bool> active-is-settings: false;
+    in property <bool> debug-tools-enabled: false;
     in property <string> text-menu: "菜单";
     in property <string> text-settings: "设置";
     in property <string> text-settings-title: "设置";
@@ -593,6 +570,13 @@ export component AppWindow inherits Window {
     in property <string> text-language-english: "English";
     in property <string> text-settings-general: "常规";
     in property <string> text-settings-appearance: "外观";
+    in property <string> text-settings-developer: "开发工具";
+    in property <string> text-ui-showcase: "UI 陈列室";
+    in property <string> text-ui-showcase-detail: "直接打开难以触发的窗口和状态；演示操作不会修改文件或任务。";
+    in property <string> text-show-delete-confirmation: "永久删除确认";
+    in property <string> text-show-conflict-confirmation: "文件冲突";
+    in property <string> text-show-exit-confirmation: "退出任务确认";
+    in property <string> text-show-operation-window: "文件进度窗口";
     in property <string> text-loading: "正在加载…";
     in property <string> text-empty-folder: "此文件夹为空";
     in property <string> text-new-tab: "新建标签";
@@ -671,6 +655,7 @@ export component AppWindow inherits Window {
     callback retry-operation(int);
     callback open-operation-window();
     callback request-close();
+    callback show-debug-window(int);
 
     private property <bool> compact: root.window-width < 1000px;
     in-out property <length> context-menu-anchor-x: 24px;
@@ -1122,7 +1107,7 @@ list := ListView {
                             accessible-id: "error-page-actions";
                             HorizontalLayout {
                                 alignment: center; spacing: 8px;
-                                if root.show-request-access: CommandButton { width: 196px; icon-source: IconMap.status-locked; label: root.text-request-access; clicked => { root.request-folder-access(); } }
+                                if root.show-request-access: StandaloneActionButton { width: 196px; icon-source: IconMap.status-locked; label: root.text-request-access; clicked => { root.request-folder-access(); } }
                             }
                         }
                     }
@@ -1160,7 +1145,8 @@ list := ListView {
                     VerticalLayout {
                         padding-left: 12px; padding-right: 12px; padding-top: 18px; padding-bottom: 18px; spacing: 6px;
                         Text { text: root.text-settings-title; color: VisualStyle.c30333a; font-size: 22px; font-weight: 600; height: 42px; }
-                        for section[index] in [root.text-settings-general, root.text-settings-appearance]: Rectangle {
+                        for section[index] in [root.text-settings-general, root.text-settings-appearance, root.text-settings-developer]: Rectangle {
+                            visible: index < 2 || root.debug-tools-enabled;
                             height: 42px; border-radius: 6px;
                             background: root.settings-section == index ? VisualStyle.cdce6ff : (settings-nav-touch.has-hover ? VisualStyle.cedf1f6 : transparent);
                             Rectangle { visible: root.settings-section == index; x: 0px; y: 9px; width: 3px; height: 24px; border-radius: 2px; background: VisualStyle.c4f6bed; }
@@ -1186,7 +1172,7 @@ list := ListView {
                             width: settings-scroll.width;
                             height: settings-scroll.viewport-height;
                             spacing: 16px;
-                            Text { text: root.settings-section == 0 ? root.text-settings-general : root.text-settings-appearance; color: VisualStyle.c30333a; font-size: 22px; font-weight: 600; height: 44px; }
+                            Text { text: root.settings-section == 0 ? root.text-settings-general : root.settings-section == 1 ? root.text-settings-appearance : root.text-settings-developer; color: VisualStyle.c30333a; font-size: 22px; font-weight: 600; height: 44px; }
                             if root.settings-section == 0: Rectangle {
                                 height: 112px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
                                 VerticalLayout {
@@ -1220,6 +1206,24 @@ list := ListView {
                                             theme-card-touch := TouchArea { mouse-cursor: pointer; clicked => { root.change-theme(index); } }
                                             accessible-role: button; accessible-label: theme-option;
                                         }
+                                    }
+                                }
+                            }
+                            if root.settings-section == 2 && root.debug-tools-enabled: Rectangle {
+                                height: 244px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                VerticalLayout {
+                                    padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 12px;
+                                    Text { text: root.text-ui-showcase; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
+                                    Text { text: root.text-ui-showcase-detail; color: VisualStyle.c62656f; font-size: 12px; wrap: word-wrap; }
+                                    HorizontalLayout {
+                                        height: 34px; spacing: 8px;
+                                        StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-show-delete-confirmation; clicked => { root.show-debug-window(0); } }
+                                        StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-show-conflict-confirmation; clicked => { root.show-debug-window(1); } }
+                                    }
+                                    HorizontalLayout {
+                                        height: 34px; spacing: 8px;
+                                        StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-show-exit-confirmation; clicked => { root.show-debug-window(2); } }
+                                        StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-show-operation-window; clicked => { root.show-debug-window(3); } }
                                     }
                                 }
                             }

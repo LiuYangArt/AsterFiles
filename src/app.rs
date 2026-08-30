@@ -479,6 +479,14 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         operation_sender.clone(),
         state.clone(),
     );
+    wire_debug_showcase(
+        &ui,
+        &operation_ui,
+        &delete_ui,
+        &conflict_ui,
+        &exit_ui,
+        state.clone(),
+    );
     let _operation_timer =
         wire_operation_window(&ui, &operation_ui, operation_sender.clone(), state.clone());
     start_event_pump(&ui, event_receiver, icon_sender, state.clone());
@@ -2347,7 +2355,8 @@ fn wire_confirmation_windows(
     let delete_weak = delete_ui.as_weak();
     let state_for_delete = state.clone();
     delete_ui.on_safe_cancel(move || {
-        if let Ok(mut app) = state_for_delete.lock() {
+        let demo_mode = delete_weak.upgrade().is_some_and(|ui| ui.get_demo_mode());
+        if !demo_mode && let Ok(mut app) = state_for_delete.lock() {
             app.pending_permanent_delete.clear();
         }
         if let Some(ui) = delete_weak.upgrade() {
@@ -2358,6 +2367,12 @@ fn wire_confirmation_windows(
     let state_for_delete = state.clone();
     let sender_for_delete = operation_sender.clone();
     delete_ui.on_primary_action(move || {
+        if delete_weak.upgrade().is_some_and(|ui| ui.get_demo_mode()) {
+            if let Some(ui) = delete_weak.upgrade() {
+                let _ = ui.hide();
+            }
+            return;
+        }
         let items = state_for_delete
             .lock()
             .map(|mut app| std::mem::take(&mut app.pending_permanent_delete))
@@ -2389,6 +2404,12 @@ fn wire_confirmation_windows(
     let ui_weak = ui.as_weak();
     let state_for_conflict = state.clone();
     conflict_ui.on_safe_cancel(move || {
+        if conflict_weak.upgrade().is_some_and(|ui| ui.get_demo_mode()) {
+            if let Some(ui) = conflict_weak.upgrade() {
+                let _ = ui.hide();
+            }
+            return;
+        }
         let (operation_id, apply_to_all) = conflict_weak
             .upgrade()
             .map(|ui| (ui.get_operation_id(), ui.get_apply_all()))
@@ -2420,6 +2441,12 @@ fn wire_confirmation_windows(
         let ui_weak = ui.as_weak();
         let state_for_conflict = state.clone();
         let callback = move || {
+            if conflict_weak.upgrade().is_some_and(|ui| ui.get_demo_mode()) {
+                if let Some(ui) = conflict_weak.upgrade() {
+                    let _ = ui.hide();
+                }
+                return;
+            }
             let (operation_id, apply_to_all) = conflict_weak
                 .upgrade()
                 .map(|ui| (ui.get_operation_id(), ui.get_apply_all()))
@@ -2449,10 +2476,11 @@ fn wire_confirmation_windows(
     let exit_weak = exit_ui.as_weak();
     let ui_weak = ui.as_weak();
     exit_ui.on_safe_cancel(move || {
+        let demo_mode = exit_weak.upgrade().is_some_and(|ui| ui.get_demo_mode());
         if let Some(exit_ui) = exit_weak.upgrade() {
             let _ = exit_ui.hide();
         }
-        if let Some(ui) = ui_weak.upgrade() {
+        if !demo_mode && let Some(ui) = ui_weak.upgrade() {
             ui.set_task_center_open(true);
         }
     });
@@ -2463,6 +2491,12 @@ fn wire_confirmation_windows(
     let delete_weak_for_exit = delete_ui.as_weak();
     let state_for_exit = state.clone();
     exit_ui.on_primary_action(move || {
+        if exit_weak.upgrade().is_some_and(|ui| ui.get_demo_mode()) {
+            if let Some(ui) = exit_weak.upgrade() {
+                let _ = ui.hide();
+            }
+            return;
+        }
         if let Ok(mut app) = state_for_exit.lock() {
             app.exit_after_cancel = true;
             let ids = app
@@ -2506,11 +2540,68 @@ fn wire_confirmation_windows(
     let exit_weak = exit_ui.as_weak();
     let ui_weak = ui.as_weak();
     exit_ui.on_secondary_action(move || {
+        let demo_mode = exit_weak.upgrade().is_some_and(|ui| ui.get_demo_mode());
         if let Some(exit_ui) = exit_weak.upgrade() {
             let _ = exit_ui.hide();
         }
-        if let Some(ui) = ui_weak.upgrade() {
+        if !demo_mode && let Some(ui) = ui_weak.upgrade() {
             ui.set_task_center_open(true);
+        }
+    });
+}
+
+fn wire_debug_showcase(
+    ui: &AppWindow,
+    operation_ui: &OperationWindow,
+    delete_ui: &ConfirmationWindow,
+    conflict_ui: &ConfirmationWindow,
+    exit_ui: &ConfirmationWindow,
+    state: SharedSessions,
+) {
+    ui.set_debug_tools_enabled(cfg!(debug_assertions));
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let ui_weak = ui.as_weak();
+    let operation_weak = operation_ui.as_weak();
+    let delete_weak = delete_ui.as_weak();
+    let conflict_weak = conflict_ui.as_weak();
+    let exit_weak = exit_ui.as_weak();
+    ui.on_show_debug_window(move |kind| {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        match kind {
+            0 => {
+                if let Some(window) = delete_weak.upgrade() {
+                    show_confirmation_window(&ui, None, &window);
+                    window.set_demo_mode(true);
+                }
+            }
+            1 => {
+                if let Some(window) = conflict_weak.upgrade() {
+                    window.set_operation_id("debug-showcase".into());
+                    window.set_source_text(r"C:\示例\一段很长的源文件名.txt".into());
+                    window.set_destination_text(r"D:\目标\一段很长的目标文件名.txt".into());
+                    window.set_apply_all(false);
+                    show_confirmation_window(&ui, operation_weak.upgrade().as_ref(), &window);
+                    window.set_demo_mode(true);
+                }
+            }
+            2 => {
+                if let Some(window) = exit_weak.upgrade() {
+                    show_confirmation_window(&ui, None, &window);
+                    window.set_demo_mode(true);
+                }
+            }
+            3 => {
+                if let Some(window) = operation_weak.upgrade() {
+                    refresh_debug_operation_window(&window, &state);
+                    position_operation_window_next_to_main(&ui, &window);
+                    let _ = window.show();
+                }
+            }
+            _ => {}
         }
     });
 }
@@ -2520,6 +2611,7 @@ fn show_confirmation_window(
     operation_ui: Option<&OperationWindow>,
     confirmation_ui: &ConfirmationWindow,
 ) {
+    confirmation_ui.set_demo_mode(false);
     if confirmation_ui.window().is_visible() {
         confirmation_ui
             .window()
@@ -2787,6 +2879,41 @@ fn refresh_operation_window(ui: &OperationWindow, state: &SharedSessions) {
     ui.set_text_window_close(close.into());
 }
 
+fn refresh_debug_operation_window(ui: &OperationWindow, state: &SharedSessions) {
+    refresh_operation_window(ui, state);
+    let language = state
+        .lock()
+        .map(|app| app.language)
+        .unwrap_or(Language::Chinese);
+    let (title, transferred, speed, eta) = match language {
+        Language::Chinese => ("正在复制示例文件", "384 MB / 1.0 GB", "48 MB/s", "约 14 秒"),
+        Language::English => (
+            "Copying sample files",
+            "384 MB / 1.0 GB",
+            "48 MB/s",
+            "About 14 seconds",
+        ),
+    };
+    ui.set_operations(ModelRc::new(VecModel::from(vec![OperationRow {
+        id: -1,
+        title: title.into(),
+        percent: "38%".into(),
+        file_progress: "12 / 32".into(),
+        transferred: transferred.into(),
+        speed: speed.into(),
+        eta: eta.into(),
+        current_item: "Example document with a long name.pdf".into(),
+        source: r"C:\Users\Example\Documents".into(),
+        destination: r"D:\Backup\Documents".into(),
+        progress: 0.38,
+        state: operation_state_index(OperationState::Running),
+        paused: false,
+        can_pause: false,
+        can_cancel: false,
+        can_retry: false,
+    }])));
+}
+
 fn refresh_confirmation_windows(
     delete_ui: &ConfirmationWindow,
     conflict_ui: &ConfirmationWindow,
@@ -2855,6 +2982,7 @@ fn refresh_confirmation_windows(
         ),
     };
     for window in [delete_ui, conflict_ui, exit_ui] {
+        window.set_demo_mode(false);
         window.set_dark_theme(app.dark_theme());
         window.set_close_text(close.into());
     }
@@ -4752,6 +4880,13 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
         english,
         settings_general,
         settings_appearance,
+        settings_developer,
+        ui_showcase,
+        ui_showcase_detail,
+        show_delete_confirmation,
+        show_conflict_confirmation,
+        show_exit_confirmation,
+        show_operation_window,
         loading,
         empty_folder,
         new_tab,
@@ -4795,6 +4930,13 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "English",
             "常规",
             "外观",
+            "开发工具",
+            "UI 陈列室",
+            "直接打开难以触发的窗口和状态；演示操作不会修改文件或任务。",
+            "永久删除确认",
+            "文件冲突",
+            "退出任务确认",
+            "文件进度窗口",
             "正在加载…",
             "此文件夹为空",
             "新建标签",
@@ -4838,6 +4980,13 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "English",
             "General",
             "Appearance",
+            "Developer tools",
+            "UI showcase",
+            "Open hard-to-reach windows and states directly. Demo actions do not change files or tasks.",
+            "Delete confirmation",
+            "File conflict",
+            "Exit confirmation",
+            "File progress window",
             "Loading…",
             "This folder is empty",
             "New tab",
@@ -4882,6 +5031,13 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_language_english(english.into());
     ui.set_text_settings_general(settings_general.into());
     ui.set_text_settings_appearance(settings_appearance.into());
+    ui.set_text_settings_developer(settings_developer.into());
+    ui.set_text_ui_showcase(ui_showcase.into());
+    ui.set_text_ui_showcase_detail(ui_showcase_detail.into());
+    ui.set_text_show_delete_confirmation(show_delete_confirmation.into());
+    ui.set_text_show_conflict_confirmation(show_conflict_confirmation.into());
+    ui.set_text_show_exit_confirmation(show_exit_confirmation.into());
+    ui.set_text_show_operation_window(show_operation_window.into());
     ui.set_text_loading(loading.into());
     ui.set_text_empty_folder(empty_folder.into());
     ui.set_text_new_tab(new_tab.into());

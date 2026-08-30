@@ -18,6 +18,7 @@ VERIFY_DIR = ARTIFACTS / "verify"
 LOG_DIR = ARTIFACTS / "logs"
 STATE_DIR = ARTIFACTS / "state"
 SUMMARY = VERIFY_DIR / "summary.json"
+DEBUG = ROOT / "target" / "debug" / "asterfiles.exe"
 RELEASE = ROOT / "target" / "release" / "asterfiles.exe"
 
 
@@ -49,15 +50,19 @@ def run_step(name: str, command: list[str]) -> dict[str, object]:
     return result
 
 
-def release_metadata() -> dict[str, object] | None:
-    if not RELEASE.is_file():
+def build_metadata(path: Path) -> dict[str, object] | None:
+    if not path.is_file():
         return None
-    digest = hashlib.sha256(RELEASE.read_bytes()).hexdigest()
-    modified = datetime.fromtimestamp(RELEASE.stat().st_mtime, timezone.utc).isoformat()
-    return {"path": str(RELEASE), "modified_utc": modified, "sha256": digest}
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    modified = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+    return {"path": str(path), "modified_utc": modified, "sha256": digest}
 
 
 def main() -> int:
+    release_requested = "--release" in sys.argv[1:]
+    unknown = [argument for argument in sys.argv[1:] if argument != "--release"]
+    if unknown:
+        raise SystemExit(f"unknown argument: {unknown[0]}")
     for directory in (VERIFY_DIR, LOG_DIR, STATE_DIR):
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -84,7 +89,9 @@ def main() -> int:
             "cargo", "run", "--", "--agent-scenario", "file-operation-partial",
             "--no-ui", "--agent-state-out", str(STATE_DIR / "file-operations" / "partial.json"),
         ]),
-        ("release", ["cargo", "build", "--release"]),
+        ("release", ["cargo", "build", "--release"])
+        if release_requested
+        else ("debug", ["cargo", "build"]),
     ]
     results = []
     for name, command in steps:
@@ -92,8 +99,9 @@ def main() -> int:
         results.append(result)
 
     passed = len(results) == len(steps) and all(step["exit_code"] == 0 for step in results)
-    release_passed = any(
-        step["name"] == "release" and step["exit_code"] == 0 for step in results
+    build_name = "release" if release_requested else "debug"
+    build_passed = any(
+        step["name"] == build_name and step["exit_code"] == 0 for step in results
     )
     summary = {
         "schema_version": 1,
@@ -106,10 +114,18 @@ def main() -> int:
             "state": str(STATE_DIR),
         },
         "steps": results,
-        "release": release_metadata() if release_passed else None,
+        "build_profile": build_name,
+        "debug": build_metadata(DEBUG) if build_passed and not release_requested else None,
+        "release": build_metadata(RELEASE) if build_passed and release_requested else None,
     }
     SUMMARY.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    emit({"event": "validation_complete", "status": summary["status"], "summary": str(SUMMARY), "release": summary["release"]})
+    emit({
+        "event": "validation_complete",
+        "status": summary["status"],
+        "summary": str(SUMMARY),
+        "build_profile": build_name,
+        "artifact": summary[build_name],
+    })
     return 0 if passed else 1
 
 
