@@ -9,7 +9,7 @@ use crate::{domain::EverythingConfig, i18n::Language};
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-const MAGIC: &[u8; 5] = b"ASTF5";
+const MAGIC: &[u8; 5] = b"ASTF6";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ThemeMode {
@@ -39,9 +39,15 @@ impl ThemeMode {
 }
 pub type ColumnOrder = [u8; 4];
 pub type SearchColumnOrder = [u8; 4];
+pub type ColumnWidths = [u32; 4];
+pub type SearchColumnWidths = [u32; 4];
 pub const DEFAULT_COLUMN_ORDER: ColumnOrder = [0, 1, 2, 3];
 #[allow(dead_code)]
 pub const DEFAULT_SEARCH_COLUMN_ORDER: SearchColumnOrder = [0, 1, 2, 3];
+pub const DEFAULT_COLUMN_WIDTHS: ColumnWidths = [480, 160, 120, 200];
+pub const DEFAULT_SEARCH_COLUMN_WIDTHS: SearchColumnWidths = [400, 320, 120, 200];
+const MIN_COLUMN_WIDTH: u32 = 64;
+const MAX_COLUMN_WIDTH: u32 = 4_096;
 const MAX_TABS: usize = 1_024;
 const MAX_PATH_UNITS: usize = 32_767;
 const MIN_WINDOW_WIDTH: u32 = 820;
@@ -64,6 +70,8 @@ pub struct SessionState {
     pub tab_paths: Vec<PathBuf>,
     pub column_order: ColumnOrder,
     pub search_column_order: SearchColumnOrder,
+    pub column_widths: ColumnWidths,
+    pub search_column_widths: SearchColumnWidths,
     pub theme_mode: ThemeMode,
     pub language: Language,
     pub everything: EverythingConfig,
@@ -102,6 +110,8 @@ impl SessionState {
             tab_paths,
             column_order,
             DEFAULT_SEARCH_COLUMN_ORDER,
+            DEFAULT_COLUMN_WIDTHS,
+            DEFAULT_SEARCH_COLUMN_WIDTHS,
             theme_mode,
             language,
             EverythingConfig::default(),
@@ -115,6 +125,8 @@ impl SessionState {
         tab_paths: Vec<PathBuf>,
         column_order: ColumnOrder,
         search_column_order: SearchColumnOrder,
+        column_widths: ColumnWidths,
+        search_column_widths: SearchColumnWidths,
         theme_mode: ThemeMode,
         language: Language,
         everything: EverythingConfig,
@@ -122,6 +134,8 @@ impl SessionState {
         validate_window(window)?;
         validate_column_order(column_order)?;
         validate_column_order(search_column_order)?;
+        validate_column_widths(column_widths)?;
+        validate_column_widths(search_column_widths)?;
         validate_everything_config(&everything)?;
         if tab_paths.len() > MAX_TABS {
             return Err(invalid_data("too many session tabs"));
@@ -139,6 +153,8 @@ impl SessionState {
             tab_paths,
             column_order,
             search_column_order,
+            column_widths,
+            search_column_widths,
             theme_mode,
             language,
             everything,
@@ -171,6 +187,8 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
         state.tab_paths.clone(),
         state.column_order,
         state.search_column_order,
+        state.column_widths,
+        state.search_column_widths,
         state.theme_mode,
         state.language,
         state.everything.clone(),
@@ -185,6 +203,8 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
     bytes.extend_from_slice(&(state.tab_paths.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&state.column_order);
     bytes.extend_from_slice(&state.search_column_order);
+    write_four_u32(&mut bytes, state.column_widths);
+    write_four_u32(&mut bytes, state.search_column_widths);
     bytes.push(state.theme_mode.storage_code());
     bytes.push(state.language.storage_code());
     write_optional_os(&mut bytes, state.everything.executable_path.as_deref())?;
@@ -217,6 +237,8 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
     }
     let column_order = read_four(bytes, &mut offset)?;
     let search_column_order = read_four(bytes, &mut offset)?;
+    let column_widths = read_four_u32(bytes, &mut offset)?;
+    let search_column_widths = read_four_u32(bytes, &mut offset)?;
     let theme_mode = ThemeMode::from_storage_code(read_u8(bytes, &mut offset)?)
         .ok_or_else(|| invalid_data("invalid session theme mode"))?;
     let language = Language::from_storage_code(read_u8(bytes, &mut offset)?)
@@ -251,6 +273,8 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
         tab_paths,
         column_order,
         search_column_order,
+        column_widths,
+        search_column_widths,
         theme_mode,
         language,
         everything,
@@ -269,6 +293,15 @@ fn validate_column_order(column_order: ColumnOrder) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_column_widths(column_widths: ColumnWidths) -> io::Result<()> {
+    if column_widths
+        .into_iter()
+        .any(|width| !(MIN_COLUMN_WIDTH..=MAX_COLUMN_WIDTH).contains(&width))
+    {
+        return Err(invalid_data("invalid session column width"));
+    }
+    Ok(())
+}
 fn validate_everything_config(config: &EverythingConfig) -> io::Result<()> {
     if config.instance_name.encode_utf16().count() > MAX_PATH_UNITS
         || config
@@ -338,6 +371,11 @@ fn write_optional_string(bytes: &mut Vec<u8>, value: Option<&str>) -> io::Result
     }
 }
 
+fn write_four_u32(bytes: &mut Vec<u8>, values: [u32; 4]) {
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+}
 fn read_optional_os(bytes: &[u8], offset: &mut usize) -> io::Result<Option<OsString>> {
     match read_u8(bytes, offset)? {
         0 => Ok(None),
@@ -381,6 +419,14 @@ fn read_units(bytes: &[u8], offset: &mut usize) -> io::Result<Vec<u16>> {
         .collect();
     *offset = end;
     Ok(units)
+}
+fn read_four_u32(bytes: &[u8], offset: &mut usize) -> io::Result<[u32; 4]> {
+    Ok([
+        read_u32(bytes, offset)?,
+        read_u32(bytes, offset)?,
+        read_u32(bytes, offset)?,
+        read_u32(bytes, offset)?,
+    ])
 }
 fn validate_window(window: WindowPlacement) -> io::Result<()> {
     if window.width < MIN_WINDOW_WIDTH
@@ -493,6 +539,8 @@ mod tests {
 
         assert_eq!(state.theme_mode, ThemeMode::System);
         assert_eq!(state.language, Language::Chinese);
+        assert_eq!(state.column_widths, DEFAULT_COLUMN_WIDTHS);
+        assert_eq!(state.search_column_widths, DEFAULT_SEARCH_COLUMN_WIDTHS);
     }
 
     #[test]
@@ -508,6 +556,8 @@ mod tests {
             vec![PathBuf::from(r"\\LiuYanghomeNAS\Multimedia")],
             DEFAULT_COLUMN_ORDER,
             [1, 0, 3, 2],
+            [560, 180, 128, 240],
+            [440, 420, 128, 240],
             ThemeMode::Dark,
             Language::English,
             EverythingConfig {
@@ -538,14 +588,14 @@ mod tests {
     #[test]
     fn rejects_invalid_setting_codes() {
         let mut invalid_theme = encode(&sample_state()).unwrap();
-        invalid_theme[33] = u8::MAX;
+        invalid_theme[73] = u8::MAX;
         assert_eq!(
             decode(&invalid_theme).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
 
         let mut invalid_language = encode(&sample_state()).unwrap();
-        invalid_language[34] = u8::MAX;
+        invalid_language[74] = u8::MAX;
         assert_eq!(
             decode(&invalid_language).unwrap_err().kind(),
             io::ErrorKind::InvalidData
@@ -727,12 +777,54 @@ mod tests {
     }
 
     #[test]
+    fn accepts_column_width_boundaries() {
+        let mut state = sample_state();
+        state.column_widths = [MIN_COLUMN_WIDTH, 160, 120, MAX_COLUMN_WIDTH];
+        state.search_column_widths = [MAX_COLUMN_WIDTH, 320, 120, MIN_COLUMN_WIDTH];
+
+        assert_eq!(decode(&encode(&state).unwrap()).unwrap(), state);
+    }
+
+    #[test]
+    fn rejects_invalid_column_widths() {
+        for invalid_width in [MIN_COLUMN_WIDTH - 1, MAX_COLUMN_WIDTH + 1] {
+            let mut state = sample_state();
+            state.column_widths[0] = invalid_width;
+            assert_eq!(
+                encode(&state).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+
+            let mut state = sample_state();
+            state.search_column_widths[1] = invalid_width;
+            assert_eq!(
+                encode(&state).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+
+        let mut bytes = encode(&sample_state()).unwrap();
+        bytes[41..45].copy_from_slice(&(MIN_COLUMN_WIDTH - 1).to_le_bytes());
+        assert_eq!(
+            decode(&bytes).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut bytes = encode(&sample_state()).unwrap();
+        bytes[57..61].copy_from_slice(&(MAX_COLUMN_WIDTH + 1).to_le_bytes());
+        assert_eq!(
+            decode(&bytes).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+    #[test]
     fn rejects_old_format() {
         for bytes in [
             b"ASTF1\0\0\0\0".as_slice(),
             b"ASTF2\0\0\0\0".as_slice(),
             b"ASTF3\0\0\0\0".as_slice(),
             b"ASTF4\0\0\0\0".as_slice(),
+            b"ASTF5\0\0\0\0".as_slice(),
         ] {
             assert_eq!(
                 decode(bytes).unwrap_err().kind(),

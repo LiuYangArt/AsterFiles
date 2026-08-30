@@ -19,6 +19,7 @@
 - 目录读取分批提交，优先让首批可见项目出现；完成前 UI 仍可导航和切换标签。
 - 标签页各自保存路径、历史、列表、选择、排序、加载状态和错误；文件任务中心、缓存和受控工作池属于窗口级共享设施。
 - 用户可见文案不得散落硬编码；日期、数量和文件大小通过统一格式化入口生成。
+- 详情列表只有一份列几何状态；表头与虚拟化内容行必须共享列顺序、列宽、起点和内边距，普通目录与 Everything 搜索分别保存列顺序和列宽，横向滚动使用同一偏移同步两层。
 
 ## 实施切片
 
@@ -91,12 +92,15 @@ Everything 适配统一位于 `platform/windows/everything.rs`，不分发 SDK D
 
 Everything 使用后台工作线程和 Query2 专用消息窗口，不占目录、Shell 图标或文件操作线程，也不在 Slint UI 线程执行 IPC、进程、路径或索引操作。命名管道只连接已保存实例，跨请求复用；断线后当前请求最多受控重连一次。搜索批次按 `TabId + RequestId + PageSource` 接受，文件夹大小另校验 `EntryId + 原始路径`；所有读写均有有限超时并在超时后取消。UNC 导航仍由目录工作池负责，未索引 UNC 不解析、不计算大小、不递归回退。
 
-当前 E1–E3 已接入；持久化格式直接升级为 ASTF5，不保留旧格式兼容。验证命令为 `cargo test --no-fail-fast`、`python tools/verify.py`、`cargo build`；汇总位于 `artifacts/verify/summary.json`，Everything 实证日志写入 `artifacts/logs/`。
+当前 E1–E3 已接入。Issue #1 将普通目录和 Everything 搜索的详情列表收敛为唯一列几何链路：表头与虚拟化内容行共享列顺序、列宽、起点、内边距和横向滚动偏移；普通/搜索分别持久化列顺序与列宽。分隔符拖动只修改当前模式的列宽，不触发搜索请求、排序或退出搜索；换序后按当前视觉相邻列调宽。会话持久化正式格式随该状态直接升级，不增加旧 ASTF 格式兼容、迁移或回退。名称命中片段高亮布局不在 Issue #1 范围内。
+
+验证命令为 `cargo test --no-fail-fast`、`python tools/verify.py`、`cargo build`；汇总位于 `artifacts/verify/summary.json`，Everything 实证日志写入 `artifacts/logs/`。
 ## 验证与产物
 
 - 统一检查：`python tools/verify.py`，覆盖格式、静态检查、测试、确定性无界面场景和 Debug 构建；正式 Release 由用户明确要求后通过 `python tools/verify.py --release` 触发。
 - 单元测试覆盖请求代次、标签隔离、路径身份和取消状态转换。
 - 机器可读汇总写入 `artifacts/verify/summary.json`；UI 状态写入 `artifacts/state/`；截图写入 `artifacts/ui/`；加载与取消日志写入 `artifacts/logs/`；性能数据写入 `artifacts/perf/`。
+- Issue #1 真实 UI 证据必须覆盖默认、窄、最大化窗口下的普通目录与 Everything 搜索截图，另保留换序后调宽、横向滚动同步、重启恢复普通/搜索独立列宽，以及 100%、125%、150% DPI 检查记录；未执行项必须明确标为人工验收，不能由编译或领域测试代替。
 - Agent 调试入口和状态字段见 [agent/debug-validation.md](agent/debug-validation.md)。
 - 每完成一个切片，同步更新本文和 `docs/task-list.md`，不保留已经失效的设计。
 

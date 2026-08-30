@@ -7,7 +7,7 @@ export struct HistoryRow { index: int, label: string }
 export struct BreadcrumbRow { index: int, label: string, current: bool }
 export struct TabRow { id: int, title: string, active: bool, loading: bool, icon: image, is-drive: bool, is-settings: bool }
 export struct SidebarRow { index: int, label: string, icon-kind: int, is-drive: bool, icon: image }
-export struct ColumnRow { kind: int }
+export struct ColumnRow { kind: int, min-width: length, content-left: length, content-right: length, icon-slot: length }
 export struct ContextCommandRow { id: int, label: string, enabled: bool, separator: bool }
 export struct OperationRow { id: int, title: string, percent: string, file-progress: string, transferred: string, speed: string, eta: string, current-item: string, source: string, destination: string, progress: float, state: int, paused: bool, can-pause: bool, can-cancel: bool, can-retry: bool }
 export global VisualStyle {
@@ -701,6 +701,7 @@ export component AppWindow inherits Window {
     callback toggle-focused();
     callback change-sort(int);
     callback reorder-column(int, int);
+    callback resize-column(int, float);
     callback open-entry(int);
     callback activate-entry(int, bool, bool);
     callback new-tab();
@@ -732,6 +733,40 @@ export component AppWindow inherits Window {
     callback start-window-trace();
 
     private property <bool> compact: root.window-width < 1000px;
+    in-out property <length> file-viewport-x: 0px;
+    in-out property <length> normal-name-width: 480px;
+    in-out property <length> normal-kind-width: 160px;
+    in-out property <length> normal-size-width: 120px;
+    in-out property <length> normal-modified-width: 200px;
+    in-out property <length> search-name-width: 400px;
+    in-out property <length> search-parent-width: 320px;
+    in-out property <length> search-size-width: 120px;
+    in-out property <length> search-modified-width: 200px;
+    private property <length> file-columns-width: root.column-width(0) + root.column-width(1) + root.column-width(2) + root.column-width(3);
+    private property <length> header-available-width: max(0px, root.width - (root.minimal ? 0px : (root.compact ? 184px : 218px)) - 44px);
+    changed header-available-width => { root.clamp-file-viewport(root.header-available-width); }
+    changed search-results-mode => { root.file-viewport-x = 0px; }
+    function column-width(kind: int) -> length {
+        return root.search-results-mode
+            ? (kind == 0 ? root.search-name-width : kind == 1 ? root.search-parent-width : kind == 2 ? root.search-size-width : root.search-modified-width)
+            : (kind == 0 ? root.normal-name-width : kind == 1 ? root.normal-kind-width : kind == 2 ? root.normal-size-width : root.normal-modified-width);
+    }
+    function set-column-width(kind: int, width: length) {
+        if root.search-results-mode {
+            if kind == 0 { root.search-name-width = width; }
+            else if kind == 1 { root.search-parent-width = width; }
+            else if kind == 2 { root.search-size-width = width; }
+            else { root.search-modified-width = width; }
+        } else {
+            if kind == 0 { root.normal-name-width = width; }
+            else if kind == 1 { root.normal-kind-width = width; }
+            else if kind == 2 { root.normal-size-width = width; }
+            else { root.normal-modified-width = width; }
+        }
+    }
+    function clamp-file-viewport(available: length) {
+        root.file-viewport-x = max(min(0px, available - root.file-columns-width), min(0px, root.file-viewport-x));
+    }
     in-out property <length> context-menu-anchor-x: 24px;
     in-out property <length> context-menu-anchor-y: 140px;
     private property <length> keyboard-menu-anchor-x: 24px;
@@ -968,43 +1003,74 @@ export component AppWindow inherits Window {
             VerticalLayout {
                 spacing: 0px;
                 Rectangle {
-                    height: 38px; background: VisualStyle.cffffff; border-width: 0px;
-                    HorizontalLayout {
-                        padding-left: 16px; padding-right: 44px; spacing: 0px;
-                        for column in root.columns: Rectangle {
-                            visible: true;
-                            width: column.kind == 0 ? (root.compact ? 46% : 50%) : column.kind == 1 ? (root.compact ? 18% : 17%) : column.kind == 2 ? (root.compact ? 14% : 14%) : (root.compact ? 22% : 19%);
-                            horizontal-stretch: column.kind == 3 ? 1 : 0;
-                            opacity: column-touch.dragging ? 0.58 : 1;
-                            Rectangle {
-                                x: 0px; y: 10px; width: 1px; height: 18px;
-                                background: VisualStyle.c57595c;
-                            }
-                            Text {
-                                x: column.kind == 0 ? 27px : 8px;
-                                width: parent.width - self.x;
-                                horizontal-alignment: left;
-                                text: (column.kind == 0 ? root.text-name : column.kind == 1 ? (root.search-results-mode ? root.text-parent-path : root.text-type) : column.kind == 2 ? root.text-size : root.text-modified) + (root.sort-field == column.kind ? (root.sort-descending ? " ↓" : " ↑") : "");
-                                color: VisualStyle.c696b74;
-                                font-size: 12px; font-weight: root.sort-field == column.kind ? 600 : 400; vertical-alignment: center;
-                            }
-                            column-touch := TouchArea {
-                                private property <length> press-x;
-                                property <bool> dragging: false;
-                                mouse-cursor: self.dragging ? grabbing : grab;
-                                pointer-event(event) => {
-                                    if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
-                                        self.press-x = self.mouse-x;
-                                        self.dragging = false;
+                    height: 38px; background: VisualStyle.cffffff; border-width: 0px; clip: true;
+                    header-viewport := Rectangle {
+                        width: parent.width - 28px; height: parent.height; clip: true;
+                        header-columns := Rectangle {
+                            x: 16px + root.file-viewport-x; width: root.file-columns-width; height: parent.height;
+                            HorizontalLayout {
+                                spacing: 0px;
+                                for column in root.columns: Rectangle {
+                                    width: root.column-width(column.kind);
+
+                                    opacity: column-touch.reorder-dragging ? 0.58 : 1;
+                                    Rectangle { x: parent.width - 1px; y: 10px; width: 1px; height: 18px; background: VisualStyle.c57595c; }
+                                    Rectangle { x: 0px; y: 0px; width: parent.width - 16px; height: parent.height; z: 1;
+                                    Text {
+                                        x: column.content-left + column.icon-slot; width: parent.width - self.x - column.content-right;
+                                        horizontal-alignment: left;
+                                        text: (column.kind == 0 ? root.text-name : column.kind == 1 ? (root.search-results-mode ? root.text-parent-path : root.text-type) : column.kind == 2 ? root.text-size : root.text-modified) + (root.sort-field == column.kind ? (root.sort-descending ? " ↓" : " ↑") : "");
+                                        color: VisualStyle.c696b74; overflow: elide;
+                                        font-size: 12px; font-weight: root.sort-field == column.kind ? 600 : 400; vertical-alignment: center;
                                     }
-                                    if event.button == PointerEventButton.left && event.kind == PointerEventKind.up && self.dragging {
-                                        root.reorder-column(column.kind, self.mouse-x - self.press-x < -2 * parent.width ? -3 : self.mouse-x - self.press-x < -parent.width ? -2 : self.mouse-x - self.press-x < -8px ? -1 : self.mouse-x - self.press-x > 2 * parent.width ? 3 : self.mouse-x - self.press-x > parent.width ? 2 : 1);
+                                    column-touch := TouchArea {
+                                        width: parent.width;
+                                        private property <length> press-x;
+                                        private property <bool> reorder-dragging: false;
+                                        mouse-cursor: self.reorder-dragging ? grabbing : pointer;
+                                        pointer-event(event) => {
+                                            if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                                                self.press-x = self.mouse-x;
+                                                self.reorder-dragging = false;
+                                            }
+                                            if event.button == PointerEventButton.left && event.kind == PointerEventKind.up && self.reorder-dragging {
+                                                root.reorder-column(column.kind, self.mouse-x - self.press-x < -2 * parent.width ? -3 : self.mouse-x - self.press-x < -parent.width ? -2 : self.mouse-x - self.press-x < -8px ? -1 : self.mouse-x - self.press-x > 2 * parent.width ? 3 : self.mouse-x - self.press-x > parent.width ? 2 : 1);
+                                            }
+                                        }
+                                        moved => { if self.pressed && abs(self.mouse-x - self.press-x) > 8px { self.reorder-dragging = true; } }
+                                        clicked => { if !self.reorder-dragging { root.change-sort(column.kind); } }
+                                    }
+                                    }
+                                    Rectangle {
+                                        // Keep the complete hit target inside its owning column so no sibling can clip or steal it.
+                                        x: parent.width - 16px; width: 16px; height: 38px; z: 20;
+                                        resize-touch := TouchArea {
+                                            width: parent.width; height: parent.height;
+                                            mouse-cursor: col-resize;
+                                            private property <length> drag-start-width;
+                                            private property <length> drag-start-pointer-x;
+                                            pointer-event(event) => {
+                                                if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                                                    self.drag-start-width = root.column-width(column.kind);
+                                                    self.drag-start-pointer-x = self.absolute-position.x + self.mouse-x;
+                                                }
+                                                if event.button == PointerEventButton.left && event.kind == PointerEventKind.up {
+                                                    root.resize-column(column.kind, root.column-width(column.kind) / 1px);
+                                                }
+                                            }
+                                            moved => {
+                                                if self.pressed {
+                                                    root.set-column-width(column.kind, min(4096px, max(column.min-width, self.drag-start-width + self.absolute-position.x + self.mouse-x - self.drag-start-pointer-x)));
+                                                    root.resize-column(column.kind, root.column-width(column.kind) / 1px);
+                                                    root.clamp-file-viewport(header-viewport.width);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
-                                moved => { if self.pressed && abs(self.mouse-x - self.press-x) > 8px { self.dragging = true; } }
-                                clicked => { if !self.dragging { root.change-sort(column.kind); } }
                             }
                         }
+
                     }
                     Path {
                         x: 0px; y: 0px; width: 5px; height: 5px;
@@ -1034,11 +1100,13 @@ export component AppWindow inherits Window {
 list := ListView {
                         visible: root.files.length > 0;
                         width: parent.width - 28px;
+                        viewport-width: self.width;
                         vertical-scrollbar-policy: ScrollBarPolicy.always-off;
                         viewport-y <=> root.file-viewport-y;
                         init => { root.file-list-top = self.absolute-position.y - root.absolute-position.y; }
                         for entry in root.files: Rectangle {
-                            width: list.width;
+                            width: max(list.width, root.file-columns-width + 16px);
+                            x: 0px;
                             height: 40px;
                             background: VisualStyle.cffffff;
                             opacity: entry.cut ? 0.52 : 1;
@@ -1048,50 +1116,50 @@ list := ListView {
                                 border-width: 0px;
                                 background: entry.selected ? VisualStyle.cdce6ff : (mouse.has-hover ? VisualStyle.ceff4ff : transparent);
                                 Rectangle {
-                                property <length> column-area-width: parent.width - 20px;
-                                for column[index] in root.columns: Rectangle {
-                                    visible: true;
+                                x: 10px + root.file-viewport-x; width: root.file-columns-width;
+                                HorizontalLayout {
+                                spacing: 0px;
+                                for column in root.columns: Rectangle {
                                     clip: true;
-                                    x: 10px + (index == 0 ? 0px : index == 1 ? parent.column-area-width * 0.35 : index == 2 ? parent.column-area-width * 0.68 : parent.column-area-width * 0.80);
-                                    width: index == 0 ? parent.column-area-width * 0.35 : index == 1 ? parent.column-area-width * 0.33 : index == 2 ? parent.column-area-width * 0.12 : parent.column-area-width * 0.20;
+                                    width: root.column-width(column.kind);
                                     if column.kind == 0: Rectangle {
                                         clip: true;
-                                        InlineIcon { x: 0px; icon-source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document); }
+                                        InlineIcon { x: column.content-left; icon-source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document); }
                                         if !(root.rename-editing && root.rename-entry-id == entry.id): Rectangle {
-                                            x: 25px;
+                                            x: column.content-left + column.icon-slot;
                                             clip: true;
-                                            width: parent.width - 25px;
+                                            width: parent.width - column.content-left - column.content-right - column.icon-slot;
                                             property <length> fade-width: 20px;
                                             segment-layout := HorizontalLayout {
-                                                x: 0px;
-                                                width: parent.width;
-                                                alignment: start;
-                                                spacing: 0px;
-                                                for segment in entry.name-segments: Text {
-                                                    text: segment.text;
-                                                    color: VisualStyle.c24252a;
-                                                    font-size: 13px;
-                                                    font-weight: segment.highlighted ? 700 : 400;
-                                                    horizontal-alignment: left;
-                                                    vertical-alignment: center;
-                                                    horizontal-stretch: 0;
-                                                }
+x: 0px;
+width: parent.width;
+alignment: start;
+spacing: 0px;
+for segment in entry.name-segments: Text {
+    text: segment.text;
+    color: VisualStyle.c24252a;
+    font-size: 13px;
+    font-weight: segment.highlighted ? 700 : 400;
+    horizontal-alignment: left;
+    vertical-alignment: center;
+    horizontal-stretch: 0;
+}
                                             }
                                             Rectangle {
-                                                visible: segment-layout.preferred-width > parent.width;
-                                                x: parent.width - parent.fade-width;
-                                                width: parent.fade-width;
-                                                height: parent.height;
-                                                background: entry.selected ? VisualStyle.cdce6ff : (mouse.has-hover ? VisualStyle.ceff4ff : VisualStyle.cffffff);
-                                                Text { text: "…"; color: VisualStyle.c24252a; font-size: 13px; horizontal-alignment: right; vertical-alignment: center; }
+visible: segment-layout.preferred-width > parent.width;
+x: parent.width - parent.fade-width;
+width: parent.fade-width;
+height: parent.height;
+background: entry.selected ? VisualStyle.cdce6ff : (mouse.has-hover ? VisualStyle.ceff4ff : VisualStyle.cffffff);
+Text { text: "…"; color: VisualStyle.c24252a; font-size: 13px; horizontal-alignment: right; vertical-alignment: center; }
                                             }
                                         }
                                         if root.rename-editing && root.rename-entry-id == entry.id: Rectangle {
                                             private property <bool> editor-active: false;
                                             private property <bool> submitted: false;
                                             private property <bool> editor-has-focus: rename-editor.has-focus;
-                                            x: 25px;
-                                            width: parent.width - 25px;
+                                            x: column.content-left + column.icon-slot;
+                                            width: parent.width - column.content-left - column.content-right - column.icon-slot;
                                             height: 30px;
                                             background: VisualStyle.cffffff;
                                             border-color: VisualStyle.c4f6bed;
@@ -1099,49 +1167,50 @@ list := ListView {
                                             border-radius: 3px;
                                             init => { self.editor-active = true; }
                                             changed editor-has-focus => {
-                                                if self.editor-active && !self.editor-has-focus && !self.submitted {
-                                                    self.submitted = true;
-                                                    if root.rename-input == "" {
-                                                        root.cancel-rename();
-                                                    } else {
-                                                        root.commit-rename(root.rename-input);
-                                                    }
-                                                }
+if self.editor-active && !self.editor-has-focus && !self.submitted {
+    self.submitted = true;
+    if root.rename-input == "" {
+        root.cancel-rename();
+    } else {
+        root.commit-rename(root.rename-input);
+    }
+}
                                             }
                                             rename-editor := TextInput {
-                                                x: 5px;
-                                                width: parent.width - 10px;
-                                                height: parent.height;
-                                                text <=> root.rename-input;
-                                                color: VisualStyle.c24252a;
-                                                selection-background-color: VisualStyle.cc7d7ff;
-                                                selection-foreground-color: VisualStyle.c24252a;
-                                                font-size: 13px;
-                                                single-line: true;
-                                                vertical-alignment: center;
-                                                init => {
-                                                    self.focus();
-                                                    self.select-all();
-                                                }
-                                                accepted => {
-                                                    parent.submitted = true;
-                                                    root.commit-rename(root.rename-input);
-                                                }
-                                                key-pressed(event) => {
-                                                    if event.text == Key.Escape {
-                                                        parent.submitted = true;
-                                                        root.cancel-rename();
-                                                        return accept;
-                                                    }
-                                                    return reject;
-                                                }
-                                                accessible-role: text-input;
-                                                accessible-label: entry.name;
+x: 5px;
+width: parent.width - 10px;
+height: parent.height;
+text <=> root.rename-input;
+color: VisualStyle.c24252a;
+selection-background-color: VisualStyle.cc7d7ff;
+selection-foreground-color: VisualStyle.c24252a;
+font-size: 13px;
+single-line: true;
+vertical-alignment: center;
+init => {
+    self.focus();
+    self.select-all();
+}
+accepted => {
+    parent.submitted = true;
+    root.commit-rename(root.rename-input);
+}
+key-pressed(event) => {
+    if event.text == Key.Escape {
+        parent.submitted = true;
+        root.cancel-rename();
+        return accept;
+    }
+    return reject;
+}
+accessible-role: text-input;
+accessible-label: entry.name;
                                             }
                                         }
                                     }
                                     if column.kind != 0: Text {
-                                        width: parent.width;
+                                        x: column.content-left;
+                                        width: parent.width - column.content-left - column.content-right;
                                         text: column.kind == 1 ? (root.search-results-mode ? entry.parent-path : entry.kind) : column.kind == 2 ? entry.size : entry.modified;
                                         color: VisualStyle.c6f717a;
                                         font-size: 12px;
@@ -1149,6 +1218,7 @@ list := ListView {
                                         overflow: elide;
                                         horizontal-alignment: column.kind == 2 ? right : left;
                                     }
+                                }
                                 }
                             }
                             }
@@ -1167,9 +1237,9 @@ list := ListView {
                                             root.keyboard-menu-anchor-x = root.context-menu-anchor-x;
                                             root.keyboard-menu-anchor-y = root.context-menu-anchor-y;
                                             root.show-entry-menu(
-                                                entry.id,
-                                                root.context-menu-anchor-x / 1px,
-                                                root.context-menu-anchor-y / 1px
+entry.id,
+root.context-menu-anchor-x / 1px,
+root.context-menu-anchor-y / 1px
                                             );
                                         }
                                     }
@@ -1187,7 +1257,37 @@ list := ListView {
                             accessible-role: list-item; accessible-label: entry.name;
                         }
                     }
-                    LightScrollBar {
+                    horizontal-scroll := Rectangle {
+                        x: 16px; y: parent.height - 11px;
+                        width: parent.width - 44px; height: 10px;
+                        visible: root.file-columns-width > self.width;
+                        background: horizontal-scroll-touch.has-hover ? VisualStyle.cf1f2f4 : transparent;
+                        border-radius: 5px;
+                        private property <length> thumb-width: max(40px, self.width * self.width / root.file-columns-width);
+                        private property <length> thumb-travel: max(0px, self.width - self.thumb-width);
+                        Rectangle {
+                            x: horizontal-scroll.thumb-travel * (-root.file-viewport-x / max(1px, root.file-columns-width - horizontal-scroll.width));
+                            y: 3px; width: horizontal-scroll.thumb-width; height: horizontal-scroll-touch.has-hover ? 6px : 3px;
+                            border-radius: self.height / 2;
+                            background: horizontal-scroll-touch.has-hover ? VisualStyle.c9a9da3 : VisualStyle.caeb1b6;
+                        }
+                        horizontal-scroll-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            private property <length> press-x;
+                            private property <length> press-value;
+                            pointer-event(event) => {
+                                if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                                    self.press-x = self.mouse-x;
+                                    self.press-value = root.file-viewport-x;
+                                }
+                            }
+                            moved => {
+                                if self.pressed && horizontal-scroll.thumb-travel > 0px {
+                                    root.file-viewport-x = max(horizontal-scroll.width - root.file-columns-width, min(0px, self.press-value - (self.mouse-x - self.press-x) * (root.file-columns-width - horizontal-scroll.width) / horizontal-scroll.thumb-travel));
+                                }
+                            }
+                        }
+                    }                    LightScrollBar {
                         x: parent.width - self.width - 9px;
                         height: parent.height;
                         value <=> list.viewport-y;

@@ -52,6 +52,7 @@ struct AppState {
     sidebar_icons: HashMap<PathBuf, platform::windows_shell_icons::ShellIconRgba>,
     sidebar: Vec<KnownLocation>,
     column_order: [u8; 4],
+    column_widths: session_store::ColumnWidths,
     operations: OperationManager,
     operation_errors: Vec<String>,
     rename_target: Option<(TabId, EntryId)>,
@@ -65,6 +66,7 @@ struct AppState {
     conflict_responses:
         HashMap<OperationId, mpsc::Sender<crate::domain::file_operations::ConflictDecision>>,
     search_column_order: [u8; 4],
+    search_column_widths: session_store::SearchColumnWidths,
     everything_config: crate::domain::EverythingConfig,
     everything_status: String,
     everything_folder_sizes_indexed: Option<bool>,
@@ -82,6 +84,8 @@ impl AppState {
             active_index,
             column_order,
             [0, 1, 2, 3],
+            session_store::DEFAULT_COLUMN_WIDTHS,
+            session_store::DEFAULT_SEARCH_COLUMN_WIDTHS,
             crate::domain::EverythingConfig::default(),
             session_store::ThemeMode::System,
             Language::Chinese,
@@ -95,6 +99,8 @@ impl AppState {
         active_index: usize,
         column_order: [u8; 4],
         search_column_order: [u8; 4],
+        column_widths: session_store::ColumnWidths,
+        search_column_widths: session_store::SearchColumnWidths,
         everything_config: crate::domain::EverythingConfig,
         theme_mode: session_store::ThemeMode,
         language: Language,
@@ -130,6 +136,7 @@ impl AppState {
             sidebar_icons: HashMap::new(),
             sidebar: Vec::new(),
             column_order,
+            column_widths,
             operations: OperationManager::new(),
             operation_errors: Vec::new(),
             rename_target: None,
@@ -142,6 +149,7 @@ impl AppState {
             cut_generation: 0,
             conflict_responses: HashMap::new(),
             search_column_order,
+            search_column_widths,
             everything_config,
             everything_status: String::new(),
             everything_folder_sizes_indexed: None,
@@ -482,6 +490,8 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         window,
         column_order,
         search_column_order,
+        column_widths,
+        search_column_widths,
         everything_config,
         theme_mode,
         language,
@@ -499,6 +509,8 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 window,
                 session.column_order,
                 session.search_column_order,
+                session.column_widths,
+                session.search_column_widths,
                 session.everything,
                 session.theme_mode,
                 session.language,
@@ -511,6 +523,8 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 default_window,
                 [0, 1, 2, 3],
                 [0, 1, 2, 3],
+                session_store::DEFAULT_COLUMN_WIDTHS,
+                session_store::DEFAULT_SEARCH_COLUMN_WIDTHS,
                 crate::domain::EverythingConfig::default(),
                 session_store::ThemeMode::System,
                 Language::Chinese,
@@ -527,6 +541,8 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         active_index,
         column_order,
         search_column_order,
+        column_widths,
+        search_column_widths,
         everything_config,
         theme_mode,
         language,
@@ -678,6 +694,8 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         active_tab,
         column_order,
         search_column_order,
+        column_widths,
+        search_column_widths,
         everything_config,
         theme_mode,
         language,
@@ -689,6 +707,8 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             active_tab,
             app.column_order,
             app.search_column_order,
+            app.column_widths,
+            app.search_column_widths,
             app.everything_config.clone(),
             app.theme_mode,
             app.language,
@@ -709,6 +729,8 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             paths,
             column_order,
             search_column_order,
+            column_widths,
+            search_column_widths,
             theme_mode,
             language,
             everything_config,
@@ -1640,6 +1662,24 @@ fn wire_callbacks(
             refresh_ui(&ui, &state_for_columns);
         }
     });
+    let state_for_column_widths = state.clone();
+    ui.on_resize_column(move |kind, width| {
+        if !(0..4).contains(&kind) || !width.is_finite() {
+            return;
+        }
+        let width = width.round().clamp(64.0, 4_096.0) as u32;
+        let mut app = state_for_column_widths
+            .lock()
+            .expect("app state mutex is not poisoned");
+        let search = app.active().page_source == PageSource::Search;
+        if search {
+            app.search_column_widths[kind as usize] = width;
+        } else {
+            app.column_widths[kind as usize] = width;
+        }
+        drop(app);
+    });
+
     let weak = ui.as_weak();
     let sender_for_new = sender.clone();
     let state_for_new = state.clone();
@@ -4709,10 +4749,16 @@ fn apply_folder_size_event(
     let Some(index) = tab.entry_indices.get(&entry_id).copied() else {
         return false;
     };
-    let Some(entry) = Arc::make_mut(&mut tab.entries).get_mut(index) else {
-        return false;
+    let updated = {
+        let Some(entry) = Arc::make_mut(&mut tab.entries).get_mut(index) else {
+            return false;
+        };
+        entry.set_folder_size(entry_id, path, state)
     };
-    entry.set_folder_size(entry_id, path, state)
+    if updated && tab.sort_field == SortField::Size {
+        tab.resort_entries();
+    }
+    updated
 }
 fn start_everything_event_pump(
     ui: &AppWindow,
@@ -4761,12 +4807,10 @@ fn everything_sort(
 ) -> platform::windows::everything::EverythingSort {
     use platform::windows::everything::EverythingSort;
     match (field, direction) {
-        (SortField::Name | SortField::Kind, SortDirection::Ascending) => {
-            EverythingSort::NameAscending
-        }
-        (SortField::Name | SortField::Kind, SortDirection::Descending) => {
-            EverythingSort::NameDescending
-        }
+        (SortField::Name, SortDirection::Ascending) => EverythingSort::NameAscending,
+        (SortField::Name, SortDirection::Descending) => EverythingSort::NameDescending,
+        (SortField::Kind, SortDirection::Ascending) => EverythingSort::ExtensionAscending,
+        (SortField::Kind, SortDirection::Descending) => EverythingSort::ExtensionDescending,
         (SortField::Size, SortDirection::Ascending) => EverythingSort::SizeAscending,
         (SortField::Size, SortDirection::Descending) => EverythingSort::SizeDescending,
         (SortField::Modified, SortDirection::Ascending) => EverythingSort::ModifiedAscending,
@@ -5119,6 +5163,14 @@ fn update_selection_summary(ui: &AppWindow, state: &SharedSessions) {
     let app = state.lock().expect("app state mutex is not poisoned");
     let tab = app.active();
 
+    ui.set_normal_name_width(app.column_widths[0] as f32);
+    ui.set_normal_kind_width(app.column_widths[1] as f32);
+    ui.set_normal_size_width(app.column_widths[2] as f32);
+    ui.set_normal_modified_width(app.column_widths[3] as f32);
+    ui.set_search_name_width(app.search_column_widths[0] as f32);
+    ui.set_search_parent_width(app.search_column_widths[1] as f32);
+    ui.set_search_size_width(app.search_column_widths[2] as f32);
+    ui.set_search_modified_width(app.search_column_widths[3] as f32);
     ui.set_columns(ModelRc::new(VecModel::from(
         (if tab.page_source == PageSource::Search {
             app.search_column_order
@@ -5128,6 +5180,11 @@ fn update_selection_summary(ui: &AppWindow, state: &SharedSessions) {
         .iter()
         .map(|kind| ColumnRow {
             kind: i32::from(*kind),
+
+            min_width: 64.0,
+            content_left: if *kind == 0 { 10.0 } else { 8.0 },
+            content_right: 8.0,
+            icon_slot: if *kind == 0 { 25.0 } else { 0.0 },
         })
         .collect::<Vec<_>>(),
     )));
@@ -5480,6 +5537,14 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
             .collect::<Vec<_>>(),
     )));
     ui.set_selected_count(tab.selected.len() as i32);
+    ui.set_normal_name_width(app.column_widths[0] as f32);
+    ui.set_normal_kind_width(app.column_widths[1] as f32);
+    ui.set_normal_size_width(app.column_widths[2] as f32);
+    ui.set_normal_modified_width(app.column_widths[3] as f32);
+    ui.set_search_name_width(app.search_column_widths[0] as f32);
+    ui.set_search_parent_width(app.search_column_widths[1] as f32);
+    ui.set_search_size_width(app.search_column_widths[2] as f32);
+    ui.set_search_modified_width(app.search_column_widths[3] as f32);
     ui.set_columns(ModelRc::new(VecModel::from(
         (if tab.page_source == PageSource::Search {
             app.search_column_order
@@ -5489,6 +5554,11 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
         .iter()
         .map(|kind| ColumnRow {
             kind: i32::from(*kind),
+
+            min_width: 64.0,
+            content_left: if *kind == 0 { 10.0 } else { 8.0 },
+            content_right: 8.0,
+            icon_slot: if *kind == 0 { 25.0 } else { 0.0 },
         })
         .collect::<Vec<_>>(),
     )));
@@ -5599,7 +5669,18 @@ fn file_row(entry: &FileEntry, tab: &TabSession, texts: Texts, app: &AppState) -
         id: entry.id.0 as i32,
         name: entry.display_name.clone().into(),
         name_segments: ModelRc::new(VecModel::from(name_segments)),
-        kind: texts.kind(entry.kind).into(),
+        kind: if entry.kind == crate::domain::EntryKind::File {
+            entry
+                .path
+                .extension()
+                .map(|extension| extension.to_string_lossy().to_uppercase())
+                .filter(|extension| !extension.is_empty())
+                .map(|extension| format!("{extension} {}", texts.kind(entry.kind)))
+                .unwrap_or_else(|| texts.kind(entry.kind).to_owned())
+                .into()
+        } else {
+            texts.kind(entry.kind).into()
+        },
         parent_path: entry.parent_display.clone().into(),
         size: if entry.kind == crate::domain::EntryKind::Directory {
             texts.folder_size(entry.folder_size).into()

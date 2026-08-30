@@ -741,6 +741,13 @@ impl TabSession {
         self.pending_entries
             .sort_unstable_by(|left, right| compare_entries(left, right, field, direction));
     }
+    pub fn resort_entries(&mut self) {
+        let field = self.sort_field;
+        let direction = self.sort_direction;
+        Arc::make_mut(&mut self.entries)
+            .sort_unstable_by(|left, right| compare_entries(left, right, field, direction));
+        self.rebuild_entry_indices();
+    }
 
     fn range_ids(&self, left: EntryId, right: EntryId) -> Vec<EntryId> {
         let Some(left) = self.entry_index(left) else {
@@ -795,29 +802,56 @@ impl TabSession {
     }
 }
 
+fn entry_type_key(entry: &FileEntry) -> String {
+    if entry.kind == EntryKind::Directory {
+        return "folder".to_owned();
+    }
+    entry
+        .path
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+
+fn entry_size_key(entry: &FileEntry) -> (u8, u64) {
+    match (entry.kind, entry.folder_size, entry.size_bytes) {
+        (EntryKind::Directory, FolderSizeState::Value(size), _) => (0, size),
+        (EntryKind::Directory, _, _) => (1, 0),
+        (_, _, Some(size)) => (0, size),
+        _ => (1, 0),
+    }
+}
 fn compare_entries(
     left: &FileEntry,
     right: &FileEntry,
     field: SortField,
     direction: SortDirection,
 ) -> Ordering {
-    let directory_order =
-        (left.kind != EntryKind::Directory).cmp(&(right.kind != EntryKind::Directory));
-    if directory_order != Ordering::Equal {
-        return directory_order;
+    if field != SortField::Kind {
+        let directory_order =
+            (left.kind != EntryKind::Directory).cmp(&(right.kind != EntryKind::Directory));
+        if directory_order != Ordering::Equal {
+            return directory_order;
+        }
     }
     let value_order = match field {
         SortField::Name => left
             .display_name
             .to_lowercase()
             .cmp(&right.display_name.to_lowercase()),
-        SortField::Kind => left.kind.cmp(&right.kind),
-        SortField::Size => left.size_bytes.cmp(&right.size_bytes),
+        SortField::Kind => entry_type_key(left).cmp(&entry_type_key(right)),
+        SortField::Size => entry_size_key(left).cmp(&entry_size_key(right)),
         SortField::Modified => left.modified.cmp(&right.modified),
     };
     let value_order = match direction {
         SortDirection::Ascending => value_order,
-        SortDirection::Descending => value_order.reverse(),
+        SortDirection::Descending => {
+            if field == SortField::Size && entry_size_key(left).0 != entry_size_key(right).0 {
+                value_order
+            } else {
+                value_order.reverse()
+            }
+        }
     };
     value_order.then_with(|| {
         left.display_name
@@ -1232,6 +1266,78 @@ mod tests {
         session.set_sort(SortField::Size);
         assert_eq!(session.entries[0].kind, EntryKind::Directory);
         assert_eq!(session.entries[1].display_name, "large");
+    }
+    #[test]
+    fn type_sort_includes_folders_in_the_type_order() {
+        let mut session = TabSession::new(TabId(1));
+        session.replace_entries(vec![
+            entry(1, "folder", EntryKind::Directory, None),
+            entry(2, "readme", EntryKind::File, Some(1)),
+            entry(3, "notes.txt", EntryKind::File, Some(1)),
+        ]);
+
+        session.set_sort(SortField::Kind);
+        assert_eq!(
+            session
+                .entries
+                .iter()
+                .map(|entry| entry.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["readme", "folder", "notes.txt"]
+        );
+        session.set_sort(SortField::Kind);
+        assert_eq!(
+            session
+                .entries
+                .iter()
+                .map(|entry| entry.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["notes.txt", "folder", "readme"]
+        );
+    }
+    #[test]
+    fn size_sort_reorders_indexed_folders_within_the_folder_group() {
+        let mut session = TabSession::new(TabId(1));
+        let mut large_folder = entry(1, "large-folder", EntryKind::Directory, None);
+        large_folder.folder_size = FolderSizeState::Value(20);
+        let mut small_folder = entry(2, "small-folder", EntryKind::Directory, None);
+        small_folder.folder_size = FolderSizeState::Value(5);
+        session.replace_entries(vec![
+            large_folder,
+            entry(3, "file", EntryKind::File, Some(1)),
+            small_folder,
+        ]);
+
+        session.set_sort(SortField::Size);
+        assert_eq!(session.entries[0].display_name, "small-folder");
+        assert_eq!(session.entries[1].display_name, "large-folder");
+        session.set_sort(SortField::Size);
+        assert_eq!(session.entries[0].display_name, "large-folder");
+        assert_eq!(session.entries[1].display_name, "small-folder");
+    }
+
+    #[test]
+    fn size_sort_places_unknown_folders_after_indexed_folders_and_can_resort_updates() {
+        let mut session = TabSession::new(TabId(1));
+        let mut indexed = entry(1, "indexed", EntryKind::Directory, None);
+        indexed.folder_size = FolderSizeState::Value(20);
+        session.replace_entries(vec![
+            entry(2, "unknown", EntryKind::Directory, None),
+            indexed,
+        ]);
+        session.set_sort(SortField::Size);
+        assert_eq!(session.entries[0].display_name, "indexed");
+        session.set_sort(SortField::Size);
+        assert_eq!(session.entries[0].display_name, "indexed");
+        assert_eq!(session.entries[1].display_name, "unknown");
+        session.set_sort(SortField::Size);
+        session.entries = Arc::new(vec![session.entries[0].clone(), {
+            let mut updated = session.entries[1].clone();
+            updated.folder_size = FolderSizeState::Value(5);
+            updated
+        }]);
+        session.resort_entries();
+        assert_eq!(session.entries[0].display_name, "unknown");
     }
 
     #[test]
