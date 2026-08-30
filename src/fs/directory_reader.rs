@@ -69,6 +69,7 @@ pub fn read_directory_batches(
         batch.push(FileEntry {
             id: EntryId(next_id),
             display_name: original_name.to_string_lossy().into_owned(),
+            name_highlights: Vec::new(),
             original_name,
             path: path.clone(),
             kind,

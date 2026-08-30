@@ -36,6 +36,7 @@ const REQ_FULL: u32 = 4;
 const REQ_SIZE: u32 = 0x10;
 const REQ_MODIFIED: u32 = 0x40;
 const REQ_ATTRIBUTES: u32 = 0x100;
+const REQ_HIGHLIGHTED_NAME: u32 = 0x2000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlatformEverythingConfig {
     pub executable_path: PathBuf,
@@ -84,6 +85,13 @@ pub enum EverythingSort {
     ModifiedAscending,
     ModifiedDescending,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EverythingItemKind {
+    #[default]
+    Any,
+    Files,
+    Folders,
+}
 impl EverythingSort {
     fn ipc(self) -> u32 {
         match self {
@@ -105,6 +113,7 @@ pub struct EverythingSearchRequest {
     pub offset: u32,
     pub max_results: u32,
     pub sort: EverythingSort,
+    pub item_kind: EverythingItemKind,
 }
 impl EverythingSearchRequest {
     pub fn new(query: impl Into<String>, scope: Option<PathBuf>) -> Self {
@@ -114,6 +123,7 @@ impl EverythingSearchRequest {
             offset: 0,
             max_results: 256,
             sort: Default::default(),
+            item_kind: Default::default(),
         }
     }
 }
@@ -131,6 +141,12 @@ pub struct EverythingSearchItem {
     pub size: Option<u64>,
     pub modified: Option<SystemTime>,
     pub is_directory: bool,
+    pub name_highlights: Vec<EverythingHighlightSegment>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EverythingHighlightSegment {
+    pub text: String,
+    pub highlighted: bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EverythingFolderSize {
@@ -266,7 +282,7 @@ impl EverythingClient {
         }
         query_ipc(
             self.window()?,
-            &compose_search(r.scope.as_deref(), &r.query),
+            &compose_typed_search(r.scope.as_deref(), &r.query, r.item_kind),
             r.offset,
             r.max_results.min(4096),
             r.sort,
@@ -291,6 +307,7 @@ impl EverythingClient {
             offset: 0,
             max_results: 64,
             sort: Default::default(),
+            item_kind: EverythingItemKind::Folders,
         };
         Ok(self
             .search(&r, timeout)?
@@ -331,6 +348,23 @@ pub fn compose_search(scope: Option<&Path>, user_query: &str) -> String {
     }
 }
 
+fn compose_typed_search(
+    scope: Option<&Path>,
+    user_query: &str,
+    item_kind: EverythingItemKind,
+) -> String {
+    let base = compose_search(scope, user_query);
+    let kind = match item_kind {
+        EverythingItemKind::Any => return base,
+        EverythingItemKind::Files => "file:",
+        EverythingItemKind::Folders => "folder:",
+    };
+    if base.is_empty() {
+        kind.to_owned()
+    } else {
+        format!("{kind} <{base}>")
+    }
+}
 fn encode_function_argument(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for character in value.chars() {
@@ -411,7 +445,13 @@ fn query_ipc(
     if w.is_null() {
         return Err(last_error());
     }
-    let flags = REQ_NAME | REQ_PATH | REQ_FULL | REQ_SIZE | REQ_MODIFIED | REQ_ATTRIBUTES;
+    let flags = REQ_NAME
+        | REQ_PATH
+        | REQ_FULL
+        | REQ_SIZE
+        | REQ_MODIFIED
+        | REQ_ATTRIBUTES
+        | REQ_HIGHLIGHTED_NAME;
     let bytes = encode_query(w, q, offset, max, flags, sort.ipc());
     let cds = COPYDATASTRUCT {
         dwData: QUERY2,
@@ -572,6 +612,7 @@ fn parse_item(
     let mut size = None;
     let mut modified = None;
     let mut attributes = 0;
+    let mut name_highlights = Vec::new();
     if flags & REQ_NAME != 0 {
         name = Some(get_wide(b, &mut c)?)
     }
@@ -590,6 +631,10 @@ fn parse_item(
     if flags & REQ_ATTRIBUTES != 0 {
         attributes = get32a(b, &mut c)?
     }
+    if flags & REQ_HIGHLIGHTED_NAME != 0 {
+        let marked = get_wide(b, &mut c)?;
+        name_highlights = parse_highlighted_name(&marked.to_string_lossy());
+    }
     let path =
         PathBuf::from(full.ok_or_else(|| EverythingError::Protocol("missing full path".into()))?);
     Ok(EverythingSearchItem {
@@ -601,7 +646,36 @@ fn parse_item(
         size,
         modified,
         is_directory: item_flags & 1 != 0 || attributes & 0x10 != 0,
+        name_highlights,
     })
+}
+fn parse_highlighted_name(marked: &str) -> Vec<EverythingHighlightSegment> {
+    let mut segments = Vec::new();
+    let mut text = String::new();
+    let mut highlighted = false;
+    let mut characters = marked.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '*' {
+            text.push(character);
+            continue;
+        }
+        if characters.peek() == Some(&'*') {
+            characters.next();
+            text.push('*');
+            continue;
+        }
+        if !text.is_empty() {
+            segments.push(EverythingHighlightSegment {
+                text: std::mem::take(&mut text),
+                highlighted,
+            });
+        }
+        highlighted = !highlighted;
+    }
+    if !text.is_empty() {
+        segments.push(EverythingHighlightSegment { text, highlighted });
+    }
+    segments
 }
 fn get_wide(b: &[u8], c: &mut usize) -> Result<OsString, EverythingError> {
     let len = get32a(b, c)? as usize;
@@ -801,11 +875,79 @@ mod tests {
         )
     }
     #[test]
+    fn type_filter_wraps_the_complete_scoped_advanced_query() {
+        let scope = Some(Path::new(r"D:\My Assets (A)!|"));
+        assert_eq!(
+            compose_typed_search(scope, "*.md size:>1kb", EverythingItemKind::Files),
+            r"file: <<ancestor:D:\My#32:Assets#32:#40:A#41:#33:#124:> *.md size:>1kb>"
+        );
+        assert_eq!(
+            compose_typed_search(None, ".md", EverythingItemKind::Folders),
+            "folder: <.md>"
+        );
+    }
+    #[test]
     fn named_class() {
         assert_eq!(
             instance_class("1.5a"),
             "EVERYTHING_TASKBAR_NOTIFICATION_(1.5a)"
         )
+    }
+    #[test]
+    fn query2_header_carries_stable_offset_and_sort_type() {
+        let encoded = encode_query(
+            123usize as HWND,
+            ".md",
+            256,
+            256,
+            REQ_FULL,
+            EverythingSort::ModifiedDescending.ipc(),
+        );
+        assert_eq!(get32(&encoded, 12).unwrap(), 256);
+        assert_eq!(get32(&encoded, 16).unwrap(), 256);
+        assert_eq!(get32(&encoded, 24).unwrap(), 14);
+    }
+    #[test]
+    fn highlighted_name_parser_preserves_compact_text_and_literal_stars() {
+        let cases = [
+            (
+                "*高级*功能计划.md",
+                vec![("高级", true), ("功能计划.md", false)],
+            ),
+            (
+                "_*high*_*level*.md",
+                vec![
+                    ("_", false),
+                    ("high", true),
+                    ("_", false),
+                    ("level", true),
+                    (".md", false),
+                ],
+            ),
+            (
+                "asset*.blend*1",
+                vec![("asset", false), (".blend", true), ("1", false)],
+            ),
+            (
+                "guide*.md*~",
+                vec![("guide", false), (".md", true), ("~", false)],
+            ),
+            ("star**file*.md*", vec![("star*file", false), (".md", true)]),
+        ];
+        for (marked, expected) in cases {
+            let actual = parse_highlighted_name(marked)
+                .into_iter()
+                .map(|segment| (segment.text, segment.highlighted))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual,
+                expected
+                    .into_iter()
+                    .map(|(text, highlighted)| (text.to_owned(), highlighted))
+                    .collect::<Vec<_>>(),
+                "{marked}"
+            );
+        }
     }
     #[test]
     fn unicode_query_encoding() {

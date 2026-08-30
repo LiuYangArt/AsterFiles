@@ -1,7 +1,8 @@
 import { ListView } from "std-widgets.slint";
 import { IconMap } from "icons/icon-map.slint";
 
-export struct FileRow { id: int, name: string, kind: string, parent-path: string, size: string, modified: string, is-directory: bool, selected: bool, focused: bool, cut: bool, icon: image }
+export struct HighlightSegment { text: string, highlighted: bool }
+export struct FileRow { id: int, name: string, name-segments: [HighlightSegment], kind: string, parent-path: string, size: string, modified: string, is-directory: bool, selected: bool, focused: bool, cut: bool, icon: image }
 export struct HistoryRow { index: int, label: string }
 export struct BreadcrumbRow { index: int, label: string, current: bool }
 export struct TabRow { id: int, title: string, active: bool, loading: bool, icon: image, is-drive: bool, is-settings: bool }
@@ -489,11 +490,7 @@ component AddressEditor inherits Rectangle {
     forward-focus: editor;
     property <bool> editor-has-focus: editor.has-focus;
 
-    changed editor-has-focus => {
-        if root.visible && !root.editor-has-focus {
-            root.cancelled();
-        }
-    }
+
 
     editor := TextInput {
         x: 8px;
@@ -676,6 +673,7 @@ export component AppWindow inherits Window {
 
     callback navigate-path(string);
     callback address-input-changed(string);
+    callback request-next-search-page();
     callback begin-search();
 
     callback cancel-address-edit();
@@ -964,10 +962,10 @@ export component AppWindow inherits Window {
                 Rectangle {
                     height: 38px; background: VisualStyle.cffffff; border-width: 0px;
                     HorizontalLayout {
-                        padding-left: 16px; padding-right: 44px; spacing: 12px;
+                        padding-left: 16px; padding-right: 44px; spacing: 0px;
                         for column in root.columns: Rectangle {
                             visible: true;
-                            width: column.kind == 0 ? (root.compact ? 48% : 52%) : column.kind == 1 ? (root.compact ? 17% : 16%) : column.kind == 2 ? (root.compact ? 13% : 14%) : (root.compact ? 22% : 18%);
+                            width: column.kind == 0 ? (root.compact ? 46% : 50%) : column.kind == 1 ? (root.compact ? 18% : 17%) : column.kind == 2 ? (root.compact ? 14% : 14%) : (root.compact ? 22% : 19%);
                             horizontal-stretch: column.kind == 3 ? 1 : 0;
                             opacity: column-touch.dragging ? 0.58 : 1;
                             Rectangle {
@@ -1041,22 +1039,51 @@ list := ListView {
                                 border-radius: 5px;
                                 border-width: 0px;
                                 background: entry.selected ? VisualStyle.cdce6ff : (mouse.has-hover ? VisualStyle.ceff4ff : transparent);
-                                HorizontalLayout {
-                                    padding-left: 10px; padding-right: 10px; spacing: 12px;
-                                for column in root.columns: Rectangle {
+                                Rectangle {
+                                property <length> column-area-width: parent.width - 20px;
+                                for column[index] in root.columns: Rectangle {
                                     visible: true;
-                                    width: column.kind == 0 ? (root.compact ? 48% : 52%) : column.kind == 1 ? (root.compact ? 17% : 16%) : column.kind == 2 ? (root.compact ? 13% : 14%) : (root.compact ? 22% : 18%);
-                                    horizontal-stretch: column.kind == 3 ? 1 : 0;
-                                    if column.kind == 0: HorizontalLayout {
-                                        width: parent.width;
-                                        spacing: 9px;
-                                        InlineIcon { icon-source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document); }
-                                        if !(root.rename-editing && root.rename-entry-id == entry.id): Text { text: entry.name; color: VisualStyle.c24252a; font-size: 13px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                                    clip: true;
+                                    x: 10px + (index == 0 ? 0px : index == 1 ? parent.column-area-width * 0.35 : index == 2 ? parent.column-area-width * 0.68 : parent.column-area-width * 0.80);
+                                    width: index == 0 ? parent.column-area-width * 0.35 : index == 1 ? parent.column-area-width * 0.33 : index == 2 ? parent.column-area-width * 0.12 : parent.column-area-width * 0.20;
+                                    if column.kind == 0: Rectangle {
+                                        clip: true;
+                                        InlineIcon { x: 0px; icon-source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document); }
+                                        if !(root.rename-editing && root.rename-entry-id == entry.id): Rectangle {
+                                            x: 25px;
+                                            clip: true;
+                                            width: parent.width - 25px;
+                                            property <length> fade-width: 20px;
+                                            segment-layout := HorizontalLayout {
+                                                x: 0px;
+                                                width: parent.width;
+                                                alignment: start;
+                                                spacing: 0px;
+                                                for segment in entry.name-segments: Text {
+                                                    text: segment.text;
+                                                    color: VisualStyle.c24252a;
+                                                    font-size: 13px;
+                                                    font-weight: segment.highlighted ? 700 : 400;
+                                                    horizontal-alignment: left;
+                                                    vertical-alignment: center;
+                                                    horizontal-stretch: 0;
+                                                }
+                                            }
+                                            Rectangle {
+                                                visible: segment-layout.preferred-width > parent.width;
+                                                x: parent.width - parent.fade-width;
+                                                width: parent.fade-width;
+                                                height: parent.height;
+                                                background: entry.selected ? VisualStyle.cdce6ff : (mouse.has-hover ? VisualStyle.ceff4ff : VisualStyle.cffffff);
+                                                Text { text: "…"; color: VisualStyle.c24252a; font-size: 13px; horizontal-alignment: right; vertical-alignment: center; }
+                                            }
+                                        }
                                         if root.rename-editing && root.rename-entry-id == entry.id: Rectangle {
                                             private property <bool> editor-active: false;
                                             private property <bool> submitted: false;
                                             private property <bool> editor-has-focus: rename-editor.has-focus;
-                                            horizontal-stretch: 1;
+                                            x: 25px;
+                                            width: parent.width - 25px;
                                             height: 30px;
                                             background: VisualStyle.cffffff;
                                             border-color: VisualStyle.c4f6bed;
@@ -1148,6 +1175,7 @@ list := ListView {
                                     root.keyboard-menu-anchor-y = parent.absolute-position.y + parent.height / 2 - root.absolute-position.y;
                                 }
                             }
+                            Tooltip { text: @markdown("\{entry.name}"); }
                             accessible-role: list-item; accessible-label: entry.name;
                         }
                     }
@@ -1157,6 +1185,11 @@ list := ListView {
                         value <=> list.viewport-y;
                         maximum: max(0px, list.viewport-height - list.visible-height);
                         page-size: list.visible-height;
+                        scrolled => {
+                            if root.search-results-mode && self.maximum > 0px && self.value <= -self.maximum + self.page-size {
+                                root.request-next-search-page();
+                            }
+                        }
                     }
                     if root.page-state == 1 || root.page-state == 3: VerticalLayout {
                         alignment: center; spacing: 8px;
@@ -1421,31 +1454,6 @@ if root.tabs-menu-open: TouchArea {
         }
     }
 
-    if root.address-editing && !root.active-is-settings: Rectangle {
-        y: 0px;
-        width: parent.width;
-        height: 59px;
-        TouchArea { clicked => { root.cancel-address-edit(); } }
-    }
-    if root.address-editing && !root.active-is-settings: Rectangle {
-        x: 0px;
-        y: 59px;
-        width: 59px + (!root.minimal ? 45px : 0px) + (!root.compact ? 90px : 0px);
-        height: 38px;
-        TouchArea { clicked => { root.cancel-address-edit(); } }
-    }
-    if root.address-editing && !root.active-is-settings: Rectangle {
-        x: parent.width - 59px - (!root.minimal ? 45px : 0px);
-        y: 59px;
-        width: 59px + (!root.minimal ? 45px : 0px);
-        height: 38px;
-        TouchArea { clicked => { root.cancel-address-edit(); } }
-    }
-    if root.address-editing && !root.active-is-settings: Rectangle {
-        y: 97px;
-        width: parent.width;
-        height: parent.height - self.y;
-        TouchArea { clicked => { root.cancel-address-edit(); } }
-    }
+
     }
 }

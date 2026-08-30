@@ -16,8 +16,9 @@ use slint::{
 use crate::{
     agent_debug::{self, AgentScenario},
     domain::{
-        AddressMode, EntryId, FileEntry, FolderSizeState, LoadState, NavigationKind, PageSource,
-        RequestId, SearchScope, SearchState, SortField, TabId, TabKind, TabSession,
+        AddressMode, EntryId, FileEntry, FolderSizeState, LoadState, NameHighlightSegment,
+        NavigationKind, PageSource, RequestId, SearchScope, SearchState, SortDirection, SortField,
+        TabId, TabKind, TabSession,
         file_operations::{
             FileOperationKind, ItemState, OperationId, OperationItem, OperationManager,
             OperationResult, OperationState,
@@ -328,6 +329,8 @@ enum EverythingRequest {
         request_id: RequestId,
         scope: SearchScope,
         query: String,
+        sort: platform::windows::everything::EverythingSort,
+        offset: u32,
         cancel: Arc<std::sync::atomic::AtomicBool>,
     },
     FolderSize {
@@ -1267,6 +1270,23 @@ fn wire_callbacks(
     });
 
     let weak = ui.as_weak();
+    let state_for_next_search_page = state.clone();
+    let everything_for_next_search_page = everything_sender.clone();
+    ui.on_request_next_search_page(move || {
+        let tab_id = state_for_next_search_page
+            .lock()
+            .expect("app state mutex is not poisoned")
+            .active_tab;
+        submit_next_search_page(
+            &everything_for_next_search_page,
+            &state_for_next_search_page,
+            tab_id,
+        );
+        if let Some(ui) = weak.upgrade() {
+            refresh_ui(&ui, &state_for_next_search_page);
+        }
+    });
+    let weak = ui.as_weak();
     let sender_for_entry = sender.clone();
     let state_for_entry = state.clone();
     ui.on_open_entry(move |entry_id| {
@@ -1562,6 +1582,7 @@ fn wire_callbacks(
 
     let weak = ui.as_weak();
     let state_for_sort = state.clone();
+    let everything_for_sort = everything_sender.clone();
     ui.on_change_sort(move |field| {
         let field = match field {
             1 => SortField::Kind,
@@ -1573,10 +1594,21 @@ fn wire_callbacks(
             .lock()
             .expect("app state mutex is not poisoned");
         let tab_id = app.active_tab;
-        if let Some(tab) = app.tabs.get_mut(&tab_id) {
-            tab.set_sort(field);
-        }
+        let search_query = if let Some(tab) = app.tabs.get_mut(&tab_id) {
+            if tab.page_source == PageSource::Search {
+                tab.set_search_sort(field);
+                Some(tab.search_query.clone())
+            } else {
+                tab.set_sort(field);
+                None
+            }
+        } else {
+            None
+        };
         drop(app);
+        if let Some(query) = search_query {
+            submit_search(&everything_for_sort, &state_for_sort, tab_id, query);
+        }
         if let Some(ui) = weak.upgrade() {
             refresh_ui(&ui, &state_for_sort);
         }
@@ -4336,6 +4368,45 @@ fn platform_everything_config(
     })
 }
 
+fn search_grouped_page(
+    client: &platform::windows::everything::EverythingClient,
+    scope: Option<PathBuf>,
+    query: String,
+    sort: platform::windows::everything::EverythingSort,
+    offset: u32,
+    limit: u32,
+    timeout: Duration,
+) -> Result<
+    (
+        Vec<platform::windows::everything::EverythingSearchItem>,
+        u32,
+    ),
+    platform::windows::everything::EverythingError,
+> {
+    use platform::windows::everything::{EverythingItemKind, EverythingSearchRequest};
+
+    let mut files = EverythingSearchRequest::new(query.clone(), scope.clone());
+    files.item_kind = EverythingItemKind::Files;
+    files.sort = sort;
+    files.offset = offset;
+    files.max_results = limit;
+    let file_page = client.search(&files, timeout)?;
+
+    let mut folders = EverythingSearchRequest::new(query, scope);
+    folders.item_kind = EverythingItemKind::Folders;
+    folders.sort = sort;
+    folders.offset = offset.saturating_sub(file_page.total);
+    folders.max_results = limit.saturating_sub(file_page.items.len() as u32);
+    let folder_page = client.search(&folders, timeout)?;
+
+    let total = file_page.total.saturating_add(folder_page.total);
+    let mut items = file_page.items;
+    if offset >= file_page.total || items.len() < limit as usize {
+        items.extend(folder_page.items);
+    }
+    items.truncate(limit as usize);
+    Ok((items, total))
+}
 fn spawn_everything_worker(
     config: crate::domain::EverythingConfig,
 ) -> (
@@ -4354,6 +4425,8 @@ fn spawn_everything_worker(
                     request_id,
                     scope,
                     query,
+                    sort,
+                    offset,
                     cancel,
                 } => {
                     let Some(client) = client.as_ref() else {
@@ -4371,18 +4444,33 @@ fn spawn_everything_worker(
                     if cancel.load(std::sync::atomic::Ordering::Acquire) {
                         continue;
                     }
-                    let mut request =
-                        platform::windows::everything::EverythingSearchRequest::new(query, scope);
-                    request.max_results = SEARCH_PAGE_LIMIT;
-                    match client.search(&request, Duration::from_secs(3)) {
-                        Ok(page) => {
-                            let entries = page
-                                .items
+                    let page_result = search_grouped_page(
+                        client,
+                        scope,
+                        query,
+                        sort,
+                        offset,
+                        SEARCH_PAGE_LIMIT,
+                        Duration::from_secs(3),
+                    );
+                    match page_result {
+                        Ok((items, total)) => {
+                            let entries = items
                                 .into_iter()
                                 .enumerate()
                                 .map(|(index, item)| FileEntry {
-                                    id: EntryId(index as u32 + 1),
+                                    id: EntryId(
+                                        offset.saturating_add(index as u32).saturating_add(1),
+                                    ),
                                     display_name: item.name.to_string_lossy().into_owned(),
+                                    name_highlights: item
+                                        .name_highlights
+                                        .into_iter()
+                                        .map(|segment| NameHighlightSegment {
+                                            text: segment.text,
+                                            highlighted: segment.highlighted,
+                                        })
+                                        .collect(),
                                     original_name: item.name,
                                     path: item.path,
                                     kind: if item.is_directory {
@@ -4405,13 +4493,13 @@ fn spawn_everything_worker(
                                 })
                                 .collect::<Vec<_>>();
                             if !cancel.load(std::sync::atomic::Ordering::Acquire) {
-                                let complete = entries.len() as u32 >= page.total;
+                                let complete = offset.saturating_add(entries.len() as u32) >= total;
                                 let _ = event_sender.send(EverythingEvent::SearchPage {
                                     tab_id,
                                     request_id,
                                     entries,
                                     complete,
-                                    total: page.total,
+                                    total,
                                 });
                             }
                         }
@@ -4519,6 +4607,24 @@ fn start_everything_event_pump(
     });
 }
 
+fn everything_sort(
+    field: SortField,
+    direction: SortDirection,
+) -> platform::windows::everything::EverythingSort {
+    use platform::windows::everything::EverythingSort;
+    match (field, direction) {
+        (SortField::Name | SortField::Kind, SortDirection::Ascending) => {
+            EverythingSort::NameAscending
+        }
+        (SortField::Name | SortField::Kind, SortDirection::Descending) => {
+            EverythingSort::NameDescending
+        }
+        (SortField::Size, SortDirection::Ascending) => EverythingSort::SizeAscending,
+        (SortField::Size, SortDirection::Descending) => EverythingSort::SizeDescending,
+        (SortField::Modified, SortDirection::Ascending) => EverythingSort::ModifiedAscending,
+        (SortField::Modified, SortDirection::Descending) => EverythingSort::ModifiedDescending,
+    }
+}
 fn submit_search(
     sender: &mpsc::Sender<EverythingRequest>,
     state: &SharedSessions,
@@ -4531,18 +4637,49 @@ fn submit_search(
             return;
         };
         let scope = tab.search_scope.clone();
+        let sort = everything_sort(tab.search_sort_field, tab.search_sort_direction);
         let (request_id, cancel) = tab.begin_search(scope.clone(), query.clone());
         EverythingRequest::Search {
             tab_id,
             request_id,
             scope,
             query,
+            sort,
+            offset: 0,
             cancel,
         }
     };
     let _ = sender.send(request);
 }
 
+fn submit_next_search_page(
+    sender: &mpsc::Sender<EverythingRequest>,
+    state: &SharedSessions,
+    tab_id: TabId,
+) {
+    let request = {
+        let mut app = state.lock().expect("app state mutex is not poisoned");
+        let Some(tab) = app.tabs.get_mut(&tab_id) else {
+            return;
+        };
+        if !tab.mark_search_page_requested() {
+            return;
+        }
+        let Some(cancel) = tab.search_cancel_token() else {
+            return;
+        };
+        EverythingRequest::Search {
+            tab_id,
+            request_id: tab.latest_request,
+            scope: tab.search_scope.clone(),
+            query: tab.search_query.clone(),
+            sort: everything_sort(tab.search_sort_field, tab.search_sort_direction),
+            offset: tab.search_loaded,
+            cancel,
+        }
+    };
+    let _ = sender.send(request);
+}
 fn submit_folder_sizes(
     sender: &mpsc::Sender<EverythingRequest>,
     state: &SharedSessions,
@@ -5207,13 +5344,18 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
         })
         .collect::<Vec<_>>(),
     )));
-    ui.set_sort_field(match tab.sort_field {
+    let (sort_field, sort_direction) = if tab.page_source == PageSource::Search {
+        (tab.search_sort_field, tab.search_sort_direction)
+    } else {
+        (tab.sort_field, tab.sort_direction)
+    };
+    ui.set_sort_field(match sort_field {
         SortField::Name => 0,
         SortField::Kind => 1,
         SortField::Size => 2,
         SortField::Modified => 3,
     });
-    ui.set_sort_descending(tab.sort_direction == crate::domain::SortDirection::Descending);
+    ui.set_sort_descending(sort_direction == crate::domain::SortDirection::Descending);
     let page_projection = agent_debug::page_projection(tab.load_state, tab.entries.is_empty());
     ui.set_page_state(if tab.page_source == PageSource::Search {
         match tab.search_state {
@@ -5290,9 +5432,25 @@ fn file_row(entry: &FileEntry, tab: &TabSession, texts: Texts, app: &AppState) -
         Some(entry.original_name.as_os_str()),
         "entry identity must retain its original file name"
     );
+    let name_segments = if entry.name_highlights.is_empty() {
+        vec![HighlightSegment {
+            text: entry.display_name.clone().into(),
+            highlighted: false,
+        }]
+    } else {
+        entry
+            .name_highlights
+            .iter()
+            .map(|segment| HighlightSegment {
+                text: segment.text.clone().into(),
+                highlighted: segment.highlighted,
+            })
+            .collect::<Vec<_>>()
+    };
     FileRow {
         id: entry.id.0 as i32,
         name: entry.display_name.clone().into(),
+        name_segments: ModelRc::new(VecModel::from(name_segments)),
         kind: texts.kind(entry.kind).into(),
         parent_path: entry.parent_display.clone().into(),
         size: if entry.kind == crate::domain::EntryKind::Directory {
@@ -5657,6 +5815,7 @@ mod tests {
             id: EntryId(1),
             original_name: "file.txt".into(),
             display_name: "file.txt".into(),
+            name_highlights: Vec::new(),
             path: PathBuf::from("same/file.txt"),
             kind: crate::domain::EntryKind::File,
             open_target: None,
@@ -5781,6 +5940,68 @@ mod tests {
     }
 
     #[test]
+    fn grouped_search_page_matches_everything_files_first_setting() {
+        let executable = PathBuf::from(r"C:\Program Files\Everything 1.5a\Everything64.exe");
+        if !executable.is_file() {
+            return;
+        }
+        let client = crate::platform::windows::everything::EverythingClient::new(
+            crate::platform::windows::everything::PlatformEverythingConfig {
+                executable_path: executable,
+                instance_name: "1.5a".into(),
+                allow_start: false,
+            },
+        )
+        .unwrap();
+        let (items, total) = search_grouped_page(
+            &client,
+            None,
+            ".md".into(),
+            crate::platform::windows::everything::EverythingSort::NameAscending,
+            0,
+            30,
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        assert_eq!(items.len(), 30);
+        assert!(total > items.len() as u32);
+        assert!(items.iter().all(|item| !item.is_directory));
+    }
+    #[test]
+    fn search_sort_state_is_independent_and_defaults_to_everything_session_direction() {
+        let mut tab = TabSession::new(TabId(1));
+        assert_eq!(tab.sort_field, SortField::Name);
+        assert_eq!(tab.sort_direction, SortDirection::Ascending);
+        assert_eq!(tab.search_sort_field, SortField::Name);
+        assert_eq!(tab.search_sort_direction, SortDirection::Descending);
+        tab.set_search_sort(SortField::Name);
+        assert_eq!(tab.search_sort_direction, SortDirection::Ascending);
+        assert_eq!(tab.sort_direction, SortDirection::Ascending);
+        tab.set_sort(SortField::Name);
+        assert_eq!(tab.sort_direction, SortDirection::Descending);
+        assert_eq!(tab.search_sort_direction, SortDirection::Ascending);
+    }
+    #[test]
+    fn search_sort_arrow_maps_to_query2_service_sort() {
+        use crate::platform::windows::everything::EverythingSort;
+        assert_eq!(
+            everything_sort(SortField::Name, SortDirection::Ascending),
+            EverythingSort::NameAscending
+        );
+        assert_eq!(
+            everything_sort(SortField::Name, SortDirection::Descending),
+            EverythingSort::NameDescending
+        );
+        assert_eq!(
+            everything_sort(SortField::Size, SortDirection::Ascending),
+            EverythingSort::SizeAscending
+        );
+        assert_eq!(
+            everything_sort(SortField::Modified, SortDirection::Descending),
+            EverythingSort::ModifiedDescending
+        );
+    }
+    #[test]
     fn root_path_has_no_parent_navigation_target() {
         assert!(Path::new(r"C:\").parent().is_none());
         assert!(is_drive_root(Path::new(r"C:\")));
@@ -5796,6 +6017,7 @@ mod tests {
             id: EntryId(3),
             original_name: "file.txt".into(),
             display_name: "file.txt".into(),
+            name_highlights: Vec::new(),
             path: PathBuf::from("same/file.txt"),
             kind: crate::domain::EntryKind::File,
             open_target: None,
@@ -5880,6 +6102,7 @@ mod tests {
                 path: PathBuf::from("C:/test/item.txt"),
                 original_name: std::ffi::OsString::from("item.txt"),
                 display_name: "item.txt".into(),
+                name_highlights: Vec::new(),
                 kind: crate::domain::EntryKind::File,
                 open_target: None,
                 parent_display: "C:/test".into(),

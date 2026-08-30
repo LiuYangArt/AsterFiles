@@ -91,6 +91,11 @@ pub enum FolderSizeState {
     Disconnected,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameHighlightSegment {
+    pub text: String,
+    pub highlighted: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EverythingConfig {
     pub executable_path: Option<PathBuf>,
     pub instance_name: String,
@@ -146,6 +151,8 @@ pub struct TabSession {
     pub page_source: PageSource,
     pub search_state: SearchState,
     pub search_total: Option<u32>,
+    pub search_loaded: u32,
+    pub search_has_more: bool,
     directory_snapshot: Option<DirectorySnapshot>,
     pub navigation_kind: NavigationKind,
     pub back_history: Vec<PathBuf>,
@@ -160,6 +167,8 @@ pub struct TabSession {
     pub selection_anchor: Option<EntryId>,
     pub sort_field: SortField,
     pub sort_direction: SortDirection,
+    pub search_sort_field: SortField,
+    pub search_sort_direction: SortDirection,
     cancel: Option<Arc<AtomicBool>>,
 }
 
@@ -179,6 +188,8 @@ impl TabSession {
             page_source: PageSource::Directory,
             search_state: SearchState::Waiting,
             search_total: None,
+            search_loaded: 0,
+            search_has_more: false,
             directory_snapshot: None,
             navigation_kind: NavigationKind::Normal,
             back_history: Vec::new(),
@@ -193,6 +204,8 @@ impl TabSession {
             selection_anchor: None,
             sort_field: SortField::Name,
             sort_direction: SortDirection::Ascending,
+            search_sort_field: SortField::Name,
+            search_sort_direction: SortDirection::Descending,
             cancel: None,
         }
     }
@@ -219,6 +232,8 @@ impl TabSession {
             page_source: PageSource::Directory,
             search_state: SearchState::Waiting,
             search_total: None,
+            search_loaded: 0,
+            search_has_more: false,
             directory_snapshot: None,
             navigation_kind: NavigationKind::Normal,
             back_history: source.back_history.clone(),
@@ -233,6 +248,8 @@ impl TabSession {
             selection_anchor: source.selection_anchor,
             sort_field: source.sort_field,
             sort_direction: source.sort_direction,
+            search_sort_field: source.search_sort_field,
+            search_sort_direction: source.search_sort_direction,
             cancel: None,
         }
     }
@@ -367,6 +384,8 @@ impl TabSession {
         self.address_input = search_address_text(&self.search_scope, &self.search_query);
         self.search_state = SearchState::Searching;
         self.search_total = None;
+        self.search_loaded = 0;
+        self.search_has_more = false;
         self.error = None;
         self.pending_entries.clear();
         self.replace_entries(Vec::new());
@@ -376,6 +395,16 @@ impl TabSession {
         (self.latest_request, cancel)
     }
 
+    pub fn search_cancel_token(&self) -> Option<Arc<AtomicBool>> {
+        self.cancel.clone()
+    }
+    pub fn mark_search_page_requested(&mut self) -> bool {
+        if self.page_source != PageSource::Search || !self.search_has_more {
+            return false;
+        }
+        self.search_has_more = false;
+        true
+    }
     pub fn accepts_page(&self, request_id: RequestId, source: PageSource) -> bool {
         self.page_source == source && self.accepts(request_id)
     }
@@ -410,6 +439,8 @@ impl TabSession {
         self.address_input.clear();
         self.search_query.clear();
         self.search_total = None;
+        self.search_loaded = 0;
+        self.search_has_more = false;
         self.search_state = SearchState::Waiting;
     }
 
@@ -424,6 +455,8 @@ impl TabSession {
         self.page_source = PageSource::Directory;
         self.directory_snapshot = None;
         self.search_total = None;
+        self.search_loaded = 0;
+        self.search_has_more = false;
         self.address_mode = AddressMode::Normal;
         self.navigation_kind = kind;
         self.load_state = LoadState::Loading;
@@ -487,6 +520,8 @@ impl TabSession {
         current.append(&mut entries);
         self.rebuild_entry_indices();
         self.search_total = Some(total);
+        self.search_loaded = self.entries.len().try_into().unwrap_or(u32::MAX);
+        self.search_has_more = !complete;
         self.search_state = if complete && self.entries.is_empty() {
             SearchState::NoResults
         } else if complete {
@@ -687,6 +722,17 @@ impl TabSession {
         self.rebuild_entry_indices();
     }
 
+    pub fn set_search_sort(&mut self, field: SortField) {
+        if self.search_sort_field == field {
+            self.search_sort_direction = match self.search_sort_direction {
+                SortDirection::Ascending => SortDirection::Descending,
+                SortDirection::Descending => SortDirection::Ascending,
+            };
+        } else {
+            self.search_sort_field = field;
+            self.search_sort_direction = SortDirection::Ascending;
+        }
+    }
     pub fn sort_pending(&mut self) {
         let field = self.sort_field;
         let direction = self.sort_direction;
@@ -803,6 +849,7 @@ pub struct FileEntry {
     pub id: EntryId,
     pub original_name: OsString,
     pub display_name: String,
+    pub name_highlights: Vec<NameHighlightSegment>,
     pub path: PathBuf,
     pub kind: EntryKind,
     pub open_target: Option<PathBuf>,
@@ -846,6 +893,7 @@ mod tests {
             id: EntryId(id),
             original_name: name.into(),
             display_name: name.into(),
+            name_highlights: Vec::new(),
             path: PathBuf::from(name),
             kind,
             open_target: None,
@@ -946,12 +994,39 @@ mod tests {
         assert_eq!(session.entries[0].display_name, "directory-row");
     }
     #[test]
+    fn requesting_next_search_page_keeps_identity_and_prevents_duplicate_queueing() {
+        let mut session = TabSession::new(TabId(1));
+        let (request, _) = session.begin_search(SearchScope::Global, ".md".into());
+        session.append_search_page(
+            (1..=256)
+                .map(|id| entry(id, &format!("result-{id}.md"), EntryKind::File, Some(1)))
+                .collect(),
+            133_186,
+            false,
+        );
+        assert_eq!(session.search_loaded, 256);
+        assert!(session.search_has_more);
+        assert!(session.mark_search_page_requested());
+        assert!(!session.mark_search_page_requested());
+        assert!(session.accepts_page(request, PageSource::Search));
+        session.append_search_page(
+            (257..=512)
+                .map(|id| entry(id, &format!("result-{id}.md"), EntryKind::File, Some(1)))
+                .collect(),
+            133_186,
+            false,
+        );
+        assert_eq!(session.search_loaded, 512);
+        assert!(session.search_has_more);
+    }
+    #[test]
     fn folder_size_update_requires_entry_identity_and_original_path() {
         let original = PathBuf::from(r"\\server\共享\零字节");
         let mut item = FileEntry {
             id: EntryId(3),
             original_name: "零字节".into(),
             display_name: "零字节".into(),
+            name_highlights: Vec::new(),
             path: original.clone(),
             kind: EntryKind::Directory,
             open_target: None,
@@ -1165,6 +1240,7 @@ mod tests {
             id: EntryId(9),
             original_name: "📁".into(),
             display_name: "📁".into(),
+            name_highlights: Vec::new(),
             path: original.clone(),
             kind: EntryKind::Directory,
             open_target: None,
