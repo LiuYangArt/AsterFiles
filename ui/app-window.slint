@@ -635,6 +635,13 @@ export component AppWindow inherits Window {
     in property <string> text-show-conflict-confirmation: "文件冲突";
     in property <string> text-show-exit-confirmation: "退出任务确认";
     in property <string> text-show-operation-window: "文件进度窗口";
+    in property <string> text-window-trace-title: "窗口交互诊断";
+    in property <string> text-window-trace-detail: "只记录窗口移动与缩放消息，不改变窗口行为。问题复现后关闭应用并把日志交给开发者。";
+    in property <string> text-window-trace-start: "开始记录";
+    in property <string> text-window-trace-active: "正在记录";
+    in property <string> text-window-trace-path: "日志位置";
+    in property <bool> window-trace-active: false;
+    in property <string> window-trace-status: "";
     in property <string> text-loading: "正在加载…";
     in property <string> text-empty-folder: "此文件夹为空";
     in property <string> text-no-search-results: "没有搜索结果";
@@ -722,6 +729,7 @@ export component AppWindow inherits Window {
     callback open-operation-window();
     callback request-close();
     callback show-debug-window(int);
+    callback start-window-trace();
 
     private property <bool> compact: root.window-width < 1000px;
     in-out property <length> context-menu-anchor-x: 24px;
@@ -1320,21 +1328,37 @@ list := ListView {
                                     Text { text: root.everything-status; color: VisualStyle.c62656f; font-size: 12px; wrap: word-wrap; }
                                     HorizontalLayout { height: 34px; spacing: 8px; StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-test-connection; clicked => { root.test-everything-connection(); } } StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-start-everything; clicked => { root.start-everything(); } } }
                                 }
-                            }                            if root.settings-section == 3 && root.debug-tools-enabled: Rectangle {
-                                height: 244px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
-                                VerticalLayout {
-                                    padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 12px;
-                                    Text { text: root.text-ui-showcase; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
-                                    Text { text: root.text-ui-showcase-detail; color: VisualStyle.c62656f; font-size: 12px; wrap: word-wrap; }
-                                    HorizontalLayout {
-                                        height: 34px; spacing: 8px;
-                                        StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-show-delete-confirmation; clicked => { root.show-debug-window(0); } }
-                                        StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-show-conflict-confirmation; clicked => { root.show-debug-window(1); } }
+                            }                            if root.settings-section == 3 && root.debug-tools-enabled: VerticalLayout {
+                                spacing: 12px;
+                                Rectangle {
+                                    height: 244px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                    VerticalLayout {
+                                        padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 12px;
+                                        Text { text: root.text-ui-showcase; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
+                                        Text { text: root.text-ui-showcase-detail; color: VisualStyle.c62656f; font-size: 12px; wrap: word-wrap; }
+                                        HorizontalLayout {
+                                            height: 34px; spacing: 8px;
+                                            StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-show-delete-confirmation; clicked => { root.show-debug-window(0); } }
+                                            StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-show-conflict-confirmation; clicked => { root.show-debug-window(1); } }
+                                        }
+                                        HorizontalLayout {
+                                            height: 34px; spacing: 8px;
+                                            StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-show-exit-confirmation; clicked => { root.show-debug-window(2); } }
+                                            StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-show-operation-window; clicked => { root.show-debug-window(3); } }
+                                        }
                                     }
-                                    HorizontalLayout {
-                                        height: 34px; spacing: 8px;
-                                        StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-show-exit-confirmation; clicked => { root.show-debug-window(2); } }
-                                        StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-show-operation-window; clicked => { root.show-debug-window(3); } }
+                                }
+                                Rectangle {
+                                    height: 170px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                    VerticalLayout {
+                                        padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 10px;
+                                        Text { text: root.text-window-trace-title; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
+                                        Text { text: root.text-window-trace-detail; color: VisualStyle.c62656f; font-size: 12px; wrap: word-wrap; }
+                                        HorizontalLayout {
+                                            height: 34px; spacing: 12px;
+                                            StandaloneActionButton { width: 132px; enabled: !root.window-trace-active; label: root.window-trace-active ? root.text-window-trace-active : root.text-window-trace-start; clicked => { root.start-window-trace(); } }
+                                            Text { text: root.window-trace-status; color: root.window-trace-active ? VisualStyle.c4f6bed : VisualStyle.c62656f; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                                        }
                                     }
                                 }
                             }

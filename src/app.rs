@@ -2294,8 +2294,18 @@ fn wire_mouse_navigation(ui: &AppWindow, exit_ui: &ConfirmationWindow, state: Sh
             return EventResult::Propagate;
         };
         if let WindowEvent::Resized(size) = event {
+            platform::windows::window_trace::log_request(
+                native_window_handle(&ui),
+                "winit-resized",
+            );
             ui.set_window_width(size.width as f32 / ui.window().scale_factor());
             return EventResult::Propagate;
+        }
+        if matches!(event, WindowEvent::Focused(false)) {
+            platform::windows::window_trace::log_request(
+                native_window_handle(&ui),
+                "winit-focused-false",
+            );
         }
         if matches!(event, WindowEvent::KeyboardInput { .. })
             && keyboard_shortcuts_suppressed(ui.get_rename_editing())
@@ -2531,6 +2541,24 @@ fn wire_mouse_navigation(ui: &AppWindow, exit_ui: &ConfirmationWindow, state: Sh
     });
 }
 
+fn wire_window_trace(ui: &AppWindow) {
+    let Some(path) = platform::windows::window_trace::requested_path() else {
+        return;
+    };
+    let weak = ui.as_weak();
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let hwnd = native_window_handle(&ui);
+        if let Err(error) = platform::windows::window_trace::install(hwnd, &path) {
+            eprintln!(
+                "failed to install window trace at {}: {error}",
+                path.display()
+            );
+        }
+    });
+}
 fn wire_window_controls(ui: &AppWindow) {
     #[cfg(windows)]
     use winit::platform::windows::{CornerPreference, WindowExtWindows};
@@ -2541,11 +2569,15 @@ fn wire_window_controls(ui: &AppWindow) {
         window.set_undecorated_shadow(true);
     });
 
+    wire_window_trace(ui);
+
     let weak = ui.as_weak();
     ui.on_drag_window(move || {
         let Some(ui) = weak.upgrade() else {
             return;
         };
+        let hwnd = native_window_handle(&ui);
+        platform::windows::window_trace::log_request(hwnd, "move-request");
         ui.window().with_winit_window(|window| {
             let _ = window.drag_window();
         });
@@ -2730,6 +2762,34 @@ fn wire_confirmation_windows(
         }
     });
     let exit_weak = exit_ui.as_weak();
+    let trace_path = platform::windows::window_trace::active_path()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(platform::windows::window_trace::default_path);
+    ui.set_window_trace_active(platform::windows::window_trace::is_active());
+    ui.set_window_trace_status(trace_path.to_string_lossy().into_owned().into());
+    let trace_weak = ui.as_weak();
+    ui.on_start_window_trace(move || {
+        let Some(ui) = trace_weak.upgrade() else {
+            return;
+        };
+        if platform::windows::window_trace::is_active() {
+            return;
+        }
+        let path = platform::windows::window_trace::default_path();
+        if let Some(parent) = path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            ui.set_window_trace_status(error.to_string().into());
+            return;
+        }
+        match platform::windows::window_trace::install(native_window_handle(&ui), &path) {
+            Ok(()) => {
+                ui.set_window_trace_active(true);
+                ui.set_window_trace_status(path.to_string_lossy().into_owned().into());
+            }
+            Err(error) => ui.set_window_trace_status(error.to_string().into()),
+        }
+    });
     let ui_weak = ui.as_weak();
     let operation_weak = operation_ui.as_weak();
     let conflict_weak_for_exit = conflict_ui.as_weak();
@@ -5584,6 +5644,11 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
         show_conflict_confirmation,
         show_exit_confirmation,
         show_operation_window,
+        window_trace_title,
+        window_trace_detail,
+        window_trace_start,
+        window_trace_active,
+        window_trace_path,
         loading,
         empty_folder,
         no_search_results,
@@ -5635,6 +5700,11 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "文件冲突",
             "退出任务确认",
             "文件进度窗口",
+            "窗口交互诊断",
+            "只记录窗口移动与缩放消息，不改变窗口行为。问题复现后关闭应用并把日志交给开发者。",
+            "开始记录",
+            "正在记录",
+            "日志位置",
             "正在加载…",
             "此文件夹为空",
             "没有搜索结果",
@@ -5686,6 +5756,11 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "File conflict",
             "Exit confirmation",
             "File progress window",
+            "Window interaction diagnostics",
+            "Records move and resize messages without changing window behavior. After reproducing the issue, close the app and send the log to the developer.",
+            "Start recording",
+            "Recording",
+            "Log location",
             "Loading…",
             "This folder is empty",
             "No search results",
@@ -5738,6 +5813,11 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_show_conflict_confirmation(show_conflict_confirmation.into());
     ui.set_text_show_exit_confirmation(show_exit_confirmation.into());
     ui.set_text_show_operation_window(show_operation_window.into());
+    ui.set_text_window_trace_title(window_trace_title.into());
+    ui.set_text_window_trace_detail(window_trace_detail.into());
+    ui.set_text_window_trace_start(window_trace_start.into());
+    ui.set_text_window_trace_active(window_trace_active.into());
+    ui.set_text_window_trace_path(window_trace_path.into());
     ui.set_text_loading(loading.into());
     ui.set_text_empty_folder(empty_folder.into());
     ui.set_text_no_search_results(no_search_results.into());
