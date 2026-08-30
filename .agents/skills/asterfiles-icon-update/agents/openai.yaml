@@ -1,0 +1,4 @@
+interface:
+  display_name: "AsterFiles 图标更新"
+  short_description: "从项目 PNG 更新窗口、任务栏和 Windows EXE 图标"
+  default_prompt: "使用 $asterfiles-icon-update 将 assets/app-icon.png 更新到 AsterFiles 的全部应用图标并完成验证。"
