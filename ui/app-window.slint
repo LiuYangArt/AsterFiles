@@ -544,7 +544,9 @@ export component AppWindow inherits Window {
     title: "AsterFiles";
     icon: @image-url("../assets/app-icon.png");
     no-frame: true;
-    resize-border-width: 14px;
+    // Windows cannot start an edge resize while maximized. Keeping the hit area active there can
+    // leave winit waiting forever for a system resize loop that never began.
+    resize-border-width: root.maximized ? 0px : 14px;
     preferred-width: 1180px;
     preferred-height: 760px;
     min-width: 820px;
