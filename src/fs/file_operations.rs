@@ -180,7 +180,8 @@ pub fn rename_path(source: &Path, new_name: &OsStr) -> Result<PathBuf, Operation
     Ok(destination)
 }
 
-pub type FileProgressCallback<'a> = dyn FnMut(u64) + 'a;
+pub type FileProgressCallback<'a> = dyn FnMut(u64, bool, &Path) + 'a;
+pub type DestinationCreatedCallback<'a> = dyn FnMut(&Path) + 'a;
 
 #[allow(dead_code)]
 pub fn copy_path(
@@ -189,7 +190,14 @@ pub fn copy_path(
     cancel: &CancellationToken,
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
 ) -> Result<FileOperationReport, OperationError> {
-    copy_path_with_progress(source, destination, cancel, resolve_conflict, &mut |_| {})
+    copy_path_with_progress(
+        source,
+        destination,
+        cancel,
+        resolve_conflict,
+        &mut |_, _, _| {},
+        &mut |_| {},
+    )
 }
 
 pub fn copy_path_with_progress(
@@ -198,6 +206,7 @@ pub fn copy_path_with_progress(
     cancel: &CancellationToken,
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
     progress: &mut FileProgressCallback<'_>,
+    destination_created: &mut DestinationCreatedCallback<'_>,
 ) -> Result<FileOperationReport, OperationError> {
     let same_location = source == destination;
     let kept_destination = same_location.then(|| keep_both_path(destination));
@@ -210,6 +219,7 @@ pub fn copy_path_with_progress(
         cancel,
         resolve_conflict,
         progress,
+        destination_created,
         &mut report,
     )?;
     Ok(report)
@@ -222,7 +232,13 @@ pub fn move_path(
     cancel: &CancellationToken,
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
 ) -> Result<FileOperationReport, OperationError> {
-    move_path_with_progress(source, destination, cancel, resolve_conflict, &mut |_| {})
+    move_path_with_progress(
+        source,
+        destination,
+        cancel,
+        resolve_conflict,
+        &mut |_, _, _| {},
+    )
 }
 
 pub fn move_path_with_progress(
@@ -323,6 +339,7 @@ pub fn move_path_with_progress(
         cancel,
         resolve_conflict,
         progress,
+        &mut |_| {},
         &mut report,
     )?;
     remove_entry(source, &CancellationToken::new(), &mut report)?;
@@ -381,6 +398,7 @@ fn copy_entry(
     cancel: &CancellationToken,
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
     progress: &mut FileProgressCallback<'_>,
+    destination_created: &mut DestinationCreatedCallback<'_>,
     report: &mut FileOperationReport,
 ) -> Result<(), OperationError> {
     check_cancel(cancel)?;
@@ -401,6 +419,7 @@ fn copy_entry(
         cancel,
         resolve_conflict,
         progress,
+        destination_created,
         report,
     )
 }
@@ -411,6 +430,7 @@ fn copy_resolved_entry(
     cancel: &CancellationToken,
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
     progress: &mut FileProgressCallback<'_>,
+    destination_created: &mut DestinationCreatedCallback<'_>,
     report: &mut FileOperationReport,
 ) -> Result<(), OperationError> {
     let source_metadata =
@@ -437,6 +457,7 @@ fn copy_resolved_entry(
                 cancel,
                 resolve_conflict,
                 progress,
+                destination_created,
                 report,
             );
         }
@@ -446,6 +467,7 @@ fn copy_resolved_entry(
             cancel,
             resolve_conflict,
             progress,
+            destination_created,
             report,
         )?;
     } else {
@@ -467,12 +489,14 @@ fn copy_directory(
     cancel: &CancellationToken,
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
     progress: &mut FileProgressCallback<'_>,
+    destination_created: &mut DestinationCreatedCallback<'_>,
     report: &mut FileOperationReport,
 ) -> Result<(), OperationError> {
     if !path_exists(destination) {
         fs::create_dir(destination).map_err(|error| OperationError::io(destination, error))?;
         report.directories += 1;
         report.affect(destination);
+        destination_created(destination);
     }
     for entry in fs::read_dir(source).map_err(|error| OperationError::io(source, error))? {
         check_cancel(cancel)?;
@@ -483,6 +507,7 @@ fn copy_directory(
             cancel,
             resolve_conflict,
             progress,
+            destination_created,
             report,
         )?;
     }
@@ -495,6 +520,7 @@ fn replace_directory_safely(
     cancel: &CancellationToken,
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
     progress: &mut FileProgressCallback<'_>,
+    destination_created: &mut DestinationCreatedCallback<'_>,
     report: &mut FileOperationReport,
 ) -> Result<(), OperationError> {
     let temporary = unique_sibling(destination, ".asterfiles-copy");
@@ -504,6 +530,7 @@ fn replace_directory_safely(
         cancel,
         resolve_conflict,
         progress,
+        destination_created,
         report,
     );
     if let Err(error) = result {
@@ -664,7 +691,7 @@ fn copy_file_to_new_path(
                 .write_all(&buffer[..read])
                 .map_err(|error| OperationError::io(destination, error))?;
             copied += read as u64;
-            progress(read as u64);
+            progress(read as u64, false, source);
         }
         output
             .sync_all()
@@ -678,6 +705,7 @@ fn copy_file_to_new_path(
     })();
     result?;
     report.bytes += copied;
+    progress(0, true, source);
     Ok(())
 }
 
@@ -843,6 +871,7 @@ fn same_path_ignoring_ascii_case(left: &Path, right: &Path) -> bool {
         .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 fn check_cancel(cancel: &CancellationToken) -> Result<(), OperationError> {
+    cancel.wait_if_paused();
     if cancel.is_cancelled() {
         Err(OperationError::Cancelled)
     } else {
@@ -890,8 +919,9 @@ mod tests {
     impl TempDir {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
-                "asterfiles-file-operations-{}-{}",
+                "asterfiles-file-operations-{}-{}-{}",
                 std::process::id(),
+                UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
@@ -1067,7 +1097,8 @@ mod tests {
             &destination,
             &cancel,
             &mut replace,
-            &mut move |_| cancel_after_first_chunk.cancel(),
+            &mut move |_, _, _| cancel_after_first_chunk.cancel(),
+            &mut |_| {},
         );
         assert_eq!(result, Err(OperationError::Cancelled));
         assert_eq!(fs::read(&destination).unwrap(), b"old target");
@@ -1089,7 +1120,7 @@ mod tests {
             &destination,
             &cancel,
             &mut replace,
-            &mut move |_| cancel_after_first_chunk.cancel(),
+            &mut move |_, _, _| cancel_after_first_chunk.cancel(),
         );
         assert_eq!(result, Err(OperationError::Cancelled));
         assert_eq!(fs::read(&destination).unwrap(), b"old target");
@@ -1110,13 +1141,41 @@ mod tests {
             &destination,
             &CancellationToken::new(),
             &mut replace,
-            &mut |bytes| increments.push(bytes),
+            &mut |bytes, completed, _| {
+                if bytes > 0 && !completed {
+                    increments.push(bytes);
+                }
+            },
+            &mut |_| {},
         )
         .unwrap();
         assert_eq!(fs::read(&destination).unwrap(), content);
         assert_eq!(report.bytes, (COPY_BUFFER_SIZE + 17) as u64);
         assert_eq!(increments, vec![COPY_BUFFER_SIZE as u64, 17]);
         assert!(temporary_siblings(temp.path()).is_empty());
+    }
+
+    #[test]
+    fn directory_copy_reports_the_real_root_as_soon_as_it_is_created() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        write(&source.join("file.txt"), b"content");
+        let mut created = Vec::new();
+
+        copy_path_with_progress(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut replace,
+            &mut |_, _, _| {},
+            &mut |path| created.push(path.to_path_buf()),
+        )
+        .unwrap();
+
+        assert_eq!(created.first(), Some(&destination));
+        assert!(destination.join("file.txt").exists());
     }
 
     #[test]

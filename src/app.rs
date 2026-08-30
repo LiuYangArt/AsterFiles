@@ -331,9 +331,15 @@ struct FileOperationRequest {
 #[derive(Debug)]
 #[allow(dead_code)]
 enum FileOperationEvent {
+    DestinationCreated {
+        id: OperationId,
+        path: PathBuf,
+    },
     Progress {
         id: OperationId,
         completed_items: usize,
+        completed_files: usize,
+        total_files: Option<usize>,
         processed_bytes: u64,
         total_bytes: Option<u64>,
         current_item: PathBuf,
@@ -378,6 +384,7 @@ struct IconEvent {
 
 pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
+    let operation_ui = OperationWindow::new()?;
     let restored = scenario
         .is_none()
         .then(|| session_store::default_path().and_then(|path| session_store::load(&path).ok()))
@@ -454,10 +461,13 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     );
     wire_mouse_navigation(&ui, state.clone());
     wire_window_controls(&ui);
+    let _operation_timer =
+        wire_operation_window(&ui, &operation_ui, operation_sender.clone(), state.clone());
     start_event_pump(&ui, event_receiver, icon_sender, state.clone());
     start_icon_event_pump(&ui, icon_receiver, state.clone());
     start_file_operation_event_pump(
         &ui,
+        &operation_ui,
         operation_receiver,
         operation_sender.clone(),
         request_sender.clone(),
@@ -477,6 +487,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     }
     start_sidebar_icon_loader(&ui, state.clone());
     refresh_ui(&ui, &state);
+    refresh_operation_window(&operation_ui, &state);
     let initial_tabs = {
         let app = state.lock().expect("app state mutex is not poisoned");
         app.tab_order
@@ -2296,6 +2307,240 @@ fn wire_window_controls(ui: &AppWindow) {
         });
     });
 }
+
+fn wire_operation_window(
+    ui: &AppWindow,
+    operation_ui: &OperationWindow,
+    operation_sender: mpsc::Sender<FileOperationRequest>,
+    state: SharedSessions,
+) -> slint::Timer {
+    #[cfg(windows)]
+    use winit::platform::windows::{CornerPreference, WindowExtWindows};
+
+    let operation_weak = operation_ui.as_weak();
+    operation_ui.on_request_hide(move || {
+        if let Some(operation_ui) = operation_weak.upgrade() {
+            let _ = operation_ui.hide();
+        }
+    });
+    let ui_weak = ui.as_weak();
+    let operation_weak = operation_ui.as_weak();
+    let state_for_close = state.clone();
+    ui.on_request_close(move || {
+        if state_for_close
+            .lock()
+            .is_ok_and(|app| app.operations.has_active_tasks())
+        {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_exit_prompt_open(true);
+            }
+        } else {
+            if let Some(operation_ui) = operation_weak.upgrade() {
+                let _ = operation_ui.hide();
+            }
+            if let Some(ui) = ui_weak.upgrade() {
+                let _ = ui.hide();
+            }
+        }
+    });
+    let operation_weak = operation_ui.as_weak();
+    operation_ui.window().on_close_requested(move || {
+        if let Some(operation_ui) = operation_weak.upgrade() {
+            let _ = operation_ui.hide();
+        }
+        slint::CloseRequestResponse::KeepWindowShown
+    });
+    let operation_weak = operation_ui.as_weak();
+    operation_ui.on_drag_window(move || {
+        if let Some(operation_ui) = operation_weak.upgrade() {
+            operation_ui.window().with_winit_window(|window| {
+                let _ = window.drag_window();
+            });
+        }
+    });
+    #[cfg(windows)]
+    operation_ui.window().with_winit_window(|window| {
+        window.set_corner_preference(CornerPreference::Round);
+        window.set_undecorated_shadow(true);
+        window.set_resizable(false);
+    });
+
+    let state_for_cancel = state.clone();
+    let ui_weak = ui.as_weak();
+    let operation_weak = operation_ui.as_weak();
+    operation_ui.on_cancel_operation(move |id| {
+        if let Ok(mut app) = state_for_cancel.lock() {
+            let id = OperationId(id as u64);
+            if let Err(error) = app.operations.cancel(id) {
+                app.operation_errors.push(format!(
+                    "unable to cancel operation {} from {:?} to {:?}",
+                    id.0, error.from, error.to
+                ));
+            }
+            if let Some(response) = app.conflict_responses.remove(&id) {
+                let _ = response.send(crate::domain::file_operations::ConflictDecision {
+                    action: crate::domain::file_operations::ConflictAction::Skip,
+                    apply_to_all: false,
+                });
+            }
+        }
+        if let Some(ui) = ui_weak.upgrade() {
+            refresh_ui(&ui, &state_for_cancel);
+        }
+        if let Some(operation_ui) = operation_weak.upgrade() {
+            let _ = operation_ui.hide();
+        }
+    });
+
+    let state_for_pause = state.clone();
+    let ui_weak = ui.as_weak();
+    let operation_weak = operation_ui.as_weak();
+    operation_ui.on_toggle_pause_operation(move |id| {
+        if let Ok(mut app) = state_for_pause.lock() {
+            let id = OperationId(id as u64);
+            if let Err(error) = app.operations.toggle_pause(id) {
+                app.operation_errors.push(format!(
+                    "unable to pause or resume operation {} from {:?}",
+                    id.0, error.from
+                ));
+            }
+        }
+        if let Some(ui) = ui_weak.upgrade() {
+            refresh_ui(&ui, &state_for_pause);
+        }
+        if let Some(operation_ui) = operation_weak.upgrade() {
+            refresh_operation_window(&operation_ui, &state_for_pause);
+        }
+    });
+
+    let state_for_retry = state.clone();
+    let sender_for_retry = operation_sender.clone();
+    operation_ui.on_retry_operation(move |id| {
+        if let Some(request) = prepare_retry(&state_for_retry, OperationId(id as u64)) {
+            let _ = sender_for_retry.send(request);
+        }
+    });
+
+    let operation_weak = operation_ui.as_weak();
+    let ui_weak = ui.as_weak();
+    let state_for_open = state.clone();
+    ui.on_open_operation_window(move || {
+        if let (Some(ui), Some(operation_ui)) = (ui_weak.upgrade(), operation_weak.upgrade()) {
+            refresh_operation_window(&operation_ui, &state_for_open);
+            position_operation_window_next_to_main(&ui, &operation_ui);
+            let _ = operation_ui.show();
+        }
+    });
+
+    let operation_weak = operation_ui.as_weak();
+    let ui_weak = ui.as_weak();
+    let state_for_auto_open = state.clone();
+    let timer = slint::Timer::default();
+    timer.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(250),
+        move || {
+            let Some(operation_ui) = operation_weak.upgrade() else {
+                return;
+            };
+            let removed = state_for_auto_open
+                .lock()
+                .map(|mut app| app.operations.prune_transient(Duration::ZERO))
+                .unwrap_or_default();
+            if removed > 0 {
+                if let Some(ui) = ui_weak.upgrade() {
+                    refresh_ui(&ui, &state_for_auto_open);
+                }
+                refresh_operation_window(&operation_ui, &state_for_auto_open);
+            }
+            let should_open = state_for_auto_open.lock().is_ok_and(|app| {
+                app.operations.iter().any(|task| {
+                    matches!(
+                        task.state,
+                        OperationState::Preflight
+                            | OperationState::Running
+                            | OperationState::Paused
+                            | OperationState::WaitingConflict
+                    ) && task.started_at.elapsed() >= Duration::from_millis(800)
+                })
+            });
+            if should_open && !operation_ui.window().is_visible() {
+                refresh_operation_window(&operation_ui, &state_for_auto_open);
+                if let Some(ui) = ui_weak.upgrade() {
+                    position_operation_window_next_to_main(&ui, &operation_ui);
+                }
+                let _ = operation_ui.show();
+            }
+        },
+    );
+    timer
+}
+
+fn position_operation_window_next_to_main(ui: &AppWindow, operation_ui: &OperationWindow) {
+    let mut target = None;
+    ui.window().with_winit_window(|main| {
+        let Some(monitor) = main.current_monitor() else {
+            return;
+        };
+        let monitor_position = monitor.position();
+        let monitor_size = monitor.size();
+        let operation_size = operation_ui.window().size();
+        let main_position = main.outer_position().unwrap_or(monitor_position);
+        let main_size = main.outer_size();
+        let centered_x =
+            main_position.x + (main_size.width as i32 - operation_size.width as i32) / 2;
+        let centered_y =
+            main_position.y + (main_size.height as i32 - operation_size.height as i32) / 2;
+        let max_x = monitor_position.x + monitor_size.width as i32 - operation_size.width as i32;
+        let max_y = monitor_position.y + monitor_size.height as i32 - operation_size.height as i32;
+        target = Some(slint::PhysicalPosition::new(
+            centered_x.clamp(monitor_position.x, max_x.max(monitor_position.x)),
+            centered_y.clamp(monitor_position.y, max_y.max(monitor_position.y)),
+        ));
+    });
+    if let Some(position) = target {
+        operation_ui.window().set_position(position);
+    }
+}
+
+fn refresh_operation_window(ui: &OperationWindow, state: &SharedSessions) {
+    let Ok(mut app) = state.lock() else {
+        return;
+    };
+    app.operations.prune_transient(Duration::ZERO);
+    ui.set_operations(ModelRc::new(VecModel::from(operation_rows(&app))));
+    ui.set_dark_theme(app.dark_theme());
+    let (title, cancel, retry, pause, resume, empty, minimize, close) = match app.language {
+        Language::Chinese => (
+            "文件操作",
+            "取消",
+            "重试",
+            "暂停",
+            "继续",
+            "没有文件操作",
+            "最小化",
+            "关闭",
+        ),
+        Language::English => (
+            "File operations",
+            "Cancel",
+            "Retry",
+            "Pause",
+            "Resume",
+            "No file operations",
+            "Minimize",
+            "Close",
+        ),
+    };
+    ui.set_text_file_operations(title.into());
+    ui.set_text_cancel_operation(cancel.into());
+    ui.set_text_retry_operation(retry.into());
+    ui.set_text_pause_operation(pause.into());
+    ui.set_text_resume_operation(resume.into());
+    ui.set_text_no_operations(empty.into());
+    ui.set_text_window_minimize(minimize.into());
+    ui.set_text_window_close(close.into());
+}
 fn scan_cleanup_diagnostics(ui: &AppWindow, state: SharedSessions) {
     let weak = ui.as_weak();
     let roots = state
@@ -2529,15 +2774,38 @@ fn spawn_file_operation_worker() -> (
             let mut indexed_states = Vec::new();
             let mut completed_paths = Vec::new();
             let started = Instant::now();
-            let total_bytes = request
+            let totals = request
                 .items
                 .iter()
                 .filter(|item| item.state == ItemState::Pending)
                 .filter_map(|item| item.source.as_deref())
-                .try_fold(0_u64, |sum, path| {
-                    tree_bytes(path).map(|value| sum.saturating_add(value))
+                .try_fold((0_u64, 0_usize), |(bytes, files), path| {
+                    tree_totals(path, &request.cancellation).map(|(next_bytes, next_files)| {
+                        (
+                            bytes.saturating_add(next_bytes),
+                            files.saturating_add(next_files),
+                        )
+                    })
                 });
+            let (total_bytes, total_files) = totals
+                .map(|(bytes, files)| (Some(bytes), Some(files)))
+                .unwrap_or((None, None));
+            let _ = event_sender.send(FileOperationEvent::Progress {
+                id: request.id,
+                completed_items: 0,
+                completed_files: 0,
+                total_files,
+                processed_bytes: 0,
+                total_bytes,
+                current_item: request
+                    .items
+                    .first()
+                    .and_then(|item| item.source.clone().or_else(|| item.destination.clone()))
+                    .unwrap_or_default(),
+                started,
+            });
             let mut processed_bytes = 0_u64;
+            let mut processed_files = 0_usize;
             let mut conflict_defaults = HashMap::new();
             for (item_index, item) in request.items.iter().enumerate() {
                 if item.state != ItemState::Pending {
@@ -2555,13 +2823,16 @@ fn spawn_file_operation_worker() -> (
                     &event_sender,
                     item_index,
                     processed_bytes,
+                    processed_files,
                     total_bytes,
+                    total_files,
                     started,
                     &mut conflict_defaults,
                 );
                 match outcome {
                     Ok(report) => {
                         processed_bytes = processed_bytes.saturating_add(report.bytes);
+                        processed_files = processed_files.saturating_add(report.files);
                         completed_paths.extend(report.completed_paths.iter().cloned());
                         let current_item = item
                             .source
@@ -2571,6 +2842,8 @@ fn spawn_file_operation_worker() -> (
                         let _ = event_sender.send(FileOperationEvent::Progress {
                             id: request.id,
                             completed_items: item_index + 1,
+                            completed_files: processed_files,
+                            total_files,
                             processed_bytes,
                             total_bytes,
                             current_item,
@@ -2600,8 +2873,12 @@ fn spawn_file_operation_worker() -> (
                             .clone()
                             .or_else(|| item.destination.clone())
                             .unwrap_or_default();
-                        failed.push((identity, message.clone()));
-                        indexed_states.push((item_index, ItemState::Failed, Some(message)));
+                        if request.cancellation.is_cancelled() {
+                            indexed_states.push((item_index, ItemState::Cancelled, None));
+                        } else {
+                            failed.push((identity, message.clone()));
+                            indexed_states.push((item_index, ItemState::Failed, Some(message)));
+                        }
                     }
                 }
             }
@@ -2621,19 +2898,29 @@ fn spawn_file_operation_worker() -> (
     (request_sender, event_receiver)
 }
 
-fn tree_bytes(path: &Path) -> Option<u64> {
+fn tree_totals(
+    path: &Path,
+    cancellation: &crate::domain::file_operations::CancellationToken,
+) -> Option<(u64, usize)> {
+    cancellation.wait_if_paused();
+    if cancellation.is_cancelled() {
+        return None;
+    }
     let metadata = std::fs::symlink_metadata(path).ok()?;
     if metadata.file_type().is_symlink() {
-        return Some(0);
+        return Some((0, 1));
     }
     if metadata.is_file() {
-        return Some(metadata.len());
+        return Some((metadata.len(), 1));
     }
-    let mut total = 0_u64;
+    let mut total_bytes = 0_u64;
+    let mut total_files = 0_usize;
     for entry in std::fs::read_dir(path).ok()? {
-        total = total.saturating_add(tree_bytes(&entry.ok()?.path())?);
+        let (bytes, files) = tree_totals(&entry.ok()?.path(), cancellation)?;
+        total_bytes = total_bytes.saturating_add(bytes);
+        total_files = total_files.saturating_add(files);
     }
-    Some(total)
+    Some((total_bytes, total_files))
 }
 
 fn file_snapshot(path: &Path) -> crate::domain::file_operations::FileSnapshot {
@@ -2660,7 +2947,9 @@ fn execute_file_operation_item(
     events: &mpsc::Sender<FileOperationEvent>,
     completed_items: usize,
     base_processed_bytes: u64,
+    base_processed_files: usize,
     operation_total_bytes: Option<u64>,
+    operation_total_files: Option<usize>,
     started: Instant,
     conflict_defaults: &mut HashMap<
         crate::domain::file_operations::ConflictCategory,
@@ -2746,18 +3035,24 @@ fn execute_file_operation_item(
             let source = item.source.as_ref().ok_or("missing source")?;
             let destination = item.destination.as_ref().ok_or("missing destination")?;
             let mut processed = base_processed_bytes;
-            let current = source.clone();
-            let mut progress = |bytes| {
+            let mut completed_files = base_processed_files;
+            let mut progress = |bytes, file_completed, current: &Path| {
                 processed = processed.saturating_add(bytes);
+                if file_completed {
+                    completed_files = completed_files.saturating_add(1);
+                }
                 let _ = events.send(FileOperationEvent::Progress {
                     id,
                     completed_items,
+                    completed_files,
+                    total_files: operation_total_files,
                     processed_bytes: processed,
                     total_bytes: operation_total_bytes,
-                    current_item: current.clone(),
+                    current_item: current.to_path_buf(),
                     started,
                 });
             };
+            let mut root_destination_reported = false;
             let result = if kind == FileOperationKind::Copy {
                 crate::fs::file_operations::copy_path_with_progress(
                     source,
@@ -2765,6 +3060,15 @@ fn execute_file_operation_item(
                     cancel,
                     replace,
                     &mut progress,
+                    &mut |path| {
+                        if !root_destination_reported {
+                            root_destination_reported = true;
+                            let _ = events.send(FileOperationEvent::DestinationCreated {
+                                id,
+                                path: path.to_path_buf(),
+                            });
+                        }
+                    },
                 )
             } else {
                 crate::fs::file_operations::move_path_with_progress(
@@ -2852,28 +3156,53 @@ fn execute_file_operation_item(
 
 fn start_file_operation_event_pump(
     ui: &AppWindow,
+    operation_ui: &OperationWindow,
     receiver: mpsc::Receiver<FileOperationEvent>,
     sender: mpsc::Sender<FileOperationRequest>,
     directory_sender: mpsc::Sender<DirectoryRequest>,
     state: SharedSessions,
 ) {
     let weak = ui.as_weak();
+    let operation_weak = operation_ui.as_weak();
     thread::spawn(move || {
         while let Ok(event) = receiver.recv() {
             let weak = weak.clone();
+            let operation_weak = operation_weak.clone();
             let sender = sender.clone();
             let directory_sender = directory_sender.clone();
             let state = state.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 let event_operation_id = match &event {
-                    FileOperationEvent::Progress { id, .. }
+                    FileOperationEvent::DestinationCreated { id, .. }
+                    | FileOperationEvent::Progress { id, .. }
                     | FileOperationEvent::Conflict { id, .. }
                     | FileOperationEvent::Finished { id, .. } => *id,
                 };
                 match event {
+                    FileOperationEvent::DestinationCreated { path, .. } => {
+                        let parent = path.parent().map(Path::to_path_buf);
+                        if let Some(parent) = parent {
+                            if let Ok(mut app) = state.lock() {
+                                let matching_tabs = app
+                                    .tabs
+                                    .values()
+                                    .filter(|tab| {
+                                        tab.visible_path().is_some_and(|visible| visible == parent)
+                                    })
+                                    .map(|tab| tab.id)
+                                    .collect::<Vec<_>>();
+                                for tab_id in matching_tabs {
+                                    app.focus_after_refresh.insert(tab_id, path.clone());
+                                }
+                            }
+                            refresh_affected_tabs(&directory_sender, &state, &[parent]);
+                        }
+                    }
                     FileOperationEvent::Progress {
                         id,
                         completed_items,
+                        completed_files,
+                        total_files,
                         processed_bytes,
                         total_bytes,
                         current_item,
@@ -2883,6 +3212,8 @@ fn start_file_operation_event_pump(
                             && let Some(task) = app.operations.task_mut(id)
                         {
                             task.progress.completed_items = completed_items;
+                            task.progress.completed_files = completed_files;
+                            task.progress.total_files = total_files;
                             task.progress.processed_bytes = processed_bytes;
                             task.progress.total_bytes = total_bytes;
                             task.progress.current_item = Some(current_item);
@@ -2973,6 +3304,9 @@ fn start_file_operation_event_pump(
                                 }
                             }
                             let _ = app.operations.finish(id, terminal, result);
+                            if cancelled {
+                                app.operations.remove_terminal(id);
+                            }
                             let next =
                                 app.operations
                                     .start_next()
@@ -3020,6 +3354,28 @@ fn start_file_operation_event_pump(
                         app.exit_after_cancel && !app.operations.has_active_tasks()
                     }) {
                         let _ = ui.hide();
+                    }
+                }
+                if let Some(operation_ui) = operation_weak.upgrade() {
+                    refresh_operation_window(&operation_ui, &state);
+                    let has_attention = state.lock().is_ok_and(|app| {
+                        app.operations.iter().any(|task| {
+                            matches!(
+                                task.state,
+                                OperationState::Failed
+                                    | OperationState::PartiallyCompleted
+                                    | OperationState::WaitingConflict
+                            )
+                        })
+                    });
+                    let has_active = state
+                        .lock()
+                        .is_ok_and(|app| app.operations.has_active_tasks());
+                    let has_rows = state
+                        .lock()
+                        .is_ok_and(|app| app.operations.iter().next().is_some());
+                    if !has_active && !has_attention && !has_rows {
+                        let _ = operation_ui.hide();
                     }
                 }
             });
@@ -3512,8 +3868,22 @@ fn update_selection_summary(ui: &AppWindow, state: &SharedSessions) {
             })
             .collect::<Vec<_>>(),
     )));
-    let operation_rows = app
-        .operations
+    let operation_rows = operation_rows(&app);
+    ui.set_operations(ModelRc::new(VecModel::from(operation_rows)));
+    ui.set_operation_error(
+        app.operation_errors
+            .last()
+            .cloned()
+            .unwrap_or_default()
+            .into(),
+    );
+    ui.set_selected_count(tab.selected.len() as i32);
+    ui.set_context_menu_has_entry(!tab.selected.is_empty() || tab.focused.is_some());
+    ui.set_status_text(status_text(tab, Texts::new(app.language)).into());
+}
+
+fn operation_rows(app: &AppState) -> Vec<OperationRow> {
+    app.operations
         .iter()
         .map(|task| {
             let completed = task
@@ -3530,20 +3900,20 @@ fn update_selection_summary(ui: &AppWindow, state: &SharedSessions) {
                 })
                 .count();
             let title = match (app.language, task.kind) {
-                (Language::Chinese, FileOperationKind::CreateFolder) => "新建文件夹",
-                (Language::Chinese, FileOperationKind::Rename) => "重命名",
-                (Language::Chinese, FileOperationKind::Copy) => "复制",
-                (Language::Chinese, FileOperationKind::Move) => "移动",
-                (Language::Chinese, FileOperationKind::RecycleDelete) => "移到回收站",
-                (Language::Chinese, FileOperationKind::PermanentDelete) => "永久删除",
-                (Language::Chinese, FileOperationKind::FastRemove) => "释放空间",
-                (Language::English, FileOperationKind::CreateFolder) => "New folder",
-                (Language::English, FileOperationKind::Rename) => "Rename",
-                (Language::English, FileOperationKind::Copy) => "Copy",
-                (Language::English, FileOperationKind::Move) => "Move",
-                (Language::English, FileOperationKind::RecycleDelete) => "Move to Recycle Bin",
-                (Language::English, FileOperationKind::PermanentDelete) => "Delete permanently",
-                (Language::English, FileOperationKind::FastRemove) => "Free space",
+                (Language::Chinese, FileOperationKind::CreateFolder) => "正在新建文件夹",
+                (Language::Chinese, FileOperationKind::Rename) => "正在重命名",
+                (Language::Chinese, FileOperationKind::Copy) => "正在复制",
+                (Language::Chinese, FileOperationKind::Move) => "正在移动",
+                (Language::Chinese, FileOperationKind::RecycleDelete) => "正在移到回收站",
+                (Language::Chinese, FileOperationKind::PermanentDelete) => "正在删除",
+                (Language::Chinese, FileOperationKind::FastRemove) => "正在删除",
+                (Language::English, FileOperationKind::CreateFolder) => "Creating folder",
+                (Language::English, FileOperationKind::Rename) => "Renaming",
+                (Language::English, FileOperationKind::Copy) => "Copying",
+                (Language::English, FileOperationKind::Move) => "Moving",
+                (Language::English, FileOperationKind::RecycleDelete) => "Recycling",
+                (Language::English, FileOperationKind::PermanentDelete) => "Deleting",
+                (Language::English, FileOperationKind::FastRemove) => "Deleting",
             };
             let progress = task
                 .progress
@@ -3557,15 +3927,14 @@ fn update_selection_summary(ui: &AppWindow, state: &SharedSessions) {
                         completed as f32 / task.items.len() as f32
                     }
                 });
-            let byte_detail = task
+            let (transferred, speed_text, eta_text) = task
                 .progress
                 .total_bytes
                 .filter(|total| *total > 0)
                 .map(|total| {
                     let elapsed = task
-                        .created_at
-                        .elapsed()
-                        .unwrap_or_default()
+                        .cancellation
+                        .active_elapsed(task.started_at)
                         .as_secs_f64()
                         .max(0.001);
                     let speed = task.progress.processed_bytes as f64 / elapsed;
@@ -3575,53 +3944,112 @@ fn update_selection_summary(ui: &AppWindow, state: &SharedSessions) {
                     } else {
                         0.0
                     };
-                    format!(
-                        " · {:.1}/{:.1} MB · {:.1} MB/s · {:.0}s",
-                        task.progress.processed_bytes as f64 / 1_048_576.0,
-                        total as f64 / 1_048_576.0,
-                        speed / 1_048_576.0,
-                        eta
+                    (
+                        format!(
+                            "{:.1} / {:.1} MB",
+                            task.progress.processed_bytes as f64 / 1_048_576.0,
+                            total as f64 / 1_048_576.0
+                        ),
+                        if task.state == OperationState::Paused {
+                            match app.language {
+                                Language::Chinese => "已暂停".to_owned(),
+                                Language::English => "Paused".to_owned(),
+                            }
+                        } else {
+                            format!("{:.1} MB/s", speed / 1_048_576.0)
+                        },
+                        match (app.language, task.state == OperationState::Paused) {
+                            (_, true) => "—".to_owned(),
+                            (language, false) => format_remaining_time(language, eta),
+                        },
                     )
                 })
+                .unwrap_or_else(|| {
+                    (
+                        format!("{completed}/{}", task.items.len()),
+                        String::new(),
+                        String::new(),
+                    )
+                });
+            let source = task
+                .items
+                .first()
+                .and_then(|item| item.source.as_deref())
+                .map(display_path)
                 .unwrap_or_default();
-            let error_detail = task
-                .result
-                .as_ref()
-                .and_then(|result| result.failed.first())
-                .map(|(_, error)| format!(" · {error}"))
+            let destination = task
+                .items
+                .first()
+                .and_then(|item| item.destination.as_deref())
+                .and_then(Path::parent)
+                .map(display_path)
                 .unwrap_or_default();
             OperationRow {
                 id: task.id.0 as i32,
                 title: title.into(),
-                detail: format!(
-                    "{completed}/{}{byte_detail}{error_detail}",
-                    task.items.len()
-                )
-                .into(),
+                percent: format!("{:.0}%", (progress * 100.0).clamp(0.0, 100.0)).into(),
+                file_progress: task
+                    .progress
+                    .total_files
+                    .map(|total| format!("{} / {total}", task.progress.completed_files.min(total)))
+                    .unwrap_or_else(|| match app.language {
+                        Language::Chinese => "正在准备…".to_owned(),
+                        Language::English => "Preparing…".to_owned(),
+                    })
+                    .into(),
+                transferred: transferred.into(),
+                speed: speed_text.into(),
+                eta: eta_text.into(),
+                source: source.into(),
+                destination: destination.into(),
+                paused: task.state == OperationState::Paused,
+                current_item: task
+                    .progress
+                    .current_item
+                    .as_deref()
+                    .and_then(Path::file_name)
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+                    .into(),
                 progress,
                 state: operation_state_index(task.state),
-                can_cancel: task.state.is_active(),
-                can_retry: task.state.is_terminal()
-                    && task.items.iter().any(|item| {
-                        matches!(
-                            item.state,
-                            ItemState::Failed | ItemState::Cancelled | ItemState::Pending
-                        )
-                    }),
+                can_cancel: matches!(
+                    task.state,
+                    OperationState::Queued
+                        | OperationState::Preflight
+                        | OperationState::Running
+                        | OperationState::Paused
+                        | OperationState::WaitingConflict
+                ),
+                can_pause: matches!(task.state, OperationState::Running | OperationState::Paused),
+                can_retry: matches!(
+                    task.state,
+                    OperationState::Failed | OperationState::PartiallyCompleted
+                ) && task.items.iter().any(|item| {
+                    matches!(
+                        item.state,
+                        ItemState::Failed | ItemState::Cancelled | ItemState::Pending
+                    )
+                }),
             }
         })
-        .collect::<Vec<_>>();
-    ui.set_operations(ModelRc::new(VecModel::from(operation_rows)));
-    ui.set_operation_error(
-        app.operation_errors
-            .last()
-            .cloned()
-            .unwrap_or_default()
-            .into(),
-    );
-    ui.set_selected_count(tab.selected.len() as i32);
-    ui.set_context_menu_has_entry(!tab.selected.is_empty() || tab.focused.is_some());
-    ui.set_status_text(status_text(tab, Texts::new(app.language)).into());
+        .collect()
+}
+
+fn format_remaining_time(language: Language, seconds: f64) -> String {
+    let seconds = seconds.max(0.0).round() as u64;
+    if seconds < 60 {
+        return match language {
+            Language::Chinese => format!("预计剩余 {seconds} 秒"),
+            Language::English => format!("About {seconds} seconds remaining"),
+        };
+    }
+    let minutes = seconds / 60;
+    let seconds = seconds % 60;
+    match language {
+        Language::Chinese => format!("预计剩余 {minutes} 分 {seconds} 秒"),
+        Language::English => format!("About {minutes}min {seconds}s remaining"),
+    }
 }
 fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
     let app = state.lock().expect("app state mutex is not poisoned");
@@ -3830,6 +4258,7 @@ fn operation_state_index(state: OperationState) -> i32 {
         OperationState::Queued => 0,
         OperationState::Preflight => 1,
         OperationState::Running => 2,
+        OperationState::Paused => 9,
         OperationState::WaitingConflict => 3,
         OperationState::Cancelling => 4,
         OperationState::Completed => 5,
@@ -4192,6 +4621,22 @@ fn initial_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remaining_time_uses_minutes_only_when_needed() {
+        assert_eq!(
+            format_remaining_time(Language::English, 42.0),
+            "About 42 seconds remaining"
+        );
+        assert_eq!(
+            format_remaining_time(Language::English, 102.0),
+            "About 1min 42s remaining"
+        );
+        assert_eq!(
+            format_remaining_time(Language::Chinese, 102.0),
+            "预计剩余 1 分 42 秒"
+        );
+    }
 
     #[test]
     fn reorders_columns_in_both_directions_and_clamps_edges() {

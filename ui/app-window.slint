@@ -8,7 +8,7 @@ export struct TabRow { id: int, title: string, active: bool, loading: bool, icon
 export struct SidebarRow { index: int, label: string, icon-kind: int, is-drive: bool, icon: image }
 export struct ColumnRow { kind: int }
 export struct ContextCommandRow { id: int, label: string, enabled: bool, separator: bool }
-export struct OperationRow { id: int, title: string, detail: string, progress: float, state: int, can-cancel: bool, can-retry: bool }
+export struct OperationRow { id: int, title: string, percent: string, file-progress: string, transferred: string, speed: string, eta: string, current-item: string, source: string, destination: string, progress: float, state: int, paused: bool, can-pause: bool, can-cancel: bool, can-retry: bool }
 export global VisualStyle {
     in-out property <bool> dark-theme: false;
     out property <color> c24252a: dark-theme ? #f2f2f2 : #24252a;
@@ -51,6 +51,129 @@ export global VisualStyle {
     out property <color> cf8f8f9: dark-theme ? #303030 : #f8f8f9;
     out property <color> cfafbfc: dark-theme ? #272727 : #fafbfc;
     out property <color> cffffff: dark-theme ? #252525 : #ffffff;
+}
+
+export component OperationWindow inherits Window {
+    title: root.text-file-operations;
+    icon: @image-url("../assets/app-icon.png");
+    no-frame: true;
+    resize-border-width: 0px;
+    preferred-width: 580px;
+    preferred-height: 255px;
+    min-width: 580px;
+    max-width: 580px;
+    min-height: 255px;
+    max-height: 255px;
+    background: VisualStyle.cffffff;
+    default-font-family: "Segoe UI";
+
+    in property <[OperationRow]> operations;
+    in property <bool> dark-theme: false;
+    in property <string> text-file-operations: "文件操作";
+    in property <string> text-cancel-operation: "取消";
+    in property <string> text-retry-operation: "重试";
+    in property <string> text-no-operations: "没有文件操作";
+    in property <string> text-window-minimize: "最小化";
+    in property <string> text-window-close: "关闭";
+    in property <string> text-pause-operation: "暂停";
+    in property <string> text-resume-operation: "继续";
+
+    callback cancel-operation(int);
+    callback toggle-pause-operation(int);
+    callback retry-operation(int);
+    callback request-hide();
+    callback drag-window();
+
+    changed dark-theme => { VisualStyle.dark-theme = root.dark-theme; }
+
+    VerticalLayout {
+        Rectangle {
+            height: 48px;
+            background: VisualStyle.cffffff;
+            HorizontalLayout {
+                padding-left: 16px;
+                Text {
+                    text: root.operations.length > 0 ? root.operations[0].title + " | " + root.operations[0].percent : root.text-file-operations;
+                    color: VisualStyle.c30333a;
+                    font-size: 16px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                Rectangle { width: 46px; Text { text: "—"; color: VisualStyle.c303138; horizontal-alignment: center; vertical-alignment: center; } TouchArea { clicked => { root.minimized = true; } } }
+                Rectangle { width: 46px; Text { text: "×"; color: VisualStyle.c303138; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; } TouchArea { pointer-event(event) => { if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) { if (root.operations.length > 0 && root.operations[0].can-cancel) { root.cancel-operation(root.operations[0].id); } else { root.request-hide(); } } } } }
+            }
+            TouchArea {
+                width: parent.width - 92px;
+                pointer-event(event) => {
+                    if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                        root.drag-window();
+                    }
+                }
+            }
+        }
+        Rectangle {
+            vertical-stretch: 1;
+            background: VisualStyle.cffffff;
+            if root.operations.length == 0: Text {
+                text: root.text-no-operations;
+                color: VisualStyle.c62656f;
+                font-size: 14px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            if root.operations.length > 0: Rectangle {
+                width: parent.width;
+                height: parent.height;
+                if root.operations.length > 0: Rectangle {
+                    property <OperationRow> operation: root.operations[0];
+                    width: parent.width;
+                    height: parent.height;
+                    background: VisualStyle.cffffff;
+                    Text { x: 20px; y: 8px; width: parent.width - 40px; height: 20px; text: "From:  " + operation.source; color: VisualStyle.c62656f; font-size: 12px; overflow: elide; vertical-alignment: center; }
+                    Text { x: 20px; y: 32px; width: parent.width - 40px; height: 20px; text: "To:       " + operation.destination; color: VisualStyle.c62656f; font-size: 12px; overflow: elide; vertical-alignment: center; }
+                    Text { x: 20px; y: 56px; width: parent.width - 40px; height: 20px; text: "File:     " + operation.current-item; color: VisualStyle.c30333a; font-size: 13px; overflow: elide; vertical-alignment: center; }
+                    Rectangle {
+                            x: 20px;
+                            y: 84px;
+                            width: parent.width - 40px;
+                            height: 22px;
+                            border-radius: 11px;
+                            background: VisualStyle.ce0e2e7;
+                            Rectangle {
+                                x: 0px;
+                                width: max(0px, min(parent.width, parent.width * operation.progress));
+                                height: parent.height;
+                                border-radius: 11px;
+                                background: operation.state == 8 || operation.state == 7 ? #b3261e : VisualStyle.cdce6ff;
+                            }
+                            Text { text: operation.file-progress; color: VisualStyle.c30333a; font-size: 11px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    HorizontalLayout {
+                            x: 20px;
+                            y: 112px;
+                            width: parent.width - 40px;
+                            height: 20px;
+                            spacing: 20px;
+                            Text { text: operation.transferred; color: VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; }
+                            Text { text: operation.speed; color: VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Text { text: operation.eta; color: VisualStyle.c62656f; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+                    }
+                    HorizontalLayout {
+                            x: parent.width - self.width - 20px;
+                            y: 148px;
+                            width: 176px;
+                            height: 34px;
+                            spacing: 8px;
+                            Rectangle { visible: operation.can-pause; width: 84px; height: 34px; horizontal-stretch: 0; border-radius: 5px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: pause-touch.pressed ? VisualStyle.cdce6ff : pause-touch.has-hover ? VisualStyle.ceff4ff : VisualStyle.cffffff; Text { text: operation.paused ? root.text-resume-operation : root.text-pause-operation; color: VisualStyle.c30333a; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; } pause-touch := TouchArea { width: parent.width; height: parent.height; mouse-cursor: pointer; pointer-event(event) => { if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) { root.toggle-pause-operation(operation.id); } } } }
+                            Rectangle { visible: operation.can-cancel; width: 84px; height: 34px; horizontal-stretch: 0; border-radius: 5px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: cancel-touch.pressed ? VisualStyle.cdce6ff : cancel-touch.has-hover ? VisualStyle.ceff4ff : VisualStyle.cffffff; Text { text: root.text-cancel-operation; color: VisualStyle.c30333a; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; } cancel-touch := TouchArea { width: parent.width; height: parent.height; mouse-cursor: pointer; pointer-event(event) => { if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) { root.cancel-operation(operation.id); } } } }
+                            Rectangle { visible: operation.can-retry; width: 76px; height: 32px; border-radius: 5px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: retry-touch.pressed ? VisualStyle.cdde3ed : retry-touch.has-hover ? VisualStyle.cedf1f6 : VisualStyle.cffffff; Text { text: root.text-retry-operation; color: VisualStyle.c30333a; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; } retry-touch := TouchArea { width: parent.width; height: parent.height; mouse-cursor: pointer; clicked => { root.retry-operation(operation.id); } } }
+                    }
+                }
+            }
+        }
+    }
 }
 
 component InlineIcon inherits Rectangle {
@@ -490,6 +613,7 @@ export component AppWindow inherits Window {
     callback cancel-permanent-delete();
     callback cancel-operation(int);
     callback retry-operation(int);
+    callback open-operation-window();
     callback resolve-conflict(int, bool);
     callback request-close();
     callback wait-on-close();
@@ -960,7 +1084,7 @@ list := ListView {
                         x: parent.width - 126px; width: 118px; height: 26px; y: 2px; border-radius: 5px;
                         background: task-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
                         Text { text: root.operations.length + " " + root.text-task-count; color: VisualStyle.c30333a; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
-                        task-touch := TouchArea { clicked => { root.task-center-open = !root.task-center-open; } mouse-cursor: pointer; }
+                        task-touch := TouchArea { clicked => { root.open-operation-window(); } mouse-cursor: pointer; }
                         accessible-role: button; accessible-label: "File operations";
                     }
                 }
@@ -1094,23 +1218,6 @@ list := ListView {
                 Text { visible: !command.separator; x: 10px; text: command.label; color: command.enabled ? VisualStyle.c30333a : VisualStyle.c9a9da3; font-size: 12px; vertical-alignment: center; }
                 command-touch := TouchArea { enabled: command.enabled && !command.separator; clicked => { root.context-menu-open = false; root.invoke-context-command(command.id); } }
                 accessible-role: button; accessible-label: command.label; accessible-enabled: command.enabled;
-            }
-        }
-    }
-    if root.task-center-open: TouchArea { z: 30; width: parent.width; height: parent.height; clicked => { root.task-center-open = false; } }
-    if root.task-center-open: Rectangle {
-        z: 31; x: parent.width - 390px; y: 50px; width: 374px; height: min(parent.height - 70px, 80px + root.operations.length * 82px);
-        background: VisualStyle.cffffff; border-color: VisualStyle.ce0e2e7; border-width: 1px; border-radius: 8px;
-        VerticalLayout { padding: 12px; spacing: 8px;
-            Text { text: root.text-file-operations; color: VisualStyle.c30333a; font-size: 16px; font-weight: 600; height: 26px; }
-            Text { visible: root.operation-error != ""; text: root.operation-error; color: #b3261e; font-size: 11px; wrap: word-wrap; }
-            for operation in root.operations: Rectangle {
-                height: 74px; background: VisualStyle.cfafbfc; border-radius: 6px; border-width: 1px; border-color: VisualStyle.ce0e2e7;
-                VerticalLayout { padding: 8px; spacing: 4px;
-                    HorizontalLayout { Text { text: operation.title; color: VisualStyle.c30333a; font-size: 12px; font-weight: 600; horizontal-stretch: 1; } Text { text: operation.detail; color: VisualStyle.c72747d; font-size: 11px; } }
-                    Rectangle { height: 5px; border-radius: 3px; background: VisualStyle.ce0e2e7; Rectangle { width: max(0px, min(parent.width, parent.width * operation.progress)); height: parent.height; border-radius: 3px; background: VisualStyle.c4f6bed; } }
-                    HorizontalLayout { Rectangle { horizontal-stretch: 1; } CommandButton { visible: operation.can-cancel; width: 68px; label: root.text-cancel-operation; clicked => { root.cancel-operation(operation.id); } } CommandButton { visible: operation.can-retry; width: 68px; label: root.text-retry-operation; clicked => { root.retry-operation(operation.id); } } }
-                }
             }
         }
     }

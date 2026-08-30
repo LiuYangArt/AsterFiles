@@ -4,10 +4,10 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 use crate::domain::TabId;
@@ -34,6 +34,7 @@ pub enum OperationState {
     Queued,
     Preflight,
     Running,
+    Paused,
     WaitingConflict,
     Cancelling,
     Completed,
@@ -49,6 +50,7 @@ impl OperationState {
             Self::Queued
                 | Self::Preflight
                 | Self::Running
+                | Self::Paused
                 | Self::WaitingConflict
                 | Self::Cancelling
         )
@@ -64,8 +66,9 @@ impl OperationState {
                 | (Preflight, Running | Cancelling | Completed | Failed)
                 | (
                     Running,
-                    WaitingConflict | Cancelling | Completed | PartiallyCompleted | Failed
+                    Paused | WaitingConflict | Cancelling | Completed | PartiallyCompleted | Failed
                 )
+                | (Paused, Running | Cancelling)
                 | (
                     WaitingConflict,
                     Running | Cancelling | PartiallyCompleted | Failed
@@ -146,6 +149,8 @@ impl OperationItem {
 pub struct OperationProgress {
     pub total_items: usize,
     pub completed_items: usize,
+    pub total_files: Option<usize>,
+    pub completed_files: usize,
     pub processed_bytes: u64,
     pub total_bytes: Option<u64>,
     pub current_item: Option<PathBuf>,
@@ -183,8 +188,22 @@ pub struct OperationEvent {
     pub changes: Vec<FileChange>,
 }
 
+#[derive(Debug, Default)]
+struct PauseState {
+    paused: bool,
+    started: Option<Instant>,
+    accumulated: Duration,
+}
+
+#[derive(Debug)]
+struct OperationControl {
+    cancelled: AtomicBool,
+    pause: Mutex<PauseState>,
+    wake: Condvar,
+}
+
 #[derive(Debug, Clone)]
-pub struct CancellationToken(Arc<AtomicBool>);
+pub struct CancellationToken(Arc<OperationControl>);
 impl Default for CancellationToken {
     fn default() -> Self {
         Self::new()
@@ -192,13 +211,61 @@ impl Default for CancellationToken {
 }
 impl CancellationToken {
     pub fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
+        Self(Arc::new(OperationControl {
+            cancelled: AtomicBool::new(false),
+            pause: Mutex::new(PauseState::default()),
+            wake: Condvar::new(),
+        }))
     }
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.cancelled.store(true, Ordering::Release);
+        self.0.wake.notify_all();
     }
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.cancelled.load(Ordering::Acquire)
+    }
+    pub fn pause(&self) {
+        if let Ok(mut state) = self.0.pause.lock()
+            && !state.paused
+        {
+            state.paused = true;
+            state.started = Some(Instant::now());
+        }
+    }
+    pub fn resume(&self) {
+        if let Ok(mut state) = self.0.pause.lock()
+            && state.paused
+        {
+            state.paused = false;
+            if let Some(started) = state.started.take() {
+                state.accumulated += started.elapsed();
+            }
+            self.0.wake.notify_all();
+        }
+    }
+    pub fn is_paused(&self) -> bool {
+        self.0.pause.lock().is_ok_and(|state| state.paused)
+    }
+    pub fn wait_if_paused(&self) {
+        let Ok(mut state) = self.0.pause.lock() else {
+            return;
+        };
+        while state.paused && !self.is_cancelled() {
+            let Ok(next) = self.0.wake.wait(state) else {
+                return;
+            };
+            state = next;
+        }
+    }
+    pub fn active_elapsed(&self, started: Instant) -> Duration {
+        let elapsed = started.elapsed();
+        let paused = self.0.pause.lock().map_or(Duration::ZERO, |state| {
+            state.accumulated
+                + state
+                    .started
+                    .map_or(Duration::ZERO, |value| value.elapsed())
+        });
+        elapsed.saturating_sub(paused)
     }
 }
 
@@ -207,6 +274,8 @@ pub struct OperationTask {
     pub id: OperationId,
     pub kind: FileOperationKind,
     pub created_at: SystemTime,
+    pub started_at: Instant,
+    pub finished_at: Option<Instant>,
     pub origin_tab: Option<TabId>,
     pub state: OperationState,
     pub execution_round: u32,
@@ -230,6 +299,8 @@ impl OperationTask {
             id,
             kind,
             created_at: SystemTime::now(),
+            started_at: Instant::now(),
+            finished_at: None,
             origin_tab,
             state: OperationState::Queued,
             execution_round: 1,
@@ -289,11 +360,28 @@ impl OperationTask {
             OperationState::Queued => self.transition(OperationState::Cancelled),
             OperationState::Preflight
             | OperationState::Running
+            | OperationState::Paused
             | OperationState::WaitingConflict => self.transition(OperationState::Cancelling),
             OperationState::Cancelling => Ok(()),
             _ => Err(StateTransitionError {
                 from: self.state,
                 to: OperationState::Cancelling,
+            }),
+        }
+    }
+    pub fn toggle_pause(&mut self) -> Result<(), StateTransitionError> {
+        match self.state {
+            OperationState::Running => {
+                self.cancellation.pause();
+                self.transition(OperationState::Paused)
+            }
+            OperationState::Paused => {
+                self.cancellation.resume();
+                self.transition(OperationState::Running)
+            }
+            _ => Err(StateTransitionError {
+                from: self.state,
+                to: OperationState::Paused,
             }),
         }
     }
@@ -320,6 +408,8 @@ impl OperationTask {
         };
         self.conflict = None;
         self.result = None;
+        self.started_at = Instant::now();
+        self.finished_at = None;
         self.cancellation = CancellationToken::new();
         self.conflict_defaults.clear();
         self.sequence.0 += 1;
@@ -404,8 +494,26 @@ impl OperationManager {
         let task = self.require_active_mut(id)?;
         task.transition(state)?;
         task.result = Some(result);
+        task.finished_at = Some(Instant::now());
         self.active = None;
         Ok(())
+    }
+    pub fn clear_terminal(&mut self) -> usize {
+        let before = self.tasks.len();
+        self.tasks.retain(|_, task| !task.state.is_terminal());
+        before - self.tasks.len()
+    }
+    pub fn prune_transient(&mut self, minimum_age: Duration) -> usize {
+        let before = self.tasks.len();
+        self.tasks.retain(|_, task| {
+            !matches!(
+                task.state,
+                OperationState::Completed | OperationState::Cancelled
+            ) || task
+                .finished_at
+                .is_none_or(|finished| finished.elapsed() < minimum_age)
+        });
+        before - self.tasks.len()
     }
     pub fn cancel(&mut self, id: OperationId) -> Result<(), StateTransitionError> {
         let was_active = self.active == Some(id);
@@ -415,6 +523,25 @@ impl OperationManager {
             self.queue.retain(|queued| *queued != id);
         }
         Ok(())
+    }
+    pub fn toggle_pause(&mut self, id: OperationId) -> Result<(), StateTransitionError> {
+        self.tasks
+            .get_mut(&id)
+            .expect("operation must exist")
+            .toggle_pause()
+    }
+    pub fn remove_terminal(&mut self, id: OperationId) -> bool {
+        if self
+            .tasks
+            .get(&id)
+            .is_some_and(|task| task.state.is_terminal())
+        {
+            self.tasks.remove(&id);
+            self.queue.retain(|queued| *queued != id);
+            true
+        } else {
+            false
+        }
     }
     pub fn retry(&mut self, id: OperationId) -> bool {
         if self.active == Some(id) {
@@ -538,6 +665,26 @@ mod tests {
         assert_eq!(manager.start_next().unwrap(), Some(second));
     }
     #[test]
+    fn running_task_can_pause_resume_and_cancel() {
+        let mut manager = OperationManager::new();
+        let id = manager.submit(FileOperationKind::Copy, None, vec![item("a")]);
+        manager.start_next().unwrap();
+        manager.mark_running(id).unwrap();
+
+        manager.toggle_pause(id).unwrap();
+        assert_eq!(manager.task(id).unwrap().state, OperationState::Paused);
+        assert!(manager.task(id).unwrap().cancellation.is_paused());
+
+        manager.toggle_pause(id).unwrap();
+        assert_eq!(manager.task(id).unwrap().state, OperationState::Running);
+        assert!(!manager.task(id).unwrap().cancellation.is_paused());
+
+        manager.toggle_pause(id).unwrap();
+        manager.cancel(id).unwrap();
+        assert_eq!(manager.task(id).unwrap().state, OperationState::Cancelling);
+        assert!(manager.task(id).unwrap().cancellation.is_cancelled());
+    }
+    #[test]
     fn retry_keeps_successes() {
         let mut manager = OperationManager::new();
         let id = manager.submit(
@@ -570,5 +717,30 @@ mod tests {
         assert_eq!(task.progress.total_items, 2);
         assert_eq!(task.items[0].state, ItemState::Succeeded);
         assert_eq!(task.items[1].state, ItemState::Pending);
+    }
+
+    #[test]
+    fn terminal_cleanup_keeps_active_tasks() {
+        let mut manager = OperationManager::new();
+        let finished = manager.submit(FileOperationKind::Copy, None, vec![item("done")]);
+        let queued = manager.submit(FileOperationKind::Move, None, vec![item("queued")]);
+        assert_eq!(manager.start_next().unwrap(), Some(finished));
+        manager.mark_running(finished).unwrap();
+        manager
+            .finish(
+                finished,
+                OperationState::Completed,
+                OperationResult {
+                    succeeded: vec![PathBuf::from("done")],
+                    skipped: vec![],
+                    failed: vec![],
+                    affected_directories: vec![],
+                },
+            )
+            .unwrap();
+
+        assert_eq!(manager.clear_terminal(), 1);
+        assert!(manager.task(finished).is_none());
+        assert_eq!(manager.task(queued).unwrap().state, OperationState::Queued);
     }
 }
