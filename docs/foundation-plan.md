@@ -87,9 +87,9 @@ OLE 的 `IDataObject`、`IDropSource`、`IDropTarget`、窗口注册和拖放循
 
 ## Everything 平台边界（2026-08-30）
 
-Everything 采用唯一正式实现：`platform/windows/everything.rs` 中的官方 WM_COPYDATA Query2 IPC，不分发 SDK DLL。选择依据是 Query2 已直接提供实例选择、版本/位数/数据库及文件夹大小索引能力、分页与排序，以及名称、父目录、完整原始路径、大小和修改时间字段；本机原型实证可连接 1.5a 并返回 Unicode 原始路径。相比 SDK DLL，该方案减少一个分发组件，同时保留同一官方 IPC 能力面。
+Everything 适配统一位于 `platform/windows/everything.rs`，不分发 SDK DLL。搜索、状态、分页和排序使用官方 WM_COPYDATA Query2；文件夹大小使用 Everything 1.5 的 Everything3 命名管道命令 18，直接按完整 UTF-8 原始路径读取索引值。两条官方 IPC 通道严格分工，大小不再通过搜索结果间接推导。
 
-Everything 使用独立工作线程和专用消息窗口，不占目录、Shell 图标或文件操作线程，也不在 Slint UI 线程执行 IPC、进程、路径或索引操作。搜索批次按 `TabId + RequestId + PageSource` 接受，文件夹大小另校验 `EntryId + 原始路径`；所有 IPC 都有有限超时。UNC 导航仍由目录工作池负责，未索引 UNC 不搜索、不计算大小、不递归回退。
+Everything 使用后台工作线程和 Query2 专用消息窗口，不占目录、Shell 图标或文件操作线程，也不在 Slint UI 线程执行 IPC、进程、路径或索引操作。命名管道只连接已保存实例，跨请求复用；断线后当前请求最多受控重连一次。搜索批次按 `TabId + RequestId + PageSource` 接受，文件夹大小另校验 `EntryId + 原始路径`；所有读写均有有限超时并在超时后取消。UNC 导航仍由目录工作池负责，未索引 UNC 不解析、不计算大小、不递归回退。
 
 当前 E1–E3 已接入；持久化格式直接升级为 ASTF5，不保留旧格式兼容。验证命令为 `cargo test --no-fail-fast`、`python tools/verify.py`、`cargo build`；汇总位于 `artifacts/verify/summary.json`，Everything 实证日志写入 `artifacts/logs/`。
 ## 验证与产物

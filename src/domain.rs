@@ -87,8 +87,10 @@ pub enum FolderSizeState {
     Querying,
     Value(u64),
     NotIndexed,
+    NotFound,
     TimedOut,
     Disconnected,
+    ProtocolError,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameHighlightSegment {

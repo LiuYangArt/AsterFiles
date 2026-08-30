@@ -67,7 +67,7 @@ struct AppState {
     search_column_order: [u8; 4],
     everything_config: crate::domain::EverythingConfig,
     everything_status: String,
-    everything_folder_sizes_available: bool,
+    everything_folder_sizes_indexed: Option<bool>,
 }
 
 impl AppState {
@@ -144,7 +144,7 @@ impl AppState {
             search_column_order,
             everything_config,
             everything_status: String::new(),
-            everything_folder_sizes_available: false,
+            everything_folder_sizes_indexed: None,
         }
     }
 
@@ -371,6 +371,16 @@ enum EverythingEvent {
             platform::windows::everything::EverythingError,
         >,
     ),
+}
+
+enum FolderSizeWork {
+    Query {
+        tab_id: TabId,
+        request_id: RequestId,
+        entry_id: EntryId,
+        path: PathBuf,
+    },
+    Configure(crate::domain::EverythingConfig),
 }
 struct IconRequest {
     tab_id: TabId,
@@ -4475,6 +4485,41 @@ fn spawn_everything_worker(
 ) {
     let (request_sender, request_receiver) = mpsc::channel::<EverythingRequest>();
     let (event_sender, event_receiver) = mpsc::channel::<EverythingEvent>();
+    let (folder_sender, folder_receiver) = mpsc::channel::<FolderSizeWork>();
+    let folder_events = event_sender.clone();
+    let folder_config = config.clone();
+    thread::spawn(move || {
+        let mut client = platform_everything_config(&folder_config)
+            .and_then(|value| platform::windows::everything::EverythingClient::new(value).ok());
+        while let Ok(work) = folder_receiver.recv() {
+            match work {
+                FolderSizeWork::Query {
+                    tab_id,
+                    request_id,
+                    entry_id,
+                    path,
+                } => {
+                    let state = client
+                        .as_ref()
+                        .map_or(FolderSizeState::Disconnected, |client| {
+                            folder_size_state(client.folder_size(&path, Duration::from_secs(2)))
+                        });
+                    let _ = folder_events.send(EverythingEvent::FolderSize {
+                        tab_id,
+                        request_id,
+                        entry_id,
+                        path,
+                        state,
+                    });
+                }
+                FolderSizeWork::Configure(config) => {
+                    client = platform_everything_config(&config).and_then(|value| {
+                        platform::windows::everything::EverythingClient::new(value).ok()
+                    });
+                }
+            }
+        }
+    });
     thread::spawn(move || {
         let mut client = platform_everything_config(&config)
             .and_then(|value| platform::windows::everything::EverythingClient::new(value).ok());
@@ -4578,33 +4623,15 @@ fn spawn_everything_worker(
                     entry_id,
                     path,
                 } => {
-                    let state = client
-                        .as_ref()
-                        .map_or(FolderSizeState::Disconnected, |client| {
-                            match client.folder_size(&path, Duration::from_secs(2)) {
-                                Ok(
-                                    platform::windows::everything::EverythingFolderSize::Indexed(
-                                        value,
-                                    ),
-                                ) => FolderSizeState::Value(value),
-                                Ok(
-                                    platform::windows::everything::EverythingFolderSize::NotIndexed,
-                                ) => FolderSizeState::NotIndexed,
-                                Err(platform::windows::everything::EverythingError::Timeout) => {
-                                    FolderSizeState::TimedOut
-                                }
-                                Err(_) => FolderSizeState::Disconnected,
-                            }
-                        });
-                    let _ = event_sender.send(EverythingEvent::FolderSize {
+                    let _ = folder_sender.send(FolderSizeWork::Query {
                         tab_id,
                         request_id,
                         entry_id,
                         path,
-                        state,
                     });
                 }
                 EverythingRequest::Configure(config) => {
+                    let _ = folder_sender.send(FolderSizeWork::Configure(config.clone()));
                     client = platform_everything_config(&config).and_then(|value| {
                         platform::windows::everything::EverythingClient::new(value).ok()
                     });
@@ -4630,6 +4657,63 @@ fn spawn_everything_worker(
     (request_sender, event_receiver)
 }
 
+fn folder_size_state(
+    result: Result<
+        platform::windows::everything::EverythingFolderSize,
+        platform::windows::everything::EverythingError,
+    >,
+) -> FolderSizeState {
+    use platform::windows::everything::{EverythingError, EverythingFolderSize};
+
+    match result {
+        Ok(EverythingFolderSize::Indexed(value)) => FolderSizeState::Value(value),
+        Ok(EverythingFolderSize::NotIndexed) => FolderSizeState::NotIndexed,
+        Err(EverythingError::Timeout) => FolderSizeState::TimedOut,
+        Err(
+            EverythingError::NotConfigured
+            | EverythingError::NotRunning(_)
+            | EverythingError::FolderSizePipeUnavailable(_)
+            | EverythingError::FolderSizeDisconnected,
+        ) => FolderSizeState::Disconnected,
+        Err(EverythingError::FolderSizeRejected(404)) => FolderSizeState::NotFound,
+        Err(EverythingError::FolderSizeRejected(_)) => FolderSizeState::ProtocolError,
+        Err(EverythingError::Protocol(message)) if protocol_reports_not_found(&message) => {
+            FolderSizeState::NotFound
+        }
+        Err(EverythingError::Protocol(_) | EverythingError::QueryRejected) => {
+            FolderSizeState::ProtocolError
+        }
+        Err(_) => FolderSizeState::ProtocolError,
+    }
+}
+
+fn protocol_reports_not_found(message: &str) -> bool {
+    message
+        .split(|character: char| !character.is_ascii_digit())
+        .any(|part| part == "404")
+}
+fn apply_folder_size_event(
+    app: &mut AppState,
+    tab_id: TabId,
+    request_id: RequestId,
+    entry_id: EntryId,
+    path: &Path,
+    state: FolderSizeState,
+) -> bool {
+    let Some(tab) = app.tabs.get_mut(&tab_id) else {
+        return false;
+    };
+    if !tab.accepts_page(request_id, PageSource::Directory) {
+        return false;
+    }
+    let Some(index) = tab.entry_indices.get(&entry_id).copied() else {
+        return false;
+    };
+    let Some(entry) = Arc::make_mut(&mut tab.entries).get_mut(index) else {
+        return false;
+    };
+    entry.set_folder_size(entry_id, path, state)
+}
 fn start_everything_event_pump(
     ui: &AppWindow,
     receiver: mpsc::Receiver<EverythingEvent>,
@@ -4650,15 +4734,19 @@ fn start_everything_event_pump(
                     tab.search_state = match error { platform::windows::everything::EverythingError::NotConfigured => SearchState::NotConfigured, platform::windows::everything::EverythingError::NotRunning(_) => SearchState::Disconnected, platform::windows::everything::EverythingError::Timeout => SearchState::TimedOut, _ => SearchState::Failed };
                     tab.error = Some(error.to_string());
                 },
-                EverythingEvent::FolderSize { tab_id, request_id, entry_id, path, state: size } => if let Some(tab) = app.tabs.get_mut(&tab_id)
-                    && tab.accepts_page(request_id, PageSource::Directory)
-                    && let Some(index) = tab.entry_indices.get(&entry_id).copied()
-                    && let Some(entry) = Arc::make_mut(&mut tab.entries).get_mut(index) {
-                    entry.set_folder_size(entry_id, &path, size);
-                },
+                EverythingEvent::FolderSize { tab_id, request_id, entry_id, path, state: size } => {
+                    apply_folder_size_event(
+                        &mut app,
+                        tab_id,
+                        request_id,
+                        entry_id,
+                        &path,
+                        size,
+                    );
+                }
                 EverythingEvent::Status(result) => match result {
-                    Ok(status) => { app.everything_status = format!("Everything {} · {}", status.version, if status.folder_size_indexed { "文件夹大小已索引" } else { "文件夹大小未索引" }); app.everything_folder_sizes_available = status.folder_size_indexed; app.everything_config.verified_version = Some(status.version.to_string()); }
-                    Err(error) => { app.everything_status = error.to_string(); app.everything_folder_sizes_available = false; }
+                    Ok(status) => { app.everything_status = format!("Everything {} · {}", status.version, if status.folder_size_indexed { "文件夹大小已索引" } else { "文件夹大小未索引" }); app.everything_folder_sizes_indexed = Some(status.folder_size_indexed); app.everything_config.verified_version = Some(status.version.to_string()); }
+                    Err(error) => { app.everything_status = error.to_string(); app.everything_folder_sizes_indexed = None; }
                 },
             }
             drop(app); refresh_ui(&ui, &state);
@@ -4748,7 +4836,7 @@ fn submit_folder_sizes(
 ) {
     let requests = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
-        if !app.everything_folder_sizes_available {
+        if app.everything_folder_sizes_indexed == Some(false) {
             return;
         }
         let Some(tab) = app.tabs.get_mut(&tab_id) else {
@@ -6138,6 +6226,97 @@ mod tests {
         assert!(!icon_event_is_current(&app, &stale_request));
     }
 
+    #[test]
+    fn folder_size_errors_keep_distinct_states() {
+        use platform::windows::everything::{EverythingError, EverythingFolderSize};
+
+        assert_eq!(
+            folder_size_state(Ok(EverythingFolderSize::Indexed(0))),
+            FolderSizeState::Value(0)
+        );
+        assert_eq!(
+            folder_size_state(Ok(EverythingFolderSize::NotIndexed)),
+            FolderSizeState::NotIndexed
+        );
+        assert_eq!(
+            folder_size_state(Err(EverythingError::FolderSizeRejected(404))),
+            FolderSizeState::NotFound
+        );
+        assert_eq!(
+            folder_size_state(Err(EverythingError::Timeout)),
+            FolderSizeState::TimedOut
+        );
+        assert_eq!(
+            folder_size_state(Err(EverythingError::FolderSizeDisconnected)),
+            FolderSizeState::Disconnected
+        );
+        assert_eq!(
+            folder_size_state(Err(EverythingError::Protocol("response code 404".into()))),
+            FolderSizeState::NotFound
+        );
+        assert_eq!(
+            folder_size_state(Err(EverythingError::Protocol("bad response".into()))),
+            FolderSizeState::ProtocolError
+        );
+        assert_eq!(
+            folder_size_state(Err(EverythingError::Windows(5))),
+            FolderSizeState::ProtocolError
+        );
+    }
+
+    #[test]
+    fn stale_folder_size_event_cannot_update_reused_entry_id() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\current")], 0, [0, 1, 2, 3]);
+        let tab = app.tabs.get_mut(&TabId(1)).unwrap();
+        tab.latest_request = RequestId(8);
+        tab.page_source = PageSource::Directory;
+        tab.replace_entries(vec![FileEntry {
+            id: EntryId(1),
+            path: PathBuf::from(r"C:\current\same-id"),
+            original_name: "same-id".into(),
+            display_name: "same-id".into(),
+            name_highlights: Vec::new(),
+            kind: crate::domain::EntryKind::Directory,
+            open_target: None,
+            parent_display: r"C:\current".into(),
+            size_bytes: None,
+            folder_size: FolderSizeState::Querying,
+            modified: None,
+        }]);
+
+        assert!(!apply_folder_size_event(
+            &mut app,
+            TabId(1),
+            RequestId(7),
+            EntryId(1),
+            Path::new(r"C:\old\same-id"),
+            FolderSizeState::Value(12),
+        ));
+        assert!(!apply_folder_size_event(
+            &mut app,
+            TabId(1),
+            RequestId(8),
+            EntryId(1),
+            Path::new(r"C:\old\same-id"),
+            FolderSizeState::Value(12),
+        ));
+        assert_eq!(
+            app.tabs[&TabId(1)].entries[0].folder_size,
+            FolderSizeState::Querying
+        );
+        assert!(apply_folder_size_event(
+            &mut app,
+            TabId(1),
+            RequestId(8),
+            EntryId(1),
+            Path::new(r"C:\current\same-id"),
+            FolderSizeState::Value(0),
+        ));
+        assert_eq!(
+            app.tabs[&TabId(1)].entries[0].folder_size,
+            FolderSizeState::Value(0)
+        );
+    }
     #[test]
     fn permission_page_has_actionable_copy_in_both_languages() {
         for language in [Language::Chinese, Language::English] {

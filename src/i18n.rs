@@ -186,10 +186,14 @@ impl Texts {
             FolderSizeState::Querying => self.choose("查询中…", "Querying…").to_owned(),
             FolderSizeState::Value(bytes) => self.size(Some(bytes)),
             FolderSizeState::NotIndexed => self.choose("未索引", "Not indexed").to_owned(),
+            FolderSizeState::NotFound => self.choose("未命中", "Not found").to_owned(),
             FolderSizeState::TimedOut => self.choose("查询超时", "Timed out").to_owned(),
             FolderSizeState::Disconnected => self
                 .choose("Everything 已断开", "Everything disconnected")
                 .to_owned(),
+            FolderSizeState::ProtocolError => {
+                self.choose("响应错误", "Invalid response").to_owned()
+            }
         }
     }
     pub fn size(self, value: Option<u64>) -> String {
@@ -238,8 +242,10 @@ mod tests {
             let texts = Texts::new(language);
             assert_eq!(texts.folder_size(FolderSizeState::Value(0)), "0 B");
             assert!(!texts.folder_size(FolderSizeState::NotIndexed).is_empty());
+            assert!(!texts.folder_size(FolderSizeState::NotFound).is_empty());
             assert!(!texts.folder_size(FolderSizeState::TimedOut).is_empty());
             assert!(!texts.folder_size(FolderSizeState::Disconnected).is_empty());
+            assert!(!texts.folder_size(FolderSizeState::ProtocolError).is_empty());
         }
     }
 

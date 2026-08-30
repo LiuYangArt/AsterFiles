@@ -6,14 +6,24 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     ptr,
-    sync::OnceLock,
+    sync::{Mutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use windows_sys::Win32::{
-    Foundation::{ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT, WPARAM},
+    Foundation::{
+        CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED,
+        ERROR_PIPE_BUSY, ERROR_SUCCESS, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, HWND,
+        INVALID_HANDLE_VALUE, LPARAM, LRESULT, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
+    },
+    Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_OVERLAPPED, GetDriveTypeW, OPEN_EXISTING, ReadFile, WriteFile,
+    },
     System::{
         DataExchange::COPYDATASTRUCT,
+        IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
+        Pipes::WaitNamedPipeW,
         Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW},
+        Threading::{CreateEventW, WaitForSingleObject},
     },
     UI::WindowsAndMessaging::{
         CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
@@ -37,6 +47,15 @@ const REQ_SIZE: u32 = 0x10;
 const REQ_MODIFIED: u32 = 0x40;
 const REQ_ATTRIBUTES: u32 = 0x100;
 const REQ_HIGHLIGHTED_NAME: u32 = 0x2000;
+const EVERYTHING3_FOLDER_SIZE_COMMAND: u32 = 18;
+const EVERYTHING3_RESPONSE_OK_MORE_DATA: u32 = 100;
+const EVERYTHING3_RESPONSE_OK: u32 = 200;
+const EVERYTHING3_RESPONSE_BAD_REQUEST: u32 = 400;
+const EVERYTHING3_RESPONSE_CANCELLED: u32 = 401;
+const EVERYTHING3_RESPONSE_NOT_FOUND: u32 = 404;
+const EVERYTHING3_RESPONSE_OUT_OF_MEMORY: u32 = 500;
+const EVERYTHING3_RESPONSE_INVALID_COMMAND: u32 = 501;
+const EVERYTHING3_UINT64_MAX: u64 = u64::MAX;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlatformEverythingConfig {
     pub executable_path: PathBuf,
@@ -163,6 +182,9 @@ pub enum EverythingError {
     UnsupportedArchitecture,
     DatabaseNotLoaded,
     QueryRejected,
+    FolderSizePipeUnavailable(String),
+    FolderSizeDisconnected,
+    FolderSizeRejected(u32),
     Protocol(String),
     StartFailed(String),
     Windows(u32),
@@ -180,6 +202,15 @@ impl fmt::Display for EverythingError {
             Self::UnsupportedArchitecture => write!(f, "Everything x64 is required"),
             Self::DatabaseNotLoaded => write!(f, "Everything database is not loaded"),
             Self::QueryRejected => write!(f, "Everything rejected the query"),
+            Self::FolderSizePipeUnavailable(i) => {
+                write!(f, "Everything folder-size IPC pipe is unavailable: {i}")
+            }
+            Self::FolderSizeDisconnected => {
+                write!(f, "Everything folder-size IPC pipe disconnected")
+            }
+            Self::FolderSizeRejected(code) => {
+                write!(f, "Everything folder-size IPC rejected the request: {code}")
+            }
             Self::Protocol(m) => write!(f, "invalid Everything response: {m}"),
             Self::StartFailed(m) => write!(f, "failed to start Everything: {m}"),
             Self::Windows(c) => write!(f, "Windows error {c}"),
@@ -187,16 +218,29 @@ impl fmt::Display for EverythingError {
     }
 }
 impl std::error::Error for EverythingError {}
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct EverythingClient {
     config: PlatformEverythingConfig,
+    folder_size_pipe: Mutex<Option<Everything3Pipe>>,
+}
+
+impl Clone for EverythingClient {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            folder_size_pipe: Mutex::new(None),
+        }
+    }
 }
 impl EverythingClient {
     pub fn new(config: PlatformEverythingConfig) -> Result<Self, EverythingError> {
         if config.instance_name.contains(['\0', '(', ')']) {
             Err(EverythingError::NotConfigured)
         } else {
-            Ok(Self { config })
+            Ok(Self {
+                config,
+                folder_size_pipe: Mutex::new(None),
+            })
         }
     }
     #[allow(dead_code)]
@@ -294,29 +338,58 @@ impl EverythingClient {
         path: &Path,
         timeout: Duration,
     ) -> Result<EverythingFolderSize, EverythingError> {
-        let status = self.status(timeout)?;
+        let deadline = std::time::Instant::now() + timeout;
+        let status = self.status(remaining(deadline)?)?;
         if !status.database_loaded || !status.folder_size_indexed {
             return Ok(EverythingFolderSize::NotIndexed);
         }
-        let r = EverythingSearchRequest {
-            query: format!(
-                "folder:wholepath:\"{}\"",
-                quote(&path.as_os_str().to_string_lossy())
-            ),
-            scope: None,
-            offset: 0,
-            max_results: 64,
-            sort: Default::default(),
-            item_kind: EverythingItemKind::Folders,
+        let query_path = normalize_folder_size_path(path)?;
+        let first = self.query_folder_size(&query_path, remaining(deadline)?)?;
+        if !matches!(
+            first,
+            EverythingFolderSize::Indexed(0) | EverythingFolderSize::NotIndexed
+        ) || is_network_path(path)
+        {
+            return Ok(first);
+        }
+        let Ok(resolved) = std::fs::canonicalize(path) else {
+            return Ok(first);
         };
-        Ok(self
-            .search(&r, timeout)?
-            .items
-            .into_iter()
-            .find(|item| windows_path_eq(&item.path, path))
-            .and_then(|item| item.size)
-            .map(EverythingFolderSize::Indexed)
-            .unwrap_or(EverythingFolderSize::NotIndexed))
+        let resolved_query = normalize_folder_size_path(&resolved)?;
+        if resolved_query == query_path {
+            return Ok(first);
+        }
+        self.query_folder_size(&resolved_query, remaining(deadline)?)
+    }
+
+    fn query_folder_size(
+        &self,
+        path: &[u8],
+        timeout: Duration,
+    ) -> Result<EverythingFolderSize, EverythingError> {
+        let pipe_name = everything3_pipe_name(&self.config.instance_name);
+        let mut connection = self
+            .folder_size_pipe
+            .lock()
+            .map_err(|_| EverythingError::FolderSizeDisconnected)?;
+        for attempt in 0..=1 {
+            if connection.is_none() {
+                *connection = Some(Everything3Pipe::connect(
+                    &pipe_name,
+                    &self.config.instance_name,
+                    timeout,
+                )?);
+            }
+            let result = connection.as_ref().unwrap().folder_size(path, timeout);
+            if result.is_err() {
+                *connection = None;
+            }
+            if matches!(result, Err(EverythingError::FolderSizeDisconnected)) && attempt == 0 {
+                continue;
+            }
+            return result;
+        }
+        Err(EverythingError::FolderSizeDisconnected)
     }
     fn window(&self) -> Result<HWND, EverythingError> {
         let class = wide(instance_class(&self.config.instance_name));
@@ -376,14 +449,7 @@ fn encode_function_argument(value: &str) -> String {
     }
     encoded
 }
-fn windows_path_eq(left: &Path, right: &Path) -> bool {
-    left.as_os_str()
-        .to_string_lossy()
-        .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
-}
-fn quote(s: &str) -> String {
-    s.replace('"', "\"\"")
-}
+
 fn instance_class(i: &str) -> String {
     if i.is_empty() {
         IPC_CLASS.into()
@@ -719,6 +785,316 @@ fn get64a(b: &[u8], c: &mut usize) -> Result<u64, EverythingError> {
 fn put32(b: &mut [u8], o: usize, v: u32) {
     b[o..o + 4].copy_from_slice(&v.to_le_bytes())
 }
+#[derive(Debug)]
+struct Everything3Pipe {
+    handle: HANDLE,
+}
+
+unsafe impl Send for Everything3Pipe {}
+
+impl Everything3Pipe {
+    fn connect(
+        pipe_name: &[u16],
+        instance_name: &str,
+        timeout: Duration,
+    ) -> Result<Self, EverythingError> {
+        let timeout_ms = millis(timeout);
+        let mut handle = unsafe {
+            CreateFileW(
+                pipe_name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE && unsafe { GetLastError() } == ERROR_PIPE_BUSY {
+            if unsafe { WaitNamedPipeW(pipe_name.as_ptr(), timeout_ms) } == 0 {
+                return if unsafe { GetLastError() } == ERROR_PIPE_BUSY {
+                    Err(EverythingError::Timeout)
+                } else {
+                    Err(EverythingError::FolderSizePipeUnavailable(
+                        instance_name.to_owned(),
+                    ))
+                };
+            }
+            handle = unsafe {
+                CreateFileW(
+                    pipe_name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OVERLAPPED,
+                    ptr::null_mut(),
+                )
+            };
+        }
+        if handle == INVALID_HANDLE_VALUE {
+            Err(EverythingError::FolderSizePipeUnavailable(
+                instance_name.to_owned(),
+            ))
+        } else {
+            Ok(Self { handle })
+        }
+    }
+
+    fn folder_size(
+        &self,
+        path: &[u8],
+        timeout: Duration,
+    ) -> Result<EverythingFolderSize, EverythingError> {
+        let mut request = Vec::with_capacity(8 + path.len());
+        request.extend_from_slice(&EVERYTHING3_FOLDER_SIZE_COMMAND.to_le_bytes());
+        request.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        request.extend_from_slice(path);
+        write_overlapped(self.handle, &request, timeout)?;
+
+        let mut header = [0u8; 8];
+        read_overlapped(self.handle, &mut header, timeout)?;
+        let code = u32::from_le_bytes(header[..4].try_into().unwrap());
+        let size = u32::from_le_bytes(header[4..].try_into().unwrap()) as usize;
+        match code {
+            EVERYTHING3_RESPONSE_OK | EVERYTHING3_RESPONSE_OK_MORE_DATA => {
+                if size != 8 {
+                    if size > 0 {
+                        skip_pipe_bytes(self.handle, size, timeout)?;
+                    }
+                    return protocol("folder-size response is not 8 bytes");
+                }
+                let mut value = [0u8; 8];
+                read_overlapped(self.handle, &mut value, timeout)?;
+                Ok(decode_folder_size_value(u64::from_le_bytes(value)))
+            }
+            code => {
+                if size > 0 {
+                    skip_pipe_bytes(self.handle, size, timeout)?;
+                }
+                match code {
+                    EVERYTHING3_RESPONSE_NOT_FOUND => {
+                        Err(EverythingError::FolderSizeRejected(code))
+                    }
+                    EVERYTHING3_RESPONSE_BAD_REQUEST
+                    | EVERYTHING3_RESPONSE_CANCELLED
+                    | EVERYTHING3_RESPONSE_OUT_OF_MEMORY
+                    | EVERYTHING3_RESPONSE_INVALID_COMMAND => {
+                        Err(EverythingError::FolderSizeRejected(code))
+                    }
+                    _ => protocol("unknown folder-size response code"),
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Everything3Pipe {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+fn decode_folder_size_value(value: u64) -> EverythingFolderSize {
+    if value == EVERYTHING3_UINT64_MAX {
+        EverythingFolderSize::NotIndexed
+    } else {
+        EverythingFolderSize::Indexed(value)
+    }
+}
+fn everything3_pipe_name(instance_name: &str) -> Vec<u16> {
+    let mut name = String::from(r"\\.\PIPE\Everything IPC");
+    if !instance_name.is_empty() {
+        name.push_str(" (");
+        name.push_str(instance_name);
+        name.push(')');
+    }
+    wide(name)
+}
+
+fn normalize_folder_size_path(path: &Path) -> Result<Vec<u8>, EverythingError> {
+    let mut value = String::from_utf16(&path.as_os_str().encode_wide().collect::<Vec<_>>())
+        .map_err(|_| EverythingError::Protocol("folder-size path is not valid Unicode".into()))?
+        .replace('/', "\\");
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        value = format!(r"\\{rest}");
+    } else if let Some(rest) = value.strip_prefix(r"\\?\") {
+        value = rest.to_owned();
+    }
+    while value.len() > 3 && value.ends_with('\\') {
+        value.pop();
+    }
+    if value.is_empty() || value.contains('\0') {
+        return Err(EverythingError::Protocol(
+            "folder-size path is empty or contains NUL".into(),
+        ));
+    }
+    Ok(value.into_bytes())
+}
+
+fn remaining(deadline: std::time::Instant) -> Result<Duration, EverythingError> {
+    deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or(EverythingError::Timeout)
+}
+
+fn is_network_path(path: &Path) -> bool {
+    let text = path.as_os_str().to_string_lossy().replace('/', "\\");
+    if text.starts_with(r"\\") && !text.starts_with(r"\\?\") {
+        return true;
+    }
+    let bytes = text.as_bytes();
+    if bytes.len() < 2 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() {
+        return false;
+    }
+    let root = wide(format!("{}:\\", bytes[0] as char));
+    unsafe { GetDriveTypeW(root.as_ptr()) == 4 }
+}
+fn write_overlapped(
+    handle: HANDLE,
+    bytes: &[u8],
+    timeout: Duration,
+) -> Result<(), EverythingError> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let written = overlapped_write(handle, &bytes[offset..], timeout)?;
+        if written == 0 {
+            return Err(EverythingError::FolderSizeDisconnected);
+        }
+        offset += written;
+    }
+    Ok(())
+}
+
+fn read_overlapped(
+    handle: HANDLE,
+    bytes: &mut [u8],
+    timeout: Duration,
+) -> Result<(), EverythingError> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let read = overlapped_read(handle, &mut bytes[offset..], timeout)?;
+        if read == 0 {
+            return Err(EverythingError::FolderSizeDisconnected);
+        }
+        offset += read;
+    }
+    Ok(())
+}
+
+fn skip_pipe_bytes(
+    handle: HANDLE,
+    mut remaining: usize,
+    timeout: Duration,
+) -> Result<(), EverythingError> {
+    let mut buffer = [0u8; 256];
+    while remaining > 0 {
+        let chunk = remaining.min(buffer.len());
+        read_overlapped(handle, &mut buffer[..chunk], timeout)?;
+        remaining -= chunk;
+    }
+    Ok(())
+}
+
+fn overlapped_read(
+    handle: HANDLE,
+    bytes: &mut [u8],
+    timeout: Duration,
+) -> Result<usize, EverythingError> {
+    overlapped_io(handle, bytes.as_mut_ptr(), bytes.len(), true, timeout)
+}
+
+fn overlapped_write(
+    handle: HANDLE,
+    bytes: &[u8],
+    timeout: Duration,
+) -> Result<usize, EverythingError> {
+    overlapped_io(
+        handle,
+        bytes.as_ptr() as *mut u8,
+        bytes.len(),
+        false,
+        timeout,
+    )
+}
+
+fn overlapped_io(
+    handle: HANDLE,
+    bytes: *mut u8,
+    byte_count: usize,
+    reading: bool,
+    timeout: Duration,
+) -> Result<usize, EverythingError> {
+    let event = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
+    if event.is_null() {
+        return Err(last_error());
+    }
+    let mut overlapped: OVERLAPPED = unsafe { zeroed() };
+    overlapped.hEvent = event;
+    let mut transferred = 0u32;
+    let ok = unsafe {
+        if reading {
+            ReadFile(
+                handle,
+                bytes,
+                byte_count as u32,
+                &mut transferred,
+                &mut overlapped,
+            )
+        } else {
+            WriteFile(
+                handle,
+                bytes,
+                byte_count as u32,
+                &mut transferred,
+                &mut overlapped,
+            )
+        }
+    };
+    let result = if ok != 0 {
+        Ok(transferred as usize)
+    } else {
+        let code = unsafe { GetLastError() };
+        if code != ERROR_IO_PENDING {
+            pipe_io_error(code)
+        } else {
+            match unsafe { WaitForSingleObject(event, millis(timeout)) } {
+                WAIT_OBJECT_0 => {
+                    if unsafe { GetOverlappedResult(handle, &overlapped, &mut transferred, 0) } != 0
+                    {
+                        Ok(transferred as usize)
+                    } else {
+                        pipe_io_error(unsafe { GetLastError() })
+                    }
+                }
+                WAIT_TIMEOUT => {
+                    unsafe {
+                        CancelIoEx(handle, &overlapped);
+                        GetOverlappedResult(handle, &overlapped, &mut transferred, 1);
+                    }
+                    Err(EverythingError::Timeout)
+                }
+                _ => pipe_io_error(unsafe { GetLastError() }),
+            }
+        }
+    };
+    unsafe {
+        CloseHandle(event);
+    }
+    result
+}
+
+fn pipe_io_error(code: u32) -> Result<usize, EverythingError> {
+    match code {
+        ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_OPERATION_ABORTED => {
+            Err(EverythingError::FolderSizeDisconnected)
+        }
+        _ => Err(EverythingError::Windows(code)),
+    }
+}
 fn protocol<T>(m: &str) -> Result<T, EverythingError> {
     Err(EverythingError::Protocol(m.into()))
 }
@@ -887,6 +1263,57 @@ mod tests {
         );
     }
     #[test]
+    fn everything3_pipe_name_includes_only_the_configured_instance() {
+        let unnamed = everything3_pipe_name("");
+        let named = everything3_pipe_name("1.5a");
+        assert_eq!(
+            String::from_utf16_lossy(&unnamed[..unnamed.len() - 1]),
+            r"\\.\PIPE\Everything IPC"
+        );
+        assert_eq!(
+            String::from_utf16_lossy(&named[..named.len() - 1]),
+            r"\\.\PIPE\Everything IPC (1.5a)"
+        );
+    }
+
+    #[test]
+    fn folder_size_path_normalization_preserves_utf8_and_trims_only_trailing_separators() {
+        assert_eq!(
+            normalize_folder_size_path(Path::new(r"F:/资料/零字节/")).unwrap(),
+            "F:\\资料\\零字节".as_bytes()
+        );
+        assert_eq!(
+            normalize_folder_size_path(Path::new(r"C:\")).unwrap(),
+            r"C:\".as_bytes()
+        );
+        assert_eq!(
+            normalize_folder_size_path(Path::new(r"\\?\F:\资料")).unwrap(),
+            r"F:\资料".as_bytes()
+        );
+        assert_eq!(
+            normalize_folder_size_path(Path::new(r"\\?\UNC\server\共享")).unwrap(),
+            r"\\server\共享".as_bytes()
+        );
+    }
+
+    #[test]
+    fn unc_paths_are_network_without_touching_the_share() {
+        assert!(is_network_path(Path::new(r"\\server\share\folder")));
+        assert!(!is_network_path(Path::new(r"F:\local\folder")));
+    }
+
+    #[test]
+    fn folder_size_response_values_distinguish_zero_and_missing_index() {
+        assert_eq!(
+            decode_folder_size_value(0),
+            EverythingFolderSize::Indexed(0)
+        );
+        assert_eq!(
+            decode_folder_size_value(EVERYTHING3_UINT64_MAX),
+            EverythingFolderSize::NotIndexed
+        );
+    }
+    #[test]
     fn named_class() {
         assert_eq!(
             instance_class("1.5a"),
@@ -980,16 +1407,39 @@ mod tests {
             .unwrap();
 
         assert!(page.items.iter().any(|item| item.path == p));
+        let indexed_folder = Path::new(r"F:\CodeProjects\AsterFiles");
+        assert!(
+            indexed_folder.is_dir(),
+            "fixed F: validation sample is missing"
+        );
         let folder_size = c
-            .folder_size(
-                Path::new(r"C:\Program Files\Everything 1.5a"),
-                Duration::from_secs(3),
-            )
+            .folder_size(indexed_folder, Duration::from_secs(3))
             .unwrap();
-        assert!(matches!(
-            folder_size,
-            EverythingFolderSize::Indexed(_) | EverythingFolderSize::NotIndexed
-        ));
+        assert!(
+            matches!(folder_size, EverythingFolderSize::Indexed(size) if size > 0),
+            "Everything3 folder-size IPC did not return an indexed positive size: {folder_size:?}"
+        );
+        println!("everything3_sample=F:\\CodeProjects\\AsterFiles result={folder_size:?}");
+        assert!(
+            c.folder_size(indexed_folder, Duration::from_secs(3))
+                .is_ok(),
+            "the reusable Everything3 pipe failed on its second query"
+        );
+
+        let empty = PathBuf::from(r"F:\CodeProjects\AsterFiles\artifacts\state")
+            .join(format!("everything-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let empty_size = loop {
+            let result = c.folder_size(&empty, Duration::from_secs(1)).unwrap();
+            if result == EverythingFolderSize::Indexed(0) || std::time::Instant::now() >= deadline {
+                break result;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        std::fs::remove_dir(&empty).unwrap();
+        assert_eq!(empty_size, EverythingFolderSize::Indexed(0));
+        println!("everything3_empty_sample=temporary result={empty_size:?}");
     }
     #[test]
     fn live_scoped_markdown_search_matches_the_indexed_docs_directory() {
