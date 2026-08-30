@@ -16,8 +16,8 @@ use slint::{
 use crate::{
     agent_debug::{self, AgentScenario},
     domain::{
-        EntryId, FileEntry, LoadState, NavigationKind, RequestId, SortField, TabId, TabKind,
-        TabSession,
+        AddressMode, EntryId, FileEntry, FolderSizeState, LoadState, NavigationKind, PageSource,
+        RequestId, SearchScope, SearchState, SortField, TabId, TabKind, TabSession,
         file_operations::{
             FileOperationKind, ItemState, OperationId, OperationItem, OperationManager,
             OperationResult, OperationState,
@@ -63,6 +63,10 @@ struct AppState {
     cut_generation: u64,
     conflict_responses:
         HashMap<OperationId, mpsc::Sender<crate::domain::file_operations::ConflictDecision>>,
+    search_column_order: [u8; 4],
+    everything_config: crate::domain::EverythingConfig,
+    everything_status: String,
+    everything_folder_sizes_available: bool,
 }
 
 impl AppState {
@@ -76,16 +80,21 @@ impl AppState {
             initial_paths,
             active_index,
             column_order,
+            [0, 1, 2, 3],
+            crate::domain::EverythingConfig::default(),
             session_store::ThemeMode::System,
             Language::Chinese,
             false,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         initial_paths: Vec<PathBuf>,
         active_index: usize,
         column_order: [u8; 4],
+        search_column_order: [u8; 4],
+        everything_config: crate::domain::EverythingConfig,
         theme_mode: session_store::ThemeMode,
         language: Language,
         system_dark_theme: bool,
@@ -131,6 +140,10 @@ impl AppState {
             cut_paths: Vec::new(),
             cut_generation: 0,
             conflict_responses: HashMap::new(),
+            search_column_order,
+            everything_config,
+            everything_status: String::new(),
+            everything_folder_sizes_available: false,
         }
     }
 
@@ -307,6 +320,55 @@ enum DirectoryEvent {
     },
 }
 
+const SEARCH_PAGE_LIMIT: u32 = 256;
+#[derive(Debug)]
+enum EverythingRequest {
+    Search {
+        tab_id: TabId,
+        request_id: RequestId,
+        scope: SearchScope,
+        query: String,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    },
+    FolderSize {
+        tab_id: TabId,
+        request_id: RequestId,
+        entry_id: EntryId,
+        path: PathBuf,
+    },
+    Configure(crate::domain::EverythingConfig),
+    TestConnection,
+    Start,
+}
+
+#[derive(Debug)]
+enum EverythingEvent {
+    SearchPage {
+        tab_id: TabId,
+        request_id: RequestId,
+        entries: Vec<FileEntry>,
+        complete: bool,
+        total: u32,
+    },
+    SearchFailed {
+        tab_id: TabId,
+        request_id: RequestId,
+        error: platform::windows::everything::EverythingError,
+    },
+    FolderSize {
+        tab_id: TabId,
+        request_id: RequestId,
+        entry_id: EntryId,
+        path: PathBuf,
+        state: FolderSizeState,
+    },
+    Status(
+        Result<
+            platform::windows::everything::EverythingStatus,
+            platform::windows::everything::EverythingError,
+        >,
+    ),
+}
 struct IconRequest {
     tab_id: TabId,
     request_id: RequestId,
@@ -401,7 +463,16 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         width: 1180,
         height: 760,
     };
-    let (restored_paths, active_index, window, column_order, theme_mode, language) = restored
+    let (
+        restored_paths,
+        active_index,
+        window,
+        column_order,
+        search_column_order,
+        everything_config,
+        theme_mode,
+        language,
+    ) = restored
         .filter(|session| !session.tab_paths.is_empty())
         .map(|session| {
             let window = if session.window.width > 7_680 || session.window.height > 4_320 {
@@ -414,6 +485,8 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 session.active_tab,
                 window,
                 session.column_order,
+                session.search_column_order,
+                session.everything,
                 session.theme_mode,
                 session.language,
             )
@@ -424,6 +497,8 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 0,
                 default_window,
                 [0, 1, 2, 3],
+                [0, 1, 2, 3],
+                crate::domain::EverythingConfig::default(),
                 session_store::ThemeMode::System,
                 Language::Chinese,
             )
@@ -438,6 +513,8 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         restored_paths,
         active_index,
         column_order,
+        search_column_order,
+        everything_config,
         theme_mode,
         language,
         platform::system_uses_dark_theme(),
@@ -454,6 +531,32 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     }
     let (request_sender, event_receiver) = spawn_directory_workers(WORKER_COUNT);
     let event_receiver = Arc::new(Mutex::new(event_receiver));
+    {
+        let mut app = state.lock().expect("app state mutex is not poisoned");
+        if app.everything_config.executable_path.is_none()
+            && let Some(installation) = platform::windows::everything::EverythingClient::discover()
+                .into_iter()
+                .find(|item| item.instance_name == "1.5a")
+                .or_else(|| {
+                    platform::windows::everything::EverythingClient::discover()
+                        .into_iter()
+                        .next()
+                })
+        {
+            if !installation.executable_path.as_os_str().is_empty() {
+                app.everything_config.executable_path = Some(installation.executable_path);
+            }
+            if !installation.instance_name.is_empty() {
+                app.everything_config.instance_name = installation.instance_name;
+            }
+        }
+    }
+    let everything_config = state
+        .lock()
+        .expect("app state mutex is not poisoned")
+        .everything_config
+        .clone();
+    let (everything_sender, everything_receiver) = spawn_everything_worker(everything_config);
     let (icon_sender, icon_receiver) = spawn_icon_workers(ICON_WORKER_COUNT, state.clone());
     let (operation_sender, operation_receiver) = spawn_file_operation_worker();
     let (clipboard_sender, clipboard_receiver) = spawn_clipboard_worker();
@@ -466,6 +569,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         request_sender.clone(),
         operation_sender.clone(),
         clipboard_sender,
+        everything_sender.clone(),
         state.clone(),
     );
     wire_mouse_navigation(&ui, &exit_ui, state.clone());
@@ -489,7 +593,15 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     );
     let _operation_timer =
         wire_operation_window(&ui, &operation_ui, operation_sender.clone(), state.clone());
-    start_event_pump(&ui, event_receiver, icon_sender, state.clone());
+    start_event_pump(
+        &ui,
+        event_receiver,
+        icon_sender,
+        everything_sender.clone(),
+        state.clone(),
+    );
+    start_everything_event_pump(&ui, everything_receiver, state.clone());
+    let _ = everything_sender.send(EverythingRequest::TestConnection);
     start_icon_event_pump(&ui, icon_receiver, state.clone());
     start_file_operation_event_pump(
         &ui,
@@ -548,13 +660,23 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             let _ = window.hide();
         }
     }
-    let (paths, active_tab, column_order, theme_mode, language) = {
+    let (
+        paths,
+        active_tab,
+        column_order,
+        search_column_order,
+        everything_config,
+        theme_mode,
+        language,
+    ) = {
         let app = state.lock().expect("app state mutex is not poisoned");
         let active_tab = app.stable_active_path_index();
         (
             app.stable_paths(),
             active_tab,
             app.column_order,
+            app.search_column_order,
+            app.everything_config.clone(),
             app.theme_mode,
             app.language,
         )
@@ -563,7 +685,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     let size = ui.window().size();
     if scenario.is_none()
         && let Some(path) = session_store::default_path()
-        && let Ok(session) = session_store::SessionState::with_settings(
+        && let Ok(session) = session_store::SessionState::with_everything_settings(
             session_store::WindowPlacement {
                 x: position.x,
                 y: position.y,
@@ -573,8 +695,10 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             active_tab,
             paths,
             column_order,
+            search_column_order,
             theme_mode,
             language,
+            everything_config,
         )
     {
         let _ = session_store::save(&path, &session);
@@ -1014,53 +1138,115 @@ fn wire_callbacks(
     sender: mpsc::Sender<DirectoryRequest>,
     operation_sender: mpsc::Sender<FileOperationRequest>,
     clipboard_sender: mpsc::Sender<ClipboardRequest>,
+    everything_sender: mpsc::Sender<EverythingRequest>,
     state: SharedSessions,
 ) {
     let weak = ui.as_weak();
     let sender_for_path = sender.clone();
     let state_for_path = state.clone();
+    let everything_for_accept = everything_sender.clone();
     ui.on_navigate_path(move |path| {
         let input = path.to_string();
-        let target = PathBuf::from(path.as_str());
-        let tab_id = {
+        let (tab_id, mode) = {
+            let app = state_for_path
+                .lock()
+                .expect("app state mutex is not poisoned");
+            (app.active_tab, app.active().address_mode)
+        };
+        let query = if mode == AddressMode::Smart {
             let mut app = state_for_path
                 .lock()
                 .expect("app state mutex is not poisoned");
-            let tab_id = app.active_tab;
-            let tab = app
-                .tabs
+            app.tabs
                 .get_mut(&tab_id)
-                .expect("active tab session exists");
-            tab.update_address_input(input);
-            tab.address_editing = true;
-            tab_id
+                .map(|tab| {
+                    tab.update_address_input(input.clone());
+                    tab.search_query.clone()
+                })
+                .unwrap_or_else(|| input.clone())
+        } else {
+            input.clone()
         };
-        submit_navigation(
-            &sender_for_path,
-            &state_for_path,
-            tab_id,
-            target,
-            NavigationKind::Normal,
-        );
+        let target = PathBuf::from(path.as_str());
+        let state_for_validation = state_for_path.clone();
+        let sender_for_validation = sender_for_path.clone();
+        let everything_for_validation = everything_for_accept.clone();
+        thread::spawn(move || {
+            if target.is_dir() {
+                let _ = slint::invoke_from_event_loop(move || {
+                    submit_navigation(
+                        &sender_for_validation,
+                        &state_for_validation,
+                        tab_id,
+                        target,
+                        NavigationKind::Normal,
+                    );
+                });
+            } else {
+                let _ = slint::invoke_from_event_loop(move || {
+                    submit_search(
+                        &everything_for_validation,
+                        &state_for_validation,
+                        tab_id,
+                        query,
+                    );
+                });
+            }
+        });
         if let Some(ui) = weak.upgrade() {
             refresh_ui(&ui, &state_for_path);
         }
     });
 
     let weak = ui.as_weak();
-    let state_for_edit = state.clone();
-    ui.on_begin_address_edit(move || {
-        let mut app = state_for_edit
+    let state_for_search_edit = state.clone();
+    ui.on_begin_search(move || {
+        let mut app = state_for_search_edit
             .lock()
             .expect("app state mutex is not poisoned");
         let tab_id = app.active_tab;
         if let Some(tab) = app.tabs.get_mut(&tab_id) {
-            tab.begin_address_edit();
+            tab.begin_smart_address_edit();
         }
         drop(app);
         if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state_for_edit);
+            refresh_ui(&ui, &state_for_search_edit);
             ui.invoke_focus_address_editor();
+        }
+    });
+
+    let state_for_changed = state.clone();
+    let everything_for_changed = everything_sender.clone();
+    ui.on_address_input_changed(move |value| {
+        let input = value.to_string();
+        let (tab_id, is_search) = {
+            let mut app = state_for_changed
+                .lock()
+                .expect("app state mutex is not poisoned");
+            let tab_id = app.active_tab;
+            let tab = app.tabs.get_mut(&tab_id).expect("active tab exists");
+            tab.update_address_input(input.clone());
+            (tab_id, tab.address_mode == AddressMode::Smart)
+        };
+        if is_search {
+            let state = state_for_changed.clone();
+            let sender = everything_for_changed.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(160));
+                let still_current = state.lock().ok().is_some_and(|app| {
+                    app.tabs.get(&tab_id).is_some_and(|tab| {
+                        tab.address_input == input && tab.address_mode == AddressMode::Smart
+                    })
+                });
+                if still_current {
+                    let query = state
+                        .lock()
+                        .ok()
+                        .and_then(|app| app.tabs.get(&tab_id).map(|tab| tab.search_query.clone()))
+                        .unwrap_or(input);
+                    submit_search(&sender, &state, tab_id, query);
+                }
+            });
         }
     });
 
@@ -1401,7 +1587,12 @@ fn wire_callbacks(
         let mut app = state_for_columns
             .lock()
             .expect("app state mutex is not poisoned");
-        reorder_column(&mut app.column_order, kind as u8, offset);
+        let search = app.active().page_source == PageSource::Search;
+        if search {
+            reorder_column(&mut app.search_column_order, kind as u8, offset);
+        } else {
+            reorder_column(&mut app.column_order, kind as u8, offset);
+        }
         drop(app);
         if let Some(ui) = weak.upgrade() {
             refresh_ui(&ui, &state_for_columns);
@@ -1741,6 +1932,28 @@ fn wire_callbacks(
         }
     });
 
+    let state_for_everything_config = state.clone();
+    let everything_for_config = everything_sender.clone();
+    ui.on_update_everything_config(move |path, instance| {
+        let mut app = state_for_everything_config
+            .lock()
+            .expect("app state mutex is not poisoned");
+        app.everything_config.executable_path =
+            (!path.is_empty()).then(|| PathBuf::from(path.as_str()));
+        app.everything_config.instance_name = instance.to_string();
+        app.everything_config.verified_version = None;
+        let config = app.everything_config.clone();
+        drop(app);
+        let _ = everything_for_config.send(EverythingRequest::Configure(config));
+    });
+    let everything_for_test = everything_sender.clone();
+    ui.on_test_everything_connection(move || {
+        let _ = everything_for_test.send(EverythingRequest::TestConnection);
+    });
+    let everything_for_start = everything_sender.clone();
+    ui.on_start_everything(move || {
+        let _ = everything_for_start.send(EverythingRequest::Start);
+    });
     let weak = ui.as_weak();
     let state_for_settings = state.clone();
     ui.on_open_settings(move || {
@@ -2115,7 +2328,7 @@ fn wire_mouse_navigation(ui: &AppWindow, exit_ui: &ConfirmationWindow, state: Sh
                         && !shift
                         && !settings_active =>
                     {
-                        ui.invoke_begin_address_edit();
+                        ui.invoke_begin_search();
                         true
                     }
                     _ if !settings_active
@@ -3974,6 +4187,7 @@ fn start_event_pump(
     ui: &AppWindow,
     receiver: Arc<Mutex<mpsc::Receiver<DirectoryEvent>>>,
     icon_sender: mpsc::Sender<IconRequest>,
+    everything_sender: mpsc::Sender<EverythingRequest>,
     state: SharedSessions,
 ) {
     let weak = ui.as_weak();
@@ -3988,10 +4202,17 @@ fn start_event_pump(
             };
             let state = state.clone();
             let icon_sender = icon_sender.clone();
+            let everything_sender = everything_sender.clone();
             if weak
                 .upgrade_in_event_loop(move |ui| {
                     let batch = match &event {
                         DirectoryEvent::Batch {
+                            tab_id, request_id, ..
+                        } => Some((*tab_id, *request_id)),
+                        _ => None,
+                    };
+                    let finished = match &event {
+                        DirectoryEvent::Finished {
                             tab_id, request_id, ..
                         } => Some((*tab_id, *request_id)),
                         _ => None,
@@ -4003,6 +4224,9 @@ fn start_event_pump(
                     if let Some((tab_id, request_id)) = batch {
                         append_active_file_rows(&ui, &state, tab_id, request_id);
                     } else {
+                        if let Some((tab_id, request_id)) = finished {
+                            submit_folder_sizes(&everything_sender, &state, tab_id, request_id);
+                        }
                         refresh_ui(&ui, &state);
                     }
                 })
@@ -4102,6 +4326,256 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
     icon_requests
 }
 
+fn platform_everything_config(
+    config: &crate::domain::EverythingConfig,
+) -> Option<platform::windows::everything::PlatformEverythingConfig> {
+    Some(platform::windows::everything::PlatformEverythingConfig {
+        executable_path: config.executable_path.clone()?,
+        instance_name: config.instance_name.clone(),
+        allow_start: config.allow_launch,
+    })
+}
+
+fn spawn_everything_worker(
+    config: crate::domain::EverythingConfig,
+) -> (
+    mpsc::Sender<EverythingRequest>,
+    mpsc::Receiver<EverythingEvent>,
+) {
+    let (request_sender, request_receiver) = mpsc::channel::<EverythingRequest>();
+    let (event_sender, event_receiver) = mpsc::channel::<EverythingEvent>();
+    thread::spawn(move || {
+        let mut client = platform_everything_config(&config)
+            .and_then(|value| platform::windows::everything::EverythingClient::new(value).ok());
+        while let Ok(request) = request_receiver.recv() {
+            match request {
+                EverythingRequest::Search {
+                    tab_id,
+                    request_id,
+                    scope,
+                    query,
+                    cancel,
+                } => {
+                    let Some(client) = client.as_ref() else {
+                        let _ = event_sender.send(EverythingEvent::SearchFailed {
+                            tab_id,
+                            request_id,
+                            error: platform::windows::everything::EverythingError::NotConfigured,
+                        });
+                        continue;
+                    };
+                    let scope = match scope {
+                        SearchScope::Global => None,
+                        SearchScope::Directory(path) => Some(path),
+                    };
+                    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                        continue;
+                    }
+                    let mut request =
+                        platform::windows::everything::EverythingSearchRequest::new(query, scope);
+                    request.max_results = SEARCH_PAGE_LIMIT;
+                    match client.search(&request, Duration::from_secs(3)) {
+                        Ok(page) => {
+                            let entries = page
+                                .items
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, item)| FileEntry {
+                                    id: EntryId(index as u32 + 1),
+                                    display_name: item.name.to_string_lossy().into_owned(),
+                                    original_name: item.name,
+                                    path: item.path,
+                                    kind: if item.is_directory {
+                                        crate::domain::EntryKind::Directory
+                                    } else {
+                                        crate::domain::EntryKind::File
+                                    },
+                                    open_target: None,
+                                    parent_display: item
+                                        .parent
+                                        .as_os_str()
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                    size_bytes: item.size,
+                                    folder_size: item
+                                        .size
+                                        .map(FolderSizeState::Value)
+                                        .unwrap_or(FolderSizeState::NotIndexed),
+                                    modified: item.modified,
+                                })
+                                .collect::<Vec<_>>();
+                            if !cancel.load(std::sync::atomic::Ordering::Acquire) {
+                                let complete = entries.len() as u32 >= page.total;
+                                let _ = event_sender.send(EverythingEvent::SearchPage {
+                                    tab_id,
+                                    request_id,
+                                    entries,
+                                    complete,
+                                    total: page.total,
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            let _ = event_sender.send(EverythingEvent::SearchFailed {
+                                tab_id,
+                                request_id,
+                                error,
+                            });
+                        }
+                    }
+                }
+                EverythingRequest::FolderSize {
+                    tab_id,
+                    request_id,
+                    entry_id,
+                    path,
+                } => {
+                    let state = client
+                        .as_ref()
+                        .map_or(FolderSizeState::Disconnected, |client| {
+                            match client.folder_size(&path, Duration::from_secs(2)) {
+                                Ok(
+                                    platform::windows::everything::EverythingFolderSize::Indexed(
+                                        value,
+                                    ),
+                                ) => FolderSizeState::Value(value),
+                                Ok(
+                                    platform::windows::everything::EverythingFolderSize::NotIndexed,
+                                ) => FolderSizeState::NotIndexed,
+                                Err(platform::windows::everything::EverythingError::Timeout) => {
+                                    FolderSizeState::TimedOut
+                                }
+                                Err(_) => FolderSizeState::Disconnected,
+                            }
+                        });
+                    let _ = event_sender.send(EverythingEvent::FolderSize {
+                        tab_id,
+                        request_id,
+                        entry_id,
+                        path,
+                        state,
+                    });
+                }
+                EverythingRequest::Configure(config) => {
+                    client = platform_everything_config(&config).and_then(|value| {
+                        platform::windows::everything::EverythingClient::new(value).ok()
+                    });
+                }
+                EverythingRequest::TestConnection => {
+                    let result = client
+                        .as_ref()
+                        .ok_or(platform::windows::everything::EverythingError::NotConfigured)
+                        .and_then(|client| client.status(Duration::from_secs(2)));
+                    let _ = event_sender.send(EverythingEvent::Status(result));
+                }
+                EverythingRequest::Start => {
+                    let result = client
+                        .as_ref()
+                        .ok_or(platform::windows::everything::EverythingError::NotConfigured)
+                        .and_then(|client| client.start())
+                        .and_then(|_| client.as_ref().unwrap().status(Duration::from_secs(3)));
+                    let _ = event_sender.send(EverythingEvent::Status(result));
+                }
+            }
+        }
+    });
+    (request_sender, event_receiver)
+}
+
+fn start_everything_event_pump(
+    ui: &AppWindow,
+    receiver: mpsc::Receiver<EverythingEvent>,
+    state: SharedSessions,
+) {
+    let weak = ui.as_weak();
+    thread::spawn(move || {
+        while let Ok(event) = receiver.recv() {
+            let state = state.clone();
+            if weak.upgrade_in_event_loop(move |ui| {
+            let mut app = state.lock().expect("app state mutex is not poisoned");
+            match event {
+                EverythingEvent::SearchPage { tab_id, request_id, entries, complete, total } => if let Some(tab) = app.tabs.get_mut(&tab_id) && tab.accepts_page(request_id, PageSource::Search) {
+                    tab.append_search_page(entries, total, complete);
+                },
+                EverythingEvent::SearchFailed { tab_id, request_id, error } => if let Some(tab) = app.tabs.get_mut(&tab_id) && tab.accepts_page(request_id, PageSource::Search) {
+                    tab.discard_pending();
+                    tab.search_state = match error { platform::windows::everything::EverythingError::NotConfigured => SearchState::NotConfigured, platform::windows::everything::EverythingError::NotRunning(_) => SearchState::Disconnected, platform::windows::everything::EverythingError::Timeout => SearchState::TimedOut, _ => SearchState::Failed };
+                    tab.error = Some(error.to_string());
+                },
+                EverythingEvent::FolderSize { tab_id, request_id, entry_id, path, state: size } => if let Some(tab) = app.tabs.get_mut(&tab_id)
+                    && tab.accepts_page(request_id, PageSource::Directory)
+                    && let Some(index) = tab.entry_indices.get(&entry_id).copied()
+                    && let Some(entry) = Arc::make_mut(&mut tab.entries).get_mut(index) {
+                    entry.set_folder_size(entry_id, &path, size);
+                },
+                EverythingEvent::Status(result) => match result {
+                    Ok(status) => { app.everything_status = format!("Everything {} · {}", status.version, if status.folder_size_indexed { "文件夹大小已索引" } else { "文件夹大小未索引" }); app.everything_folder_sizes_available = status.folder_size_indexed; app.everything_config.verified_version = Some(status.version.to_string()); }
+                    Err(error) => { app.everything_status = error.to_string(); app.everything_folder_sizes_available = false; }
+                },
+            }
+            drop(app); refresh_ui(&ui, &state);
+        }).is_err() { break; }
+        }
+    });
+}
+
+fn submit_search(
+    sender: &mpsc::Sender<EverythingRequest>,
+    state: &SharedSessions,
+    tab_id: TabId,
+    query: String,
+) {
+    let request = {
+        let mut app = state.lock().expect("app state mutex is not poisoned");
+        let Some(tab) = app.tabs.get_mut(&tab_id) else {
+            return;
+        };
+        let scope = tab.search_scope.clone();
+        let (request_id, cancel) = tab.begin_search(scope.clone(), query.clone());
+        EverythingRequest::Search {
+            tab_id,
+            request_id,
+            scope,
+            query,
+            cancel,
+        }
+    };
+    let _ = sender.send(request);
+}
+
+fn submit_folder_sizes(
+    sender: &mpsc::Sender<EverythingRequest>,
+    state: &SharedSessions,
+    tab_id: TabId,
+    request_id: RequestId,
+) {
+    let requests = {
+        let mut app = state.lock().expect("app state mutex is not poisoned");
+        if !app.everything_folder_sizes_available {
+            return;
+        }
+        let Some(tab) = app.tabs.get_mut(&tab_id) else {
+            return;
+        };
+        Arc::make_mut(&mut tab.entries)
+            .iter_mut()
+            .filter(|entry| entry.kind == crate::domain::EntryKind::Directory)
+            .take(48)
+            .map(|entry| {
+                entry.folder_size = FolderSizeState::Querying;
+                (entry.id, entry.path.clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    for (entry_id, path) in requests {
+        let _ = sender.send(EverythingRequest::FolderSize {
+            tab_id,
+            request_id,
+            entry_id,
+            path,
+        });
+    }
+}
 fn spawn_icon_workers(
     worker_count: usize,
     state: SharedSessions,
@@ -4361,12 +4835,16 @@ fn update_selection_summary(ui: &AppWindow, state: &SharedSessions) {
     let tab = app.active();
 
     ui.set_columns(ModelRc::new(VecModel::from(
-        app.column_order
-            .iter()
-            .map(|kind| ColumnRow {
-                kind: i32::from(*kind),
-            })
-            .collect::<Vec<_>>(),
+        (if tab.page_source == PageSource::Search {
+            app.search_column_order
+        } else {
+            app.column_order
+        })
+        .iter()
+        .map(|kind| ColumnRow {
+            kind: i32::from(*kind),
+        })
+        .collect::<Vec<_>>(),
     )));
     let operation_rows = operation_rows(&app);
     ui.set_operations(ModelRc::new(VecModel::from(operation_rows)));
@@ -4596,6 +5074,8 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
     ui.set_current_location_is_drive(current_location_path.is_some_and(is_drive_root));
     ui.set_address_input(address_input.into());
     ui.set_address_editing(tab.address_editing);
+    ui.set_search_mode(tab.address_mode == AddressMode::Smart);
+    ui.set_search_results_mode(tab.page_source == PageSource::Search);
 
     ui.set_status_text(status_text(tab, texts).into());
     let (error_page_title, error_page_description) = error_page_text(tab.load_state, texts);
@@ -4716,12 +5196,16 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
     )));
     ui.set_selected_count(tab.selected.len() as i32);
     ui.set_columns(ModelRc::new(VecModel::from(
-        app.column_order
-            .iter()
-            .map(|kind| ColumnRow {
-                kind: i32::from(*kind),
-            })
-            .collect::<Vec<_>>(),
+        (if tab.page_source == PageSource::Search {
+            app.search_column_order
+        } else {
+            app.column_order
+        })
+        .iter()
+        .map(|kind| ColumnRow {
+            kind: i32::from(*kind),
+        })
+        .collect::<Vec<_>>(),
     )));
     ui.set_sort_field(match tab.sort_field {
         SortField::Name => 0,
@@ -4731,7 +5215,21 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
     });
     ui.set_sort_descending(tab.sort_direction == crate::domain::SortDirection::Descending);
     let page_projection = agent_debug::page_projection(tab.load_state, tab.entries.is_empty());
-    ui.set_page_state(page_projection.index);
+    ui.set_page_state(if tab.page_source == PageSource::Search {
+        match tab.search_state {
+            SearchState::Searching if tab.entries.is_empty() => 1,
+            SearchState::NoResults => 3,
+            SearchState::NotConfigured
+            | SearchState::Disconnected
+            | SearchState::NotIndexed
+            | SearchState::SyntaxError
+            | SearchState::TimedOut
+            | SearchState::Failed => 9,
+            _ => 4,
+        }
+    } else {
+        page_projection.index
+    });
     ui.set_show_request_access(
         page_projection
             .visible_page_operations
@@ -4753,6 +5251,16 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
         Language::Chinese => 0,
         Language::English => 1,
     });
+    ui.set_everything_path(
+        app.everything_config
+            .executable_path
+            .as_deref()
+            .map(display_path)
+            .unwrap_or_default()
+            .into(),
+    );
+    ui.set_everything_instance(app.everything_config.instance_name.clone().into());
+    ui.set_everything_status(app.everything_status.clone().into());
     ui.set_theme_mode(match app.theme_mode {
         session_store::ThemeMode::System => 0,
         session_store::ThemeMode::Light => 1,
@@ -4786,7 +5294,12 @@ fn file_row(entry: &FileEntry, tab: &TabSession, texts: Texts, app: &AppState) -
         id: entry.id.0 as i32,
         name: entry.display_name.clone().into(),
         kind: texts.kind(entry.kind).into(),
-        size: texts.size(entry.size_bytes).into(),
+        parent_path: entry.parent_display.clone().into(),
+        size: if entry.kind == crate::domain::EntryKind::Directory {
+            texts.folder_size(entry.folder_size).into()
+        } else {
+            texts.size(entry.size_bytes).into()
+        },
         modified: texts.modified(entry.modified).into(),
         is_directory: entry.kind == crate::domain::EntryKind::Directory,
         selected: tab.selected.contains(&entry.id),
@@ -4808,6 +5321,18 @@ fn shell_icon_image(icon: &platform::windows_shell_icons::ShellIconRgba) -> Imag
 }
 
 fn status_text(tab: &TabSession, texts: Texts) -> String {
+    if tab.page_source == PageSource::Search {
+        return match tab.search_total {
+            Some(total) if total as usize > tab.entries.len() => match texts.language {
+                Language::Chinese => format!("已显示前 {} 项，共 {total} 项", tab.entries.len()),
+                Language::English => {
+                    format!("Showing first {} of {total} items", tab.entries.len())
+                }
+            },
+            Some(total) => texts.items(total as usize, 0),
+            None => texts.search_state(tab.search_state).to_owned(),
+        };
+    }
     if !tab.selected.is_empty() {
         return match texts.language {
             Language::Chinese => format!("已选择 {} 项", tab.selected.len()),
@@ -4903,6 +5428,7 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
         show_operation_window,
         loading,
         empty_folder,
+        no_search_results,
         new_tab,
         close_tab,
         all_tabs,
@@ -4953,6 +5479,7 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "文件进度窗口",
             "正在加载…",
             "此文件夹为空",
+            "没有搜索结果",
             "新建标签",
             "关闭标签",
             "全部标签",
@@ -5003,6 +5530,7 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "File progress window",
             "Loading…",
             "This folder is empty",
+            "No search results",
             "New tab",
             "Close tab",
             "All tabs",
@@ -5054,6 +5582,7 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_show_operation_window(show_operation_window.into());
     ui.set_text_loading(loading.into());
     ui.set_text_empty_folder(empty_folder.into());
+    ui.set_text_no_search_results(no_search_results.into());
     ui.set_text_new_tab(new_tab.into());
     ui.set_text_close_tab(close_tab.into());
     ui.set_text_all_tabs(all_tabs.into());
@@ -5131,7 +5660,9 @@ mod tests {
             path: PathBuf::from("same/file.txt"),
             kind: crate::domain::EntryKind::File,
             open_target: None,
+            parent_display: "same".into(),
             size_bytes: Some(1),
+            folder_size: crate::domain::FolderSizeState::Unknown,
             modified: None,
         }]);
         let source_entries = source.entries.clone();
@@ -5268,7 +5799,9 @@ mod tests {
             path: PathBuf::from("same/file.txt"),
             kind: crate::domain::EntryKind::File,
             open_target: None,
+            parent_display: "same".into(),
             size_bytes: Some(1),
+            folder_size: crate::domain::FolderSizeState::Unknown,
             modified: None,
         }]);
         let event = IconEvent {
@@ -5349,7 +5882,9 @@ mod tests {
                 display_name: "item.txt".into(),
                 kind: crate::domain::EntryKind::File,
                 open_target: None,
+                parent_display: "C:/test".into(),
                 size_bytes: Some(1),
+                folder_size: crate::domain::FolderSizeState::Unknown,
                 modified: None,
             }]);
         }

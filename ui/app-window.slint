@@ -1,7 +1,7 @@
 import { ListView } from "std-widgets.slint";
 import { IconMap } from "icons/icon-map.slint";
 
-export struct FileRow { id: int, name: string, kind: string, size: string, modified: string, is-directory: bool, selected: bool, focused: bool, cut: bool, icon: image }
+export struct FileRow { id: int, name: string, kind: string, parent-path: string, size: string, modified: string, is-directory: bool, selected: bool, focused: bool, cut: bool, icon: image }
 export struct HistoryRow { index: int, label: string }
 export struct BreadcrumbRow { index: int, label: string, current: bool }
 export struct TabRow { id: int, title: string, active: bool, loading: bool, icon: image, is-drive: bool, is-settings: bool }
@@ -477,11 +477,12 @@ component AddressEditor inherits Rectangle {
     in property <string> address-label;
     in property <string> cancel-label;
     callback accepted(string);
+    callback changed(string);
     callback cancelled();
 
-    public function focus-and-select-all() {
+    public function focus-at-end() {
         editor.focus();
-        editor.select-all();
+        editor.set-selection-offsets(2147483647, 2147483647);
     }
 
     background: VisualStyle.cffffff;
@@ -507,6 +508,7 @@ component AddressEditor inherits Rectangle {
         vertical-alignment: center;
         accessible-role: text-input;
         accessible-label: root.address-label;
+        edited => { root.changed(root.text); }
         accepted => { root.accepted(root.text); }
         key-pressed(event) => {
             if event.text == Key.Escape {
@@ -560,6 +562,8 @@ export component AppWindow inherits Window {
     in property <bool> current-location-is-drive: false;
     in-out property <string> address-input: "C:\\";
     in property <bool> address-editing: false;
+    in property <bool> search-mode: false;
+    in property <bool> search-results-mode: false;
 
 
     in property <string> status-text: "";
@@ -620,6 +624,14 @@ export component AppWindow inherits Window {
     in property <string> text-settings-general: "常规";
     in property <string> text-settings-appearance: "外观";
     in property <string> text-settings-developer: "开发工具";
+    in property <string> text-everything: "Everything";
+    in property <string> text-everything-path: "程序路径";
+    in property <string> text-everything-instance: "实例";
+    in property <string> text-test-connection: "测试连接";
+    in property <string> text-start-everything: "启动 Everything";
+    in-out property <string> everything-path: "";
+    in-out property <string> everything-instance: "1.5a";
+    in property <string> everything-status: "";
     in property <string> text-ui-showcase: "UI 陈列室";
     in property <string> text-ui-showcase-detail: "直接打开难以触发的窗口和状态；演示操作不会修改文件或任务。";
     in property <string> text-show-delete-confirmation: "永久删除确认";
@@ -628,6 +640,7 @@ export component AppWindow inherits Window {
     in property <string> text-show-operation-window: "文件进度窗口";
     in property <string> text-loading: "正在加载…";
     in property <string> text-empty-folder: "此文件夹为空";
+    in property <string> text-no-search-results: "没有搜索结果";
     in property <string> text-new-tab: "新建标签";
     in property <string> text-close-tab: "关闭标签";
     in property <string> text-all-tabs: "全部标签";
@@ -653,6 +666,7 @@ export component AppWindow inherits Window {
     in property <string> text-drives: "磁盘";
     in property <string> text-name: "名称";
     in property <string> text-type: "类型";
+    in property <string> text-parent-path: "父目录";
     in property <string> text-modified: "修改时间";
     in property <string> text-size: "大小";
     in property <string> text-file-operations: "文件操作";
@@ -661,7 +675,9 @@ export component AppWindow inherits Window {
     in property <string> text-retry-operation: "重试";
 
     callback navigate-path(string);
-    callback begin-address-edit();
+    callback address-input-changed(string);
+    callback begin-search();
+
     callback cancel-address-edit();
     callback navigate-back();
     callback navigate-forward();
@@ -689,6 +705,9 @@ export component AppWindow inherits Window {
     callback open-settings();
     callback change-theme(int);
     callback change-language(int);
+    callback update-everything-config(string, string);
+    callback test-everything-connection();
+    callback start-everything();
     callback drag-window();
     callback show-entry-menu(int, float, float);
     callback show-background-menu(float, float);
@@ -725,7 +744,7 @@ export component AppWindow inherits Window {
     in property <int> active-tab-index: 0;
     changed active-tab-index => { root.reveal-tab(root.active-tab-index); }
 
-    public function focus-address-editor() { address-editor.focus-and-select-all(); }
+    public function focus-address-editor() { address-editor.focus-at-end(); }
     public function show-keyboard-context-menu() {
         root.context-menu-anchor-x = root.keyboard-menu-anchor-x;
         root.context-menu-anchor-y = root.keyboard-menu-anchor-y;
@@ -767,8 +786,8 @@ export component AppWindow inherits Window {
         KeyBinding { keys: @keys(Alt + UpArrow); enabled: root.can-navigate-up; activated => { root.navigate-up(); } }
         KeyBinding { keys: @keys(F5); enabled: root.can-refresh; activated => { root.refresh(); } }
         KeyBinding { keys: @keys(Control + R); enabled: root.can-refresh; activated => { root.refresh(); } }
-        KeyBinding { keys: @keys(Control + L); enabled: !root.active-is-settings; activated => { root.begin-address-edit(); } }
-        KeyBinding { keys: @keys(Alt + D); enabled: !root.active-is-settings; activated => { root.begin-address-edit(); } }
+        KeyBinding { keys: @keys(Control + L); enabled: !root.active-is-settings; activated => { root.begin-search(); } }
+        KeyBinding { keys: @keys(Alt + D); enabled: !root.active-is-settings; activated => { root.begin-search(); } }
         KeyBinding { keys: @keys(Control + A); enabled: !root.active-is-settings && !root.address-editing; activated => { root.select-all(); } }
         KeyBinding { keys: @keys(Control + Space); enabled: !root.active-is-settings && !root.address-editing; activated => { root.toggle-focused(); } }
         KeyBinding { keys: @keys(UpArrow); enabled: !root.active-is-settings && !root.address-editing; activated => { root.move-focus(-1, false); } }
@@ -906,11 +925,11 @@ export component AppWindow inherits Window {
                 if !root.compact: IconButton { icon-source: IconMap.action-refresh; tip: root.text-refresh + " (F5)"; enabled: root.can-refresh; button-label: root.text-refresh; clicked => { root.refresh(); } }
                 Rectangle {
                     height: 38px; horizontal-stretch: 1; background: VisualStyle.cffffff; border-width: 0px; border-radius: 5px;
-                    if !root.address-editing: Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; HorizontalLayout { padding-left: 8px; padding-right: 8px; padding-top: 3px; padding-bottom: 3px; spacing: 2px; InlineIcon { icon-source: root.current-location-icon.width != 0 ? root.current-location-icon : (root.current-location-is-drive ? IconMap.location-drive : IconMap.file-folder); icon-size: 16px; } for crumb in root.breadcrumbs: BreadcrumbButton { label: crumb.label; current: crumb.current; clicked => { root.navigate-breadcrumb(crumb.index); } } Rectangle { horizontal-stretch: 1; TouchArea { mouse-cursor: pointer; clicked => { root.begin-address-edit(); } } } } }
-                    address-editor := AddressEditor { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: parent.height - 4px; text <=> root.address-input; address-label: root.text-address; cancel-label: root.text-cancel-edit; accepted(value) => { root.navigate-path(value); } cancelled => { root.cancel-address-edit(); } }
+                    if !root.address-editing: Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; HorizontalLayout { padding-left: 8px; padding-right: 8px; padding-top: 3px; padding-bottom: 3px; spacing: 2px; InlineIcon { icon-source: root.current-location-icon.width != 0 ? root.current-location-icon : (root.current-location-is-drive ? IconMap.location-drive : IconMap.file-folder); icon-size: 16px; } for crumb in root.breadcrumbs: BreadcrumbButton { label: crumb.label; current: crumb.current; clicked => { root.navigate-breadcrumb(crumb.index); } } Rectangle { horizontal-stretch: 1; TouchArea { mouse-cursor: text; clicked => { root.begin-search(); } } } } }
+                    address-editor := AddressEditor { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: parent.height - 4px; text <=> root.address-input; address-label: root.search-mode ? root.text-parent-path : root.text-address; cancel-label: root.text-cancel-edit; changed(value) => { root.address-input-changed(value); } accepted(value) => { root.navigate-path(value); } cancelled => { root.cancel-address-edit(); } }
 
                 }
-                IconButton { icon-source: IconMap.action-forward; tip: root.text-go; button-label: root.text-go; clicked => { root.address-editing ? root.navigate-path(root.address-input) : root.begin-address-edit(); } }
+                IconButton { icon-source: IconMap.action-forward; tip: root.text-go; button-label: root.text-go; clicked => { root.address-editing ? root.navigate-path(root.address-input) : root.begin-search(); } }
             }
         }
 
@@ -959,7 +978,7 @@ export component AppWindow inherits Window {
                                 x: column.kind == 0 ? 27px : 8px;
                                 width: parent.width - self.x;
                                 horizontal-alignment: left;
-                                text: (column.kind == 0 ? root.text-name : column.kind == 1 ? root.text-type : column.kind == 2 ? root.text-size : root.text-modified) + (root.sort-field == column.kind ? (root.sort-descending ? " ↓" : " ↑") : "");
+                                text: (column.kind == 0 ? root.text-name : column.kind == 1 ? (root.search-results-mode ? root.text-parent-path : root.text-type) : column.kind == 2 ? root.text-size : root.text-modified) + (root.sort-field == column.kind ? (root.sort-descending ? " ↓" : " ↑") : "");
                                 color: VisualStyle.c696b74;
                                 font-size: 12px; font-weight: root.sort-field == column.kind ? 600 : 400; vertical-alignment: center;
                             }
@@ -1088,7 +1107,7 @@ list := ListView {
                                     }
                                     if column.kind != 0: Text {
                                         width: parent.width;
-                                        text: column.kind == 1 ? entry.kind : column.kind == 2 ? entry.size : entry.modified;
+                                        text: column.kind == 1 ? (root.search-results-mode ? entry.parent-path : entry.kind) : column.kind == 2 ? entry.size : entry.modified;
                                         color: VisualStyle.c6f717a;
                                         font-size: 12px;
                                         vertical-alignment: center;
@@ -1141,7 +1160,7 @@ list := ListView {
                     }
                     if root.page-state == 1 || root.page-state == 3: VerticalLayout {
                         alignment: center; spacing: 8px;
-                        Text { text: root.page-state == 1 ? root.text-loading : root.text-empty-folder; color: VisualStyle.c62656f; font-size: 16px; horizontal-alignment: center; }
+                        Text { text: root.page-state == 1 ? root.text-loading : (root.search-results-mode ? root.text-no-search-results : root.text-empty-folder); color: VisualStyle.c62656f; font-size: 16px; horizontal-alignment: center; }
                     }
                     if root.page-state >= 5: VerticalLayout {
                         alignment: center; spacing: 12px;
@@ -1193,8 +1212,8 @@ list := ListView {
                     VerticalLayout {
                         padding-left: 12px; padding-right: 12px; padding-top: 18px; padding-bottom: 18px; spacing: 6px;
                         Text { text: root.text-settings-title; color: VisualStyle.c30333a; font-size: 22px; font-weight: 600; height: 42px; }
-                        for section[index] in [root.text-settings-general, root.text-settings-appearance, root.text-settings-developer]: Rectangle {
-                            visible: index < 2 || root.debug-tools-enabled;
+                        for section[index] in [root.text-settings-general, root.text-settings-appearance, root.text-everything, root.text-settings-developer]: Rectangle {
+                            visible: index < 3 || root.debug-tools-enabled;
                             height: 42px; border-radius: 6px;
                             background: root.settings-section == index ? VisualStyle.cdce6ff : (settings-nav-touch.has-hover ? VisualStyle.cedf1f6 : transparent);
                             Rectangle { visible: root.settings-section == index; x: 0px; y: 9px; width: 3px; height: 24px; border-radius: 2px; background: VisualStyle.c4f6bed; }
@@ -1257,7 +1276,18 @@ list := ListView {
                                     }
                                 }
                             }
-                            if root.settings-section == 2 && root.debug-tools-enabled: Rectangle {
+                            if root.settings-section == 2: Rectangle {
+                                height: 262px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                VerticalLayout {
+                                    padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 10px;
+                                    Text { text: root.text-everything-path; color: VisualStyle.c30333a; font-size: 13px; }
+                                    Rectangle { height: 34px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cffffff; TextInput { x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.everything-path; single-line: true; edited => { root.update-everything-config(root.everything-path, root.everything-instance); } } }
+                                    Text { text: root.text-everything-instance; color: VisualStyle.c30333a; font-size: 13px; }
+                                    Rectangle { height: 34px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cffffff; TextInput { x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.everything-instance; single-line: true; edited => { root.update-everything-config(root.everything-path, root.everything-instance); } } }
+                                    Text { text: root.everything-status; color: VisualStyle.c62656f; font-size: 12px; wrap: word-wrap; }
+                                    HorizontalLayout { height: 34px; spacing: 8px; StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-test-connection; clicked => { root.test-everything-connection(); } } StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-start-everything; clicked => { root.start-everything(); } } }
+                                }
+                            }                            if root.settings-section == 3 && root.debug-tools-enabled: Rectangle {
                                 height: 244px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
                                 VerticalLayout {
                                     padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 12px;

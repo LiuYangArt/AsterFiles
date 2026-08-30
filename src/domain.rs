@@ -47,6 +47,69 @@ pub enum NavigationKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressMode {
+    Normal,
+    Smart,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchScope {
+    Global,
+    Directory(PathBuf),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageSource {
+    Directory,
+    Search,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum SearchState {
+    Waiting,
+    Searching,
+    Partial,
+    Complete,
+    NoResults,
+    NotConfigured,
+    Disconnected,
+    NotIndexed,
+    SyntaxError,
+    TimedOut,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderSizeState {
+    Unknown,
+    Querying,
+    Value(u64),
+    NotIndexed,
+    TimedOut,
+    Disconnected,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EverythingConfig {
+    pub executable_path: Option<PathBuf>,
+    pub instance_name: String,
+    pub verified_version: Option<String>,
+    pub allow_launch: bool,
+}
+
+impl Default for EverythingConfig {
+    fn default() -> Self {
+        Self {
+            executable_path: None,
+            instance_name: "1.5a".to_owned(),
+            verified_version: None,
+            allow_launch: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortField {
     Name,
     Kind,
@@ -61,6 +124,14 @@ pub enum SortDirection {
 }
 
 #[derive(Debug)]
+struct DirectorySnapshot {
+    entries: Arc<Vec<FileEntry>>,
+    error: Option<String>,
+    selected: Vec<EntryId>,
+    focused: Option<EntryId>,
+    selection_anchor: Option<EntryId>,
+}
+#[derive(Debug)]
 pub struct TabSession {
     pub id: TabId,
     pub kind: TabKind,
@@ -69,6 +140,13 @@ pub struct TabSession {
     pub requested_path: Option<PathBuf>,
     pub address_editing: bool,
     pub address_input: String,
+    pub address_mode: AddressMode,
+    pub search_scope: SearchScope,
+    pub search_query: String,
+    pub page_source: PageSource,
+    pub search_state: SearchState,
+    pub search_total: Option<u32>,
+    directory_snapshot: Option<DirectorySnapshot>,
     pub navigation_kind: NavigationKind,
     pub back_history: Vec<PathBuf>,
     pub forward_history: Vec<PathBuf>,
@@ -95,6 +173,13 @@ impl TabSession {
             requested_path: None,
             address_editing: false,
             address_input: String::new(),
+            address_mode: AddressMode::Normal,
+            search_scope: SearchScope::Global,
+            search_query: String::new(),
+            page_source: PageSource::Directory,
+            search_state: SearchState::Waiting,
+            search_total: None,
+            directory_snapshot: None,
             navigation_kind: NavigationKind::Normal,
             back_history: Vec::new(),
             forward_history: Vec::new(),
@@ -128,6 +213,13 @@ impl TabSession {
             requested_path: None,
             address_editing: false,
             address_input: String::new(),
+            address_mode: AddressMode::Normal,
+            search_scope: SearchScope::Global,
+            search_query: String::new(),
+            page_source: PageSource::Directory,
+            search_state: SearchState::Waiting,
+            search_total: None,
+            directory_snapshot: None,
             navigation_kind: NavigationKind::Normal,
             back_history: source.back_history.clone(),
             forward_history: source.forward_history.clone(),
@@ -144,9 +236,16 @@ impl TabSession {
             cancel: None,
         }
     }
-    pub fn begin_address_edit(&mut self) {
+    pub fn begin_smart_address_edit(&mut self) {
         self.address_editing = true;
-        self.address_input = self.visible_path().map(display_path).unwrap_or_default();
+        self.address_mode = AddressMode::Smart;
+        self.search_scope = self
+            .visible_path()
+            .map(|path| SearchScope::Directory(path.to_path_buf()))
+            .unwrap_or(SearchScope::Global);
+        self.search_query.clear();
+        self.address_input = search_address_text(&self.search_scope, &self.search_query);
+        self.search_state = SearchState::Waiting;
     }
 
     pub fn visible_path(&self) -> Option<&Path> {
@@ -227,15 +326,91 @@ impl TabSession {
     }
 
     pub fn update_address_input(&mut self, input: String) {
+        if self.address_mode == AddressMode::Smart {
+            match &self.search_scope {
+                SearchScope::Directory(path) => {
+                    let prefix = search_scope_prefix(path);
+                    if let Some(query) = input.strip_prefix(&prefix) {
+                        self.search_query = query.to_owned();
+                    } else {
+                        self.search_scope = SearchScope::Global;
+                        self.search_query = input.clone();
+                    }
+                }
+                SearchScope::Global => self.search_query.clone_from(&input),
+            }
+        }
         self.address_input = input;
     }
 
-    pub fn cancel_address_edit(&mut self) {
-        self.address_editing = false;
-        self.address_input.clear();
-        if !matches!(self.load_state, LoadState::Loading | LoadState::Partial) {
-            self.error = None;
+    pub fn begin_search(
+        &mut self,
+        scope: SearchScope,
+        query: String,
+    ) -> (RequestId, Arc<AtomicBool>) {
+        self.cancel_pending();
+        self.latest_request.0 += 1;
+        if self.page_source == PageSource::Directory {
+            self.directory_snapshot = Some(DirectorySnapshot {
+                entries: self.entries.clone(),
+                error: self.error.clone(),
+                selected: self.selected.clone(),
+                focused: self.focused,
+                selection_anchor: self.selection_anchor,
+            });
         }
+        self.page_source = PageSource::Search;
+        self.address_mode = AddressMode::Smart;
+        self.address_editing = true;
+        self.search_scope = scope;
+        self.search_query = query;
+        self.address_input = search_address_text(&self.search_scope, &self.search_query);
+        self.search_state = SearchState::Searching;
+        self.search_total = None;
+        self.error = None;
+        self.pending_entries.clear();
+        self.replace_entries(Vec::new());
+        self.clear_selection();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(cancel.clone());
+        (self.latest_request, cancel)
+    }
+
+    pub fn accepts_page(&self, request_id: RequestId, source: PageSource) -> bool {
+        self.page_source == source && self.accepts(request_id)
+    }
+
+    #[allow(dead_code)]
+    pub fn finish_search(&mut self) {
+        self.commit_pending();
+        self.search_state = if self.entries.is_empty() {
+            SearchState::NoResults
+        } else {
+            SearchState::Complete
+        };
+    }
+
+    pub fn cancel_address_edit(&mut self) {
+        let was_search = self.page_source == PageSource::Search;
+        self.cancel_pending();
+        if was_search {
+            self.latest_request.0 += 1;
+        }
+        if let Some(snapshot) = self.directory_snapshot.take() {
+            self.entries = snapshot.entries;
+            self.error = snapshot.error;
+            self.selected = snapshot.selected;
+            self.focused = snapshot.focused;
+            self.selection_anchor = snapshot.selection_anchor;
+            self.rebuild_entry_indices();
+        }
+        self.page_source = PageSource::Directory;
+        self.address_editing = false;
+        self.address_mode = AddressMode::Normal;
+        self.address_input.clear();
+        self.search_query.clear();
+        self.search_total = None;
+        self.search_state = SearchState::Waiting;
     }
 
     pub fn begin_navigation(
@@ -246,6 +421,10 @@ impl TabSession {
         self.cancel_pending();
         self.latest_request.0 += 1;
         self.requested_path = Some(path);
+        self.page_source = PageSource::Directory;
+        self.directory_snapshot = None;
+        self.search_total = None;
+        self.address_mode = AddressMode::Normal;
         self.navigation_kind = kind;
         self.load_state = LoadState::Loading;
         self.error = None;
@@ -266,7 +445,14 @@ impl TabSession {
     pub fn cancel_pending(&mut self) {
         if let Some(cancel) = self.cancel.take() {
             cancel.store(true, AtomicOrdering::Release);
-            if matches!(self.load_state, LoadState::Loading | LoadState::Partial) {
+            if self.page_source == PageSource::Search
+                && matches!(
+                    self.search_state,
+                    SearchState::Searching | SearchState::Partial
+                )
+            {
+                self.search_state = SearchState::Cancelled;
+            } else if matches!(self.load_state, LoadState::Loading | LoadState::Partial) {
                 self.load_state = LoadState::Cancelled;
             }
         }
@@ -288,10 +474,27 @@ impl TabSession {
             self.entry_indices.insert(entry.id, start + offset);
         }
         self.pending_entries.append(&mut entries);
-        self.load_state = LoadState::Partial;
+        if self.page_source == PageSource::Search {
+            self.search_state = SearchState::Partial;
+        } else {
+            self.load_state = LoadState::Partial;
+        }
         start
     }
 
+    pub fn append_search_page(&mut self, mut entries: Vec<FileEntry>, total: u32, complete: bool) {
+        let current = Arc::make_mut(&mut self.entries);
+        current.append(&mut entries);
+        self.rebuild_entry_indices();
+        self.search_total = Some(total);
+        self.search_state = if complete && self.entries.is_empty() {
+            SearchState::NoResults
+        } else if complete {
+            SearchState::Complete
+        } else {
+            SearchState::Partial
+        };
+    }
     pub fn commit_pending(&mut self) {
         let entries = std::mem::take(&mut self.pending_entries);
         self.replace_entries(entries);
@@ -575,6 +778,16 @@ fn compare_entries(
     })
 }
 
+fn search_scope_prefix(path: &Path) -> String {
+    format!("{} ", display_path(path))
+}
+
+pub fn search_address_text(scope: &SearchScope, query: &str) -> String {
+    match scope {
+        SearchScope::Directory(path) => format!("{}{}", search_scope_prefix(path), query),
+        SearchScope::Global => query.to_owned(),
+    }
+}
 fn display_path(path: &Path) -> String {
     path.as_os_str().to_string_lossy().into_owned()
 }
@@ -593,10 +806,30 @@ pub struct FileEntry {
     pub path: PathBuf,
     pub kind: EntryKind,
     pub open_target: Option<PathBuf>,
+    pub parent_display: String,
     pub size_bytes: Option<u64>,
+    pub folder_size: FolderSizeState,
     pub modified: Option<std::time::SystemTime>,
 }
 
+impl FileEntry {
+    pub fn accepts_folder_size(&self, entry_id: EntryId, original_path: &Path) -> bool {
+        self.id == entry_id && self.path == original_path
+    }
+
+    pub fn set_folder_size(
+        &mut self,
+        entry_id: EntryId,
+        original_path: &Path,
+        state: FolderSizeState,
+    ) -> bool {
+        if !self.accepts_folder_size(entry_id, original_path) {
+            return false;
+        }
+        self.folder_size = state;
+        true
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EntryKind {
     Directory,
@@ -616,11 +849,126 @@ mod tests {
             path: PathBuf::from(name),
             kind,
             open_target: None,
+            parent_display: String::new(),
             size_bytes: size,
+            folder_size: FolderSizeState::Unknown,
             modified: None,
         }
     }
 
+    #[test]
+    fn search_requests_are_isolated_by_request_and_page_source() {
+        let mut session = TabSession::new(TabId(7));
+        let (first, first_cancel) = session.begin_search(
+            SearchScope::Directory(PathBuf::from(r"C:\范围 (一)")),
+            "*.blend size:>100mb".to_owned(),
+        );
+        assert!(session.accepts_page(first, PageSource::Search));
+        assert!(!session.accepts_page(first, PageSource::Directory));
+
+        let (second, _) = session.begin_search(SearchScope::Global, "ext:png|jpg".to_owned());
+        assert!(first_cancel.load(AtomicOrdering::Acquire));
+        assert!(!session.accepts_page(first, PageSource::Search));
+        assert!(session.accepts_page(second, PageSource::Search));
+        assert_eq!(session.search_scope, SearchScope::Global);
+        assert_eq!(session.search_query, "ext:png|jpg");
+    }
+
+    #[test]
+    fn search_address_keeps_directory_prefix_for_drive_path() {
+        let mut session = TabSession::new(TabId(1));
+        session.current_path = Some(PathBuf::from(r"D:\Assets"));
+        session.begin_smart_address_edit();
+        assert_eq!(session.address_input, r"D:\Assets ");
+        session.update_address_input(r"D:\Assets *.blend".to_owned());
+        assert_eq!(
+            session.search_scope,
+            SearchScope::Directory(PathBuf::from(r"D:\Assets"))
+        );
+        assert_eq!(session.search_query, "*.blend");
+        let (_, _) =
+            session.begin_search(session.search_scope.clone(), session.search_query.clone());
+        assert_eq!(session.address_input, r"D:\Assets *.blend");
+    }
+
+    #[test]
+    fn search_address_does_not_split_paths_containing_spaces() {
+        let scope = SearchScope::Directory(PathBuf::from(r"D:\My Assets (A)!|"));
+        let mut session = TabSession::new(TabId(1));
+        session.begin_search(scope.clone(), "ext:png|jpg".to_owned());
+        assert_eq!(session.address_input, r"D:\My Assets (A)!| ext:png|jpg");
+        session.update_address_input(r"D:\My Assets (A)!| ext:png|jpg size:>1mb".to_owned());
+        assert_eq!(session.search_scope, scope);
+        assert_eq!(session.search_query, "ext:png|jpg size:>1mb");
+    }
+
+    #[test]
+    fn search_address_keeps_unc_prefix_until_the_complete_prefix_is_deleted() {
+        let path = PathBuf::from(r"\\LiuYanghomeNAS\Multimedia");
+        let mut session = TabSession::new(TabId(1));
+        session.begin_search(SearchScope::Directory(path.clone()), "*.mkv".to_owned());
+        assert_eq!(session.address_input, r"\\LiuYanghomeNAS\Multimedia *.mkv");
+        session.update_address_input(r"\\LiuYanghomeNAS\Multimedia *.mp4".to_owned());
+        assert_eq!(session.search_scope, SearchScope::Directory(path));
+        assert_eq!(session.search_query, "*.mp4");
+        session.update_address_input("*.mkv".to_owned());
+        assert_eq!(session.search_scope, SearchScope::Global);
+        assert_eq!(session.search_query, "*.mkv");
+    }
+    #[test]
+    fn search_first_page_is_visible_bounded_and_cancel_restores_directory() {
+        let mut session = TabSession::new(TabId(1));
+        session.current_path = Some(PathBuf::from(r"F:\CodeProjects\AsterFiles"));
+        session.replace_entries(vec![entry(90, "directory-row", EntryKind::File, Some(1))]);
+        session.select_entry(EntryId(90), false, false);
+        let (request, _) = session.begin_search(SearchScope::Global, ".md".to_owned());
+
+        let first_page = (1..=256)
+            .map(|id| entry(id, &format!("result-{id}.md"), EntryKind::File, Some(1)))
+            .collect();
+        session.append_search_page(first_page, 133_186, false);
+        assert_eq!(session.entries.len(), 256);
+        assert_eq!(session.search_total, Some(133_186));
+        assert_eq!(session.page_source, PageSource::Search);
+        assert_eq!(session.search_state, SearchState::Partial);
+
+        session.cancel_address_edit();
+        assert_eq!(session.page_source, PageSource::Directory);
+        assert_eq!(session.entries.len(), 1);
+        assert_eq!(session.entries[0].display_name, "directory-row");
+        assert_eq!(session.selected, vec![EntryId(90)]);
+        assert_eq!(session.search_total, None);
+        assert!(!session.accepts_page(request, PageSource::Search));
+        let late_page = vec![entry(999, "late.md", EntryKind::File, Some(1))];
+        if session.accepts_page(request, PageSource::Search) {
+            session.append_search_page(late_page, 133_186, false);
+        }
+        assert_eq!(session.entries[0].display_name, "directory-row");
+    }
+    #[test]
+    fn folder_size_update_requires_entry_identity_and_original_path() {
+        let original = PathBuf::from(r"\\server\共享\零字节");
+        let mut item = FileEntry {
+            id: EntryId(3),
+            original_name: "零字节".into(),
+            display_name: "零字节".into(),
+            path: original.clone(),
+            kind: EntryKind::Directory,
+            open_target: None,
+            parent_display: r"\\server\共享".into(),
+            size_bytes: None,
+            folder_size: FolderSizeState::Querying,
+            modified: None,
+        };
+        assert!(!item.set_folder_size(EntryId(4), &original, FolderSizeState::Value(0)));
+        assert!(!item.set_folder_size(
+            EntryId(3),
+            Path::new(r"\\server\共享\别处"),
+            FolderSizeState::Value(0)
+        ));
+        assert!(item.set_folder_size(EntryId(3), &original, FolderSizeState::Value(0)));
+        assert_eq!(item.folder_size, FolderSizeState::Value(0));
+    }
     #[test]
     fn partial_selection_uses_the_visible_batch_indices() {
         let mut session = TabSession::new(TabId(1));
@@ -747,7 +1095,7 @@ mod tests {
     fn address_edit_cancel_restores_successful_path() {
         let mut session = TabSession::new(TabId(1));
         session.current_path = Some(PathBuf::from("C:\\成功"));
-        session.begin_address_edit();
+        session.begin_smart_address_edit();
         session.update_address_input("C:\\不存在📁".to_owned());
         session.load_state = LoadState::NotFound;
         session.cancel_address_edit();
@@ -820,7 +1168,9 @@ mod tests {
             path: original.clone(),
             kind: EntryKind::Directory,
             open_target: None,
+            parent_display: "中文".into(),
             size_bytes: None,
+            folder_size: FolderSizeState::Unknown,
             modified: None,
         }]);
         assert_eq!(

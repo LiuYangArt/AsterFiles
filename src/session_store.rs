@@ -4,12 +4,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::i18n::Language;
+use crate::{domain::EverythingConfig, i18n::Language};
 
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-const MAGIC: &[u8; 5] = b"ASTF4";
+const MAGIC: &[u8; 5] = b"ASTF5";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ThemeMode {
@@ -38,7 +38,10 @@ impl ThemeMode {
     }
 }
 pub type ColumnOrder = [u8; 4];
+pub type SearchColumnOrder = [u8; 4];
 pub const DEFAULT_COLUMN_ORDER: ColumnOrder = [0, 1, 2, 3];
+#[allow(dead_code)]
+pub const DEFAULT_SEARCH_COLUMN_ORDER: SearchColumnOrder = [0, 1, 2, 3];
 const MAX_TABS: usize = 1_024;
 const MAX_PATH_UNITS: usize = 32_767;
 const MIN_WINDOW_WIDTH: u32 = 820;
@@ -60,8 +63,10 @@ pub struct SessionState {
     pub active_tab: usize,
     pub tab_paths: Vec<PathBuf>,
     pub column_order: ColumnOrder,
+    pub search_column_order: SearchColumnOrder,
     pub theme_mode: ThemeMode,
     pub language: Language,
+    pub everything: EverythingConfig,
 }
 
 impl SessionState {
@@ -82,6 +87,7 @@ impl SessionState {
         )
     }
 
+    #[allow(dead_code)]
     pub fn with_settings(
         window: WindowPlacement,
         active_tab: usize,
@@ -90,8 +96,33 @@ impl SessionState {
         theme_mode: ThemeMode,
         language: Language,
     ) -> io::Result<Self> {
+        Self::with_everything_settings(
+            window,
+            active_tab,
+            tab_paths,
+            column_order,
+            DEFAULT_SEARCH_COLUMN_ORDER,
+            theme_mode,
+            language,
+            EverythingConfig::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_everything_settings(
+        window: WindowPlacement,
+        active_tab: usize,
+        tab_paths: Vec<PathBuf>,
+        column_order: ColumnOrder,
+        search_column_order: SearchColumnOrder,
+        theme_mode: ThemeMode,
+        language: Language,
+        everything: EverythingConfig,
+    ) -> io::Result<Self> {
         validate_window(window)?;
         validate_column_order(column_order)?;
+        validate_column_order(search_column_order)?;
+        validate_everything_config(&everything)?;
         if tab_paths.len() > MAX_TABS {
             return Err(invalid_data("too many session tabs"));
         }
@@ -107,8 +138,10 @@ impl SessionState {
             active_tab,
             tab_paths,
             column_order,
+            search_column_order,
             theme_mode,
             language,
+            everything,
         })
     }
 }
@@ -132,13 +165,15 @@ pub fn save(path: &Path, state: &SessionState) -> io::Result<()> {
 }
 
 fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
-    let state = SessionState::with_settings(
+    let state = SessionState::with_everything_settings(
         state.window,
         state.active_tab,
         state.tab_paths.clone(),
         state.column_order,
+        state.search_column_order,
         state.theme_mode,
         state.language,
+        state.everything.clone(),
     )?;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(MAGIC);
@@ -149,18 +184,16 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
     bytes.extend_from_slice(&(state.active_tab as u32).to_le_bytes());
     bytes.extend_from_slice(&(state.tab_paths.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&state.column_order);
+    bytes.extend_from_slice(&state.search_column_order);
     bytes.push(state.theme_mode.storage_code());
     bytes.push(state.language.storage_code());
+    write_optional_os(&mut bytes, state.everything.executable_path.as_deref())?;
+    write_string(&mut bytes, &state.everything.instance_name)?;
+    write_optional_string(&mut bytes, state.everything.verified_version.as_deref())?;
+    bytes.push(u8::from(state.everything.allow_launch));
 
     for path in &state.tab_paths {
-        let units = encode_os(path.as_os_str());
-        if units.len() > MAX_PATH_UNITS {
-            return Err(invalid_data("session path is too long"));
-        }
-        bytes.extend_from_slice(&(units.len() as u32).to_le_bytes());
-        for unit in units {
-            bytes.extend_from_slice(&unit.to_le_bytes());
-        }
+        write_os(&mut bytes, path.as_os_str())?;
     }
     Ok(bytes)
 }
@@ -183,43 +216,44 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
         return Err(invalid_data("too many session tabs"));
     }
     let column_order = read_four(bytes, &mut offset)?;
+    let search_column_order = read_four(bytes, &mut offset)?;
     let theme_mode = ThemeMode::from_storage_code(read_u8(bytes, &mut offset)?)
         .ok_or_else(|| invalid_data("invalid session theme mode"))?;
     let language = Language::from_storage_code(read_u8(bytes, &mut offset)?)
         .ok_or_else(|| invalid_data("invalid session language"))?;
+    let executable_path = read_optional_os(bytes, &mut offset)?.map(PathBuf::from);
+    let instance_name = read_string(bytes, &mut offset)?;
+    let verified_version = read_optional_string(bytes, &mut offset)?;
+    let allow_launch = match read_u8(bytes, &mut offset)? {
+        0 => false,
+        1 => true,
+        _ => return Err(invalid_data("invalid Everything launch setting")),
+    };
+    let everything = EverythingConfig {
+        executable_path,
+        instance_name,
+        verified_version,
+        allow_launch,
+    };
 
     let mut tab_paths = Vec::with_capacity(count);
     for _ in 0..count {
-        let length = read_u32(bytes, &mut offset)? as usize;
-        if length > MAX_PATH_UNITS {
-            return Err(invalid_data("session path is too long"));
-        }
-        let byte_length = length
-            .checked_mul(2)
-            .ok_or_else(|| invalid_data("invalid session path length"))?;
-        let end = offset
-            .checked_add(byte_length)
-            .filter(|end| *end <= bytes.len())
-            .ok_or_else(|| invalid_data("truncated session"))?;
-        let units = bytes[offset..end]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect::<Vec<_>>();
-        tab_paths.push(PathBuf::from(decode_os(&units)));
-        offset = end;
+        tab_paths.push(PathBuf::from(read_os(bytes, &mut offset)?));
     }
 
     if offset != bytes.len() {
         return Err(invalid_data("unexpected trailing session data"));
     }
 
-    SessionState::with_settings(
+    SessionState::with_everything_settings(
         window,
         active_tab,
         tab_paths,
         column_order,
+        search_column_order,
         theme_mode,
         language,
+        everything,
     )
 }
 
@@ -235,6 +269,119 @@ fn validate_column_order(column_order: ColumnOrder) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_everything_config(config: &EverythingConfig) -> io::Result<()> {
+    if config.instance_name.encode_utf16().count() > MAX_PATH_UNITS
+        || config
+            .verified_version
+            .as_deref()
+            .is_some_and(|version| version.encode_utf16().count() > MAX_PATH_UNITS)
+    {
+        return Err(invalid_data("Everything setting is too long"));
+    }
+    if config
+        .executable_path
+        .as_deref()
+        .is_some_and(|path| encode_os(path.as_os_str()).len() > MAX_PATH_UNITS)
+    {
+        return Err(invalid_data("Everything executable path is too long"));
+    }
+    Ok(())
+}
+
+fn write_optional_os(bytes: &mut Vec<u8>, value: Option<&Path>) -> io::Result<()> {
+    match value {
+        Some(value) => {
+            bytes.push(1);
+            write_os(bytes, value.as_os_str())
+        }
+        None => {
+            bytes.push(0);
+            Ok(())
+        }
+    }
+}
+
+fn write_os(bytes: &mut Vec<u8>, value: &OsStr) -> io::Result<()> {
+    let units = encode_os(value);
+    if units.len() > MAX_PATH_UNITS {
+        return Err(invalid_data("stored path is too long"));
+    }
+    bytes.extend_from_slice(&(units.len() as u32).to_le_bytes());
+    for unit in units {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn write_string(bytes: &mut Vec<u8>, value: &str) -> io::Result<()> {
+    let units = value.encode_utf16().collect::<Vec<_>>();
+    if units.len() > MAX_PATH_UNITS {
+        return Err(invalid_data("stored string is too long"));
+    }
+    bytes.extend_from_slice(&(units.len() as u32).to_le_bytes());
+    for unit in units {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn write_optional_string(bytes: &mut Vec<u8>, value: Option<&str>) -> io::Result<()> {
+    match value {
+        Some(value) => {
+            bytes.push(1);
+            write_string(bytes, value)
+        }
+        None => {
+            bytes.push(0);
+            Ok(())
+        }
+    }
+}
+
+fn read_optional_os(bytes: &[u8], offset: &mut usize) -> io::Result<Option<OsString>> {
+    match read_u8(bytes, offset)? {
+        0 => Ok(None),
+        1 => read_os(bytes, offset).map(Some),
+        _ => Err(invalid_data("invalid optional path")),
+    }
+}
+
+fn read_os(bytes: &[u8], offset: &mut usize) -> io::Result<OsString> {
+    read_units(bytes, offset).map(|units| decode_os(&units))
+}
+
+fn read_string(bytes: &[u8], offset: &mut usize) -> io::Result<String> {
+    String::from_utf16(&read_units(bytes, offset)?)
+        .map_err(|_| invalid_data("invalid stored string"))
+}
+
+fn read_optional_string(bytes: &[u8], offset: &mut usize) -> io::Result<Option<String>> {
+    match read_u8(bytes, offset)? {
+        0 => Ok(None),
+        1 => read_string(bytes, offset).map(Some),
+        _ => Err(invalid_data("invalid optional string")),
+    }
+}
+
+fn read_units(bytes: &[u8], offset: &mut usize) -> io::Result<Vec<u16>> {
+    let length = read_u32(bytes, offset)? as usize;
+    if length > MAX_PATH_UNITS {
+        return Err(invalid_data("stored value is too long"));
+    }
+    let byte_length = length
+        .checked_mul(2)
+        .ok_or_else(|| invalid_data("invalid stored value length"))?;
+    let end = offset
+        .checked_add(byte_length)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| invalid_data("truncated session"))?;
+    let units = bytes[*offset..end]
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect();
+    *offset = end;
+    Ok(units)
+}
 fn validate_window(window: WindowPlacement) -> io::Result<()> {
     if window.width < MIN_WINDOW_WIDTH
         || window.height < MIN_WINDOW_HEIGHT
@@ -348,6 +495,34 @@ mod tests {
         assert_eq!(state.language, Language::Chinese);
     }
 
+    #[test]
+    fn everything_settings_and_search_columns_round_trip() {
+        let state = SessionState::with_everything_settings(
+            WindowPlacement {
+                x: 20,
+                y: 30,
+                width: 1200,
+                height: 800,
+            },
+            0,
+            vec![PathBuf::from(r"\\LiuYanghomeNAS\Multimedia")],
+            DEFAULT_COLUMN_ORDER,
+            [1, 0, 3, 2],
+            ThemeMode::Dark,
+            Language::English,
+            EverythingConfig {
+                executable_path: Some(PathBuf::from(
+                    r"C:\Program Files\Everything 1.5a\Everything64.exe",
+                )),
+                instance_name: "1.5a 特殊".to_owned(),
+                verified_version: Some("1.5.0.1396a x64".to_owned()),
+                allow_launch: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(decode(&encode(&state).unwrap()).unwrap(), state);
+    }
     #[test]
     fn setting_storage_codes_are_stable() {
         assert_eq!(ThemeMode::System.storage_code(), 0);
@@ -538,7 +713,13 @@ mod tests {
         }
 
         let mut bytes = encode(&sample_state()).unwrap();
-        bytes[29..33].copy_from_slice(&[0, 1, 1, 3]);
+        bytes[33..37].copy_from_slice(&[0, 1, 1, 3]);
+        assert_eq!(
+            decode(&bytes).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut bytes = encode(&sample_state()).unwrap();
+        bytes[37..41].copy_from_slice(&[0, 1, 1, 3]);
         assert_eq!(
             decode(&bytes).unwrap_err().kind(),
             io::ErrorKind::InvalidData
@@ -551,6 +732,7 @@ mod tests {
             b"ASTF1\0\0\0\0".as_slice(),
             b"ASTF2\0\0\0\0".as_slice(),
             b"ASTF3\0\0\0\0".as_slice(),
+            b"ASTF4\0\0\0\0".as_slice(),
         ] {
             assert_eq!(
                 decode(bytes).unwrap_err().kind(),

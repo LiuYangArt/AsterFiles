@@ -70,10 +70,15 @@ pub fn read_directory_batches(
             id: EntryId(next_id),
             display_name: original_name.to_string_lossy().into_owned(),
             original_name,
-            path,
+            path: path.clone(),
             kind,
             open_target,
+            parent_display: path
+                .parent()
+                .map(|value| value.as_os_str().to_string_lossy().into_owned())
+                .unwrap_or_default(),
             size_bytes: metadata.is_file().then_some(metadata.len()),
+            folder_size: crate::domain::FolderSizeState::Unknown,
             modified: metadata.modified().ok(),
         });
         next_id += 1;
