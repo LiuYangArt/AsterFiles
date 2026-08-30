@@ -58,6 +58,7 @@ component StandaloneActionButton inherits Rectangle {
     in property <string> label;
     in property <bool> enabled: true;
     in property <bool> dangerous: false;
+    in property <bool> center-content: true;
     callback clicked();
     width: 96px;
     height: 34px;
@@ -67,10 +68,13 @@ component StandaloneActionButton inherits Rectangle {
     border-color: root.dangerous ? VisualStyle.cc42b1c : VisualStyle.ce0e2e7;
     background: !root.enabled ? VisualStyle.cf8f8f9 : button-touch.pressed ? (root.dangerous ? #a4261a : VisualStyle.cdce6ff) : button-touch.has-hover ? (root.dangerous ? VisualStyle.cc42b1c : VisualStyle.ceff4ff) : (root.dangerous ? #b3261e : VisualStyle.cffffff);
     opacity: root.enabled ? 1 : 0.5;
-    HorizontalLayout {
-        padding-left: 10px; padding-right: 10px; spacing: 6px; alignment: center;
-        if root.icon-source.width != 0: Image { width: 16px; height: 16px; source: root.icon-source; image-fit: contain; colorize: VisualStyle.c303138; }
-        Text { text: root.label; color: root.dangerous ? #ffffff : VisualStyle.c30333a; font-size: 12px; vertical-alignment: center; overflow: elide; }
+    Rectangle {
+        x: 10px; width: parent.width - 20px; height: parent.height;
+        HorizontalLayout {
+            spacing: 6px; alignment: root.center-content ? center : start;
+            if root.icon-source.width != 0: Rectangle { width: 16px; vertical-stretch: 1; Image { width: 16px; height: 16px; y: (parent.height - self.height) / 2; source: root.icon-source; image-fit: contain; colorize: VisualStyle.c303138; } }
+            Text { horizontal-stretch: root.center-content ? 0 : 1; text: root.label; color: root.dangerous ? #ffffff : VisualStyle.c30333a; font-size: 12px; vertical-alignment: center; overflow: elide; }
+        }
     }
     button-touch := TouchArea { enabled: root.enabled; mouse-cursor: pointer; clicked => { root.clicked(); } }
     accessible-role: button;
@@ -1109,7 +1113,7 @@ list := ListView {
                             accessible-id: "error-page-actions";
                             HorizontalLayout {
                                 alignment: center; spacing: 8px;
-                                if root.show-request-access: StandaloneActionButton { width: 196px; icon-source: IconMap.status-locked; label: root.text-request-access; clicked => { root.request-folder-access(); } }
+                                if root.show-request-access: StandaloneActionButton { width: 260px; center-content: false; icon-source: IconMap.status-locked; label: root.text-request-access; clicked => { root.request-folder-access(); } }
                             }
                         }
                     }
