@@ -954,8 +954,47 @@ pub fn client_screen_rect(hwnd: isize) -> io::Result<(i32, i32, i32, i32)> {
     ))
 }
 
+#[derive(Default)]
+struct ThreadApartment {
+    apartment: Option<OleApartment>,
+    registrations: std::collections::HashMap<isize, DragDropRegistration>,
+}
+
+impl ThreadApartment {
+    fn ensure(&mut self) -> io::Result<()> {
+        if self.apartment.is_none() {
+            self.apartment = Some(OleApartment::initialize()?);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ThreadApartment {
+    fn drop(&mut self) {
+        self.registrations.clear();
+        self.apartment.take();
+    }
+}
+
 thread_local! {
-    static REGISTRATIONS: std::cell::RefCell<std::collections::HashMap<isize, DragDropRegistration>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    static THREAD_APARTMENT: std::cell::RefCell<ThreadApartment> = std::cell::RefCell::new(ThreadApartment::default());
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationAction {
+    WaitForWindow,
+    Keep,
+    Replace,
+}
+
+pub fn registration_action(registered_hwnd: isize, observed_hwnd: isize) -> RegistrationAction {
+    if observed_hwnd == 0 {
+        RegistrationAction::WaitForWindow
+    } else if registered_hwnd == observed_hwnd {
+        RegistrationAction::Keep
+    } else {
+        RegistrationAction::Replace
+    }
 }
 
 pub fn register_current(
@@ -963,9 +1002,12 @@ pub fn register_current(
     target: SharedTarget,
     intents: mpsc::Sender<DropIntent>,
 ) -> io::Result<()> {
-    REGISTRATIONS.with(|registrations| {
-        let mut registrations = registrations.borrow_mut();
-        if let std::collections::hash_map::Entry::Vacant(entry) = registrations.entry(hwnd) {
+    THREAD_APARTMENT.with(|apartment| {
+        let mut apartment = apartment.borrow_mut();
+        apartment.ensure()?;
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            apartment.registrations.entry(hwnd)
+        {
             entry.insert(DragDropRegistration::register(hwnd, target, intents)?);
         }
         Ok(())
@@ -973,14 +1015,14 @@ pub fn register_current(
 }
 
 pub fn revoke(hwnd: isize) {
-    REGISTRATIONS.with(|registrations| {
-        registrations.borrow_mut().remove(&hwnd);
+    THREAD_APARTMENT.with(|apartment| {
+        apartment.borrow_mut().registrations.remove(&hwnd);
     });
 }
 
 pub fn revoke_current() {
-    REGISTRATIONS.with(|registrations| {
-        registrations.borrow_mut().clear();
+    THREAD_APARTMENT.with(|apartment| {
+        apartment.borrow_mut().registrations.clear();
     });
 }
 
@@ -1002,7 +1044,6 @@ impl DragDropRegistration {
                 "main window handle is not available",
             ));
         }
-        unsafe { OleInitialize(None) }.map_err(windows_error)?;
         let state = Arc::new(Mutex::new(DragDropState::default()));
         let target = IDropTarget::from(NativeDropTarget {
             state: state.clone(),
@@ -1012,7 +1053,6 @@ impl DragDropRegistration {
         });
         let hwnd = HWND(hwnd as *mut c_void);
         if let Err(error) = unsafe { RegisterDragDrop(hwnd, &target) } {
-            unsafe { OleUninitialize() };
             return Err(windows_error(error));
         }
         if let Ok(mut current) = state.lock() {
@@ -1041,7 +1081,6 @@ impl Drop for DragDropRegistration {
         {
             live.remove(&(self.hwnd.0 as isize));
         }
-        unsafe { OleUninitialize() };
     }
 }
 
@@ -1257,5 +1296,13 @@ mod tests {
             Path::new(r"\\server\share\one"),
             Path::new(r"\\server\other\two")
         ));
+    }
+
+    #[test]
+    fn native_drop_registration_retries_until_each_window_has_a_real_handle() {
+        assert_eq!(registration_action(0, 0), RegistrationAction::WaitForWindow);
+        assert_eq!(registration_action(0, 101), RegistrationAction::Replace);
+        assert_eq!(registration_action(101, 101), RegistrationAction::Keep);
+        assert_eq!(registration_action(101, 202), RegistrationAction::Replace);
     }
 }
