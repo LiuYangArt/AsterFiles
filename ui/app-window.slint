@@ -868,12 +868,16 @@ export component AppWindow inherits Window {
     private property <length> max-tab-cluster-width: max(80px, root.window-width - 8px - 34px - 34px - 36px - 3 * 46px - 12px);
     private property <bool> tabs-overflow: root.tabs.length * 80px + 5px * max(0, root.tabs.length - 1) > root.max-tab-cluster-width;
     private property <length> max-tab-strip-width: max(80px, root.max-tab-cluster-width - (root.tabs-overflow ? 33px : 0px));
-    private property <length> tab-width: root.tabs.length == 0 ? 178px : max(80px, min(178px, (root.max-tab-strip-width - 5px * max(0, root.tabs.length - 1)) / root.tabs.length));
+    out property <length> tab-current-width: root.tabs.length == 0 ? 178px : max(80px, min(178px, (root.max-tab-strip-width - 5px * max(0, root.tabs.length - 1)) / root.tabs.length));
+    private property <length> tab-width: root.tab-current-width;
     private property <length> tab-content-width: root.tabs.length * root.tab-width + 5px * max(0, root.tabs.length - 1);
     out property <length> tab-strip-width: min(root.max-tab-strip-width, root.tab-content-width);
+    out property <length> tab-viewport-x: tab-strip.viewport-x;
     private property <bool> tabs-menu-open: false;
     in-out property <bool> tab-dragging: false;
     private property <bool> suppress-tab-click: false;
+    private property <bool> external-tab-dragging: false;
+    private property <int> external-tab-insertion-index: -1;
     private property <int> tab-drag-source-index: -1;
     private property <int> tab-drag-insertion-index: -1;
     private property <length> tab-drag-pointer-x: 0px;
@@ -889,6 +893,14 @@ export component AppWindow inherits Window {
         root.tab-drag-source-index = -1;
         root.tab-drag-insertion-index = -1;
         root.tab-drag-title = "";
+    }
+    public function project-external-tab-drag(insertion-index: int) {
+        root.external-tab-dragging = true;
+        root.external-tab-insertion-index = insertion-index;
+    }
+    public function clear-external-tab-drag() {
+        root.external-tab-dragging = false;
+        root.external-tab-insertion-index = -1;
     }
     in property <int> active-tab-index: 0;
     changed active-tab-index => { root.reveal-tab(root.active-tab-index); }
@@ -988,7 +1000,10 @@ export component AppWindow inherits Window {
                     Rectangle {
                         width: root.tab-content-width; height: 34px;
                         for tab[index] in root.tabs: Rectangle {
-                            x: root.tab-dragging
+                            x: root.external-tab-dragging
+                                ? index * (root.tab-width + 5px)
+                                    + (index >= root.external-tab-insertion-index && root.external-tab-insertion-index >= 0 ? root.tab-width + 5px : 0px)
+                                : root.tab-dragging
                                 ? (index < root.tab-drag-source-index ? index : index > root.tab-drag-source-index ? index - 1 : index) * (root.tab-width + 5px)
                                     + ((index != root.tab-drag-source-index && (index < root.tab-drag-source-index ? index : index - 1) >= root.tab-drag-insertion-index && root.tab-drag-insertion-index >= 0) ? root.tab-width + 5px : 0px)
                                 : index * (root.tab-width + 5px);

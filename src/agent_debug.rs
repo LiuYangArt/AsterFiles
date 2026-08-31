@@ -36,6 +36,7 @@ pub enum AgentScenario {
     MultiWindowStateLayering,
     TabReorder,
     TabDetach,
+    TabCrossWindow,
 }
 
 impl AgentScenario {
@@ -49,6 +50,7 @@ impl AgentScenario {
             Self::MultiWindowStateLayering => "multi-window-state-layering",
             Self::TabReorder => "tab-reorder",
             Self::TabDetach => "tab-detach",
+            Self::TabCrossWindow => "tab-cross-window",
         }
     }
 
@@ -114,6 +116,7 @@ fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
         "multi-window-state-layering" => Ok(AgentScenario::MultiWindowStateLayering),
         "tab-reorder" => Ok(AgentScenario::TabReorder),
         "tab-detach" => Ok(AgentScenario::TabDetach),
+        "tab-cross-window" => Ok(AgentScenario::TabCrossWindow),
         _ => Err(format!("unknown agent scenario: {value}")),
     }
 }
@@ -140,6 +143,10 @@ pub fn apply_scenario(session: &mut TabSession, scenario: AgentScenario) {
         }
         AgentScenario::TabDetach => {
             session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\TabDetach"));
+            session.load_state = LoadState::Complete;
+        }
+        AgentScenario::TabCrossWindow => {
+            session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\TabCrossWindow"));
             session.load_state = LoadState::Complete;
         }
         AgentScenario::FileOperationRunning
@@ -257,6 +264,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
             | AgentScenario::MultiWindowStateLayering
             | AgentScenario::TabReorder
             | AgentScenario::TabDetach
+            | AgentScenario::TabCrossWindow
     ) {
         return None;
     }
@@ -311,6 +319,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
         AgentScenario::MultiWindowStateLayering => unreachable!(),
         AgentScenario::TabReorder => unreachable!(),
         AgentScenario::TabDetach => unreachable!(),
+        AgentScenario::TabCrossWindow => unreachable!(),
         AgentScenario::PermissionDenied => unreachable!(),
     }
     manager.task(id).map(|task| match task.state {
