@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KnownLocationKind {
     Home,
+    Pinned,
     Desktop,
     Downloads,
     Documents,
@@ -115,7 +116,7 @@ mod windows_impl {
             (KnownLocationKind::Music, "音乐", FOLDERID_Music),
             (KnownLocationKind::Videos, "视频", FOLDERID_Videos),
         ];
-        specifications
+        let mut locations = specifications
             .into_iter()
             .filter_map(|(kind, label, id)| {
                 known_folder(&id).map(|path| KnownLocation {
@@ -124,8 +125,96 @@ mod windows_impl {
                     path,
                 })
             })
-            .chain(logical_drives())
-            .collect()
+            .collect::<Vec<_>>();
+        if let Ok(pinned) = explorer_pinned_locations() {
+            locations.splice(1..1, pinned);
+        }
+        locations.extend(logical_drives());
+        locations
+    }
+
+    pub fn explorer_pinned_locations() -> std::io::Result<Vec<KnownLocation>> {
+        use windows::{
+            Win32::{
+                System::SystemServices::SFGAO_FOLDER,
+                UI::Shell::{
+                    BHID_EnumItems, IEnumShellItems, IShellItem, SHCreateItemFromParsingName,
+                    SIGDN_FILESYSPATH, SIGDN_NORMALDISPLAY,
+                },
+            },
+            core::{PCWSTR, PWSTR},
+        };
+        struct ComGuard;
+        impl Drop for ComGuard {
+            fn drop(&mut self) {
+                unsafe { CoUninitialize() };
+            }
+        }
+        let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+        let _guard = initialized.then_some(ComGuard);
+        let namespace = "::{3936e9e4-d92c-4eee-a85a-bc16d5ea0819}\0"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        let root: IShellItem = unsafe {
+            SHCreateItemFromParsingName(PCWSTR(namespace.as_ptr()), None)
+                .map_err(std::io::Error::other)?
+        };
+        let items: IEnumShellItems = unsafe {
+            root.BindToHandler(None, &BHID_EnumItems)
+                .map_err(std::io::Error::other)?
+        };
+        let mut result = Vec::new();
+        loop {
+            let mut next = [None];
+            let mut fetched = 0;
+            if unsafe { items.Next(&mut next, Some(&mut fetched)) }.is_err() || fetched == 0 {
+                break;
+            }
+            let Some(item) = next[0].take() else { continue };
+            let attributes = unsafe { item.GetAttributes(SFGAO_FOLDER) }.unwrap_or_default();
+            if !attributes.contains(SFGAO_FOLDER) {
+                continue;
+            }
+            let Ok(path) = (unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }) else {
+                continue;
+            };
+            let path = take_shell_string(path);
+            if path.as_os_str().is_empty() {
+                continue;
+            }
+            let label = unsafe { item.GetDisplayName(SIGDN_NORMALDISPLAY) }
+                .map(take_shell_string)
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| {
+                    path.file_name()
+                        .unwrap_or(path.as_os_str())
+                        .to_string_lossy()
+                        .into_owned()
+                });
+            result.push(KnownLocation {
+                kind: KnownLocationKind::Pinned,
+                label,
+                path,
+            });
+        }
+        return Ok(result);
+
+        fn take_shell_string(value: PWSTR) -> PathBuf {
+            if value.is_null() {
+                return PathBuf::new();
+            }
+            let mut len = 0;
+            unsafe {
+                while *value.0.add(len) != 0 {
+                    len += 1;
+                }
+            }
+            let path = PathBuf::from(OsString::from_wide(unsafe {
+                std::slice::from_raw_parts(value.0, len)
+            }));
+            unsafe { CoTaskMemFree(value.0.cast()) };
+            path
+        }
     }
 
     fn known_folder(id: &GUID) -> Option<PathBuf> {

@@ -1903,11 +1903,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         state.clone(),
     );
     scan_cleanup_diagnostics(&ui, state.clone());
-    {
-        let mut app = state.lock().expect("app state mutex is not poisoned");
-        app.sidebar = platform::known_locations();
-    }
-    start_sidebar_icon_loader(&ui, state.clone());
+    start_sidebar_loader(&ui, state.clone());
     refresh_window_ui(&ui, &state, initial_window_id);
     refresh_operation_window(&operation_ui, &state);
     refresh_confirmation_windows(&delete_ui, &conflict_ui, &exit_ui, &state);
@@ -7970,6 +7966,26 @@ fn start_sidebar_icon_loader(ui: &AppWindow, state: SharedSessions) {
     });
 }
 
+fn start_sidebar_loader(ui: &AppWindow, state: SharedSessions) {
+    let weak = ui.as_weak();
+    thread::spawn(move || {
+        let locations = platform::known_locations();
+        let state_for_ui = state.clone();
+        let weak_for_icons = weak.clone();
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            if let Ok(mut app) = state_for_ui.lock() {
+                app.sidebar = locations;
+            }
+            refresh_all_windows(&state_for_ui);
+            if let Some(owner) = weak_for_icons.upgrade() {
+                start_sidebar_icon_loader(&owner, state_for_ui.clone());
+            } else {
+                start_sidebar_icon_loader(&ui, state_for_ui.clone());
+            }
+        });
+    });
+}
+
 fn start_icon_event_pump(
     ui: &AppWindow,
     receiver: mpsc::Receiver<IconEvent>,
@@ -8540,6 +8556,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
                     (Language::English, KnownLocationKind::Pictures) => "Pictures",
                     (Language::English, KnownLocationKind::Music) => "Music",
                     (Language::English, KnownLocationKind::Videos) => "Videos",
+                    (_, KnownLocationKind::Pinned) => location.label.as_str(),
                     (_, KnownLocationKind::Drive) => location.label.as_str(),
                 }
                 .into(),
@@ -8552,6 +8569,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
                     KnownLocationKind::Music => 5,
                     KnownLocationKind::Videos => 6,
                     KnownLocationKind::Drive => 7,
+                    KnownLocationKind::Pinned => 3,
                 },
                 is_drive: location.kind == KnownLocationKind::Drive,
                 icon: app
