@@ -137,6 +137,7 @@ pub struct EverythingSearchRequest {
     pub max_results: u32,
     pub sort: EverythingSort,
     pub item_kind: EverythingItemKind,
+    pub recursive: bool,
 }
 impl EverythingSearchRequest {
     pub fn new(query: impl Into<String>, scope: Option<PathBuf>) -> Self {
@@ -147,6 +148,7 @@ impl EverythingSearchRequest {
             max_results: 256,
             sort: Default::default(),
             item_kind: Default::default(),
+            recursive: true,
         }
     }
 }
@@ -330,7 +332,7 @@ impl EverythingClient {
         }
         query_ipc(
             self.window()?,
-            &compose_typed_search(r.scope.as_deref(), &r.query, r.item_kind),
+            &compose_typed_search(r.scope.as_deref(), &r.query, r.item_kind, r.recursive),
             r.offset,
             r.max_results.min(4096),
             r.sort,
@@ -407,12 +409,13 @@ impl EverythingClient {
         }
     }
 }
-pub fn compose_search(scope: Option<&Path>, user_query: &str) -> String {
+pub fn compose_search(scope: Option<&Path>, user_query: &str, recursive: bool) -> String {
     let q = user_query.trim();
     match scope {
         Some(path) => {
             let scope = format!(
-                "ancestor:{}",
+                "{}:{}",
+                if recursive { "ancestor" } else { "parent" },
                 encode_function_argument(&path.as_os_str().to_string_lossy())
             );
             if q.is_empty() {
@@ -429,8 +432,9 @@ fn compose_typed_search(
     scope: Option<&Path>,
     user_query: &str,
     item_kind: EverythingItemKind,
+    recursive: bool,
 ) -> String {
-    let base = compose_search(scope, user_query);
+    let base = compose_search(scope, user_query, recursive);
     let kind = match item_kind {
         EverythingItemKind::Any => return base,
         EverythingItemKind::Files => "file:",
@@ -1230,7 +1234,8 @@ mod tests {
         assert_eq!(
             compose_search(
                 Some(Path::new(r#"C:\资料 (A)!|\Emoji 😀\say "hi""#)),
-                "ext:png|jpg dm:thisweek"
+                "ext:png|jpg dm:thisweek",
+                true
             ),
             r#"<ancestor:C:\资料#32:#40:A#41:#33:#124:\Emoji#32:#128512:\say#32:#34:hi#34:> ext:png|jpg dm:thisweek"#
         )
@@ -1239,30 +1244,41 @@ mod tests {
     #[test]
     fn scope_uses_everything_character_entities_for_space_parentheses_and_operators() {
         assert_eq!(
-            compose_search(Some(Path::new(r"D:\My Assets (A)!|")), "*.blend"),
+            compose_search(Some(Path::new(r"D:\My Assets (A)!|")), "*.blend", true),
             r"<ancestor:D:\My#32:Assets#32:#40:A#41:#33:#124:> *.blend"
         );
         assert_eq!(
-            compose_search(Some(Path::new(r"\\LiuYanghomeNAS\Multimedia")), "*.mkv"),
+            compose_search(
+                Some(Path::new(r"\\LiuYanghomeNAS\Multimedia")),
+                "*.mkv",
+                true
+            ),
             r"<ancestor:\\LiuYanghomeNAS\Multimedia> *.mkv"
         );
     }
     #[test]
     fn global_is_unchanged() {
         assert_eq!(
-            compose_search(None, "  *.blend size:>100mb  "),
+            compose_search(None, "  *.blend size:>100mb  ", true),
             "*.blend size:>100mb"
         )
+    }
+    #[test]
+    fn current_folder_scope_uses_parent_instead_of_ancestor() {
+        assert_eq!(
+            compose_search(Some(Path::new(r"D:\Assets")), "*.blend", false),
+            r"<parent:D:\Assets> *.blend"
+        );
     }
     #[test]
     fn type_filter_wraps_the_complete_scoped_advanced_query() {
         let scope = Some(Path::new(r"D:\My Assets (A)!|"));
         assert_eq!(
-            compose_typed_search(scope, "*.md size:>1kb", EverythingItemKind::Files),
+            compose_typed_search(scope, "*.md size:>1kb", EverythingItemKind::Files, true),
             r"file: <<ancestor:D:\My#32:Assets#32:#40:A#41:#33:#124:> *.md size:>1kb>"
         );
         assert_eq!(
-            compose_typed_search(None, ".md", EverythingItemKind::Folders),
+            compose_typed_search(None, ".md", EverythingItemKind::Folders, true),
             "folder: <.md>"
         );
     }

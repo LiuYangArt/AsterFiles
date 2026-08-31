@@ -477,9 +477,13 @@ component AddressEditor inherits Rectangle {
     in property <bool> has-error: false;
     in property <string> address-label;
     in property <string> cancel-label;
+    in property <bool> depth-enabled: false;
+    in property <bool> recursive: true;
+    in property <string> depth-label;
     callback accepted(string);
     callback changed(string);
     callback cancelled();
+    callback toggle-depth();
 
     public function focus-at-end() {
         editor.focus();
@@ -492,9 +496,32 @@ component AddressEditor inherits Rectangle {
 
 
 
+    Rectangle {
+        x: 0px;
+        width: 30px;
+        height: parent.height;
+        border-radius: 4px;
+        background: root.depth-enabled ? (depth-touch.pressed ? VisualStyle.cdde3ed : depth-touch.has-hover ? VisualStyle.cedf1f6 : transparent) : transparent;
+        opacity: root.depth-enabled ? 1 : 0.35;
+        Image {
+            width: 18px; height: 18px;
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            source: root.recursive ? IconMap.action-search-recursive : IconMap.action-search-current;
+            colorize: VisualStyle.c303138;
+        }
+        depth-touch := TouchArea {
+            enabled: root.depth-enabled;
+            mouse-cursor: root.depth-enabled ? pointer : default;
+            clicked => { root.toggle-depth(); }
+        }
+        accessible-role: button;
+        accessible-label: root.depth-label;
+        accessible-enabled: root.depth-enabled;
+    }
+
     editor := TextInput {
-        x: 8px;
-        width: parent.width - 38px;
+        x: 32px;
+        width: parent.width - 70px;
         height: parent.height;
         text <=> root.text;
         color: VisualStyle.c30333a;
@@ -511,6 +538,13 @@ component AddressEditor inherits Rectangle {
             if event.text == Key.Escape {
                 root.cancelled();
                 return accept;
+            }
+            if event.text == Key.Tab && !event.modifiers.shift && !event.modifiers.control && !event.modifiers.alt && !event.modifiers.meta {
+                if root.depth-enabled {
+                    root.toggle-depth();
+                    return accept;
+                }
+                return reject;
             }
             return reject;
         }
@@ -563,6 +597,8 @@ export component AppWindow inherits Window {
     in property <bool> address-editing: false;
     in property <bool> search-mode: false;
     in property <bool> search-results-mode: false;
+    in property <bool> search-depth-enabled: false;
+    in property <bool> search-recursive: true;
 
 
     in property <string> status-text: "";
@@ -656,6 +692,9 @@ export component AppWindow inherits Window {
     in property <string> text-window-close: "关闭";
     in property <string> text-cancel-edit: "取消编辑";
     in property <string> text-address: "路径";
+    in property <string> text-search-recursive: "搜索当前文件夹及子文件夹";
+    in property <string> text-search-current: "仅搜索当前文件夹";
+    in property <string> text-search-global-disabled: "全局搜索不支持切换范围";
     in property <string> text-go: "前往";
     in property <string> text-back: "后退";
     in property <string> text-forward: "前进";
@@ -684,6 +723,7 @@ export component AppWindow inherits Window {
     callback address-input-changed(string);
     callback request-search-page(int);
     callback begin-search();
+    callback toggle-search-depth();
 
     callback cancel-address-edit();
     callback navigate-back();
@@ -974,7 +1014,7 @@ export component AppWindow inherits Window {
                 Rectangle {
                     height: 38px; horizontal-stretch: 1; background: VisualStyle.cffffff; border-width: 0px; border-radius: 5px;
                     if !root.address-editing: Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; HorizontalLayout { padding-left: 8px; padding-right: 8px; padding-top: 3px; padding-bottom: 3px; spacing: 2px; InlineIcon { icon-source: root.current-location-icon.width != 0 ? root.current-location-icon : (root.current-location-is-drive ? IconMap.location-drive : IconMap.file-folder); icon-size: 16px; } for crumb in root.breadcrumbs: BreadcrumbButton { label: crumb.label; current: crumb.current; clicked => { root.navigate-breadcrumb(crumb.index); } } Rectangle { horizontal-stretch: 1; TouchArea { mouse-cursor: text; clicked => { root.begin-search(); } } } } }
-                    address-editor := AddressEditor { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: parent.height - 4px; text <=> root.address-input; address-label: root.search-mode ? root.text-parent-path : root.text-address; cancel-label: root.text-cancel-edit; changed(value) => { root.address-input-changed(value); } accepted(value) => { root.navigate-path(value); } cancelled => { root.cancel-address-edit(); } }
+                    address-editor := AddressEditor { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: parent.height - 4px; text <=> root.address-input; address-label: root.search-mode ? root.text-parent-path : root.text-address; cancel-label: root.text-cancel-edit; depth-enabled: root.search-mode && root.search-depth-enabled; recursive: root.search-recursive; depth-label: !root.search-depth-enabled ? root.text-search-global-disabled : (root.search-recursive ? root.text-search-recursive : root.text-search-current); changed(value) => { root.address-input-changed(value); } accepted(value) => { root.navigate-path(value); } cancelled => { root.cancel-address-edit(); } toggle-depth => { root.toggle-search-depth(); } }
 
                 }
                 IconButton { icon-source: IconMap.action-forward; tip: root.text-go; button-label: root.text-go; clicked => { root.address-editing ? root.navigate-path(root.address-input) : root.begin-search(); } }

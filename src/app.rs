@@ -17,8 +17,8 @@ use crate::{
     agent_debug::{self, AgentScenario},
     domain::{
         AddressMode, EntryId, FileEntry, FolderSizeState, LoadState, NameHighlightSegment,
-        NavigationKind, PageSource, RequestId, SearchScope, SearchState, SortDirection, SortField,
-        TabId, TabKind, TabSession,
+        NavigationKind, PageSource, RequestId, SearchDepth, SearchScope, SearchState,
+        SortDirection, SortField, TabId, TabKind, TabSession,
         file_operations::{
             FileOperationKind, ItemState, OperationId, OperationItem, OperationManager,
             OperationResult, OperationState,
@@ -427,6 +427,7 @@ enum EverythingRequest {
         tab_id: TabId,
         request_id: RequestId,
         scope: SearchScope,
+        depth: SearchDepth,
         query: String,
         sort: platform::windows::everything::EverythingSort,
         offset: u32,
@@ -1395,6 +1396,33 @@ fn wire_callbacks(
                     });
                 }
             });
+        }
+    });
+
+    let state_for_search_depth = state.clone();
+    let everything_for_search_depth = everything_sender.clone();
+    let weak_for_search_depth = ui.as_weak();
+    ui.on_toggle_search_depth(move || {
+        let (tab_id, query, changed) = {
+            let mut app = state_for_search_depth
+                .lock()
+                .expect("app state mutex is not poisoned");
+            let tab_id = app.active_tab;
+            let tab = app.tabs.get_mut(&tab_id).expect("active tab exists");
+            let changed = tab.address_mode == AddressMode::Smart && tab.toggle_search_depth();
+            (tab_id, tab.search_query.clone(), changed)
+        };
+        if changed {
+            submit_search(
+                &everything_for_search_depth,
+                &state_for_search_depth,
+                weak_for_search_depth.upgrade().as_ref(),
+                tab_id,
+                query,
+            );
+            if let Some(ui) = weak_for_search_depth.upgrade() {
+                ui.invoke_focus_address_editor();
+            }
         }
     });
 
@@ -4630,7 +4658,7 @@ fn platform_everything_config(
 
 fn search_grouped_page(
     client: &platform::windows::everything::EverythingClient,
-    scope: Option<PathBuf>,
+    scope: (Option<PathBuf>, bool),
     query: String,
     sort: platform::windows::everything::EverythingSort,
     offset: u32,
@@ -4645,8 +4673,10 @@ fn search_grouped_page(
     platform::windows::everything::EverythingError,
 > {
     use platform::windows::everything::{EverythingItemKind, EverythingSearchRequest};
+    let (scope, recursive) = scope;
 
     let mut files = EverythingSearchRequest::new(query.clone(), scope.clone());
+    files.recursive = recursive;
     files.item_kind = EverythingItemKind::Files;
     files.sort = sort;
     files.offset = offset;
@@ -4654,6 +4684,7 @@ fn search_grouped_page(
     let file_page = client.search(&files, timeout)?;
 
     let mut folders = EverythingSearchRequest::new(query, scope);
+    folders.recursive = recursive;
     folders.item_kind = EverythingItemKind::Folders;
     folders.sort = sort;
     folders.offset = offset.saturating_sub(file_page.total);
@@ -4720,6 +4751,7 @@ fn spawn_everything_worker(
                     tab_id,
                     request_id,
                     scope,
+                    depth,
                     query,
                     sort,
                     offset,
@@ -4738,6 +4770,7 @@ fn spawn_everything_worker(
                         SearchScope::Global => None,
                         SearchScope::Directory(path) => Some(path),
                     };
+                    let recursive = depth == SearchDepth::Recursive;
                     if cancel.load(std::sync::atomic::Ordering::Acquire) {
                         let _ = event_sender.send(EverythingEvent::SearchSkipped {
                             tab_id,
@@ -4748,7 +4781,7 @@ fn spawn_everything_worker(
                     }
                     let page_result = search_grouped_page(
                         client,
-                        scope,
+                        (scope, recursive),
                         query,
                         sort,
                         offset,
@@ -4942,6 +4975,7 @@ fn start_everything_event_pump(
                     let pending_offset = tab.finish_search_page_request(offset);
                     if tab.search_file_total.is_some_and(|known| known != file_total) {
                         let scope = tab.search_scope.clone();
+                        let depth = tab.search_depth;
                         let query = tab.search_query.clone();
                         let sort = everything_sort(tab.search_sort_field, tab.search_sort_direction);
                         let (request_id, cancel) = tab.begin_search(scope.clone(), query.clone());
@@ -4950,6 +4984,7 @@ fn start_everything_event_pump(
                             tab_id,
                             request_id,
                             scope,
+                            depth,
                             query,
                             sort,
                             offset: 0,
@@ -4969,6 +5004,7 @@ fn start_everything_event_pump(
                             tab_id,
                             request_id,
                             scope: tab.search_scope.clone(),
+                            depth: tab.search_depth,
                             query: tab.search_query.clone(),
                             sort: everything_sort(tab.search_sort_field, tab.search_sort_direction),
                             offset,
@@ -5000,6 +5036,7 @@ fn start_everything_event_pump(
                             tab_id,
                             request_id,
                             scope: tab.search_scope.clone(),
+                            depth: tab.search_depth,
                             query: tab.search_query.clone(),
                             sort: everything_sort(tab.search_sort_field, tab.search_sort_direction),
                             offset,
@@ -5023,6 +5060,7 @@ fn start_everything_event_pump(
                             tab_id,
                             request_id,
                             scope: tab.search_scope.clone(),
+                            depth: tab.search_depth,
                             query: tab.search_query.clone(),
                             sort: everything_sort(tab.search_sort_field, tab.search_sort_direction),
                             offset,
@@ -5158,6 +5196,7 @@ fn submit_search(
             tab_id,
             request_id,
             scope,
+            depth: tab.search_depth,
             query,
             sort,
             offset: 0,
@@ -5196,6 +5235,7 @@ fn submit_search_page(
             tab_id,
             request_id: tab.latest_request,
             scope: tab.search_scope.clone(),
+            depth: tab.search_depth,
             query: tab.search_query.clone(),
             sort: everything_sort(tab.search_sort_field, tab.search_sort_direction),
             offset,
@@ -5757,6 +5797,8 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
     ui.set_address_editing(tab.address_editing);
     ui.set_search_mode(tab.address_mode == AddressMode::Smart);
     ui.set_search_results_mode(tab.page_source == PageSource::Search);
+    ui.set_search_depth_enabled(matches!(tab.search_scope, SearchScope::Directory(_)));
+    ui.set_search_recursive(tab.search_depth == SearchDepth::Recursive);
 
     ui.set_status_text(status_text(tab, texts).into());
     let (error_page_title, error_page_description) = error_page_text(tab.load_state, texts);
@@ -6168,6 +6210,9 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
         close,
         address,
         cancel_edit,
+        search_recursive,
+        search_current,
+        search_global_disabled,
     ) = match language {
         Language::Chinese => (
             "前往",
@@ -6224,6 +6269,9 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "关闭",
             "路径",
             "取消编辑",
+            "搜索当前文件夹及子文件夹",
+            "仅搜索当前文件夹",
+            "全局搜索不支持切换范围",
         ),
         Language::English => (
             "Go",
@@ -6280,6 +6328,9 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "Close",
             "Path",
             "Cancel editing",
+            "Search current folder and subfolders",
+            "Search current folder only",
+            "Search depth is unavailable for global search",
         ),
     };
     ui.set_text_go(go.into());
@@ -6337,6 +6388,9 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_window_close(close.into());
     ui.set_text_address(address.into());
     ui.set_text_cancel_edit(cancel_edit.into());
+    ui.set_text_search_recursive(search_recursive.into());
+    ui.set_text_search_current(search_current.into());
+    ui.set_text_search_global_disabled(search_global_disabled.into());
     let (file_operations, task_count, cancel_operation, retry_operation) = match language {
         Language::Chinese => ("文件操作", "个任务", "取消", "重试"),
         Language::English => ("File operations", "tasks", "Cancel", "Retry"),
@@ -6542,7 +6596,7 @@ mod tests {
         .unwrap();
         let (items, total, file_total) = search_grouped_page(
             &client,
-            None,
+            (None, true),
             ".md".into(),
             crate::platform::windows::everything::EverythingSort::NameAscending,
             0,

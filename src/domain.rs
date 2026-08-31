@@ -59,6 +59,12 @@ pub enum SearchScope {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchDepth {
+    CurrentFolder,
+    Recursive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageSource {
     Directory,
     Search,
@@ -149,6 +155,7 @@ pub struct TabSession {
     pub address_input: String,
     pub address_mode: AddressMode,
     pub search_scope: SearchScope,
+    pub search_depth: SearchDepth,
     pub search_query: String,
     pub page_source: PageSource,
     pub search_state: SearchState,
@@ -190,6 +197,7 @@ impl TabSession {
             address_input: String::new(),
             address_mode: AddressMode::Normal,
             search_scope: SearchScope::Global,
+            search_depth: SearchDepth::Recursive,
             search_query: String::new(),
             page_source: PageSource::Directory,
             search_state: SearchState::Waiting,
@@ -238,6 +246,7 @@ impl TabSession {
             address_input: String::new(),
             address_mode: AddressMode::Normal,
             search_scope: SearchScope::Global,
+            search_depth: SearchDepth::Recursive,
             search_query: String::new(),
             page_source: PageSource::Directory,
             search_state: SearchState::Waiting,
@@ -274,6 +283,7 @@ impl TabSession {
             .visible_path()
             .map(|path| SearchScope::Directory(path.to_path_buf()))
             .unwrap_or(SearchScope::Global);
+        self.search_depth = SearchDepth::Recursive;
         self.search_query.clear();
         self.address_input = search_address_text(&self.search_scope, &self.search_query);
         self.search_state = SearchState::Waiting;
@@ -372,6 +382,17 @@ impl TabSession {
             }
         }
         self.address_input = input;
+    }
+
+    pub fn toggle_search_depth(&mut self) -> bool {
+        if !matches!(self.search_scope, SearchScope::Directory(_)) {
+            return false;
+        }
+        self.search_depth = match self.search_depth {
+            SearchDepth::CurrentFolder => SearchDepth::Recursive,
+            SearchDepth::Recursive => SearchDepth::CurrentFolder,
+        };
+        true
     }
 
     pub fn begin_search(
@@ -1088,6 +1109,23 @@ mod tests {
         let (_, _) =
             session.begin_search(session.search_scope.clone(), session.search_query.clone());
         assert_eq!(session.address_input, r"D:\Assets *.blend");
+    }
+
+    #[test]
+    fn smart_address_search_depth_defaults_to_recursive_and_only_toggles_for_a_directory() {
+        let mut session = TabSession::new(TabId(1));
+        session.current_path = Some(PathBuf::from(r"D:\Assets"));
+        session.load_state = LoadState::Complete;
+        session.begin_smart_address_edit();
+        assert_eq!(session.search_depth, SearchDepth::Recursive);
+        assert!(session.toggle_search_depth());
+        assert_eq!(session.search_depth, SearchDepth::CurrentFolder);
+        assert_eq!(session.address_input, r"D:\Assets ");
+
+        session.update_address_input("*.blend".to_owned());
+        assert_eq!(session.search_scope, SearchScope::Global);
+        assert!(!session.toggle_search_depth());
+        assert_eq!(session.search_depth, SearchDepth::CurrentFolder);
     }
 
     #[test]
