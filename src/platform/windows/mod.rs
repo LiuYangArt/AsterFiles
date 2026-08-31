@@ -33,3 +33,28 @@ pub fn begin_window_drag(hwnd: isize) -> io::Result<()> {
     }
     Ok(())
 }
+
+pub fn capture_pointer(hwnd: isize) -> io::Result<()> {
+    if hwnd == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "window handle unavailable",
+        ));
+    }
+    let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+    unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd) };
+    if unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture() } != hwnd {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub fn has_pointer_capture(hwnd: isize) -> bool {
+    hwnd != 0
+        && unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture() }
+            == hwnd as windows_sys::Win32::Foundation::HWND
+}
+
+pub fn release_pointer_capture() {
+    unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture() };
+}

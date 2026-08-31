@@ -8,12 +8,6 @@ use std::path::{Path, PathBuf};
 pub enum KnownLocationKind {
     Home,
     Pinned,
-    Desktop,
-    Downloads,
-    Documents,
-    Pictures,
-    Music,
-    Videos,
     Drive,
 }
 
@@ -75,11 +69,7 @@ mod windows_impl {
             Storage::FileSystem::{GetLogicalDrives, GetVolumeInformationW},
             System::Com::CoTaskMemFree,
             UI::{
-                Shell::{
-                    FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Music,
-                    FOLDERID_Pictures, FOLDERID_Profile, FOLDERID_Videos, SHGetKnownFolderPath,
-                    ShellExecuteW,
-                },
+                Shell::{FOLDERID_Profile, SHGetKnownFolderPath, ShellExecuteW},
                 WindowsAndMessaging::SW_SHOWNORMAL,
             },
         },
@@ -107,27 +97,17 @@ mod windows_impl {
         std::time::Duration::from_millis(unsafe { GetDoubleClickTime() }.into())
     }
     pub fn known_locations() -> Vec<KnownLocation> {
-        let specifications = [
-            (KnownLocationKind::Home, "主页", FOLDERID_Profile),
-            (KnownLocationKind::Desktop, "桌面", FOLDERID_Desktop),
-            (KnownLocationKind::Downloads, "下载", FOLDERID_Downloads),
-            (KnownLocationKind::Documents, "文档", FOLDERID_Documents),
-            (KnownLocationKind::Pictures, "图片", FOLDERID_Pictures),
-            (KnownLocationKind::Music, "音乐", FOLDERID_Music),
-            (KnownLocationKind::Videos, "视频", FOLDERID_Videos),
-        ];
-        let mut locations = specifications
-            .into_iter()
-            .filter_map(|(kind, label, id)| {
-                known_folder(&id).map(|path| KnownLocation {
-                    kind,
-                    label: label.to_owned(),
+        let mut locations = known_folder(&FOLDERID_Profile)
+            .map(|path| {
+                vec![KnownLocation {
+                    kind: KnownLocationKind::Home,
+                    label: "主页".to_owned(),
                     path,
-                })
+                }]
             })
-            .collect::<Vec<_>>();
+            .unwrap_or_default();
         if let Ok(pinned) = explorer_pinned_locations() {
-            locations.splice(1..1, pinned);
+            locations.extend(pinned);
         }
         locations.extend(logical_drives());
         locations
@@ -138,11 +118,12 @@ mod windows_impl {
             Win32::{
                 System::SystemServices::SFGAO_FOLDER,
                 UI::Shell::{
-                    BHID_EnumItems, IEnumShellItems, IShellItem, SHCreateItemFromParsingName,
-                    SIGDN_FILESYSPATH, SIGDN_NORMALDISPLAY,
+                    BHID_EnumItems, IEnumShellItems, IShellItem, IShellItem2,
+                    SHCreateItemFromParsingName, SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_FILESYSPATH,
+                    SIGDN_NORMALDISPLAY,
                 },
             },
-            core::{PCWSTR, PWSTR},
+            core::{Interface, PCWSTR, PWSTR},
         };
         struct ComGuard;
         impl Drop for ComGuard {
@@ -152,7 +133,7 @@ mod windows_impl {
         }
         let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
         let _guard = initialized.then_some(ComGuard);
-        let namespace = "::{3936e9e4-d92c-4eee-a85a-bc16d5ea0819}\0"
+        let namespace = "shell:::{3936e9e4-d92c-4eee-a85a-bc16d5ea0819}\0"
             .encode_utf16()
             .collect::<Vec<_>>();
         let root: IShellItem = unsafe {
@@ -171,11 +152,23 @@ mod windows_impl {
                 break;
             }
             let Some(item) = next[0].take() else { continue };
+            let pinned = item
+                .cast::<IShellItem2>()
+                .and_then(|properties| unsafe {
+                    properties
+                        .GetBool(&windows::Win32::Storage::EnhancedStorage::PKEY_Home_IsPinned)
+                })
+                .is_ok_and(|value| value.as_bool());
+            if !pinned {
+                continue;
+            }
             let attributes = unsafe { item.GetAttributes(SFGAO_FOLDER) }.unwrap_or_default();
             if !attributes.contains(SFGAO_FOLDER) {
                 continue;
             }
-            let Ok(path) = (unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }) else {
+            let Ok(path) = (unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) })
+                .or_else(|_| unsafe { item.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING) })
+            else {
                 continue;
             };
             let path = take_shell_string(path);
@@ -394,8 +387,8 @@ mod windows_impl {
 
 #[cfg(windows)]
 pub use windows_impl::{
-    double_click_interval, known_locations, open_path, request_folder_access,
-    resolve_shortcut_target,
+    double_click_interval, explorer_pinned_locations, known_locations, open_path,
+    request_folder_access, resolve_shortcut_target,
 };
 
 #[cfg(not(windows))]

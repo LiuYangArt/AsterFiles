@@ -119,7 +119,7 @@ platform/windows/drag_drop：IDataObject、IDropSource、IDropTarget、OLE
 - [x] 关闭 winit 内置固定 COPY 文件目标，复用主窗口原生句柄，在 winit/STA 线程完成 OLE 初始化、`RegisterDragDrop`，退出按撤销注册、释放目标、反初始化 OLE 的顺序清理。
 - [x] 建立线程亲和的生命周期事件桥和 Agent 可读状态；D0 明确返回禁止效果，`CF_HDROP` 接收与文件任务留给 D1。
 
-### P3.D1 拖入当前目录（已完成）
+### P3.D1 拖入当前目录（真实验收失败，修复待复验）
 
 - [x] 接收 `CF_HDROP` 单项、多项、文件和目录，保留原始 Windows 路径。
 - [x] 完成同卷移动、跨卷复制、`Ctrl`/`Shift` 修饰键、禁止状态和当前目录放下；`Alt`/`Ctrl+Shift` 的快捷方式继续留给 D4。
@@ -147,7 +147,7 @@ platform/windows/drag_drop：IDataObject、IDropSource、IDropTarget、OLE
 - [x] 自动覆盖 DPI 坐标换算、取消、窗口失焦清理、长路径、Unicode 与 UNC 数据格式；断开盘、权限、多屏和真实触控板保留集中人工验收。
 - [x] 完成中英文设置文案、控件无障碍名称、Agent 拖放状态导出和验证日志入口；人工证据统一在 P3 最终验收留存。
 
-### P3.D6 右键拖放菜单（已完成自动化部分）
+### P3.D6 右键拖放菜单（真实验收失败，修复待复验）
 
 - [x] Explorer、桌面与应用内右键放下统一进入待选择状态，不在松键时执行磁盘操作。
 - [x] 菜单提供复制、移动、创建快捷方式和取消；按来源允许效果过滤，并在选择后重新执行路径保护和后台预检查。
@@ -195,4 +195,3 @@ platform/windows/drag_drop：IDataObject、IDropSource、IDropTarget、OLE
 - 复制、移动、快捷方式和禁止状态反馈准确；取消不修改磁盘。
 - 原始路径身份、UI 线程边界、多标签隔离和 COM 线程亲和均保持。
 - 自动验证、Windows 11 人工矩阵、`python tools/verify.py` 和 Release 构建全部通过。
-

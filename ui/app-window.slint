@@ -3,6 +3,7 @@ import { IconMap } from "icons/icon-map.slint";
 
 export struct HighlightSegment { text: string, highlighted: bool }
 export struct FileRow { id: int, loaded: bool, name: string, name-segments: [HighlightSegment], kind: string, parent-path: string, size: string, modified: string, is-directory: bool, selected: bool, focused: bool, cut: bool, icon: image }
+export struct GridRow { entries: [FileRow] }
 export struct HistoryRow { index: int, label: string }
 export struct BreadcrumbRow { index: int, label: string, current: bool }
 export struct TabRow { id: int, title: string, active: bool, loading: bool, icon: image, is-drive: bool, is-settings: bool }
@@ -609,6 +610,8 @@ export component AppWindow inherits Window {
 
 
     in property <[FileRow]> files;
+    in property <[GridRow]> grid-rows;
+    in property <int> grid-column-count: 1;
     in-out property <int> projected-file-tab-id: -1;
     in-out property <int> projected-file-request-id: -1;
     in property <[TabRow]> tabs;
@@ -1249,7 +1252,7 @@ export component AppWindow inherits Window {
                         clicked => { root.clear-selection(); }
                     }
 list := ListView {
-                        visible: root.files.length > 0;
+                        visible: root.files.length > 0 && root.view-mode != 2;
                         width: parent.width - 28px;
                         viewport-width: self.width;
                         vertical-scrollbar-policy: ScrollBarPolicy.always-off;
@@ -1258,7 +1261,7 @@ list := ListView {
                         for entry in root.files: Rectangle {
                             width: max(list.width, root.file-columns-width + 16px);
                             x: 0px;
-                            height: root.view-mode == 2 ? 112px : root.view-mode == 1 ? 34px : 40px;
+                            height: root.view-mode == 1 ? 34px : 40px;
                             background: VisualStyle.cffffff;
                             opacity: !entry.loaded ? 0 : (entry.cut ? 0.52 : 1);
                             Rectangle {
@@ -1276,9 +1279,9 @@ list := ListView {
                                     clip: true;
                                     if column.kind == 0: Rectangle {
                                         clip: true;
-                                        InlineIcon { x: column.content-left; width: root.view-mode == 2 ? 64px : 20px; height: root.view-mode == 2 ? 64px : 20px; icon-source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document); }
+                                        InlineIcon { x: column.content-left; width: 20px; height: 20px; icon-source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document); }
                                         if !(root.rename-editing && root.rename-entry-id == entry.id): Rectangle {
-                                            x: column.content-left + (root.view-mode == 2 ? 76px : column.icon-slot);
+                                            x: column.content-left + column.icon-slot;
                                             clip: true;
                                             width: parent.width - column.content-left - column.content-right - column.icon-slot;
                                             property <length> fade-width: 20px;
@@ -1468,12 +1471,44 @@ accessible-label: entry.name;
                                 }
                             }
                         }
-                    }                    LightScrollBar {
+                    }
+                    grid := ListView {
+                        visible: root.files.length > 0 && root.view-mode == 2;
+                        width: parent.width - 28px;
+                        viewport-width: self.width;
+                        vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+                        viewport-y <=> root.file-viewport-y;
+                        for row in root.grid-rows: HorizontalLayout {
+                            height: 148px;
+                            spacing: 8px;
+                            for entry in row.entries: Rectangle {
+                                width: 140px; height: 140px;
+                                border-radius: 7px;
+                                background: entry.selected ? VisualStyle.cdce6ff : card-touch.has-hover ? VisualStyle.ceff4ff : transparent;
+                                Image {
+                                    x: 20px; y: 8px; width: 100px; height: 100px;
+                                    source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document);
+                                    image-fit: contain;
+                                }
+                                Text {
+                                    x: 7px; y: 110px; width: parent.width - 14px; height: 28px;
+                                    text: entry.name; color: VisualStyle.c24252a; font-size: 12px;
+                                    horizontal-alignment: center; vertical-alignment: center; overflow: elide;
+                                }
+                                card-touch := TouchArea {
+                                    enabled: entry.loaded;
+                                    mouse-cursor: pointer;
+                                    clicked => { root.activate-entry(entry.id, false, false); }
+                                }
+                            }
+                        }
+                    }
+                    LightScrollBar {
                         x: parent.width - self.width - 9px;
                         height: parent.height;
-                        value <=> list.viewport-y;
-                        maximum: max(0px, list.viewport-height - list.visible-height);
-                        page-size: list.visible-height;
+                        value <=> root.file-viewport-y;
+                        maximum: root.view-mode == 2 ? max(0px, grid.viewport-height - grid.visible-height) : max(0px, list.viewport-height - list.visible-height);
+                        page-size: root.view-mode == 2 ? grid.visible-height : list.visible-height;
                         scrolled(viewport-y) => {
                             root.request-visible-search-page(viewport-y);
                         }

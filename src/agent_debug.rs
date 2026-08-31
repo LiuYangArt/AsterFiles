@@ -37,6 +37,7 @@ pub enum AgentScenario {
     TabReorder,
     TabDetach,
     TabCrossWindow,
+    ExplorerPins,
 }
 
 impl AgentScenario {
@@ -51,6 +52,7 @@ impl AgentScenario {
             Self::TabReorder => "tab-reorder",
             Self::TabDetach => "tab-detach",
             Self::TabCrossWindow => "tab-cross-window",
+            Self::ExplorerPins => "explorer-pins",
         }
     }
 
@@ -117,6 +119,7 @@ fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
         "tab-reorder" => Ok(AgentScenario::TabReorder),
         "tab-detach" => Ok(AgentScenario::TabDetach),
         "tab-cross-window" => Ok(AgentScenario::TabCrossWindow),
+        "explorer-pins" => Ok(AgentScenario::ExplorerPins),
         _ => Err(format!("unknown agent scenario: {value}")),
     }
 }
@@ -147,6 +150,10 @@ pub fn apply_scenario(session: &mut TabSession, scenario: AgentScenario) {
         }
         AgentScenario::TabCrossWindow => {
             session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\TabCrossWindow"));
+            session.load_state = LoadState::Complete;
+        }
+        AgentScenario::ExplorerPins => {
+            session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\ExplorerPins"));
             session.load_state = LoadState::Complete;
         }
         AgentScenario::FileOperationRunning
@@ -265,6 +272,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
             | AgentScenario::TabReorder
             | AgentScenario::TabDetach
             | AgentScenario::TabCrossWindow
+            | AgentScenario::ExplorerPins
     ) {
         return None;
     }
@@ -320,6 +328,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
         AgentScenario::TabReorder => unreachable!(),
         AgentScenario::TabDetach => unreachable!(),
         AgentScenario::TabCrossWindow => unreachable!(),
+        AgentScenario::ExplorerPins => unreachable!(),
         AgentScenario::PermissionDenied => unreachable!(),
     }
     manager.task(id).map(|task| match task.state {

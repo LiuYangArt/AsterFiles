@@ -81,6 +81,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
         }
+        if scenario == agent_debug::AgentScenario::ExplorerPins {
+            let output = agent_options
+                .state_output()
+                .expect("scenario has a default state output");
+            let pins = platform::explorer_pinned_locations()?;
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let items = pins
+                .iter()
+                .map(|item| {
+                    format!(
+                        "{{\"label\":{:?},\"path\":{:?}}}",
+                        item.label,
+                        item.path.to_string_lossy()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            std::fs::write(
+                &output,
+                format!(
+                    "{{\"schema_version\":1,\"scenario\":\"explorer-pins\",\"scope\":\"real_windows_shell_read_only\",\"count\":{},\"items\":[{}]}}\n",
+                    pins.len(),
+                    items
+                ),
+            )?;
+            println!(
+                "{{\"event\":\"agent_state_exported\",\"scenario\":\"{}\",\"artifact\":{:?}}}",
+                scenario.name(),
+                output.to_string_lossy().as_ref()
+            );
+            if agent_options.no_ui {
+                return Ok(());
+            }
+        }
         let mut session = domain::TabSession::new(domain::TabId(1));
         agent_debug::apply_scenario(&mut session, scenario);
         let output = agent_options

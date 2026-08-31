@@ -41,8 +41,9 @@ mod windows_impl {
         Win32::{
             Foundation::RPC_E_CHANGED_MODE,
             Graphics::Gdi::{
-                BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection,
-                DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDIBits, HBITMAP, HGDIOBJ, SelectObject,
+                BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection,
+                DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDIBits, GetObjectW, HBITMAP, HGDIOBJ,
+                SelectObject,
             },
             Storage::FileSystem::{
                 FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES,
@@ -101,11 +102,24 @@ mod windows_impl {
                 .map_err(windows_error)?
         };
         let bitmap = Bitmap(bitmap);
+        let mut native = BITMAP::default();
+        let read = unsafe {
+            GetObjectW(
+                bitmap.0.into(),
+                size_of::<BITMAP>() as i32,
+                Some((&mut native as *mut BITMAP).cast()),
+            )
+        };
+        if read == 0 || native.bmWidth <= 0 || native.bmHeight == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let width = native.bmWidth as u32;
+        let height = native.bmHeight.unsigned_abs();
         let mut info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: size as i32,
-                biHeight: -(size as i32),
+                biWidth: width as i32,
+                biHeight: -(height as i32),
                 biPlanes: 1,
                 biBitCount: 32,
                 biCompression: BI_RGB.0,
@@ -113,7 +127,7 @@ mod windows_impl {
             },
             ..Default::default()
         };
-        let mut pixels = vec![0; size as usize * size as usize * 4];
+        let mut pixels = vec![0; width as usize * height as usize * 4];
         let dc = unsafe { GetDC(None) };
         if dc.is_invalid() {
             return Err(io::Error::last_os_error());
@@ -123,19 +137,19 @@ mod windows_impl {
                 dc,
                 bitmap.0,
                 0,
-                size,
+                height,
                 Some(pixels.as_mut_ptr().cast()),
                 &mut info,
                 DIB_RGB_COLORS,
             )
         };
         unsafe { ReleaseDC(None, dc) };
-        if lines != size as i32 {
+        if lines != height as i32 {
             return Err(io::Error::other(
                 "Windows Shell thumbnail pixels unavailable",
             ));
         }
-        ShellIconRgba::from_bgra(size, size, pixels)
+        ShellIconRgba::from_bgra(width, height, pixels)
     }
 
     struct ComInitialization {
