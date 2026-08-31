@@ -757,6 +757,7 @@ export component AppWindow inherits Window {
     callback test-everything-connection();
     callback start-everything();
     callback drag-window();
+    callback drag-window-after-menu-dismiss();
     callback show-entry-menu(int, float, float);
     callback show-background-menu(float, float);
     callback reopen-context-menu(float, float);
@@ -812,6 +813,14 @@ export component AppWindow inherits Window {
     function request-visible-search-page(viewport-y: length) {
         if root.search-results-mode {
             root.request-search-page(floor(max(0px, -viewport-y) / 40px / 256) * 256);
+        }
+    }
+    function dismiss-menus-and-drag-window(pointer-x: length, pointer-y: length) {
+        root.context-menu-open = false;
+        root.tabs-menu-open = false;
+        root.menu-open = false;
+        if pointer-y < 46px && pointer-x >= 8px + 34px + 5px + root.tab-strip-width + (root.tabs-overflow ? 33px : 0px) + 5px + 34px + 5px && pointer-x < root.width - 3 * 46px {
+            root.drag-window-after-menu-dismiss();
         }
     }
     in-out property <length> context-menu-anchor-x: 24px;
@@ -1524,6 +1533,12 @@ root.context-menu-anchor-y / 1px
         z: 28; width: parent.width; height: parent.height;
         private property <bool> reopened-by-right-click: false;
         pointer-event(event) => {
+            if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                root.dismiss-menus-and-drag-window(
+                    self.absolute-position.x + self.mouse-x - root.absolute-position.x,
+                    self.absolute-position.y + self.mouse-y - root.absolute-position.y
+                );
+            }
             if event.kind == PointerEventKind.down && event.button == PointerEventButton.right {
                 self.reopened-by-right-click = true;
                 root.context-menu-open = false;
@@ -1567,6 +1582,14 @@ if root.tabs-menu-open: TouchArea {
         z: 19;
         width: parent.width;
         height: parent.height;
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                root.dismiss-menus-and-drag-window(
+                    self.absolute-position.x + self.mouse-x - root.absolute-position.x,
+                    self.absolute-position.y + self.mouse-y - root.absolute-position.y
+                );
+            }
+        }
         clicked => { root.tabs-menu-open = false; }
     }
 
@@ -1598,6 +1621,14 @@ if root.tabs-menu-open: TouchArea {
         z: 19;
         width: parent.width;
         height: parent.height;
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                root.dismiss-menus-and-drag-window(
+                    self.absolute-position.x + self.mouse-x - root.absolute-position.x,
+                    self.absolute-position.y + self.mouse-y - root.absolute-position.y
+                );
+            }
+        }
         clicked => { root.menu-open = false; }
     }
 

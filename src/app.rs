@@ -2810,6 +2810,16 @@ fn wire_window_controls(ui: &AppWindow) {
             let _ = window.drag_window();
         });
     });
+
+    let weak = ui.as_weak();
+    ui.on_drag_window_after_menu_dismiss(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let hwnd = native_window_handle(&ui);
+        platform::windows::window_trace::log_request(hwnd, "move-request-after-menu-dismiss");
+        let _ = platform::windows::begin_window_drag(hwnd);
+    });
 }
 
 fn configure_confirmation_window(ui: &ConfirmationWindow) {
