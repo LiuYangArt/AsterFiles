@@ -622,6 +622,14 @@ export component AppWindow inherits Window {
     in-out property <length> file-viewport-y: 0px;
     out property <length> file-list-top: 0px;
     in-out property <bool> context-menu-open: false;
+    in-out property <bool> drop-menu-open: false;
+    in property <bool> drop-can-copy: false;
+    in property <bool> drop-can-move: false;
+    in property <bool> drop-can-link: false;
+    in property <string> text-drop-copy: "复制到此处";
+    in property <string> text-drop-move: "移动到此处";
+    in property <string> text-drop-link: "在此处创建快捷方式";
+    in property <string> text-drop-cancel: "取消";
     in property <bool> context-menu-on-background: false;
     in-out property <bool> task-center-open: false;
     in-out property <string> rename-input: "";
@@ -753,7 +761,14 @@ export component AppWindow inherits Window {
     callback activate-entry(int, bool, bool);
     callback begin-internal-drag(int, float, float, bool, bool);
     callback update-internal-drag(float, float);
-    callback end-internal-drag(float, float, bool, bool);
+    callback end-internal-drag(float, float, bool, bool, bool);
+    callback choose-drop-effect(int);
+    public function show-drop-menu(x: float, y: float) {
+        root.context-menu-anchor-x = x * 1px;
+        root.context-menu-anchor-y = y * 1px;
+        root.context-menu-open = false;
+        root.drop-menu-open = true;
+    }
     callback new-tab();
     callback close-tab(int);
     callback restore-tab();
@@ -1297,7 +1312,7 @@ accessible-label: entry.name;
                                     if event.kind == PointerEventKind.down {
                                         self.click-control = event.modifiers.control;
                                         self.click-shift = event.modifiers.shift;
-                                        if event.button == PointerEventButton.left {
+                                        if event.button == PointerEventButton.left || event.button == PointerEventButton.right {
                                             self.drag-started = true;
                                             root.begin-internal-drag(
                                                 entry.id,
@@ -1307,7 +1322,7 @@ accessible-label: entry.name;
                                                 event.modifiers.shift
                                             );
                                         }
-                                        if event.button == PointerEventButton.right {
+                                        if event.button == PointerEventButton.right && !self.drag-started {
                                             root.context-menu-anchor-x = self.absolute-position.x + self.mouse-x - root.absolute-position.x;
                                             root.context-menu-anchor-y = self.absolute-position.y + self.mouse-y - root.absolute-position.y;
                                             root.keyboard-menu-anchor-x = root.context-menu-anchor-x;
@@ -1325,13 +1340,14 @@ root.context-menu-anchor-y / 1px
                                             (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px
                                         );
                                     }
-                                    if event.kind == PointerEventKind.up && event.button == PointerEventButton.left && self.drag-started {
+                                    if event.kind == PointerEventKind.up && (event.button == PointerEventButton.left || event.button == PointerEventButton.right) && self.drag-started {
                                         self.drag-started = false;
                                         root.end-internal-drag(
                                             (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
                                             (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px,
                                             event.modifiers.control,
-                                            event.modifiers.shift
+                                            event.modifiers.shift,
+                                            event.button == PointerEventButton.right
                                         );
                                     }
                                 }
@@ -1565,6 +1581,27 @@ root.context-menu-anchor-y / 1px
         }
     }
 
+    if root.drop-menu-open: TouchArea {
+        z: 38; width: parent.width; height: parent.height;
+        clicked => { root.drop-menu-open = false; root.choose-drop-effect(0); }
+    }
+    if root.drop-menu-open: Rectangle {
+        z: 39;
+        x: min(max(12px, root.context-menu-anchor-x), max(12px, parent.width - self.width - 12px));
+        y: min(max(12px, root.context-menu-anchor-y), max(12px, parent.height - self.height - 12px));
+        width: 250px; height: 156px;
+        background: VisualStyle.cffffff; border-color: VisualStyle.ce0e2e7; border-width: 1px; border-radius: 7px;
+        VerticalLayout { padding: 6px;
+            for option[index] in [root.text-drop-copy, root.text-drop-move, root.text-drop-link, root.text-drop-cancel]: Rectangle {
+                height: 36px; border-radius: 5px;
+                private property <bool> option-enabled: index == 3 || (index == 0 ? root.drop-can-copy : index == 1 ? root.drop-can-move : root.drop-can-link);
+                background: self.option-enabled && option-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
+                Text { x: 10px; text: option; color: parent.option-enabled ? VisualStyle.c30333a : VisualStyle.c9a9da3; font-size: 12px; vertical-alignment: center; }
+                option-touch := TouchArea { enabled: parent.option-enabled; clicked => { root.drop-menu-open = false; root.choose-drop-effect(index == 3 ? 0 : index + 1); } }
+                accessible-role: button; accessible-label: option; accessible-enabled: self.option-enabled;
+            }
+        }
+    }
     if root.context-menu-open: TouchArea {
         z: 28; width: parent.width; height: parent.height;
         private property <bool> reopened-by-right-click: false;

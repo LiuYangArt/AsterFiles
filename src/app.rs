@@ -71,6 +71,7 @@ struct AppState {
     everything_config: crate::domain::EverythingConfig,
     everything_status: String,
     everything_folder_sizes_indexed: Option<bool>,
+    pending_right_drop: Option<platform::windows::drag_drop::DropIntent>,
 }
 
 impl AppState {
@@ -155,6 +156,7 @@ impl AppState {
             everything_config,
             everything_status: String::new(),
             everything_folder_sizes_indexed: None,
+            pending_right_drop: None,
         }
     }
 
@@ -1305,6 +1307,7 @@ fn wire_internal_drag_drop(
 ) {
     #[derive(Debug)]
     struct InternalDrag {
+        entry_id: EntryId,
         paths: Vec<PathBuf>,
         source_directories: Vec<PathBuf>,
         start_x: f32,
@@ -1334,6 +1337,7 @@ fn wire_internal_drag_drop(
             .collect();
         if let Ok(mut drag) = drag_for_begin.lock() {
             *drag = Some(InternalDrag {
+                entry_id: id,
                 paths,
                 source_directories,
                 start_x: x,
@@ -1388,7 +1392,7 @@ fn wire_internal_drag_drop(
     let weak_for_end = ui.as_weak();
     let state_for_end = state.clone();
     let drag_for_end = drag.clone();
-    ui.on_end_internal_drag(move |x, y, control, shift| {
+    ui.on_end_internal_drag(move |x, y, control, shift, right_button| {
         let Some(ui) = weak_for_end.upgrade() else {
             return;
         };
@@ -1396,9 +1400,14 @@ fn wire_internal_drag_drop(
         let Some(drag) = drag_for_end.lock().ok().and_then(|mut drag| drag.take()) else {
             return;
         };
-        if drag.outbound_started
-            || ((x - drag.start_x).powi(2) + (y - drag.start_y).powi(2)).sqrt() < 4.0
-        {
+        if drag.outbound_started {
+            return;
+        }
+        let distance = ((x - drag.start_x).powi(2) + (y - drag.start_y).powi(2)).sqrt();
+        if distance < 4.0 {
+            if right_button {
+                ui.invoke_show_entry_menu(drag.entry_id.0 as i32, x, y);
+            }
             return;
         }
         let target = state_for_end.lock().ok().and_then(|app| {
@@ -1418,33 +1427,24 @@ fn wire_internal_drag_drop(
             paths: drag.paths,
             target,
             effect,
+            right_button,
+            screen_x: x.round() as i32,
+            screen_y: y.round() as i32,
+            allowed_effects: platform::windows::drag_drop::ALLOW_COPY
+                | platform::windows::drag_drop::ALLOW_MOVE
+                | platform::windows::drag_drop::ALLOW_LINK,
         };
-        let state_for_worker = state_for_end.clone();
-        let operation_for_worker = operation_sender.clone();
-        thread::spawn(move || match prepare_drop_operation(intent) {
-            Ok(PreparedDrop::Operation(kind, items)) => {
-                let _ = slint::invoke_from_event_loop(move || {
-                    enqueue_operation(&state_for_worker, &operation_for_worker, kind, items);
-                });
+        if right_button {
+            ui.set_drop_can_copy(true);
+            ui.set_drop_can_move(true);
+            ui.set_drop_can_link(true);
+            if let Ok(mut app) = state_for_end.lock() {
+                app.pending_right_drop = Some(intent);
             }
-            Ok(PreparedDrop::Shortcuts(shortcuts)) => {
-                let result = create_drop_shortcuts(shortcuts);
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Err(error) = result
-                        && let Ok(mut app) = state_for_worker.lock()
-                    {
-                        app.operation_errors.push(error);
-                    }
-                });
-            }
-            Err(error) => {
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Ok(mut app) = state_for_worker.lock() {
-                        app.operation_errors.push(error);
-                    }
-                });
-            }
-        });
+            ui.invoke_show_drop_menu(x, y);
+        } else {
+            dispatch_drop_operation(intent, state_for_end.clone(), operation_sender.clone());
+        }
     });
 }
 
@@ -2704,6 +2704,10 @@ fn wire_mouse_navigation(ui: &AppWindow, exit_ui: &ConfirmationWindow, state: Sh
         if should_close_context_menu(event) {
             if let Some(ui) = weak.upgrade() {
                 ui.set_context_menu_open(false);
+                ui.set_drop_menu_open(false);
+            }
+            if let Ok(mut app) = state.lock() {
+                app.pending_right_drop = None;
             }
             return EventResult::Propagate;
         }
@@ -2727,6 +2731,20 @@ fn wire_mouse_navigation(ui: &AppWindow, exit_ui: &ConfirmationWindow, state: Sh
                 native_window_handle(&ui),
                 "winit-focused-false",
             );
+        }
+        if matches!(
+            event,
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && matches!(event.logical_key, Key::Named(NamedKey::Escape))
+        ) && ui.get_drop_menu_open()
+        {
+            ui.set_drop_menu_open(false);
+            if let Ok(mut app) = state.lock() {
+                app.pending_right_drop = None;
+            }
+            return EventResult::PreventDefault;
         }
         if matches!(event, WindowEvent::KeyboardInput { .. })
             && keyboard_shortcuts_suppressed(ui.get_rename_editing())
@@ -2874,7 +2892,14 @@ fn wire_mouse_navigation(ui: &AppWindow, exit_ui: &ConfirmationWindow, state: Sh
                     Key::Named(NamedKey::Escape)
                         if !settings_active && !editing_address && !control && !alt && !shift =>
                     {
-                        ui.invoke_clear_selection();
+                        if ui.get_drop_menu_open() {
+                            ui.set_drop_menu_open(false);
+                            if let Ok(mut app) = state.lock() {
+                                app.pending_right_drop = None;
+                            }
+                        } else {
+                            ui.invoke_clear_selection();
+                        }
                         true
                     }
                     _ if control
@@ -2991,6 +3016,78 @@ fn wire_mouse_navigation(ui: &AppWindow, exit_ui: &ConfirmationWindow, state: Sh
     });
 }
 
+fn drop_requires_choice(intent: &platform::windows::drag_drop::DropIntent) -> bool {
+    intent.right_button
+}
+fn selected_right_drop(
+    mut intent: platform::windows::drag_drop::DropIntent,
+    choice: i32,
+) -> Result<Option<platform::windows::drag_drop::DropIntent>, String> {
+    let (effect, allowed, key_state) = match choice {
+        0 => return Ok(None),
+        1 => (
+            platform::windows::drag_drop::DropEffect::Copy,
+            platform::windows::drag_drop::ALLOW_COPY,
+            8,
+        ),
+        2 => (
+            platform::windows::drag_drop::DropEffect::Move,
+            platform::windows::drag_drop::ALLOW_MOVE,
+            4,
+        ),
+        3 => (
+            platform::windows::drag_drop::DropEffect::Link,
+            platform::windows::drag_drop::ALLOW_LINK,
+            32,
+        ),
+        _ => return Err("无效的拖放菜单选择".to_owned()),
+    };
+    if intent.allowed_effects & allowed == 0 {
+        return Err("拖放来源不允许所选操作".to_owned());
+    }
+    let (validated, reason) = platform::windows::drag_drop::negotiate_effect(
+        &intent.paths,
+        Some(&intent.target),
+        key_state,
+    );
+    if reason.is_some() || validated != effect {
+        return Err("所选拖放操作未通过路径保护".to_owned());
+    }
+    intent.effect = effect;
+    intent.right_button = false;
+    Ok(Some(intent))
+}
+
+fn dispatch_drop_operation(
+    intent: platform::windows::drag_drop::DropIntent,
+    state: SharedSessions,
+    operation_sender: mpsc::Sender<FileOperationRequest>,
+) {
+    thread::spawn(move || match prepare_drop_operation(intent) {
+        Ok(PreparedDrop::Operation(kind, items)) => {
+            let _ = slint::invoke_from_event_loop(move || {
+                enqueue_operation(&state, &operation_sender, kind, items);
+            });
+        }
+        Ok(PreparedDrop::Shortcuts(shortcuts)) => {
+            let result = create_drop_shortcuts(shortcuts);
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Err(error) = result
+                    && let Ok(mut app) = state.lock()
+                {
+                    app.operation_errors.push(error);
+                }
+            });
+        }
+        Err(error) => {
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Ok(mut app) = state.lock() {
+                    app.operation_errors.push(error);
+                }
+            });
+        }
+    });
+}
 fn wire_native_drag_drop(
     ui: &AppWindow,
     operation_sender: mpsc::Sender<FileOperationRequest>,
@@ -3067,33 +3164,66 @@ fn wire_native_drag_drop(
         },
     );
 
+    let state_for_choice = state.clone();
+    let operation_for_choice = operation_sender.clone();
+    ui.on_choose_drop_effect(move |choice| {
+        let pending = state_for_choice
+            .lock()
+            .ok()
+            .and_then(|mut app| app.pending_right_drop.take());
+        let Some(intent) = pending else {
+            return;
+        };
+        match selected_right_drop(intent, choice) {
+            Ok(Some(intent)) => dispatch_drop_operation(
+                intent,
+                state_for_choice.clone(),
+                operation_for_choice.clone(),
+            ),
+            Ok(None) => {}
+            Err(error) => {
+                if let Ok(mut app) = state_for_choice.lock() {
+                    app.operation_errors.push(error);
+                }
+            }
+        }
+    });
+
+    let weak_for_intents = ui.as_weak();
     thread::spawn(move || {
         while let Ok(intent) = intent_receiver.recv() {
-            let prepared = prepare_drop_operation(intent);
-            let state_for_ui = state.clone();
-            let sender_for_ui = operation_sender.clone();
-            let _ = slint::invoke_from_event_loop(move || match prepared {
-                Ok(PreparedDrop::Operation(kind, items)) => {
-                    enqueue_operation(&state_for_ui, &sender_for_ui, kind, items)
-                }
-                Ok(PreparedDrop::Shortcuts(shortcuts)) => {
-                    let state_for_shortcuts = state_for_ui.clone();
-                    thread::spawn(move || {
-                        if let Err(error) = create_drop_shortcuts(shortcuts) {
-                            let _ = slint::invoke_from_event_loop(move || {
-                                if let Ok(mut app) = state_for_shortcuts.lock() {
-                                    app.operation_errors.push(error);
-                                }
-                            });
-                        }
-                    });
-                }
-                Err(error) => {
+            if drop_requires_choice(&intent) {
+                let state_for_ui = state.clone();
+                let weak_for_ui = weak_for_intents.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(ui) = weak_for_ui.upgrade() else {
+                        return;
+                    };
+                    let Ok((client_left, client_top, _, _)) =
+                        platform::windows::drag_drop::client_screen_rect(native_window_handle(&ui))
+                    else {
+                        return;
+                    };
+                    let scale = ui.window().scale_factor();
+                    let x = (intent.screen_x - client_left) as f32 / scale;
+                    let y = (intent.screen_y - client_top) as f32 / scale;
+                    ui.set_drop_can_copy(
+                        intent.allowed_effects & platform::windows::drag_drop::ALLOW_COPY != 0,
+                    );
+                    ui.set_drop_can_move(
+                        intent.allowed_effects & platform::windows::drag_drop::ALLOW_MOVE != 0,
+                    );
+                    ui.set_drop_can_link(
+                        intent.allowed_effects & platform::windows::drag_drop::ALLOW_LINK != 0,
+                    );
                     if let Ok(mut app) = state_for_ui.lock() {
-                        app.operation_errors.push(error);
+                        app.pending_right_drop = Some(intent);
                     }
-                }
-            });
+                    ui.invoke_show_drop_menu(x, y);
+                });
+            } else {
+                dispatch_drop_operation(intent, state.clone(), operation_sender.clone());
+            }
         }
     });
     target_timer
@@ -6812,6 +6942,10 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
         search_recursive,
         search_current,
         search_global_disabled,
+        drop_copy,
+        drop_move,
+        drop_link,
+        drop_cancel,
     ) = match language {
         Language::Chinese => (
             "前往",
@@ -6873,6 +7007,10 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "搜索当前文件夹及子文件夹",
             "仅搜索当前文件夹",
             "全局搜索不支持切换范围",
+            "复制到此处",
+            "移动到此处",
+            "在此处创建快捷方式",
+            "取消",
         ),
         Language::English => (
             "Go",
@@ -6934,6 +7072,10 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "Search current folder and subfolders",
             "Search current folder only",
             "Search depth is unavailable for global search",
+            "Copy here",
+            "Move here",
+            "Create shortcut here",
+            "Cancel",
         ),
     };
     ui.set_text_go(go.into());
@@ -6996,6 +7138,10 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_search_recursive(search_recursive.into());
     ui.set_text_search_current(search_current.into());
     ui.set_text_search_global_disabled(search_global_disabled.into());
+    ui.set_text_drop_copy(drop_copy.into());
+    ui.set_text_drop_move(drop_move.into());
+    ui.set_text_drop_link(drop_link.into());
+    ui.set_text_drop_cancel(drop_cancel.into());
     let (file_operations, task_count, cancel_operation, retry_operation) = match language {
         Language::Chinese => ("文件操作", "个任务", "取消", "重试"),
         Language::English => ("File operations", "tasks", "Cancel", "Retry"),
@@ -7623,6 +7769,12 @@ mod tests {
                 paths: vec![source.clone()],
                 target: target.clone(),
                 effect: platform::windows::drag_drop::DropEffect::Copy,
+                right_button: false,
+                screen_x: 0,
+                screen_y: 0,
+                allowed_effects: platform::windows::drag_drop::ALLOW_COPY
+                    | platform::windows::drag_drop::ALLOW_MOVE
+                    | platform::windows::drag_drop::ALLOW_LINK,
             })
             .unwrap()
         else {
@@ -7658,6 +7810,12 @@ mod tests {
                 paths: vec![source.clone()],
                 target: target.clone(),
                 effect: platform::windows::drag_drop::DropEffect::Link,
+                right_button: false,
+                screen_x: 0,
+                screen_y: 0,
+                allowed_effects: platform::windows::drag_drop::ALLOW_COPY
+                    | platform::windows::drag_drop::ALLOW_MOVE
+                    | platform::windows::drag_drop::ALLOW_LINK,
             })
             .unwrap()
         else {
@@ -7690,6 +7848,12 @@ mod tests {
                 paths: vec![first.clone(), second.clone()],
                 target: target.clone(),
                 effect: platform::windows::drag_drop::DropEffect::Link,
+                right_button: false,
+                screen_x: 0,
+                screen_y: 0,
+                allowed_effects: platform::windows::drag_drop::ALLOW_COPY
+                    | platform::windows::drag_drop::ALLOW_MOVE
+                    | platform::windows::drag_drop::ALLOW_LINK,
             })
             .unwrap()
         else {
@@ -7704,6 +7868,84 @@ mod tests {
         );
         std::fs::remove_dir_all(temporary).unwrap();
     }
+    fn right_drop_intent(
+        paths: Vec<PathBuf>,
+        target: PathBuf,
+        allowed_effects: u32,
+    ) -> platform::windows::drag_drop::DropIntent {
+        platform::windows::drag_drop::DropIntent {
+            paths,
+            target,
+            effect: platform::windows::drag_drop::DropEffect::Move,
+            right_button: true,
+            screen_x: 25,
+            screen_y: 40,
+            allowed_effects,
+        }
+    }
+
+    #[test]
+    fn right_drop_waits_for_a_menu_choice_and_cancel_does_not_prepare_work() {
+        let intent = right_drop_intent(
+            vec![PathBuf::from(r"C:\Source\item.txt")],
+            PathBuf::from(r"C:\Target"),
+            platform::windows::drag_drop::ALLOW_COPY,
+        );
+        assert!(drop_requires_choice(&intent));
+        assert_eq!(selected_right_drop(intent, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn right_drop_choices_select_copy_move_and_link() {
+        let allowed = platform::windows::drag_drop::ALLOW_COPY
+            | platform::windows::drag_drop::ALLOW_MOVE
+            | platform::windows::drag_drop::ALLOW_LINK;
+        for (choice, effect) in [
+            (1, platform::windows::drag_drop::DropEffect::Copy),
+            (2, platform::windows::drag_drop::DropEffect::Move),
+            (3, platform::windows::drag_drop::DropEffect::Link),
+        ] {
+            let selected = selected_right_drop(
+                right_drop_intent(
+                    vec![PathBuf::from(r"C:\Source\item.txt")],
+                    PathBuf::from(r"C:\Target"),
+                    allowed,
+                ),
+                choice,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(selected.effect, effect);
+            assert!(!selected.right_button);
+        }
+    }
+
+    #[test]
+    fn right_drop_rejects_disallowed_effects_and_protected_paths() {
+        let copy_only = right_drop_intent(
+            vec![PathBuf::from(r"C:\Source\item.txt")],
+            PathBuf::from(r"C:\Target"),
+            platform::windows::drag_drop::ALLOW_COPY,
+        );
+        assert!(selected_right_drop(copy_only, 2).is_err());
+
+        let descendant = right_drop_intent(
+            vec![PathBuf::from(r"C:\Source")],
+            PathBuf::from(r"C:\Source\Child"),
+            platform::windows::drag_drop::ALLOW_COPY
+                | platform::windows::drag_drop::ALLOW_MOVE
+                | platform::windows::drag_drop::ALLOW_LINK,
+        );
+        assert!(selected_right_drop(descendant, 1).is_err());
+
+        let same_location = right_drop_intent(
+            vec![PathBuf::from(r"C:\Target\item.txt")],
+            PathBuf::from(r"C:\Target"),
+            platform::windows::drag_drop::ALLOW_COPY,
+        );
+        assert!(selected_right_drop(same_location, 1).is_err());
+    }
+
     #[test]
     fn external_cut_tracking_keeps_only_sources_still_on_disk() {
         let temporary = std::env::temp_dir().join(format!(

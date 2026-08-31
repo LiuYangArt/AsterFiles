@@ -92,7 +92,15 @@ pub struct DropIntent {
     pub paths: Vec<PathBuf>,
     pub target: PathBuf,
     pub effect: DropEffect,
+    pub right_button: bool,
+    pub screen_x: i32,
+    pub screen_y: i32,
+    pub allowed_effects: u32,
 }
+
+pub const ALLOW_COPY: u32 = 1;
+pub const ALLOW_MOVE: u32 = 2;
+pub const ALLOW_LINK: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DragDropLifecycle {
@@ -245,6 +253,8 @@ pub fn current_state() -> DragDropState {
 struct DragContext {
     paths: Vec<PathBuf>,
     effect: DropEffect,
+    allowed_effects: u32,
+    right_button: bool,
 }
 
 #[implement(IDropTarget)]
@@ -299,11 +309,16 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
             .map_err(windows::core::Error::from)?
             .unwrap_or_default();
         let target = self.target(_point);
+        let offered = unsafe { native_effect.as_ref() }
+            .copied()
+            .unwrap_or(DROPEFFECT_NONE);
         let (effect, reason) = negotiate_effect(&paths, target.as_deref(), key_state.0);
         set_native_effect(native_effect, effect);
         if let Ok(mut context) = self.context.lock() {
             context.paths = paths.clone();
             context.effect = effect;
+            context.allowed_effects = allowed_effects(offered);
+            context.right_button = key_state.0 & MK_RBUTTON.0 != 0;
         }
         self.update(
             DragDropEvent::Entered,
@@ -332,6 +347,7 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
         set_native_effect(native_effect, effect);
         if let Ok(mut context) = self.context.lock() {
             context.effect = effect;
+            context.right_button |= key_state.0 & MK_RBUTTON.0 != 0;
         }
         self.update(
             DragDropEvent::Moved,
@@ -366,13 +382,25 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
             .map_err(windows::core::Error::from)?
             .unwrap_or_default();
         let target = self.target(_point);
+        let offered = unsafe { native_effect.as_ref() }
+            .copied()
+            .unwrap_or(DROPEFFECT_NONE);
         let (effect, reason) = negotiate_effect(&paths, target.as_deref(), key_state.0);
         set_native_effect(native_effect, effect);
         if let (Some(target), None) = (target.clone(), reason) {
+            let (allowed_effects, tracked_right_button) = self
+                .context
+                .lock()
+                .map(|context| (context.allowed_effects, context.right_button))
+                .unwrap_or_else(|_| (allowed_effects(offered), false));
             let _ = self.intents.send(DropIntent {
                 paths: paths.clone(),
                 target,
                 effect,
+                right_button: tracked_right_button || key_state.0 & MK_RBUTTON.0 != 0,
+                screen_x: _point.x,
+                screen_y: _point.y,
+                allowed_effects,
             });
         }
         self.update(
@@ -396,6 +424,19 @@ fn set_native_effect(output: *mut DROPEFFECT, effect: DropEffect) {
     }
 }
 
+pub fn allowed_effects(effect: DROPEFFECT) -> u32 {
+    let mut allowed = 0;
+    if effect.0 & DROPEFFECT_COPY.0 != 0 {
+        allowed |= ALLOW_COPY;
+    }
+    if effect.0 & DROPEFFECT_MOVE.0 != 0 {
+        allowed |= ALLOW_MOVE;
+    }
+    if effect.0 & DROPEFFECT_LINK.0 != 0 {
+        allowed |= ALLOW_LINK;
+    }
+    allowed
+}
 pub fn negotiate_effect(
     paths: &[PathBuf],
     target: Option<&Path>,
@@ -936,6 +977,20 @@ mod tests {
             performed_format
         ));
         assert!(!supports_format(&format_etc(99), CF_HDROP));
+    }
+
+    #[test]
+    fn inbound_allowed_effects_preserve_source_mask() {
+        assert_eq!(allowed_effects(DROPEFFECT_NONE), 0);
+        assert_eq!(allowed_effects(DROPEFFECT_COPY), ALLOW_COPY);
+        assert_eq!(allowed_effects(DROPEFFECT_MOVE), ALLOW_MOVE);
+        assert_eq!(allowed_effects(DROPEFFECT_LINK), ALLOW_LINK);
+        assert_eq!(
+            allowed_effects(DROPEFFECT(
+                DROPEFFECT_COPY.0 | DROPEFFECT_MOVE.0 | DROPEFFECT_LINK.0
+            )),
+            ALLOW_COPY | ALLOW_MOVE | ALLOW_LINK
+        );
     }
 
     #[test]

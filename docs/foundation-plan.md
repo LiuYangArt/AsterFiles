@@ -94,6 +94,8 @@ P3.D1 已完成当前目录目标：原生 STA 回调只读取 `CF_HDROP` 数据
 P3.D2 已完成：协调层把当前可见的目录行按窗口物理坐标投影为短生命周期目标快照，原生回调只在快照内命中，不读取磁盘；文件夹目标通过稳定 `EntryId` 对应的原始路径展示悬停反馈。拖动接近列表上下边缘时每个受控周期只滚动一小段，不自动进入目录。应用内拖动在超过最小距离后，使用当前选择的原始路径快照投递到同一 D1 预检查与 `OperationManager` 链路；自身、同目录和自身子目录继续明确拒绝。
 
 P3.D3–D5 已完成自动化实现：拖出使用标准 `IDataObject + IDropSource + DoDragDrop`，提供 `CF_HDROP`、Preferred/Performed DropEffect 和原始多选路径，外部目标完成后只保守刷新源目录。拖入链接效果在后台创建 `.lnk` 并采用 Windows 风格递增名称；系统默认拖动光标承担复制、移动、链接和禁止反馈。目录监听使用独立 `ReadDirectoryChangesW` 后台 guard，按当前文件标签动态启停、合并短时事件并定向刷新。目录枚举按 Windows 隐藏/系统属性应用独立持久化开关，会话格式直接升级为 ASTF7。
+
+P3 右键拖放补充已完成自动化实现：右键放下只保存原始路径、目标、落点和来源允许效果，并显示独立的复制、移动、创建快捷方式或取消菜单；用户选择后重新执行路径保护和后台预检查，再复用 P2 OperationManager。菜单外点击、Escape、窗口失焦、遮挡或销毁只清除待选择状态。AsterFiles 拖出到 Explorer 时仍完全由目标决定右键拖放菜单，未修改独立 Windows Shell 菜单 Feature。
 P3 产品决策汇总见 [P3 Windows 原生集成决策摘要](p3-windows-integration-decisions.md)。Windows 隐藏文件和系统文件使用独立持久化开关：默认显示隐藏文件、不显示系统文件，显示时不使用弱化样式。系统缩略图整体移到 P4，与详细信息、列表、网格和大图标视图统一设计；P3 继续使用现有 Shell 图标链路。右键菜单与拖放、目录监听及路径边界没有实施依赖，P3 不修改菜单；菜单后续设计见 [Windows Shell 菜单集成 Feature](windows-shell-menu-feature.md)。
 
 ## Everything 平台边界（2026-08-30）
