@@ -335,6 +335,7 @@ impl OperationTask {
         conflict: OperationConflict,
     ) -> Result<(), StateTransitionError> {
         self.transition(OperationState::WaitingConflict)?;
+        self.cancellation.pause();
         self.conflict = Some(conflict);
         Ok(())
     }
@@ -352,6 +353,7 @@ impl OperationTask {
             self.conflict_defaults
                 .insert(conflict.category, decision.action);
         }
+        self.cancellation.resume();
         self.transition(OperationState::Running)
     }
     pub fn request_cancel(&mut self) -> Result<(), StateTransitionError> {
@@ -652,6 +654,50 @@ mod tests {
         );
         assert_eq!(task.conflict_default(ConflictCategory::TypeMismatch), None);
     }
+    #[test]
+    fn conflict_wait_is_excluded_from_active_elapsed_time() {
+        let mut task = OperationTask::new(
+            OperationId(1),
+            FileOperationKind::Copy,
+            None,
+            vec![item("a")],
+        );
+        task.transition(OperationState::Preflight).unwrap();
+        task.transition(OperationState::Running).unwrap();
+        task.started_at = Instant::now() - Duration::from_millis(700);
+        let snapshot = FileSnapshot {
+            path: PathBuf::from("a"),
+            is_directory: false,
+            size_bytes: Some(1),
+            modified: None,
+        };
+
+        task.set_conflict(OperationConflict {
+            category: ConflictCategory::ExistingFile,
+            source: snapshot.clone(),
+            destination: snapshot,
+        })
+        .unwrap();
+        assert_eq!(task.state, OperationState::WaitingConflict);
+        assert!(task.cancellation.is_paused());
+        let before = task.cancellation.active_elapsed(task.started_at);
+        std::thread::sleep(Duration::from_millis(30));
+        let during = task.cancellation.active_elapsed(task.started_at);
+        assert!(during.saturating_sub(before) < Duration::from_millis(10));
+
+        task.resolve_conflict(ConflictDecision {
+            action: ConflictAction::Replace,
+            apply_to_all: false,
+        })
+        .unwrap();
+        assert_eq!(task.state, OperationState::Running);
+        assert!(!task.cancellation.is_paused());
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            task.cancellation.active_elapsed(task.started_at) >= during + Duration::from_millis(15)
+        );
+    }
+
     #[test]
     fn cancelling_queued_task_removes_it_from_queue() {
         let mut manager = OperationManager::new();

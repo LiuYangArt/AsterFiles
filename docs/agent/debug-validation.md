@@ -34,6 +34,16 @@ cargo run -- --agent-scenario permission-denied --no-ui
 - `error_type`：稳定的错误分类。
 
 权限页的页面内部操作只能是 `request_windows_access`。该状态与 UI 显示条件共用同一动作模型，并通过 Slint 无窗口测试后端检查实际可见组件树。顶部后退、刷新继续属于全局导航，不得被误报为页面内“返回”或“重试”。
+## P3.D0 拖放底座状态
+
+无界面导出原生拖放底座的稳定初始状态，不创建桌面窗口，也不执行文件操作：
+
+```powershell
+cargo run -- --agent-scenario drag-drop-foundation --no-ui
+```
+
+统一验证写入 `artifacts/state/drag-drop/foundation.json`。`drag_drop` 对象包含生命周期、是否注册、源数量、目标、协商效果、拒绝原因、最后事件和事件序号。无界面场景固定为 `unregistered`；真实窗口创建后才在主 winit/STA 线程完成注册。P3.D0 尚不接受文件，进入窗口的拖放会返回禁止，P3.D1 再接入 `CF_HDROP` 和文件任务。
+
 ## P2 文件任务状态
 
 文件任务提供三个确定性无界面场景，不执行真实磁盘写入：

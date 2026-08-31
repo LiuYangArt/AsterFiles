@@ -750,7 +750,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     start_clipboard_event_pump(
         &ui,
         clipboard_receiver,
-        operation_sender,
+        operation_sender.clone(),
         request_sender.clone(),
         state.clone(),
     );
@@ -787,7 +787,10 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         }
     }
 
+    let _drag_drop_target_timer =
+        wire_native_drag_drop(&ui, operation_sender.clone(), state.clone());
     let result = ui.run();
+    platform::windows::drag_drop::revoke_current();
     for weak in [delete_weak, conflict_weak, exit_weak] {
         if let Some(window) = weak.upgrade() {
             let _ = window.hide();
@@ -2769,6 +2772,102 @@ fn wire_mouse_navigation(ui: &AppWindow, exit_ui: &ConfirmationWindow, state: Sh
     });
 }
 
+fn wire_native_drag_drop(
+    ui: &AppWindow,
+    operation_sender: mpsc::Sender<FileOperationRequest>,
+    state: SharedSessions,
+) -> slint::Timer {
+    use std::cell::Cell;
+
+    let target = Arc::new(Mutex::new(None));
+    let (intent_sender, intent_receiver) = mpsc::channel();
+    let weak = ui.as_weak();
+    let attempted = Cell::new(false);
+    let target_for_registration = target.clone();
+    ui.window().on_winit_window_event(move |_, _| {
+        if !attempted.replace(true)
+            && let Some(ui) = weak.upgrade()
+            && let Err(error) = platform::windows::drag_drop::register_current(
+                native_window_handle(&ui),
+                target_for_registration.clone(),
+                intent_sender.clone(),
+            )
+        {
+            eprintln!("failed to register native drag-drop target: {error}");
+        }
+        EventResult::Propagate
+    });
+
+    let target_for_refresh = target.clone();
+    let state_for_target = state.clone();
+    let target_timer = slint::Timer::default();
+    target_timer.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(100),
+        move || {
+            let path = state_for_target.lock().ok().and_then(|app| {
+                let tab = app.active();
+                (tab.kind == TabKind::Files && tab.load_state == LoadState::Complete)
+                    .then(|| tab.visible_path().map(Path::to_path_buf))
+                    .flatten()
+            });
+            if let Ok(mut target) = target_for_refresh.lock() {
+                *target = path;
+            }
+        },
+    );
+
+    thread::spawn(move || {
+        while let Ok(intent) = intent_receiver.recv() {
+            let prepared = prepare_drop_operation(intent);
+            let state_for_ui = state.clone();
+            let sender_for_ui = operation_sender.clone();
+            let _ = slint::invoke_from_event_loop(move || match prepared {
+                Ok((kind, items)) => enqueue_operation(&state_for_ui, &sender_for_ui, kind, items),
+                Err(error) => {
+                    if let Ok(mut app) = state_for_ui.lock() {
+                        app.operation_errors.push(error);
+                    }
+                }
+            });
+        }
+    });
+    target_timer
+}
+
+fn prepare_drop_operation(
+    intent: platform::windows::drag_drop::DropIntent,
+) -> Result<(FileOperationKind, Vec<OperationItem>), String> {
+    let target_metadata =
+        std::fs::metadata(&intent.target).map_err(|error| format!("拖放目标不可用：{error}"))?;
+    if !target_metadata.is_dir() {
+        return Err("拖放目标不是文件夹".to_owned());
+    }
+    let kind = match intent.effect {
+        platform::windows::drag_drop::DropEffect::Copy => FileOperationKind::Copy,
+        platform::windows::drag_drop::DropEffect::Move => FileOperationKind::Move,
+        _ => return Err("拖放效果不受支持".to_owned()),
+    };
+    let mut items = Vec::with_capacity(intent.paths.len());
+    for source in intent.paths {
+        let metadata = std::fs::symlink_metadata(&source)
+            .map_err(|error| format!("拖放来源不可用：{error}"))?;
+        let _ = metadata.file_type();
+        let name = source
+            .file_name()
+            .ok_or_else(|| "拖放来源没有可用名称".to_owned())?;
+        let destination = intent.target.join(name);
+        if source == destination || intent.target.starts_with(&source) {
+            return Err("不能把项目拖放到自身或自身子目录".to_owned());
+        }
+        items.push(OperationItem::pending(Some(source), Some(destination)));
+    }
+    if items.is_empty() {
+        return Err("拖放未包含文件系统项目".to_owned());
+    }
+    Ok((kind, items))
+}
+
 fn wire_window_trace(ui: &AppWindow) {
     let Some(path) = platform::windows::window_trace::requested_path() else {
         return;
@@ -3333,17 +3432,9 @@ fn wire_operation_window(
                 }
                 refresh_operation_window(&operation_ui, &state_for_auto_open);
             }
-            let should_open = state_for_auto_open.lock().is_ok_and(|app| {
-                app.operations.iter().any(|task| {
-                    matches!(
-                        task.state,
-                        OperationState::Preflight
-                            | OperationState::Running
-                            | OperationState::Paused
-                            | OperationState::WaitingConflict
-                    ) && task.started_at.elapsed() >= Duration::from_millis(800)
-                })
-            });
+            let should_open = state_for_auto_open
+                .lock()
+                .is_ok_and(|app| should_auto_open_operation_window(&app));
             if should_open && !operation_ui.window().is_visible() {
                 refresh_operation_window(&operation_ui, &state_for_auto_open);
                 if let Some(ui) = ui_weak.upgrade() {
@@ -3354,6 +3445,15 @@ fn wire_operation_window(
         },
     );
     timer
+}
+
+fn should_auto_open_operation_window(app: &AppState) -> bool {
+    app.operations.iter().any(|task| {
+        matches!(
+            task.state,
+            OperationState::Preflight | OperationState::Running | OperationState::Paused
+        ) && task.cancellation.active_elapsed(task.started_at) >= Duration::from_millis(800)
+    })
 }
 
 fn position_operation_window_next_to_main(ui: &AppWindow, operation_ui: &OperationWindow) {
@@ -6431,6 +6531,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn operation_window_waits_until_conflict_is_resolved_and_runtime_reaches_threshold() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
+        let id = app.operations.submit(
+            FileOperationKind::Copy,
+            None,
+            vec![OperationItem::pending(
+                Some(PathBuf::from("a")),
+                Some(PathBuf::from("b")),
+            )],
+        );
+        app.operations.start_next().unwrap();
+        app.operations.mark_running(id).unwrap();
+        {
+            let task = app.operations.task_mut(id).unwrap();
+            task.started_at = Instant::now() - Duration::from_millis(900);
+            let snapshot = crate::domain::file_operations::FileSnapshot {
+                path: PathBuf::from("a"),
+                is_directory: false,
+                size_bytes: Some(1),
+                modified: None,
+            };
+            task.set_conflict(crate::domain::file_operations::OperationConflict {
+                category: crate::domain::file_operations::ConflictCategory::ExistingFile,
+                source: snapshot.clone(),
+                destination: snapshot,
+            })
+            .unwrap();
+        }
+        assert!(!should_auto_open_operation_window(&app));
+
+        app.operations
+            .task_mut(id)
+            .unwrap()
+            .resolve_conflict(crate::domain::file_operations::ConflictDecision {
+                action: crate::domain::file_operations::ConflictAction::Replace,
+                apply_to_all: false,
+            })
+            .unwrap();
+        assert!(should_auto_open_operation_window(&app));
+    }
+
+    #[test]
     fn remaining_time_uses_minutes_only_when_needed() {
         assert_eq!(
             format_remaining_time(Language::English, 42.0),
@@ -6892,6 +7034,38 @@ mod tests {
             context_target_at(&state, 170.0, 166.0, -80.0),
             (Some(EntryId(3)), false)
         );
+    }
+
+    #[test]
+    fn drop_preflight_preserves_paths_and_builds_operation_items() {
+        let temporary = std::env::temp_dir().join(format!(
+            "asterfiles-drop-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&temporary);
+        let source_parent = temporary.join("来源");
+        let target = temporary.join("目标");
+        std::fs::create_dir_all(&source_parent).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let source = source_parent.join("文件😀.txt");
+        std::fs::write(&source, b"drag").unwrap();
+
+        let (kind, items) = prepare_drop_operation(platform::windows::drag_drop::DropIntent {
+            paths: vec![source.clone()],
+            target: target.clone(),
+            effect: platform::windows::drag_drop::DropEffect::Copy,
+        })
+        .unwrap();
+
+        assert_eq!(kind, FileOperationKind::Copy);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].source.as_deref(), Some(source.as_path()));
+        assert_eq!(
+            items[0].destination.as_deref(),
+            Some(target.join("文件😀.txt").as_path())
+        );
+        std::fs::remove_dir_all(temporary).unwrap();
     }
 
     #[test]

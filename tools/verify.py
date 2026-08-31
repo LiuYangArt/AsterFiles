@@ -89,6 +89,10 @@ def main() -> int:
             "cargo", "run", "--", "--agent-scenario", "file-operation-partial",
             "--no-ui", "--agent-state-out", str(STATE_DIR / "file-operations" / "partial.json"),
         ]),
+        ("agent-drag-drop-foundation", [
+            "cargo", "run", "--", "--agent-scenario", "drag-drop-foundation",
+            "--no-ui", "--agent-state-out", str(STATE_DIR / "drag-drop" / "foundation.json"),
+        ]),
         ("release", ["cargo", "build", "--release"])
         if release_requested
         else ("debug", ["cargo", "build"]),

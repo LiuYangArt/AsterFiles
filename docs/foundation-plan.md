@@ -87,6 +87,10 @@ P2 的完整设计见 [P2 基础文件操作与右键菜单实施方案](p2-file
 
 OLE 的 `IDataObject`、`IDropSource`、`IDropTarget`、窗口注册和拖放循环集中在 `platform/windows/drag_drop`。COM 对象遵守 STA 与窗口线程亲和，UI 不枚举目录、读取元数据或执行磁盘操作。拖动开始时由应用协调层把 `TabId + EntryId` 固定为原始路径快照；拖入任务沿用独立 `OperationId`，拖放不得复用导航 `RequestId`。操作后的路径变化继续广播给所有相关标签，外部目标无法返回可靠结果时只定向刷新，不猜测或伪造移动成功。
 
+P3.D0 已完成：winit 自带的固定 COPY 文件目标在窗口属性阶段关闭，AsterFiles 在首个原生窗口事件到达、真实 HWND 可用后，于同一 winit/STA 线程初始化 OLE 并注册自有 `IDropTarget`，生命周期覆盖 `ui.run()`，退出严格执行 `RevokeDragDrop`、释放目标、`OleUninitialize`。底座记录进入、移动、离开、放下与撤销事件，并由后续 D1 扩展为 `CF_HDROP` 接收和文件任务提交。确定性状态写入 `artifacts/state/drag-drop/foundation.json`。
+
+P3.D1 已完成当前目录目标：原生 STA 回调只读取 `CF_HDROP` 数据对象、当前协调层路径快照和修饰键，协商同卷移动/跨卷复制并投递原始路径意图；磁盘存在性、目标目录和路径保护在后台线程预检查，UI 线程只把已验证条目提交给既有 `OperationManager`。当前目标随活动文件标签的最近成功目录更新；设置页、加载中或错误页没有可放下目标。文件夹行目标、应用内拖放和边缘滚动仍归 D2。
+
 P3 产品决策汇总见 [P3 Windows 原生集成决策摘要](p3-windows-integration-decisions.md)。Windows 隐藏文件和系统文件使用独立持久化开关：默认显示隐藏文件、不显示系统文件，显示时不使用弱化样式。系统缩略图整体移到 P4，与详细信息、列表、网格和大图标视图统一设计；P3 继续使用现有 Shell 图标链路。右键菜单与拖放、目录监听及路径边界没有实施依赖，P3 不修改菜单；菜单后续设计见 [Windows Shell 菜单集成 Feature](windows-shell-menu-feature.md)。
 
 ## Everything 平台边界（2026-08-30）

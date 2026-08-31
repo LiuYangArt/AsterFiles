@@ -113,6 +113,8 @@ Issue #4 已由用户确认完成；性能基线的长期量化继续归入 P6�
 
 P3 已确认的产品范围、隐藏/系统文件默认值和缩略图后移决策见 [P3 Windows 原生集成决策摘要](p3-windows-integration-decisions.md)。右键菜单改造已拆为独立的 [Windows Shell 菜单集成 Feature](windows-shell-menu-feature.md)，不属于 P3。
 
+- [x] P3.D0 原生拖放底座：关闭 winit 固定 COPY 的内置目标，在主窗口 STA 线程注册自有 `IDropTarget`，退出按撤销注册、释放目标、反初始化 OLE 的顺序清理；底座暂时明确拒绝文件落下，并提供无界面 Agent 状态与生命周期测试。
+- [x] P3.D1 拖入当前目录：接收桌面/Explorer 的 `CF_HDROP` 单项、多项、文件和目录，按同卷移动、跨卷复制及 `Ctrl`/`Shift` 修饰键协商效果；无目标、同目录、自身/子目录、虚拟数据和快捷方式请求明确禁止，放下后经后台预检查复用 P2 任务中心。
 - [ ] 建立单独的 Windows 适配层，集中承载 Shell、COM 与系统调用。
 - [ ] 按 [P3 Windows 文件拖放实施方案](p3-windows-drag-drop-plan.md) 接入桌面、Explorer 与 AsterFiles 双向文件拖放。
 - [ ] 拖入空白处或文件夹时复用 P2 任务中心；同盘默认移动、跨盘默认复制，修饰键可强制复制、移动或创建快捷方式。

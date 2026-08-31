@@ -32,6 +32,7 @@ pub enum AgentScenario {
     FileOperationRunning,
     FileOperationConflict,
     FileOperationPartial,
+    DragDropFoundation,
 }
 
 impl AgentScenario {
@@ -41,6 +42,7 @@ impl AgentScenario {
             Self::FileOperationRunning => "file-operation-running",
             Self::FileOperationConflict => "file-operation-conflict",
             Self::FileOperationPartial => "file-operation-partial",
+            Self::DragDropFoundation => "drag-drop-foundation",
         }
     }
 
@@ -102,6 +104,7 @@ fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
         "file-operation-running" => Ok(AgentScenario::FileOperationRunning),
         "file-operation-conflict" => Ok(AgentScenario::FileOperationConflict),
         "file-operation-partial" => Ok(AgentScenario::FileOperationPartial),
+        "drag-drop-foundation" => Ok(AgentScenario::DragDropFoundation),
         _ => Err(format!("unknown agent scenario: {value}")),
     }
 }
@@ -113,6 +116,10 @@ pub fn apply_scenario(session: &mut TabSession, scenario: AgentScenario) {
             session.requested_path = Some(PathBuf::from(r"C:\AgentScenarios\PermissionDenied"));
             session.load_state = LoadState::PermissionDenied;
             session.error = Some("permission denied".to_owned());
+        }
+        AgentScenario::DragDropFoundation => {
+            session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\DragDrop"));
+            session.load_state = LoadState::Complete;
         }
         AgentScenario::FileOperationRunning
         | AgentScenario::FileOperationConflict
@@ -143,6 +150,7 @@ struct AgentState {
     page_state: &'static str,
     visible_page_operations: Vec<&'static str>,
     error_type: Option<&'static str>,
+    drag_drop: Option<crate::platform::windows::drag_drop::DragDropState>,
 }
 
 impl AgentState {
@@ -163,6 +171,8 @@ impl AgentState {
                 .map(PageOperation::name)
                 .collect(),
             error_type: operation_state.or(projection.error_type),
+            drag_drop: (scenario == AgentScenario::DragDropFoundation)
+                .then(crate::platform::windows::drag_drop::current_state),
         }
     }
 
@@ -177,19 +187,52 @@ impl AgentState {
             .error_type
             .map(|value| format!("\"{}\"", escape_json(value)))
             .unwrap_or_else(|| "null".to_owned());
+        let drag_drop = self.drag_drop.as_ref().map_or_else(
+            || "null".to_owned(),
+            |state| {
+                let target = state
+                    .target
+                    .as_ref()
+                    .map(|value| format!("\"{}\"", escape_json(value)))
+                    .unwrap_or_else(|| "null".to_owned());
+                let reason = state
+                    .rejection_reason
+                    .map(|value| format!("\"{}\"", escape_json(value)))
+                    .unwrap_or_else(|| "null".to_owned());
+                let last_event = state
+                    .last_event
+                    .map(|value| format!("\"{}\"", value.name()))
+                    .unwrap_or_else(|| "null".to_owned());
+                format!(
+                    "{{\"lifecycle\":\"{}\",\"registered\":{},\"source_count\":{},\"target\":{},\"negotiated_effect\":\"{}\",\"rejection_reason\":{},\"last_event\":{},\"event_sequence\":{}}}",
+                    state.lifecycle.name(),
+                    state.registered,
+                    state.source_count,
+                    target,
+                    state.negotiated_effect,
+                    reason,
+                    last_event,
+                    state.event_sequence,
+                )
+            },
+        );
         format!(
-            "{{\n  \"schema_version\": 1,\n  \"scenario\": \"{}\",\n  \"current_path\": \"{}\",\n  \"page_state\": \"{}\",\n  \"visible_page_operations\": [{}],\n  \"error_type\": {}\n}}\n",
+            "{{\n  \"schema_version\": 1,\n  \"scenario\": \"{}\",\n  \"current_path\": \"{}\",\n  \"page_state\": \"{}\",\n  \"visible_page_operations\": [{}],\n  \"error_type\": {},\n  \"drag_drop\": {}\n}}\n",
             escape_json(self.scenario),
             escape_json(&self.current_path),
             escape_json(self.page_state),
             operations,
             error_type,
+            drag_drop,
         )
     }
 }
 
 fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str> {
-    if scenario == AgentScenario::PermissionDenied {
+    if matches!(
+        scenario,
+        AgentScenario::PermissionDenied | AgentScenario::DragDropFoundation
+    ) {
         return None;
     }
     let mut manager = OperationManager::new();
@@ -239,6 +282,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
                 },
             );
         }
+        AgentScenario::DragDropFoundation => unreachable!(),
         AgentScenario::PermissionDenied => unreachable!(),
     }
     manager.task(id).map(|task| match task.state {
@@ -357,6 +401,19 @@ mod tests {
             buttons[0].accessible_label().as_deref(),
             Some("Request access with Windows")
         );
+    }
+
+    #[test]
+    fn exported_drag_drop_foundation_state_is_agent_readable() {
+        let mut session = TabSession::new(TabId(1));
+        apply_scenario(&mut session, AgentScenario::DragDropFoundation);
+
+        let json = AgentState::from_session(&session, AgentScenario::DragDropFoundation).to_json();
+
+        assert!(json.contains("\"scenario\": \"drag-drop-foundation\""));
+        assert!(json.contains("\"lifecycle\":\"unregistered\""));
+        assert!(json.contains("\"registered\":false"));
+        assert!(json.contains("\"rejection_reason\":\"not_registered\""));
     }
 
     #[test]

@@ -52,6 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_winit_window_attributes_hook(|attributes| {
                 attributes
                     .with_decorations(false)
+                    .with_drag_and_drop(false)
                     .with_undecorated_shadow(true)
                     .with_corner_preference(CornerPreference::Round)
             })

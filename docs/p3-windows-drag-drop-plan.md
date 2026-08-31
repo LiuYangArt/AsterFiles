@@ -113,17 +113,17 @@ platform/windows/drag_drop：IDataObject、IDropSource、IDropTarget、OLE
 
 ## 8. 实施切片
 
-### P3.D0 原生底座
+### P3.D0 原生底座（已完成）
 
-- 建立 `platform/windows/drag_drop`。
-- 取得 winit/Win32 窗口句柄，完成 OLE 初始化、`RegisterDragDrop` 和退出时 `RevokeDragDrop`。
-- 建立线程亲和的事件桥和 Agent 可读状态。
+- [x] 建立 `platform/windows/drag_drop`。
+- [x] 关闭 winit 内置固定 COPY 文件目标，复用主窗口原生句柄，在 winit/STA 线程完成 OLE 初始化、`RegisterDragDrop`，退出按撤销注册、释放目标、反初始化 OLE 的顺序清理。
+- [x] 建立线程亲和的生命周期事件桥和 Agent 可读状态；D0 明确返回禁止效果，`CF_HDROP` 接收与文件任务留给 D1。
 
-### P3.D1 拖入当前目录
+### P3.D1 拖入当前目录（已完成）
 
-- 接收 `CF_HDROP` 单项、多项、文件和目录。
-- 完成效果协商、修饰键、禁止状态和空白处放下。
-- 放下后提交 P2 复制/移动任务。
+- [x] 接收 `CF_HDROP` 单项、多项、文件和目录，保留原始 Windows 路径。
+- [x] 完成同卷移动、跨卷复制、`Ctrl`/`Shift` 修饰键、禁止状态和当前目录放下；`Alt`/`Ctrl+Shift` 的快捷方式继续留给 D4。
+- [x] 放下后在后台预检查来源与目标，再通过统一事件桥提交 P2 复制/移动任务。
 
 ### P3.D2 文件夹目标与应用内拖放
 
