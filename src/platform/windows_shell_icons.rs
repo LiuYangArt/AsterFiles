@@ -76,7 +76,10 @@ mod windows_impl {
         size: u32,
         cache_only: bool,
     ) -> io::Result<ShellIconRgba> {
-        use windows::Win32::{Foundation::SIZE, Graphics::Gdi::GetDC};
+        use windows::Win32::{
+            Foundation::SIZE,
+            Graphics::Gdi::{GetDC, ReleaseDC},
+        };
         let _com = ComInitialization::new()?;
         let wide = wide_null(path.as_os_str());
         let factory: IShellItemImageFactory = unsafe {
@@ -126,6 +129,7 @@ mod windows_impl {
                 DIB_RGB_COLORS,
             )
         };
+        unsafe { ReleaseDC(None, dc) };
         if lines != size as i32 {
             return Err(io::Error::other(
                 "Windows Shell thumbnail pixels unavailable",
