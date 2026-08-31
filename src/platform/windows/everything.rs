@@ -249,10 +249,6 @@ impl EverythingClient {
             })
         }
     }
-    #[allow(dead_code)]
-    pub fn config(&self) -> &PlatformEverythingConfig {
-        &self.config
-    }
     pub fn discover() -> Vec<EverythingInstallation> {
         let running = running_instances();
         let mut found = registry_installations();

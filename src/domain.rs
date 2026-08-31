@@ -161,8 +161,6 @@ pub struct TabSession {
     pub search_state: SearchState,
     pub search_total: Option<u32>,
     pub search_file_total: Option<u32>,
-    pub search_loaded: u32,
-    pub search_has_more: bool,
     pub search_requested_pages: HashSet<u32>,
     pub search_pending_pages: VecDeque<u32>,
     pub search_cached_pages: VecDeque<u32>,
@@ -203,8 +201,6 @@ impl TabSession {
             search_state: SearchState::Waiting,
             search_total: None,
             search_file_total: None,
-            search_loaded: 0,
-            search_has_more: false,
             search_requested_pages: HashSet::new(),
             search_pending_pages: VecDeque::new(),
             search_cached_pages: VecDeque::new(),
@@ -252,8 +248,6 @@ impl TabSession {
             search_state: SearchState::Waiting,
             search_total: None,
             search_file_total: None,
-            search_loaded: 0,
-            search_has_more: false,
             search_requested_pages: HashSet::new(),
             search_pending_pages: VecDeque::new(),
             search_cached_pages: VecDeque::new(),
@@ -420,8 +414,6 @@ impl TabSession {
         self.search_state = SearchState::Searching;
         self.search_total = None;
         self.search_file_total = None;
-        self.search_loaded = 0;
-        self.search_has_more = false;
         self.search_requested_pages.clear();
         self.search_requested_pages.insert(0);
         self.search_pending_pages.clear();
@@ -473,8 +465,6 @@ impl TabSession {
         self.search_query.clear();
         self.search_total = None;
         self.search_file_total = None;
-        self.search_loaded = 0;
-        self.search_has_more = false;
         self.search_requested_pages.clear();
         self.search_pending_pages.clear();
         self.search_cached_pages.clear();
@@ -493,8 +483,6 @@ impl TabSession {
         self.directory_snapshot = None;
         self.search_total = None;
         self.search_file_total = None;
-        self.search_loaded = 0;
-        self.search_has_more = false;
         self.search_requested_pages.clear();
         self.search_pending_pages.clear();
         self.search_cached_pages.clear();
@@ -619,11 +607,10 @@ impl TabSession {
         }
         self.search_total = Some(total);
         self.search_file_total = Some(file_total);
-        self.search_loaded = self.entries.len().try_into().unwrap_or(u32::MAX);
-        self.search_has_more = self.search_loaded < total;
+        let loaded = self.entries.len().try_into().unwrap_or(u32::MAX);
         self.search_state = if total == 0 {
             SearchState::NoResults
-        } else if self.search_loaded >= total {
+        } else if loaded >= total {
             SearchState::Complete
         } else {
             SearchState::Partial
@@ -1196,8 +1183,8 @@ mod tests {
             256,
         );
         session.finish_search_page_request(0);
-        assert_eq!(session.search_loaded, 256);
-        assert!(session.search_has_more);
+        assert_eq!(session.entries.len(), 256);
+        assert_eq!(session.search_state, SearchState::Partial);
         assert_eq!(session.queue_search_pages(&[256, 0, 512], 256), Some(256));
         assert_eq!(session.queue_search_pages(&[1024, 768, 1280], 256), None);
         assert!(session.accepts_page(request, PageSource::Search));
@@ -1211,8 +1198,8 @@ mod tests {
             100_000,
             256,
         );
-        assert_eq!(session.search_loaded, 512);
-        assert!(session.search_has_more);
+        assert_eq!(session.entries.len(), 512);
+        assert_eq!(session.search_state, SearchState::Partial);
     }
 
     #[test]
@@ -1245,7 +1232,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2, 513, 514]
         );
-        assert_eq!(session.search_loaded, 4);
+        assert_eq!(session.entries.len(), 4);
         assert_eq!(session.search_total, Some(100_000));
     }
 

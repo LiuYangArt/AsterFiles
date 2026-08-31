@@ -75,10 +75,6 @@ pub struct ClassicMenuSession {
 }
 
 impl ClassicMenuSession {
-    pub fn for_paths(paths: &[PathBuf], include_extended_verbs: bool) -> io::Result<Self> {
-        Self::for_paths_with_owner(paths, include_extended_verbs, 0)
-    }
-
     pub fn for_paths_with_owner(
         paths: &[PathBuf],
         include_extended_verbs: bool,
@@ -88,10 +84,6 @@ impl ClassicMenuSession {
         Self::create(include_extended_verbs, || {
             create_selection_context_menu(paths, HWND(owner_window as *mut _))
         })
-    }
-
-    pub fn for_background(folder: &Path, include_extended_verbs: bool) -> io::Result<Self> {
-        Self::for_background_with_owner(folder, include_extended_verbs, 0)
     }
 
     pub fn for_background_with_owner(
