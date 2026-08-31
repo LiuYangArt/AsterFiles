@@ -97,6 +97,10 @@ def main() -> int:
             "cargo", "run", "--", "--agent-scenario", "multi-window-state-layering",
             "--no-ui", "--agent-state-out", str(STATE_DIR / "multi-window" / "state-layering.json"),
         ]),
+        ("agent-tab-reorder", [
+            "cargo", "run", "--", "--agent-scenario", "tab-reorder",
+            "--no-ui", "--agent-state-out", str(STATE_DIR / "tab-reorder" / "state.json"),
+        ]),
         ("release", ["cargo", "build", "--release"])
         if release_requested
         else ("debug", ["cargo", "build"]),

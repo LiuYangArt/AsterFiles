@@ -34,6 +34,7 @@ pub enum AgentScenario {
     FileOperationPartial,
     DragDropFoundation,
     MultiWindowStateLayering,
+    TabReorder,
 }
 
 impl AgentScenario {
@@ -45,6 +46,7 @@ impl AgentScenario {
             Self::FileOperationPartial => "file-operation-partial",
             Self::DragDropFoundation => "drag-drop-foundation",
             Self::MultiWindowStateLayering => "multi-window-state-layering",
+            Self::TabReorder => "tab-reorder",
         }
     }
 
@@ -108,6 +110,7 @@ fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
         "file-operation-partial" => Ok(AgentScenario::FileOperationPartial),
         "drag-drop-foundation" => Ok(AgentScenario::DragDropFoundation),
         "multi-window-state-layering" => Ok(AgentScenario::MultiWindowStateLayering),
+        "tab-reorder" => Ok(AgentScenario::TabReorder),
         _ => Err(format!("unknown agent scenario: {value}")),
     }
 }
@@ -126,6 +129,10 @@ pub fn apply_scenario(session: &mut TabSession, scenario: AgentScenario) {
         }
         AgentScenario::MultiWindowStateLayering => {
             session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\MultiWindow"));
+            session.load_state = LoadState::Complete;
+        }
+        AgentScenario::TabReorder => {
+            session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\TabReorder"));
             session.load_state = LoadState::Complete;
         }
         AgentScenario::FileOperationRunning
@@ -241,6 +248,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
         AgentScenario::PermissionDenied
             | AgentScenario::DragDropFoundation
             | AgentScenario::MultiWindowStateLayering
+            | AgentScenario::TabReorder
     ) {
         return None;
     }
@@ -293,6 +301,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
         }
         AgentScenario::DragDropFoundation => unreachable!(),
         AgentScenario::MultiWindowStateLayering => unreachable!(),
+        AgentScenario::TabReorder => unreachable!(),
         AgentScenario::PermissionDenied => unreachable!(),
     }
     manager.task(id).map(|task| match task.state {

@@ -779,6 +779,10 @@ export component AppWindow inherits Window {
     callback close-tab(int);
     callback restore-tab();
     callback activate-tab(int);
+    callback begin-tab-drag(int, int, float, float);
+    callback update-tab-drag(float, float, float, float, float, float) -> int;
+    callback end-tab-drag(float, float, float, float, float, float);
+    callback cancel-tab-drag();
     callback open-settings();
     callback change-theme(int);
     callback change-language(int);
@@ -866,8 +870,26 @@ export component AppWindow inherits Window {
     private property <length> max-tab-strip-width: max(80px, root.max-tab-cluster-width - (root.tabs-overflow ? 33px : 0px));
     private property <length> tab-width: root.tabs.length == 0 ? 178px : max(80px, min(178px, (root.max-tab-strip-width - 5px * max(0, root.tabs.length - 1)) / root.tabs.length));
     private property <length> tab-content-width: root.tabs.length * root.tab-width + 5px * max(0, root.tabs.length - 1);
-    private property <length> tab-strip-width: min(root.max-tab-strip-width, root.tab-content-width);
+    out property <length> tab-strip-width: min(root.max-tab-strip-width, root.tab-content-width);
     private property <bool> tabs-menu-open: false;
+    in-out property <bool> tab-dragging: false;
+    private property <bool> suppress-tab-click: false;
+    private property <int> tab-drag-source-index: -1;
+    private property <int> tab-drag-insertion-index: -1;
+    private property <length> tab-drag-pointer-x: 0px;
+    private property <length> tab-drag-pointer-y: 0px;
+    private property <length> tab-drag-grab-x: 0px;
+    private property <string> tab-drag-title: "";
+    private property <image> tab-drag-icon;
+    private property <bool> tab-drag-is-drive: false;
+    private property <bool> tab-drag-active: false;
+    public function clear-tab-drag() {
+        root.tab-dragging = false;
+        root.suppress-tab-click = false;
+        root.tab-drag-source-index = -1;
+        root.tab-drag-insertion-index = -1;
+        root.tab-drag-title = "";
+    }
     in property <int> active-tab-index: 0;
     changed active-tab-index => { root.reveal-tab(root.active-tab-index); }
 
@@ -965,10 +987,13 @@ export component AppWindow inherits Window {
                     changed width => { root.reveal-tab(root.active-tab-index); }
                     Rectangle {
                         width: root.tab-content-width; height: 34px;
-                        HorizontalLayout {
-                        width: parent.width; height: parent.height; spacing: 5px;
                         for tab[index] in root.tabs: Rectangle {
+                            x: root.tab-dragging
+                                ? (index < root.tab-drag-source-index ? index : index > root.tab-drag-source-index ? index - 1 : index) * (root.tab-width + 5px)
+                                    + ((index != root.tab-drag-source-index && (index < root.tab-drag-source-index ? index : index - 1) >= root.tab-drag-insertion-index && root.tab-drag-insertion-index >= 0) ? root.tab-width + 5px : 0px)
+                                : index * (root.tab-width + 5px);
                             width: root.tab-width; height: 34px;
+                            visible: !root.tab-dragging || index != root.tab-drag-source-index;
                             background: tab.active ? transparent : (tab-touch.has-hover ? VisualStyle.ce8eaf0 : VisualStyle.cf1f2f5);
                             border-width: 0px;
                             ActiveTabShape {
@@ -979,10 +1004,34 @@ export component AppWindow inherits Window {
                             }
                             tab-touch := TouchArea {
                                 mouse-cursor: pointer;
-                                clicked => { root.activate-tab(tab.id); root.reveal-tab(index); }
+                                clicked => {
+                                    if root.suppress-tab-click { root.suppress-tab-click = false; }
+                                    else { root.activate-tab(tab.id); root.reveal-tab(index); }
+                                }
                                 pointer-event(event) => {
+                                    if event.button == PointerEventButton.left && event.kind == PointerEventKind.down && !tab.is-settings {
+                                        root.tab-drag-source-index = index;
+                                        root.tab-drag-grab-x = self.mouse-x;
+                                        root.tab-drag-title = tab.title;
+                                        root.tab-drag-icon = tab.icon;
+                                        root.tab-drag-is-drive = tab.is-drive;
+                                        root.tab-drag-active = tab.active;
+                                        root.begin-tab-drag(tab.id, index, ((8 + 34 + 5) * 1px + index * (root.tab-width + 5px) + tab-strip.viewport-x + self.mouse-x) / 1px, (12px + self.mouse-y) / 1px);
+                                    }
                                     if (event.button == PointerEventButton.middle && event.kind == PointerEventKind.up && root.can-close-tab) {
                                         root.close-tab(tab.id);
+                                    }
+                                }
+                                moved => {
+                                    if self.pressed && root.tab-drag-source-index == index {
+                                        root.tab-drag-pointer-x = (8 + 34 + 5) * 1px + index * (root.tab-width + 5px) + tab-strip.viewport-x + self.mouse-x;
+                                        root.tab-drag-pointer-y = 12px + self.mouse-y;
+                                        let insertion = root.update-tab-drag(root.tab-drag-pointer-x / 1px, root.tab-drag-pointer-y / 1px, 8 + 34 + 5, root.tab-strip-width / 1px, tab-strip.viewport-x / 1px, root.tab-width / 1px);
+                                        if insertion >= -1 {
+                                            root.tab-dragging = true;
+                                            root.suppress-tab-click = true;
+                                            root.tab-drag-insertion-index = insertion;
+                                        }
                                     }
                                 }
                                 scroll-event(event) => {
@@ -1010,7 +1059,6 @@ export component AppWindow inherits Window {
                                 }
                             }
                             Tooltip { text: @markdown("\{tab.title}"); }
-                        }
                         }
                     }
                     }
@@ -1285,6 +1333,7 @@ accepted => {
         root.rename-submitting = true;
         root.commit-rename(root.rename-input);
     }
+
 }
 key-pressed(event) => {
     if event.text == Key.Escape {
@@ -1705,6 +1754,23 @@ if root.tabs-menu-open: TouchArea {
             }
         }
     }
+    if root.tab-dragging: Rectangle {
+        x: root.tab-drag-pointer-x - root.tab-drag-grab-x;
+        y: root.tab-drag-pointer-y - 17px;
+        width: root.tab-width;
+        height: 34px;
+        border-radius: 7px;
+        background: root.tab-drag-active ? VisualStyle.c323437 : VisualStyle.cf1f2f5;
+        border-width: 1px;
+        border-color: VisualStyle.cd9dce2;
+        z: 100;
+        HorizontalLayout {
+            padding-left: 14px; padding-right: 12px; spacing: 6px;
+            InlineIcon { icon-source: root.tab-drag-icon.width != 0 ? root.tab-drag-icon : (root.tab-drag-is-drive ? IconMap.location-drive : IconMap.file-folder); icon-size: 16px; }
+            Text { text: root.tab-drag-title; color: VisualStyle.c303138; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+        }
+    }
+
     if root.menu-open: TouchArea {
         z: 19;
         width: parent.width;

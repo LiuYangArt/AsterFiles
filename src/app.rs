@@ -119,6 +119,77 @@ pub fn export_multi_window_state_layering(path: &Path) -> io::Result<()> {
     std::fs::write(path, state)
 }
 
+pub fn export_tab_reorder_state(path: &Path) -> io::Result<()> {
+    let mut app = AppState::new(
+        vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")],
+        1,
+        [0, 1, 2, 3],
+        [0, 1, 2, 3],
+        session_store::DEFAULT_COLUMN_WIDTHS,
+        session_store::DEFAULT_SEARCH_COLUMN_WIDTHS,
+        crate::domain::EverythingConfig::default(),
+        session_store::ThemeMode::System,
+        Language::Chinese,
+        false,
+    );
+    let window = app.active_window;
+    let active = app.active_window_state().active_tab;
+    let source = app.active_window_state().tab_order[0];
+    let request_id = {
+        let tab = app.tab_mut(source).expect("source tab exists");
+        let (request_id, _) =
+            tab.begin_navigation(PathBuf::from("pending"), NavigationKind::Refresh);
+        request_id
+    };
+    app.begin_tab_drag(window, source, 0, 100.0, 20.0);
+    let threshold_preserved = app
+        .update_tab_drag(104.0, 20.0, 47.0, 540.0, 0.0, 178.0)
+        .is_none()
+        && app.active_window_state().tab_order == [TabId(1), TabId(2), TabId(3)];
+    app.cancel_tab_drag();
+    app.begin_tab_drag(window, source, 0, 100.0, 20.0);
+    let target_slot = app
+        .update_tab_drag(500.0, 20.0, 47.0, 540.0, 0.0, 178.0)
+        .expect("drag crosses threshold");
+    let reordered = app.finish_tab_drag(true);
+    let paths = app
+        .stable_paths()
+        .iter()
+        .map(|value| format!("\"{}\"", value.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let state = format!(
+        concat!(
+            "{{\n",
+            "  \"schema_version\": 1,\n",
+            "  \"scenario\": \"tab-reorder\",\n",
+            "  \"scope\": \"pure_state_no_native_pointer_capture\",\n",
+            "  \"threshold_preserved_order\": {},\n",
+            "  \"target_slot\": {},\n",
+            "  \"reordered\": {},\n",
+            "  \"tab_order\": [{}, {}, {}],\n",
+            "  \"active_tab_unchanged\": {},\n",
+            "  \"request_id_unchanged\": {},\n",
+            "  \"session_paths\": [{}]\n",
+            "}}\n"
+        ),
+        threshold_preserved,
+        target_slot,
+        reordered,
+        app.active_window_state().tab_order[0].0,
+        app.active_window_state().tab_order[1].0,
+        app.active_window_state().tab_order[2].0,
+        app.active_window_state().active_tab == active,
+        app.tab(source)
+            .is_some_and(|tab| tab.latest_request == request_id),
+        paths,
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, state)
+}
+
 type SharedSessions = Arc<Mutex<AppState>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -138,6 +209,73 @@ struct WindowState {
     active_tab: TabId,
     closed_tabs: VecDeque<PathBuf>,
     placement: session_store::WindowPlacement,
+}
+
+fn movable_tab_range(window: &WindowState, source_index: usize) -> Option<std::ops::Range<usize>> {
+    window.tab_order.get(source_index)?;
+    let start = window.tab_order[..source_index]
+        .iter()
+        .rposition(|id| {
+            window
+                .tabs
+                .get(id)
+                .is_some_and(|tab| tab.kind == TabKind::Settings)
+        })
+        .map_or(0, |index| index + 1);
+    let end = window.tab_order[source_index + 1..]
+        .iter()
+        .position(|id| {
+            window
+                .tabs
+                .get(id)
+                .is_some_and(|tab| tab.kind == TabKind::Settings)
+        })
+        .map_or(window.tab_order.len(), |index| source_index + 1 + index);
+    Some(start..end)
+}
+
+fn tab_insertion_slot(
+    pointer_x: f32,
+    strip_x: f32,
+    strip_width: f32,
+    viewport_x: f32,
+    tab_width: f32,
+    range: std::ops::Range<usize>,
+) -> Option<usize> {
+    if pointer_x < strip_x || pointer_x > strip_x + strip_width || range.is_empty() {
+        return None;
+    }
+    let pitch = tab_width + 5.0;
+    let range_x = pointer_x - strip_x - viewport_x - range.start as f32 * pitch;
+    let remaining = range.len().saturating_sub(1);
+    if range_x <= tab_width / 2.0 {
+        return Some(range.start);
+    }
+    for slot in 1..remaining {
+        let midpoint = slot as f32 * pitch + tab_width / 2.0;
+        if range_x < midpoint {
+            return Some(range.start + slot);
+        }
+    }
+    Some(range.start + remaining)
+}
+
+const TAB_DRAG_THRESHOLD: f32 = 6.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TabDragPhase {
+    Pressed,
+    Dragging { insertion_index: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TabDragSession {
+    window_id: WindowId,
+    tab_id: TabId,
+    source_index: usize,
+    press_x: f32,
+    press_y: f32,
+    phase: TabDragPhase,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -190,6 +328,7 @@ struct AppState {
     everything_status: String,
     everything_folder_sizes_indexed: Option<bool>,
     pending_right_drop: Option<platform::windows::drag_drop::DropIntent>,
+    tab_drag: Option<TabDragSession>,
 }
 
 impl AppState {
@@ -317,6 +456,7 @@ impl AppState {
             everything_status: String::new(),
             everything_folder_sizes_indexed: None,
             pending_right_drop: None,
+            tab_drag: None,
         }
     }
 
@@ -410,6 +550,95 @@ impl AppState {
         } else {
             WindowCloseAction::ExitApplication
         }
+    }
+
+    fn begin_tab_drag(
+        &mut self,
+        window_id: WindowId,
+        tab_id: TabId,
+        source_index: usize,
+        press_x: f32,
+        press_y: f32,
+    ) -> bool {
+        let Some(window) = self.windows.get(&window_id) else {
+            return false;
+        };
+        if window.tab_order.get(source_index) != Some(&tab_id)
+            || window
+                .tabs
+                .get(&tab_id)
+                .is_none_or(|tab| tab.kind != TabKind::Files)
+        {
+            return false;
+        }
+        self.tab_drag = Some(TabDragSession {
+            window_id,
+            tab_id,
+            source_index,
+            press_x,
+            press_y,
+            phase: TabDragPhase::Pressed,
+        });
+        true
+    }
+
+    fn update_tab_drag(
+        &mut self,
+        pointer_x: f32,
+        pointer_y: f32,
+        strip_x: f32,
+        strip_width: f32,
+        viewport_x: f32,
+        tab_width: f32,
+    ) -> Option<usize> {
+        let mut drag = self.tab_drag?;
+        if matches!(drag.phase, TabDragPhase::Pressed)
+            && (pointer_x - drag.press_x).hypot(pointer_y - drag.press_y) < TAB_DRAG_THRESHOLD
+        {
+            return None;
+        }
+        let window = self.windows.get(&drag.window_id)?;
+        let range = movable_tab_range(window, drag.source_index)?;
+        let insertion_index = tab_insertion_slot(
+            pointer_x,
+            strip_x,
+            strip_width,
+            viewport_x,
+            tab_width,
+            range,
+        )?;
+        drag.phase = TabDragPhase::Dragging { insertion_index };
+        self.tab_drag = Some(drag);
+        ((0.0..=46.0).contains(&pointer_y)
+            && pointer_x >= strip_x
+            && pointer_x <= strip_x + strip_width)
+            .then_some(insertion_index)
+    }
+
+    fn finish_tab_drag(&mut self, valid_release: bool) -> bool {
+        let Some(drag) = self.tab_drag.take() else {
+            return false;
+        };
+        let TabDragPhase::Dragging { insertion_index } = drag.phase else {
+            return false;
+        };
+        if !valid_release {
+            return false;
+        }
+        let Some(window) = self.windows.get_mut(&drag.window_id) else {
+            return false;
+        };
+        if window.tab_order.get(drag.source_index) != Some(&drag.tab_id) {
+            return false;
+        }
+        let moved = window.tab_order.remove(drag.source_index);
+        let target = insertion_index.min(window.tab_order.len());
+        window.tab_order.insert(target, moved);
+        target != drag.source_index
+    }
+
+    fn cancel_tab_drag(&mut self) -> bool {
+        self.tab_drag.take().is_some()
     }
 
     fn duplicate_active_tab(&mut self) -> Option<TabId> {
@@ -2477,6 +2706,56 @@ fn wire_callbacks(
         }
     });
 
+    let state_for_tab_drag = state.clone();
+    ui.on_begin_tab_drag(move |tab_id, source_index, press_x, press_y| {
+        if let Ok(mut app) = state_for_tab_drag.lock() {
+            let window_id = app.active_window;
+            app.begin_tab_drag(
+                window_id,
+                TabId(tab_id as u32),
+                source_index.max(0) as usize,
+                press_x,
+                press_y,
+            );
+        }
+    });
+
+    let state_for_tab_drag = state.clone();
+    ui.on_update_tab_drag(move |x, y, strip_x, strip_width, viewport_x, tab_width| {
+        state_for_tab_drag
+            .lock()
+            .ok()
+            .and_then(|mut app| {
+                app.update_tab_drag(x, y, strip_x, strip_width, viewport_x, tab_width)
+            })
+            .map(|index| index as i32)
+            .unwrap_or(-2)
+    });
+
+    let weak = ui.as_weak();
+    let state_for_tab_drag = state.clone();
+    ui.on_end_tab_drag(move |x, y, strip_x, strip_width, _viewport_x, _tab_width| {
+        let valid = (0.0..=46.0).contains(&y) && x >= strip_x && x <= strip_x + strip_width;
+        if let Ok(mut app) = state_for_tab_drag.lock() {
+            app.finish_tab_drag(valid);
+        }
+        if let Some(ui) = weak.upgrade() {
+            ui.invoke_clear_tab_drag();
+            refresh_ui(&ui, &state_for_tab_drag);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let state_for_tab_drag = state.clone();
+    ui.on_cancel_tab_drag(move || {
+        if let Ok(mut app) = state_for_tab_drag.lock() {
+            app.cancel_tab_drag();
+        }
+        if let Some(ui) = weak.upgrade() {
+            ui.invoke_clear_tab_drag();
+        }
+    });
+
     let weak = ui.as_weak();
     let sender_for_back = sender.clone();
     let state_for_back = state.clone();
@@ -3040,6 +3319,7 @@ fn wire_callbacks(
             }
             WindowCloseAction::CloseWindow => {
                 if let Ok(mut app) = state_for_close.lock() {
+                    app.cancel_tab_drag();
                     let active_window = app.active_window;
                     let _ = app.close_window(active_window);
                 }
@@ -3115,6 +3395,7 @@ fn wire_mouse_navigation(ui: &AppWindow, exit_ui: &ConfirmationWindow, state: Sh
                 }
                 WindowCloseAction::CloseWindow => {
                     if let Ok(mut app) = state.lock() {
+                        app.cancel_tab_drag();
                         let active_window = app.active_window;
                         let _ = app.close_window(active_window);
                     }
@@ -3128,6 +3409,7 @@ fn wire_mouse_navigation(ui: &AppWindow, exit_ui: &ConfirmationWindow, state: Sh
             if let Some(ui) = weak.upgrade() {
                 ui.set_context_menu_open(false);
                 ui.set_drop_menu_open(false);
+                ui.invoke_cancel_tab_drag();
             }
             if let Ok(mut app) = state.lock() {
                 app.pending_right_drop = None;
@@ -3161,13 +3443,24 @@ fn wire_mouse_navigation(ui: &AppWindow, exit_ui: &ConfirmationWindow, state: Sh
                 if event.state == ElementState::Pressed
                     && !event.repeat
                     && matches!(event.logical_key, Key::Named(NamedKey::Escape))
-        ) && ui.get_drop_menu_open()
-        {
-            ui.set_drop_menu_open(false);
-            if let Ok(mut app) = state.lock() {
-                app.pending_right_drop = None;
+        ) {
+            let mut cancelled = false;
+            if ui.get_drop_menu_open() {
+                ui.set_drop_menu_open(false);
+                if let Ok(mut app) = state.lock() {
+                    app.pending_right_drop = None;
+                }
+                cancelled = true;
             }
-            return EventResult::PreventDefault;
+            if state.lock().is_ok_and(|app| app.tab_drag.is_some()) {
+                ui.invoke_cancel_tab_drag();
+                cancelled = true;
+            }
+            return if cancelled {
+                EventResult::PreventDefault
+            } else {
+                EventResult::Propagate
+            };
         }
         if matches!(event, WindowEvent::KeyboardInput { .. })
             && keyboard_shortcuts_suppressed(ui.get_rename_editing())
@@ -3205,6 +3498,28 @@ fn wire_mouse_navigation(ui: &AppWindow, exit_ui: &ConfirmationWindow, state: Sh
                     );
                 }
                 EventResult::PreventDefault
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: winit::event::MouseButton::Left,
+                ..
+            } => {
+                let logical = cursor_position
+                    .get()
+                    .to_logical::<f32>(f64::from(ui.window().scale_factor()));
+                let strip_x = 8.0 + 34.0 + 5.0;
+                let strip_width = ui.get_tab_strip_width() / 1.0;
+                let valid = logical.y >= 0.0
+                    && logical.y <= 46.0
+                    && logical.x >= strip_x
+                    && logical.x <= strip_x + strip_width;
+                let finished = state.lock().is_ok_and(|mut app| app.finish_tab_drag(valid));
+                if finished || ui.get_tab_dragging() {
+                    ui.invoke_clear_tab_drag();
+                    refresh_ui(&ui, &state);
+                    return EventResult::PreventDefault;
+                }
+                EventResult::Propagate
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && !event.repeat =>
@@ -8071,6 +8386,175 @@ mod tests {
         );
         assert_eq!(app.stable_active_path_index(), 1);
         assert!(app.window(window).is_some());
+    }
+
+    fn begin_drag_at(app: &mut AppState, index: usize) -> (WindowId, TabId) {
+        let window_id = app.active_window;
+        let tab_id = app.active_window_state().tab_order[index];
+        assert!(app.begin_tab_drag(window_id, tab_id, index, 100.0, 20.0));
+        (window_id, tab_id)
+    }
+
+    #[test]
+    fn tab_drag_threshold_and_invalid_release_preserve_order() {
+        let mut app = AppState::new_for_test(
+            vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")],
+            0,
+            [0, 1, 2, 3],
+        );
+        let original = app.active_window_state().tab_order.clone();
+        begin_drag_at(&mut app, 1);
+        assert_eq!(
+            app.update_tab_drag(104.0, 20.0, 47.0, 540.0, 0.0, 178.0),
+            None
+        );
+        assert!(!app.finish_tab_drag(true));
+        assert_eq!(app.active_window_state().tab_order, original);
+
+        begin_drag_at(&mut app, 1);
+        assert_eq!(
+            app.update_tab_drag(500.0, 20.0, 47.0, 540.0, 0.0, 178.0),
+            Some(2)
+        );
+        assert!(!app.finish_tab_drag(false));
+        assert_eq!(app.active_window_state().tab_order, original);
+    }
+
+    #[test]
+    fn tab_drag_reorders_only_ids_and_preserves_request_identity() {
+        let mut app = AppState::new_for_test(
+            vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")],
+            1,
+            [0, 1, 2, 3],
+        );
+        let active = app.active_window_state().active_tab;
+        let tab = app.tab_mut(active).unwrap();
+        let (request_id, cancel) =
+            tab.begin_navigation(PathBuf::from("pending"), NavigationKind::Refresh);
+        let (_, moved) = begin_drag_at(&mut app, 0);
+        assert_eq!(
+            app.update_tab_drag(500.0, 20.0, 47.0, 540.0, 0.0, 178.0),
+            Some(2)
+        );
+        assert!(app.finish_tab_drag(true));
+        assert_eq!(
+            app.active_window_state().tab_order,
+            [TabId(2), TabId(3), moved]
+        );
+        assert_eq!(app.active_window_state().active_tab, active);
+        assert_eq!(app.tab(active).unwrap().latest_request, request_id);
+        assert!(!cancel.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn settings_tab_is_fixed_and_bounds_the_file_tab_range() {
+        let mut app = AppState::new_for_test(
+            vec![PathBuf::from("a"), PathBuf::from("b")],
+            0,
+            [0, 1, 2, 3],
+        );
+        let settings = app.open_settings();
+        let third = app.create_tab(PathBuf::from("c"));
+        assert!(!app.begin_tab_drag(app.active_window, settings, 2, 100.0, 20.0));
+        assert!(app.begin_tab_drag(app.active_window, third, 3, 600.0, 20.0));
+        assert_eq!(
+            app.update_tab_drag(50.0, 20.0, 47.0, 720.0, 0.0, 178.0),
+            Some(3)
+        );
+        assert!(!app.finish_tab_drag(true));
+        assert_eq!(
+            app.active_window_state().tab_order,
+            [TabId(1), TabId(2), settings, third]
+        );
+    }
+
+    #[test]
+    fn tab_drag_slot_accounts_for_overflow_viewport_offset() {
+        let mut app = AppState::new_for_test(
+            vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")],
+            0,
+            [0, 1, 2, 3],
+        );
+        begin_drag_at(&mut app, 2);
+        assert_eq!(
+            app.update_tab_drag(52.0, 20.0, 47.0, 240.0, -100.0, 80.0),
+            Some(1)
+        );
+        app.cancel_tab_drag();
+        assert_eq!(
+            app.active_window_state().tab_order,
+            [TabId(1), TabId(2), TabId(3)]
+        );
+    }
+
+    #[test]
+    fn tab_insertion_slot_uses_midpoints_gaps_ranges_and_bounds() {
+        assert_eq!(tab_insertion_slot(46.0, 47.0, 300.0, 0.0, 80.0, 0..3), None);
+        assert_eq!(
+            tab_insertion_slot(48.0, 47.0, 300.0, 0.0, 80.0, 0..3),
+            Some(0)
+        );
+        assert_eq!(
+            tab_insertion_slot(87.0, 47.0, 300.0, 0.0, 80.0, 0..3),
+            Some(0)
+        );
+        assert_eq!(
+            tab_insertion_slot(88.0, 47.0, 300.0, 0.0, 80.0, 0..3),
+            Some(1)
+        );
+        assert_eq!(
+            tab_insertion_slot(130.0, 47.0, 300.0, 0.0, 80.0, 0..3),
+            Some(1)
+        );
+        assert_eq!(
+            tab_insertion_slot(340.0, 47.0, 300.0, 0.0, 80.0, 0..3),
+            Some(2)
+        );
+        assert_eq!(
+            tab_insertion_slot(348.0, 47.0, 300.0, 0.0, 80.0, 0..3),
+            None
+        );
+        assert_eq!(
+            tab_insertion_slot(52.0, 47.0, 240.0, -100.0, 80.0, 0..3),
+            Some(1)
+        );
+        assert_eq!(
+            tab_insertion_slot(305.0, 47.0, 400.0, 0.0, 80.0, 3..5),
+            Some(3)
+        );
+        assert_eq!(
+            tab_insertion_slot(390.0, 47.0, 400.0, 0.0, 80.0, 3..5),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn astf7_round_trip_uses_reordered_paths_and_active_file_index() {
+        let mut app = AppState::new_for_test(
+            vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")],
+            1,
+            [0, 1, 2, 3],
+        );
+        begin_drag_at(&mut app, 0);
+        app.update_tab_drag(500.0, 20.0, 47.0, 540.0, 0.0, 178.0);
+        app.finish_tab_drag(true);
+        let temporary =
+            std::env::temp_dir().join(format!("asterfiles-tab-order-{}.bin", std::process::id()));
+        let session = session_store::SessionState::new(
+            test_window_placement(80),
+            app.stable_active_path_index(),
+            app.stable_paths(),
+            [0, 1, 2, 3],
+        )
+        .unwrap();
+        session_store::save(&temporary, &session).unwrap();
+        let restored = session_store::load(&temporary).unwrap();
+        std::fs::remove_file(temporary).unwrap();
+        assert_eq!(
+            restored.tab_paths,
+            [PathBuf::from("b"), PathBuf::from("c"), PathBuf::from("a")]
+        );
+        assert_eq!(restored.active_tab, 0);
     }
     #[test]
     fn complete_tab_duplication_shares_entries_without_reloading() {
