@@ -450,29 +450,48 @@ fn cross_window_drop_target(
     source_window: WindowId,
     source_ui: &AppWindow,
     cursor: winit::dpi::PhysicalPosition<f64>,
+    state: &SharedSessions,
 ) -> Option<(WindowId, usize)> {
-    let source_position = source_ui.window().position();
-    let screen_x = f64::from(source_position.x) + cursor.x;
-    let screen_y = f64::from(source_position.y) + cursor.y;
+    let (source_left, source_top, _, _) =
+        platform::windows::drag_drop::client_screen_rect(native_window_handle(source_ui)).ok()?;
+    let screen_x = f64::from(source_left) + cursor.x;
+    let screen_y = f64::from(source_top) + cursor.y;
     WINDOW_RUNTIMES.with_borrow(|runtimes| {
         runtimes.iter().find_map(|(window_id, runtime)| {
             if *window_id == source_window {
                 return None;
             }
-            let target_position = runtime.ui.window().position();
+            let (target_left, target_top, _, _) =
+                platform::windows::drag_drop::client_screen_rect(native_window_handle(&runtime.ui))
+                    .ok()?;
             let scale = f64::from(runtime.ui.window().scale_factor());
-            let x = ((screen_x - f64::from(target_position.x)) / scale) as f32;
-            let y = ((screen_y - f64::from(target_position.y)) / scale) as f32;
+            let x = ((screen_x - f64::from(target_left)) / scale) as f32;
+            let y = ((screen_y - f64::from(target_top)) / scale) as f32;
             if !(0.0..=46.0).contains(&y) {
                 return None;
             }
+            let file_boundary = state.lock().ok().and_then(|app| {
+                let window = app.window(*window_id)?;
+                Some(
+                    window
+                        .tab_order
+                        .iter()
+                        .position(|id| {
+                            window
+                                .tabs
+                                .get(id)
+                                .is_some_and(|tab| tab.kind == TabKind::Settings)
+                        })
+                        .unwrap_or(window.tab_order.len()),
+                )
+            })?;
             external_tab_insertion_slot(
                 x,
                 47.0,
                 runtime.ui.get_tab_strip_width(),
                 runtime.ui.get_tab_viewport_x(),
                 runtime.ui.get_tab_current_width(),
-                runtime.ui.get_tabs().row_count(),
+                file_boundary,
             )
             .map(|slot| (*window_id, slot))
         })
@@ -1313,6 +1332,7 @@ impl AppState {
         self.active_window_state().stable_paths()
     }
 
+    #[cfg(test)]
     fn stable_active_path_index(&self) -> usize {
         self.active_window_state().stable_active_path_index()
     }
@@ -1668,6 +1688,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         restored_paths,
         active_index,
         window,
+        additional_windows,
         column_order,
         search_column_order,
         column_widths,
@@ -1677,17 +1698,20 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         language,
         file_visibility,
     ) = restored
-        .filter(|session| !session.tab_paths.is_empty())
+        .filter(|session| {
+            session
+                .windows
+                .first()
+                .is_some_and(|window| !window.tab_paths.is_empty())
+        })
         .map(|session| {
-            let window = if session.window.width > 7_680 || session.window.height > 4_320 {
-                default_window
-            } else {
-                session.window
-            };
+            let mut windows = session.windows;
+            let first = windows.remove(0);
             (
-                session.tab_paths,
-                session.active_tab,
-                window,
+                first.tab_paths,
+                first.active_tab,
+                first.placement,
+                windows,
                 session.column_order,
                 session.search_column_order,
                 session.column_widths,
@@ -1703,6 +1727,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 vec![initial_path()],
                 0,
                 default_window,
+                Vec::new(),
                 [0, 1, 2, 3],
                 [0, 1, 2, 3],
                 session_store::DEFAULT_COLUMN_WIDTHS,
@@ -1734,6 +1759,15 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     if let Ok(mut app) = state.lock() {
         app.file_visibility = file_visibility;
         app.active_window_state_mut().placement = window;
+        for restored in &additional_windows {
+            if !restored.tab_paths.is_empty() {
+                app.register_window(
+                    restored.tab_paths.clone(),
+                    restored.active_tab,
+                    restored.placement,
+                );
+            }
+        }
         let _ = app.window(app.active_window);
     }
     if let Some(scenario) = scenario {
@@ -1915,6 +1949,27 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             },
         );
     });
+    let restored_window_ids = state
+        .lock()
+        .map(|app| {
+            app.windows
+                .keys()
+                .copied()
+                .filter(|id| *id != initial_window_id)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for window_id in restored_window_ids {
+        install_app_window(
+            AppWindow::new()?,
+            window_id,
+            &delete_ui,
+            &conflict_ui,
+            &exit_ui,
+            &senders,
+            state.clone(),
+        )?;
+    }
     ui.show()?;
     let result = slint::run_event_loop();
     drop(directory_watch_timer);
@@ -1924,9 +1979,27 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             let _ = window.hide();
         }
     }
+    let live_placements = WINDOW_RUNTIMES.with_borrow(|runtimes| {
+        runtimes
+            .iter()
+            .map(|(id, runtime)| {
+                let position = runtime.ui.window().position();
+                let size = runtime.ui.window().size();
+                let scale = runtime.ui.window().scale_factor();
+                (
+                    *id,
+                    session_store::WindowPlacement {
+                        x: position.x,
+                        y: position.y,
+                        width: (size.width as f32 / scale).round() as u32,
+                        height: (size.height as f32 / scale).round() as u32,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>()
+    });
     let (
-        paths,
-        active_tab,
+        windows,
         column_order,
         search_column_order,
         column_widths,
@@ -1936,11 +2009,28 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         language,
         file_visibility,
     ) = {
-        let app = state.lock().expect("app state mutex is not poisoned");
-        let active_tab = app.stable_active_path_index();
+        let mut app = state.lock().expect("app state mutex is not poisoned");
+        for (id, placement) in &live_placements {
+            if let Some(window) = app.windows.get_mut(id) {
+                window.placement = *placement;
+            }
+        }
+        let mut window_ids = app.windows.keys().copied().collect::<Vec<_>>();
+        window_ids.sort_by_key(|id| id.0);
+        let windows = window_ids
+            .into_iter()
+            .filter_map(|id| {
+                let window = app.windows.get(&id)?;
+                let paths = window.stable_paths();
+                (!paths.is_empty()).then_some(session_store::WindowSessionState {
+                    placement: window.placement,
+                    active_tab: window.stable_active_path_index(),
+                    tab_paths: paths,
+                })
+            })
+            .collect::<Vec<_>>();
         (
-            app.stable_paths(),
-            active_tab,
+            windows,
             app.column_order,
             app.search_column_order,
             app.column_widths,
@@ -1951,23 +2041,10 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             app.file_visibility,
         )
     };
-    let position = ui.window().position();
-    let size = ui.window().size();
-    let window = session_store::WindowPlacement {
-        x: position.x,
-        y: position.y,
-        width: (size.width as f32 / ui.window().scale_factor()).round() as u32,
-        height: (size.height as f32 / ui.window().scale_factor()).round() as u32,
-    };
-    if let Ok(mut app) = state.lock() {
-        app.active_window_state_mut().placement = window;
-    }
     if scenario.is_none()
         && let Some(path) = session_store::default_path()
-        && let Ok(session) = session_store::SessionState::with_file_visibility_settings(
-            window,
-            active_tab,
-            paths,
+        && let Ok(session) = session_store::SessionState::with_windows_and_settings(
+            windows,
             column_order,
             search_column_order,
             column_widths,
@@ -2247,6 +2324,9 @@ fn move_tab_into_existing_window(
     senders: &WorkerSenders,
     state: &SharedSessions,
 ) -> bool {
+    if window_ui(destination_window).is_none() {
+        return false;
+    }
     let outcome = state
         .lock()
         .ok()
@@ -3598,6 +3678,7 @@ fn wire_callbacks(
         if let Some(ui) = weak.upgrade() {
             ui.invoke_clear_tab_drag();
         }
+        project_cross_window_drop(None);
     });
 
     let weak = ui.as_weak();
@@ -4330,7 +4411,12 @@ fn wire_mouse_navigation(
                     })
                 });
                 if dragging {
-                    project_cross_window_drop(cross_window_drop_target(window_id, &ui, *position));
+                    project_cross_window_drop(cross_window_drop_target(
+                        window_id,
+                        &ui,
+                        *position,
+                        &shared_state,
+                    ));
                 }
                 EventResult::Propagate
             }
@@ -4376,7 +4462,14 @@ fn wire_mouse_navigation(
                     && logical.x >= strip_x
                     && logical.x <= strip_x + strip_width;
                 let cross_target = (!valid)
-                    .then(|| cross_window_drop_target(window_id, &ui, cursor_position.get()))
+                    .then(|| {
+                        cross_window_drop_target(
+                            window_id,
+                            &ui,
+                            cursor_position.get(),
+                            &shared_state,
+                        )
+                    })
                     .flatten();
                 let moved = cross_target.is_some_and(|(destination, insertion)| {
                     move_tab_into_existing_window(
@@ -9694,7 +9787,7 @@ mod tests {
     }
 
     #[test]
-    fn astf7_round_trip_uses_reordered_paths_and_active_file_index() {
+    fn astf8_round_trip_uses_reordered_paths_and_active_file_index() {
         let mut app = AppState::new_for_test(
             vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")],
             1,
@@ -9716,10 +9809,10 @@ mod tests {
         let restored = session_store::load(&temporary).unwrap();
         std::fs::remove_file(temporary).unwrap();
         assert_eq!(
-            restored.tab_paths,
+            restored.windows[0].tab_paths,
             [PathBuf::from("b"), PathBuf::from("c"), PathBuf::from("a")]
         );
-        assert_eq!(restored.active_tab, 0);
+        assert_eq!(restored.windows[0].active_tab, 0);
     }
     #[test]
     fn complete_tab_duplication_shares_entries_without_reloading() {

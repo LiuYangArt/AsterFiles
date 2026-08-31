@@ -12,7 +12,7 @@ use crate::{
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-const MAGIC: &[u8; 5] = b"ASTF7";
+const MAGIC: &[u8; 5] = b"ASTF8";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ThemeMode {
@@ -52,6 +52,7 @@ pub const DEFAULT_SEARCH_COLUMN_WIDTHS: SearchColumnWidths = [400, 320, 120, 200
 const MIN_COLUMN_WIDTH: u32 = 64;
 const MAX_COLUMN_WIDTH: u32 = 4_096;
 const MAX_TABS: usize = 1_024;
+const MAX_WINDOWS: usize = 128;
 const MAX_PATH_UNITS: usize = 32_767;
 const MIN_WINDOW_WIDTH: u32 = 820;
 const MIN_WINDOW_HEIGHT: u32 = 520;
@@ -68,9 +69,7 @@ pub struct WindowPlacement {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionState {
-    pub window: WindowPlacement,
-    pub active_tab: usize,
-    pub tab_paths: Vec<PathBuf>,
+    pub windows: Vec<WindowSessionState>,
     pub column_order: ColumnOrder,
     pub search_column_order: SearchColumnOrder,
     pub column_widths: ColumnWidths,
@@ -79,6 +78,13 @@ pub struct SessionState {
     pub language: Language,
     pub everything: EverythingConfig,
     pub file_visibility: FileVisibility,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowSessionState {
+    pub placement: WindowPlacement,
+    pub active_tab: usize,
+    pub tab_paths: Vec<PathBuf>,
 }
 
 impl SessionState {
@@ -164,26 +170,56 @@ impl SessionState {
         everything: EverythingConfig,
         file_visibility: FileVisibility,
     ) -> io::Result<Self> {
-        validate_window(window)?;
+        Self::with_windows_and_settings(
+            vec![WindowSessionState {
+                placement: window,
+                active_tab,
+                tab_paths,
+            }],
+            column_order,
+            search_column_order,
+            column_widths,
+            search_column_widths,
+            theme_mode,
+            language,
+            everything,
+            file_visibility,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_windows_and_settings(
+        mut windows: Vec<WindowSessionState>,
+        column_order: ColumnOrder,
+        search_column_order: SearchColumnOrder,
+        column_widths: ColumnWidths,
+        search_column_widths: SearchColumnWidths,
+        theme_mode: ThemeMode,
+        language: Language,
+        everything: EverythingConfig,
+        file_visibility: FileVisibility,
+    ) -> io::Result<Self> {
+        if windows.is_empty() || windows.len() > MAX_WINDOWS {
+            return Err(invalid_data("invalid session window count"));
+        }
+        for window in &mut windows {
+            validate_window(window.placement)?;
+            if window.tab_paths.len() > MAX_TABS {
+                return Err(invalid_data("invalid session tab count"));
+            }
+            window.active_tab = if window.tab_paths.is_empty() {
+                0
+            } else {
+                window.active_tab.min(window.tab_paths.len() - 1)
+            };
+        }
         validate_column_order(column_order)?;
         validate_column_order(search_column_order)?;
         validate_column_widths(column_widths)?;
         validate_column_widths(search_column_widths)?;
         validate_everything_config(&everything)?;
-        if tab_paths.len() > MAX_TABS {
-            return Err(invalid_data("too many session tabs"));
-        }
-
-        let active_tab = if tab_paths.is_empty() {
-            0
-        } else {
-            active_tab.min(tab_paths.len() - 1)
-        };
-
         Ok(Self {
-            window,
-            active_tab,
-            tab_paths,
+            windows,
             column_order,
             search_column_order,
             column_widths,
@@ -215,10 +251,8 @@ pub fn save(path: &Path, state: &SessionState) -> io::Result<()> {
 }
 
 fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
-    let state = SessionState::with_file_visibility_settings(
-        state.window,
-        state.active_tab,
-        state.tab_paths.clone(),
+    let state = SessionState::with_windows_and_settings(
+        state.windows.clone(),
         state.column_order,
         state.search_column_order,
         state.column_widths,
@@ -230,12 +264,7 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
     )?;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(MAGIC);
-    bytes.extend_from_slice(&state.window.x.to_le_bytes());
-    bytes.extend_from_slice(&state.window.y.to_le_bytes());
-    bytes.extend_from_slice(&state.window.width.to_le_bytes());
-    bytes.extend_from_slice(&state.window.height.to_le_bytes());
-    bytes.extend_from_slice(&(state.active_tab as u32).to_le_bytes());
-    bytes.extend_from_slice(&(state.tab_paths.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&(state.windows.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&state.column_order);
     bytes.extend_from_slice(&state.search_column_order);
     write_four_u32(&mut bytes, state.column_widths);
@@ -249,8 +278,16 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
     bytes.push(u8::from(state.file_visibility.show_hidden));
     bytes.push(u8::from(state.file_visibility.show_system));
 
-    for path in &state.tab_paths {
-        write_os(&mut bytes, path.as_os_str())?;
+    for window in &state.windows {
+        bytes.extend_from_slice(&window.placement.x.to_le_bytes());
+        bytes.extend_from_slice(&window.placement.y.to_le_bytes());
+        bytes.extend_from_slice(&window.placement.width.to_le_bytes());
+        bytes.extend_from_slice(&window.placement.height.to_le_bytes());
+        bytes.extend_from_slice(&(window.active_tab as u32).to_le_bytes());
+        bytes.extend_from_slice(&(window.tab_paths.len() as u32).to_le_bytes());
+        for path in &window.tab_paths {
+            write_os(&mut bytes, path.as_os_str())?;
+        }
     }
     Ok(bytes)
 }
@@ -261,16 +298,9 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
     }
 
     let mut offset = MAGIC.len();
-    let window = WindowPlacement {
-        x: read_i32(bytes, &mut offset)?,
-        y: read_i32(bytes, &mut offset)?,
-        width: read_u32(bytes, &mut offset)?,
-        height: read_u32(bytes, &mut offset)?,
-    };
-    let active_tab = read_u32(bytes, &mut offset)? as usize;
-    let count = read_u32(bytes, &mut offset)? as usize;
-    if count > MAX_TABS {
-        return Err(invalid_data("too many session tabs"));
+    let window_count = read_u32(bytes, &mut offset)? as usize;
+    if window_count == 0 || window_count > MAX_WINDOWS {
+        return Err(invalid_data("invalid session window count"));
     }
     let column_order = read_four(bytes, &mut offset)?;
     let search_column_order = read_four(bytes, &mut offset)?;
@@ -299,19 +329,36 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
         show_system: read_bool(bytes, &mut offset, "invalid system-file setting")?,
     };
 
-    let mut tab_paths = Vec::with_capacity(count);
-    for _ in 0..count {
-        tab_paths.push(PathBuf::from(read_os(bytes, &mut offset)?));
+    let mut windows = Vec::with_capacity(window_count);
+    for _ in 0..window_count {
+        let placement = WindowPlacement {
+            x: read_i32(bytes, &mut offset)?,
+            y: read_i32(bytes, &mut offset)?,
+            width: read_u32(bytes, &mut offset)?,
+            height: read_u32(bytes, &mut offset)?,
+        };
+        let active_tab = read_u32(bytes, &mut offset)? as usize;
+        let count = read_u32(bytes, &mut offset)? as usize;
+        if count > MAX_TABS {
+            return Err(invalid_data("too many session tabs"));
+        }
+        let mut tab_paths = Vec::with_capacity(count);
+        for _ in 0..count {
+            tab_paths.push(PathBuf::from(read_os(bytes, &mut offset)?));
+        }
+        windows.push(WindowSessionState {
+            placement,
+            active_tab,
+            tab_paths,
+        });
     }
 
     if offset != bytes.len() {
         return Err(invalid_data("unexpected trailing session data"));
     }
 
-    SessionState::with_file_visibility_settings(
-        window,
-        active_tab,
-        tab_paths,
+    SessionState::with_windows_and_settings(
+        windows,
         column_order,
         search_column_order,
         column_widths,
@@ -572,6 +619,24 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_multiple_windows_with_independent_layout_and_order() {
+        let mut state = sample_state();
+        state.windows.push(WindowSessionState {
+            placement: WindowPlacement {
+                x: 420,
+                y: 180,
+                width: 1024,
+                height: 700,
+            },
+            active_tab: 0,
+            tab_paths: vec![PathBuf::from(r"D:\three"), PathBuf::from(r"D:\four")],
+        });
+        let restored = decode(&encode(&state).unwrap()).unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(restored.windows[1].tab_paths[0], PathBuf::from(r"D:\three"));
+    }
+
+    #[test]
     fn default_constructor_uses_system_theme_and_chinese() {
         let state = SessionState::new(
             WindowPlacement {
@@ -638,7 +703,7 @@ mod tests {
     fn rejects_invalid_file_visibility_flags() {
         let mut bytes = encode(&sample_state()).unwrap();
         let flags_offset = bytes.len()
-            - sample_state()
+            - sample_state().windows[0]
                 .tab_paths
                 .iter()
                 .map(|path| 4 + encode_os(path.as_os_str()).len() * 2)
@@ -672,14 +737,14 @@ mod tests {
     #[test]
     fn rejects_invalid_setting_codes() {
         let mut invalid_theme = encode(&sample_state()).unwrap();
-        invalid_theme[73] = u8::MAX;
+        invalid_theme[49] = u8::MAX;
         assert_eq!(
             decode(&invalid_theme).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
 
         let mut invalid_language = encode(&sample_state()).unwrap();
-        invalid_language[74] = u8::MAX;
+        invalid_language[50] = u8::MAX;
         assert_eq!(
             decode(&invalid_language).unwrap_err().kind(),
             io::ErrorKind::InvalidData
@@ -737,16 +802,9 @@ mod tests {
     #[test]
     fn rejects_invalid_window_dimensions() {
         let mut state = sample_state();
-        state.window.width = 0;
+        state.windows[0].placement.width = 0;
         assert_eq!(
             encode(&state).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-
-        let mut bytes = encode(&sample_state()).unwrap();
-        bytes[13..17].copy_from_slice(&0_u32.to_le_bytes());
-        assert_eq!(
-            decode(&bytes).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
     }
@@ -801,11 +859,7 @@ mod tests {
             DEFAULT_COLUMN_ORDER,
         )
         .unwrap();
-        assert_eq!(state.active_tab, 1);
-
-        let mut bytes = encode(&state).unwrap();
-        bytes[21..25].copy_from_slice(&99_u32.to_le_bytes());
-        assert_eq!(decode(&bytes).unwrap().active_tab, 1);
+        assert_eq!(state.windows[0].active_tab, 1);
     }
 
     #[test]
@@ -822,7 +876,7 @@ mod tests {
             DEFAULT_COLUMN_ORDER,
         )
         .unwrap();
-        assert_eq!(state.active_tab, 0);
+        assert_eq!(state.windows[0].active_tab, 0);
     }
 
     #[test]
@@ -847,13 +901,13 @@ mod tests {
         }
 
         let mut bytes = encode(&sample_state()).unwrap();
-        bytes[33..37].copy_from_slice(&[0, 1, 1, 3]);
+        bytes[9..13].copy_from_slice(&[0, 1, 1, 3]);
         assert_eq!(
             decode(&bytes).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
         let mut bytes = encode(&sample_state()).unwrap();
-        bytes[37..41].copy_from_slice(&[0, 1, 1, 3]);
+        bytes[13..17].copy_from_slice(&[0, 1, 1, 3]);
         assert_eq!(
             decode(&bytes).unwrap_err().kind(),
             io::ErrorKind::InvalidData
@@ -888,14 +942,14 @@ mod tests {
         }
 
         let mut bytes = encode(&sample_state()).unwrap();
-        bytes[41..45].copy_from_slice(&(MIN_COLUMN_WIDTH - 1).to_le_bytes());
+        bytes[17..21].copy_from_slice(&(MIN_COLUMN_WIDTH - 1).to_le_bytes());
         assert_eq!(
             decode(&bytes).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
 
         let mut bytes = encode(&sample_state()).unwrap();
-        bytes[57..61].copy_from_slice(&(MAX_COLUMN_WIDTH + 1).to_le_bytes());
+        bytes[33..37].copy_from_slice(&(MAX_COLUMN_WIDTH + 1).to_le_bytes());
         assert_eq!(
             decode(&bytes).unwrap_err().kind(),
             io::ErrorKind::InvalidData
@@ -910,6 +964,7 @@ mod tests {
             b"ASTF4\0\0\0\0".as_slice(),
             b"ASTF5\0\0\0\0".as_slice(),
             b"ASTF6\0\0\0\0".as_slice(),
+            b"ASTF7\0\0\0\0".as_slice(),
         ] {
             assert_eq!(
                 decode(bytes).unwrap_err().kind(),
