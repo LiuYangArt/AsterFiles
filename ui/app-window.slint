@@ -621,6 +621,7 @@ export component AppWindow inherits Window {
     in property <[OperationRow]> operations;
     in-out property <length> file-viewport-y: 0px;
     out property <length> file-list-top: 0px;
+    in-out property <int> view-mode: 0;
     in-out property <bool> context-menu-open: false;
     in-out property <bool> drop-menu-open: false;
     private property <bool> internal-drag-pointer-active: false;
@@ -758,6 +759,7 @@ export component AppWindow inherits Window {
     callback focus-boundary(bool, bool);
     callback toggle-focused();
     callback change-sort(int);
+    callback change-view-mode(int);
     callback reorder-column(int, int);
     callback resize-column(int, float);
     callback open-entry(int);
@@ -1152,7 +1154,7 @@ export component AppWindow inherits Window {
             VerticalLayout {
                 spacing: 0px;
                 Rectangle {
-                    height: 38px; background: VisualStyle.cffffff; border-width: 0px; clip: true;
+                    height: root.view-mode == 0 ? 38px : 0px; visible: root.view-mode == 0; background: VisualStyle.cffffff; border-width: 0px; clip: true;
                     header-viewport := Rectangle {
                         width: parent.width - 28px; height: parent.height; clip: true;
                         header-columns := Rectangle {
@@ -1256,7 +1258,7 @@ list := ListView {
                         for entry in root.files: Rectangle {
                             width: max(list.width, root.file-columns-width + 16px);
                             x: 0px;
-                            height: 40px;
+                            height: root.view-mode == 2 ? 112px : root.view-mode == 1 ? 34px : 40px;
                             background: VisualStyle.cffffff;
                             opacity: !entry.loaded ? 0 : (entry.cut ? 0.52 : 1);
                             Rectangle {
@@ -1265,17 +1267,18 @@ list := ListView {
                                 border-width: 0px;
                                 background: entry.id == root.drop-hover-entry-id ? VisualStyle.cc7d7ff : (entry.selected ? VisualStyle.cdce6ff : (mouse.has-hover ? VisualStyle.ceff4ff : transparent));
                                 Rectangle {
-                                x: 10px + root.file-viewport-x; width: root.file-columns-width;
+                                x: 10px + (root.view-mode == 0 ? root.file-viewport-x : 0px); width: root.view-mode == 0 ? root.file-columns-width : parent.width - 20px;
                                 HorizontalLayout {
                                 spacing: 0px;
                                 for column in root.columns: Rectangle {
+                                    visible: root.view-mode == 0 || column.kind == 0;
+                                    width: self.visible ? (root.view-mode == 0 ? root.column-width(column.kind) : parent.width) : 0px;
                                     clip: true;
-                                    width: root.column-width(column.kind);
                                     if column.kind == 0: Rectangle {
                                         clip: true;
-                                        InlineIcon { x: column.content-left; icon-source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document); }
+                                        InlineIcon { x: column.content-left; width: root.view-mode == 2 ? 64px : 20px; height: root.view-mode == 2 ? 64px : 20px; icon-source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document); }
                                         if !(root.rename-editing && root.rename-entry-id == entry.id): Rectangle {
-                                            x: column.content-left + column.icon-slot;
+                                            x: column.content-left + (root.view-mode == 2 ? 76px : column.icon-slot);
                                             clip: true;
                                             width: parent.width - column.content-left - column.content-right - column.icon-slot;
                                             property <length> fade-width: 20px;
@@ -1501,6 +1504,17 @@ accessible-label: entry.name;
                 Rectangle {
                     height: 30px; background: VisualStyle.cfafbfc;
                     Text { x: 14px; text: root.operation-error != "" && root.rename-editing ? root.operation-error : root.status-text; color: root.operation-error != "" && root.rename-editing ? VisualStyle.cc42b1c : VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; }
+                    Rectangle {
+                        x: parent.width - 220px; width: 84px; height: 26px; y: 2px;
+                        HorizontalLayout {
+                            spacing: 2px;
+                            for mode in [0, 1, 2]: Rectangle {
+                                width: 26px; border-radius: 4px; background: root.view-mode == mode ? VisualStyle.cdce6ff : mode-touch.has-hover ? VisualStyle.ceff4ff : transparent;
+                                Text { text: mode == 0 ? "≡" : mode == 1 ? "☷" : "▦"; color: VisualStyle.c30333a; horizontal-alignment: center; vertical-alignment: center; }
+                                mode-touch := TouchArea { clicked => { root.change-view-mode(mode); } mouse-cursor: pointer; }
+                            }
+                        }
+                    }
                     Rectangle {
                         visible: root.operations.length > 0;
                         x: parent.width - 126px; width: 118px; height: 26px; y: 2px; border-radius: 5px;

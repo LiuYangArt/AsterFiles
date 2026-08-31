@@ -19,7 +19,7 @@ use crate::{
     domain::{
         AddressMode, EntryId, FileEntry, FolderSizeState, LoadState, NameHighlightSegment,
         NavigationKind, PageSource, RequestId, SearchDepth, SearchScope, SearchState,
-        SortDirection, SortField, TabId, TabKind, TabSession,
+        SortDirection, SortField, TabId, TabKind, TabSession, ViewMode,
         file_operations::{
             FileOperationKind, ItemState, OperationId, OperationItem, OperationManager,
             OperationResult, OperationState,
@@ -739,6 +739,7 @@ struct AppState {
     icon_cache: HashMap<PathBuf, platform::windows_shell_icons::ShellIconRgba>,
     sidebar_icons: HashMap<PathBuf, platform::windows_shell_icons::ShellIconRgba>,
     sidebar: Vec<KnownLocation>,
+    directory_view_modes: HashMap<PathBuf, crate::domain::ViewMode>,
     column_order: [u8; 4],
     column_widths: session_store::ColumnWidths,
     operations: OperationManager,
@@ -868,6 +869,7 @@ impl AppState {
             icon_cache: HashMap::new(),
             sidebar_icons: HashMap::new(),
             sidebar: Vec::new(),
+            directory_view_modes: HashMap::new(),
             column_order,
             column_widths,
             operations: OperationManager::new(),
@@ -3494,6 +3496,25 @@ fn wire_callbacks(
         }
         if let Some(ui) = weak.upgrade() {
             refresh_ui(&ui, &state_for_sort);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let state_for_view = state.clone();
+    ui.on_change_view_mode(move |mode| {
+        let mode = match mode {
+            1 => ViewMode::List,
+            2 => ViewMode::Grid,
+            _ => ViewMode::Details,
+        };
+        if let Ok(mut app) = state_for_view.lock() {
+            let path = app.active().visible_path().map(Path::to_path_buf);
+            if let Some(path) = path {
+                app.directory_view_modes.insert(path, mode);
+            }
+        }
+        if let Some(ui) = weak.upgrade() {
+            refresh_ui(&ui, &state_for_view);
         }
     });
     let weak = ui.as_weak();
@@ -8408,6 +8429,16 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
     let tab = app.active();
     let active_is_settings = tab.kind == TabKind::Settings;
     ui.set_active_is_settings(active_is_settings);
+    let view_mode = tab
+        .visible_path()
+        .and_then(|path| app.directory_view_modes.get(path))
+        .copied()
+        .unwrap_or(ViewMode::Details);
+    ui.set_view_mode(match view_mode {
+        ViewMode::Details => 0,
+        ViewMode::List => 1,
+        ViewMode::Grid => 2,
+    });
     let display_entries = if matches!(tab.load_state, LoadState::Partial) {
         &tab.pending_entries
     } else if tab.has_failed_location() {
@@ -9968,6 +9999,30 @@ mod tests {
         let app = state.lock().expect("app state mutex is not poisoned");
         assert_eq!(app.active().latest_request, RequestId(0));
         assert!(app.active().back_history.is_empty());
+    }
+
+    #[test]
+    fn directory_view_modes_are_shared_by_raw_path_without_touching_requests() {
+        let mut app = AppState::new_for_test(
+            vec![PathBuf::from("A"), PathBuf::from("B")],
+            0,
+            [0, 1, 2, 3],
+        );
+        let tab_a = app.active_window_state().tab_order[0];
+        let request = app.tab(tab_a).unwrap().latest_request;
+        app.directory_view_modes
+            .insert(PathBuf::from("A"), ViewMode::Grid);
+        app.directory_view_modes
+            .insert(PathBuf::from("B"), ViewMode::List);
+        assert_eq!(
+            app.directory_view_modes.get(Path::new("A")),
+            Some(&ViewMode::Grid)
+        );
+        assert_eq!(
+            app.directory_view_modes.get(Path::new("B")),
+            Some(&ViewMode::List)
+        );
+        assert_eq!(app.tab(tab_a).unwrap().latest_request, request);
     }
 
     #[test]

@@ -151,6 +151,13 @@ pub enum SortDirection {
     Descending,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Details,
+    List,
+    Grid,
+}
+
 #[derive(Debug)]
 struct DirectorySnapshot {
     entries: Arc<Vec<FileEntry>>,
