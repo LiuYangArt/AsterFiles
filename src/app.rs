@@ -35,7 +35,94 @@ slint::include_modules!();
 const WORKER_COUNT: usize = 4;
 const ICON_WORKER_COUNT: usize = 2;
 
+pub fn export_multi_window_state_layering(path: &Path) -> io::Result<()> {
+    let mut app = AppState::new(
+        vec![PathBuf::from(r"C:\AgentScenarios\WindowA")],
+        0,
+        [0, 1, 2, 3],
+        [0, 1, 2, 3],
+        session_store::DEFAULT_COLUMN_WIDTHS,
+        session_store::DEFAULT_SEARCH_COLUMN_WIDTHS,
+        crate::domain::EverythingConfig::default(),
+        session_store::ThemeMode::System,
+        Language::Chinese,
+        false,
+    );
+    let first_window = app.active_window;
+    let second_window = app.register_window(
+        vec![PathBuf::from(r"C:\AgentScenarios\WindowB")],
+        0,
+        session_store::WindowPlacement {
+            x: 160,
+            y: 120,
+            width: 1180,
+            height: 760,
+        },
+    );
+    let first_tab = app
+        .window(first_window)
+        .expect("first window exists")
+        .active_tab;
+    let second_tab = app
+        .window(second_window)
+        .expect("second window exists")
+        .active_tab;
+    let (_, first_cancel) = app
+        .tab_mut(first_tab)
+        .expect("first tab exists")
+        .begin_navigation(
+            PathBuf::from(r"C:\AgentScenarios\WindowA\Pending"),
+            NavigationKind::Normal,
+        );
+    let operation = app.operations.submit(
+        FileOperationKind::Copy,
+        Some(first_tab),
+        vec![OperationItem::pending(
+            Some(PathBuf::from(r"C:\AgentScenarios\source.txt")),
+            Some(PathBuf::from(r"C:\AgentScenarios\target.txt")),
+        )],
+    );
+    let close_decision = app
+        .close_window(first_window)
+        .expect("first window can close");
+    let state = format!(
+        concat!(
+            "{{\n",
+            "  \"schema_version\": 1,\n",
+            "  \"scenario\": \"multi-window-state-layering\",\n",
+            "  \"scope\": \"pure_state_no_second_native_window\",\n",
+            "  \"window_ids\": [{}, {}],\n",
+            "  \"tab_ids\": [{}, {}],\n",
+            "  \"tab_ids_globally_unique\": {},\n",
+            "  \"closed_window_request_cancelled\": {},\n",
+            "  \"remaining_window_registered\": {},\n",
+            "  \"shared_operation_survived\": {},\n",
+            "  \"close_decision\": \"{}\"\n",
+            "}}\n"
+        ),
+        first_window.0,
+        second_window.0,
+        first_tab.0,
+        second_tab.0,
+        first_tab != second_tab,
+        first_cancel.load(std::sync::atomic::Ordering::Acquire),
+        app.window(second_window).is_some(),
+        app.operations.task(operation).is_some(),
+        match close_decision {
+            WindowCloseDecision::KeepRunning => "keep_running",
+            WindowCloseDecision::ExitApplication => "exit_application",
+        },
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, state)
+}
+
 type SharedSessions = Arc<Mutex<AppState>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct WindowId(u32);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingFocus {
@@ -45,11 +132,35 @@ struct PendingFocus {
 }
 
 #[derive(Debug)]
-struct AppState {
+struct WindowState {
     tabs: HashMap<TabId, TabSession>,
     tab_order: Vec<TabId>,
     active_tab: TabId,
     closed_tabs: VecDeque<PathBuf>,
+    placement: session_store::WindowPlacement,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowCloseDecision {
+    KeepRunning,
+    ExitApplication,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowCloseAction {
+    CloseWindow,
+    ExitApplication,
+    ConfirmApplicationExit,
+    Ignore,
+}
+
+#[derive(Debug)]
+struct AppState {
+    windows: HashMap<WindowId, WindowState>,
+    active_window: WindowId,
+    #[cfg_attr(not(test), allow(dead_code))]
+    next_window_id: u32,
     next_tab_id: u32,
     language: Language,
     theme_mode: session_store::ThemeMode,
@@ -82,6 +193,35 @@ struct AppState {
 }
 
 impl AppState {
+    fn active_window_state(&self) -> &WindowState {
+        self.windows
+            .get(&self.active_window)
+            .expect("active window state exists")
+    }
+
+    fn active_window_state_mut(&mut self) -> &mut WindowState {
+        self.windows
+            .get_mut(&self.active_window)
+            .expect("active window state exists")
+    }
+    fn tab(&self, tab_id: TabId) -> Option<&TabSession> {
+        self.windows
+            .values()
+            .find_map(|window| window.tabs.get(&tab_id))
+    }
+
+    fn tab_mut(&mut self, tab_id: TabId) -> Option<&mut TabSession> {
+        self.windows
+            .values_mut()
+            .find_map(|window| window.tabs.get_mut(&tab_id))
+    }
+
+    fn window_for_tab(&self, tab_id: TabId) -> Option<WindowId> {
+        self.windows
+            .iter()
+            .find_map(|(id, window)| window.tabs.contains_key(&tab_id).then_some(*id))
+    }
+
     #[cfg(test)]
     fn new_for_test(
         initial_paths: Vec<PathBuf>,
@@ -120,22 +260,35 @@ impl AppState {
         } else {
             initial_paths
         };
+        let active_window = WindowId(1);
         let mut tabs = HashMap::new();
         let mut tab_order = Vec::new();
-        for (index, path) in initial_paths.into_iter().enumerate() {
-            let id = TabId(index as u32 + 1);
+        let mut next_tab_id = 1;
+        for path in initial_paths {
+            let id = TabId(next_tab_id);
+            next_tab_id += 1;
             let mut tab = TabSession::new(id);
             tab.current_path = Some(path);
             tabs.insert(id, tab);
             tab_order.push(id);
         }
         let active_tab = tab_order[active_index.min(tab_order.len() - 1)];
-        let next_tab_id = tab_order.len() as u32 + 1;
-        Self {
+        let window = WindowState {
             tabs,
             tab_order,
             active_tab,
             closed_tabs: VecDeque::new(),
+            placement: session_store::WindowPlacement {
+                x: 80,
+                y: 80,
+                width: 1180,
+                height: 760,
+            },
+        };
+        Self {
+            windows: HashMap::from([(active_window, window)]),
+            active_window,
+            next_window_id: 2,
             next_tab_id,
             language,
             theme_mode,
@@ -167,55 +320,157 @@ impl AppState {
         }
     }
 
-    fn duplicate_active_tab(&mut self) -> Option<TabId> {
-        let source_id = self.active_tab;
-        let source = self.tabs.get(&source_id)?;
-        if source.kind != TabKind::Files || source.load_state != LoadState::Complete {
-            return None;
-        }
+    fn allocate_tab_id(&mut self) -> TabId {
         let id = TabId(self.next_tab_id);
-        self.next_tab_id += 1;
-        let tab = TabSession::duplicate_complete(id, source);
-        self.tabs.insert(id, tab);
-        self.tab_order.push(id);
-        self.active_tab = id;
+        self.next_tab_id = self
+            .next_tab_id
+            .checked_add(1)
+            .expect("tab identity space is exhausted");
+        id
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn register_window(
+        &mut self,
+        initial_paths: Vec<PathBuf>,
+        active_index: usize,
+        placement: session_store::WindowPlacement,
+    ) -> WindowId {
+        let id = WindowId(self.next_window_id);
+        self.next_window_id = self
+            .next_window_id
+            .checked_add(1)
+            .expect("window identity space is exhausted");
+        let paths = if initial_paths.is_empty() {
+            vec![initial_path()]
+        } else {
+            initial_paths
+        };
+        let mut tabs = HashMap::new();
+        let mut tab_order = Vec::new();
+        for path in paths {
+            let tab_id = self.allocate_tab_id();
+            let mut tab = TabSession::new(tab_id);
+            tab.current_path = Some(path);
+            tabs.insert(tab_id, tab);
+            tab_order.push(tab_id);
+        }
+        let active_tab = tab_order[active_index.min(tab_order.len() - 1)];
+        self.windows.insert(
+            id,
+            WindowState {
+                tabs,
+                tab_order,
+                active_tab,
+                closed_tabs: VecDeque::new(),
+                placement,
+            },
+        );
+        id
+    }
+
+    fn window(&self, id: WindowId) -> Option<&WindowState> {
+        self.windows.get(&id)
+    }
+
+    #[cfg(test)]
+    fn window_mut(&mut self, id: WindowId) -> Option<&mut WindowState> {
+        self.windows.get_mut(&id)
+    }
+
+    fn close_window(&mut self, id: WindowId) -> Option<WindowCloseDecision> {
+        let mut window = self.windows.remove(&id)?;
+        for tab in window.tabs.values_mut() {
+            tab.cancel_pending();
+        }
+        self.icons
+            .retain(|(tab_id, _, _), _| !window.tabs.contains_key(tab_id));
+        self.focus_after_refresh
+            .retain(|tab_id, _| !window.tabs.contains_key(tab_id));
+        self.rename_target = self
+            .rename_target
+            .filter(|(tab_id, _)| !window.tabs.contains_key(tab_id));
+        if self.windows.is_empty() {
+            return Some(WindowCloseDecision::ExitApplication);
+        }
+        if self.active_window == id {
+            self.active_window = *self.windows.keys().min_by_key(|id| id.0)?;
+        }
+        Some(WindowCloseDecision::KeepRunning)
+    }
+
+    fn request_window_close(&self, id: WindowId) -> WindowCloseAction {
+        if !self.windows.contains_key(&id) {
+            return WindowCloseAction::Ignore;
+        }
+        if self.windows.len() > 1 {
+            WindowCloseAction::CloseWindow
+        } else if self.operations.has_active_tasks() {
+            WindowCloseAction::ConfirmApplicationExit
+        } else {
+            WindowCloseAction::ExitApplication
+        }
+    }
+
+    fn duplicate_active_tab(&mut self) -> Option<TabId> {
+        let source_id = self.active_window_state().active_tab;
+        let id = self.allocate_tab_id();
+        let tab = {
+            let source = self.active_window_state().tabs.get(&source_id)?;
+            if source.kind != TabKind::Files || source.load_state != LoadState::Complete {
+                return None;
+            }
+            TabSession::duplicate_complete(id, source)
+        };
+        let window = self.active_window_state_mut();
+        window.tabs.insert(id, tab);
+        window.tab_order.push(id);
+        window.active_tab = id;
         Some(id)
     }
     fn create_tab(&mut self, path: PathBuf) -> TabId {
-        let id = TabId(self.next_tab_id);
-        self.next_tab_id += 1;
+        let id = self.allocate_tab_id();
         let mut tab = TabSession::new(id);
         tab.current_path = Some(path);
-        self.tabs.insert(id, tab);
-        self.tab_order.push(id);
-        self.active_tab = id;
+        let window = self.active_window_state_mut();
+        window.tabs.insert(id, tab);
+        window.tab_order.push(id);
+        window.active_tab = id;
         id
     }
 
     fn open_settings(&mut self) -> TabId {
-        if let Some(id) = self.tab_order.iter().copied().find(|id| {
-            self.tabs
-                .get(id)
-                .is_some_and(|tab| tab.kind == TabKind::Settings)
-        }) {
-            self.active_tab = id;
+        if let Some(id) = self
+            .active_window_state()
+            .tab_order
+            .iter()
+            .copied()
+            .find(|id| {
+                self.active_window_state()
+                    .tabs
+                    .get(id)
+                    .is_some_and(|tab| tab.kind == TabKind::Settings)
+            })
+        {
+            self.active_window_state_mut().active_tab = id;
             return id;
         }
-        let id = TabId(self.next_tab_id);
-        self.next_tab_id += 1;
-        self.tabs.insert(id, TabSession::new_settings(id));
-        self.tab_order.push(id);
-        self.active_tab = id;
+        let id = self.allocate_tab_id();
+        let window = self.active_window_state_mut();
+        window.tabs.insert(id, TabSession::new_settings(id));
+        window.tab_order.push(id);
+        window.active_tab = id;
         id
     }
 
     fn close_tab(&mut self, closing: TabId) -> Option<TabId> {
-        if self.tab_order.len() == 1 {
+        if self.active_window_state().tab_order.len() == 1 {
             return None;
         }
-        let closing_kind = self.tabs.get(&closing)?.kind;
+        let closing_kind = self.active_window_state().tabs.get(&closing)?.kind;
         if closing_kind == TabKind::Files
             && self
+                .active_window_state()
                 .tabs
                 .values()
                 .filter(|tab| tab.kind == TabKind::Files)
@@ -224,31 +479,60 @@ impl AppState {
         {
             return None;
         }
-        let index = self.tab_order.iter().position(|id| *id == closing)?;
-        let closing_was_active = closing == self.active_tab;
-        if let Some(mut tab) = self.tabs.remove(&closing) {
+        let index = self
+            .active_window_state()
+            .tab_order
+            .iter()
+            .position(|id| *id == closing)?;
+        let closing_was_active = closing == self.active_window_state().active_tab;
+        let removed = self.active_window_state_mut().tabs.remove(&closing);
+        if let Some(mut tab) = removed {
             tab.cancel_pending();
             self.icons.retain(|(tab_id, _, _), _| *tab_id != closing);
             if tab.kind == TabKind::Files
                 && let Some(path) = tab.current_path.take()
             {
-                self.closed_tabs.push_front(path);
-                self.closed_tabs.truncate(10);
+                let window = self.active_window_state_mut();
+                window.closed_tabs.push_front(path);
+                window.closed_tabs.truncate(10);
             }
         }
-        self.tab_order.remove(index);
+        self.active_window_state_mut().tab_order.remove(index);
         if closing_was_active {
-            self.active_tab = self.tab_order[index.min(self.tab_order.len() - 1)];
+            let window = self.active_window_state_mut();
+            window.active_tab = window.tab_order[index.min(window.tab_order.len() - 1)];
         }
-        Some(self.active_tab)
+        Some(self.active_window_state().active_tab)
     }
 
     fn restore_closed(&mut self) -> Option<(TabId, PathBuf)> {
-        let path = self.closed_tabs.pop_front()?;
+        let path = self.active_window_state_mut().closed_tabs.pop_front()?;
         let tab_id = self.create_tab(path.clone());
         Some((tab_id, path))
     }
 
+    fn active(&self) -> &TabSession {
+        self.active_window_state().active()
+    }
+
+    fn stable_paths(&self) -> Vec<PathBuf> {
+        self.active_window_state().stable_paths()
+    }
+
+    fn stable_active_path_index(&self) -> usize {
+        self.active_window_state().stable_active_path_index()
+    }
+
+    fn dark_theme(&self) -> bool {
+        match self.theme_mode {
+            session_store::ThemeMode::System => self.system_dark_theme,
+            session_store::ThemeMode::Light => false,
+            session_store::ThemeMode::Dark => true,
+        }
+    }
+}
+
+impl WindowState {
     fn active(&self) -> &TabSession {
         self.tabs
             .get(&self.active_tab)
@@ -264,7 +548,6 @@ impl AppState {
     }
 
     fn stable_active_path_index(&self) -> usize {
-        let active = self.active_tab;
         let mut file_index = 0;
         for id in &self.tab_order {
             let Some(tab) = self.tabs.get(id) else {
@@ -273,20 +556,12 @@ impl AppState {
             if tab.kind != TabKind::Files {
                 continue;
             }
-            if *id == active {
+            if *id == self.active_tab {
                 return file_index;
             }
             file_index += 1;
         }
         file_index.saturating_sub(1)
-    }
-
-    fn dark_theme(&self) -> bool {
-        match self.theme_mode {
-            session_store::ThemeMode::System => self.system_dark_theme,
-            session_store::ThemeMode::Light => false,
-            session_store::ThemeMode::Dark => true,
-        }
     }
 }
 
@@ -664,12 +939,15 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     )));
     if let Ok(mut app) = state.lock() {
         app.file_visibility = file_visibility;
+        app.active_window_state_mut().placement = window;
+        let _ = app.window(app.active_window);
     }
     if let Some(scenario) = scenario {
         let mut app = state.lock().expect("app state mutex is not poisoned");
-        let active_tab = app.active_tab;
+        let active_tab = app.active_window_state().active_tab;
         agent_debug::apply_scenario(
-            app.tabs
+            app.active_window_state_mut()
+                .tabs
                 .get_mut(&active_tab)
                 .expect("active tab session exists"),
             scenario,
@@ -789,10 +1067,12 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     refresh_confirmation_windows(&delete_ui, &conflict_ui, &exit_ui, &state);
     let initial_tabs = {
         let app = state.lock().expect("app state mutex is not poisoned");
-        app.tab_order
+        app.active_window_state()
+            .tab_order
             .iter()
             .filter_map(|id| {
-                app.tabs
+                app.active_window_state()
+                    .tabs
                     .get(id)
                     .and_then(|tab| tab.current_path.clone())
                     .map(|path| (*id, path))
@@ -851,15 +1131,19 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     };
     let position = ui.window().position();
     let size = ui.window().size();
+    let window = session_store::WindowPlacement {
+        x: position.x,
+        y: position.y,
+        width: (size.width as f32 / ui.window().scale_factor()).round() as u32,
+        height: (size.height as f32 / ui.window().scale_factor()).round() as u32,
+    };
+    if let Ok(mut app) = state.lock() {
+        app.active_window_state_mut().placement = window;
+    }
     if scenario.is_none()
         && let Some(path) = session_store::default_path()
         && let Ok(session) = session_store::SessionState::with_file_visibility_settings(
-            session_store::WindowPlacement {
-                x: position.x,
-                y: position.y,
-                width: (size.width as f32 / ui.window().scale_factor()).round() as u32,
-                height: (size.height as f32 / ui.window().scale_factor()).round() as u32,
-            },
+            window,
             active_tab,
             paths,
             column_order,
@@ -874,6 +1158,10 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     {
         let _ = session_store::save(&path, &session);
     }
+    let _ = state.lock().ok().and_then(|mut app| {
+        let active_window = app.active_window;
+        app.close_window(active_window)
+    });
     result
 }
 
@@ -888,7 +1176,7 @@ fn submit_navigation(
         let mut app = state.lock().expect("app state mutex is not poisoned");
         app.icons.retain(|(icon_tab, _, _), _| *icon_tab != tab_id);
         app.focus_after_refresh.remove(&tab_id);
-        let Some(tab) = app.tabs.get_mut(&tab_id) else {
+        let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) else {
             return false;
         };
         if tab.kind != TabKind::Files {
@@ -968,7 +1256,7 @@ fn enqueue_operation(
     }
     let request = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
-        let tab = app.active_tab;
+        let tab = app.active_window_state().active_tab;
         app.operations.submit(kind, Some(tab), items);
         if app.operations.active_id().is_some() {
             return;
@@ -1051,7 +1339,7 @@ fn begin_rename_ui(weak: &slint::Weak<AppWindow>, state: &SharedSessions) {
         app.rename_extension = entry
             .filter(|entry| entry.kind == crate::domain::EntryKind::File)
             .and_then(|entry| entry.path.extension().map(std::ffi::OsStr::to_os_string));
-        app.rename_target = Some((app.active_tab, id));
+        app.rename_target = Some((app.active_window_state().active_tab, id));
         name.map(|name| (id, name))
     };
     if let Some((id, name)) = target
@@ -1105,7 +1393,12 @@ fn submit_rename(
             .map_err(|error| rename_validation_message(app.language, error))?;
         let target = app.rename_target;
         target
-            .and_then(|(tab_id, id)| app.tabs.get(&tab_id)?.visible_entry(id))
+            .and_then(|(tab_id, id)| {
+                app.active_window_state()
+                    .tabs
+                    .get(&tab_id)?
+                    .visible_entry(id)
+            })
             .and_then(|entry| {
                 entry.path.parent().map(|parent| {
                     let mut new_name = std::ffi::OsString::from(name);
@@ -1534,13 +1827,17 @@ fn wire_callbacks(
             let app = state_for_path
                 .lock()
                 .expect("app state mutex is not poisoned");
-            (app.active_tab, app.active().address_mode)
+            (
+                app.active_window_state().active_tab,
+                app.active().address_mode,
+            )
         };
         let query = if mode == AddressMode::Smart {
             let mut app = state_for_path
                 .lock()
                 .expect("app state mutex is not poisoned");
-            app.tabs
+            app.active_window_state_mut()
+                .tabs
                 .get_mut(&tab_id)
                 .map(|tab| {
                     tab.update_address_input(input.clone());
@@ -1588,8 +1885,8 @@ fn wire_callbacks(
         let mut app = state_for_search_edit
             .lock()
             .expect("app state mutex is not poisoned");
-        let tab_id = app.active_tab;
-        if let Some(tab) = app.tabs.get_mut(&tab_id) {
+        let tab_id = app.active_window_state().active_tab;
+        if let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) {
             tab.begin_smart_address_edit();
         }
         drop(app);
@@ -1608,8 +1905,12 @@ fn wire_callbacks(
             let mut app = state_for_changed
                 .lock()
                 .expect("app state mutex is not poisoned");
-            let tab_id = app.active_tab;
-            let tab = app.tabs.get_mut(&tab_id).expect("active tab exists");
+            let tab_id = app.active_window_state().active_tab;
+            let tab = app
+                .active_window_state_mut()
+                .tabs
+                .get_mut(&tab_id)
+                .expect("active tab exists");
             tab.update_address_input(input.clone());
             (tab_id, tab.address_mode == AddressMode::Smart)
         };
@@ -1620,15 +1921,23 @@ fn wire_callbacks(
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(160));
                 let still_current = state.lock().ok().is_some_and(|app| {
-                    app.tabs.get(&tab_id).is_some_and(|tab| {
-                        tab.address_input == input && tab.address_mode == AddressMode::Smart
-                    })
+                    app.active_window_state()
+                        .tabs
+                        .get(&tab_id)
+                        .is_some_and(|tab| {
+                            tab.address_input == input && tab.address_mode == AddressMode::Smart
+                        })
                 });
                 if still_current {
                     let query = state
                         .lock()
                         .ok()
-                        .and_then(|app| app.tabs.get(&tab_id).map(|tab| tab.search_query.clone()))
+                        .and_then(|app| {
+                            app.active_window_state()
+                                .tabs
+                                .get(&tab_id)
+                                .map(|tab| tab.search_query.clone())
+                        })
                         .unwrap_or(input);
                     let _ = weak.upgrade_in_event_loop(move |ui| {
                         submit_search(&sender, &state, Some(&ui), tab_id, query);
@@ -1646,8 +1955,12 @@ fn wire_callbacks(
             let mut app = state_for_search_depth
                 .lock()
                 .expect("app state mutex is not poisoned");
-            let tab_id = app.active_tab;
-            let tab = app.tabs.get_mut(&tab_id).expect("active tab exists");
+            let tab_id = app.active_window_state().active_tab;
+            let tab = app
+                .active_window_state_mut()
+                .tabs
+                .get_mut(&tab_id)
+                .expect("active tab exists");
             let changed = tab.address_mode == AddressMode::Smart && tab.toggle_search_depth();
             (tab_id, tab.search_query.clone(), changed)
         };
@@ -1671,8 +1984,8 @@ fn wire_callbacks(
         let mut app = state_for_cancel_edit
             .lock()
             .expect("app state mutex is not poisoned");
-        let tab_id = app.active_tab;
-        if let Some(tab) = app.tabs.get_mut(&tab_id) {
+        let tab_id = app.active_window_state().active_tab;
+        if let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) {
             tab.cancel_address_edit();
         }
         drop(app);
@@ -1687,6 +2000,7 @@ fn wire_callbacks(
         let tab_id = state_for_next_search_page
             .lock()
             .expect("app state mutex is not poisoned")
+            .active_window_state()
             .active_tab;
         submit_search_page(
             &everything_for_next_search_page,
@@ -1711,7 +2025,7 @@ fn wire_callbacks(
             entry_id.and_then(|entry_id| {
                 app.active().visible_entry(entry_id).map(|entry| {
                     (
-                        app.active_tab,
+                        app.active_window_state().active_tab,
                         entry
                             .open_target
                             .clone()
@@ -1754,7 +2068,7 @@ fn wire_callbacks(
             usize::try_from(index)
                 .ok()
                 .and_then(|index| app.active().breadcrumb_paths().get(index).cloned())
-                .map(|(_, path)| (app.active_tab, path))
+                .map(|(_, path)| (app.active_window_state().active_tab, path))
         };
         if let Some((tab_id, path)) = target {
             submit_navigation(
@@ -1780,7 +2094,7 @@ fn wire_callbacks(
             usize::try_from(index)
                 .ok()
                 .and_then(|index| app.sidebar.get(index))
-                .map(|location| (app.active_tab, location.path.clone()))
+                .map(|location| (app.active_window_state().active_tab, location.path.clone()))
         };
         if let Some((tab_id, path)) = target {
             submit_navigation(
@@ -1807,7 +2121,10 @@ fn wire_callbacks(
             let app = state_for_activate_entry
                 .lock()
                 .expect("app state mutex is not poisoned");
-            (app.active_tab, app.active().latest_request)
+            (
+                app.active_window_state().active_tab,
+                app.active().latest_request,
+            )
         };
         let double_click_interval = platform::double_click_interval();
         let should_open = last_click.get().is_some_and(
@@ -1827,7 +2144,7 @@ fn wire_callbacks(
                     .expect("app state mutex is not poisoned");
                 app.active().visible_entry(entry_id).map(|entry| {
                     (
-                        app.active_tab,
+                        app.active_window_state().active_tab,
                         entry
                             .open_target
                             .clone()
@@ -1863,8 +2180,8 @@ fn wire_callbacks(
             let mut app = state_for_activate_entry
                 .lock()
                 .expect("app state mutex is not poisoned");
-            let tab_id = app.active_tab;
-            let Some(tab) = app.tabs.get_mut(&tab_id) else {
+            let tab_id = app.active_window_state().active_tab;
+            let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) else {
                 return;
             };
             let previous_selected = tab.selected.clone();
@@ -1889,8 +2206,8 @@ fn wire_callbacks(
             let mut app = state_for_select
                 .lock()
                 .expect("app state mutex is not poisoned");
-            let tab_id = app.active_tab;
-            let Some(tab) = app.tabs.get_mut(&tab_id) else {
+            let tab_id = app.active_window_state().active_tab;
+            let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) else {
                 return;
             };
             let previous_selected = tab.selected.clone();
@@ -1915,8 +2232,8 @@ fn wire_callbacks(
         let mut app = state_for_clear
             .lock()
             .expect("app state mutex is not poisoned");
-        let tab_id = app.active_tab;
-        if let Some(tab) = app.tabs.get_mut(&tab_id) {
+        let tab_id = app.active_window_state().active_tab;
+        if let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) {
             tab.clear_selection();
         }
         drop(app);
@@ -1931,8 +2248,8 @@ fn wire_callbacks(
         let mut app = state_for_all
             .lock()
             .expect("app state mutex is not poisoned");
-        let tab_id = app.active_tab;
-        if let Some(tab) = app.tabs.get_mut(&tab_id) {
+        let tab_id = app.active_window_state().active_tab;
+        if let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) {
             tab.select_all();
         }
         drop(app);
@@ -1947,8 +2264,8 @@ fn wire_callbacks(
         let mut app = state_for_focus
             .lock()
             .expect("app state mutex is not poisoned");
-        let tab_id = app.active_tab;
-        if let Some(tab) = app.tabs.get_mut(&tab_id) {
+        let tab_id = app.active_window_state().active_tab;
+        if let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) {
             tab.move_focus(delta as isize, extend);
         }
         drop(app);
@@ -1963,8 +2280,8 @@ fn wire_callbacks(
         let mut app = state_for_boundary
             .lock()
             .expect("app state mutex is not poisoned");
-        let tab_id = app.active_tab;
-        if let Some(tab) = app.tabs.get_mut(&tab_id) {
+        let tab_id = app.active_window_state().active_tab;
+        if let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) {
             tab.focus_boundary(last, extend);
         }
         drop(app);
@@ -1979,8 +2296,8 @@ fn wire_callbacks(
         let mut app = state_for_toggle
             .lock()
             .expect("app state mutex is not poisoned");
-        let tab_id = app.active_tab;
-        if let Some(tab) = app.tabs.get_mut(&tab_id) {
+        let tab_id = app.active_window_state().active_tab;
+        if let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) {
             tab.toggle_focused();
         }
         drop(app);
@@ -2002,8 +2319,8 @@ fn wire_callbacks(
         let mut app = state_for_sort
             .lock()
             .expect("app state mutex is not poisoned");
-        let tab_id = app.active_tab;
-        let search_query = if let Some(tab) = app.tabs.get_mut(&tab_id) {
+        let tab_id = app.active_window_state().active_tab;
+        let search_query = if let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) {
             if tab.page_source == PageSource::Search {
                 tab.set_search_sort(field);
                 Some(tab.search_query.clone())
@@ -2109,11 +2426,11 @@ fn wire_callbacks(
             .lock()
             .expect("app state mutex is not poisoned");
         let target = if tab_id < 0 {
-            app.active_tab
+            app.active_window_state().active_tab
         } else {
             TabId(tab_id as u32)
         };
-        if app.tabs.contains_key(&target) {
+        if app.active_window_state().tabs.contains_key(&target) {
             app.close_tab(target);
         }
         drop(app);
@@ -2151,8 +2468,8 @@ fn wire_callbacks(
         let mut app = state_for_activate
             .lock()
             .expect("app state mutex is not poisoned");
-        if app.tabs.contains_key(&id) {
-            app.active_tab = id;
+        if app.active_window_state().tabs.contains_key(&id) {
+            app.active_window_state_mut().active_tab = id;
         }
         drop(app);
         if let Some(ui) = weak.upgrade() {
@@ -2168,8 +2485,9 @@ fn wire_callbacks(
             let mut app = state_for_back
                 .lock()
                 .expect("app state mutex is not poisoned");
-            let tab_id = app.active_tab;
+            let tab_id = app.active_window_state().active_tab;
             if app
+                .active_window_state_mut()
                 .tabs
                 .get_mut(&tab_id)
                 .is_some_and(TabSession::restore_successful_location)
@@ -2206,7 +2524,7 @@ fn wire_callbacks(
                 .expect("app state mutex is not poisoned");
             app.active()
                 .forward_target()
-                .map(|path| (app.active_tab, path))
+                .map(|path| (app.active_window_state().active_tab, path))
         };
         if let Some((tab_id, path)) = target {
             submit_navigation(
@@ -2240,7 +2558,7 @@ fn wire_callbacks(
             index
                 .and_then(|index| stack.iter().rev().nth(index))
                 .cloned()
-                .map(|path| (app.active_tab, path))
+                .map(|path| (app.active_window_state().active_tab, path))
         };
         if let Some((tab_id, path)) = target {
             submit_navigation(
@@ -2272,7 +2590,7 @@ fn wire_callbacks(
                 .visible_path()
                 .and_then(Path::parent)
                 .map(Path::to_path_buf)
-                .map(|path| (app.active_tab, path))
+                .map(|path| (app.active_window_state().active_tab, path))
         };
         if let Some((tab_id, path)) = target {
             submit_navigation(
@@ -2306,7 +2624,7 @@ fn wire_callbacks(
                     .requested_path
                     .clone()
                     .or_else(|| app.active().current_path.clone())
-                    .map(|path| (app.active_tab, path))
+                    .map(|path| (app.active_window_state().active_tab, path))
             }
         };
         if let Some((tab_id, path)) = target {
@@ -2384,7 +2702,8 @@ fn wire_callbacks(
                 show_hidden,
                 show_system,
             };
-            app.tabs
+            app.active_window_state()
+                .tabs
                 .values()
                 .filter_map(|tab| tab.visible_path().map(|path| (tab.id, path.to_path_buf())))
                 .collect::<Vec<_>>()
@@ -2475,10 +2794,10 @@ fn wire_callbacks(
         let mut app = state_for_entry_menu
             .lock()
             .expect("app state mutex is not poisoned");
-        let tab_id = app.active_tab;
+        let tab_id = app.active_window_state().active_tab;
         if entry_id >= 0 {
             let id = EntryId(entry_id as u32);
-            if let Some(tab) = app.tabs.get_mut(&tab_id)
+            if let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id)
                 && !tab.selected.contains(&id)
             {
                 tab.select_entry(id, false, false);
@@ -2499,8 +2818,8 @@ fn wire_callbacks(
             (true, x.round() as i32, y.round() as i32);
         let _ = clipboard_for_background.send(ClipboardRequest::CheckAvailability);
         if let Ok(mut app) = state_for_background_menu.lock() {
-            let tab_id = app.active_tab;
-            if let Some(tab) = app.tabs.get_mut(&tab_id) {
+            let tab_id = app.active_window_state().active_tab;
+            if let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) {
                 tab.clear_selection();
             }
         }
@@ -2524,8 +2843,8 @@ fn wire_callbacks(
             (background, x.round() as i32, y.round() as i32);
         let _ = clipboard_for_reopen.send(ClipboardRequest::CheckAvailability);
         if let Ok(mut app) = state_for_reopen_menu.lock() {
-            let tab_id = app.active_tab;
-            if let Some(tab) = app.tabs.get_mut(&tab_id) {
+            let tab_id = app.active_window_state().active_tab;
+            if let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) {
                 if let Some(id) = entry_id {
                     if !tab.selected.contains(&id) {
                         tab.select_entry(id, false, false);
@@ -2709,15 +3028,31 @@ fn wire_callbacks(
     let state_for_close = state.clone();
     let exit_weak = exit_ui.as_weak();
     ui.on_request_close(move || {
-        if state_for_close
+        let action = state_for_close
             .lock()
-            .is_ok_and(|app| app.operations.has_active_tasks())
-        {
-            if let (Some(ui), Some(exit_ui)) = (weak.upgrade(), exit_weak.upgrade()) {
-                show_confirmation_window(&ui, None, &exit_ui);
+            .map(|app| app.request_window_close(app.active_window))
+            .unwrap_or(WindowCloseAction::Ignore);
+        match action {
+            WindowCloseAction::ConfirmApplicationExit => {
+                if let (Some(ui), Some(exit_ui)) = (weak.upgrade(), exit_weak.upgrade()) {
+                    show_confirmation_window(&ui, None, &exit_ui);
+                }
             }
-        } else if let Some(ui) = weak.upgrade() {
-            let _ = ui.hide();
+            WindowCloseAction::CloseWindow => {
+                if let Ok(mut app) = state_for_close.lock() {
+                    let active_window = app.active_window;
+                    let _ = app.close_window(active_window);
+                }
+                if let Some(ui) = weak.upgrade() {
+                    let _ = ui.hide();
+                }
+            }
+            WindowCloseAction::ExitApplication => {
+                if let Some(ui) = weak.upgrade() {
+                    let _ = ui.hide();
+                }
+            }
+            WindowCloseAction::Ignore => {}
         }
     });
 }
@@ -2765,18 +3100,29 @@ fn wire_mouse_navigation(ui: &AppWindow, exit_ui: &ConfirmationWindow, state: Sh
     let cursor_position = Cell::new(winit::dpi::PhysicalPosition::new(0.0, 0.0));
     ui.window().on_winit_window_event(move |_, event| {
         if matches!(event, WindowEvent::CloseRequested) {
-            if state
+            let action = state
                 .lock()
-                .is_ok_and(|app| app.operations.has_active_tasks())
-            {
-                if let Some(ui) = weak.upgrade()
-                    && let Some(exit_ui) = exit_weak.upgrade()
-                {
-                    show_confirmation_window(&ui, None, &exit_ui);
+                .map(|app| app.request_window_close(app.active_window))
+                .unwrap_or(WindowCloseAction::Ignore);
+            match action {
+                WindowCloseAction::ConfirmApplicationExit => {
+                    if let Some(ui) = weak.upgrade()
+                        && let Some(exit_ui) = exit_weak.upgrade()
+                    {
+                        show_confirmation_window(&ui, None, &exit_ui);
+                    }
+                    return EventResult::PreventDefault;
                 }
-                return EventResult::PreventDefault;
+                WindowCloseAction::CloseWindow => {
+                    if let Ok(mut app) = state.lock() {
+                        let active_window = app.active_window;
+                        let _ = app.close_window(active_window);
+                    }
+                    return EventResult::Propagate;
+                }
+                WindowCloseAction::ExitApplication => return EventResult::Propagate,
+                WindowCloseAction::Ignore => return EventResult::PreventDefault,
             }
-            return EventResult::Propagate;
         }
         if should_close_context_menu(event) {
             if let Some(ui) = weak.upgrade() {
@@ -4503,8 +4849,9 @@ fn queue_completed_focus(app: &mut AppState, targets: &[PathBuf]) {
             .cloned()
             .collect::<Vec<_>>();
         let matching_tabs = app
-            .tabs
+            .windows
             .values()
+            .flat_map(|window| window.tabs.values())
             .filter(|tab| tab.visible_path() == Some(directory.as_path()))
             .map(|tab| tab.id)
             .collect::<Vec<_>>();
@@ -5249,7 +5596,8 @@ fn start_directory_watchers(
     timer
 }
 fn watched_roots(app: &AppState) -> std::collections::HashSet<PathBuf> {
-    app.tabs
+    app.active_window_state()
+        .tabs
         .values()
         .filter_map(|tab| tab.visible_path().map(Path::to_path_buf))
         .collect()
@@ -5270,7 +5618,8 @@ fn refresh_affected_tabs(
 ) {
     let targets = {
         let app = state.lock().expect("app state mutex is not poisoned");
-        app.tabs
+        app.active_window_state()
+            .tabs
             .values()
             .filter_map(|tab| {
                 tab.visible_path()
@@ -5289,7 +5638,11 @@ fn refresh_affected_tabs(
             && let Some(mut pending) = pending
             && let Ok(mut app) = state.lock()
         {
-            pending.request_id = app.tabs.get(&tab).map(|session| session.latest_request);
+            pending.request_id = app
+                .active_window_state()
+                .tabs
+                .get(&tab)
+                .map(|session| session.latest_request);
             app.focus_after_refresh.insert(tab, pending);
         }
     }
@@ -5438,8 +5791,9 @@ fn reveal_focused_entry(
 ) {
     const ROW_HEIGHT: f32 = 40.0;
     let index = state.lock().ok().and_then(|app| {
-        (app.active_tab == tab_id)
-            .then(|| app.tabs.get(&tab_id))
+        (app.window_for_tab(tab_id) == Some(app.active_window)
+            && app.active_window_state().active_tab == tab_id)
+            .then(|| app.tab(tab_id))
             .flatten()
             .filter(|tab| tab.latest_request == request_id)
             .and_then(|tab| tab.focused.and_then(|id| tab.visible_entry_index(id)))
@@ -5472,10 +5826,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
             request_id,
             entries,
         } => {
-            let accepted = app
-                .tabs
-                .get(&tab_id)
-                .is_some_and(|tab| tab.accepts(request_id));
+            let accepted = app.tab(tab_id).is_some_and(|tab| tab.accepts(request_id));
             if accepted {
                 icon_requests.extend(
                     entries
@@ -5488,8 +5839,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                             path: entry.path.clone(),
                         }),
                 );
-                app.tabs
-                    .get_mut(&tab_id)
+                app.tab_mut(tab_id)
                     .expect("accepted tab exists")
                     .append_pending(entries);
             }
@@ -5500,10 +5850,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
             path,
             skipped,
         } => {
-            let accepted = app
-                .tabs
-                .get(&tab_id)
-                .is_some_and(|tab| tab.accepts(request_id));
+            let accepted = app.tab(tab_id).is_some_and(|tab| tab.accepts(request_id));
             let focus = accepted
                 .then(|| app.focus_after_refresh.get(&tab_id).cloned())
                 .flatten()
@@ -5513,7 +5860,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
             if accepted {
                 let consumed_focus = focus.is_some();
                 let location_path = {
-                    let tab = app.tabs.get_mut(&tab_id).expect("accepted tab exists");
+                    let tab = app.tab_mut(tab_id).expect("accepted tab exists");
                     tab.sort_pending();
                     tab.commit_pending();
                     tab.commit_path(path);
@@ -5549,7 +5896,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
             }
         }
         DirectoryEvent::Cancelled { tab_id, request_id } => {
-            if let Some(tab) = app.tabs.get_mut(&tab_id)
+            if let Some(tab) = app.tab_mut(tab_id)
                 && tab.latest_request == request_id
             {
                 tab.discard_pending();
@@ -5562,7 +5909,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
             kind,
             message,
         } => {
-            if let Some(tab) = app.tabs.get_mut(&tab_id)
+            if let Some(tab) = app.tab_mut(tab_id)
                 && tab.accepts(request_id)
             {
                 tab.discard_pending();
@@ -5865,7 +6212,7 @@ fn apply_folder_size_event(
     path: &Path,
     state: FolderSizeState,
 ) -> bool {
-    let Some(tab) = app.tabs.get_mut(&tab_id) else {
+    let Some(tab) = app.tab_mut(tab_id) else {
         return false;
     };
     if !tab.accepts_page(request_id, PageSource::Directory) {
@@ -5885,6 +6232,24 @@ fn apply_folder_size_event(
     }
     updated
 }
+
+#[cfg(test)]
+fn apply_search_page_event(
+    app: &mut AppState,
+    tab_id: TabId,
+    request_id: RequestId,
+    offset: u32,
+    entries: Vec<FileEntry>,
+    total: u32,
+    file_total: u32,
+) -> Option<Vec<u32>> {
+    let tab = app.tab_mut(tab_id)?;
+    if !tab.accepts_page(request_id, PageSource::Search) {
+        return None;
+    }
+    tab.finish_search_page_request(offset);
+    Some(tab.merge_search_page(offset, entries, total, file_total, SEARCH_PAGE_LIMIT))
+}
 fn start_everything_event_pump(
     ui: &AppWindow,
     receiver: mpsc::Receiver<EverythingEvent>,
@@ -5899,7 +6264,7 @@ fn start_everything_event_pump(
             if weak.upgrade_in_event_loop(move |ui| {
             let mut app = state.lock().expect("app state mutex is not poisoned");
             match event {
-                EverythingEvent::SearchPage { tab_id, request_id, offset, entries, total, file_total } => if let Some(tab) = app.tabs.get_mut(&tab_id) && tab.accepts_page(request_id, PageSource::Search) {
+                EverythingEvent::SearchPage { tab_id, request_id, offset, entries, total, file_total } => if let Some(tab) = app.tab_mut(tab_id) && tab.accepts_page(request_id, PageSource::Search) {
                     let pending_offset = tab.finish_search_page_request(offset);
                     if tab.search_file_total.is_some_and(|known| known != file_total) {
                         let scope = tab.search_scope.clone();
@@ -5939,7 +6304,8 @@ fn start_everything_event_pump(
                             cancel,
                         })
                     });
-                    let active = app.active_tab == tab_id;
+                    let active = app.window_for_tab(tab_id) == Some(app.active_window)
+                        && app.active_window_state_mut().active_tab == tab_id;
                     drop(app);
                     if let Some(request) = pending_request {
                         let _ = sender_for_search_consistency.send(request);
@@ -5957,7 +6323,7 @@ fn start_everything_event_pump(
                     }
                     return;
                 },
-                EverythingEvent::SearchFailed { tab_id, request_id, offset, error } => if let Some(tab) = app.tabs.get_mut(&tab_id) && tab.accepts_page(request_id, PageSource::Search) {
+                EverythingEvent::SearchFailed { tab_id, request_id, offset, error } => if let Some(tab) = app.tab_mut(tab_id) && tab.accepts_page(request_id, PageSource::Search) {
                     let pending_offset = tab.finish_search_page_request(offset);
                     let pending_request = pending_offset.and_then(|offset| {
                         tab.search_cancel_token().map(|cancel| EverythingRequest::Search {
@@ -5979,7 +6345,7 @@ fn start_everything_event_pump(
                     }
                 },
                 EverythingEvent::SearchSkipped { tab_id, request_id, offset } => {
-                    if let Some(tab) = app.tabs.get_mut(&tab_id)
+                    if let Some(tab) = app.tab_mut(tab_id)
                         && tab.accepts_page(request_id, PageSource::Search)
                         && let Some(offset) = tab.finish_search_page_request(offset)
                         && let Some(cancel) = tab.search_cancel_token()
@@ -6046,10 +6412,12 @@ fn project_search_page(
     evicted: &[u32],
 ) {
     let app = state.lock().expect("app state mutex is not poisoned");
-    if app.active_tab != tab_id {
+    if app.window_for_tab(tab_id) != Some(app.active_window)
+        || app.active_window_state().active_tab != tab_id
+    {
         return;
     }
-    let tab = app.active();
+    let tab = app.tab(tab_id).expect("routed tab exists");
     if tab.latest_request != request_id || tab.page_source != PageSource::Search {
         return;
     }
@@ -6114,7 +6482,7 @@ fn submit_search(
 ) {
     let request = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
-        let Some(tab) = app.tabs.get_mut(&tab_id) else {
+        let Some(tab) = app.tab_mut(tab_id) else {
             return;
         };
         let scope = tab.search_scope.clone();
@@ -6146,7 +6514,7 @@ fn submit_search_page(
 ) {
     let request = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
-        let Some(tab) = app.tabs.get_mut(&tab_id) else {
+        let Some(tab) = app.tab_mut(tab_id) else {
             return;
         };
         let page = offset / SEARCH_PAGE_LIMIT * SEARCH_PAGE_LIMIT;
@@ -6183,7 +6551,7 @@ fn submit_folder_sizes(
         if app.everything_folder_sizes_indexed == Some(false) {
             return;
         }
-        let Some(tab) = app.tabs.get_mut(&tab_id) else {
+        let Some(tab) = app.tab_mut(tab_id) else {
             return;
         };
         Arc::make_mut(&mut tab.entries)
@@ -6229,7 +6597,8 @@ fn spawn_icon_workers(
                     .lock()
                     .ok()
                     .and_then(|app| {
-                        app.tabs
+                        app.active_window_state()
+                            .tabs
                             .get(&request.tab_id)
                             .map(|tab| tab.latest_request == request.request_id)
                     })
@@ -6342,7 +6711,7 @@ fn apply_icon_event(state: &SharedSessions, event: IconEvent) -> Option<IconUpda
 }
 
 fn icon_event_is_current(app: &AppState, event: &IconEvent) -> bool {
-    app.tabs.get(&event.tab_id).is_some_and(|tab| {
+    app.tab(event.tab_id).is_some_and(|tab| {
         tab.latest_request == event.request_id
             && match event.target {
                 IconTarget::Entry(entry_id) => tab
@@ -6373,7 +6742,7 @@ fn append_active_file_rows(
 ) {
     use slint::Model;
     let app = state.lock().expect("app state mutex is not poisoned");
-    if app.active_tab != tab_id {
+    if app.active_window_state().active_tab != tab_id {
         return;
     }
     let tab = app.active();
@@ -6408,7 +6777,7 @@ fn update_icon_row(ui: &AppWindow, state: &SharedSessions, update: IconUpdate) {
     use slint::Model;
 
     let app = state.lock().expect("app state mutex is not poisoned");
-    if app.active_tab != update.tab_id {
+    if app.active_window_state().active_tab != update.tab_id {
         return;
     }
     let tab = app.active();
@@ -6733,15 +7102,17 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
     ui.set_error_page_title(error_page_title.into());
     ui.set_error_page_description(error_page_description.into());
     ui.set_active_tab_index(
-        app.tab_order
+        app.active_window_state()
+            .tab_order
             .iter()
-            .position(|id| *id == app.active_tab)
+            .position(|id| *id == app.active_window_state().active_tab)
             .unwrap_or(0) as i32,
     );
     ui.set_tabs(ModelRc::new(VecModel::from(
-        app.tab_order
+        app.active_window_state()
+            .tab_order
             .iter()
-            .filter_map(|id| app.tabs.get(id))
+            .filter_map(|id| app.active_window_state().tabs.get(id))
             .map(|tab| TabRow {
                 id: tab.id.0 as i32,
                 title: if tab.kind == TabKind::Settings {
@@ -6756,7 +7127,7 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
                         })
                 }
                 .into(),
-                active: tab.id == app.active_tab,
+                active: tab.id == app.active_window_state().active_tab,
                 loading: matches!(tab.load_state, LoadState::Loading | LoadState::Partial),
                 icon: tab
                     .visible_path()
@@ -6914,8 +7285,8 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
     ui.set_can_refresh(
         !active_is_settings && !matches!(tab.load_state, LoadState::Loading | LoadState::Partial),
     );
-    ui.set_can_close_tab(app.tab_order.len() > 1);
-    ui.set_can_restore_tab(!app.closed_tabs.is_empty());
+    ui.set_can_close_tab(app.active_window_state().tab_order.len() > 1);
+    ui.set_can_restore_tab(!app.active_window_state().closed_tabs.is_empty());
     ui.set_language_mode(match app.language {
         Language::Chinese => 0,
         Language::English => 1,
@@ -7442,10 +7813,273 @@ mod tests {
         assert!(!reorder_column(&mut order, 9, -1));
         assert!(!reorder_column(&mut order, 2, 0));
     }
+
+    fn test_window_placement(x: i32) -> session_store::WindowPlacement {
+        session_store::WindowPlacement {
+            x,
+            y: 80,
+            width: 1180,
+            height: 760,
+        }
+    }
+
+    #[test]
+    fn window_registry_allocates_global_tab_ids_without_reuse() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
+        let first_window = app.active_window;
+        let first_extra = app.create_tab(PathBuf::from("two"));
+        let second_window =
+            app.register_window(vec![PathBuf::from("three")], 0, test_window_placement(160));
+        let second_first = app.window(second_window).unwrap().active_tab;
+
+        assert_eq!(
+            app.window(first_window).unwrap().tab_order,
+            [TabId(1), first_extra]
+        );
+        assert_eq!(second_first, TabId(3));
+        app.active_window = second_window;
+        assert_eq!(app.close_tab(second_first), None);
+        let second_extra = app.create_tab(PathBuf::from("four"));
+        assert_eq!(second_extra, TabId(4));
+    }
+
+    #[test]
+    fn window_state_keeps_tabs_history_and_placement_isolated() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
+        let first_window = app.active_window;
+        let closed = app.create_tab(PathBuf::from("closed"));
+        app.close_tab(closed).unwrap();
+        let second_window = app.register_window(
+            vec![PathBuf::from("second"), PathBuf::from("active")],
+            1,
+            test_window_placement(240),
+        );
+
+        let first = app.window(first_window).unwrap();
+        let second = app.window(second_window).unwrap();
+        assert_eq!(first.closed_tabs, [PathBuf::from("closed")]);
+        assert!(second.closed_tabs.is_empty());
+        assert_eq!(first.active_tab, TabId(1));
+        assert_eq!(second.active_tab, TabId(4));
+        assert_eq!(first.placement.x, 80);
+        assert_eq!(second.placement.x, 240);
+    }
+
+    #[test]
+    fn closing_one_window_cancels_only_its_tabs_and_keeps_shared_operation() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
+        let first_window = app.active_window;
+        let second_window =
+            app.register_window(vec![PathBuf::from("two")], 0, test_window_placement(160));
+        let first_tab = app.window(first_window).unwrap().active_tab;
+        let second_tab = app.window(second_window).unwrap().active_tab;
+        let (_, first_cancel) = app
+            .window_mut(first_window)
+            .unwrap()
+            .tabs
+            .get_mut(&first_tab)
+            .unwrap()
+            .begin_navigation(PathBuf::from("one/new"), NavigationKind::Normal);
+        let (_, second_cancel) = app
+            .window_mut(second_window)
+            .unwrap()
+            .tabs
+            .get_mut(&second_tab)
+            .unwrap()
+            .begin_navigation(PathBuf::from("two/new"), NavigationKind::Normal);
+        let operation = app.operations.submit(
+            FileOperationKind::Copy,
+            Some(first_tab),
+            vec![OperationItem::pending(
+                Some(PathBuf::from("source")),
+                Some(PathBuf::from("target")),
+            )],
+        );
+
+        assert_eq!(
+            app.close_window(first_window),
+            Some(WindowCloseDecision::KeepRunning)
+        );
+        assert!(first_cancel.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!second_cancel.load(std::sync::atomic::Ordering::Acquire));
+        assert!(app.window(second_window).is_some());
+        assert!(app.operations.task(operation).is_some());
+        assert_eq!(
+            app.close_window(second_window),
+            Some(WindowCloseDecision::ExitApplication)
+        );
+    }
+
+    #[test]
+    fn directory_events_route_to_non_active_windows_by_global_tab_id() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
+        let first_window = app.active_window;
+        let second_window =
+            app.register_window(vec![PathBuf::from("two")], 0, test_window_placement(160));
+        let first_tab = app.window(first_window).unwrap().active_tab;
+        let second_tab = app.window(second_window).unwrap().active_tab;
+        for tab_id in [first_tab, second_tab] {
+            let tab = app.tab_mut(tab_id).unwrap();
+            tab.latest_request = RequestId(7);
+            tab.load_state = LoadState::Loading;
+        }
+        let state = Arc::new(Mutex::new(app));
+        let entry = focus_entry(1, "two/item.txt");
+
+        apply_event(
+            &state,
+            DirectoryEvent::Batch {
+                tab_id: second_tab,
+                request_id: RequestId(7),
+                entries: vec![entry],
+            },
+        );
+        apply_event(
+            &state,
+            DirectoryEvent::Finished {
+                tab_id: second_tab,
+                request_id: RequestId(7),
+                path: PathBuf::from("two"),
+                skipped: 0,
+            },
+        );
+        let app = state.lock().unwrap();
+        assert!(app.tab(first_tab).unwrap().entries.is_empty());
+        assert_eq!(app.tab(second_tab).unwrap().entries.len(), 1);
+        assert_eq!(app.tab(second_tab).unwrap().load_state, LoadState::Complete);
+    }
+
+    #[test]
+    fn search_and_icon_events_route_to_non_active_windows() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
+        let second_window =
+            app.register_window(vec![PathBuf::from("two")], 0, test_window_placement(160));
+        let second_tab = app.window(second_window).unwrap().active_tab;
+        let tab = app.tab_mut(second_tab).unwrap();
+        let (request_id, _) = tab.begin_search(SearchScope::Global, "item".into());
+        let search_entry = focus_entry(1, "two/item.txt");
+        assert!(
+            apply_search_page_event(
+                &mut app,
+                second_tab,
+                request_id,
+                0,
+                vec![search_entry.clone()],
+                1,
+                1,
+            )
+            .is_some()
+        );
+        let event = IconEvent {
+            tab_id: second_tab,
+            request_id,
+            target: IconTarget::Entry(EntryId(1)),
+            path: search_entry.path,
+            icon: platform::windows_shell_icons::ShellIconRgba {
+                width: 1,
+                height: 1,
+                pixels: vec![0, 0, 0, 0],
+            },
+        };
+        assert!(icon_event_is_current(&app, &event));
+    }
+
+    #[test]
+    fn closed_window_rejects_late_results_while_other_window_accepts_them() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
+        let first_window = app.active_window;
+        let second_window =
+            app.register_window(vec![PathBuf::from("two")], 0, test_window_placement(160));
+        let first_tab = app.window(first_window).unwrap().active_tab;
+        let second_tab = app.window(second_window).unwrap().active_tab;
+        for tab_id in [first_tab, second_tab] {
+            let tab = app.tab_mut(tab_id).unwrap();
+            tab.latest_request = RequestId(9);
+            tab.load_state = LoadState::Loading;
+        }
+        app.close_window(first_window).unwrap();
+        let state = Arc::new(Mutex::new(app));
+        apply_event(
+            &state,
+            DirectoryEvent::Batch {
+                tab_id: first_tab,
+                request_id: RequestId(9),
+                entries: vec![focus_entry(1, "one/late.txt")],
+            },
+        );
+        apply_event(
+            &state,
+            DirectoryEvent::Batch {
+                tab_id: second_tab,
+                request_id: RequestId(9),
+                entries: vec![focus_entry(1, "two/current.txt")],
+            },
+        );
+        let app = state.lock().unwrap();
+        assert!(app.tab(first_tab).is_none());
+        assert_eq!(app.tab(second_tab).unwrap().pending_entries.len(), 1);
+    }
+
+    #[test]
+    fn close_decision_only_confirms_exit_for_last_window_with_active_tasks() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
+        let first_window = app.active_window;
+        let operation = app.operations.submit(
+            FileOperationKind::Copy,
+            None,
+            vec![OperationItem::pending(
+                Some(PathBuf::from("source")),
+                Some(PathBuf::from("target")),
+            )],
+        );
+        app.operations.start_next().unwrap();
+        app.operations.mark_running(operation).unwrap();
+        assert_eq!(
+            app.request_window_close(first_window),
+            WindowCloseAction::ConfirmApplicationExit
+        );
+        let second_window =
+            app.register_window(vec![PathBuf::from("two")], 0, test_window_placement(160));
+        assert_eq!(
+            app.request_window_close(first_window),
+            WindowCloseAction::CloseWindow
+        );
+        app.close_window(first_window).unwrap();
+        assert_eq!(
+            app.request_window_close(second_window),
+            WindowCloseAction::ConfirmApplicationExit
+        );
+        assert!(app.operations.task(operation).is_some());
+    }
+
+    #[test]
+    fn last_window_without_tasks_keeps_state_until_session_snapshot_is_read() {
+        let app = AppState::new_for_test(
+            vec![PathBuf::from("one"), PathBuf::from("two")],
+            1,
+            [0, 1, 2, 3],
+        );
+        let window = app.active_window;
+
+        assert_eq!(
+            app.request_window_close(window),
+            WindowCloseAction::ExitApplication
+        );
+        assert_eq!(
+            app.stable_paths(),
+            [PathBuf::from("one"), PathBuf::from("two")]
+        );
+        assert_eq!(app.stable_active_path_index(), 1);
+        assert!(app.window(window).is_some());
+    }
     #[test]
     fn complete_tab_duplication_shares_entries_without_reloading() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("same")], 0, [0, 1, 2, 3]);
-        let source = app.tabs.get_mut(&TabId(1)).unwrap();
+        let source = app
+            .active_window_state_mut()
+            .tabs
+            .get_mut(&TabId(1))
+            .unwrap();
         source.latest_request = RequestId(7);
         source.load_state = LoadState::Complete;
         source.replace_entries(vec![FileEntry {
@@ -7464,7 +8098,7 @@ mod tests {
         let source_entries = source.entries.clone();
 
         let duplicate = app.duplicate_active_tab().expect("complete tab duplicates");
-        let duplicated = app.tabs.get(&duplicate).unwrap();
+        let duplicated = app.active_window_state().tabs.get(&duplicate).unwrap();
 
         assert!(Arc::ptr_eq(&source_entries, &duplicated.entries));
         assert_eq!(duplicated.latest_request, RequestId(7));
@@ -7474,7 +8108,7 @@ mod tests {
     fn closing_a_tab_preserves_another_session() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
         let second = app.create_tab(PathBuf::from("two"));
-        assert_eq!(app.active_tab, second);
+        assert_eq!(app.active_window_state().active_tab, second);
         assert_eq!(app.close_tab(TabId(2)), Some(TabId(1)));
         assert_eq!(app.active().current_path, Some(PathBuf::from("one")));
     }
@@ -7484,12 +8118,12 @@ mod tests {
         let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
         let second = app.create_tab(PathBuf::from("two"));
         let third = app.create_tab(PathBuf::from("three"));
-        assert_eq!(app.active_tab, third);
+        assert_eq!(app.active_window_state().active_tab, third);
 
         assert_eq!(app.close_tab(second), Some(third));
-        assert_eq!(app.active_tab, third);
+        assert_eq!(app.active_window_state().active_tab, third);
         assert_eq!(app.active().current_path, Some(PathBuf::from("three")));
-        assert!(!app.tabs.contains_key(&second));
+        assert!(!app.active_window_state().tabs.contains_key(&second));
     }
 
     #[test]
@@ -7498,11 +8132,11 @@ mod tests {
 
         let settings = app.open_settings();
         assert_eq!(app.open_settings(), settings);
-        assert_eq!(app.tab_order.len(), 2);
+        assert_eq!(app.active_window_state().tab_order.len(), 2);
         assert_eq!(app.active().kind, TabKind::Settings);
 
         assert_eq!(app.close_tab(settings), Some(TabId(1)));
-        assert!(app.closed_tabs.is_empty());
+        assert!(app.active_window_state().closed_tabs.is_empty());
         assert!(app.restore_closed().is_none());
     }
 
@@ -7528,7 +8162,7 @@ mod tests {
         app.open_settings();
 
         assert_eq!(app.close_tab(TabId(1)), None);
-        assert!(app.tabs.contains_key(&TabId(1)));
+        assert!(app.active_window_state().tabs.contains_key(&TabId(1)));
     }
 
     #[test]
@@ -7649,7 +8283,11 @@ mod tests {
     #[test]
     fn icon_events_require_matching_tab_request_entry_and_path() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("same")], 0, [0, 1, 2, 3]);
-        let tab = app.tabs.get_mut(&TabId(1)).unwrap();
+        let tab = app
+            .active_window_state_mut()
+            .tabs
+            .get_mut(&TabId(1))
+            .unwrap();
         tab.latest_request = RequestId(7);
         tab.replace_entries(vec![FileEntry {
             id: EntryId(3),
@@ -7692,7 +8330,7 @@ mod tests {
         stale_request.request_id = RequestId(7);
         stale_request.path = PathBuf::from("same/other.txt");
         assert!(!icon_event_is_current(&app, &stale_request));
-        app.tabs.remove(&TabId(1));
+        app.active_window_state_mut().tabs.remove(&TabId(1));
         assert!(!icon_event_is_current(&app, &stale_request));
     }
 
@@ -7737,7 +8375,11 @@ mod tests {
     #[test]
     fn stale_folder_size_event_cannot_update_reused_entry_id() {
         let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\current")], 0, [0, 1, 2, 3]);
-        let tab = app.tabs.get_mut(&TabId(1)).unwrap();
+        let tab = app
+            .active_window_state_mut()
+            .tabs
+            .get_mut(&TabId(1))
+            .unwrap();
         tab.latest_request = RequestId(8);
         tab.page_source = PageSource::Directory;
         tab.replace_entries(vec![FileEntry {
@@ -7771,7 +8413,7 @@ mod tests {
             FolderSizeState::Value(12),
         ));
         assert_eq!(
-            app.tabs[&TabId(1)].entries[0].folder_size,
+            app.active_window_state().tabs[&TabId(1)].entries[0].folder_size,
             FolderSizeState::Querying
         );
         assert!(apply_folder_size_event(
@@ -7783,7 +8425,7 @@ mod tests {
             FolderSizeState::Value(0),
         ));
         assert_eq!(
-            app.tabs[&TabId(1)].entries[0].folder_size,
+            app.active_window_state().tabs[&TabId(1)].entries[0].folder_size,
             FolderSizeState::Value(0)
         );
     }
@@ -7811,7 +8453,11 @@ mod tests {
     #[test]
     fn pressing_an_unselected_row_for_drag_does_not_mutate_selection() {
         let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\test")], 0, [0, 1, 2, 3]);
-        let tab = app.tabs.get_mut(&TabId(1)).unwrap();
+        let tab = app
+            .active_window_state_mut()
+            .tabs
+            .get_mut(&TabId(1))
+            .unwrap();
         tab.replace_entries(vec![
             focus_entry(1, r"C:\test\one.txt"),
             focus_entry(2, r"C:\test\two.txt"),
@@ -7823,7 +8469,7 @@ mod tests {
             drag_paths_for_pressed_entry(&app, EntryId(2)),
             vec![PathBuf::from(r"C:\test\two.txt")]
         );
-        let tab = &app.tabs[&TabId(1)];
+        let tab = &app.active_window_state().tabs[&TabId(1)];
         assert_eq!(tab.selected, vec![EntryId(1)]);
         assert_eq!(tab.focused, Some(EntryId(1)));
         assert_eq!(tab.selection_anchor, Some(EntryId(1)));
@@ -7832,7 +8478,11 @@ mod tests {
     #[test]
     fn pressing_a_selected_row_for_drag_uses_the_existing_multi_selection() {
         let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\test")], 0, [0, 1, 2, 3]);
-        let tab = app.tabs.get_mut(&TabId(1)).unwrap();
+        let tab = app
+            .active_window_state_mut()
+            .tabs
+            .get_mut(&TabId(1))
+            .unwrap();
         tab.replace_entries(vec![
             focus_entry(1, r"C:\test\one.txt"),
             focus_entry(2, r"C:\test\two.txt"),
@@ -7861,7 +8511,7 @@ mod tests {
         ];
         queue_completed_focus(&mut app, &targets);
         for tab_id in [TabId(1), TabId(2)] {
-            let tab = app.tabs.get_mut(&tab_id).unwrap();
+            let tab = app.active_window_state_mut().tabs.get_mut(&tab_id).unwrap();
             let (_, cancel) =
                 tab.begin_navigation(PathBuf::from(r"C:\target"), NavigationKind::Refresh);
             assert!(!cancel.load(std::sync::atomic::Ordering::Acquire));
@@ -7886,7 +8536,7 @@ mod tests {
         }
         let app = state.lock().unwrap();
         for tab_id in [TabId(1), TabId(2)] {
-            let tab = &app.tabs[&tab_id];
+            let tab = &app.active_window_state().tabs[&tab_id];
             assert_eq!(tab.selected, vec![EntryId(1), EntryId(2)]);
             assert_eq!(tab.focused, Some(EntryId(2)));
         }
@@ -7993,7 +8643,11 @@ mod tests {
         )));
         {
             let mut app = state.lock().unwrap();
-            let tab = app.tabs.get_mut(&TabId(1)).unwrap();
+            let tab = app
+                .active_window_state_mut()
+                .tabs
+                .get_mut(&TabId(1))
+                .unwrap();
             tab.replace_entries(vec![FileEntry {
                 id: EntryId(1),
                 path: PathBuf::from("C:/test/item.txt"),
@@ -8024,23 +8678,27 @@ mod tests {
         )));
         {
             let mut app = state.lock().unwrap();
-            app.tabs.get_mut(&TabId(1)).unwrap().replace_entries(
-                (1..=4)
-                    .map(|id| FileEntry {
-                        id: EntryId(id),
-                        original_name: format!("{id}.txt").into(),
-                        display_name: format!("{id}.txt"),
-                        name_highlights: Vec::new(),
-                        path: PathBuf::from(format!(r"C:\test\{id}.txt")),
-                        kind: crate::domain::EntryKind::File,
-                        open_target: None,
-                        parent_display: "C:/test".into(),
-                        size_bytes: Some(1),
-                        folder_size: crate::domain::FolderSizeState::Unknown,
-                        modified: None,
-                    })
-                    .collect(),
-            );
+            app.active_window_state_mut()
+                .tabs
+                .get_mut(&TabId(1))
+                .unwrap()
+                .replace_entries(
+                    (1..=4)
+                        .map(|id| FileEntry {
+                            id: EntryId(id),
+                            original_name: format!("{id}.txt").into(),
+                            display_name: format!("{id}.txt"),
+                            name_highlights: Vec::new(),
+                            path: PathBuf::from(format!(r"C:\test\{id}.txt")),
+                            kind: crate::domain::EntryKind::File,
+                            open_target: None,
+                            parent_display: "C:/test".into(),
+                            size_bytes: Some(1),
+                            folder_size: crate::domain::FolderSizeState::Unknown,
+                            modified: None,
+                        })
+                        .collect(),
+                );
         }
         assert_eq!(
             context_target_at(&state, 170.0, 166.0, -80.0),
@@ -8084,34 +8742,38 @@ mod tests {
     #[test]
     fn internal_drag_targets_only_directory_rows_with_viewport_offset() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
-        app.tabs.get_mut(&TabId(1)).unwrap().replace_entries(vec![
-            FileEntry {
-                id: EntryId(1),
-                original_name: "file.txt".into(),
-                display_name: "file.txt".into(),
-                name_highlights: Vec::new(),
-                path: PathBuf::from(r"C:\test\file.txt"),
-                kind: crate::domain::EntryKind::File,
-                open_target: None,
-                parent_display: String::new(),
-                size_bytes: Some(1),
-                folder_size: crate::domain::FolderSizeState::Unknown,
-                modified: None,
-            },
-            FileEntry {
-                id: EntryId(2),
-                original_name: "folder".into(),
-                display_name: "folder".into(),
-                name_highlights: Vec::new(),
-                path: PathBuf::from(r"C:\test\folder"),
-                kind: crate::domain::EntryKind::Directory,
-                open_target: None,
-                parent_display: String::new(),
-                size_bytes: None,
-                folder_size: crate::domain::FolderSizeState::Unknown,
-                modified: None,
-            },
-        ]);
+        app.active_window_state_mut()
+            .tabs
+            .get_mut(&TabId(1))
+            .unwrap()
+            .replace_entries(vec![
+                FileEntry {
+                    id: EntryId(1),
+                    original_name: "file.txt".into(),
+                    display_name: "file.txt".into(),
+                    name_highlights: Vec::new(),
+                    path: PathBuf::from(r"C:\test\file.txt"),
+                    kind: crate::domain::EntryKind::File,
+                    open_target: None,
+                    parent_display: String::new(),
+                    size_bytes: Some(1),
+                    folder_size: crate::domain::FolderSizeState::Unknown,
+                    modified: None,
+                },
+                FileEntry {
+                    id: EntryId(2),
+                    original_name: "folder".into(),
+                    display_name: "folder".into(),
+                    name_highlights: Vec::new(),
+                    path: PathBuf::from(r"C:\test\folder"),
+                    kind: crate::domain::EntryKind::Directory,
+                    open_target: None,
+                    parent_display: String::new(),
+                    size_bytes: None,
+                    folder_size: crate::domain::FolderSizeState::Unknown,
+                    modified: None,
+                },
+            ]);
 
         assert_eq!(internal_drag_target(&app, 20.0, 0.0, 0.0), None);
         assert_eq!(

@@ -33,6 +33,7 @@ pub enum AgentScenario {
     FileOperationConflict,
     FileOperationPartial,
     DragDropFoundation,
+    MultiWindowStateLayering,
 }
 
 impl AgentScenario {
@@ -43,6 +44,7 @@ impl AgentScenario {
             Self::FileOperationConflict => "file-operation-conflict",
             Self::FileOperationPartial => "file-operation-partial",
             Self::DragDropFoundation => "drag-drop-foundation",
+            Self::MultiWindowStateLayering => "multi-window-state-layering",
         }
     }
 
@@ -105,6 +107,7 @@ fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
         "file-operation-conflict" => Ok(AgentScenario::FileOperationConflict),
         "file-operation-partial" => Ok(AgentScenario::FileOperationPartial),
         "drag-drop-foundation" => Ok(AgentScenario::DragDropFoundation),
+        "multi-window-state-layering" => Ok(AgentScenario::MultiWindowStateLayering),
         _ => Err(format!("unknown agent scenario: {value}")),
     }
 }
@@ -119,6 +122,10 @@ pub fn apply_scenario(session: &mut TabSession, scenario: AgentScenario) {
         }
         AgentScenario::DragDropFoundation => {
             session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\DragDrop"));
+            session.load_state = LoadState::Complete;
+        }
+        AgentScenario::MultiWindowStateLayering => {
+            session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\MultiWindow"));
             session.load_state = LoadState::Complete;
         }
         AgentScenario::FileOperationRunning
@@ -231,7 +238,9 @@ impl AgentState {
 fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str> {
     if matches!(
         scenario,
-        AgentScenario::PermissionDenied | AgentScenario::DragDropFoundation
+        AgentScenario::PermissionDenied
+            | AgentScenario::DragDropFoundation
+            | AgentScenario::MultiWindowStateLayering
     ) {
         return None;
     }
@@ -283,6 +292,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
             );
         }
         AgentScenario::DragDropFoundation => unreachable!(),
+        AgentScenario::MultiWindowStateLayering => unreachable!(),
         AgentScenario::PermissionDenied => unreachable!(),
     }
     manager.task(id).map(|task| match task.state {

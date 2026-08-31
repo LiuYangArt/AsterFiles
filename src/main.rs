@@ -25,6 +25,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
 
     if let Some(scenario) = agent_options.scenario {
+        if scenario == agent_debug::AgentScenario::MultiWindowStateLayering {
+            let output = agent_options
+                .state_output()
+                .expect("scenario has a default state output");
+            app::export_multi_window_state_layering(&output)?;
+            println!(
+                "{{\"event\":\"agent_state_exported\",\"scenario\":\"{}\",\"artifact\":{:?}}}",
+                scenario.name(),
+                output.to_string_lossy().as_ref()
+            );
+            if agent_options.no_ui {
+                return Ok(());
+            }
+        }
         let mut session = domain::TabSession::new(domain::TabId(1));
         agent_debug::apply_scenario(&mut session, scenario);
         let output = agent_options
