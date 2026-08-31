@@ -7,6 +7,18 @@ pub struct ShellIconRgba {
     pub pixels: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThumbnailSource {
+    Cache,
+    Provider,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShellThumbnailRgba {
+    pub image: ShellIconRgba,
+    pub source: ThumbnailSource,
+}
+
 impl ShellIconRgba {
     fn from_bgra(width: u32, height: u32, pixels: Vec<u8>) -> io::Result<Self> {
         let expected_len = width
@@ -51,9 +63,9 @@ mod windows_impl {
             System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize},
             UI::{
                 Shell::{
-                    IShellItemImageFactory, SHCreateItemFromParsingName, SHFILEINFOW, SHGFI_ICON,
-                    SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SIIGBF_BIGGERSIZEOK,
-                    SIIGBF_INCACHEONLY, SIIGBF_THUMBNAILONLY,
+                    IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SHFILEINFOW,
+                    SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW,
+                    SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
                 },
                 WindowsAndMessaging::{
                     DI_NORMAL, DestroyIcon, DrawIconEx, GetSystemMetrics, HICON, SM_CXICON,
@@ -64,7 +76,7 @@ mod windows_impl {
         core::PCWSTR,
     };
 
-    use super::{Path, ShellIconRgba, io};
+    use super::{Path, ShellIconRgba, ShellThumbnailRgba, ThumbnailSource, io};
 
     pub fn shell_icon_rgba(path: &Path) -> io::Result<ShellIconRgba> {
         let _com = ComInitialization::new()?;
@@ -72,24 +84,13 @@ mod windows_impl {
         icon.to_rgba()
     }
 
-    pub fn shell_thumbnail_rgba(
-        path: &Path,
-        size: u32,
-        cache_only: bool,
-    ) -> io::Result<ShellIconRgba> {
-        use windows::Win32::{
-            Foundation::SIZE,
-            Graphics::Gdi::{GetDC, ReleaseDC},
-        };
+    pub fn shell_large_icon_rgba(path: &Path, size: u32) -> io::Result<ShellIconRgba> {
+        use windows::Win32::Foundation::SIZE;
         let _com = ComInitialization::new()?;
         let wide = wide_null(path.as_os_str());
         let factory: IShellItemImageFactory = unsafe {
             SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).map_err(windows_error)?
         };
-        let mut flags = SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK;
-        if cache_only {
-            flags |= SIIGBF_INCACHEONLY;
-        }
         let bitmap = unsafe {
             factory
                 .GetImage(
@@ -97,15 +98,72 @@ mod windows_impl {
                         cx: size as i32,
                         cy: size as i32,
                     },
-                    flags,
+                    SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
                 )
                 .map_err(windows_error)?
         };
-        let bitmap = Bitmap(bitmap);
+        bitmap_to_rgba(bitmap)
+    }
+
+    pub fn shell_thumbnail_rgba(
+        path: &Path,
+        size: u32,
+        cache_only: bool,
+    ) -> io::Result<ShellThumbnailRgba> {
+        use windows::Win32::{
+            System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
+            UI::Shell::{
+                ISharedBitmap, IThumbnailCache, LocalThumbnailCache, WTS_CACHED, WTS_CACHEFLAGS,
+                WTS_EXTRACT, WTS_INCACHEONLY, WTS_SCALETOREQUESTEDSIZE,
+            },
+        };
+        let _com = ComInitialization::new()?;
+        let wide = wide_null(path.as_os_str());
+        let item: IShellItem = unsafe {
+            SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).map_err(windows_error)?
+        };
+        let cache: IThumbnailCache = unsafe {
+            CoCreateInstance(&LocalThumbnailCache, None, CLSCTX_INPROC_SERVER)
+                .map_err(windows_error)?
+        };
+        let mut shared: Option<ISharedBitmap> = None;
+        let mut cache_flags = WTS_CACHEFLAGS::default();
+        let flags = if cache_only {
+            WTS_INCACHEONLY
+        } else {
+            WTS_EXTRACT | WTS_SCALETOREQUESTEDSIZE
+        };
+        unsafe {
+            cache
+                .GetThumbnail(
+                    &item,
+                    size,
+                    flags,
+                    Some(&mut shared),
+                    Some(&mut cache_flags),
+                    None,
+                )
+                .map_err(windows_error)?
+        };
+        let shared =
+            shared.ok_or_else(|| io::Error::other("thumbnail cache returned no bitmap"))?;
+        let bitmap = unsafe { shared.GetSharedBitmap().map_err(windows_error)? };
+        bitmap_to_rgba(bitmap).map(|image| ShellThumbnailRgba {
+            image,
+            source: if cache_flags.0 & WTS_CACHED.0 != 0 {
+                ThumbnailSource::Cache
+            } else {
+                ThumbnailSource::Provider
+            },
+        })
+    }
+
+    fn bitmap_to_rgba(bitmap: HBITMAP) -> io::Result<ShellIconRgba> {
+        use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
         let mut native = BITMAP::default();
         let read = unsafe {
             GetObjectW(
-                bitmap.0.into(),
+                bitmap.into(),
                 size_of::<BITMAP>() as i32,
                 Some((&mut native as *mut BITMAP).cast()),
             )
@@ -135,7 +193,7 @@ mod windows_impl {
         let lines = unsafe {
             GetDIBits(
                 dc,
-                bitmap.0,
+                bitmap,
                 0,
                 height,
                 Some(pixels.as_mut_ptr().cast()),
@@ -353,10 +411,17 @@ mod windows_impl {
 }
 
 #[cfg(windows)]
-pub use windows_impl::{shell_icon_rgba, shell_thumbnail_rgba};
+pub use windows_impl::{shell_icon_rgba, shell_large_icon_rgba, shell_thumbnail_rgba};
 
 #[cfg(not(windows))]
 pub fn shell_icon_rgba(_path: &Path) -> io::Result<ShellIconRgba> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Windows Shell icons are only available on Windows",
+    ))
+}
+#[cfg(not(windows))]
+pub fn shell_large_icon_rgba(_path: &Path, _size: u32) -> io::Result<ShellIconRgba> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "Windows Shell icons are only available on Windows",
@@ -368,7 +433,7 @@ pub fn shell_thumbnail_rgba(
     _path: &Path,
     _size: u32,
     _cache_only: bool,
-) -> io::Result<ShellIconRgba> {
+) -> io::Result<ShellThumbnailRgba> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "Windows Shell thumbnails are only available on Windows",

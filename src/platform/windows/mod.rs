@@ -58,3 +58,41 @@ pub fn has_pointer_capture(hwnd: isize) -> bool {
 pub fn release_pointer_capture() {
     unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture() };
 }
+
+pub fn configure_drag_preview(hwnd: isize) -> io::Result<()> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongPtrW, HWND_TOPMOST, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, SetWindowLongPtrW, SetWindowPos, ShowWindow, WS_EX_LAYERED,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    };
+    if hwnd == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "preview window handle unavailable",
+        ));
+    }
+    let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+    let current = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+    let desired = current
+        | WS_EX_LAYERED as isize
+        | WS_EX_TRANSPARENT as isize
+        | WS_EX_NOACTIVATE as isize
+        | WS_EX_TOOLWINDOW as isize;
+    unsafe { SetWindowLongPtrW(hwnd, GWL_EXSTYLE, desired) };
+    if unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } & desired != desired {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+    Ok(())
+}

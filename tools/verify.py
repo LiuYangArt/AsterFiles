@@ -113,6 +113,10 @@ def main() -> int:
             "cargo", "run", "--", "--agent-scenario", "explorer-pins",
             "--no-ui", "--agent-state-out", str(STATE_DIR / "explorer-pins" / "shell.json"),
         ]),
+        ("agent-shell-thumbnail", [
+            "cargo", "run", "--", "--agent-scenario", "shell-thumbnail",
+            "--no-ui", "--agent-state-out", str(STATE_DIR / "thumbnails" / "shell-png.json"),
+        ]),
         ("release", ["cargo", "build", "--release"])
         if release_requested
         else ("debug", ["cargo", "build"]),

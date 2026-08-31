@@ -38,6 +38,7 @@ pub enum AgentScenario {
     TabDetach,
     TabCrossWindow,
     ExplorerPins,
+    ShellThumbnail,
 }
 
 impl AgentScenario {
@@ -53,6 +54,7 @@ impl AgentScenario {
             Self::TabDetach => "tab-detach",
             Self::TabCrossWindow => "tab-cross-window",
             Self::ExplorerPins => "explorer-pins",
+            Self::ShellThumbnail => "shell-thumbnail",
         }
     }
 
@@ -120,6 +122,7 @@ fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
         "tab-detach" => Ok(AgentScenario::TabDetach),
         "tab-cross-window" => Ok(AgentScenario::TabCrossWindow),
         "explorer-pins" => Ok(AgentScenario::ExplorerPins),
+        "shell-thumbnail" => Ok(AgentScenario::ShellThumbnail),
         _ => Err(format!("unknown agent scenario: {value}")),
     }
 }
@@ -154,6 +157,10 @@ pub fn apply_scenario(session: &mut TabSession, scenario: AgentScenario) {
         }
         AgentScenario::ExplorerPins => {
             session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\ExplorerPins"));
+            session.load_state = LoadState::Complete;
+        }
+        AgentScenario::ShellThumbnail => {
+            session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\ShellThumbnail"));
             session.load_state = LoadState::Complete;
         }
         AgentScenario::FileOperationRunning
@@ -273,6 +280,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
             | AgentScenario::TabDetach
             | AgentScenario::TabCrossWindow
             | AgentScenario::ExplorerPins
+            | AgentScenario::ShellThumbnail
     ) {
         return None;
     }
@@ -329,6 +337,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
         AgentScenario::TabDetach => unreachable!(),
         AgentScenario::TabCrossWindow => unreachable!(),
         AgentScenario::ExplorerPins => unreachable!(),
+        AgentScenario::ShellThumbnail => unreachable!(),
         AgentScenario::PermissionDenied => unreachable!(),
     }
     manager.task(id).map(|task| match task.state {

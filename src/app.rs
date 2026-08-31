@@ -411,6 +411,86 @@ struct WindowRuntime {
 
 thread_local! {
     static WINDOW_RUNTIMES: RefCell<HashMap<WindowId, WindowRuntime>> = RefCell::new(HashMap::new());
+    static TAB_DRAG_PREVIEW: RefCell<Option<TabDragPreviewWindow>> = const { RefCell::new(None) };
+}
+
+fn show_tab_drag_preview(
+    source_ui: &AppWindow,
+    state: &SharedSessions,
+    screen_x: i32,
+    screen_y: i32,
+) -> Result<(), slint::PlatformError> {
+    let (title, icon, is_drive, active, dark, width) = {
+        let app = state.lock().map_err(|_| slint::PlatformError::NoPlatform)?;
+        let drag = app.tab_drag.ok_or(slint::PlatformError::NoPlatform)?;
+        let tab = app
+            .tab(drag.tab_id)
+            .ok_or(slint::PlatformError::NoPlatform)?;
+        let title = tab
+            .visible_path()
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| display_path(tab.visible_path().unwrap_or(Path::new("C:\\"))));
+        (
+            title,
+            tab.visible_path()
+                .and_then(|path| app.icon_cache.get(path))
+                .map(shell_icon_image)
+                .unwrap_or_default(),
+            tab.visible_path().is_some_and(is_drive_root),
+            app.window(drag.window_id)
+                .is_some_and(|window| window.active_tab == drag.tab_id),
+            app.dark_theme(),
+            source_ui.get_tab_current_width().max(80.0),
+        )
+    };
+    TAB_DRAG_PREVIEW.with_borrow_mut(|slot| {
+        let preview = match slot {
+            Some(preview) => preview,
+            None => slot.insert(TabDragPreviewWindow::new()?),
+        };
+        preview.set_card_title(slint::SharedString::from(title));
+        preview.set_card_icon(icon);
+        preview.set_card_is_drive(is_drive);
+        preview.set_card_active(active);
+        preview.set_dark_theme(dark);
+        preview.set_card_width(width);
+        preview.window().set_position(slint::PhysicalPosition::new(
+            screen_x - (width * source_ui.window().scale_factor() / 2.0).round() as i32,
+            screen_y - (17.0 * source_ui.window().scale_factor()).round() as i32,
+        ));
+        preview.show()?;
+        platform::windows::configure_drag_preview(component_window_handle(preview))
+            .map_err(|error| slint::PlatformError::Other(error.to_string()))?;
+        Ok(())
+    })
+}
+
+fn move_tab_drag_preview(source_ui: &AppWindow, cursor: winit::dpi::PhysicalPosition<f64>) {
+    let Ok((left, top, _, _)) =
+        platform::windows::drag_drop::client_screen_rect(native_window_handle(source_ui))
+    else {
+        return;
+    };
+    TAB_DRAG_PREVIEW.with_borrow(|slot| {
+        if let Some(preview) = slot {
+            let width = preview.get_card_width();
+            let scale = source_ui.window().scale_factor();
+            preview.window().set_position(slint::PhysicalPosition::new(
+                left + cursor.x.round() as i32 - (width * scale / 2.0).round() as i32,
+                top + cursor.y.round() as i32 - (17.0 * scale).round() as i32,
+            ));
+        }
+    });
+}
+
+fn hide_tab_drag_preview() {
+    TAB_DRAG_PREVIEW.with_borrow_mut(|slot| {
+        if let Some(preview) = slot.take() {
+            let _ = preview.hide();
+        }
+    });
 }
 
 fn refresh_all_windows(state: &SharedSessions) {
@@ -1646,6 +1726,7 @@ struct IconRequest {
     target: IconTarget,
     path: PathBuf,
     thumbnail: bool,
+    requested_px: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1715,6 +1796,7 @@ struct IconEvent {
     path: PathBuf,
     icon: platform::windows_shell_icons::ShellIconRgba,
     actual_thumbnail: bool,
+    requested_px: u32,
 }
 
 pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> {
@@ -2834,6 +2916,10 @@ fn show_classic_menu(
 }
 
 fn native_window_handle(ui: &AppWindow) -> isize {
+    component_window_handle(ui)
+}
+
+fn component_window_handle<T: slint::ComponentHandle>(ui: &T) -> isize {
     use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     ui.window()
         .with_winit_window(|window| {
@@ -3568,6 +3654,11 @@ fn wire_callbacks(
             }
             if mode == ViewMode::Grid {
                 let tab = app.active();
+                let requested_px = weak
+                    .upgrade()
+                    .map(|ui| (100.0 * ui.window().scale_factor()).round() as u32)
+                    .unwrap_or(100)
+                    .max(64);
                 tab.visible_entries()
                     .iter()
                     .take(96)
@@ -3577,6 +3668,7 @@ fn wire_callbacks(
                         target: IconTarget::Entry(entry.id),
                         path: entry.path.clone(),
                         thumbnail: true,
+                        requested_px,
                     })
                     .collect::<Vec<_>>()
             } else {
@@ -3760,6 +3852,24 @@ fn wire_callbacks(
                 project_cross_window_drop(None);
                 return -2;
             }
+            let (left, top, _, _) =
+                platform::windows::drag_drop::client_screen_rect(hwnd).unwrap_or_default();
+            if show_tab_drag_preview(
+                &ui,
+                &state_for_tab_drag.shared,
+                left + (x * ui.window().scale_factor()).round() as i32,
+                top + (y * ui.window().scale_factor()).round() as i32,
+            )
+            .is_err()
+            {
+                platform::windows::release_pointer_capture();
+                if let Ok(mut app) = state_for_tab_drag.lock() {
+                    app.cancel_tab_drag();
+                }
+                ui.invoke_clear_tab_drag();
+                project_cross_window_drop(None);
+                return -2;
+            }
         }
         insertion.map(|index| index as i32).unwrap_or(-2)
     });
@@ -3778,6 +3888,7 @@ fn wire_callbacks(
             return;
         }
         platform::windows::release_pointer_capture();
+        hide_tab_drag_preview();
         if let Ok(mut app) = state_for_tab_drag.lock() {
             app.finish_tab_drag(true);
         }
@@ -3789,6 +3900,7 @@ fn wire_callbacks(
     let state_for_tab_drag = state.clone();
     ui.on_cancel_tab_drag(move || {
         platform::windows::release_pointer_capture();
+        hide_tab_drag_preview();
         if let Ok(mut app) = state_for_tab_drag.lock() {
             app.cancel_tab_drag();
         }
@@ -4545,6 +4657,7 @@ fn wire_mouse_navigation(
                     })
                 });
                 if dragging {
+                    move_tab_drag_preview(&ui, *position);
                     project_cross_window_drop(cross_window_drop_target(
                         window_id,
                         &ui,
@@ -4587,6 +4700,7 @@ fn wire_mouse_navigation(
                 ..
             } => {
                 platform::windows::release_pointer_capture();
+                hide_tab_drag_preview();
                 let logical = cursor_position
                     .get()
                     .to_logical::<f32>(f64::from(ui.window().scale_factor()));
@@ -7283,6 +7397,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                             target: IconTarget::Entry(entry.id),
                             path: entry.path.clone(),
                             thumbnail: false,
+                            requested_px: 0,
                         }),
                 );
                 app.tab_mut(tab_id)
@@ -7339,6 +7454,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                     target: IconTarget::Location,
                     path: location_path,
                     thumbnail: false,
+                    requested_px: 0,
                 });
             }
         }
@@ -8066,29 +8182,38 @@ fn spawn_icon_workers(
                 let cached = state.lock().ok().and_then(|app| {
                     if request.thumbnail {
                         app.thumbnail_cache
-                            .get(&(request.path.clone(), 96))
+                            .get(&(request.path.clone(), request.requested_px))
                             .cloned()
                     } else {
                         app.icon_cache.get(&request.path).cloned()
                     }
                 });
                 let (icon, actual_thumbnail) = if request.thumbnail {
-                    let thumbnail = cached.or_else(|| {
-                        platform::windows_shell_icons::shell_thumbnail_rgba(&request.path, 96, true)
-                            .or_else(|_| {
-                                platform::windows_shell_icons::shell_thumbnail_rgba(
-                                    &request.path,
-                                    96,
-                                    false,
-                                )
-                            })
-                            .ok()
-                    });
-                    if thumbnail.is_some() {
-                        (thumbnail, true)
+                    if cached.is_some() {
+                        (cached, true)
+                    } else if let Ok(thumbnail) =
+                        platform::windows_shell_icons::shell_thumbnail_rgba(
+                            &request.path,
+                            request.requested_px,
+                            true,
+                        )
+                        .or_else(|_| {
+                            platform::windows_shell_icons::shell_thumbnail_rgba(
+                                &request.path,
+                                request.requested_px,
+                                false,
+                            )
+                        })
+                    {
+                        let _source = thumbnail.source;
+                        (Some(thumbnail.image), true)
                     } else {
                         (
-                            platform::windows_shell_icons::shell_icon_rgba(&request.path).ok(),
+                            platform::windows_shell_icons::shell_large_icon_rgba(
+                                &request.path,
+                                request.requested_px,
+                            )
+                            .ok(),
                             false,
                         )
                     }
@@ -8108,6 +8233,7 @@ fn spawn_icon_workers(
                         path: request.path,
                         icon,
                         actual_thumbnail,
+                        requested_px: request.requested_px,
                     });
                 }
             }
@@ -8227,7 +8353,7 @@ fn apply_icon_event(state: &SharedSessions, event: IconEvent) -> Option<IconUpda
     };
     if event.actual_thumbnail {
         app.thumbnail_cache
-            .insert((event.path.clone(), 96), event.icon.clone());
+            .insert((event.path.clone(), event.requested_px), event.icon.clone());
     } else {
         app.icon_cache.insert(event.path, event.icon);
     }
@@ -9536,6 +9662,7 @@ mod tests {
                 pixels: vec![0, 0, 0, 0],
             },
             actual_thumbnail: false,
+            requested_px: 0,
         };
         assert!(icon_event_is_current(&app, &event));
     }
@@ -10340,6 +10467,7 @@ mod tests {
                 pixels: vec![0, 0, 0, 0],
             },
             actual_thumbnail: false,
+            requested_px: 0,
         };
         assert!(icon_event_is_current(&app, &event));
 
@@ -10350,6 +10478,7 @@ mod tests {
             path: PathBuf::from("same"),
             icon: event.icon.clone(),
             actual_thumbnail: false,
+            requested_px: 0,
         };
         assert!(icon_event_is_current(&app, &location_event));
 
