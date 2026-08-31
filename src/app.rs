@@ -37,6 +37,13 @@ const ICON_WORKER_COUNT: usize = 2;
 
 type SharedSessions = Arc<Mutex<AppState>>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingFocus {
+    directory: PathBuf,
+    request_id: Option<RequestId>,
+    paths: Vec<PathBuf>,
+}
+
 #[derive(Debug)]
 struct AppState {
     tabs: HashMap<TabId, TabSession>,
@@ -58,7 +65,7 @@ struct AppState {
     operation_errors: Vec<String>,
     rename_target: Option<(TabId, EntryId)>,
     rename_extension: Option<std::ffi::OsString>,
-    focus_after_refresh: HashMap<TabId, PathBuf>,
+    focus_after_refresh: HashMap<TabId, PendingFocus>,
     pending_permanent_delete: Vec<OperationItem>,
     exit_after_cancel: bool,
     clipboard_has_files: bool,
@@ -541,7 +548,7 @@ enum FileOperationEvent {
         id: OperationId,
         result: OperationResult,
         item_states: Vec<(usize, ItemState, Option<String>)>,
-        completed_paths: Vec<PathBuf>,
+        completed_targets: Vec<PathBuf>,
     },
 }
 
@@ -880,6 +887,7 @@ fn submit_navigation(
     let request = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         app.icons.retain(|(icon_tab, _, _), _| *icon_tab != tab_id);
+        app.focus_after_refresh.remove(&tab_id);
         let Some(tab) = app.tabs.get_mut(&tab_id) else {
             return false;
         };
@@ -1045,9 +1053,46 @@ fn begin_rename_ui(weak: &slint::Weak<AppWindow>, state: &SharedSessions) {
     }
 }
 
-fn submit_rename(state: &SharedSessions, sender: &mpsc::Sender<FileOperationRequest>, name: &str) {
+fn rename_validation_message(
+    language: Language,
+    error: crate::fs::file_operations::NameValidationError,
+) -> String {
+    use crate::fs::file_operations::NameValidationError;
+    match (language, error) {
+        (Language::Chinese, NameValidationError::Empty) => "名称不能为空。".to_owned(),
+        (Language::English, NameValidationError::Empty) => "The name cannot be empty.".to_owned(),
+        (Language::Chinese, NameValidationError::DotName) => "不能使用这个名称。".to_owned(),
+        (Language::English, NameValidationError::DotName) => "This name cannot be used.".to_owned(),
+        (Language::Chinese, NameValidationError::InvalidCharacter(character)) => {
+            format!("名称不能包含字符“{character}”。")
+        }
+        (Language::English, NameValidationError::InvalidCharacter(character)) => {
+            format!("The name cannot contain '{character}'.")
+        }
+        (Language::Chinese, NameValidationError::TrailingSpaceOrDot) => {
+            "名称不能以空格或句点结尾。".to_owned()
+        }
+        (Language::English, NameValidationError::TrailingSpaceOrDot) => {
+            "The name cannot end with a space or period.".to_owned()
+        }
+        (Language::Chinese, NameValidationError::ReservedName) => {
+            "这是 Windows 保留名称，不能使用。".to_owned()
+        }
+        (Language::English, NameValidationError::ReservedName) => {
+            "This name is reserved by Windows.".to_owned()
+        }
+    }
+}
+
+fn submit_rename(
+    state: &SharedSessions,
+    sender: &mpsc::Sender<FileOperationRequest>,
+    name: &str,
+) -> Result<(), String> {
     let item = {
         let app = state.lock().expect("app state mutex is not poisoned");
+        crate::fs::file_operations::validate_name(std::ffi::OsStr::new(name))
+            .map_err(|error| rename_validation_message(app.language, error))?;
         let target = app.rename_target;
         target
             .and_then(|(tab_id, id)| app.tabs.get(&tab_id)?.visible_entry(id))
@@ -1062,9 +1107,11 @@ fn submit_rename(state: &SharedSessions, sender: &mpsc::Sender<FileOperationRequ
                 })
             })
     };
-    if let Some(item) = item {
-        enqueue_operation(state, sender, FileOperationKind::Rename, vec![item]);
-    }
+    let Some(item) = item else {
+        return Err("Rename target is no longer available.".to_owned());
+    };
+    enqueue_operation(state, sender, FileOperationKind::Rename, vec![item]);
+    Ok(())
 }
 
 fn should_fast_remove(path: &Path) -> bool {
@@ -1313,13 +1360,14 @@ fn wire_internal_drag_drop(
         start_x: f32,
         start_y: f32,
         outbound_started: bool,
+        right_button: bool,
     }
 
     let drag = Arc::new(Mutex::new(None::<InternalDrag>));
 
     let state_for_begin = state.clone();
     let drag_for_begin = drag.clone();
-    ui.on_begin_internal_drag(move |entry_id, x, y, _control, _shift| {
+    ui.on_begin_internal_drag(move |entry_id, x, y, _control, _shift, right_button| {
         let mut app = state_for_begin
             .lock()
             .expect("app state mutex is not poisoned");
@@ -1343,6 +1391,7 @@ fn wire_internal_drag_drop(
                 start_x: x,
                 start_y: y,
                 outbound_started: false,
+                right_button,
             });
         }
     });
@@ -1358,20 +1407,29 @@ fn wire_internal_drag_drop(
         let outbound = drag_for_update.lock().ok().and_then(|mut drag| {
             let drag = drag.as_mut()?;
             let distance = ((x - drag.start_x).powi(2) + (y - drag.start_y).powi(2)).sqrt();
-            if distance < 4.0 || drag.outbound_started {
+            if !should_release_internal_pointer_grab(distance, drag.outbound_started) {
                 return None;
             }
             drag.outbound_started = true;
-            Some((drag.paths.clone(), drag.source_directories.clone()))
+            Some((
+                drag.paths.clone(),
+                drag.source_directories.clone(),
+                drag.right_button,
+            ))
         });
-        let Some((paths, source_directories)) = outbound else {
+        let Some((paths, source_directories, right_button)) = outbound else {
             return;
         };
+        // OLE must own pointer routing before the window can receive its own native drop callbacks.
+        ui.invoke_release_internal_drag_pointer();
         ui.set_drop_hover_entry_id(-1);
-        match platform::windows::drag_drop::begin_outbound_drag(
+        eprintln!("drag-drop: threshold reached, entering DoDragDrop right_button={right_button}");
+        let outbound_result = platform::windows::drag_drop::begin_outbound_drag(
             &paths,
             platform::windows::drag_drop::DropEffect::Move,
-        ) {
+        );
+        eprintln!("drag-drop: DoDragDrop returned result={outbound_result:?}");
+        match outbound_result {
             Ok(result) if result.dropped => {
                 // External targets own the operation; refresh only the source views and never infer item removal.
                 refresh_affected_tabs(
@@ -1417,7 +1475,9 @@ fn wire_internal_drag_drop(
         let Some(target) = target else {
             return;
         };
-        let key_state = (if control { 8 } else { 0 }) | (if shift { 4 } else { 0 });
+        let key_state = (if control { 8 } else { 0 })
+            | (if shift { 4 } else { 0 })
+            | (if right_button { 2 } else { 0 });
         let (effect, reason) =
             platform::windows::drag_drop::negotiate_effect(&drag.paths, Some(&target), key_state);
         if reason.is_some() {
@@ -2558,10 +2618,22 @@ fn wire_callbacks(
     ui.on_begin_rename(move || {
         begin_rename_ui(&weak, &state_for_rename);
     });
+    let weak = ui.as_weak();
     let state_for_commit_rename = state.clone();
     let sender_for_rename = operation_sender.clone();
     ui.on_commit_rename(move |name| {
-        submit_rename(&state_for_commit_rename, &sender_for_rename, name.as_str());
+        if let Err(message) =
+            submit_rename(&state_for_commit_rename, &sender_for_rename, name.as_str())
+        {
+            if let Ok(mut app) = state_for_commit_rename.lock() {
+                app.operation_errors.push(message);
+            }
+            if let Some(ui) = weak.upgrade() {
+                ui.set_rename_submitting(false);
+                ui.set_rename_submit_generation(ui.get_rename_submit_generation() + 1);
+                refresh_ui(&ui, &state_for_commit_rename);
+            }
+        }
     });
     let weak = ui.as_weak();
     let state_for_cancel_rename = state.clone();
@@ -2571,6 +2643,7 @@ fn wire_callbacks(
             app.rename_extension = None;
         }
         if let Some(ui) = weak.upgrade() {
+            ui.set_rename_submitting(false);
             ui.set_rename_editing(false);
             refresh_ui(&ui, &state_for_cancel_rename);
         }
@@ -3016,6 +3089,9 @@ fn wire_mouse_navigation(ui: &AppWindow, exit_ui: &ConfirmationWindow, state: Sh
     });
 }
 
+fn should_release_internal_pointer_grab(distance: f32, outbound_started: bool) -> bool {
+    distance >= 4.0 && !outbound_started
+}
 fn drop_requires_choice(intent: &platform::windows::drag_drop::DropIntent) -> bool {
     intent.right_button
 }
@@ -3045,10 +3121,11 @@ fn selected_right_drop(
     if intent.allowed_effects & allowed == 0 {
         return Err("拖放来源不允许所选操作".to_owned());
     }
+    let validation_key_state = key_state | if intent.right_button { 2 } else { 0 };
     let (validated, reason) = platform::windows::drag_drop::negotiate_effect(
         &intent.paths,
         Some(&intent.target),
-        key_state,
+        validation_key_state,
     );
     if reason.is_some() || validated != effect {
         return Err("所选拖放操作未通过路径保护".to_owned());
@@ -3192,6 +3269,10 @@ fn wire_native_drag_drop(
     let weak_for_intents = ui.as_weak();
     thread::spawn(move || {
         while let Ok(intent) = intent_receiver.recv() {
+            eprintln!(
+                "drag-drop: intent received right_button={}",
+                intent.right_button
+            );
             if drop_requires_choice(&intent) {
                 let state_for_ui = state.clone();
                 let weak_for_ui = weak_for_intents.clone();
@@ -3219,6 +3300,7 @@ fn wire_native_drag_drop(
                     if let Ok(mut app) = state_for_ui.lock() {
                         app.pending_right_drop = Some(intent);
                     }
+                    eprintln!("drag-drop: showing right-drop menu x={x} y={y}");
                     ui.invoke_show_drop_menu(x, y);
                 });
             } else {
@@ -3351,8 +3433,11 @@ fn prepare_drop_operation(
             .file_name()
             .ok_or_else(|| "拖放来源没有可用名称".to_owned())?;
         let destination = intent.target.join(name);
-        if source == destination || intent.target.starts_with(&source) {
-            return Err("不能把项目拖放到自身或自身子目录".to_owned());
+        if intent.target.starts_with(&source)
+            || (source == destination
+                && intent.effect == platform::windows::drag_drop::DropEffect::Move)
+        {
+            return Err("不能把项目移动到自身或把项目拖放到自身子目录".to_owned());
         }
         items.push(OperationItem::pending(Some(source), Some(destination)));
     }
@@ -4384,6 +4469,54 @@ fn monitor_external_cut(
     });
 }
 
+fn completed_target_for_item(
+    item: &OperationItem,
+    completed_paths: &[PathBuf],
+    destination_was_existing_directory: bool,
+) -> Option<PathBuf> {
+    let destination = item.destination.as_deref()?;
+    if destination_was_existing_directory {
+        return None;
+    }
+    let parent = destination.parent()?;
+    completed_paths
+        .iter()
+        .rfind(|path| {
+            path.parent() == Some(parent) && item.source.as_deref() != Some(path.as_path())
+        })
+        .cloned()
+}
+
+fn queue_completed_focus(app: &mut AppState, targets: &[PathBuf]) {
+    let directories = targets
+        .iter()
+        .filter_map(|path| path.parent().map(Path::to_path_buf))
+        .collect::<std::collections::HashSet<_>>();
+    for directory in directories {
+        let paths = targets
+            .iter()
+            .filter(|path| path.parent() == Some(directory.as_path()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let matching_tabs = app
+            .tabs
+            .values()
+            .filter(|tab| tab.visible_path() == Some(directory.as_path()))
+            .map(|tab| tab.id)
+            .collect::<Vec<_>>();
+        for tab_id in matching_tabs {
+            app.focus_after_refresh.insert(
+                tab_id,
+                PendingFocus {
+                    directory: directory.clone(),
+                    request_id: None,
+                    paths: paths.clone(),
+                },
+            );
+        }
+    }
+}
+
 fn existing_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
     paths
         .iter()
@@ -4404,7 +4537,7 @@ fn spawn_file_operation_worker() -> (
             let mut failed = Vec::new();
             let mut affected = Vec::new();
             let mut indexed_states = Vec::new();
-            let mut completed_paths = Vec::new();
+            let mut completed_targets = Vec::new();
             let started = Instant::now();
             let totals = request
                 .items
@@ -4447,6 +4580,17 @@ fn spawn_file_operation_worker() -> (
                     indexed_states.push((item_index, ItemState::Cancelled, None));
                     continue;
                 }
+                let destination_was_existing_directory = item.source != item.destination
+                    && item
+                        .source
+                        .as_deref()
+                        .and_then(|path| std::fs::symlink_metadata(path).ok())
+                        .is_some_and(|metadata| metadata.file_type().is_dir())
+                    && item
+                        .destination
+                        .as_deref()
+                        .and_then(|path| std::fs::symlink_metadata(path).ok())
+                        .is_some_and(|metadata| metadata.file_type().is_dir());
                 let outcome = execute_file_operation_item(
                     request.id,
                     request.kind,
@@ -4465,7 +4609,16 @@ fn spawn_file_operation_worker() -> (
                     Ok(report) => {
                         processed_bytes = processed_bytes.saturating_add(report.bytes);
                         processed_files = processed_files.saturating_add(report.files);
-                        completed_paths.extend(report.completed_paths.iter().cloned());
+                        if report.skipped.is_empty()
+                            && let Some(target) = completed_target_for_item(
+                                item,
+                                &report.completed_paths,
+                                destination_was_existing_directory,
+                            )
+                            && !completed_targets.contains(&target)
+                        {
+                            completed_targets.push(target);
+                        }
                         let current_item = item
                             .source
                             .clone()
@@ -4523,7 +4676,7 @@ fn spawn_file_operation_worker() -> (
                     affected_directories: affected,
                 },
                 item_states: indexed_states,
-                completed_paths,
+                completed_targets,
             });
         }
     });
@@ -4824,19 +4977,6 @@ fn start_file_operation_event_pump(
                     FileOperationEvent::DestinationCreated { path, .. } => {
                         let parent = path.parent().map(Path::to_path_buf);
                         if let Some(parent) = parent {
-                            if let Ok(mut app) = state.lock() {
-                                let matching_tabs = app
-                                    .tabs
-                                    .values()
-                                    .filter(|tab| {
-                                        tab.visible_path().is_some_and(|visible| visible == parent)
-                                    })
-                                    .map(|tab| tab.id)
-                                    .collect::<Vec<_>>();
-                                for tab_id in matching_tabs {
-                                    app.focus_after_refresh.insert(tab_id, path.clone());
-                                }
-                            }
                             refresh_affected_tabs(&directory_sender, &state, &[parent]);
                         }
                     }
@@ -4893,75 +5033,47 @@ fn start_file_operation_event_pump(
                         id,
                         result,
                         item_states,
-                        completed_paths,
+                        completed_targets,
                     } => {
-                        let (affected, next) = {
-                            let mut app = state.lock().expect("app state mutex is not poisoned");
-                            if let Some(task) = app.operations.task_mut(id) {
-                                for (index, status, error) in item_states {
-                                    if let Some(item) = task.items.get_mut(index) {
-                                        item.state = status;
-                                        item.error = error;
+                        let (affected, next) =
+                            {
+                                let mut app =
+                                    state.lock().expect("app state mutex is not poisoned");
+                                if let Some(task) = app.operations.task_mut(id) {
+                                    for (index, status, error) in item_states {
+                                        if let Some(item) = task.items.get_mut(index) {
+                                            item.state = status;
+                                            item.error = error;
+                                        }
                                     }
                                 }
-                            }
-                            let cancelled = app
-                                .operations
-                                .task(id)
-                                .is_some_and(|task| task.cancellation.is_cancelled());
-                            let terminal = if cancelled
-                                && result.succeeded.is_empty()
-                                && result.failed.is_empty()
-                            {
-                                OperationState::Cancelled
-                            } else if cancelled
-                                || (!result.failed.is_empty() && !result.succeeded.is_empty())
-                            {
-                                OperationState::PartiallyCompleted
-                            } else if result.failed.is_empty() {
-                                OperationState::Completed
-                            } else {
-                                OperationState::Failed
-                            };
-                            let affected = result.affected_directories.clone();
-                            app.conflict_responses.remove(&id);
-                            if let Some(origin_tab) =
-                                app.operations.task(id).and_then(|task| task.origin_tab)
-                                && let Some(target) = completed_paths.last().cloned()
-                            {
-                                let visible_path =
-                                    app.tabs.get(&origin_tab).and_then(|tab| tab.visible_path());
-                                if target.parent().is_some_and(|parent| {
-                                    visible_path.is_some_and(|path| path == parent)
-                                }) {
-                                    app.focus_after_refresh.insert(origin_tab, target);
+                                let cancelled = app
+                                    .operations
+                                    .task(id)
+                                    .is_some_and(|task| task.cancellation.is_cancelled());
+                                let terminal = if cancelled
+                                    && result.succeeded.is_empty()
+                                    && result.failed.is_empty()
+                                {
+                                    OperationState::Cancelled
+                                } else if cancelled
+                                    || (!result.failed.is_empty() && !result.succeeded.is_empty())
+                                {
+                                    OperationState::PartiallyCompleted
+                                } else if result.failed.is_empty() {
+                                    OperationState::Completed
+                                } else {
+                                    OperationState::Failed
+                                };
+                                let affected = result.affected_directories.clone();
+                                app.conflict_responses.remove(&id);
+                                queue_completed_focus(&mut app, &completed_targets);
+                                let _ = app.operations.finish(id, terminal, result);
+                                if cancelled {
+                                    app.operations.remove_terminal(id);
                                 }
-                            }
-                            if let Some(target) = completed_paths.last() {
-                                let matching_tabs = app
-                                    .tabs
-                                    .values()
-                                    .filter(|tab| {
-                                        target.parent().is_some_and(|parent| {
-                                            tab.visible_path().is_some_and(|path| path == parent)
-                                        })
-                                    })
-                                    .map(|tab| tab.id)
-                                    .collect::<Vec<_>>();
-                                for tab_id in matching_tabs {
-                                    app.focus_after_refresh.insert(tab_id, target.clone());
-                                }
-                            }
-                            let _ = app.operations.finish(id, terminal, result);
-                            if cancelled {
-                                app.operations.remove_terminal(id);
-                            }
-                            let next =
-                                app.operations
-                                    .start_next()
-                                    .ok()
-                                    .flatten()
-                                    .and_then(|next_id| {
+                                let next = app.operations.start_next().ok().flatten().and_then(
+                                    |next_id| {
                                         let _ = app.operations.mark_running(next_id);
                                         app.operations.task(next_id).map(|task| {
                                             FileOperationRequest {
@@ -4971,9 +5083,10 @@ fn start_file_operation_event_pump(
                                                 cancellation: task.cancellation.clone(),
                                             }
                                         })
-                                    });
-                            (affected, next)
-                        };
+                                    },
+                                );
+                                (affected, next)
+                            };
                         if let Some(request) = next {
                             let _ = sender.send(request);
                         }
@@ -4996,7 +5109,23 @@ fn start_file_operation_event_pump(
                             app.rename_target = None;
                             app.rename_extension = None;
                         }
+                        ui.set_rename_submitting(false);
                         ui.set_rename_editing(false);
+                    } else {
+                        let failed_rename = state
+                            .lock()
+                            .ok()
+                            .and_then(|app| app.operations.task(event_operation_id).cloned())
+                            .filter(|task| task.kind == FileOperationKind::Rename)
+                            .filter(|task| task.state != OperationState::Running)
+                            .and_then(|task| task.items.into_iter().find_map(|item| item.error));
+                        if let Some(message) = failed_rename {
+                            if let Ok(mut app) = state.lock() {
+                                app.operation_errors.push(message);
+                            }
+                            ui.set_rename_submitting(false);
+                            ui.set_rename_submit_generation(ui.get_rename_submit_generation() + 1);
+                        }
                     }
                     refresh_ui(&ui, &state);
                     if state.lock().is_ok_and(|app| {
@@ -5147,7 +5276,18 @@ fn refresh_affected_tabs(
             .collect::<Vec<_>>()
     };
     for (tab, path) in targets {
-        submit_navigation(sender, state, tab, path, NavigationKind::Refresh);
+        let pending = state
+            .lock()
+            .ok()
+            .and_then(|mut app| app.focus_after_refresh.remove(&tab))
+            .filter(|pending| pending.directory == path);
+        if submit_navigation(sender, state, tab, path.clone(), NavigationKind::Refresh)
+            && let Some(mut pending) = pending
+            && let Ok(mut app) = state.lock()
+        {
+            pending.request_id = app.tabs.get(&tab).map(|session| session.latest_request);
+            app.focus_after_refresh.insert(tab, pending);
+        }
     }
 }
 
@@ -5273,6 +5413,9 @@ fn start_event_pump(
                             submit_folder_sizes(&everything_sender, &state, tab_id, request_id);
                         }
                         refresh_ui(&ui, &state);
+                        if let Some((tab_id, request_id)) = finished {
+                            reveal_focused_entry(&ui, &state, tab_id, request_id);
+                        }
                     }
                 })
                 .is_err()
@@ -5281,6 +5424,39 @@ fn start_event_pump(
             }
         }
     });
+}
+
+fn reveal_focused_entry(
+    ui: &AppWindow,
+    state: &SharedSessions,
+    tab_id: TabId,
+    request_id: RequestId,
+) {
+    const ROW_HEIGHT: f32 = 40.0;
+    let index = state.lock().ok().and_then(|app| {
+        (app.active_tab == tab_id)
+            .then(|| app.tabs.get(&tab_id))
+            .flatten()
+            .filter(|tab| tab.latest_request == request_id)
+            .and_then(|tab| tab.focused.and_then(|id| tab.visible_entry_index(id)))
+    });
+    let Some(index) = index else {
+        return;
+    };
+    let window_height = ui.window().size().height as f32 / ui.window().scale_factor();
+    let visible_height = (window_height - ui.get_file_list_top() - 30.0).max(ROW_HEIGHT);
+    let current = ui.get_file_viewport_y();
+    let row_top = index as f32 * ROW_HEIGHT + current;
+    let row_bottom = row_top + ROW_HEIGHT;
+    let viewport = if row_top < 0.0 {
+        -(index as f32 * ROW_HEIGHT)
+    } else if row_bottom > visible_height {
+        visible_height - (index as f32 + 1.0) * ROW_HEIGHT
+    } else {
+        current
+    };
+    let maximum = (ui.get_files().row_count() as f32 * ROW_HEIGHT - visible_height).max(0.0);
+    ui.set_file_viewport_y(viewport.clamp(-maximum, 0.0));
 }
 
 fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest> {
@@ -5320,28 +5496,51 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
             path,
             skipped,
         } => {
-            let focus_target = app.focus_after_refresh.remove(&tab_id);
-            if let Some(tab) = app.tabs.get_mut(&tab_id)
-                && tab.accepts(request_id)
-            {
-                tab.sort_pending();
-                tab.commit_pending();
-                tab.commit_path(path);
-                if let Some(target) = focus_target
-                    && let Some(id) = tab
-                        .entries
-                        .iter()
-                        .find(|entry| entry.path == target)
-                        .map(|entry| entry.id)
-                {
-                    tab.select_entry(id, false, false);
+            let accepted = app
+                .tabs
+                .get(&tab_id)
+                .is_some_and(|tab| tab.accepts(request_id));
+            let focus = accepted
+                .then(|| app.focus_after_refresh.get(&tab_id).cloned())
+                .flatten()
+                .filter(|pending| {
+                    pending.request_id == Some(request_id) && pending.directory == path
+                });
+            if accepted {
+                let consumed_focus = focus.is_some();
+                let location_path = {
+                    let tab = app.tabs.get_mut(&tab_id).expect("accepted tab exists");
+                    tab.sort_pending();
+                    tab.commit_pending();
+                    tab.commit_path(path);
+                    if let Some(focus) = focus.as_ref() {
+                        let ids = focus
+                            .paths
+                            .iter()
+                            .filter_map(|target| {
+                                tab.entries
+                                    .iter()
+                                    .find(|entry| entry.path == *target)
+                                    .map(|entry| entry.id)
+                            })
+                            .collect::<Vec<_>>();
+                        if let Some(focused) = ids.last().copied() {
+                            tab.selected = ids;
+                            tab.focused = Some(focused);
+                            tab.selection_anchor = Some(focused);
+                        }
+                    }
+                    tab.error = (skipped > 0).then(|| skipped.to_string());
+                    tab.current_path.clone().expect("committed path exists")
+                };
+                if consumed_focus {
+                    app.focus_after_refresh.remove(&tab_id);
                 }
-                tab.error = (skipped > 0).then(|| skipped.to_string());
                 icon_requests.push(IconRequest {
                     tab_id,
                     request_id,
                     target: IconTarget::Location,
-                    path: tab.current_path.clone().expect("committed path exists"),
+                    path: location_path,
                 });
             }
         }
@@ -7584,6 +7783,134 @@ mod tests {
             FolderSizeState::Value(0)
         );
     }
+
+    fn focus_entry(id: u32, path: &str) -> FileEntry {
+        FileEntry {
+            id: EntryId(id),
+            original_name: Path::new(path).file_name().unwrap().to_os_string(),
+            display_name: Path::new(path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            name_highlights: Vec::new(),
+            path: PathBuf::from(path),
+            kind: crate::domain::EntryKind::File,
+            open_target: None,
+            parent_display: String::new(),
+            size_bytes: Some(1),
+            folder_size: crate::domain::FolderSizeState::Unknown,
+            modified: None,
+        }
+    }
+
+    #[test]
+    fn completed_focus_selects_all_targets_in_every_matching_tab() {
+        let mut app = AppState::new_for_test(
+            vec![PathBuf::from(r"C:\target"), PathBuf::from(r"C:\target")],
+            0,
+            [0, 1, 2, 3],
+        );
+        let targets = vec![
+            PathBuf::from(r"C:\target\first.txt"),
+            PathBuf::from(r"C:\target\second.txt"),
+        ];
+        queue_completed_focus(&mut app, &targets);
+        for tab_id in [TabId(1), TabId(2)] {
+            let tab = app.tabs.get_mut(&tab_id).unwrap();
+            let (_, cancel) =
+                tab.begin_navigation(PathBuf::from(r"C:\target"), NavigationKind::Refresh);
+            assert!(!cancel.load(std::sync::atomic::Ordering::Acquire));
+            let request_id = tab.latest_request;
+            tab.pending_entries = vec![
+                focus_entry(1, r"C:\target\first.txt"),
+                focus_entry(2, r"C:\target\second.txt"),
+            ];
+            app.focus_after_refresh.get_mut(&tab_id).unwrap().request_id = Some(request_id);
+        }
+        let state = Arc::new(Mutex::new(app));
+        for tab_id in [TabId(1), TabId(2)] {
+            apply_event(
+                &state,
+                DirectoryEvent::Finished {
+                    tab_id,
+                    request_id: RequestId(1),
+                    path: PathBuf::from(r"C:\target"),
+                    skipped: 0,
+                },
+            );
+        }
+        let app = state.lock().unwrap();
+        for tab_id in [TabId(1), TabId(2)] {
+            let tab = &app.tabs[&tab_id];
+            assert_eq!(tab.selected, vec![EntryId(1), EntryId(2)]);
+            assert_eq!(tab.focused, Some(EntryId(2)));
+        }
+    }
+
+    #[test]
+    fn stale_refresh_does_not_consume_completed_focus() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\target")], 0, [0, 1, 2, 3]);
+        queue_completed_focus(&mut app, &[PathBuf::from(r"C:\target\item.txt")]);
+        app.focus_after_refresh
+            .get_mut(&TabId(1))
+            .unwrap()
+            .request_id = Some(RequestId(8));
+        let state = Arc::new(Mutex::new(app));
+        apply_event(
+            &state,
+            DirectoryEvent::Finished {
+                tab_id: TabId(1),
+                request_id: RequestId(7),
+                path: PathBuf::from(r"C:\target"),
+                skipped: 0,
+            },
+        );
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .focus_after_refresh
+                .contains_key(&TabId(1))
+        );
+    }
+
+    #[test]
+    fn final_target_uses_keep_both_path_and_excludes_existing_merge_root() {
+        let item = OperationItem::pending(
+            Some(PathBuf::from(r"C:\source\name.txt")),
+            Some(PathBuf::from(r"C:\target\name.txt")),
+        );
+        let kept = PathBuf::from(r"C:\target\name (2).txt");
+        assert_eq!(
+            completed_target_for_item(&item, std::slice::from_ref(&kept), false),
+            Some(kept)
+        );
+        assert_eq!(
+            completed_target_for_item(
+                &OperationItem::pending(
+                    Some(PathBuf::from(r"C:\source\folder")),
+                    Some(PathBuf::from(r"C:\target\folder")),
+                ),
+                &[PathBuf::from(r"C:\target\folder")],
+                true,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rename_validation_keeps_invalid_names_out_of_operation_queue() {
+        assert!(crate::fs::file_operations::validate_name(std::ffi::OsStr::new("")).is_err());
+        assert!(
+            crate::fs::file_operations::validate_name(std::ffi::OsStr::new("bad?.txt")).is_err()
+        );
+        assert!(
+            crate::fs::file_operations::validate_name(std::ffi::OsStr::new("valid.txt")).is_ok()
+        );
+        assert!(!keyboard_shortcuts_suppressed(false));
+        assert!(keyboard_shortcuts_suppressed(true));
+    }
     #[test]
     fn permission_page_has_actionable_copy_in_both_languages() {
         for language in [Language::Chinese, Language::English] {
@@ -7868,6 +8195,12 @@ mod tests {
         );
         std::fs::remove_dir_all(temporary).unwrap();
     }
+    #[test]
+    fn internal_drag_releases_pointer_grab_once_before_ole() {
+        assert!(!should_release_internal_pointer_grab(3.9, false));
+        assert!(should_release_internal_pointer_grab(4.0, false));
+        assert!(!should_release_internal_pointer_grab(8.0, true));
+    }
     fn right_drop_intent(
         paths: Vec<PathBuf>,
         target: PathBuf,
@@ -7941,9 +8274,69 @@ mod tests {
         let same_location = right_drop_intent(
             vec![PathBuf::from(r"C:\Target\item.txt")],
             PathBuf::from(r"C:\Target"),
-            platform::windows::drag_drop::ALLOW_COPY,
+            platform::windows::drag_drop::ALLOW_COPY
+                | platform::windows::drag_drop::ALLOW_MOVE
+                | platform::windows::drag_drop::ALLOW_LINK,
         );
-        assert!(selected_right_drop(same_location, 1).is_err());
+        assert_eq!(
+            selected_right_drop(same_location.clone(), 1)
+                .unwrap()
+                .unwrap()
+                .effect,
+            platform::windows::drag_drop::DropEffect::Copy
+        );
+        assert!(selected_right_drop(same_location.clone(), 2).is_err());
+        assert_eq!(
+            selected_right_drop(same_location, 3)
+                .unwrap()
+                .unwrap()
+                .effect,
+            platform::windows::drag_drop::DropEffect::Link
+        );
+    }
+
+    #[test]
+    fn same_folder_drop_preflight_keeps_copy_and_link_executable() {
+        let temporary = std::env::temp_dir().join(format!(
+            "asterfiles-same-folder-drop-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&temporary);
+        std::fs::create_dir_all(&temporary).unwrap();
+        let source = temporary.join("Report.txt");
+        std::fs::write(&source, b"source").unwrap();
+        let allowed =
+            platform::windows::drag_drop::ALLOW_COPY | platform::windows::drag_drop::ALLOW_LINK;
+
+        let copy = selected_right_drop(
+            right_drop_intent(vec![source.clone()], temporary.clone(), allowed),
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        let PreparedDrop::Operation(FileOperationKind::Copy, copy_items) =
+            prepare_drop_operation(copy).unwrap()
+        else {
+            panic!("same-folder copy must remain executable");
+        };
+        assert_eq!(copy_items[0].source.as_deref(), Some(source.as_path()));
+        assert_eq!(copy_items[0].destination.as_deref(), Some(source.as_path()));
+
+        let link = selected_right_drop(
+            right_drop_intent(vec![source.clone()], temporary.clone(), allowed),
+            3,
+        )
+        .unwrap()
+        .unwrap();
+        let PreparedDrop::Shortcuts(shortcuts) = prepare_drop_operation(link).unwrap() else {
+            panic!("same-folder link must remain executable");
+        };
+        assert_eq!(shortcuts[0].0, source);
+        assert_eq!(shortcuts[0].1, temporary.join("Report.lnk"));
+        create_drop_shortcuts(shortcuts).unwrap();
+        assert!(temporary.join("Report.lnk").is_file());
+        std::fs::remove_dir_all(temporary).unwrap();
     }
 
     #[test]

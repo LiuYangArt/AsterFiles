@@ -37,7 +37,11 @@ use windows::{
             },
             SystemServices::{MK_CONTROL, MK_LBUTTON, MK_RBUTTON, MK_SHIFT, MODIFIERKEYS_FLAGS},
         },
-        UI::Shell::{DROPFILES, DragQueryFileW, HDROP, SHCreateStdEnumFmtEtc},
+        UI::Shell::{
+            Common::ITEMIDLIST, DROPFILES, DragQueryFileW, HDROP, ILClone, ILFindLastID, ILIsEqual,
+            ILRemoveLastID, SHCreateDataObject, SHCreateStdEnumFmtEtc, SHGetDesktopFolder,
+            SHGetIDListFromObject, SHParseDisplayName,
+        },
     },
     core::{Error as WindowsError, HRESULT, PCWSTR, Ref, implement},
 };
@@ -385,19 +389,25 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
         let offered = unsafe { native_effect.as_ref() }
             .copied()
             .unwrap_or(DROPEFFECT_NONE);
-        let (effect, reason) = negotiate_effect(&paths, target.as_deref(), key_state.0);
+        let (offered_effects, tracked_right_button) = self
+            .context
+            .lock()
+            .map(|context| (context.allowed_effects, context.right_button))
+            .unwrap_or_else(|_| (allowed_effects(offered), false));
+        let right_button = tracked_right_button || key_state.0 & MK_RBUTTON.0 != 0;
+        let effective_key_state = drop_key_state(key_state.0, right_button);
+        let (effect, reason) = negotiate_effect(&paths, target.as_deref(), effective_key_state);
         set_native_effect(native_effect, effect);
         if let (Some(target), None) = (target.clone(), reason) {
-            let (allowed_effects, tracked_right_button) = self
-                .context
-                .lock()
-                .map(|context| (context.allowed_effects, context.right_button))
-                .unwrap_or_else(|_| (allowed_effects(offered), false));
+            let allowed_effects = allowed_effects_for_target(&paths, &target, offered_effects);
+            eprintln!(
+                "drag-drop: native Drop right_button={right_button} allowed_effects={allowed_effects}"
+            );
             let _ = self.intents.send(DropIntent {
                 paths: paths.clone(),
                 target,
                 effect,
-                right_button: tracked_right_button || key_state.0 & MK_RBUTTON.0 != 0,
+                right_button,
                 screen_x: _point.x,
                 screen_y: _point.y,
                 allowed_effects,
@@ -437,6 +447,27 @@ pub fn allowed_effects(effect: DROPEFFECT) -> u32 {
     }
     allowed
 }
+pub fn drop_key_state(key_state: u32, tracked_right_button: bool) -> u32 {
+    key_state
+        | if tracked_right_button {
+            MK_RBUTTON.0
+        } else {
+            0
+        }
+}
+pub fn is_same_location(paths: &[PathBuf], target: &Path) -> bool {
+    paths
+        .iter()
+        .any(|path| path == target || path.parent() == Some(target))
+}
+
+pub fn allowed_effects_for_target(paths: &[PathBuf], target: &Path, offered: u32) -> u32 {
+    if is_same_location(paths, target) {
+        offered & (ALLOW_COPY | ALLOW_LINK)
+    } else {
+        offered
+    }
+}
 pub fn negotiate_effect(
     paths: &[PathBuf],
     target: Option<&Path>,
@@ -448,10 +479,15 @@ pub fn negotiate_effect(
     if paths.is_empty() {
         return (DropEffect::None, Some("unsupported_data"));
     }
-    if paths
-        .iter()
-        .any(|path| path == target || path.parent() == Some(target))
-    {
+    if is_same_location(paths, target) {
+        if key_state & MK_ALT != 0
+            || key_state & (MK_CONTROL.0 | MK_SHIFT.0) == (MK_CONTROL.0 | MK_SHIFT.0)
+        {
+            return (DropEffect::Link, None);
+        }
+        if key_state & MK_CONTROL.0 != 0 || key_state & MK_RBUTTON.0 != 0 {
+            return (DropEffect::Copy, None);
+        }
         return (DropEffect::None, Some("same_location"));
     }
     if paths.iter().any(|path| target.starts_with(path)) {
@@ -552,7 +588,7 @@ pub fn begin_outbound_drag(
     let preferred_format = clipboard_format("Preferred DropEffect")?;
     let performed_format = clipboard_format("Performed DropEffect")?;
     let performed_effect = Arc::new(Mutex::new(None));
-    let data_object = IDataObject::from(OutboundDataObject {
+    let supplemental = IDataObject::from(OutboundDataObject {
         formats: vec![
             (CF_HDROP, encode_dropfiles(paths)?),
             (
@@ -563,6 +599,7 @@ pub fn begin_outbound_drag(
         performed_format,
         performed_effect: performed_effect.clone(),
     });
+    let data_object = shell_data_object(paths, &supplemental)?;
     let drop_source = IDropSource::from(NativeDropSource);
     let allowed = DROPEFFECT(DROPEFFECT_COPY.0 | DROPEFFECT_MOVE.0 | DROPEFFECT_LINK.0);
     let mut native_effect = DROPEFFECT_NONE;
@@ -584,6 +621,69 @@ pub fn begin_outbound_drag(
     })
 }
 
+fn shell_data_object(paths: &[PathBuf], supplemental: &IDataObject) -> io::Result<IDataObject> {
+    let mut pidls = Vec::<*mut ITEMIDLIST>::with_capacity(paths.len());
+    let mut parent_pidls = Vec::<*mut ITEMIDLIST>::with_capacity(paths.len());
+    let result = (|| {
+        for path in paths {
+            validate_drag_path(path)?;
+            let wide = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            let mut pidl = ptr::null_mut();
+            unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut pidl, 0, None) }
+                .map_err(windows_error)?;
+            let parent = unsafe { ILClone(pidl) };
+            if parent.is_null() || !unsafe { ILRemoveLastID(Some(parent)) }.as_bool() {
+                return Err(io::Error::other("unable to resolve outbound Shell parent"));
+            }
+            pidls.push(pidl);
+            parent_pidls.push(parent);
+        }
+        let common_parent = parent_pidls.first().copied().filter(|first| {
+            parent_pidls
+                .iter()
+                .all(|candidate| unsafe { ILIsEqual(*first, *candidate) }.as_bool())
+        });
+        if let Some(parent) = common_parent {
+            let children = pidls
+                .iter()
+                .map(|pidl| unsafe { ILFindLastID(*pidl) }.cast_const())
+                .collect::<Vec<_>>();
+            unsafe {
+                SHCreateDataObject::<_, IDataObject>(
+                    Some(parent.cast_const()),
+                    Some(&children),
+                    supplemental,
+                )
+            }
+            .map_err(windows_error)
+        } else {
+            let absolute = pidls
+                .iter()
+                .map(|pidl| pidl.cast_const())
+                .collect::<Vec<_>>();
+            let desktop = unsafe { SHGetDesktopFolder() }.map_err(windows_error)?;
+            let desktop_pidl = unsafe { SHGetIDListFromObject(&desktop) }.map_err(windows_error)?;
+            let created = unsafe {
+                SHCreateDataObject::<_, IDataObject>(
+                    Some(desktop_pidl.cast_const()),
+                    Some(&absolute),
+                    supplemental,
+                )
+            }
+            .map_err(windows_error);
+            unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(desktop_pidl.cast())) };
+            created
+        }
+    })();
+    for pidl in pidls.into_iter().chain(parent_pidls) {
+        unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(pidl.cast())) };
+    }
+    result
+}
 struct OleApartment;
 
 impl OleApartment {
@@ -963,6 +1063,45 @@ mod tests {
     }
 
     #[test]
+    fn shell_data_object_exposes_shell_id_list_for_explorer_link_menu() {
+        let _ole = OleApartment::initialize().unwrap();
+        let temporary = std::env::temp_dir().join(format!(
+            "asterfiles-shell-data-object-{}-{:?}.txt",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&temporary, b"drag").unwrap();
+        let preferred_format = clipboard_format("Preferred DropEffect").unwrap();
+        let performed_format = clipboard_format("Performed DropEffect").unwrap();
+        let supplemental = IDataObject::from(OutboundDataObject {
+            formats: vec![
+                (
+                    CF_HDROP,
+                    encode_dropfiles(std::slice::from_ref(&temporary)).unwrap(),
+                ),
+                (preferred_format, DROPEFFECT_MOVE.0.to_ne_bytes().to_vec()),
+            ],
+            performed_format,
+            performed_effect: Arc::new(Mutex::new(None)),
+        });
+        let data = shell_data_object(std::slice::from_ref(&temporary), &supplemental).unwrap();
+        let shell_id_list = clipboard_format("Shell IDList Array").unwrap();
+        assert_eq!(
+            unsafe { data.QueryGetData(&format_etc(CF_HDROP)) },
+            HRESULT(0)
+        );
+        assert_eq!(
+            unsafe { data.QueryGetData(&format_etc(shell_id_list)) },
+            HRESULT(0)
+        );
+        assert_eq!(
+            unsafe { data.QueryGetData(&format_etc(preferred_format)) },
+            HRESULT(0)
+        );
+        std::fs::remove_file(temporary).unwrap();
+    }
+
+    #[test]
     fn outbound_data_formats_match_explorer_contract() {
         let preferred_format = 0xC123;
         let performed_format = 0xC124;
@@ -1074,6 +1213,30 @@ mod tests {
         assert_eq!(
             negotiate_effect(&source, Some(Path::new(r"C:\Target")), MK_ALT),
             (DropEffect::Link, None)
+        );
+    }
+
+    #[test]
+    fn drop_uses_tracked_right_button_after_button_release() {
+        assert_eq!(drop_key_state(0, true) & MK_RBUTTON.0, MK_RBUTTON.0);
+        assert_eq!(drop_key_state(0, false) & MK_RBUTTON.0, 0);
+    }
+
+    #[test]
+    fn same_folder_right_drop_allows_copy_and_link_but_not_move() {
+        let paths = vec![PathBuf::from(r"C:\Target\item.txt")];
+        let target = Path::new(r"C:\Target");
+        assert_eq!(
+            negotiate_effect(&paths, Some(target), MK_RBUTTON.0),
+            (DropEffect::Copy, None)
+        );
+        assert_eq!(
+            allowed_effects_for_target(&paths, target, ALLOW_COPY | ALLOW_MOVE | ALLOW_LINK),
+            ALLOW_COPY | ALLOW_LINK
+        );
+        assert_eq!(
+            negotiate_effect(&paths, Some(target), 0),
+            (DropEffect::None, Some("same_location"))
         );
     }
 

@@ -623,6 +623,7 @@ export component AppWindow inherits Window {
     out property <length> file-list-top: 0px;
     in-out property <bool> context-menu-open: false;
     in-out property <bool> drop-menu-open: false;
+    private property <bool> internal-drag-pointer-active: false;
     in property <bool> drop-can-copy: false;
     in property <bool> drop-can-move: false;
     in property <bool> drop-can-link: false;
@@ -635,6 +636,8 @@ export component AppWindow inherits Window {
     in-out property <string> rename-input: "";
     in property <int> rename-entry-id: -1;
     in property <bool> rename-editing: false;
+    in-out property <bool> rename-submitting: false;
+    in-out property <int> rename-submit-generation: 0;
     in property <string> operation-error: "";
     in property <bool> context-menu-has-entry: false;
     in-out property <bool> quick-access-expanded: true;
@@ -759,8 +762,11 @@ export component AppWindow inherits Window {
     callback resize-column(int, float);
     callback open-entry(int);
     callback activate-entry(int, bool, bool);
-    callback begin-internal-drag(int, float, float, bool, bool);
+    callback begin-internal-drag(int, float, float, bool, bool, bool);
     callback update-internal-drag(float, float);
+    public function release-internal-drag-pointer() {
+        root.internal-drag-pointer-active = false;
+    }
     callback end-internal-drag(float, float, bool, bool, bool);
     callback choose-drop-effect(int);
     public function show-drop-menu(x: float, y: float) {
@@ -1235,9 +1241,11 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: 13px; horizontal-alig
                                             }
                                         }
                                         if root.rename-editing && root.rename-entry-id == entry.id: Rectangle {
+                                            z: 101;
                                             private property <bool> editor-active: false;
                                             private property <bool> submitted: false;
                                             private property <bool> editor-has-focus: rename-editor.has-focus;
+                                            private property <int> submit-generation: root.rename-submit-generation;
                                             x: column.content-left + column.icon-slot;
                                             width: parent.width - column.content-left - column.content-right - column.icon-slot;
                                             height: 30px;
@@ -1246,14 +1254,14 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: 13px; horizontal-alig
                                             border-width: 1px;
                                             border-radius: 3px;
                                             init => { self.editor-active = true; }
+                                            changed submit-generation => {
+                                                self.submitted = false;
+                                                rename-editor.focus();
+                                            }
                                             changed editor-has-focus => {
 if self.editor-active && !self.editor-has-focus && !self.submitted {
     self.submitted = true;
-    if root.rename-input == "" {
-        root.cancel-rename();
-    } else {
-        root.commit-rename(root.rename-input);
-    }
+    root.commit-rename(root.rename-input);
 }
                                             }
                                             rename-editor := TextInput {
@@ -1272,8 +1280,11 @@ init => {
     self.select-all();
 }
 accepted => {
-    parent.submitted = true;
-    root.commit-rename(root.rename-input);
+    if !root.rename-submitting {
+        parent.submitted = true;
+        root.rename-submitting = true;
+        root.commit-rename(root.rename-input);
+    }
 }
 key-pressed(event) => {
     if event.text == Key.Escape {
@@ -1306,42 +1317,34 @@ accessible-label: entry.name;
                                 enabled: entry.loaded && !(root.rename-editing && root.rename-entry-id == entry.id);
                                 private property <bool> click-control: false;
                                 private property <bool> click-shift: false;
-                                private property <bool> drag-started: false;
+                                private property <bool> pressed-here: false;
                                 mouse-cursor: pointer;
                                 pointer-event(event) => {
                                     if event.kind == PointerEventKind.down {
                                         self.click-control = event.modifiers.control;
                                         self.click-shift = event.modifiers.shift;
                                         if event.button == PointerEventButton.left || event.button == PointerEventButton.right {
-                                            self.drag-started = true;
+                                            self.pressed-here = true;
+                                            root.internal-drag-pointer-active = true;
                                             root.begin-internal-drag(
                                                 entry.id,
                                                 (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
                                                 (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px,
                                                 event.modifiers.control,
-                                                event.modifiers.shift
-                                            );
-                                        }
-                                        if event.button == PointerEventButton.right && !self.drag-started {
-                                            root.context-menu-anchor-x = self.absolute-position.x + self.mouse-x - root.absolute-position.x;
-                                            root.context-menu-anchor-y = self.absolute-position.y + self.mouse-y - root.absolute-position.y;
-                                            root.keyboard-menu-anchor-x = root.context-menu-anchor-x;
-                                            root.keyboard-menu-anchor-y = root.context-menu-anchor-y;
-                                            root.show-entry-menu(
-entry.id,
-root.context-menu-anchor-x / 1px,
-root.context-menu-anchor-y / 1px
+                                                event.modifiers.shift,
+                                                event.button == PointerEventButton.right
                                             );
                                         }
                                     }
-                                    if event.kind == PointerEventKind.move && self.drag-started {
+                                    if event.kind == PointerEventKind.move && self.pressed-here && root.internal-drag-pointer-active {
                                         root.update-internal-drag(
                                             (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
                                             (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px
                                         );
                                     }
-                                    if event.kind == PointerEventKind.up && (event.button == PointerEventButton.left || event.button == PointerEventButton.right) && self.drag-started {
-                                        self.drag-started = false;
+                                    if event.kind == PointerEventKind.up && (event.button == PointerEventButton.left || event.button == PointerEventButton.right) && self.pressed-here && root.internal-drag-pointer-active {
+                                        self.pressed-here = false;
+                                        root.internal-drag-pointer-active = false;
                                         root.end-internal-drag(
                                             (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
                                             (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px,
@@ -1433,7 +1436,7 @@ root.context-menu-anchor-y / 1px
 
                 Rectangle {
                     height: 30px; background: VisualStyle.cfafbfc;
-                    Text { x: 14px; text: root.status-text; color: VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; }
+                    Text { x: 14px; text: root.operation-error != "" && root.rename-editing ? root.operation-error : root.status-text; color: root.operation-error != "" && root.rename-editing ? VisualStyle.cc42b1c : VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; }
                     Rectangle {
                         visible: root.operations.length > 0;
                         x: parent.width - 126px; width: 118px; height: 26px; y: 2px; border-radius: 5px;
@@ -1602,6 +1605,18 @@ root.context-menu-anchor-y / 1px
             }
         }
     }
+    if root.rename-editing: TouchArea {
+        z: 100;
+        width: parent.width;
+        height: parent.height;
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down && event.button == PointerEventButton.left && !root.rename-submitting {
+                root.rename-submitting = true;
+                root.commit-rename(root.rename-input);
+            }
+        }
+    }
+
     if root.context-menu-open: TouchArea {
         z: 28; width: parent.width; height: parent.height;
         private property <bool> reopened-by-right-click: false;
