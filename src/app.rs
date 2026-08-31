@@ -1311,7 +1311,7 @@ fn wire_callbacks(
         } else {
             input.clone()
         };
-        let target = PathBuf::from(path.as_str());
+        let target = platform::windows::address_path::normalize_address_path(path.as_str());
         let state_for_validation = state_for_path.clone();
         let sender_for_validation = sender_for_path.clone();
         let everything_for_validation = everything_for_accept.clone();
