@@ -101,6 +101,10 @@ def main() -> int:
             "cargo", "run", "--", "--agent-scenario", "tab-reorder",
             "--no-ui", "--agent-state-out", str(STATE_DIR / "tab-reorder" / "state.json"),
         ]),
+        ("agent-tab-detach", [
+            "cargo", "run", "--", "--agent-scenario", "tab-detach",
+            "--no-ui", "--agent-state-out", str(STATE_DIR / "tab-detach" / "state.json"),
+        ]),
         ("release", ["cargo", "build", "--release"])
         if release_requested
         else ("debug", ["cargo", "build"]),

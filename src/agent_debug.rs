@@ -35,6 +35,7 @@ pub enum AgentScenario {
     DragDropFoundation,
     MultiWindowStateLayering,
     TabReorder,
+    TabDetach,
 }
 
 impl AgentScenario {
@@ -47,6 +48,7 @@ impl AgentScenario {
             Self::DragDropFoundation => "drag-drop-foundation",
             Self::MultiWindowStateLayering => "multi-window-state-layering",
             Self::TabReorder => "tab-reorder",
+            Self::TabDetach => "tab-detach",
         }
     }
 
@@ -111,6 +113,7 @@ fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
         "drag-drop-foundation" => Ok(AgentScenario::DragDropFoundation),
         "multi-window-state-layering" => Ok(AgentScenario::MultiWindowStateLayering),
         "tab-reorder" => Ok(AgentScenario::TabReorder),
+        "tab-detach" => Ok(AgentScenario::TabDetach),
         _ => Err(format!("unknown agent scenario: {value}")),
     }
 }
@@ -133,6 +136,10 @@ pub fn apply_scenario(session: &mut TabSession, scenario: AgentScenario) {
         }
         AgentScenario::TabReorder => {
             session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\TabReorder"));
+            session.load_state = LoadState::Complete;
+        }
+        AgentScenario::TabDetach => {
+            session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\TabDetach"));
             session.load_state = LoadState::Complete;
         }
         AgentScenario::FileOperationRunning
@@ -186,7 +193,7 @@ impl AgentState {
                 .collect(),
             error_type: operation_state.or(projection.error_type),
             drag_drop: (scenario == AgentScenario::DragDropFoundation)
-                .then(crate::platform::windows::drag_drop::current_state),
+                .then(|| crate::platform::windows::drag_drop::current_state(0)),
         }
     }
 
@@ -249,6 +256,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
             | AgentScenario::DragDropFoundation
             | AgentScenario::MultiWindowStateLayering
             | AgentScenario::TabReorder
+            | AgentScenario::TabDetach
     ) {
         return None;
     }
@@ -302,6 +310,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
         AgentScenario::DragDropFoundation => unreachable!(),
         AgentScenario::MultiWindowStateLayering => unreachable!(),
         AgentScenario::TabReorder => unreachable!(),
+        AgentScenario::TabDetach => unreachable!(),
         AgentScenario::PermissionDenied => unreachable!(),
     }
     manager.task(id).map(|task| match task.state {

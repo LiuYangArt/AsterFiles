@@ -243,12 +243,13 @@ impl DropTargetSnapshot {
 }
 
 type SharedTarget = Arc<Mutex<DropTargetSnapshot>>;
-static LIVE_STATE: OnceLock<Mutex<Weak<Mutex<DragDropState>>>> = OnceLock::new();
+static LIVE_STATES: OnceLock<Mutex<std::collections::HashMap<isize, Weak<Mutex<DragDropState>>>>> =
+    OnceLock::new();
 
-pub fn current_state() -> DragDropState {
-    LIVE_STATE
+pub fn current_state(hwnd: isize) -> DragDropState {
+    LIVE_STATES
         .get()
-        .and_then(|state| state.lock().ok()?.upgrade())
+        .and_then(|states| states.lock().ok()?.get(&hwnd)?.upgrade())
         .and_then(|state| state.lock().ok().map(|state| state.clone()))
         .unwrap_or_default()
 }
@@ -954,7 +955,7 @@ pub fn client_screen_rect(hwnd: isize) -> io::Result<(i32, i32, i32, i32)> {
 }
 
 thread_local! {
-    static REGISTRATION: std::cell::RefCell<Option<DragDropRegistration>> = const { std::cell::RefCell::new(None) };
+    static REGISTRATIONS: std::cell::RefCell<std::collections::HashMap<isize, DragDropRegistration>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 pub fn register_current(
@@ -962,18 +963,24 @@ pub fn register_current(
     target: SharedTarget,
     intents: mpsc::Sender<DropIntent>,
 ) -> io::Result<()> {
-    REGISTRATION.with(|registration| {
-        let mut registration = registration.borrow_mut();
-        if registration.is_none() {
-            *registration = Some(DragDropRegistration::register(hwnd, target, intents)?);
+    REGISTRATIONS.with(|registrations| {
+        let mut registrations = registrations.borrow_mut();
+        if let std::collections::hash_map::Entry::Vacant(entry) = registrations.entry(hwnd) {
+            entry.insert(DragDropRegistration::register(hwnd, target, intents)?);
         }
         Ok(())
     })
 }
 
+pub fn revoke(hwnd: isize) {
+    REGISTRATIONS.with(|registrations| {
+        registrations.borrow_mut().remove(&hwnd);
+    });
+}
+
 pub fn revoke_current() {
-    REGISTRATION.with(|registration| {
-        registration.borrow_mut().take();
+    REGISTRATIONS.with(|registrations| {
+        registrations.borrow_mut().clear();
     });
 }
 
@@ -1011,8 +1018,8 @@ impl DragDropRegistration {
         if let Ok(mut current) = state.lock() {
             current.record(DragDropEvent::Registered);
         }
-        if let Ok(mut live) = LIVE_STATE.get_or_init(Default::default).lock() {
-            *live = Arc::downgrade(&state);
+        if let Ok(mut live) = LIVE_STATES.get_or_init(Default::default).lock() {
+            live.insert(hwnd.0 as isize, Arc::downgrade(&state));
         }
         Ok(Self {
             hwnd,
@@ -1029,10 +1036,10 @@ impl Drop for DragDropRegistration {
             state.record(DragDropEvent::Revoked);
         }
         self.target.take();
-        if let Some(live) = LIVE_STATE.get()
+        if let Some(live) = LIVE_STATES.get()
             && let Ok(mut live) = live.lock()
         {
-            *live = Weak::new();
+            live.remove(&(self.hwnd.0 as isize));
         }
         unsafe { OleUninitialize() };
     }
