@@ -4,12 +4,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{domain::EverythingConfig, i18n::Language};
+use crate::{
+    domain::{EverythingConfig, FileVisibility},
+    i18n::Language,
+};
 
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-const MAGIC: &[u8; 5] = b"ASTF6";
+const MAGIC: &[u8; 5] = b"ASTF7";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ThemeMode {
@@ -75,6 +78,7 @@ pub struct SessionState {
     pub theme_mode: ThemeMode,
     pub language: Language,
     pub everything: EverythingConfig,
+    pub file_visibility: FileVisibility,
 }
 
 impl SessionState {
@@ -131,6 +135,35 @@ impl SessionState {
         language: Language,
         everything: EverythingConfig,
     ) -> io::Result<Self> {
+        Self::with_file_visibility_settings(
+            window,
+            active_tab,
+            tab_paths,
+            column_order,
+            search_column_order,
+            column_widths,
+            search_column_widths,
+            theme_mode,
+            language,
+            everything,
+            FileVisibility::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_file_visibility_settings(
+        window: WindowPlacement,
+        active_tab: usize,
+        tab_paths: Vec<PathBuf>,
+        column_order: ColumnOrder,
+        search_column_order: SearchColumnOrder,
+        column_widths: ColumnWidths,
+        search_column_widths: SearchColumnWidths,
+        theme_mode: ThemeMode,
+        language: Language,
+        everything: EverythingConfig,
+        file_visibility: FileVisibility,
+    ) -> io::Result<Self> {
         validate_window(window)?;
         validate_column_order(column_order)?;
         validate_column_order(search_column_order)?;
@@ -158,6 +191,7 @@ impl SessionState {
             theme_mode,
             language,
             everything,
+            file_visibility,
         })
     }
 }
@@ -181,7 +215,7 @@ pub fn save(path: &Path, state: &SessionState) -> io::Result<()> {
 }
 
 fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
-    let state = SessionState::with_everything_settings(
+    let state = SessionState::with_file_visibility_settings(
         state.window,
         state.active_tab,
         state.tab_paths.clone(),
@@ -192,6 +226,7 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
         state.theme_mode,
         state.language,
         state.everything.clone(),
+        state.file_visibility,
     )?;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(MAGIC);
@@ -211,6 +246,8 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
     write_string(&mut bytes, &state.everything.instance_name)?;
     write_optional_string(&mut bytes, state.everything.verified_version.as_deref())?;
     bytes.push(u8::from(state.everything.allow_launch));
+    bytes.push(u8::from(state.file_visibility.show_hidden));
+    bytes.push(u8::from(state.file_visibility.show_system));
 
     for path in &state.tab_paths {
         write_os(&mut bytes, path.as_os_str())?;
@@ -257,6 +294,10 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
         verified_version,
         allow_launch,
     };
+    let file_visibility = FileVisibility {
+        show_hidden: read_bool(bytes, &mut offset, "invalid hidden-file setting")?,
+        show_system: read_bool(bytes, &mut offset, "invalid system-file setting")?,
+    };
 
     let mut tab_paths = Vec::with_capacity(count);
     for _ in 0..count {
@@ -267,7 +308,7 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
         return Err(invalid_data("unexpected trailing session data"));
     }
 
-    SessionState::with_everything_settings(
+    SessionState::with_file_visibility_settings(
         window,
         active_tab,
         tab_paths,
@@ -278,6 +319,7 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
         theme_mode,
         language,
         everything,
+        file_visibility,
     )
 }
 
@@ -439,6 +481,13 @@ fn validate_window(window: WindowPlacement) -> io::Result<()> {
     Ok(())
 }
 
+fn read_bool(bytes: &[u8], offset: &mut usize, message: &'static str) -> io::Result<bool> {
+    match read_u8(bytes, offset)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(invalid_data(message)),
+    }
+}
 fn read_u8(bytes: &[u8], offset: &mut usize) -> io::Result<u8> {
     let value = bytes
         .get(*offset)
@@ -541,6 +590,7 @@ mod tests {
         assert_eq!(state.language, Language::Chinese);
         assert_eq!(state.column_widths, DEFAULT_COLUMN_WIDTHS);
         assert_eq!(state.search_column_widths, DEFAULT_SEARCH_COLUMN_WIDTHS);
+        assert_eq!(state.file_visibility, FileVisibility::default());
     }
 
     #[test]
@@ -572,6 +622,40 @@ mod tests {
         .unwrap();
 
         assert_eq!(decode(&encode(&state).unwrap()).unwrap(), state);
+    }
+    #[test]
+    fn file_visibility_settings_round_trip_independently() {
+        let mut state = sample_state();
+        state.file_visibility = FileVisibility {
+            show_hidden: false,
+            show_system: true,
+        };
+
+        assert_eq!(decode(&encode(&state).unwrap()).unwrap(), state);
+    }
+
+    #[test]
+    fn rejects_invalid_file_visibility_flags() {
+        let mut bytes = encode(&sample_state()).unwrap();
+        let flags_offset = bytes.len()
+            - sample_state()
+                .tab_paths
+                .iter()
+                .map(|path| 4 + encode_os(path.as_os_str()).len() * 2)
+                .sum::<usize>()
+            - 2;
+        bytes[flags_offset] = 2;
+        assert_eq!(
+            decode(&bytes).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut bytes = encode(&sample_state()).unwrap();
+        bytes[flags_offset + 1] = 2;
+        assert_eq!(
+            decode(&bytes).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
     #[test]
     fn setting_storage_codes_are_stable() {
@@ -825,6 +909,7 @@ mod tests {
             b"ASTF3\0\0\0\0".as_slice(),
             b"ASTF4\0\0\0\0".as_slice(),
             b"ASTF5\0\0\0\0".as_slice(),
+            b"ASTF6\0\0\0\0".as_slice(),
         ] {
             assert_eq!(
                 decode(bytes).unwrap_err().kind(),

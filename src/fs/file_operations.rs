@@ -277,36 +277,18 @@ pub fn move_path_with_progress(
             .as_ref()
             .is_some_and(|metadata| metadata.file_type().is_dir())
     {
-        match resolve_conflict(ConflictCategory::ExistingDirectory, source, destination) {
-            ConflictAction::Skip => {
-                let mut report = FileOperationReport::new();
-                report.skipped.push(source.to_path_buf());
-                return Ok(report);
-            }
-            ConflictAction::KeepBoth => {
-                return move_path_with_progress(
-                    source,
-                    &keep_both_path(destination),
-                    cancel,
-                    resolve_conflict,
-                    progress,
-                );
-            }
-            ConflictAction::Replace => {
-                let mut report = FileOperationReport::new();
-                move_directory_merged(
-                    source,
-                    destination,
-                    cancel,
-                    resolve_conflict,
-                    progress,
-                    &mut report,
-                )?;
-                report.affect(source);
-                report.affect(destination);
-                return Ok(report);
-            }
-        }
+        let mut report = FileOperationReport::new();
+        move_directory_merged(
+            source,
+            destination,
+            cancel,
+            resolve_conflict,
+            progress,
+            &mut report,
+        )?;
+        report.affect(source);
+        report.affect(destination);
+        return Ok(report);
     }
     let resolution =
         match resolve_destination(source, destination, &source_metadata, resolve_conflict) {
@@ -564,35 +546,14 @@ fn move_directory_merged(
                 && fs::symlink_metadata(&destination_child)
                     .is_ok_and(|item| item.file_type().is_dir())
             {
-                match resolve_conflict(
-                    ConflictCategory::ExistingDirectory,
+                move_directory_merged(
                     &source_child,
                     &destination_child,
-                ) {
-                    ConflictAction::Skip => {
-                        report.skipped.push(source_child);
-                        continue;
-                    }
-                    ConflictAction::KeepBoth => {
-                        let kept = keep_both_path(&destination_child);
-                        let child_report = move_path_with_progress(
-                            &source_child,
-                            &kept,
-                            cancel,
-                            resolve_conflict,
-                            progress,
-                        )?;
-                        merge_report(report, child_report);
-                    }
-                    ConflictAction::Replace => move_directory_merged(
-                        &source_child,
-                        &destination_child,
-                        cancel,
-                        resolve_conflict,
-                        progress,
-                        report,
-                    )?,
-                }
+                    cancel,
+                    resolve_conflict,
+                    progress,
+                    report,
+                )?;
                 continue;
             }
         }
@@ -768,18 +729,18 @@ fn resolve_destination(
     } else {
         ConflictCategory::TypeMismatch
     };
+    if category == ConflictCategory::ExistingDirectory {
+        return Ok(DestinationResolution {
+            path: destination.to_path_buf(),
+            replace_existing: false,
+        });
+    }
     match resolve_conflict(category, source, destination) {
         ConflictAction::Skip => Err(OperationError::ConflictSkipped(destination.to_path_buf())),
         ConflictAction::KeepBoth => Ok(DestinationResolution {
             path: keep_both_path(destination),
             replace_existing: false,
         }),
-        ConflictAction::Replace if category == ConflictCategory::ExistingDirectory => {
-            Ok(DestinationResolution {
-                path: destination.to_path_buf(),
-                replace_existing: false,
-            })
-        }
         ConflictAction::Replace => Ok(DestinationResolution {
             path: destination.to_path_buf(),
             replace_existing: true,
@@ -1004,6 +965,87 @@ mod tests {
         write(&source, b"x");
         let renamed = rename_path(&source, OsStr::new("new.txt")).unwrap();
         assert_eq!(renamed, temp.path().join("new.txt"));
+        assert!(!source.exists());
+    }
+    #[test]
+    fn matching_directory_root_merges_without_a_root_conflict() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        write(&source.join("added.txt"), b"added");
+        let mut conflicts = Vec::new();
+
+        copy_path(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut |category, source, destination| {
+                conflicts.push((category, source.to_path_buf(), destination.to_path_buf()));
+                ConflictAction::Replace
+            },
+        )
+        .unwrap();
+
+        assert!(conflicts.is_empty());
+        assert_eq!(fs::read(destination.join("added.txt")).unwrap(), b"added");
+    }
+
+    #[test]
+    fn matching_directory_root_only_reports_inner_file_conflicts() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        write(&source.join("same.txt"), b"new");
+        write(&destination.join("same.txt"), b"old");
+        let mut conflicts = Vec::new();
+
+        copy_path(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut |category, source, destination| {
+                conflicts.push((category, source.to_path_buf(), destination.to_path_buf()));
+                ConflictAction::Replace
+            },
+        )
+        .unwrap();
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].0, ConflictCategory::ExistingFile);
+        assert_eq!(conflicts[0].1, source.join("same.txt"));
+        assert_eq!(conflicts[0].2, destination.join("same.txt"));
+        assert_eq!(fs::read(destination.join("same.txt")).unwrap(), b"new");
+    }
+    #[test]
+    fn nested_matching_directories_merge_without_directory_conflicts() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::create_dir_all(destination.join("nested")).unwrap();
+        write(&source.join("nested").join("added.txt"), b"added");
+        let mut conflicts = Vec::new();
+
+        move_path(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut |category, source, destination| {
+                conflicts.push((category, source.to_path_buf(), destination.to_path_buf()));
+                ConflictAction::Replace
+            },
+        )
+        .unwrap();
+
+        assert!(conflicts.is_empty());
+        assert_eq!(
+            fs::read(destination.join("nested").join("added.txt")).unwrap(),
+            b"added"
+        );
         assert!(!source.exists());
     }
     #[test]

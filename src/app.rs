@@ -24,7 +24,7 @@ use crate::{
             OperationResult, OperationState,
         },
     },
-    fs::{ReadOutcome, read_directory_batches},
+    fs::{ReadOutcome, read_directory_batches_filtered},
     i18n::{Language, Texts},
     platform::{self, KnownLocation, KnownLocationKind},
     session_store,
@@ -46,6 +46,7 @@ struct AppState {
     next_tab_id: u32,
     language: Language,
     theme_mode: session_store::ThemeMode,
+    file_visibility: crate::domain::FileVisibility,
     system_dark_theme: bool,
     icons: HashMap<(TabId, RequestId, EntryId), platform::windows_shell_icons::ShellIconRgba>,
     icon_cache: HashMap<PathBuf, platform::windows_shell_icons::ShellIconRgba>,
@@ -130,6 +131,7 @@ impl AppState {
             next_tab_id,
             language,
             theme_mode,
+            file_visibility: crate::domain::FileVisibility::default(),
             system_dark_theme,
             icons: HashMap::new(),
             icon_cache: HashMap::new(),
@@ -301,6 +303,7 @@ struct DirectoryRequest {
     tab_id: TabId,
     request_id: RequestId,
     path: PathBuf,
+    visibility: crate::domain::FileVisibility,
     cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -594,6 +597,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         everything_config,
         theme_mode,
         language,
+        file_visibility,
     ) = restored
         .filter(|session| !session.tab_paths.is_empty())
         .map(|session| {
@@ -613,6 +617,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 session.everything,
                 session.theme_mode,
                 session.language,
+                session.file_visibility,
             )
         })
         .unwrap_or_else(|| {
@@ -627,6 +632,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 crate::domain::EverythingConfig::default(),
                 session_store::ThemeMode::System,
                 Language::Chinese,
+                crate::domain::FileVisibility::default(),
             )
         });
     ui.window()
@@ -647,6 +653,9 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         language,
         platform::system_uses_dark_theme(),
     )));
+    if let Ok(mut app) = state.lock() {
+        app.file_visibility = file_visibility;
+    }
     if let Some(scenario) = scenario {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         let active_tab = app.active_tab;
@@ -698,6 +707,12 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         operation_sender.clone(),
         clipboard_sender,
         everything_sender.clone(),
+        state.clone(),
+    );
+    wire_internal_drag_drop(
+        &ui,
+        operation_sender.clone(),
+        request_sender.clone(),
         state.clone(),
     );
     wire_mouse_navigation(&ui, &exit_ui, state.clone());
@@ -789,7 +804,9 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
 
     let _drag_drop_target_timer =
         wire_native_drag_drop(&ui, operation_sender.clone(), state.clone());
+    let directory_watch_timer = start_directory_watchers(request_sender.clone(), state.clone());
     let result = ui.run();
+    drop(directory_watch_timer);
     platform::windows::drag_drop::revoke_current();
     for weak in [delete_weak, conflict_weak, exit_weak] {
         if let Some(window) = weak.upgrade() {
@@ -806,6 +823,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         everything_config,
         theme_mode,
         language,
+        file_visibility,
     ) = {
         let app = state.lock().expect("app state mutex is not poisoned");
         let active_tab = app.stable_active_path_index();
@@ -819,13 +837,14 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             app.everything_config.clone(),
             app.theme_mode,
             app.language,
+            app.file_visibility,
         )
     };
     let position = ui.window().position();
     let size = ui.window().size();
     if scenario.is_none()
         && let Some(path) = session_store::default_path()
-        && let Ok(session) = session_store::SessionState::with_everything_settings(
+        && let Ok(session) = session_store::SessionState::with_file_visibility_settings(
             session_store::WindowPlacement {
                 x: position.x,
                 y: position.y,
@@ -841,6 +860,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             theme_mode,
             language,
             everything_config,
+            file_visibility,
         )
     {
         let _ = session_store::save(&path, &session);
@@ -873,6 +893,7 @@ fn submit_navigation(
             tab_id,
             request_id,
             path,
+            visibility: app.file_visibility,
             cancel,
         }
     };
@@ -1276,6 +1297,157 @@ fn native_window_handle(ui: &AppWindow) -> isize {
         })
         .unwrap_or_default()
 }
+fn wire_internal_drag_drop(
+    ui: &AppWindow,
+    operation_sender: mpsc::Sender<FileOperationRequest>,
+    directory_sender: mpsc::Sender<DirectoryRequest>,
+    state: SharedSessions,
+) {
+    #[derive(Debug)]
+    struct InternalDrag {
+        paths: Vec<PathBuf>,
+        source_directories: Vec<PathBuf>,
+        start_x: f32,
+        start_y: f32,
+        outbound_started: bool,
+    }
+
+    let drag = Arc::new(Mutex::new(None::<InternalDrag>));
+
+    let state_for_begin = state.clone();
+    let drag_for_begin = drag.clone();
+    ui.on_begin_internal_drag(move |entry_id, x, y, _control, _shift| {
+        let mut app = state_for_begin
+            .lock()
+            .expect("app state mutex is not poisoned");
+        let id = EntryId(entry_id as u32);
+        let tab_id = app.active_tab;
+        if let Some(tab) = app.tabs.get_mut(&tab_id)
+            && !tab.selected.contains(&id)
+        {
+            tab.select_entry(id, false, false);
+        }
+        let paths = selected_paths(&app);
+        let source_directories = paths
+            .iter()
+            .filter_map(|path| path.parent().map(Path::to_path_buf))
+            .collect();
+        if let Ok(mut drag) = drag_for_begin.lock() {
+            *drag = Some(InternalDrag {
+                paths,
+                source_directories,
+                start_x: x,
+                start_y: y,
+                outbound_started: false,
+            });
+        }
+    });
+
+    let weak_for_update = ui.as_weak();
+    let state_for_update = state.clone();
+    let drag_for_update = drag.clone();
+    let directory_for_update = directory_sender.clone();
+    ui.on_update_internal_drag(move |x, y| {
+        let Some(ui) = weak_for_update.upgrade() else {
+            return;
+        };
+        let outbound = drag_for_update.lock().ok().and_then(|mut drag| {
+            let drag = drag.as_mut()?;
+            let distance = ((x - drag.start_x).powi(2) + (y - drag.start_y).powi(2)).sqrt();
+            if distance < 4.0 || drag.outbound_started {
+                return None;
+            }
+            drag.outbound_started = true;
+            Some((drag.paths.clone(), drag.source_directories.clone()))
+        });
+        let Some((paths, source_directories)) = outbound else {
+            return;
+        };
+        ui.set_drop_hover_entry_id(-1);
+        match platform::windows::drag_drop::begin_outbound_drag(
+            &paths,
+            platform::windows::drag_drop::DropEffect::Move,
+        ) {
+            Ok(result) if result.dropped => {
+                // External targets own the operation; refresh only the source views and never infer item removal.
+                refresh_affected_tabs(
+                    &directory_for_update,
+                    &state_for_update,
+                    &source_directories,
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                if let Ok(mut app) = state_for_update.lock() {
+                    app.operation_errors
+                        .push(format!("outbound drag failed: {error}"));
+                }
+            }
+        }
+    });
+    let weak_for_end = ui.as_weak();
+    let state_for_end = state.clone();
+    let drag_for_end = drag.clone();
+    ui.on_end_internal_drag(move |x, y, control, shift| {
+        let Some(ui) = weak_for_end.upgrade() else {
+            return;
+        };
+        ui.set_drop_hover_entry_id(-1);
+        let Some(drag) = drag_for_end.lock().ok().and_then(|mut drag| drag.take()) else {
+            return;
+        };
+        if drag.outbound_started
+            || ((x - drag.start_x).powi(2) + (y - drag.start_y).powi(2)).sqrt() < 4.0
+        {
+            return;
+        }
+        let target = state_for_end.lock().ok().and_then(|app| {
+            internal_drag_target(&app, y, ui.get_file_list_top(), ui.get_file_viewport_y())
+                .map(|(_, path)| path)
+        });
+        let Some(target) = target else {
+            return;
+        };
+        let key_state = (if control { 8 } else { 0 }) | (if shift { 4 } else { 0 });
+        let (effect, reason) =
+            platform::windows::drag_drop::negotiate_effect(&drag.paths, Some(&target), key_state);
+        if reason.is_some() {
+            return;
+        }
+        let intent = platform::windows::drag_drop::DropIntent {
+            paths: drag.paths,
+            target,
+            effect,
+        };
+        let state_for_worker = state_for_end.clone();
+        let operation_for_worker = operation_sender.clone();
+        thread::spawn(move || match prepare_drop_operation(intent) {
+            Ok(PreparedDrop::Operation(kind, items)) => {
+                let _ = slint::invoke_from_event_loop(move || {
+                    enqueue_operation(&state_for_worker, &operation_for_worker, kind, items);
+                });
+            }
+            Ok(PreparedDrop::Shortcuts(shortcuts)) => {
+                let result = create_drop_shortcuts(shortcuts);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Err(error) = result
+                        && let Ok(mut app) = state_for_worker.lock()
+                    {
+                        app.operation_errors.push(error);
+                    }
+                });
+            }
+            Err(error) => {
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Ok(mut app) = state_for_worker.lock() {
+                        app.operation_errors.push(error);
+                    }
+                });
+            }
+        });
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn wire_callbacks(
     ui: &AppWindow,
@@ -2136,6 +2308,36 @@ fn wire_callbacks(
         }
     });
 
+    let weak_for_visibility = ui.as_weak();
+    let state_for_visibility = state.clone();
+    let sender_for_visibility = sender.clone();
+    ui.on_change_file_visibility(move |show_hidden, show_system| {
+        let targets = {
+            let mut app = state_for_visibility
+                .lock()
+                .expect("app state mutex is not poisoned");
+            app.file_visibility = crate::domain::FileVisibility {
+                show_hidden,
+                show_system,
+            };
+            app.tabs
+                .values()
+                .filter_map(|tab| tab.visible_path().map(|path| (tab.id, path.to_path_buf())))
+                .collect::<Vec<_>>()
+        };
+        for (tab_id, path) in targets {
+            submit_navigation(
+                &sender_for_visibility,
+                &state_for_visibility,
+                tab_id,
+                path,
+                NavigationKind::Refresh,
+            );
+        }
+        if let Some(ui) = weak_for_visibility.upgrade() {
+            refresh_ui(&ui, &state_for_visibility);
+        }
+    });
     let weak = ui.as_weak();
     let delete_weak_for_theme = delete_ui.as_weak();
     let conflict_weak_for_theme = conflict_ui.as_weak();
@@ -2455,9 +2657,28 @@ fn keyboard_shortcuts_suppressed(rename_editing: bool) -> bool {
     rename_editing
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SideNavigation {
+    Back,
+    Forward,
+}
+
+fn side_navigation_for_mouse_button(
+    state: winit::event::ElementState,
+    button: winit::event::MouseButton,
+) -> Option<SideNavigation> {
+    if state != winit::event::ElementState::Released {
+        return None;
+    }
+    match button {
+        winit::event::MouseButton::Back => Some(SideNavigation::Back),
+        winit::event::MouseButton::Forward => Some(SideNavigation::Forward),
+        _ => None,
+    }
+}
 fn wire_mouse_navigation(ui: &AppWindow, exit_ui: &ConfirmationWindow, state: SharedSessions) {
     use winit::{
-        event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
+        event::{ElementState, MouseScrollDelta, WindowEvent},
         keyboard::{Key, ModifiersState, NamedKey},
     };
 
@@ -2736,12 +2957,11 @@ fn wire_mouse_navigation(ui: &AppWindow, exit_ui: &ConfirmationWindow, state: Sh
                     EventResult::Propagate
                 }
             }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Back,
-                ..
-            } => {
-                if *state == ElementState::Released && ui.get_can_navigate_back() {
+            WindowEvent::MouseInput { state, button, .. }
+                if side_navigation_for_mouse_button(*state, *button)
+                    == Some(SideNavigation::Back) =>
+            {
+                if ui.get_can_navigate_back() {
                     let weak = ui.as_weak();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = weak.upgrade() {
@@ -2751,12 +2971,11 @@ fn wire_mouse_navigation(ui: &AppWindow, exit_ui: &ConfirmationWindow, state: Sh
                 }
                 EventResult::PreventDefault
             }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Forward,
-                ..
-            } => {
-                if *state == ElementState::Released && ui.get_can_navigate_forward() {
+            WindowEvent::MouseInput { state, button, .. }
+                if side_navigation_for_mouse_button(*state, *button)
+                    == Some(SideNavigation::Forward) =>
+            {
+                if ui.get_can_navigate_forward() {
                     let weak = ui.as_weak();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = weak.upgrade() {
@@ -2779,40 +2998,71 @@ fn wire_native_drag_drop(
 ) -> slint::Timer {
     use std::cell::Cell;
 
-    let target = Arc::new(Mutex::new(None));
+    let target = Arc::new(Mutex::new(
+        platform::windows::drag_drop::DropTargetSnapshot::default(),
+    ));
     let (intent_sender, intent_receiver) = mpsc::channel();
     let weak = ui.as_weak();
-    let attempted = Cell::new(false);
     let target_for_registration = target.clone();
-    ui.window().on_winit_window_event(move |_, _| {
-        if !attempted.replace(true)
-            && let Some(ui) = weak.upgrade()
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade()
             && let Err(error) = platform::windows::drag_drop::register_current(
                 native_window_handle(&ui),
-                target_for_registration.clone(),
-                intent_sender.clone(),
+                target_for_registration,
+                intent_sender,
             )
         {
             eprintln!("failed to register native drag-drop target: {error}");
         }
-        EventResult::Propagate
     });
 
     let target_for_refresh = target.clone();
     let state_for_target = state.clone();
+    let weak_for_target = ui.as_weak();
+    let last_sequence = Cell::new(0_u64);
     let target_timer = slint::Timer::default();
     target_timer.start(
         slint::TimerMode::Repeated,
         Duration::from_millis(100),
         move || {
-            let path = state_for_target.lock().ok().and_then(|app| {
-                let tab = app.active();
-                (tab.kind == TabKind::Files && tab.load_state == LoadState::Complete)
-                    .then(|| tab.visible_path().map(Path::to_path_buf))
-                    .flatten()
-            });
+            let snapshot = weak_for_target
+                .upgrade()
+                .and_then(|ui| {
+                    state_for_target
+                        .lock()
+                        .ok()
+                        .and_then(|app| drop_target_snapshot(&app, &ui))
+                })
+                .unwrap_or_default();
             if let Ok(mut target) = target_for_refresh.lock() {
-                *target = path;
+                *target = snapshot.clone();
+            }
+            if let Some(ui) = weak_for_target.upgrade() {
+                let drag = platform::windows::drag_drop::current_state();
+                if drag.event_sequence != last_sequence.get() {
+                    last_sequence.set(drag.event_sequence);
+                    let hovered = drag
+                        .target
+                        .as_deref()
+                        .and_then(|path| {
+                            snapshot
+                                .folder_rows
+                                .iter()
+                                .find(|row| row.path == Path::new(path))
+                        })
+                        .and_then(|row| {
+                            state_for_target.lock().ok().and_then(|app| {
+                                app.active()
+                                    .visible_entries()
+                                    .iter()
+                                    .find(|entry| entry.path == row.path)
+                                    .map(|entry| entry.id.0 as i32)
+                            })
+                        })
+                        .unwrap_or(-1);
+                    ui.set_drop_hover_entry_id(hovered);
+                    auto_scroll_drag_edge(&ui, &drag);
+                }
             }
         },
     );
@@ -2823,7 +3073,21 @@ fn wire_native_drag_drop(
             let state_for_ui = state.clone();
             let sender_for_ui = operation_sender.clone();
             let _ = slint::invoke_from_event_loop(move || match prepared {
-                Ok((kind, items)) => enqueue_operation(&state_for_ui, &sender_for_ui, kind, items),
+                Ok(PreparedDrop::Operation(kind, items)) => {
+                    enqueue_operation(&state_for_ui, &sender_for_ui, kind, items)
+                }
+                Ok(PreparedDrop::Shortcuts(shortcuts)) => {
+                    let state_for_shortcuts = state_for_ui.clone();
+                    thread::spawn(move || {
+                        if let Err(error) = create_drop_shortcuts(shortcuts) {
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Ok(mut app) = state_for_shortcuts.lock() {
+                                    app.operation_errors.push(error);
+                                }
+                            });
+                        }
+                    });
+                }
                 Err(error) => {
                     if let Ok(mut app) = state_for_ui.lock() {
                         app.operation_errors.push(error);
@@ -2835,18 +3099,118 @@ fn wire_native_drag_drop(
     target_timer
 }
 
+fn auto_scroll_drag_edge(ui: &AppWindow, drag: &platform::windows::drag_drop::DragDropState) {
+    if drag.lifecycle != platform::windows::drag_drop::DragDropLifecycle::Dragging {
+        return;
+    }
+    let Some(cursor_y) = drag.cursor_y else {
+        return;
+    };
+    let Ok((_, client_top, _, client_bottom)) =
+        platform::windows::drag_drop::client_screen_rect(native_window_handle(ui))
+    else {
+        return;
+    };
+    let scale = ui.window().scale_factor();
+    let list_top = client_top + (ui.get_file_list_top() * scale).round() as i32;
+    let bottom = client_bottom - (30.0 * scale).round() as i32;
+    let edge = (32.0 * scale).round() as i32;
+    let delta = if cursor_y < list_top + edge {
+        24.0
+    } else if cursor_y > bottom - edge {
+        -24.0
+    } else {
+        0.0
+    };
+    if delta == 0.0 {
+        return;
+    }
+    let visible_height = ((bottom - list_top).max(0) as f32 / scale).max(0.0);
+    let maximum = (ui.get_files().row_count() as f32 * 40.0 - visible_height).max(0.0);
+    ui.set_file_viewport_y((ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0));
+}
+
+fn drop_target_snapshot(
+    app: &AppState,
+    ui: &AppWindow,
+) -> Option<platform::windows::drag_drop::DropTargetSnapshot> {
+    let tab = app.active();
+    if tab.kind != TabKind::Files || tab.load_state != LoadState::Complete {
+        return None;
+    }
+    let current = tab.visible_path()?.to_path_buf();
+    let hwnd = native_window_handle(ui);
+    let (left, top, right, bottom) = platform::windows::drag_drop::client_screen_rect(hwnd).ok()?;
+    let scale = ui.window().scale_factor();
+    let list_top = (ui.get_file_list_top() * scale).round() as i32;
+    let viewport = (-ui.get_file_viewport_y() * scale).max(0.0);
+    let row_height = 40.0 * scale;
+    let folder_rows = tab
+        .visible_entries()
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.kind == crate::domain::EntryKind::Directory)
+        .filter_map(|(index, entry)| {
+            let row_top = top + list_top + (index as f32 * row_height - viewport).round() as i32;
+            let row_bottom = row_top + row_height.round() as i32;
+            (row_bottom > top + list_top && row_top < bottom).then(|| {
+                platform::windows::drag_drop::FolderDropTarget {
+                    left,
+                    top: row_top,
+                    right,
+                    bottom: row_bottom.min(bottom),
+                    path: entry.path.clone(),
+                }
+            })
+        })
+        .collect();
+    Some(platform::windows::drag_drop::DropTargetSnapshot {
+        current: Some(current),
+        folder_rows,
+    })
+}
+
+fn internal_drag_target(
+    app: &AppState,
+    y: f32,
+    list_top: f32,
+    viewport_y: f32,
+) -> Option<(EntryId, PathBuf)> {
+    let index = ((y - list_top + (-viewport_y).max(0.0)) / 40.0).floor() as usize;
+    app.active()
+        .visible_entries()
+        .get(index)
+        .filter(|entry| entry.kind == crate::domain::EntryKind::Directory)
+        .map(|entry| (entry.id, entry.path.clone()))
+}
+
+fn create_drop_shortcuts(shortcuts: Vec<(PathBuf, PathBuf)>) -> Result<(), String> {
+    for (source, destination) in shortcuts {
+        platform::windows::shortcut::create_shortcut(&source, &destination)
+            .map_err(|error| format!("创建快捷方式失败：{error}"))?;
+    }
+    Ok(())
+}
+enum PreparedDrop {
+    Operation(FileOperationKind, Vec<OperationItem>),
+    Shortcuts(Vec<(PathBuf, PathBuf)>),
+}
+
 fn prepare_drop_operation(
     intent: platform::windows::drag_drop::DropIntent,
-) -> Result<(FileOperationKind, Vec<OperationItem>), String> {
+) -> Result<PreparedDrop, String> {
     let target_metadata =
         std::fs::metadata(&intent.target).map_err(|error| format!("拖放目标不可用：{error}"))?;
     if !target_metadata.is_dir() {
         return Err("拖放目标不是文件夹".to_owned());
     }
     let kind = match intent.effect {
-        platform::windows::drag_drop::DropEffect::Copy => FileOperationKind::Copy,
-        platform::windows::drag_drop::DropEffect::Move => FileOperationKind::Move,
-        _ => return Err("拖放效果不受支持".to_owned()),
+        platform::windows::drag_drop::DropEffect::Copy => Some(FileOperationKind::Copy),
+        platform::windows::drag_drop::DropEffect::Move => Some(FileOperationKind::Move),
+        platform::windows::drag_drop::DropEffect::Link => None,
+        platform::windows::drag_drop::DropEffect::None => {
+            return Err("拖放效果不受支持".to_owned());
+        }
     };
     let mut items = Vec::with_capacity(intent.paths.len());
     for source in intent.paths {
@@ -2865,7 +3229,36 @@ fn prepare_drop_operation(
     if items.is_empty() {
         return Err("拖放未包含文件系统项目".to_owned());
     }
-    Ok((kind, items))
+    if let Some(kind) = kind {
+        Ok(PreparedDrop::Operation(kind, items))
+    } else {
+        let mut reserved = std::collections::HashSet::new();
+        let mut shortcuts = Vec::with_capacity(items.len());
+        for source in items.into_iter().filter_map(|item| item.source) {
+            let mut destination =
+                platform::windows::shortcut::shortcut_destination(&intent.target, &source)
+                    .map_err(|error| error.to_string())?;
+            if reserved.contains(&destination) {
+                let stem = source
+                    .file_stem()
+                    .or_else(|| source.file_name())
+                    .ok_or_else(|| "拖放来源没有可用名称".to_owned())?;
+                for index in 2_u64.. {
+                    let mut name = stem.to_os_string();
+                    name.push(format!(" ({index})"));
+                    let mut candidate = intent.target.join(name);
+                    candidate.set_extension("lnk");
+                    if !reserved.contains(&candidate) && !candidate.exists() {
+                        destination = candidate;
+                        break;
+                    }
+                }
+            }
+            reserved.insert(destination.clone());
+            shortcuts.push((source, destination));
+        }
+        Ok(PreparedDrop::Shortcuts(shortcuts))
+    }
 }
 
 fn wire_window_trace(ui: &AppWindow) {
@@ -4520,6 +4913,93 @@ fn start_file_operation_event_pump(
         }
     });
 }
+fn start_directory_watchers(
+    directory_sender: mpsc::Sender<DirectoryRequest>,
+    state: SharedSessions,
+) -> slint::Timer {
+    use std::{cell::RefCell, rc::Rc};
+
+    let (event_sender, event_receiver) = mpsc::channel();
+    let failed_roots = Arc::new(Mutex::new(std::collections::HashSet::<PathBuf>::new()));
+    let failed_for_timer = failed_roots.clone();
+    let watchers = Rc::new(RefCell::new(HashMap::<
+        PathBuf,
+        platform::windows::directory_watch::DirectoryWatch,
+    >::new()));
+    let watchers_for_timer = watchers.clone();
+    let state_for_timer = state.clone();
+    let timer = slint::Timer::default();
+    timer.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(500),
+        move || {
+            let roots = state_for_timer
+                .lock()
+                .map(|app| watched_roots(&app))
+                .unwrap_or_default();
+            let mut watchers = watchers_for_timer.borrow_mut();
+            if let Ok(mut failed) = failed_for_timer.lock() {
+                for root in failed.drain() {
+                    watchers.remove(&root);
+                }
+            }
+            watchers.retain(|root, _| roots.contains(root));
+            for root in roots {
+                if watchers.contains_key(&root) {
+                    continue;
+                }
+                if let Ok(watcher) = platform::windows::directory_watch::DirectoryWatch::start(
+                    &root,
+                    false,
+                    event_sender.clone(),
+                ) {
+                    watchers.insert(root, watcher);
+                }
+            }
+        },
+    );
+    thread::spawn(move || {
+        while let Ok(first) = event_receiver.recv() {
+            if let platform::windows::directory_watch::DirectoryWatchEvent::Error {
+                root,
+                message,
+            } = &first
+            {
+                eprintln!("directory watch failed for {}: {message}", root.display());
+                if let Ok(mut failed) = failed_roots.lock() {
+                    failed.insert(root.clone());
+                }
+            }
+            let mut roots = std::collections::HashSet::from([watch_event_root(first)]);
+            thread::sleep(Duration::from_millis(120));
+            while let Ok(next) = event_receiver.try_recv() {
+                roots.insert(watch_event_root(next));
+            }
+            let roots = roots.into_iter().collect::<Vec<_>>();
+            let sender_for_ui = directory_sender.clone();
+            let state_for_ui = state.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                refresh_affected_tabs(&sender_for_ui, &state_for_ui, &roots);
+            });
+        }
+    });
+    timer
+}
+fn watched_roots(app: &AppState) -> std::collections::HashSet<PathBuf> {
+    app.tabs
+        .values()
+        .filter_map(|tab| tab.visible_path().map(Path::to_path_buf))
+        .collect()
+}
+
+fn watch_event_root(event: platform::windows::directory_watch::DirectoryWatchEvent) -> PathBuf {
+    use platform::windows::directory_watch::DirectoryWatchEvent;
+    match event {
+        DirectoryWatchEvent::Changes { root, .. }
+        | DirectoryWatchEvent::Overflow { root }
+        | DirectoryWatchEvent::Error { root, .. } => root,
+    }
+}
 fn refresh_affected_tabs(
     sender: &mpsc::Sender<DirectoryRequest>,
     state: &SharedSessions,
@@ -4585,13 +5065,18 @@ fn spawn_directory_workers(
 }
 
 fn run_directory_request(request: DirectoryRequest, events: &mpsc::Sender<DirectoryEvent>) {
-    let result = read_directory_batches(&request.path, &request.cancel, |entries| {
-        let _ = events.send(DirectoryEvent::Batch {
-            tab_id: request.tab_id,
-            request_id: request.request_id,
-            entries,
-        });
-    });
+    let result = read_directory_batches_filtered(
+        &request.path,
+        &request.cancel,
+        request.visibility,
+        |entries| {
+            let _ = events.send(DirectoryEvent::Batch {
+                tab_id: request.tab_id,
+                request_id: request.request_id,
+                entries,
+            });
+        },
+    );
     let event = match result {
         Ok(ReadOutcome::Complete { skipped }) => DirectoryEvent::Finished {
             tab_id: request.tab_id,
@@ -6102,6 +6587,8 @@ fn refresh_ui(ui: &AppWindow, state: &SharedSessions) {
         Language::Chinese => 0,
         Language::English => 1,
     });
+    ui.set_show_hidden_files(app.file_visibility.show_hidden);
+    ui.set_show_system_files(app.file_visibility.show_system);
     ui.set_everything_path(
         app.everything_config
             .executable_path
@@ -6294,6 +6781,8 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
         language_label,
         chinese,
         english,
+        show_hidden_files,
+        show_system_files,
         settings_general,
         settings_appearance,
         settings_developer,
@@ -6353,6 +6842,8 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "语言",
             "中文",
             "English",
+            "显示隐藏文件",
+            "显示系统文件",
             "常规",
             "外观",
             "开发工具",
@@ -6412,6 +6903,8 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "Language",
             "中文",
             "English",
+            "Show hidden files",
+            "Show system files",
             "General",
             "Appearance",
             "Developer tools",
@@ -6472,6 +6965,8 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_language(language_label.into());
     ui.set_text_language_chinese(chinese.into());
     ui.set_text_language_english(english.into());
+    ui.set_text_show_hidden_files(show_hidden_files.into());
+    ui.set_text_show_system_files(show_system_files.into());
     ui.set_text_settings_general(settings_general.into());
     ui.set_text_settings_appearance(settings_appearance.into());
     ui.set_text_settings_developer(settings_developer.into());
@@ -7037,6 +7532,78 @@ mod tests {
     }
 
     #[test]
+    fn watched_roots_deduplicate_tabs_showing_the_same_directory() {
+        let app = AppState::new_for_test(
+            vec![PathBuf::from(r"C:\One"), PathBuf::from(r"C:\One")],
+            0,
+            [0, 1, 2, 3],
+        );
+        assert_eq!(
+            watched_roots(&app),
+            std::collections::HashSet::from([PathBuf::from(r"C:\One")])
+        );
+    }
+    #[test]
+    fn side_navigation_routes_only_released_back_and_forward_buttons() {
+        use winit::event::{ElementState, MouseButton};
+
+        assert_eq!(
+            side_navigation_for_mouse_button(ElementState::Released, MouseButton::Back),
+            Some(SideNavigation::Back)
+        );
+        assert_eq!(
+            side_navigation_for_mouse_button(ElementState::Released, MouseButton::Forward),
+            Some(SideNavigation::Forward)
+        );
+        assert_eq!(
+            side_navigation_for_mouse_button(ElementState::Pressed, MouseButton::Back),
+            None
+        );
+        assert_eq!(
+            side_navigation_for_mouse_button(ElementState::Released, MouseButton::Left),
+            None
+        );
+    }
+    #[test]
+    fn internal_drag_targets_only_directory_rows_with_viewport_offset() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
+        app.tabs.get_mut(&TabId(1)).unwrap().replace_entries(vec![
+            FileEntry {
+                id: EntryId(1),
+                original_name: "file.txt".into(),
+                display_name: "file.txt".into(),
+                name_highlights: Vec::new(),
+                path: PathBuf::from(r"C:\test\file.txt"),
+                kind: crate::domain::EntryKind::File,
+                open_target: None,
+                parent_display: String::new(),
+                size_bytes: Some(1),
+                folder_size: crate::domain::FolderSizeState::Unknown,
+                modified: None,
+            },
+            FileEntry {
+                id: EntryId(2),
+                original_name: "folder".into(),
+                display_name: "folder".into(),
+                name_highlights: Vec::new(),
+                path: PathBuf::from(r"C:\test\folder"),
+                kind: crate::domain::EntryKind::Directory,
+                open_target: None,
+                parent_display: String::new(),
+                size_bytes: None,
+                folder_size: crate::domain::FolderSizeState::Unknown,
+                modified: None,
+            },
+        ]);
+
+        assert_eq!(internal_drag_target(&app, 20.0, 0.0, 0.0), None);
+        assert_eq!(
+            internal_drag_target(&app, 20.0, 0.0, -40.0),
+            Some((EntryId(2), PathBuf::from(r"C:\test\folder")))
+        );
+    }
+
+    #[test]
     fn drop_preflight_preserves_paths_and_builds_operation_items() {
         let temporary = std::env::temp_dir().join(format!(
             "asterfiles-drop-test-{}-{:?}",
@@ -7051,12 +7618,16 @@ mod tests {
         let source = source_parent.join("文件😀.txt");
         std::fs::write(&source, b"drag").unwrap();
 
-        let (kind, items) = prepare_drop_operation(platform::windows::drag_drop::DropIntent {
-            paths: vec![source.clone()],
-            target: target.clone(),
-            effect: platform::windows::drag_drop::DropEffect::Copy,
-        })
-        .unwrap();
+        let PreparedDrop::Operation(kind, items) =
+            prepare_drop_operation(platform::windows::drag_drop::DropIntent {
+                paths: vec![source.clone()],
+                target: target.clone(),
+                effect: platform::windows::drag_drop::DropEffect::Copy,
+            })
+            .unwrap()
+        else {
+            panic!("copy drag must create a file operation");
+        };
 
         assert_eq!(kind, FileOperationKind::Copy);
         assert_eq!(items.len(), 1);
@@ -7068,6 +7639,71 @@ mod tests {
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
+    #[test]
+    fn link_drop_preflight_uses_numbered_shortcut_destination() {
+        let temporary = std::env::temp_dir().join(format!(
+            "asterfiles-link-drop-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&temporary);
+        let target = temporary.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let source = temporary.join("Report.txt");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(target.join("Report.lnk"), b"existing").unwrap();
+
+        let PreparedDrop::Shortcuts(shortcuts) =
+            prepare_drop_operation(platform::windows::drag_drop::DropIntent {
+                paths: vec![source.clone()],
+                target: target.clone(),
+                effect: platform::windows::drag_drop::DropEffect::Link,
+            })
+            .unwrap()
+        else {
+            panic!("link drag must prepare shortcuts");
+        };
+        assert_eq!(shortcuts, vec![(source, target.join("Report (2).lnk"))]);
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+    #[test]
+    fn link_drop_reserves_distinct_names_for_same_named_sources() {
+        let temporary = std::env::temp_dir().join(format!(
+            "asterfiles-link-batch-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&temporary);
+        let left = temporary.join("left");
+        let right = temporary.join("right");
+        let target = temporary.join("target");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let first = left.join("Report.txt");
+        let second = right.join("Report.txt");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+
+        let PreparedDrop::Shortcuts(shortcuts) =
+            prepare_drop_operation(platform::windows::drag_drop::DropIntent {
+                paths: vec![first.clone(), second.clone()],
+                target: target.clone(),
+                effect: platform::windows::drag_drop::DropEffect::Link,
+            })
+            .unwrap()
+        else {
+            panic!("link drag must prepare shortcuts");
+        };
+        assert_eq!(
+            shortcuts,
+            vec![
+                (first, target.join("Report.lnk")),
+                (second, target.join("Report (2).lnk")),
+            ]
+        );
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
     #[test]
     fn external_cut_tracking_keeps_only_sources_still_on_disk() {
         let temporary = std::env::temp_dir().join(format!(

@@ -1,4 +1,4 @@
-import { ListView } from "std-widgets.slint";
+import { CheckBox, ListView } from "std-widgets.slint";
 import { IconMap } from "icons/icon-map.slint";
 
 export struct HighlightSegment { text: string, highlighted: bool }
@@ -638,12 +638,15 @@ export component AppWindow inherits Window {
     in property <bool> can-close-tab: false;
     in property <bool> can-restore-tab: false;
     in property <int> selected-count: 0;
+    in property <int> drop-hover-entry-id: -1;
     in property <int> sort-field: 0;
     in property <bool> sort-descending: false;
     in property <int> page-state: 0;
     in property <bool> dark-theme: false;
     in property <int> theme-mode: 0;
     in property <int> language-mode: 0;
+    in property <bool> show-hidden-files: true;
+    in property <bool> show-system-files: false;
     in property <bool> active-is-settings: false;
     in property <bool> debug-tools-enabled: false;
     in property <string> text-menu: "菜单";
@@ -656,6 +659,8 @@ export component AppWindow inherits Window {
     in property <string> text-language: "语言";
     in property <string> text-language-chinese: "中文";
     in property <string> text-language-english: "English";
+    in property <string> text-show-hidden-files: "显示隐藏文件";
+    in property <string> text-show-system-files: "显示系统文件";
     in property <string> text-settings-general: "常规";
     in property <string> text-settings-appearance: "外观";
     in property <string> text-settings-developer: "开发工具";
@@ -746,6 +751,9 @@ export component AppWindow inherits Window {
     callback resize-column(int, float);
     callback open-entry(int);
     callback activate-entry(int, bool, bool);
+    callback begin-internal-drag(int, float, float, bool, bool);
+    callback update-internal-drag(float, float);
+    callback end-internal-drag(float, float, bool, bool);
     callback new-tab();
     callback close-tab(int);
     callback restore-tab();
@@ -753,6 +761,7 @@ export component AppWindow inherits Window {
     callback open-settings();
     callback change-theme(int);
     callback change-language(int);
+    callback change-file-visibility(bool, bool);
     callback update-everything-config(string, string);
     callback test-everything-connection();
     callback start-everything();
@@ -1170,7 +1179,7 @@ list := ListView {
                                 x: 6px; y: 2px; width: parent.width - 12px; height: parent.height - 4px;
                                 border-radius: 5px;
                                 border-width: 0px;
-                                background: entry.selected ? VisualStyle.cdce6ff : (mouse.has-hover ? VisualStyle.ceff4ff : transparent);
+                                background: entry.id == root.drop-hover-entry-id ? VisualStyle.cc7d7ff : (entry.selected ? VisualStyle.cdce6ff : (mouse.has-hover ? VisualStyle.ceff4ff : transparent));
                                 Rectangle {
                                 x: 10px + root.file-viewport-x; width: root.file-columns-width;
                                 HorizontalLayout {
@@ -1206,7 +1215,7 @@ visible: segment-layout.preferred-width > parent.width;
 x: parent.width - parent.fade-width;
 width: parent.fade-width;
 height: parent.height;
-background: entry.selected ? VisualStyle.cdce6ff : (mouse.has-hover ? VisualStyle.ceff4ff : VisualStyle.cffffff);
+background: entry.id == root.drop-hover-entry-id ? VisualStyle.cc7d7ff : (entry.selected ? VisualStyle.cdce6ff : (mouse.has-hover ? VisualStyle.ceff4ff : VisualStyle.cffffff));
 Text { text: "…"; color: VisualStyle.c24252a; font-size: 13px; horizontal-alignment: right; vertical-alignment: center; }
                                             }
                                         }
@@ -1282,11 +1291,22 @@ accessible-label: entry.name;
                                 enabled: entry.loaded && !(root.rename-editing && root.rename-entry-id == entry.id);
                                 private property <bool> click-control: false;
                                 private property <bool> click-shift: false;
+                                private property <bool> drag-started: false;
                                 mouse-cursor: pointer;
                                 pointer-event(event) => {
                                     if event.kind == PointerEventKind.down {
                                         self.click-control = event.modifiers.control;
                                         self.click-shift = event.modifiers.shift;
+                                        if event.button == PointerEventButton.left {
+                                            self.drag-started = true;
+                                            root.begin-internal-drag(
+                                                entry.id,
+                                                (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
+                                                (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px,
+                                                event.modifiers.control,
+                                                event.modifiers.shift
+                                            );
+                                        }
                                         if event.button == PointerEventButton.right {
                                             root.context-menu-anchor-x = self.absolute-position.x + self.mouse-x - root.absolute-position.x;
                                             root.context-menu-anchor-y = self.absolute-position.y + self.mouse-y - root.absolute-position.y;
@@ -1299,7 +1319,21 @@ root.context-menu-anchor-y / 1px
                                             );
                                         }
                                     }
-
+                                    if event.kind == PointerEventKind.move && self.drag-started {
+                                        root.update-internal-drag(
+                                            (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
+                                            (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px
+                                        );
+                                    }
+                                    if event.kind == PointerEventKind.up && event.button == PointerEventButton.left && self.drag-started {
+                                        self.drag-started = false;
+                                        root.end-internal-drag(
+                                            (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
+                                            (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px,
+                                            event.modifiers.control,
+                                            event.modifiers.shift
+                                        );
+                                    }
                                 }
                                 scroll-event(event) => {
                                     list.viewport-y = max(-(list.viewport-height - list.visible-height), min(0px, list.viewport-y + event.delta-y));
@@ -1441,7 +1475,7 @@ root.context-menu-anchor-y / 1px
                             spacing: 16px;
                             Text { text: root.settings-section == 0 ? root.text-settings-general : root.settings-section == 1 ? root.text-settings-appearance : root.text-settings-developer; color: VisualStyle.c30333a; font-size: 22px; font-weight: 600; height: 44px; }
                             if root.settings-section == 0: Rectangle {
-                                height: 112px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                height: 202px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
                                 VerticalLayout {
                                     padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 12px;
                                     Text { text: root.text-language; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
@@ -1456,6 +1490,8 @@ root.context-menu-anchor-y / 1px
                                             accessible-role: button; accessible-label: language-option;
                                         }
                                     }
+                                    CheckBox { text: root.text-show-hidden-files; checked: root.show-hidden-files; toggled => { root.change-file-visibility(self.checked, root.show-system-files); } }
+                                    CheckBox { text: root.text-show-system-files; checked: root.show-system-files; toggled => { root.change-file-visibility(root.show-hidden-files, self.checked); } }
                                 }
                             }
                             if root.settings-section == 1: Rectangle {

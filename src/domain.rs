@@ -103,6 +103,21 @@ pub struct NameHighlightSegment {
     pub text: String,
     pub highlighted: bool,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileVisibility {
+    pub show_hidden: bool,
+    pub show_system: bool,
+}
+
+impl Default for FileVisibility {
+    fn default() -> Self {
+        Self {
+            show_hidden: true,
+            show_system: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EverythingConfig {
     pub executable_path: Option<PathBuf>,
