@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     ffi::{OsString, c_void},
     io,
     mem::{ManuallyDrop, size_of},
@@ -17,14 +18,21 @@ use windows_sys::Win32::{
 use windows::{
     Win32::{
         Foundation::{
-            DATA_S_SAMEFORMATETC, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS,
-            DV_E_FORMATETC, E_NOTIMPL, HWND, OLE_E_ADVISENOTSUPPORTED, POINTL,
+            COLORREF, DATA_S_SAMEFORMATETC, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP,
+            DRAGDROP_S_USEDEFAULTCURSORS, DV_E_FORMATETC, E_NOTIMPL, HWND,
+            OLE_E_ADVISENOTSUPPORTED, POINT, POINTL, RECT as WinRect, SIZE,
+        },
+        Graphics::Gdi::{
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection,
+            CreateSolidBrush, DIB_RGB_COLORS, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
+            DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, FillRect, HBITMAP, HGDIOBJ, RoundRect,
+            SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
         },
         System::{
             Com::{
-                DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject,
-                IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0,
-                TYMED_HGLOBAL,
+                CLSCTX_INPROC_SERVER, CoCreateInstance, DATADIR_GET, DVASPECT_CONTENT, FORMATETC,
+                IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA,
+                STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
             },
             DataExchange::RegisterClipboardFormatW,
             Memory::{
@@ -38,8 +46,9 @@ use windows::{
             SystemServices::{MK_CONTROL, MK_LBUTTON, MK_RBUTTON, MK_SHIFT, MODIFIERKEYS_FLAGS},
         },
         UI::Shell::{
-            Common::ITEMIDLIST, DROPFILES, DragQueryFileW, HDROP, ILClone, ILFindLastID, ILIsEqual,
-            ILRemoveLastID, SHCreateDataObject, SHCreateStdEnumFmtEtc, SHGetDesktopFolder,
+            CLSID_DragDropHelper, Common::ITEMIDLIST, DROPFILES, DragQueryFileW, HDROP,
+            IDragSourceHelper, IDropTargetHelper, ILClone, ILFindLastID, ILIsEqual, ILRemoveLastID,
+            SHCreateDataObject, SHCreateStdEnumFmtEtc, SHDRAGIMAGE, SHGetDesktopFolder,
             SHGetIDListFromObject, SHParseDisplayName,
         },
     },
@@ -49,6 +58,74 @@ use windows_sys::Win32::Foundation::GlobalFree;
 
 const CF_HDROP: u16 = 15;
 const MK_ALT: u32 = 0x20;
+const TAB_DRAG_FORMAT: &str = "AsterFiles.TabDrag.v1";
+const TAB_DRAG_MAGIC: [u8; 8] = *b"ASTFTAB1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabDragPayload {
+    pub process_id: u32,
+    pub source_hwnd: isize,
+    pub tab_id: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabDropPoint {
+    pub target_hwnd: isize,
+    pub screen_x: i32,
+    pub screen_y: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabDragResult {
+    pub dropped: Option<TabDropPoint>,
+    pub released_outside: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TabDragImage {
+    pub title: String,
+    pub icon: Option<(u32, u32, Vec<u8>)>,
+    pub width_px: u32,
+    pub height_px: u32,
+    pub grab_x_px: i32,
+    pub dark: bool,
+    pub active: bool,
+}
+
+type TabTargetHandlers = std::collections::HashMap<isize, Box<dyn Fn(TabTargetEvent)>>;
+
+thread_local! {
+    static TAB_DROP_TRACKING: RefCell<Option<TabDropTracking>> = const { RefCell::new(None) };
+    static TAB_TARGET_HANDLERS: RefCell<TabTargetHandlers> = RefCell::new(TabTargetHandlers::new());
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabTargetEvent {
+    Hover { screen_x: i32, screen_y: i32 },
+    Leave,
+    Drop { screen_x: i32, screen_y: i32 },
+}
+
+pub fn set_tab_target_handler(hwnd: isize, handler: Box<dyn Fn(TabTargetEvent)>) {
+    TAB_TARGET_HANDLERS.with_borrow_mut(|handlers| {
+        handlers.insert(hwnd, handler);
+    });
+}
+
+fn notify_tab_target(hwnd: isize, event: TabTargetEvent) {
+    TAB_TARGET_HANDLERS.with_borrow(|handlers| {
+        if let Some(handler) = handlers.get(&hwnd) {
+            handler(event);
+        }
+    });
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TabDropTracking {
+    payload: TabDragPayload,
+    hover: Option<TabDropPoint>,
+    dropped: Option<TabDropPoint>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DropEffect {
@@ -264,9 +341,12 @@ struct DragContext {
 
 #[implement(IDropTarget)]
 struct NativeDropTarget {
+    hwnd: isize,
+    helper: Option<IDropTargetHelper>,
     state: SharedState,
     target: SharedTarget,
     context: Mutex<DragContext>,
+    tab_context: Mutex<Option<TabDragPayload>>,
     intents: mpsc::Sender<DropIntent>,
 }
 
@@ -307,6 +387,31 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
         _point: &POINTL,
         native_effect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
+        let tab_payload = data.as_ref().and_then(read_tab_drag_payload);
+        if let Some(payload) =
+            tab_payload.filter(|payload| payload.process_id == std::process::id())
+        {
+            if let Ok(mut context) = self.tab_context.lock() {
+                *context = Some(payload);
+            }
+            track_tab_hover(payload, self.hwnd, _point);
+            if let (Some(helper), Some(data)) = (&self.helper, data.as_ref()) {
+                let point = POINT {
+                    x: _point.x,
+                    y: _point.y,
+                };
+                let _ = unsafe {
+                    helper.DragEnter(
+                        HWND(self.hwnd as *mut c_void),
+                        data,
+                        &point,
+                        DROPEFFECT_MOVE,
+                    )
+                };
+            }
+            set_native_effect(native_effect, DropEffect::Move);
+            return Ok(());
+        }
         let paths = data
             .as_ref()
             .map(read_drop_paths)
@@ -342,6 +447,18 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
         _point: &POINTL,
         native_effect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
+        if let Some(payload) = self.tab_context.lock().ok().and_then(|context| *context) {
+            track_tab_hover(payload, self.hwnd, _point);
+            if let Some(helper) = &self.helper {
+                let point = POINT {
+                    x: _point.x,
+                    y: _point.y,
+                };
+                let _ = unsafe { helper.DragOver(&point, DROPEFFECT_MOVE) };
+            }
+            set_native_effect(native_effect, DropEffect::Move);
+            return Ok(());
+        }
         let target = self.target(_point);
         let paths = self
             .context
@@ -366,6 +483,24 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
     }
 
     fn DragLeave(&self) -> windows::core::Result<()> {
+        if self
+            .tab_context
+            .lock()
+            .ok()
+            .and_then(|mut context| context.take())
+            .is_some()
+        {
+            TAB_DROP_TRACKING.with_borrow_mut(|tracking| {
+                if let Some(tracking) = tracking {
+                    tracking.hover = None;
+                }
+            });
+            notify_tab_target(self.hwnd, TabTargetEvent::Leave);
+            if let Some(helper) = &self.helper {
+                let _ = unsafe { helper.DragLeave() };
+            }
+            return Ok(());
+        }
         if let Ok(mut context) = self.context.lock() {
             *context = DragContext::default();
         }
@@ -380,6 +515,44 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
         _point: &POINTL,
         native_effect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
+        if let Some(payload) = self
+            .tab_context
+            .lock()
+            .ok()
+            .and_then(|mut context| context.take())
+        {
+            let point = TabDropPoint {
+                target_hwnd: self.hwnd,
+                screen_x: _point.x,
+                screen_y: _point.y,
+            };
+            TAB_DROP_TRACKING.with_borrow_mut(|tracking| {
+                if tracking
+                    .as_ref()
+                    .is_some_and(|tracking| tracking.payload == payload)
+                    && let Some(tracking) = tracking.as_mut()
+                {
+                    tracking.hover = Some(point);
+                    tracking.dropped = Some(point);
+                }
+            });
+            notify_tab_target(
+                self.hwnd,
+                TabTargetEvent::Drop {
+                    screen_x: _point.x,
+                    screen_y: _point.y,
+                },
+            );
+            if let (Some(helper), Some(data)) = (&self.helper, data.as_ref()) {
+                let point = POINT {
+                    x: _point.x,
+                    y: _point.y,
+                };
+                let _ = unsafe { helper.Drop(data, &point, DROPEFFECT_MOVE) };
+            }
+            set_native_effect(native_effect, DropEffect::Move);
+            return Ok(());
+        }
         let paths = data
             .as_ref()
             .map(read_drop_paths)
@@ -544,6 +717,277 @@ fn read_drop_paths(data: &IDataObject) -> io::Result<Vec<PathBuf>> {
     result
 }
 
+fn track_tab_hover(payload: TabDragPayload, hwnd: isize, point: &POINTL) {
+    TAB_DROP_TRACKING.with_borrow_mut(|tracking| {
+        if tracking
+            .as_ref()
+            .is_some_and(|tracking| tracking.payload == payload)
+            && let Some(tracking) = tracking.as_mut()
+        {
+            tracking.hover = Some(TabDropPoint {
+                target_hwnd: hwnd,
+                screen_x: point.x,
+                screen_y: point.y,
+            });
+        }
+    });
+    notify_tab_target(
+        hwnd,
+        TabTargetEvent::Hover {
+            screen_x: point.x,
+            screen_y: point.y,
+        },
+    );
+}
+
+fn encode_tab_drag_payload(payload: TabDragPayload) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(24);
+    bytes.extend_from_slice(&TAB_DRAG_MAGIC);
+    bytes.extend_from_slice(&payload.process_id.to_ne_bytes());
+    bytes.extend_from_slice(&(payload.source_hwnd as i64).to_ne_bytes());
+    bytes.extend_from_slice(&payload.tab_id.to_ne_bytes());
+    bytes
+}
+
+fn decode_tab_drag_payload(bytes: &[u8]) -> Option<TabDragPayload> {
+    if bytes.len() != 24 || bytes[..8] != TAB_DRAG_MAGIC {
+        return None;
+    }
+    Some(TabDragPayload {
+        process_id: u32::from_ne_bytes(bytes[8..12].try_into().ok()?),
+        source_hwnd: i64::from_ne_bytes(bytes[12..20].try_into().ok()?) as isize,
+        tab_id: u32::from_ne_bytes(bytes[20..24].try_into().ok()?),
+    })
+}
+
+fn read_tab_drag_payload(data: &IDataObject) -> Option<TabDragPayload> {
+    let format = clipboard_format(TAB_DRAG_FORMAT).ok()?;
+    let format = format_etc(format);
+    let mut medium = unsafe { data.GetData(&format) }.ok()?;
+    let bytes = read_hglobal_bytes(&medium).ok();
+    unsafe { ReleaseStgMedium(&mut medium) };
+    bytes.and_then(|bytes| decode_tab_drag_payload(&bytes))
+}
+
+fn read_hglobal_bytes(medium: &STGMEDIUM) -> io::Result<Vec<u8>> {
+    if medium.tymed != TYMED_HGLOBAL.0 as u32 {
+        return Err(io::Error::other("tab drag payload storage is unavailable"));
+    }
+    let global = unsafe { medium.u.hGlobal };
+    let size = unsafe { GlobalSize(global) };
+    let pointer = unsafe { GlobalLock(global) };
+    if pointer.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), size) }.to_vec();
+    let _ = unsafe { GlobalUnlock(global) };
+    Ok(bytes)
+}
+
+pub fn begin_tab_drag(payload: TabDragPayload, image: &TabDragImage) -> io::Result<TabDragResult> {
+    let _ole = OleApartment::initialize()?;
+    let tab_format = clipboard_format(TAB_DRAG_FORMAT)?;
+    let data = IDataObject::from(OutboundDataObject {
+        formats: vec![(tab_format, encode_tab_drag_payload(payload))],
+        dynamic_formats: Mutex::new(Vec::new()),
+        performed_format: 0,
+        performed_effect: Arc::new(Mutex::new(None)),
+        accept_extra_set_data: true,
+    });
+    TAB_DROP_TRACKING.with_borrow_mut(|tracking| {
+        *tracking = Some(TabDropTracking {
+            payload,
+            hover: None,
+            dropped: None,
+        });
+    });
+    let drag_result = (|| {
+        let bitmap = NativeDragBitmap::new(image)?;
+        let helper: IDragSourceHelper =
+            unsafe { CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER) }
+                .map_err(windows_error)?;
+        let drag_image = SHDRAGIMAGE {
+            sizeDragImage: SIZE {
+                cx: image.width_px as i32,
+                cy: image.height_px as i32,
+            },
+            ptOffset: POINT {
+                x: image
+                    .grab_x_px
+                    .clamp(0, image.width_px.saturating_sub(1) as i32),
+                y: (image.height_px / 2) as i32,
+            },
+            hbmpDragImage: bitmap.handle,
+            crColorKey: COLORREF(0x00ff00ff),
+        };
+        unsafe { helper.InitializeFromBitmap(&drag_image, &data) }.map_err(windows_error)?;
+        let drop_source = IDropSource::from(NativeDropSource);
+        let mut effect = DROPEFFECT_NONE;
+        let result = unsafe { DoDragDrop(&data, &drop_source, DROPEFFECT_MOVE, &mut effect) };
+        Ok::<_, io::Error>((result, effect))
+    })();
+    let tracking = TAB_DROP_TRACKING.with_borrow_mut(|tracking| tracking.take());
+    let (result, effect) = drag_result?;
+    if result.is_err() {
+        return Err(windows_error(WindowsError::from(result)));
+    }
+    Ok(TabDragResult {
+        dropped: tracking.and_then(|tracking| tracking.dropped),
+        released_outside: result == DRAGDROP_S_DROP && effect == DROPEFFECT_NONE,
+    })
+}
+
+struct NativeDragBitmap {
+    handle: HBITMAP,
+}
+
+impl NativeDragBitmap {
+    fn new(image: &TabDragImage) -> io::Result<Self> {
+        let width = image.width_px.max(80) as i32;
+        let height = image.height_px.max(34) as i32;
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut pixels = ptr::null_mut();
+        let bitmap = unsafe { CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut pixels, None, 0) }
+            .map_err(windows_error)?;
+        let dc = unsafe { CreateCompatibleDC(None) };
+        if dc.is_invalid() {
+            let _ = unsafe { DeleteObject(HGDIOBJ(bitmap.0)) };
+            return Err(io::Error::last_os_error());
+        }
+        let old = unsafe { SelectObject(dc, HGDIOBJ(bitmap.0)) };
+        let key = COLORREF(0x00ff00ff);
+        let key_brush = unsafe { CreateSolidBrush(key) };
+        let background = if image.dark {
+            if image.active {
+                COLORREF(0x00373432)
+            } else {
+                COLORREF(0x003e3b3a)
+            }
+        } else if image.active {
+            COLORREF(0x00f5f2f1)
+        } else {
+            COLORREF(0x00ffffff)
+        };
+        let background_brush = unsafe { CreateSolidBrush(background) };
+        let full = WinRect {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        unsafe { FillRect(dc, &full, key_brush) };
+        let old_brush = unsafe { SelectObject(dc, HGDIOBJ(background_brush.0)) };
+        let _ = unsafe { RoundRect(dc, 0, 0, width, height, 14, 14) };
+        if let Some((icon_width, icon_height, icon)) = image.icon.as_ref() {
+            composite_icon(
+                pixels.cast::<u8>(),
+                width as u32,
+                height as u32,
+                12,
+                ((height - 16) / 2).max(0) as u32,
+                16,
+                16,
+                *icon_width,
+                *icon_height,
+                icon,
+            );
+        }
+        let _ = unsafe { SetBkMode(dc, TRANSPARENT) };
+        let _ = unsafe {
+            SetTextColor(
+                dc,
+                if image.dark {
+                    COLORREF(0x00f2f2f2)
+                } else {
+                    COLORREF(0x00383130)
+                },
+            )
+        };
+        let mut title = image.title.encode_utf16().collect::<Vec<_>>();
+        let mut rect = WinRect {
+            left: 34,
+            top: 0,
+            right: width - 10,
+            bottom: height,
+        };
+        unsafe {
+            DrawTextW(
+                dc,
+                &mut title,
+                &mut rect,
+                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+            )
+        };
+
+        // The drag card itself is opaque; only the pixels outside rounded corners use the color key.
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(pixels.cast::<u8>(), (width * height * 4) as usize)
+        };
+        for pixel in bytes.chunks_exact_mut(4) {
+            pixel[3] = 255;
+        }
+        unsafe { SelectObject(dc, old_brush) };
+        let _ = unsafe { DeleteObject(HGDIOBJ(key_brush.0)) };
+        let _ = unsafe { DeleteObject(HGDIOBJ(background_brush.0)) };
+        unsafe { SelectObject(dc, old) };
+        let _ = unsafe { DeleteDC(dc) };
+        Ok(Self { handle: bitmap })
+    }
+}
+
+impl Drop for NativeDragBitmap {
+    fn drop(&mut self) {
+        let _ = unsafe { DeleteObject(HGDIOBJ(self.handle.0)) };
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn composite_icon(
+    target: *mut u8,
+    target_width: u32,
+    target_height: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    source_width: u32,
+    source_height: u32,
+    source: &[u8],
+) {
+    if target.is_null() || source_width == 0 || source_height == 0 {
+        return;
+    }
+    let target = unsafe {
+        std::slice::from_raw_parts_mut(target, (target_width * target_height * 4) as usize)
+    };
+    for dy in 0..height.min(target_height.saturating_sub(y)) {
+        for dx in 0..width.min(target_width.saturating_sub(x)) {
+            let sx = dx * source_width / width;
+            let sy = dy * source_height / height;
+            let source_index = ((sy * source_width + sx) * 4) as usize;
+            let target_index = (((y + dy) * target_width + x + dx) * 4) as usize;
+            let alpha = source.get(source_index + 3).copied().unwrap_or(0) as u16;
+            for channel in 0..3 {
+                let source_value = source.get(source_index + channel).copied().unwrap_or(0) as u16;
+                let target_value = target[target_index + (2 - channel)] as u16;
+                target[target_index + (2 - channel)] =
+                    ((source_value * alpha + target_value * (255 - alpha)) / 255) as u8;
+            }
+        }
+    }
+}
+
 fn read_hdrop(drop: HDROP) -> io::Result<Vec<PathBuf>> {
     let count = unsafe { DragQueryFileW(drop, u32::MAX, None) };
     let mut paths = Vec::with_capacity(count as usize);
@@ -597,8 +1041,10 @@ pub fn begin_outbound_drag(
                 preferred_effect.native().0.to_ne_bytes().to_vec(),
             ),
         ],
+        dynamic_formats: Mutex::new(Vec::new()),
         performed_format,
         performed_effect: performed_effect.clone(),
+        accept_extra_set_data: false,
     });
     let data_object = shell_data_object(paths, &supplemental)?;
     let drop_source = IDropSource::from(NativeDropSource);
@@ -732,8 +1178,10 @@ fn query_continue_drag(escape_pressed: bool, key_state: u32) -> HRESULT {
 #[implement(IDataObject)]
 struct OutboundDataObject {
     formats: Vec<(u16, Vec<u8>)>,
+    dynamic_formats: Mutex<Vec<(u16, Vec<u8>)>>,
     performed_format: u16,
     performed_effect: Arc<Mutex<Option<DropEffect>>>,
+    accept_extra_set_data: bool,
 }
 
 #[allow(non_snake_case)]
@@ -744,6 +1192,14 @@ impl IDataObject_Impl for OutboundDataObject_Impl {
             .iter()
             .find(|(id, _)| supports_format(format, *id))
             .map(|(_, bytes)| allocate_medium(bytes))
+            .or_else(|| {
+                self.dynamic_formats
+                    .lock()
+                    .ok()?
+                    .iter()
+                    .find(|(id, _)| supports_format(format, *id))
+                    .map(|(_, bytes)| allocate_medium(bytes))
+            })
             .unwrap_or_else(|| Err(DV_E_FORMATETC.into()))
     }
 
@@ -763,6 +1219,10 @@ impl IDataObject_Impl for OutboundDataObject_Impl {
             .formats
             .iter()
             .any(|(id, _)| supports_format(format, *id))
+            || self
+                .dynamic_formats
+                .lock()
+                .is_ok_and(|formats| formats.iter().any(|(id, _)| supports_format(format, *id)))
         {
             HRESULT(0)
         } else {
@@ -786,11 +1246,22 @@ impl IDataObject_Impl for OutboundDataObject_Impl {
         let format = unsafe { format.as_ref() }.ok_or_else(|| WindowsError::from(E_NOTIMPL))?;
         let medium = unsafe { medium.as_ref() }.ok_or_else(|| WindowsError::from(E_NOTIMPL))?;
         if !supports_format(format, self.performed_format) {
-            return Err(DV_E_FORMATETC.into());
-        }
-        let effect = read_effect_medium(medium)?;
-        if let Ok(mut performed) = self.performed_effect.lock() {
-            *performed = Some(effect);
+            if !self.accept_extra_set_data {
+                return Err(DV_E_FORMATETC.into());
+            }
+            let bytes = read_hglobal_bytes(medium)?;
+            if let Ok(mut formats) = self.dynamic_formats.lock() {
+                if let Some(existing) = formats.iter_mut().find(|(id, _)| *id == format.cfFormat) {
+                    existing.1 = bytes;
+                } else {
+                    formats.push((format.cfFormat, bytes));
+                }
+            }
+        } else {
+            let effect = read_effect_medium(medium)?;
+            if let Ok(mut performed) = self.performed_effect.lock() {
+                *performed = Some(effect);
+            }
         }
         if release.as_bool() {
             let mut owned = medium.clone();
@@ -807,6 +1278,18 @@ impl IDataObject_Impl for OutboundDataObject_Impl {
             .formats
             .iter()
             .map(|(id, _)| format_etc(*id))
+            .chain(
+                self.dynamic_formats
+                    .lock()
+                    .ok()
+                    .into_iter()
+                    .flat_map(|formats| {
+                        formats
+                            .iter()
+                            .map(|(id, _)| format_etc(*id))
+                            .collect::<Vec<_>>()
+                    }),
+            )
             .collect::<Vec<_>>();
         unsafe { SHCreateStdEnumFmtEtc(&formats) }
     }
@@ -1015,6 +1498,9 @@ pub fn register_current(
 }
 
 pub fn revoke(hwnd: isize) {
+    TAB_TARGET_HANDLERS.with_borrow_mut(|handlers| {
+        handlers.remove(&hwnd);
+    });
     THREAD_APARTMENT.with(|apartment| {
         apartment.borrow_mut().registrations.remove(&hwnd);
     });
@@ -1045,10 +1531,15 @@ impl DragDropRegistration {
             ));
         }
         let state = Arc::new(Mutex::new(DragDropState::default()));
+        let helper =
+            unsafe { CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER) }.ok();
         let target = IDropTarget::from(NativeDropTarget {
+            hwnd,
+            helper,
             state: state.clone(),
             target: current_target,
             context: Mutex::new(DragContext::default()),
+            tab_context: Mutex::new(None),
             intents,
         });
         let hwnd = HWND(hwnd as *mut c_void);
@@ -1127,8 +1618,10 @@ mod tests {
                 ),
                 (preferred_format, DROPEFFECT_MOVE.0.to_ne_bytes().to_vec()),
             ],
+            dynamic_formats: Mutex::new(Vec::new()),
             performed_format,
             performed_effect: Arc::new(Mutex::new(None)),
+            accept_extra_set_data: false,
         });
         let data = shell_data_object(std::slice::from_ref(&temporary), &supplemental).unwrap();
         let shell_id_list = clipboard_format("Shell IDList Array").unwrap();
@@ -1162,6 +1655,96 @@ mod tests {
             performed_format
         ));
         assert!(!supports_format(&format_etc(99), CF_HDROP));
+    }
+
+    #[test]
+    fn tab_drag_payload_round_trips_and_rejects_wrong_magic_or_size() {
+        let payload = TabDragPayload {
+            process_id: 42,
+            source_hwnd: 0x1234,
+            tab_id: 99,
+        };
+        let bytes = encode_tab_drag_payload(payload);
+
+        assert_eq!(decode_tab_drag_payload(&bytes), Some(payload));
+        assert_eq!(decode_tab_drag_payload(&bytes[..23]), None);
+        let mut wrong_magic = bytes;
+        wrong_magic[0] = b'X';
+        assert_eq!(decode_tab_drag_payload(&wrong_magic), None);
+    }
+
+    #[test]
+    fn tab_drag_data_object_exposes_only_private_format() {
+        let _ole = OleApartment::initialize().unwrap();
+        let tab_format = clipboard_format(TAB_DRAG_FORMAT).unwrap();
+        let data = IDataObject::from(OutboundDataObject {
+            formats: vec![(
+                tab_format,
+                encode_tab_drag_payload(TabDragPayload {
+                    process_id: std::process::id(),
+                    source_hwnd: 123,
+                    tab_id: 7,
+                }),
+            )],
+            dynamic_formats: Mutex::new(Vec::new()),
+            performed_format: 0,
+            performed_effect: Arc::new(Mutex::new(None)),
+            accept_extra_set_data: true,
+        });
+
+        assert_eq!(
+            unsafe { data.QueryGetData(&format_etc(tab_format)) },
+            HRESULT(0)
+        );
+        assert_ne!(
+            unsafe { data.QueryGetData(&format_etc(CF_HDROP)) },
+            HRESULT(0)
+        );
+        assert_eq!(
+            read_tab_drag_payload(&data),
+            Some(TabDragPayload {
+                process_id: std::process::id(),
+                source_hwnd: 123,
+                tab_id: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn tab_target_tracking_records_hover_drop_and_leave_without_file_state() {
+        let payload = TabDragPayload {
+            process_id: std::process::id(),
+            source_hwnd: 1,
+            tab_id: 2,
+        };
+        TAB_DROP_TRACKING.with_borrow_mut(|tracking| {
+            *tracking = Some(TabDropTracking {
+                payload,
+                hover: None,
+                dropped: None,
+            });
+        });
+        track_tab_hover(payload, 10, &POINTL { x: 400, y: 200 });
+        assert_eq!(
+            TAB_DROP_TRACKING
+                .with_borrow(|tracking| tracking.as_ref().and_then(|value| value.hover)),
+            Some(TabDropPoint {
+                target_hwnd: 10,
+                screen_x: 400,
+                screen_y: 200,
+            })
+        );
+        TAB_DROP_TRACKING.with_borrow_mut(|tracking| {
+            if let Some(value) = tracking.as_mut() {
+                value.hover = None;
+            }
+        });
+        assert!(TAB_DROP_TRACKING.with_borrow(|tracking| {
+            tracking
+                .as_ref()
+                .is_some_and(|value| value.hover.is_none() && value.dropped.is_none())
+        }));
+        TAB_DROP_TRACKING.with_borrow_mut(|tracking| *tracking = None);
     }
 
     #[test]

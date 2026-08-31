@@ -274,31 +274,6 @@ component InlineIcon inherits Rectangle {
     Image { width: root.icon-size; height: root.icon-size; y: (parent.height - self.height) / 2; source: root.icon-source; }
 }
 
-export component TabDragPreviewWindow inherits Window {
-    title: "AsterFiles Tab Drag Preview";
-    no-frame: true;
-    background: transparent;
-    width: root.card-width;
-    height: 34px;
-    in property <length> card-width: 178px;
-    in property <string> card-title: "";
-    in property <image> card-icon;
-    in property <bool> card-is-drive: false;
-    in property <bool> card-active: false;
-    in property <bool> dark-theme: false;
-    Rectangle {
-        border-radius: 7px;
-        background: root.card-active ? (root.dark-theme ? #323437 : #f1f2f5) : (root.dark-theme ? #3a3b3e : #ffffff);
-        border-width: 1px;
-        border-color: root.dark-theme ? #55585f : #d9dce2;
-        HorizontalLayout {
-            padding-left: 14px; padding-right: 12px; spacing: 6px;
-            InlineIcon { icon-source: root.card-icon.width != 0 ? root.card-icon : (root.card-is-drive ? IconMap.location-drive : IconMap.file-folder); icon-size: 16px; }
-            Text { text: root.card-title; color: root.dark-theme ? #f2f2f2 : #303138; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
-        }
-    }
-}
-
 component ActiveTabShape inherits Rectangle {
     in property <color> shape-color;
     background: transparent;
@@ -811,8 +786,6 @@ export component AppWindow inherits Window {
     callback activate-tab(int);
     callback begin-tab-drag(int, int, float, float);
     callback update-tab-drag(float, float, float, float, float, float) -> int;
-    callback end-tab-drag(float, float, float, float, float, float);
-    callback finish-global-tab-drag(float, float);
     callback cancel-tab-drag();
     callback open-settings();
     callback change-theme(int);
@@ -906,11 +879,12 @@ export component AppWindow inherits Window {
     out property <length> tab-viewport-x: tab-strip.viewport-x;
     private property <bool> tabs-menu-open: false;
     in-out property <bool> tab-dragging: false;
-    private property <bool> suppress-tab-click: false;
+    private property <bool> tab-drag-pointer-active: false;
+    in-out property <bool> suppress-tab-click: false;
     private property <bool> external-tab-dragging: false;
     private property <int> external-tab-insertion-index: -1;
     private property <int> tab-drag-source-index: -1;
-    private property <int> tab-drag-insertion-index: -1;
+    in-out property <int> tab-drag-insertion-index: -1;
     private property <length> tab-drag-pointer-x: 0px;
     private property <length> tab-drag-pointer-y: 0px;
     private property <length> tab-drag-grab-x: 0px;
@@ -920,10 +894,13 @@ export component AppWindow inherits Window {
     private property <bool> tab-drag-active: false;
     public function clear-tab-drag() {
         root.tab-dragging = false;
-        root.suppress-tab-click = false;
+        root.tab-drag-pointer-active = false;
         root.tab-drag-source-index = -1;
         root.tab-drag-insertion-index = -1;
         root.tab-drag-title = "";
+    }
+    public function release-tab-drag-pointer() {
+        root.tab-drag-pointer-active = false;
     }
     public function project-external-tab-drag(insertion-index: int) {
         root.external-tab-dragging = true;
@@ -1051,11 +1028,12 @@ export component AppWindow inherits Window {
                             tab-touch := TouchArea {
                                 mouse-cursor: pointer;
                                 clicked => {
-                                    if root.suppress-tab-click { root.suppress-tab-click = false; }
-                                    else { root.activate-tab(tab.id); root.reveal-tab(index); }
+                                    if !root.suppress-tab-click { root.activate-tab(tab.id); root.reveal-tab(index); }
+                                    root.suppress-tab-click = false;
                                 }
                                 pointer-event(event) => {
                                     if event.button == PointerEventButton.left && event.kind == PointerEventKind.down && !tab.is-settings {
+                                        root.tab-drag-pointer-active = true;
                                         root.tab-drag-source-index = index;
                                         root.tab-drag-grab-x = self.mouse-x;
                                         root.tab-drag-title = tab.title;
@@ -1069,7 +1047,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 moved => {
-                                    if self.pressed && root.tab-drag-source-index == index {
+                                    if self.pressed && root.tab-drag-pointer-active && root.tab-drag-source-index == index {
                                         root.tab-drag-pointer-x = (8 + 34 + 5) * 1px + index * (root.tab-width + 5px) + tab-strip.viewport-x + self.mouse-x;
                                         root.tab-drag-pointer-y = 12px + self.mouse-y;
                                         let insertion = root.update-tab-drag(root.tab-drag-pointer-x / 1px, root.tab-drag-pointer-y / 1px, 8 + 34 + 5, root.tab-strip-width / 1px, tab-strip.viewport-x / 1px, root.tab-width / 1px);

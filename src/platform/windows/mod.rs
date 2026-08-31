@@ -19,14 +19,6 @@ pub fn cursor_screen_position() -> io::Result<(i32, i32)> {
     Ok((cursor.x, cursor.y))
 }
 
-pub fn left_mouse_button_down() -> bool {
-    unsafe {
-        windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(
-            windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_LBUTTON as i32,
-        ) < 0
-    }
-}
-
 pub fn begin_window_drag(hwnd: isize) -> io::Result<()> {
     if hwnd == 0 {
         return Err(io::Error::new(
@@ -50,21 +42,6 @@ pub fn begin_window_drag(hwnd: isize) -> io::Result<()> {
     Ok(())
 }
 
-pub fn capture_pointer(hwnd: isize) -> io::Result<()> {
-    if hwnd == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "window handle unavailable",
-        ));
-    }
-    let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
-    unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd) };
-    if unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture() } != hwnd {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 pub fn has_pointer_capture(hwnd: isize) -> bool {
     hwnd != 0
         && unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture() }
@@ -73,42 +50,4 @@ pub fn has_pointer_capture(hwnd: isize) -> bool {
 
 pub fn release_pointer_capture() {
     unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture() };
-}
-
-pub fn configure_drag_preview(hwnd: isize) -> io::Result<()> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, GetWindowLongPtrW, HWND_TOPMOST, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-        SWP_NOMOVE, SWP_NOSIZE, SetWindowLongPtrW, SetWindowPos, ShowWindow, WS_EX_LAYERED,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
-    };
-    if hwnd == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "preview window handle unavailable",
-        ));
-    }
-    let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
-    let current = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
-    let desired = current
-        | WS_EX_LAYERED as isize
-        | WS_EX_TRANSPARENT as isize
-        | WS_EX_NOACTIVATE as isize
-        | WS_EX_TOOLWINDOW as isize;
-    unsafe { SetWindowLongPtrW(hwnd, GWL_EXSTYLE, desired) };
-    if unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } & desired != desired {
-        return Err(io::Error::last_os_error());
-    }
-    unsafe {
-        SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
-        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-    }
-    Ok(())
 }

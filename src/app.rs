@@ -411,111 +411,42 @@ struct WindowRuntime {
 
 thread_local! {
     static WINDOW_RUNTIMES: RefCell<HashMap<WindowId, WindowRuntime>> = RefCell::new(HashMap::new());
-    static TAB_DRAG_PREVIEW: RefCell<Option<TabDragPreviewWindow>> = const { RefCell::new(None) };
-    static TAB_DRAG_PREVIEW_TIMER: RefCell<Option<slint::Timer>> = const { RefCell::new(None) };
 }
 
-fn show_tab_drag_preview(
-    source_ui: &AppWindow,
+fn native_tab_drag_image(
+    ui: &AppWindow,
     state: &SharedSessions,
-    screen_x: i32,
-    screen_y: i32,
-) -> Result<(), slint::PlatformError> {
-    let (title, icon, is_drive, active, dark, width) = {
-        let app = state.lock().map_err(|_| slint::PlatformError::NoPlatform)?;
-        let drag = app.tab_drag.ok_or(slint::PlatformError::NoPlatform)?;
-        let tab = app
-            .tab(drag.tab_id)
-            .ok_or(slint::PlatformError::NoPlatform)?;
-        let title = tab
-            .visible_path()
-            .and_then(Path::file_name)
-            .map(|name| name.to_string_lossy().into_owned())
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| display_path(tab.visible_path().unwrap_or(Path::new("C:\\"))));
-        (
-            title,
-            tab.visible_path()
-                .and_then(|path| app.icon_cache.get(path))
-                .map(shell_icon_image)
-                .unwrap_or_default(),
-            tab.visible_path().is_some_and(is_drive_root),
-            app.window(drag.window_id)
-                .is_some_and(|window| window.active_tab == drag.tab_id),
-            app.dark_theme(),
-            source_ui.get_tab_current_width().max(80.0),
-        )
-    };
-    TAB_DRAG_PREVIEW.with_borrow_mut(|slot| {
-        let preview = match slot {
-            Some(preview) => preview,
-            None => slot.insert(TabDragPreviewWindow::new()?),
-        };
-        preview.set_card_title(slint::SharedString::from(title));
-        preview.set_card_icon(icon);
-        preview.set_card_is_drive(is_drive);
-        preview.set_card_active(active);
-        preview.set_dark_theme(dark);
-        preview.set_card_width(width);
-        preview.window().set_position(slint::PhysicalPosition::new(
-            screen_x - (width * source_ui.window().scale_factor() / 2.0).round() as i32,
-            screen_y - (17.0 * source_ui.window().scale_factor()).round() as i32,
-        ));
-        preview.show()?;
-        platform::windows::configure_drag_preview(component_window_handle(preview))
-            .map_err(|error| slint::PlatformError::Other(error.to_string()))?;
-        Ok::<(), slint::PlatformError>(())
-    })?;
-
-    let weak = source_ui.as_weak();
-    let state = state.clone();
-    let timer = slint::Timer::default();
-    timer.start(
-        slint::TimerMode::Repeated,
-        Duration::from_millis(16),
-        move || {
-            let Some(source_ui) = weak.upgrade() else {
-                return;
-            };
-            let Ok((screen_x, screen_y)) = platform::windows::cursor_screen_position() else {
-                return;
-            };
-            if !platform::windows::left_mouse_button_down() {
-                source_ui.invoke_finish_global_tab_drag(screen_x as f32, screen_y as f32);
-                return;
-            }
-            move_tab_drag_preview(screen_x, screen_y, source_ui.window().scale_factor());
-            let source_window = state.lock().ok().and_then(|app| {
-                app.tab_drag
-                    .filter(|drag| matches!(drag.phase, TabDragPhase::Dragging { .. }))
-                    .map(|drag| drag.window_id)
-            });
-            project_cross_window_drop(source_window.and_then(|source_window| {
-                cross_window_drop_target(source_window, screen_x, screen_y, &state)
-            }));
-        },
-    );
-    TAB_DRAG_PREVIEW_TIMER.with_borrow_mut(|slot| *slot = Some(timer));
-    Ok(())
-}
-
-fn move_tab_drag_preview(screen_x: i32, screen_y: i32, scale: f32) {
-    TAB_DRAG_PREVIEW.with_borrow(|slot| {
-        if let Some(preview) = slot {
-            let width = preview.get_card_width();
-            let (x, y) = drag_preview_position(screen_x, screen_y, width, scale);
-            preview
-                .window()
-                .set_position(slint::PhysicalPosition::new(x, y));
-        }
-    });
-}
-
-fn drag_preview_position(screen_x: i32, screen_y: i32, width: f32, scale: f32) -> (i32, i32) {
-    (
-        screen_x - (width * scale / 2.0).round() as i32,
-        screen_y - (17.0 * scale).round() as i32,
-    )
+) -> Option<platform::windows::drag_drop::TabDragImage> {
+    let scale = ui.window().scale_factor();
+    let app = state.lock().ok()?;
+    let drag = app.tab_drag?;
+    let tab = app.tab(drag.tab_id)?;
+    let icon = tab
+        .visible_path()
+        .and_then(|path| app.icon_cache.get(path))
+        .map(|icon| (icon.width, icon.height, icon.pixels.clone()));
+    let title = tab
+        .visible_path()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| display_path(tab.visible_path().unwrap_or(Path::new("C:\\"))));
+    Some(platform::windows::drag_drop::TabDragImage {
+        title,
+        icon,
+        width_px: (ui.get_tab_current_width().max(80.0) * scale).round() as u32,
+        height_px: (34.0 * scale).round() as u32,
+        grab_x_px: ((drag.press_x
+            - 47.0
+            - ui.get_tab_viewport_x()
+            - drag.source_index as f32 * (ui.get_tab_current_width() + 5.0))
+            * scale)
+            .round() as i32,
+        dark: app.dark_theme(),
+        active: app
+            .window(drag.window_id)
+            .is_some_and(|window| window.active_tab == drag.tab_id),
+    })
 }
 
 fn screen_to_client_physical(screen_x: i32, screen_y: i32, left: i32, top: i32) -> (f64, f64) {
@@ -621,17 +552,6 @@ fn request_grid_thumbnails(
     for request in grid_thumbnail_requests(ui, state, window_id) {
         let _ = sender.send(request);
     }
-}
-
-fn hide_tab_drag_preview() {
-    TAB_DRAG_PREVIEW_TIMER.with_borrow_mut(|slot| {
-        slot.take();
-    });
-    TAB_DRAG_PREVIEW.with_borrow_mut(|slot| {
-        if let Some(preview) = slot.take() {
-            let _ = preview.hide();
-        }
-    });
 }
 
 fn refresh_all_windows(state: &SharedSessions) {
@@ -774,6 +694,55 @@ fn project_cross_window_drop(target: Option<(WindowId, usize)>) {
             }
         }
     });
+}
+
+fn project_native_tab_target(
+    window_id: WindowId,
+    event: platform::windows::drag_drop::TabTargetEvent,
+    state: &SharedSessions,
+) {
+    let Some(ui) = window_ui(window_id) else {
+        return;
+    };
+    let target = match event {
+        platform::windows::drag_drop::TabTargetEvent::Hover { screen_x, screen_y } => {
+            let source_window = state
+                .lock()
+                .ok()
+                .and_then(|app| app.tab_drag.map(|drag| drag.window_id));
+            source_window.and_then(|source_window| {
+                if source_window == window_id {
+                    let (left, top, _, _) =
+                        platform::windows::drag_drop::client_screen_rect(native_window_handle(&ui))
+                            .ok()?;
+                    let (x, y) = physical_client_to_logical(
+                        f64::from(screen_x),
+                        f64::from(screen_y),
+                        left,
+                        top,
+                        ui.window().scale_factor(),
+                    );
+                    let insertion = state.lock().ok().and_then(|mut app| {
+                        app.update_tab_drag(
+                            x,
+                            y,
+                            47.0,
+                            ui.get_tab_strip_width(),
+                            ui.get_tab_viewport_x(),
+                            ui.get_tab_current_width(),
+                        )
+                    });
+                    ui.set_tab_drag_insertion_index(insertion.map_or(-1, |index| index as i32));
+                    None
+                } else {
+                    cross_window_drop_target(source_window, screen_x, screen_y, state)
+                }
+            })
+        }
+        platform::windows::drag_drop::TabTargetEvent::Leave
+        | platform::windows::drag_drop::TabTargetEvent::Drop { .. } => None,
+    };
+    project_cross_window_drop(target);
 }
 
 fn remove_window_runtime(window_id: WindowId) {
@@ -2641,11 +2610,10 @@ fn move_tab_into_existing_window(
     true
 }
 
-fn finish_global_tab_drag(
+fn finish_native_tab_drag(
     source_ui: &AppWindow,
     source_window: WindowId,
-    screen_x: i32,
-    screen_y: i32,
+    drop_point: Option<platform::windows::drag_drop::TabDropPoint>,
     senders: &WorkerSenders,
     confirmations: &ConfirmationWindows,
     state: &SharedSessions,
@@ -2658,9 +2626,25 @@ fn finish_global_tab_drag(
     if !dragging {
         return false;
     }
-    platform::windows::release_pointer_capture();
-    hide_tab_drag_preview();
-    let cross_target = cross_window_drop_target(source_window, screen_x, screen_y, state);
+    let Some(drop_point) = drop_point else {
+        if let Ok(mut app) = state.lock() {
+            app.cancel_tab_drag();
+        }
+        project_cross_window_drop(None);
+        source_ui.invoke_clear_tab_drag();
+        refresh_window_ui(source_ui, state, source_window);
+        return false;
+    };
+    let screen_x = drop_point.screen_x;
+    let screen_y = drop_point.screen_y;
+    let target_window = WINDOW_RUNTIMES.with_borrow(|runtimes| {
+        runtimes.iter().find_map(|(window_id, runtime)| {
+            (native_window_handle(&runtime.ui) == drop_point.target_hwnd).then_some(*window_id)
+        })
+    });
+    let cross_target = target_window
+        .filter(|window_id| *window_id != source_window)
+        .and_then(|_| cross_window_drop_target(source_window, screen_x, screen_y, state));
     let moved = cross_target.is_some_and(|(destination, insertion)| {
         move_tab_into_existing_window(
             source_ui,
@@ -2675,6 +2659,7 @@ fn finish_global_tab_drag(
         .unwrap_or((false, winit::dpi::PhysicalPosition::new(0.0, 0.0)));
     let detached = !moved
         && cross_target.is_none()
+        && target_window.is_none()
         && !valid_source
         && detach_tab_into_new_window(
             source_ui,
@@ -4028,6 +4013,14 @@ fn wire_callbacks(
 
     let weak = ui.as_weak();
     let state_for_tab_drag = state.clone();
+    let senders_for_tab_drag = WorkerSenders {
+        directory: sender.clone(),
+        operation: operation_sender.clone(),
+        clipboard: clipboard_sender.clone(),
+        everything: everything_sender.clone(),
+        icon: icon_sender.clone(),
+    };
+    let confirmations_for_tab_drag = ConfirmationWindows::new(delete_ui, conflict_ui, exit_ui);
     ui.on_update_tab_drag(move |x, y, strip_x, strip_width, viewport_x, tab_width| {
         let update = state_for_tab_drag.lock().ok().map(|mut app| {
             let before = app.tab_drag.map(|drag| drag.phase);
@@ -4040,90 +4033,60 @@ fn wire_callbacks(
         let Some((insertion, became_dragging)) = update else {
             return -2;
         };
-        if became_dragging && let Some(ui) = weak.upgrade() {
+        if should_start_native_tab_drag(became_dragging, false)
+            && let Some(ui) = weak.upgrade()
+        {
             let hwnd = native_window_handle(&ui);
-            if platform::windows::capture_pointer(hwnd).is_err() {
-                if let Ok(mut app) = state_for_tab_drag.lock() {
-                    app.cancel_tab_drag();
-                }
-                ui.invoke_clear_tab_drag();
-                project_cross_window_drop(None);
-                return -2;
-            }
-            let (left, top, _, _) =
-                platform::windows::drag_drop::client_screen_rect(hwnd).unwrap_or_default();
-            if show_tab_drag_preview(
+            let payload = state_for_tab_drag.lock().ok().and_then(|app| {
+                app.tab_drag
+                    .map(|drag| platform::windows::drag_drop::TabDragPayload {
+                        process_id: std::process::id(),
+                        source_hwnd: hwnd,
+                        tab_id: drag.tab_id.0,
+                    })
+            });
+            let image = native_tab_drag_image(&ui, &state_for_tab_drag.shared);
+            ui.set_tab_dragging(true);
+            ui.set_suppress_tab_click(true);
+            // End Slint's gesture ownership before Windows starts the modal OLE drag loop.
+            ui.invoke_release_tab_drag_pointer();
+            let result = payload.zip(image).map(|(payload, image)| {
+                platform::windows::drag_drop::begin_tab_drag(payload, &image)
+            });
+            let drop_point = result
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .and_then(|result| result.dropped)
+                .or_else(|| {
+                    result
+                        .as_ref()
+                        .and_then(|result| result.as_ref().ok())
+                        .filter(|result| result.released_outside)
+                        .and_then(|_| platform::windows::cursor_screen_position().ok())
+                        .map(
+                            |(screen_x, screen_y)| platform::windows::drag_drop::TabDropPoint {
+                                target_hwnd: 0,
+                                screen_x,
+                                screen_y,
+                            },
+                        )
+                });
+            finish_native_tab_drag(
                 &ui,
+                state_for_tab_drag.window_id,
+                drop_point,
+                &senders_for_tab_drag,
+                &confirmations_for_tab_drag,
                 &state_for_tab_drag.shared,
-                left + (x * ui.window().scale_factor()).round() as i32,
-                top + (y * ui.window().scale_factor()).round() as i32,
-            )
-            .is_err()
-            {
-                platform::windows::release_pointer_capture();
-                if let Ok(mut app) = state_for_tab_drag.lock() {
-                    app.cancel_tab_drag();
-                }
-                ui.invoke_clear_tab_drag();
-                project_cross_window_drop(None);
-                return -2;
-            }
+            );
+            return -2;
         }
         insertion.map(|index| index as i32).unwrap_or(-2)
     });
 
     let weak = ui.as_weak();
     let state_for_tab_drag = state.clone();
-    ui.on_end_tab_drag(move |x, y, strip_x, strip_width, _viewport_x, _tab_width| {
-        let valid = (0.0..=46.0).contains(&y) && x >= strip_x && x <= strip_x + strip_width;
-        if !valid {
-            return;
-        }
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        if !ui.get_tab_dragging() {
-            return;
-        }
-        platform::windows::release_pointer_capture();
-        hide_tab_drag_preview();
-        if let Ok(mut app) = state_for_tab_drag.lock() {
-            app.finish_tab_drag(true);
-        }
-        ui.invoke_clear_tab_drag();
-        refresh_ui(&ui, &state_for_tab_drag);
-    });
-
-    let weak = ui.as_weak();
-    let state_for_finish = state.clone();
-    let senders_for_finish = WorkerSenders {
-        directory: sender.clone(),
-        operation: operation_sender.clone(),
-        clipboard: clipboard_sender.clone(),
-        everything: everything_sender.clone(),
-        icon: icon_sender.clone(),
-    };
-    let confirmations_for_finish = ConfirmationWindows::new(delete_ui, conflict_ui, exit_ui);
-    ui.on_finish_global_tab_drag(move |screen_x, screen_y| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        finish_global_tab_drag(
-            &ui,
-            state_for_finish.window_id,
-            screen_x.round() as i32,
-            screen_y.round() as i32,
-            &senders_for_finish,
-            &confirmations_for_finish,
-            &state_for_finish.shared,
-        );
-    });
-
-    let weak = ui.as_weak();
-    let state_for_tab_drag = state.clone();
     ui.on_cancel_tab_drag(move || {
-        platform::windows::release_pointer_capture();
-        hide_tab_drag_preview();
         if let Ok(mut app) = state_for_tab_drag.lock() {
             app.cancel_tab_drag();
         }
@@ -4876,23 +4839,6 @@ fn wire_mouse_navigation(
         match event {
             WindowEvent::CursorMoved { position, .. } => {
                 cursor_position.set(*position);
-                let dragging = shared_state.lock().is_ok_and(|app| {
-                    app.tab_drag.is_some_and(|drag| {
-                        drag.window_id == window_id
-                            && matches!(drag.phase, TabDragPhase::Dragging { .. })
-                    })
-                });
-                if dragging
-                    && let Ok((screen_x, screen_y)) = platform::windows::cursor_screen_position()
-                {
-                    move_tab_drag_preview(screen_x, screen_y, ui.window().scale_factor());
-                    project_cross_window_drop(cross_window_drop_target(
-                        window_id,
-                        screen_x,
-                        screen_y,
-                        &shared_state,
-                    ));
-                }
                 EventResult::Propagate
             }
             WindowEvent::MouseWheel { delta, .. } if !ui.get_active_is_settings() => {
@@ -4924,27 +4870,6 @@ fn wire_mouse_navigation(
                     );
                 }
                 EventResult::PreventDefault
-            }
-            WindowEvent::MouseInput {
-                state: ElementState::Released,
-                button: winit::event::MouseButton::Left,
-                ..
-            } => {
-                let screen = platform::windows::cursor_screen_position().ok();
-                if let Some((screen_x, screen_y)) = screen
-                    && finish_global_tab_drag(
-                        &ui,
-                        window_id,
-                        screen_x,
-                        screen_y,
-                        &senders,
-                        &confirmations,
-                        &shared_state,
-                    )
-                {
-                    return EventResult::PreventDefault;
-                }
-                EventResult::Propagate
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && !event.repeat =>
@@ -5182,6 +5107,10 @@ fn wire_mouse_navigation(
 fn should_release_internal_pointer_grab(distance: f32, outbound_started: bool) -> bool {
     distance >= 4.0 && !outbound_started
 }
+
+fn should_start_native_tab_drag(became_dragging: bool, native_started: bool) -> bool {
+    became_dragging && !native_started
+}
 fn drop_requires_choice(intent: &platform::windows::drag_drop::DropIntent) -> bool {
     intent.right_button
 }
@@ -5262,6 +5191,7 @@ fn wire_native_drag_drop(
 ) -> slint::Timer {
     use std::cell::Cell;
 
+    let window_id = state.window_id;
     let target = Arc::new(Mutex::new(
         platform::windows::drag_drop::DropTargetSnapshot::default(),
     ));
@@ -5294,7 +5224,16 @@ fn wire_native_drag_drop(
                     target_for_registration.clone(),
                     intent_for_registration.clone(),
                 ) {
-                    Ok(()) => registered_hwnd.set(hwnd),
+                    Ok(()) => {
+                        registered_hwnd.set(hwnd);
+                        let state_for_tabs = state_for_target.shared.clone();
+                        platform::windows::drag_drop::set_tab_target_handler(
+                            hwnd,
+                            Box::new(move |event| {
+                                project_native_tab_target(window_id, event, &state_for_tabs);
+                            }),
+                        );
+                    }
                     Err(error) => {
                         eprintln!("failed to register native drag-drop target hwnd={hwnd}: {error}")
                     }
@@ -9683,9 +9622,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drag_preview_uses_physical_screen_cursor_at_each_dpi() {
-        assert_eq!(drag_preview_position(800, 400, 178.0, 1.0), (711, 383));
-        assert_eq!(drag_preview_position(800, 400, 178.0, 1.5), (666, 374));
+    fn tab_drop_routes_physical_screen_cursor_at_each_dpi() {
         assert_eq!(
             screen_to_client_physical(800, 400, 640, 250),
             (160.0, 150.0)
@@ -11364,6 +11301,13 @@ mod tests {
         assert!(!should_release_internal_pointer_grab(3.9, false));
         assert!(should_release_internal_pointer_grab(4.0, false));
         assert!(!should_release_internal_pointer_grab(8.0, true));
+    }
+
+    #[test]
+    fn native_tab_drag_starts_once_after_the_threshold_transition() {
+        assert!(!should_start_native_tab_drag(false, false));
+        assert!(should_start_native_tab_drag(true, false));
+        assert!(!should_start_native_tab_drag(true, true));
     }
     fn right_drop_intent(
         paths: Vec<PathBuf>,
