@@ -812,6 +812,7 @@ export component AppWindow inherits Window {
     callback begin-tab-drag(int, int, float, float);
     callback update-tab-drag(float, float, float, float, float, float) -> int;
     callback end-tab-drag(float, float, float, float, float, float);
+    callback finish-global-tab-drag(float, float);
     callback cancel-tab-drag();
     callback open-settings();
     callback change-theme(int);

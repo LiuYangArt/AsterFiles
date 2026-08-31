@@ -412,6 +412,7 @@ struct WindowRuntime {
 thread_local! {
     static WINDOW_RUNTIMES: RefCell<HashMap<WindowId, WindowRuntime>> = RefCell::new(HashMap::new());
     static TAB_DRAG_PREVIEW: RefCell<Option<TabDragPreviewWindow>> = const { RefCell::new(None) };
+    static TAB_DRAG_PREVIEW_TIMER: RefCell<Option<slint::Timer>> = const { RefCell::new(None) };
 }
 
 fn show_tab_drag_preview(
@@ -463,29 +464,169 @@ fn show_tab_drag_preview(
         preview.show()?;
         platform::windows::configure_drag_preview(component_window_handle(preview))
             .map_err(|error| slint::PlatformError::Other(error.to_string()))?;
-        Ok(())
-    })
+        Ok::<(), slint::PlatformError>(())
+    })?;
+
+    let weak = source_ui.as_weak();
+    let state = state.clone();
+    let timer = slint::Timer::default();
+    timer.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(16),
+        move || {
+            let Some(source_ui) = weak.upgrade() else {
+                return;
+            };
+            let Ok((screen_x, screen_y)) = platform::windows::cursor_screen_position() else {
+                return;
+            };
+            if !platform::windows::left_mouse_button_down() {
+                source_ui.invoke_finish_global_tab_drag(screen_x as f32, screen_y as f32);
+                return;
+            }
+            move_tab_drag_preview(screen_x, screen_y, source_ui.window().scale_factor());
+            let source_window = state.lock().ok().and_then(|app| {
+                app.tab_drag
+                    .filter(|drag| matches!(drag.phase, TabDragPhase::Dragging { .. }))
+                    .map(|drag| drag.window_id)
+            });
+            project_cross_window_drop(source_window.and_then(|source_window| {
+                cross_window_drop_target(source_window, screen_x, screen_y, &state)
+            }));
+        },
+    );
+    TAB_DRAG_PREVIEW_TIMER.with_borrow_mut(|slot| *slot = Some(timer));
+    Ok(())
 }
 
-fn move_tab_drag_preview(source_ui: &AppWindow, cursor: winit::dpi::PhysicalPosition<f64>) {
-    let Ok((left, top, _, _)) =
-        platform::windows::drag_drop::client_screen_rect(native_window_handle(source_ui))
-    else {
-        return;
-    };
+fn move_tab_drag_preview(screen_x: i32, screen_y: i32, scale: f32) {
     TAB_DRAG_PREVIEW.with_borrow(|slot| {
         if let Some(preview) = slot {
             let width = preview.get_card_width();
-            let scale = source_ui.window().scale_factor();
-            preview.window().set_position(slint::PhysicalPosition::new(
-                left + cursor.x.round() as i32 - (width * scale / 2.0).round() as i32,
-                top + cursor.y.round() as i32 - (17.0 * scale).round() as i32,
-            ));
+            let (x, y) = drag_preview_position(screen_x, screen_y, width, scale);
+            preview
+                .window()
+                .set_position(slint::PhysicalPosition::new(x, y));
         }
     });
 }
 
+fn drag_preview_position(screen_x: i32, screen_y: i32, width: f32, scale: f32) -> (i32, i32) {
+    (
+        screen_x - (width * scale / 2.0).round() as i32,
+        screen_y - (17.0 * scale).round() as i32,
+    )
+}
+
+fn screen_to_client_physical(screen_x: i32, screen_y: i32, left: i32, top: i32) -> (f64, f64) {
+    (f64::from(screen_x - left), f64::from(screen_y - top))
+}
+
+fn grid_thumbnail_request_px(scale: f32) -> u32 {
+    (100.0 * scale).round().max(64.0) as u32
+}
+
+fn grid_thumbnail_request_indices(
+    entry_count: usize,
+    columns: usize,
+    viewport_y: f32,
+    visible_height: f32,
+) -> Vec<usize> {
+    if entry_count == 0 {
+        return Vec::new();
+    }
+    let columns = columns.max(1);
+    let first_row = ((-viewport_y).max(0.0) / 148.0).floor() as usize;
+    let visible_rows = (visible_height.max(148.0) / 148.0).ceil() as usize + 1;
+    let first = first_row.saturating_sub(2) * columns;
+    let last = ((first_row + visible_rows + 2) * columns).min(entry_count);
+    (first..last).collect()
+}
+
+fn grid_thumbnail_requests(
+    ui: &AppWindow,
+    state: &SharedSessions,
+    window_id: WindowId,
+) -> Vec<IconRequest> {
+    let requested_px = grid_thumbnail_request_px(ui.window().scale_factor());
+    let columns = ui.get_grid_column_count().max(1) as usize;
+    let visible_height = ui.window().size().height as f32 / ui.window().scale_factor()
+        - ui.get_file_list_top()
+        - 30.0;
+    let mut app = state.lock().expect("app state mutex is not poisoned");
+    let Some(window) = app.window(window_id) else {
+        return Vec::new();
+    };
+    let Some(tab) = window.tabs.get(&window.active_tab) else {
+        return Vec::new();
+    };
+    if tab.kind != TabKind::Files
+        || tab
+            .visible_path()
+            .is_none_or(|path| app.directory_view_modes.get(path) != Some(&ViewMode::Grid))
+    {
+        return Vec::new();
+    }
+    let entries = tab.visible_entries();
+    let indices = grid_thumbnail_request_indices(
+        entries.len(),
+        columns,
+        ui.get_file_viewport_y() / 1.0,
+        visible_height,
+    );
+    let requests = indices
+        .into_iter()
+        .take_while(|index| *index < entries.len())
+        .filter_map(|index| {
+            let entry = &entries[index];
+            (!app
+                .thumbnail_cache
+                .contains_key(&(entry.path.clone(), requested_px))
+                && !app
+                    .large_icon_cache
+                    .contains_key(&(entry.path.clone(), requested_px))
+                && !app.thumbnail_requests.contains(&(
+                    tab.id,
+                    tab.latest_request,
+                    entry.path.clone(),
+                    requested_px,
+                )))
+            .then(|| IconRequest {
+                tab_id: tab.id,
+                request_id: tab.latest_request,
+                target: IconTarget::Entry(entry.id),
+                path: entry.path.clone(),
+                thumbnail: true,
+                requested_px,
+            })
+        })
+        .collect::<Vec<_>>();
+    for request in &requests {
+        app.thumbnail_requests.insert((
+            request.tab_id,
+            request.request_id,
+            request.path.clone(),
+            request.requested_px,
+        ));
+    }
+    requests
+}
+
+fn request_grid_thumbnails(
+    ui: &AppWindow,
+    state: &SharedSessions,
+    window_id: WindowId,
+    sender: &mpsc::Sender<IconRequest>,
+) {
+    for request in grid_thumbnail_requests(ui, state, window_id) {
+        let _ = sender.send(request);
+    }
+}
+
 fn hide_tab_drag_preview() {
+    TAB_DRAG_PREVIEW_TIMER.with_borrow_mut(|slot| {
+        slot.take();
+    });
     TAB_DRAG_PREVIEW.with_borrow_mut(|slot| {
         if let Some(preview) = slot.take() {
             let _ = preview.hide();
@@ -529,14 +670,12 @@ fn window_ui(window_id: WindowId) -> Option<AppWindow> {
 
 fn cross_window_drop_target(
     source_window: WindowId,
-    source_ui: &AppWindow,
-    cursor: winit::dpi::PhysicalPosition<f64>,
+    screen_x: i32,
+    screen_y: i32,
     state: &SharedSessions,
 ) -> Option<(WindowId, usize)> {
-    let (source_left, source_top, _, _) =
-        platform::windows::drag_drop::client_screen_rect(native_window_handle(source_ui)).ok()?;
-    let screen_x = f64::from(source_left) + cursor.x;
-    let screen_y = f64::from(source_top) + cursor.y;
+    let screen_x = f64::from(screen_x);
+    let screen_y = f64::from(screen_y);
     WINDOW_RUNTIMES.with_borrow(|runtimes| {
         runtimes.iter().find_map(|(window_id, runtime)| {
             if *window_id == source_window {
@@ -559,7 +698,7 @@ fn cross_window_drop_target(
                 target_top,
                 runtime.ui.window().scale_factor(),
             );
-            if !(0.0..=46.0).contains(&y) {
+            if !(0.0..=96.0).contains(&y) {
                 return None;
             }
             let file_boundary = state.lock().ok().and_then(|app| {
@@ -577,7 +716,7 @@ fn cross_window_drop_target(
                         .unwrap_or(window.tab_order.len()),
                 )
             })?;
-            external_tab_insertion_slot(
+            let slot = external_tab_insertion_slot(
                 x,
                 47.0,
                 runtime.ui.get_tab_strip_width(),
@@ -585,9 +724,29 @@ fn cross_window_drop_target(
                 runtime.ui.get_tab_current_width(),
                 file_boundary,
             )
-            .map(|slot| (*window_id, slot))
+            .or_else(|| (x >= 0.0 && x <= runtime.ui.get_window_width()).then_some(file_boundary));
+            slot.map(|slot| (*window_id, slot))
         })
     })
+}
+
+fn source_tab_drop_is_valid(
+    source_ui: &AppWindow,
+    screen_x: i32,
+    screen_y: i32,
+) -> Option<(bool, winit::dpi::PhysicalPosition<f64>)> {
+    let (left, top, right, _) =
+        platform::windows::drag_drop::client_screen_rect(native_window_handle(source_ui)).ok()?;
+    let (client_x, client_y) = screen_to_client_physical(screen_x, screen_y, left, top);
+    let logical = winit::dpi::PhysicalPosition::new(client_x, client_y)
+        .to_logical::<f32>(f64::from(source_ui.window().scale_factor()));
+    let strip_x = 47.0;
+    let strip_right = strip_x + source_ui.get_tab_strip_width();
+    let valid = screen_x >= left
+        && screen_x < right
+        && (0.0..=46.0).contains(&logical.y)
+        && (strip_x..=strip_right).contains(&logical.x);
+    Some((valid, winit::dpi::PhysicalPosition::new(client_x, client_y)))
 }
 
 fn physical_client_to_logical(
@@ -844,6 +1003,8 @@ struct AppState {
     icon_cache: HashMap<PathBuf, platform::windows_shell_icons::ShellIconRgba>,
     sidebar_icons: HashMap<PathBuf, platform::windows_shell_icons::ShellIconRgba>,
     thumbnail_cache: HashMap<(PathBuf, u32), platform::windows_shell_icons::ShellIconRgba>,
+    large_icon_cache: HashMap<(PathBuf, u32), platform::windows_shell_icons::ShellIconRgba>,
+    thumbnail_requests: std::collections::HashSet<(TabId, RequestId, PathBuf, u32)>,
     sidebar: Vec<KnownLocation>,
     directory_view_modes: HashMap<PathBuf, crate::domain::ViewMode>,
     column_order: [u8; 4],
@@ -975,6 +1136,8 @@ impl AppState {
             icon_cache: HashMap::new(),
             sidebar_icons: HashMap::new(),
             thumbnail_cache: HashMap::new(),
+            large_icon_cache: HashMap::new(),
+            thumbnail_requests: std::collections::HashSet::new(),
             sidebar: Vec::new(),
             directory_view_modes: HashMap::new(),
             column_order,
@@ -2207,6 +2370,8 @@ fn submit_navigation(
     let request = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         app.icons.retain(|(icon_tab, _, _), _| *icon_tab != tab_id);
+        app.thumbnail_requests
+            .retain(|(request_tab, _, _, _)| *request_tab != tab_id);
         app.focus_after_refresh.remove(&tab_id);
         let Some(tab) = app.tab_mut(tab_id) else {
             return false;
@@ -2362,7 +2527,8 @@ fn install_app_window_at(
 fn detach_tab_into_new_window(
     source_ui: &AppWindow,
     source_window: WindowId,
-    cursor: winit::dpi::PhysicalPosition<f64>,
+    screen_x: i32,
+    screen_y: i32,
     senders: &WorkerSenders,
     confirmations: &ConfirmationWindows,
     state: &SharedSessions,
@@ -2379,16 +2545,10 @@ fn detach_tab_into_new_window(
         }
         app.reserve_window_id()
     };
-    let (source_left, source_top, _, _) =
-        platform::windows::drag_drop::client_screen_rect(native_window_handle(source_ui))
-            .unwrap_or_else(|_| {
-                let position = source_ui.window().position();
-                (position.x, position.y, position.x, position.y)
-            });
     let scale = source_ui.window().scale_factor();
     let placement = session_store::WindowPlacement {
-        x: source_left + cursor.x.round() as i32 - (178.0 * scale / 2.0).round() as i32,
-        y: source_top + cursor.y.round() as i32 - (20.0 * scale).round() as i32,
+        x: screen_x - (178.0 * scale / 2.0).round() as i32,
+        y: screen_y - (20.0 * scale).round() as i32,
         width: 1180,
         height: 760,
     };
@@ -2479,6 +2639,65 @@ fn move_tab_into_existing_window(
         source_ui.invoke_clear_tab_drag();
     }
     true
+}
+
+fn finish_global_tab_drag(
+    source_ui: &AppWindow,
+    source_window: WindowId,
+    screen_x: i32,
+    screen_y: i32,
+    senders: &WorkerSenders,
+    confirmations: &ConfirmationWindows,
+    state: &SharedSessions,
+) -> bool {
+    let dragging = state.lock().is_ok_and(|app| {
+        app.tab_drag.is_some_and(|drag| {
+            drag.window_id == source_window && matches!(drag.phase, TabDragPhase::Dragging { .. })
+        })
+    });
+    if !dragging {
+        return false;
+    }
+    platform::windows::release_pointer_capture();
+    hide_tab_drag_preview();
+    let cross_target = cross_window_drop_target(source_window, screen_x, screen_y, state);
+    let moved = cross_target.is_some_and(|(destination, insertion)| {
+        move_tab_into_existing_window(
+            source_ui,
+            source_window,
+            destination,
+            insertion,
+            senders,
+            state,
+        )
+    });
+    let (valid_source, _) = source_tab_drop_is_valid(source_ui, screen_x, screen_y)
+        .unwrap_or((false, winit::dpi::PhysicalPosition::new(0.0, 0.0)));
+    let detached = !moved
+        && cross_target.is_none()
+        && !valid_source
+        && detach_tab_into_new_window(
+            source_ui,
+            source_window,
+            screen_x,
+            screen_y,
+            senders,
+            confirmations,
+            state,
+        );
+    let finished = if valid_source {
+        state.lock().is_ok_and(|mut app| app.finish_tab_drag(true))
+    } else if moved || detached {
+        false
+    } else {
+        state.lock().is_ok_and(|mut app| app.cancel_tab_drag())
+    };
+    project_cross_window_drop(None);
+    source_ui.invoke_clear_tab_drag();
+    if !moved && !detached {
+        refresh_window_ui(source_ui, state, source_window);
+    }
+    finished || moved || detached
 }
 
 fn drag_paths_for_pressed_entry(app: &AppState, entry_id: EntryId) -> Vec<PathBuf> {
@@ -3647,41 +3866,20 @@ fn wire_callbacks(
             2 => ViewMode::Grid,
             _ => ViewMode::Details,
         };
-        let thumbnail_requests = if let Ok(mut app) = state_for_view.lock() {
+        if let Ok(mut app) = state_for_view.lock() {
             let path = app.active().visible_path().map(Path::to_path_buf);
             if let Some(path) = path {
                 app.directory_view_modes.insert(path, mode);
             }
-            if mode == ViewMode::Grid {
-                let tab = app.active();
-                let requested_px = weak
-                    .upgrade()
-                    .map(|ui| (100.0 * ui.window().scale_factor()).round() as u32)
-                    .unwrap_or(100)
-                    .max(64);
-                tab.visible_entries()
-                    .iter()
-                    .take(96)
-                    .map(|entry| IconRequest {
-                        tab_id: tab.id,
-                        request_id: tab.latest_request,
-                        target: IconTarget::Entry(entry.id),
-                        path: entry.path.clone(),
-                        thumbnail: true,
-                        requested_px,
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-        for request in thumbnail_requests {
-            let _ = icon_for_view.send(request);
         }
         if let Some(ui) = weak.upgrade() {
             refresh_ui(&ui, &state_for_view);
+            request_grid_thumbnails(
+                &ui,
+                &state_for_view.shared,
+                state_for_view.window_id,
+                &icon_for_view,
+            );
         }
     });
     let weak = ui.as_weak();
@@ -3894,6 +4092,31 @@ fn wire_callbacks(
         }
         ui.invoke_clear_tab_drag();
         refresh_ui(&ui, &state_for_tab_drag);
+    });
+
+    let weak = ui.as_weak();
+    let state_for_finish = state.clone();
+    let senders_for_finish = WorkerSenders {
+        directory: sender.clone(),
+        operation: operation_sender.clone(),
+        clipboard: clipboard_sender.clone(),
+        everything: everything_sender.clone(),
+        icon: icon_sender.clone(),
+    };
+    let confirmations_for_finish = ConfirmationWindows::new(delete_ui, conflict_ui, exit_ui);
+    ui.on_finish_global_tab_drag(move |screen_x, screen_y| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        finish_global_tab_drag(
+            &ui,
+            state_for_finish.window_id,
+            screen_x.round() as i32,
+            screen_y.round() as i32,
+            &senders_for_finish,
+            &confirmations_for_finish,
+            &state_for_finish.shared,
+        );
     });
 
     let weak = ui.as_weak();
@@ -4609,6 +4832,9 @@ fn wire_mouse_navigation(
                 "winit-resized",
             );
             ui.set_window_width(size.width as f32 / ui.window().scale_factor());
+            if ui.get_view_mode() == 2 {
+                request_grid_thumbnails(&ui, &shared_state, window_id, &senders.icon);
+            }
             return EventResult::Propagate;
         }
         if matches!(event, WindowEvent::Focused(false)) {
@@ -4656,12 +4882,14 @@ fn wire_mouse_navigation(
                             && matches!(drag.phase, TabDragPhase::Dragging { .. })
                     })
                 });
-                if dragging {
-                    move_tab_drag_preview(&ui, *position);
+                if dragging
+                    && let Ok((screen_x, screen_y)) = platform::windows::cursor_screen_position()
+                {
+                    move_tab_drag_preview(screen_x, screen_y, ui.window().scale_factor());
                     project_cross_window_drop(cross_window_drop_target(
                         window_id,
-                        &ui,
-                        *position,
+                        screen_x,
+                        screen_y,
                         &shared_state,
                     ));
                 }
@@ -4686,6 +4914,9 @@ fn wire_mouse_navigation(
                 let maximum = (ui.get_files().row_count() as f32 * 40.0 - visible_height).max(0.0);
                 let viewport = (ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0);
                 ui.set_file_viewport_y(viewport);
+                if ui.get_view_mode() == 2 {
+                    request_grid_thumbnails(&ui, &shared_state, window_id, &senders.icon);
+                }
                 if ui.get_search_results_mode() {
                     ui.invoke_request_search_page(
                         ((-viewport).max(0.0) / 40.0) as i32 / SEARCH_PAGE_LIMIT as i32
@@ -4699,58 +4930,18 @@ fn wire_mouse_navigation(
                 button: winit::event::MouseButton::Left,
                 ..
             } => {
-                platform::windows::release_pointer_capture();
-                hide_tab_drag_preview();
-                let logical = cursor_position
-                    .get()
-                    .to_logical::<f32>(f64::from(ui.window().scale_factor()));
-                let strip_x = 8.0 + 34.0 + 5.0;
-                let strip_width = ui.get_tab_strip_width() / 1.0;
-                let valid = logical.y >= 0.0
-                    && logical.y <= 46.0
-                    && logical.x >= strip_x
-                    && logical.x <= strip_x + strip_width;
-                let cross_target = (!valid)
-                    .then(|| {
-                        cross_window_drop_target(
-                            window_id,
-                            &ui,
-                            cursor_position.get(),
-                            &shared_state,
-                        )
-                    })
-                    .flatten();
-                let moved = cross_target.is_some_and(|(destination, insertion)| {
-                    move_tab_into_existing_window(
+                let screen = platform::windows::cursor_screen_position().ok();
+                if let Some((screen_x, screen_y)) = screen
+                    && finish_global_tab_drag(
                         &ui,
                         window_id,
-                        destination,
-                        insertion,
-                        &senders,
-                        &shared_state,
-                    )
-                });
-                let detached = !valid
-                    && cross_target.is_none()
-                    && detach_tab_into_new_window(
-                        &ui,
-                        window_id,
-                        cursor_position.get(),
+                        screen_x,
+                        screen_y,
                         &senders,
                         &confirmations,
                         &shared_state,
-                    );
-                let finished = if valid {
-                    state.lock().is_ok_and(|mut app| app.finish_tab_drag(true))
-                } else if moved || detached {
-                    false
-                } else {
-                    state.lock().is_ok_and(|mut app| app.cancel_tab_drag())
-                };
-                project_cross_window_drop(None);
-                if finished || moved || detached || ui.get_tab_dragging() {
-                    ui.invoke_clear_tab_drag();
-                    refresh_ui(&ui, &state);
+                    )
+                {
                     return EventResult::PreventDefault;
                 }
                 EventResult::Propagate
@@ -7320,6 +7511,12 @@ fn start_event_pump(
                         } else {
                             append_active_file_rows(&ui, &state, tab_id, request_id);
                         }
+                        if let Some(window_id) =
+                            state.lock().ok().and_then(|app| app.window_for_tab(tab_id))
+                            && let Some(target_ui) = window_ui(window_id)
+                        {
+                            request_grid_thumbnails(&target_ui, &state, window_id, &icon_sender);
+                        }
                     } else {
                         if let Some((tab_id, request_id)) = finished {
                             submit_folder_sizes(&everything_sender, &state, tab_id, request_id);
@@ -8183,14 +8380,22 @@ fn spawn_icon_workers(
                     if request.thumbnail {
                         app.thumbnail_cache
                             .get(&(request.path.clone(), request.requested_px))
+                            .or_else(|| {
+                                app.large_icon_cache
+                                    .get(&(request.path.clone(), request.requested_px))
+                            })
                             .cloned()
                     } else {
                         app.icon_cache.get(&request.path).cloned()
                     }
                 });
                 let (icon, actual_thumbnail) = if request.thumbnail {
-                    if cached.is_some() {
-                        (cached, true)
+                    if let Some(cached) = cached {
+                        let actual = state.lock().is_ok_and(|app| {
+                            app.thumbnail_cache
+                                .contains_key(&(request.path.clone(), request.requested_px))
+                        });
+                        (Some(cached), actual)
                     } else if let Ok(thumbnail) =
                         platform::windows_shell_icons::shell_thumbnail_rgba(
                             &request.path,
@@ -8235,6 +8440,15 @@ fn spawn_icon_workers(
                         actual_thumbnail,
                         requested_px: request.requested_px,
                     });
+                } else if request.thumbnail
+                    && let Ok(mut app) = state.lock()
+                {
+                    app.thumbnail_requests.remove(&(
+                        request.tab_id,
+                        request.request_id,
+                        request.path,
+                        request.requested_px,
+                    ));
                 }
             }
         });
@@ -8338,6 +8552,14 @@ struct IconUpdate {
 
 fn apply_icon_event(state: &SharedSessions, event: IconEvent) -> Option<IconUpdate> {
     let mut app = state.lock().expect("app state mutex is not poisoned");
+    if event.requested_px > 0 {
+        app.thumbnail_requests.remove(&(
+            event.tab_id,
+            event.request_id,
+            event.path.clone(),
+            event.requested_px,
+        ));
+    }
     if !icon_event_is_current(&app, &event) {
         return None;
     }
@@ -8353,6 +8575,9 @@ fn apply_icon_event(state: &SharedSessions, event: IconEvent) -> Option<IconUpda
     };
     if event.actual_thumbnail {
         app.thumbnail_cache
+            .insert((event.path.clone(), event.requested_px), event.icon.clone());
+    } else if event.requested_px > 0 {
+        app.large_icon_cache
             .insert((event.path.clone(), event.requested_px), event.icon.clone());
     } else {
         app.icon_cache.insert(event.path, event.icon);
@@ -8443,6 +8668,14 @@ fn update_icon_row(ui: &AppWindow, state: &SharedSessions, update: IconUpdate) {
         );
         return;
     };
+    let grid_mode = tab
+        .visible_path()
+        .is_some_and(|path| app.directory_view_modes.get(path) == Some(&ViewMode::Grid));
+    if grid_mode {
+        drop(app);
+        refresh_tab_window(state, update.tab_id);
+        return;
+    }
     let Some(index) = tab.visible_entry_index(entry_id) else {
         return;
     };
@@ -9028,6 +9261,34 @@ fn file_row(entry: &FileEntry, tab: &TabSession, texts: Texts, app: &AppState) -
             })
             .collect::<Vec<_>>()
     };
+    let grid_image = tab
+        .visible_path()
+        .is_some_and(|path| app.directory_view_modes.get(path) == Some(&ViewMode::Grid))
+        .then(|| {
+            let thumbnail = app
+                .thumbnail_cache
+                .iter()
+                .filter(|((path, _), _)| path == &entry.path)
+                .max_by_key(|((_, requested_px), image)| {
+                    (*requested_px, image.width.min(image.height))
+                })
+                .map(|(_, image)| image);
+            thumbnail.or_else(|| {
+                app.large_icon_cache
+                    .iter()
+                    .filter(|((path, _), _)| path == &entry.path)
+                    .max_by_key(|((_, requested_px), image)| {
+                        (*requested_px, image.width.min(image.height))
+                    })
+                    .map(|(_, image)| image)
+            })
+        })
+        .flatten();
+    let image = grid_image.or_else(|| {
+        app.icons
+            .get(&(tab.id, tab.latest_request, entry.id))
+            .or_else(|| app.icon_cache.get(&entry.path))
+    });
     FileRow {
         id: entry.id.0 as i32,
         loaded: true,
@@ -9056,12 +9317,7 @@ fn file_row(entry: &FileEntry, tab: &TabSession, texts: Texts, app: &AppState) -
         selected: tab.selected.contains(&entry.id),
         focused: tab.focused == Some(entry.id),
         cut: app.cut_paths.contains(&entry.path),
-        icon: app
-            .icons
-            .get(&(tab.id, tab.latest_request, entry.id))
-            .or_else(|| app.icon_cache.get(&entry.path))
-            .map(shell_icon_image)
-            .unwrap_or_default(),
+        icon: image.map(shell_icon_image).unwrap_or_default(),
     }
 }
 
@@ -9425,6 +9681,50 @@ fn initial_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drag_preview_uses_physical_screen_cursor_at_each_dpi() {
+        assert_eq!(drag_preview_position(800, 400, 178.0, 1.0), (711, 383));
+        assert_eq!(drag_preview_position(800, 400, 178.0, 1.5), (666, 374));
+        assert_eq!(
+            screen_to_client_physical(800, 400, 640, 250),
+            (160.0, 150.0)
+        );
+        assert_eq!(grid_thumbnail_request_px(1.0), 100);
+        assert_eq!(grid_thumbnail_request_px(1.5), 150);
+    }
+
+    #[test]
+    fn grid_directory_batch_keeps_icon_loading_separate_from_thumbnail_planning() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\grid")], 0, [0, 1, 2, 3]);
+        app.directory_view_modes
+            .insert(PathBuf::from(r"C:\grid"), ViewMode::Grid);
+        let tab = app.tab_mut(TabId(1)).unwrap();
+        tab.latest_request = RequestId(4);
+        tab.load_state = LoadState::Loading;
+        let state = Arc::new(Mutex::new(app));
+
+        let requests = apply_event(
+            &state,
+            DirectoryEvent::Batch {
+                tab_id: TabId(1),
+                request_id: RequestId(4),
+                entries: vec![focus_entry(1, r"C:\grid\photo.png")],
+            },
+        );
+
+        assert_eq!(requests.len(), 1);
+        assert!(!requests[0].thumbnail);
+        assert_eq!(requests[0].requested_px, 0);
+        assert_eq!(
+            grid_thumbnail_request_indices(500, 4, -296.0, 444.0),
+            (0..32).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            grid_thumbnail_request_indices(500, 4, -1480.0, 296.0),
+            (32..60).collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn operation_window_waits_until_conflict_is_resolved_and_runtime_reaches_threshold() {

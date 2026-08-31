@@ -8,6 +8,8 @@ mod i18n;
 mod platform;
 mod session_store;
 
+use std::path::PathBuf;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The application owns its colors; keep native popup styling aligned with the startup system theme.
     unsafe {
@@ -184,14 +186,23 @@ fn export_shell_thumbnail_probe(
     output: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
-    let directory =
-        std::env::temp_dir().join(format!("asterfiles-thumbnail-probe-{}", std::process::id()));
-    std::fs::create_dir_all(&directory)?;
-    let png = directory.join("probe.png");
-    let bytes: &[u8] = include_bytes!("../assets/app-icon.png");
-    let mut file = std::fs::File::create(&png)?;
-    file.write_all(bytes)?;
-    drop(file);
+    let supplied = std::env::var_os("ASTERFILES_THUMBNAIL_PROBE_PATH").map(PathBuf::from);
+    let temporary = supplied.is_none();
+    let directory = temporary.then(|| {
+        std::env::temp_dir().join(format!("asterfiles-thumbnail-probe-{}", std::process::id()))
+    });
+    let png = if let Some(path) = supplied {
+        path
+    } else {
+        let directory = directory.as_ref().expect("temporary directory exists");
+        std::fs::create_dir_all(directory)?;
+        let png = directory.join("probe.png");
+        let bytes: &[u8] = include_bytes!("../assets/app-icon.png");
+        let mut file = std::fs::File::create(&png)?;
+        file.write_all(bytes)?;
+        drop(file);
+        png
+    };
     let requested = 128_u32;
     let result = platform::windows_shell_icons::shell_thumbnail_rgba(&png, requested, false);
     let json = match result {
@@ -204,14 +215,20 @@ fn export_shell_thumbnail_probe(
                 .into());
             }
             format!(
-                "{{\"schema_version\":1,\"scenario\":\"shell-thumbnail\",\"scope\":\"real_windows_shell_temporary_png\",\"requested_px\":{},\"returned_px\":[{},{}],\"source\":\"{}\",\"icon_fallback\":false}}\n",
+                "{{\"schema_version\":1,\"scenario\":\"shell-thumbnail\",\"scope\":\"{}\",\"requested_px\":{},\"returned_px\":[{},{}],\"source\":\"{}\",\"icon_fallback\":false,\"pixel_fingerprint\":\"{}\"}}\n",
+                if temporary {
+                    "real_windows_shell_temporary_png"
+                } else {
+                    "user_supplied_png"
+                },
                 requested,
                 result.image.width,
                 result.image.height,
                 match result.source {
                     platform::windows_shell_icons::ThumbnailSource::Cache => "thumbnail_cache",
                     platform::windows_shell_icons::ThumbnailSource::Provider => "provider",
-                }
+                },
+                thumbnail_fingerprint(&result.image),
             )
         }
         Err(error) => return Err(format!("PNG thumbnail extraction failed: {error}").into()),
@@ -220,7 +237,18 @@ fn export_shell_thumbnail_probe(
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(output, json)?;
-    std::fs::remove_file(&png)?;
-    std::fs::remove_dir(&directory)?;
+    if let Some(directory) = directory {
+        std::fs::remove_file(&png)?;
+        std::fs::remove_dir(&directory)?;
+    }
     Ok(())
+}
+
+fn thumbnail_fingerprint(image: &platform::windows_shell_icons::ShellIconRgba) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in &image.pixels {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }

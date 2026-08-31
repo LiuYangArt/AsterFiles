@@ -114,7 +114,7 @@ mod windows_impl {
             System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
             UI::Shell::{
                 ISharedBitmap, IThumbnailCache, LocalThumbnailCache, WTS_CACHED, WTS_CACHEFLAGS,
-                WTS_EXTRACT, WTS_INCACHEONLY, WTS_SCALETOREQUESTEDSIZE,
+                WTS_FORCEEXTRACTION, WTS_INCACHEONLY, WTS_SCALETOREQUESTEDSIZE, WTS_SCALEUP,
             },
         };
         let _com = ComInitialization::new()?;
@@ -131,7 +131,7 @@ mod windows_impl {
         let flags = if cache_only {
             WTS_INCACHEONLY
         } else {
-            WTS_EXTRACT | WTS_SCALETOREQUESTEDSIZE
+            WTS_FORCEEXTRACTION | WTS_SCALETOREQUESTEDSIZE | WTS_SCALEUP
         };
         unsafe {
             cache

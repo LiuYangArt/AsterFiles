@@ -11,6 +11,22 @@ pub mod window_trace;
 
 use std::io;
 
+pub fn cursor_screen_position() -> io::Result<(i32, i32)> {
+    let mut cursor = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut cursor) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((cursor.x, cursor.y))
+}
+
+pub fn left_mouse_button_down() -> bool {
+    unsafe {
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_LBUTTON as i32,
+        ) < 0
+    }
+}
+
 pub fn begin_window_drag(hwnd: isize) -> io::Result<()> {
     if hwnd == 0 {
         return Err(io::Error::new(
