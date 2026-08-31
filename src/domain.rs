@@ -709,15 +709,12 @@ impl TabSession {
             }
             NavigationKind::Refresh => {}
         }
-        let was_refresh = self.navigation_kind == NavigationKind::Refresh;
         self.current_path = Some(path);
         self.requested_path = None;
         self.address_editing = false;
         self.address_input.clear();
         self.navigation_kind = NavigationKind::Normal;
-        if !was_refresh {
-            self.clear_selection();
-        }
+        self.clear_selection();
     }
 
     pub fn back_target(&self) -> Option<PathBuf> {
@@ -1348,23 +1345,6 @@ mod tests {
         assert!(first_cancel.load(AtomicOrdering::Acquire));
         assert!(!session.accepts(first));
         assert!(session.accepts(second));
-    }
-
-    #[test]
-    fn refresh_commit_preserves_reconciled_selection_and_focus() {
-        let mut session = TabSession::new(TabId(1));
-        session.current_path = Some(PathBuf::from(r"C:\target"));
-        session.replace_entries(vec![entry(1, "copied.txt", EntryKind::File, Some(1))]);
-        session.select_entry(EntryId(1), false, false);
-
-        session.begin_navigation(PathBuf::from(r"C:\target"), NavigationKind::Refresh);
-        session.pending_entries = vec![entry(1, "copied.txt", EntryKind::File, Some(1))];
-        session.commit_pending();
-        session.commit_path(PathBuf::from(r"C:\target"));
-
-        assert_eq!(session.selected, vec![EntryId(1)]);
-        assert_eq!(session.focused, Some(EntryId(1)));
-        assert_eq!(session.selection_anchor, Some(EntryId(1)));
     }
 
     #[test]

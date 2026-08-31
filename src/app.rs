@@ -910,6 +910,16 @@ fn submit_navigation(
     sender.send(request).is_ok()
 }
 
+fn drag_paths_for_pressed_entry(app: &AppState, entry_id: EntryId) -> Vec<PathBuf> {
+    let tab = app.active();
+    if tab.selected.contains(&entry_id) {
+        return selected_paths(app);
+    }
+    tab.visible_entry(entry_id)
+        .map(|entry| vec![entry.path.clone()])
+        .unwrap_or_default()
+}
+
 fn selected_paths(app: &AppState) -> Vec<PathBuf> {
     app.active()
         .selected
@@ -1368,17 +1378,11 @@ fn wire_internal_drag_drop(
     let state_for_begin = state.clone();
     let drag_for_begin = drag.clone();
     ui.on_begin_internal_drag(move |entry_id, x, y, _control, _shift, right_button| {
-        let mut app = state_for_begin
+        let app = state_for_begin
             .lock()
             .expect("app state mutex is not poisoned");
         let id = EntryId(entry_id as u32);
-        let tab_id = app.active_tab;
-        if let Some(tab) = app.tabs.get_mut(&tab_id)
-            && !tab.selected.contains(&id)
-        {
-            tab.select_entry(id, false, false);
-        }
-        let paths = selected_paths(&app);
+        let paths = drag_paths_for_pressed_entry(&app, id);
         let source_directories = paths
             .iter()
             .filter_map(|path| path.parent().map(Path::to_path_buf))
@@ -7804,6 +7808,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pressing_an_unselected_row_for_drag_does_not_mutate_selection() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\test")], 0, [0, 1, 2, 3]);
+        let tab = app.tabs.get_mut(&TabId(1)).unwrap();
+        tab.replace_entries(vec![
+            focus_entry(1, r"C:\test\one.txt"),
+            focus_entry(2, r"C:\test\two.txt"),
+            focus_entry(3, r"C:\test\three.txt"),
+        ]);
+        tab.select_entry(EntryId(1), false, false);
+
+        assert_eq!(
+            drag_paths_for_pressed_entry(&app, EntryId(2)),
+            vec![PathBuf::from(r"C:\test\two.txt")]
+        );
+        let tab = &app.tabs[&TabId(1)];
+        assert_eq!(tab.selected, vec![EntryId(1)]);
+        assert_eq!(tab.focused, Some(EntryId(1)));
+        assert_eq!(tab.selection_anchor, Some(EntryId(1)));
+    }
+
+    #[test]
+    fn pressing_a_selected_row_for_drag_uses_the_existing_multi_selection() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\test")], 0, [0, 1, 2, 3]);
+        let tab = app.tabs.get_mut(&TabId(1)).unwrap();
+        tab.replace_entries(vec![
+            focus_entry(1, r"C:\test\one.txt"),
+            focus_entry(2, r"C:\test\two.txt"),
+        ]);
+        tab.select_entry(EntryId(1), false, false);
+        tab.select_entry(EntryId(2), true, false);
+
+        assert_eq!(
+            drag_paths_for_pressed_entry(&app, EntryId(2)),
+            vec![
+                PathBuf::from(r"C:\test\one.txt"),
+                PathBuf::from(r"C:\test\two.txt"),
+            ]
+        );
+    }
     #[test]
     fn completed_focus_selects_all_targets_in_every_matching_tab() {
         let mut app = AppState::new_for_test(
