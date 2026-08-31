@@ -1597,6 +1597,7 @@ struct IconRequest {
     request_id: RequestId,
     target: IconTarget,
     path: PathBuf,
+    thumbnail: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1665,6 +1666,7 @@ struct IconEvent {
     target: IconTarget,
     path: PathBuf,
     icon: platform::windows_shell_icons::ShellIconRgba,
+    thumbnail: bool,
 }
 
 pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> {
@@ -7153,6 +7155,13 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                             request_id,
                             target: IconTarget::Entry(entry.id),
                             path: entry.path.clone(),
+                            thumbnail: app
+                                .window_for_tab(tab_id)
+                                .and_then(|window| app.window(window))
+                                .and_then(|window| window.tabs.get(&tab_id))
+                                .and_then(TabSession::visible_path)
+                                .and_then(|path| app.directory_view_modes.get(path))
+                                == Some(&ViewMode::Grid),
                         }),
                 );
                 app.tab_mut(tab_id)
@@ -7208,6 +7217,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                     request_id,
                     target: IconTarget::Location,
                     path: location_path,
+                    thumbnail: false,
                 });
             }
         }
@@ -7925,9 +7935,7 @@ fn spawn_icon_workers(
                     .lock()
                     .ok()
                     .and_then(|app| {
-                        app.active_window_state()
-                            .tabs
-                            .get(&request.tab_id)
+                        app.tab(request.tab_id)
                             .map(|tab| tab.latest_request == request.request_id)
                     })
                     .unwrap_or(false);
@@ -7938,8 +7946,20 @@ fn spawn_icon_workers(
                     .lock()
                     .ok()
                     .and_then(|app| app.icon_cache.get(&request.path).cloned());
-                let icon = cached
-                    .or_else(|| platform::windows_shell_icons::shell_icon_rgba(&request.path).ok());
+                let icon = if request.thumbnail {
+                    platform::windows_shell_icons::shell_thumbnail_rgba(&request.path, 96, true)
+                        .or_else(|_| {
+                            platform::windows_shell_icons::shell_thumbnail_rgba(
+                                &request.path,
+                                96,
+                                false,
+                            )
+                        })
+                        .ok()
+                } else {
+                    cached
+                }
+                .or_else(|| platform::windows_shell_icons::shell_icon_rgba(&request.path).ok());
                 if let Some(icon) = icon {
                     let _ = events.send(IconEvent {
                         tab_id: request.tab_id,
@@ -7947,6 +7967,7 @@ fn spawn_icon_workers(
                         target: request.target,
                         path: request.path,
                         icon,
+                        thumbnail: request.thumbnail,
                     });
                 }
             }
@@ -8064,7 +8085,9 @@ fn apply_icon_event(state: &SharedSessions, event: IconEvent) -> Option<IconUpda
         }
         IconTarget::Location => None,
     };
-    app.icon_cache.insert(event.path, event.icon);
+    if !event.thumbnail {
+        app.icon_cache.insert(event.path, event.icon);
+    }
     Some(IconUpdate {
         tab_id: event.tab_id,
         entry_id,
@@ -9375,6 +9398,7 @@ mod tests {
                 height: 1,
                 pixels: vec![0, 0, 0, 0],
             },
+            thumbnail: false,
         };
         assert!(icon_event_is_current(&app, &event));
     }
@@ -10127,6 +10151,7 @@ mod tests {
                 height: 1,
                 pixels: vec![0, 0, 0, 0],
             },
+            thumbnail: false,
         };
         assert!(icon_event_is_current(&app, &event));
 
@@ -10136,6 +10161,7 @@ mod tests {
             target: IconTarget::Location,
             path: PathBuf::from("same"),
             icon: event.icon.clone(),
+            thumbnail: false,
         };
         assert!(icon_event_is_current(&app, &location_event));
 
