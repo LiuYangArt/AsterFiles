@@ -78,7 +78,7 @@
 
 P2 的完整设计见 [P2 基础文件操作与右键菜单实施方案](p2-file-operations-plan.md)。文件任务中心属于窗口级共享设施，使用独立 `OperationId` 和工作池，不复用标签导航的 `RequestId`，也不得占用目录读取或 Shell 图标线程。UI 只提交 `TabId + EntryId` 等意图；应用协调层在提交时解析为 Rust 原始路径快照，后台操作与 Windows Shell/COM 继续放在各自独立模块。
 
-文件操作完成后发出基于原始路径的变化事件，应用协调层更新所有显示源目录或目标目录的标签；无法安全局部投影时，只为受影响标签生成新的目录 `RequestId` 并定向刷新。复制、移动、回收站删除和永久删除的取消只停止未开始工作，不回滚已经完成的项目；界面必须准确显示部分完成。右键菜单是 P2 的主要功能入口，基础文件命令进入 AsterFiles 任务中心，其他 Shell 命令通过 Windows 执行，第三方扩展隔离和超时强化留到 P3。
+文件操作完成后发出基于原始路径的变化事件，应用协调层更新所有显示源目录或目标目录的标签；无法安全局部投影时，只为受影响标签生成新的目录 `RequestId` 并定向刷新。复制、移动、回收站删除和永久删除的取消只停止未开始工作，不回滚已经完成的项目；界面必须准确显示部分完成。右键菜单是 P2 的主要功能入口，基础文件命令进入 AsterFiles 任务中心，其他 Shell 命令通过 Windows 执行。现有“显示完整经典菜单”保持为兼容入口；后续菜单改造归入独立的 [Windows Shell 菜单集成 Feature](windows-shell-menu-feature.md)，不属于 P3。
 
 ## P3 Windows 拖放接入边界
 
@@ -86,9 +86,7 @@ P2 的完整设计见 [P2 基础文件操作与右键菜单实施方案](p2-file
 
 OLE 的 `IDataObject`、`IDropSource`、`IDropTarget`、窗口注册和拖放循环集中在 `platform/windows/drag_drop`。COM 对象遵守 STA 与窗口线程亲和，UI 不枚举目录、读取元数据或执行磁盘操作。拖动开始时由应用协调层把 `TabId + EntryId` 固定为原始路径快照；拖入任务沿用独立 `OperationId`，拖放不得复用导航 `RequestId`。操作后的路径变化继续广播给所有相关标签，外部目标无法返回可靠结果时只定向刷新，不猜测或伪造移动成功。
 
-P3 产品决策汇总见 [P3 Windows 原生集成决策摘要](p3-windows-integration-decisions.md)。Windows 隐藏文件和系统文件使用独立持久化开关：默认显示隐藏文件、不显示系统文件，显示时不使用弱化样式。系统缩略图整体移到 P4，与详细信息、列表、网格和大图标视图统一设计；P3 继续使用现有 Shell 图标链路。
-
-第三方 Shell 扩展必须在隔离边界内加载，AsterFiles 自带命令不等待扩展。慢、超时或异常扩展必须按具体扩展名称显示“正在加载”“加载超时”或“加载失败”，并记录稳定标识、耗时、结果、错误和日志入口；不得只显示无法定位问题的笼统状态。Windows 完整菜单始终保留为兼容入口。
+P3 产品决策汇总见 [P3 Windows 原生集成决策摘要](p3-windows-integration-decisions.md)。Windows 隐藏文件和系统文件使用独立持久化开关：默认显示隐藏文件、不显示系统文件，显示时不使用弱化样式。系统缩略图整体移到 P4，与详细信息、列表、网格和大图标视图统一设计；P3 继续使用现有 Shell 图标链路。右键菜单与拖放、目录监听及路径边界没有实施依赖，P3 不修改菜单；菜单后续设计见 [Windows Shell 菜单集成 Feature](windows-shell-menu-feature.md)。
 
 ## Everything 平台边界（2026-08-30）
 
@@ -138,4 +136,4 @@ Windows 适配集中在 `platform/windows`：文件剪贴板使用 `CF_HDROP + P
 
 复制目录在后台成功创建真实目标根目录后立即发出一次创建事件；协调层只刷新正在显示目标父目录的标签，并以最终原始路径聚焦、选中该目录。冲突选择“保留两者”继续使用 Explorer 风格的 `Name (2)`、`Name (3)` 递增名称，不创建 UI 占位项，也不等待整个复制任务完成后才显示成果。
 
-自动验证已覆盖 83 项测试、无界面真实 OperationManager 场景和 Release 构建。Windows 11 的 Explorer 双向互通、UNC、回收站策略及第三方扩展仍需按 [p2-manual-acceptance.md](p2-manual-acceptance.md) 人工留证，不能用单元测试代替。第三方 Shell 扩展的进程隔离与超时继续按 P3 边界后置。
+自动验证已覆盖 83 项测试、无界面真实 OperationManager 场景和 Release 构建。Windows 11 的 Explorer 双向互通、UNC、回收站策略及第三方扩展仍需按 [p2-manual-acceptance.md](p2-manual-acceptance.md) 人工留证，不能用单元测试代替。第三方 Shell 扩展的进程隔离、超时与菜单形态不再归入 P3，后续按独立菜单 Feature 评估。
