@@ -692,6 +692,7 @@ fn project_cross_window_drop(target: Option<(WindowId, usize)>) {
             } else {
                 runtime.ui.invoke_clear_external_tab_drag();
             }
+            runtime.ui.window().request_redraw();
         }
     });
 }
@@ -733,6 +734,7 @@ fn project_native_tab_target(
                         )
                     });
                     ui.set_tab_drag_insertion_index(insertion.map_or(-1, |index| index as i32));
+                    ui.window().request_redraw();
                     None
                 } else {
                     cross_window_drop_target(source_window, screen_x, screen_y, state)

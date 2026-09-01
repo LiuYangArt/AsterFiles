@@ -1006,7 +1006,7 @@ export component AppWindow inherits Window {
                     viewport-height: self.height;
                     changed width => { root.reveal-tab(root.active-tab-index); }
                     Rectangle {
-                        width: root.tab-content-width; height: 34px;
+                        width: max(root.tab-content-width, tab-strip.width); height: 34px;
                         for tab[index] in root.tabs: Rectangle {
                             x: root.tab-dragging
                                 ? (index < root.tab-drag-source-index ? index : index > root.tab-drag-source-index ? index - 1 : index) * (root.tab-width + 5px)
@@ -1087,10 +1087,10 @@ export component AppWindow inherits Window {
                             visible: self.external || self.local;
                             x: self.visual-slot <= 0
                                 ? 0px
-                                : min(root.tab-content-width - 5px, self.visual-slot * (root.tab-width + 5px) - 5px);
-                            y: 2px;
+                                : min(parent.width - 5px, self.visual-slot * (root.tab-width + 5px) - 5px);
+                            y: 0px;
                             width: 5px;
-                            height: 30px;
+                            height: 34px;
                             border-radius: 2.5px;
                             background: VisualStyle.c4f6bed;
                         }
