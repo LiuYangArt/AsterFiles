@@ -11,6 +11,7 @@ use std::{
     rc::Rc,
     sync::mpsc,
     thread,
+    time::Duration,
 };
 use windows::{
     Win32::{
@@ -24,10 +25,11 @@ use windows::{
             },
             WindowsAndMessaging::{
                 CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-                GetMenuItemCount, GetMenuItemInfoW, HMENU, MENUITEMINFOW, MFS_CHECKED, MFS_DEFAULT,
-                MFS_DISABLED, MFT_SEPARATOR, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING,
-                MIIM_SUBMENU, RegisterClassW, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-                TrackPopupMenuEx, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DRAWITEM, WM_INITMENUPOPUP,
+                DispatchMessageW, GetMenuItemCount, GetMenuItemInfoW, HMENU, MENUITEMINFOW,
+                MFS_CHECKED, MFS_DEFAULT, MFS_DISABLED, MFT_SEPARATOR, MIIM_FTYPE, MIIM_ID,
+                MIIM_STATE, MIIM_STRING, MIIM_SUBMENU, MSG, PM_NOREMOVE, PM_REMOVE, PeekMessageW,
+                RegisterClassW, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
+                TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DRAWITEM, WM_INITMENUPOPUP,
                 WM_MEASUREITEM, WM_MENUCHAR, WNDCLASSW,
             },
         },
@@ -177,7 +179,14 @@ fn shell_menu_worker_loop(
     events: mpsc::Sender<ShellMenuEvent>,
 ) {
     let mut session: Option<(ShellMenuSessionId, ShellMenuRequestId, ClassicMenuSession)> = None;
-    while let Ok(command) = commands.recv() {
+    ensure_sta_message_queue();
+    loop {
+        pump_sta_messages();
+        let command = match commands.recv_timeout(Duration::from_millis(10)) {
+            Ok(command) => command,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         match command {
             ShellMenuCommand::Load {
                 session_id,
@@ -317,12 +326,30 @@ fn shell_menu_worker_loop(
                 });
             }
         }
+        pump_sta_messages();
+    }
+}
+
+fn ensure_sta_message_queue() {
+    let mut message = MSG::default();
+    unsafe {
+        let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
+    }
+}
+
+fn pump_sta_messages() {
+    let mut message = MSG::default();
+    while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+        unsafe {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
     }
 }
 
 pub struct ClassicMenuSession {
     menu: HMENU,
-    context_menu: IContextMenu,
+    context_menu: Option<IContextMenu>,
     context_menu2: Option<IContextMenu2>,
     context_menu3: Option<IContextMenu3>,
     com_initialized: bool,
@@ -379,10 +406,16 @@ impl ClassicMenuSession {
         };
         let context_menu3 = context_menu.cast::<IContextMenu3>().ok();
         let context_menu2 = context_menu.cast::<IContextMenu2>().ok();
-        let menu = unsafe { CreatePopupMenu() }.map_err(|error| {
-            unsafe { CoUninitialize() };
-            windows_error(error)
-        })?;
+        let menu = match unsafe { CreatePopupMenu() } {
+            Ok(menu) => menu,
+            Err(error) => {
+                drop(context_menu3);
+                drop(context_menu2);
+                drop(context_menu);
+                unsafe { CoUninitialize() };
+                return Err(windows_error(error));
+            }
+        };
         let flags = CMF_NORMAL
             | if include_extended_verbs {
                 CMF_EXTENDEDVERBS
@@ -395,15 +428,18 @@ impl ClassicMenuSession {
         if query.is_err() {
             unsafe {
                 let _ = DestroyMenu(menu);
-                CoUninitialize();
             }
+            drop(context_menu3);
+            drop(context_menu2);
+            drop(context_menu);
+            unsafe { CoUninitialize() };
             return Err(io::Error::other(format!(
                 "QueryContextMenu failed: {query:?}"
             )));
         }
         Ok(Self {
             menu,
-            context_menu,
+            context_menu: Some(context_menu),
             context_menu2,
             context_menu3,
             com_initialized: true,
@@ -447,7 +483,27 @@ impl ClassicMenuSession {
         })?;
         let position = submenu_position(registration.parent, registration.menu)?;
         self.initialize_submenu(registration.menu, position);
-        self.read_menu_level(registration.menu)
+        pump_sta_messages();
+        let mut submenu = submenu_at_position(registration.parent, position)?;
+        self.submenus[index].menu = submenu;
+        let items = self.read_menu_level(submenu)?;
+        if !items.is_empty() {
+            return Ok(items);
+        }
+
+        // Some shell extensions publish dynamic submenu items through the STA queue
+        // immediately after WM_INITMENUPOPUP instead of during the call itself.
+        for _ in 0..4 {
+            thread::sleep(Duration::from_millis(10));
+            pump_sta_messages();
+            submenu = submenu_at_position(registration.parent, position)?;
+            self.submenus[index].menu = submenu;
+            let items = self.read_menu_level(submenu)?;
+            if !items.is_empty() {
+                return Ok(items);
+            }
+        }
+        Ok(Vec::new())
     }
 
     fn invoke_command(
@@ -460,7 +516,11 @@ impl ClassicMenuSession {
         let offset = command_id
             .checked_sub(FIRST_COMMAND_ID)
             .ok_or_else(|| io::Error::other("shell returned an invalid menu command"))?;
-        let verb = command_verb(&self.context_menu, command_id);
+        let context_menu = self
+            .context_menu
+            .as_ref()
+            .ok_or_else(|| io::Error::other("shell context menu was already released"))?;
+        let verb = command_verb(context_menu, command_id);
         if let Some(verb) = verb.as_deref().filter(|verb| is_builtin_verb(verb)) {
             return Ok(ClassicMenuInvocation::BuiltIn {
                 verb: verb.to_owned(),
@@ -487,7 +547,7 @@ impl ClassicMenuSession {
             },
         };
         let base = (&invocation as *const CMINVOKECOMMANDINFOEX).cast();
-        unsafe { self.context_menu.InvokeCommand(&*base) }.map_err(windows_error)?;
+        unsafe { context_menu.InvokeCommand(&*base) }.map_err(windows_error)?;
         Ok(ClassicMenuInvocation::Shell { verb })
     }
     pub fn show_native_and_invoke(
@@ -545,6 +605,12 @@ impl ClassicMenuSession {
         }
         None
     }
+
+    fn release_com_interfaces(&mut self) {
+        self.context_menu3 = None;
+        self.context_menu2 = None;
+        self.context_menu = None;
+    }
 }
 
 impl Drop for ClassicMenuSession {
@@ -552,6 +618,7 @@ impl Drop for ClassicMenuSession {
         unsafe {
             let _ = DestroyMenu(self.menu);
         }
+        self.release_com_interfaces();
         if self.com_initialized {
             unsafe { CoUninitialize() };
         }
@@ -754,7 +821,12 @@ fn read_menu_level(
         items.push(ClassicMenuItem {
             command_id,
             title: clean_menu_title(&String::from_utf16_lossy(&title[..info.cch as usize])),
-            verb: command_id.and_then(|id| command_verb(&session.context_menu, id)),
+            verb: command_id.and_then(|id| {
+                session
+                    .context_menu
+                    .as_ref()
+                    .and_then(|menu| command_verb(menu, id))
+            }),
             enabled: !info.fState.contains(MFS_DISABLED),
             checked: info.fState.contains(MFS_CHECKED),
             default: info.fState.contains(MFS_DEFAULT),
@@ -784,6 +856,22 @@ fn submenu_position(parent: HMENU, submenu: HMENU) -> io::Result<u32> {
         io::ErrorKind::NotFound,
         "shell submenu is no longer attached to its parent",
     ))
+}
+
+fn submenu_at_position(parent: HMENU, position: u32) -> io::Result<HMENU> {
+    let mut info = MENUITEMINFOW {
+        cbSize: size_of::<MENUITEMINFOW>() as u32,
+        fMask: MIIM_SUBMENU,
+        ..Default::default()
+    };
+    unsafe { GetMenuItemInfoW(parent, position, true, &mut info) }.map_err(windows_error)?;
+    if info.hSubMenu.is_invalid() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "shell submenu disappeared during initialization",
+        ));
+    }
+    Ok(info.hSubMenu)
 }
 
 fn read_menu_recursive(
@@ -833,7 +921,12 @@ fn read_menu_recursive(
         items.push(ClassicMenuItem {
             command_id,
             title: clean_menu_title(&String::from_utf16_lossy(&title[..info.cch as usize])),
-            verb: command_id.and_then(|id| command_verb(&session.context_menu, id)),
+            verb: command_id.and_then(|id| {
+                session
+                    .context_menu
+                    .as_ref()
+                    .and_then(|menu| command_verb(menu, id))
+            }),
             enabled: !info.fState.contains(MFS_DISABLED),
             checked: info.fState.contains(MFS_CHECKED),
             default: info.fState.contains(MFS_DEFAULT),

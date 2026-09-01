@@ -642,6 +642,12 @@ export component AppWindow inherits Window {
     in-out property <bool> context-submenu-loading: false;
     in-out property <bool> context-submenu-parent-open: false;
     in-out property <length> context-submenu-anchor-y: 0px;
+    in-out property <length> context-submenu-parent-anchor-y: 0px;
+    in-out property <length> context-active-anchor-y: 0px;
+    in-out property <length> context-submenu-active-anchor-y: 0px;
+    in-out property <length> context-menu-content-height: 0px;
+    in-out property <length> context-submenu-content-height: 0px;
+    in-out property <length> context-submenu-parent-content-height: 0px;
     private property <length> context-menu-panel-x: min(
         max(12px, root.context-menu-anchor-x + 320px + 12px <= root.width ? root.context-menu-anchor-x : root.context-menu-anchor-x - 320px),
         max(12px, root.width - 320px - 12px)
@@ -1916,7 +1922,7 @@ accessible-label: entry.name;
             max(12px, parent.height - self.height - 12px)
         );
         width: 320px;
-        height: min(parent.height - 24px, 48px + root.context-commands.length * 28px + (root.context-shell-loading ? 22px : 0px));
+        height: min(parent.height - 24px, 42px + root.context-menu-content-height + (root.context-shell-loading ? 24px : 0px));
         background: VisualStyle.cffffff; border-color: VisualStyle.ce0e2e7; border-width: 1px; border-radius: 8px;
         VerticalLayout {
             padding: 4px; spacing: 1px;
@@ -1935,7 +1941,11 @@ accessible-label: entry.name;
                     key-pressed(event) => {
                         if event.text == Key.UpArrow { if root.context-submenu-open { root.move-context-submenu-selection(-1); } else { root.move-context-selection(-1); } return accept; }
                         if event.text == Key.DownArrow { if root.context-submenu-open { root.move-context-submenu-selection(1); } else { root.move-context-selection(1); } return accept; }
-                        if event.text == Key.RightArrow { root.open-context-submenu(root.context-submenu-open ? -root.context-submenu-active-index - 1 : root.context-active-index); return accept; }
+                        if event.text == Key.RightArrow {
+                            root.context-submenu-anchor-y = root.context-submenu-open ? root.context-submenu-active-anchor-y : root.context-active-anchor-y;
+                            root.open-context-submenu(root.context-submenu-open ? -root.context-submenu-active-index - 1 : root.context-active-index);
+                            return accept;
+                        }
                         if event.text == Key.LeftArrow && root.context-submenu-open { root.close-context-submenu(); return accept; }
                         if event.text == Key.Escape {
                             if root.context-search != "" { root.context-search = ""; root.filter-context-menu(""); }
@@ -1952,6 +1962,8 @@ accessible-label: entry.name;
                 command-list := VerticalLayout {
                     width: menu-scroll.width;
                     for command[index] in root.context-commands: Rectangle {
+                        property <bool> command-hovered: command-touch.has-hover;
+                        property <bool> command-active: root.context-active-index == index;
                         height: command.separator ? 9px : 28px; border-radius: 4px;
                         background: command.enabled && !command.separator && (index == root.context-active-index || command-touch.has-hover) ? VisualStyle.cedf1f6 : transparent;
                         Rectangle { visible: command.separator; x: 4px; width: parent.width - 8px; height: 1px; y: 4px; background: VisualStyle.ce0e2e7; }
@@ -1961,11 +1973,21 @@ accessible-label: entry.name;
                         command-touch := TouchArea {
                             enabled: command.enabled && !command.separator;
                             mouse-cursor: pointer;
-                            moved => { root.context-active-index = index; root.context-submenu-anchor-y = self.absolute-position.y - root.absolute-position.y; root.hover-context-submenu(command.submenu ? index : -2147483647); }
+                            moved => { root.context-active-index = index; }
                             clicked => {
-                                if command.submenu { root.open-context-submenu(index); }
+                                if command.submenu { root.context-submenu-anchor-y = self.absolute-position.y - root.absolute-position.y; root.open-context-submenu(index); }
                                 else { root.context-menu-open = false; root.invoke-context-command(command.id); if !command.shell { root.dismiss-context-menu(); } }
                             }
+                        }
+                        changed command-hovered => {
+                            if command-hovered {
+                                root.context-active-index = index;
+                                root.context-submenu-anchor-y = self.absolute-position.y - root.absolute-position.y;
+                                root.hover-context-submenu(command.submenu ? index : -2147483647);
+                            }
+                        }
+                        changed command-active => {
+                            if command-active { root.context-active-anchor-y = self.absolute-position.y - root.absolute-position.y; }
                         }
                         accessible-role: button; accessible-label: command.label; accessible-enabled: command.enabled;
                     }
@@ -1979,12 +2001,12 @@ accessible-label: entry.name;
         }
         init => { context-search-editor.focus(); }
     }
-    if root.context-menu-open && root.context-submenu-open: Rectangle {
+    if root.context-menu-open && root.context-submenu-open: submenu-panel := Rectangle {
         z: 30;
         x: root.context-submenu-parent-open ? (root.context-submenu-first-x > root.context-menu-panel-x ? root.context-submenu-first-x + 284px : max(12px, root.context-submenu-first-x - self.width - 4px)) : root.context-submenu-first-x;
         y: min(parent.height - self.height - 12px, max(12px, root.context-submenu-anchor-y));
         width: 280px;
-        height: min(parent.height - 24px, max(36px, 8px + root.context-submenu-commands.length * 28px + (root.context-submenu-loading ? 22px : 0px)));
+        height: min(parent.height - 24px, max(28px, 8px + root.context-submenu-content-height + (root.context-submenu-loading ? 20px : 0px)));
         background: VisualStyle.cffffff; border-color: VisualStyle.ce0e2e7; border-width: 1px; border-radius: 6px;
         VerticalLayout {
             padding: 4px;
@@ -1993,6 +2015,8 @@ accessible-label: entry.name;
                 submenu-list := VerticalLayout {
                     width: submenu-scroll.width;
                     for command[index] in root.context-submenu-commands: Rectangle {
+                        property <bool> submenu-hovered: submenu-touch.has-hover;
+                        property <bool> submenu-active: root.context-submenu-active-index == index;
                         height: command.separator ? 9px : 28px; border-radius: 4px;
                         background: command.enabled && !command.separator && (index == root.context-submenu-active-index || submenu-touch.has-hover) ? VisualStyle.cedf1f6 : transparent;
                         Rectangle { visible: command.separator; x: 4px; width: parent.width - 8px; height: 1px; y: 4px; background: VisualStyle.ce0e2e7; }
@@ -2002,11 +2026,27 @@ accessible-label: entry.name;
                         submenu-touch := TouchArea {
                             enabled: command.enabled && !command.separator;
                             mouse-cursor: pointer;
-                            moved => { root.context-submenu-active-index = index; root.context-submenu-anchor-y = self.absolute-position.y - root.absolute-position.y; if command.submenu { root.hover-context-submenu(-index - 1); } else { root.cancel-context-submenu-hover(); } }
+                            moved => { root.context-submenu-active-index = index; }
                             clicked => {
-                                if command.submenu { root.open-context-submenu(-index - 1); }
+                                if command.submenu {
+                                    root.context-submenu-parent-anchor-y = submenu-panel.y;
+                                    root.context-submenu-anchor-y = self.absolute-position.y - root.absolute-position.y;
+                                    root.open-context-submenu(-index - 1);
+                                }
                                 else { root.context-menu-open = false; root.invoke-context-command(command.id); if !command.shell { root.dismiss-context-menu(); } }
                             }
+                        }
+                        changed submenu-hovered => {
+                            if submenu-hovered {
+                                root.context-submenu-active-index = index;
+                                root.context-submenu-parent-anchor-y = submenu-panel.y;
+                                root.context-submenu-anchor-y = self.absolute-position.y - root.absolute-position.y;
+                                if command.submenu { root.hover-context-submenu(-index - 1); }
+                                else { root.cancel-context-submenu-hover(); }
+                            }
+                        }
+                        changed submenu-active => {
+                            if submenu-active { root.context-submenu-active-anchor-y = self.absolute-position.y - root.absolute-position.y; }
                         }
                     }
                 }
@@ -2017,13 +2057,14 @@ accessible-label: entry.name;
     if root.context-menu-open && root.context-submenu-parent-open: Rectangle {
         z: 30;
         x: root.context-submenu-first-x;
-        y: min(parent.height - self.height - 12px, max(12px, root.context-submenu-anchor-y));
+        y: min(parent.height - self.height - 12px, max(12px, root.context-submenu-parent-anchor-y));
         width: 280px;
-        height: min(parent.height - 24px, max(36px, 8px + root.context-submenu-parent-commands.length * 28px));
+        height: min(parent.height - 24px, max(28px, 8px + root.context-submenu-parent-content-height));
         background: VisualStyle.cffffff; border-color: VisualStyle.ce0e2e7; border-width: 1px; border-radius: 6px;
         VerticalLayout {
             padding: 4px;
             for command[index] in root.context-submenu-parent-commands: Rectangle {
+                property <bool> parent-submenu-hovered: parent-submenu-touch.has-hover;
                 height: command.separator ? 9px : 28px; border-radius: 4px;
                 background: parent-submenu-touch.has-hover && command.enabled && !command.separator ? VisualStyle.cedf1f6 : transparent;
                 Rectangle { visible: command.separator; x: 4px; width: parent.width - 8px; height: 1px; y: 4px; background: VisualStyle.ce0e2e7; }
@@ -2033,11 +2074,23 @@ accessible-label: entry.name;
                 parent-submenu-touch := TouchArea {
                     enabled: command.enabled && !command.separator;
                     mouse-cursor: pointer;
-                    moved => { if command.submenu { root.close-context-submenu(); root.hover-context-submenu(-index - 1); } else { root.cancel-context-submenu-hover(); } }
                     clicked => {
                         root.close-context-submenu();
-                        if command.submenu { root.open-context-submenu(-index - 1); }
+                        if command.submenu {
+                            root.context-submenu-anchor-y = self.absolute-position.y - root.absolute-position.y;
+                            root.open-context-submenu(-index - 1);
+                        }
                         else { root.context-menu-open = false; root.invoke-context-command(command.id); if !command.shell { root.dismiss-context-menu(); } }
+                    }
+                }
+                changed parent-submenu-hovered => {
+                    if parent-submenu-hovered {
+                        if command.submenu {
+                            root.close-context-submenu();
+                            root.context-submenu-anchor-y = self.absolute-position.y - root.absolute-position.y;
+                            root.hover-context-submenu(-index - 1);
+                        }
+                        else { root.cancel-context-submenu-hover(); }
                     }
                 }
             }

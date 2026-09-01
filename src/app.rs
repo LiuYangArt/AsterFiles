@@ -3521,7 +3521,14 @@ fn project_context_submenu(ui: &AppWindow, menu: &SharedQuickMenu) {
         .map(|menu| menu.submenu_rows.clone())
         .unwrap_or_default();
     ui.set_context_submenu_active_index(first_enabled_context_index(&rows));
+    ui.set_context_submenu_content_height(context_menu_content_height(&rows));
     ui.set_context_submenu_commands(ModelRc::new(VecModel::from(rows)));
+}
+
+fn context_menu_content_height(rows: &[ContextCommandRow]) -> f32 {
+    rows.iter()
+        .map(|row| if row.separator { 9.0 } else { 28.0 })
+        .sum()
 }
 
 fn wire_context_submenu_hover(ui: &AppWindow) -> Rc<slint::Timer> {
@@ -3558,6 +3565,7 @@ fn project_filtered_context_menu(ui: &AppWindow, menu: &SharedQuickMenu, query: 
         .map(|menu| filtered_context_rows(&menu.all_rows, query))
         .unwrap_or_default();
     ui.set_context_active_index(first_enabled_context_index(&rows));
+    ui.set_context_menu_content_height(context_menu_content_height(&rows));
     ui.set_context_commands(ModelRc::new(VecModel::from(rows)));
 }
 
@@ -5914,6 +5922,8 @@ fn wire_callbacks(
             ui.set_context_submenu_open(false);
             ui.set_context_submenu_parent_open(false);
             ui.set_context_submenu_loading(false);
+            ui.set_context_submenu_content_height(0.0);
+            ui.set_context_submenu_parent_content_height(0.0);
             project_filtered_context_menu(&ui, &quick_menu_for_filter, query.as_str());
         }
     });
@@ -5956,6 +5966,7 @@ fn wire_callbacks(
             && !row.separator
         {
             if row.submenu {
+                ui.set_context_submenu_anchor_y(ui.get_context_active_anchor_y());
                 ui.invoke_open_context_submenu(index);
             } else {
                 ui.set_context_menu_open(false);
@@ -6013,12 +6024,14 @@ fn wire_callbacks(
                 .ok()
                 .and_then(|menu| menu.submenu_history.last().map(|(_, rows)| rows.clone()))
                 .unwrap_or_default();
+            ui.set_context_submenu_parent_content_height(context_menu_content_height(&parent_rows));
             ui.set_context_submenu_parent_commands(ModelRc::new(VecModel::from(parent_rows)));
             ui.set_context_submenu_parent_open(true);
         } else {
             ui.set_context_submenu_parent_open(false);
         }
         ui.set_context_submenu_loading(true);
+        ui.set_context_submenu_content_height(0.0);
         ui.set_context_submenu_commands(ModelRc::new(VecModel::from(
             Vec::<ContextCommandRow>::new(),
         )));
@@ -6048,11 +6061,16 @@ fn wire_callbacks(
                 });
             if let Some(rows) = restored {
                 ui.set_context_submenu_parent_open(false);
+                ui.set_context_submenu_parent_content_height(0.0);
+                ui.set_context_submenu_anchor_y(ui.get_context_submenu_parent_anchor_y());
                 ui.set_context_submenu_active_index(first_enabled_context_index(&rows));
+                ui.set_context_submenu_content_height(context_menu_content_height(&rows));
                 ui.set_context_submenu_commands(ModelRc::new(VecModel::from(rows)));
             } else {
                 ui.set_context_submenu_open(false);
                 ui.set_context_submenu_parent_open(false);
+                ui.set_context_submenu_content_height(0.0);
+                ui.set_context_submenu_parent_content_height(0.0);
             }
         }
     });
@@ -6067,6 +6085,8 @@ fn wire_callbacks(
             && !row.separator
         {
             if row.submenu {
+                ui.set_context_submenu_parent_anchor_y(ui.get_context_submenu_anchor_y());
+                ui.set_context_submenu_anchor_y(ui.get_context_submenu_active_anchor_y());
                 ui.invoke_open_context_submenu(-index - 1);
             } else {
                 ui.set_context_menu_open(false);
@@ -11996,6 +12016,17 @@ mod tests {
         assert!(!result[0].separator);
         assert!(result[1].separator);
         assert!(!result[2].separator);
+    }
+
+    #[test]
+    fn quick_menu_content_height_uses_compact_separator_height() {
+        let rows = vec![
+            context_test_row(1, "Open", "open", false),
+            context_test_row(-1, "", "", true),
+            context_test_row(2, "PowerShell 7", "powershell", false),
+        ];
+
+        assert_eq!(context_menu_content_height(&rows), 65.0);
     }
 
     #[test]
