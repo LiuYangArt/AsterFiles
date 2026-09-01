@@ -32,7 +32,7 @@ use windows::{
             Com::{
                 CLSCTX_INPROC_SERVER, CoCreateInstance, DATADIR_GET, DVASPECT_CONTENT, FORMATETC,
                 IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA,
-                STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
+                STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL, Urlmon::CopyStgMedium,
             },
             DataExchange::RegisterClipboardFormatW,
             Memory::{
@@ -1178,7 +1178,7 @@ fn query_continue_drag(escape_pressed: bool, key_state: u32) -> HRESULT {
 #[implement(IDataObject)]
 struct OutboundDataObject {
     formats: Vec<(u16, Vec<u8>)>,
-    dynamic_formats: Mutex<Vec<(u16, Vec<u8>)>>,
+    dynamic_formats: Mutex<Vec<(FORMATETC, STGMEDIUM)>>,
     performed_format: u16,
     performed_effect: Arc<Mutex<Option<DropEffect>>>,
     accept_extra_set_data: bool,
@@ -1197,8 +1197,8 @@ impl IDataObject_Impl for OutboundDataObject_Impl {
                     .lock()
                     .ok()?
                     .iter()
-                    .find(|(id, _)| supports_format(format, *id))
-                    .map(|(_, bytes)| allocate_medium(bytes))
+                    .find(|(stored, _)| format_matches(format, stored))
+                    .map(|(_, medium)| copy_medium(medium))
             })
             .unwrap_or_else(|| Err(DV_E_FORMATETC.into()))
     }
@@ -1219,10 +1219,11 @@ impl IDataObject_Impl for OutboundDataObject_Impl {
             .formats
             .iter()
             .any(|(id, _)| supports_format(format, *id))
-            || self
-                .dynamic_formats
-                .lock()
-                .is_ok_and(|formats| formats.iter().any(|(id, _)| supports_format(format, *id)))
+            || self.dynamic_formats.lock().is_ok_and(|formats| {
+                formats
+                    .iter()
+                    .any(|(stored, _)| format_matches(format, stored))
+            })
         {
             HRESULT(0)
         } else {
@@ -1249,12 +1250,16 @@ impl IDataObject_Impl for OutboundDataObject_Impl {
             if !self.accept_extra_set_data {
                 return Err(DV_E_FORMATETC.into());
             }
-            let bytes = read_hglobal_bytes(medium)?;
+            let stored = copy_medium(medium)?;
             if let Ok(mut formats) = self.dynamic_formats.lock() {
-                if let Some(existing) = formats.iter_mut().find(|(id, _)| *id == format.cfFormat) {
-                    existing.1 = bytes;
+                if let Some(existing) = formats
+                    .iter_mut()
+                    .find(|(stored, _)| format_matches(format, stored))
+                {
+                    unsafe { ReleaseStgMedium(&mut existing.1) };
+                    existing.1 = stored;
                 } else {
-                    formats.push((format.cfFormat, bytes));
+                    formats.push((*format, stored));
                 }
             }
         } else {
@@ -1286,7 +1291,7 @@ impl IDataObject_Impl for OutboundDataObject_Impl {
                     .flat_map(|formats| {
                         formats
                             .iter()
-                            .map(|(id, _)| format_etc(*id))
+                            .map(|(format, _)| *format)
                             .collect::<Vec<_>>()
                     }),
             )
@@ -1310,6 +1315,27 @@ impl IDataObject_Impl for OutboundDataObject_Impl {
     fn EnumDAdvise(&self) -> windows::core::Result<IEnumSTATDATA> {
         Err(OLE_E_ADVISENOTSUPPORTED.into())
     }
+}
+
+impl Drop for OutboundDataObject {
+    fn drop(&mut self) {
+        if let Ok(formats) = self.dynamic_formats.get_mut() {
+            for (_, medium) in formats {
+                unsafe { ReleaseStgMedium(medium) };
+            }
+        }
+    }
+}
+
+fn copy_medium(medium: &STGMEDIUM) -> windows::core::Result<STGMEDIUM> {
+    unsafe { CopyStgMedium(medium) }
+}
+
+fn format_matches(left: &FORMATETC, right: &FORMATETC) -> bool {
+    left.cfFormat == right.cfFormat
+        && left.dwAspect == right.dwAspect
+        && left.lindex == right.lindex
+        && left.tymed & right.tymed != 0
 }
 
 fn encode_dropfiles(paths: &[PathBuf]) -> io::Result<Vec<u8>> {
@@ -1708,6 +1734,46 @@ mod tests {
                 tab_id: 7,
             })
         );
+    }
+
+    #[test]
+    fn native_drag_helper_accepts_the_opaque_tab_card() {
+        let _ole = OleApartment::initialize().unwrap();
+        let tab_format = clipboard_format(TAB_DRAG_FORMAT).unwrap();
+        let data = IDataObject::from(OutboundDataObject {
+            formats: vec![(
+                tab_format,
+                encode_tab_drag_payload(TabDragPayload {
+                    process_id: std::process::id(),
+                    source_hwnd: 123,
+                    tab_id: 7,
+                }),
+            )],
+            dynamic_formats: Mutex::new(Vec::new()),
+            performed_format: 0,
+            performed_effect: Arc::new(Mutex::new(None)),
+            accept_extra_set_data: true,
+        });
+        let image = TabDragImage {
+            title: "Tab".to_owned(),
+            icon: None,
+            width_px: 178,
+            height_px: 34,
+            grab_x_px: 32,
+            dark: true,
+            active: true,
+        };
+        let bitmap = NativeDragBitmap::new(&image).unwrap();
+        let helper: IDragSourceHelper =
+            unsafe { CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER) }.unwrap();
+        let drag_image = SHDRAGIMAGE {
+            sizeDragImage: SIZE { cx: 178, cy: 34 },
+            ptOffset: POINT { x: 32, y: 17 },
+            hbmpDragImage: bitmap.handle,
+            crColorKey: COLORREF(0x00ff00ff),
+        };
+
+        unsafe { helper.InitializeFromBitmap(&drag_image, &data) }.unwrap();
     }
 
     #[test]
