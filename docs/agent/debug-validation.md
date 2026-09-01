@@ -44,6 +44,13 @@ cargo run -- --agent-scenario drag-drop-foundation --no-ui
 
 统一验证写入 `artifacts/state/drag-drop/foundation.json`。`drag_drop` 对象包含生命周期、是否注册、源数量、目标、协商效果、拒绝原因、最后事件和事件序号。无界面场景固定为 `unregistered`；真实窗口创建后才在主 winit/STA 线程完成注册。P3.D0 尚不接受文件，进入窗口的拖放会返回禁止，P3.D1 再接入 `CF_HDROP` 和文件任务。
 
+## Issue #5 文件夹大小调度
+
+```powershell
+cargo run -- --agent-scenario folder-size-scheduler --no-ui --agent-state-out artifacts/state/folder-size/scheduler.json
+```
+
+场景不启动窗口、不扫描真实目录、不写 Everything 配置。产物记录普通首屏、重复滚动和后部滚动的提交数，完整大小排序的终态数量与最终刷新次数，以及取消后旧代次是否被拒绝。统一验证执行该场景；日志位于 `artifacts/logs/`，后续人工性能测量写入 `artifacts/perf/`。
 ## P2 文件任务状态
 
 文件任务提供三个确定性无界面场景，不执行真实磁盘写入：

@@ -1,4 +1,5 @@
 pub mod file_operations;
+pub mod folder_size_scheduler;
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
@@ -210,6 +211,7 @@ pub struct TabSession {
     pub sort_direction: SortDirection,
     pub search_sort_field: SortField,
     pub search_sort_direction: SortDirection,
+    pub folder_sizes: folder_size_scheduler::FolderSizeScheduler,
     cancel: Option<Arc<AtomicBool>>,
 }
 
@@ -251,6 +253,7 @@ impl TabSession {
             sort_direction: SortDirection::Ascending,
             search_sort_field: SortField::Name,
             search_sort_direction: SortDirection::Descending,
+            folder_sizes: folder_size_scheduler::FolderSizeScheduler::new(),
             cancel: None,
         }
     }
@@ -299,6 +302,7 @@ impl TabSession {
             sort_direction: source.sort_direction,
             search_sort_field: source.search_sort_field,
             search_sort_direction: source.search_sort_direction,
+            folder_sizes: folder_size_scheduler::FolderSizeScheduler::new(),
             cancel: None,
         }
     }
@@ -1051,11 +1055,13 @@ fn compare_entries(
             }
         }
     };
-    value_order.then_with(|| {
-        left.display_name
-            .to_lowercase()
-            .cmp(&right.display_name.to_lowercase())
-    })
+    value_order
+        .then_with(|| {
+            left.display_name
+                .to_lowercase()
+                .cmp(&right.display_name.to_lowercase())
+        })
+        .then_with(|| left.path.cmp(&right.path))
 }
 
 fn search_scope_prefix(path: &Path) -> String {
@@ -1835,6 +1841,19 @@ mod tests {
         assert_eq!(session.entries[0].display_name, "unknown");
     }
 
+    #[test]
+    fn size_sort_uses_path_after_equal_size_and_name() {
+        let mut left = entry(1, "same", EntryKind::Directory, None);
+        left.path = PathBuf::from(r"C:\b\same");
+        left.folder_size = FolderSizeState::Value(7);
+        let mut right = entry(2, "same", EntryKind::Directory, None);
+        right.path = PathBuf::from(r"C:\a\same");
+        right.folder_size = FolderSizeState::Value(7);
+        let mut session = TabSession::new(TabId(1));
+        session.replace_entries(vec![left, right]);
+        session.set_sort(SortField::Size);
+        assert_eq!(session.entries[0].path, PathBuf::from(r"C:\a\same"));
+    }
     #[test]
     fn entry_id_resolves_original_unicode_path() {
         let mut session = TabSession::new(TabId(1));

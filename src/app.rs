@@ -25,6 +25,7 @@ use crate::{
             FileOperationKind, ItemState, OperationId, OperationItem, OperationManager,
             OperationResult, OperationState,
         },
+        folder_size_scheduler::{FOLDER_SIZE_QUEUE_CAPACITY, FolderSizeCommit, FolderSizeQuery},
     },
     fs::{ReadOutcome, read_directory_batches_filtered},
     i18n::{Language, Texts},
@@ -37,6 +38,75 @@ slint::include_modules!();
 const WORKER_COUNT: usize = 4;
 const ICON_WORKER_COUNT: usize = 2;
 
+pub fn export_folder_size_scheduler_state(path: &Path) -> io::Result<()> {
+    use crate::domain::{
+        EntryKind,
+        folder_size_scheduler::{FolderSizeCommit, FolderSizeScheduler},
+    };
+    use std::ffi::OsString;
+
+    let entry = |id: u32| FileEntry {
+        id: EntryId(id),
+        original_name: OsString::from(format!("folder-{id:03}")),
+        display_name: format!("folder-{id:03}"),
+        name_highlights: Vec::new(),
+        path: PathBuf::from(format!(r"C:\AgentScenarios\FolderSizes\folder-{id:03}")),
+        kind: EntryKind::Directory,
+        open_target: None,
+        parent_display: r"C:\AgentScenarios\FolderSizes".to_owned(),
+        size_bytes: None,
+        folder_size: FolderSizeState::Unknown,
+        modified: None,
+    };
+    let mut visible_entries = (1..=80).map(entry).collect::<Vec<_>>();
+    let mut visible = FolderSizeScheduler::new();
+    let first = visible.visible_queries(RequestId(1), &mut visible_entries, 0, 10);
+    let repeated = visible.visible_queries(RequestId(1), &mut visible_entries, 0, 10);
+    let scrolled = visible.visible_queries(RequestId(1), &mut visible_entries, 60, 10);
+
+    let mut sorted_entries = (1..=55).map(entry).collect::<Vec<_>>();
+    let mut complete = FolderSizeScheduler::new();
+    let mut pending = complete.begin_complete_sort(RequestId(2), &mut sorted_entries);
+    let mut refreshes = 0;
+    while !pending.is_empty() {
+        for query in pending {
+            assert!(complete.start(&query));
+            if complete.complete(
+                &query,
+                if query.key.entry_id.0 % 11 == 0 {
+                    FolderSizeState::NotIndexed
+                } else {
+                    FolderSizeState::Value(u64::from(query.key.entry_id.0))
+                },
+                &mut sorted_entries,
+            ) == FolderSizeCommit::CompleteSort
+            {
+                refreshes += 1;
+            }
+        }
+        pending = complete.next_complete_queries(&mut sorted_entries);
+    }
+    let progress = complete.progress().expect("complete sort has progress");
+    let old = complete.begin_complete_sort(RequestId(2), &mut sorted_entries);
+    complete.cancel(RequestId(3));
+    let cancelled_rejected = old.first().is_none_or(|query| !complete.accepts(query));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(
+        path,
+        format!(
+            "{{\n  \"schema_version\": 1,\n  \"scenario\": \"folder-size-scheduler\",\n  \"visible_range\": {{\"entry_count\": 80, \"first_submitted\": {}, \"repeated_submitted\": {}, \"scrolled_submitted\": {}, \"submit_limit\": 24}},\n  \"complete_sort\": {{\"directory_count\": {}, \"completed\": {}, \"terminal_failures\": 5, \"final_refreshes\": {}}},\n  \"cancellation\": {{\"old_generation_rejected\": {}}}\n}}\n",
+            first.len(),
+            repeated.len(),
+            scrolled.len(),
+            progress.total,
+            progress.completed,
+            refreshes,
+            cancelled_rejected,
+        ),
+    )
+}
 pub fn export_multi_window_state_layering(path: &Path) -> io::Result<()> {
     let mut app = AppState::new(
         vec![PathBuf::from(r"C:\AgentScenarios\WindowA")],
@@ -1425,6 +1495,7 @@ impl AppState {
     fn close_window(&mut self, id: WindowId) -> Option<WindowCloseDecision> {
         let mut window = self.windows.remove(&id)?;
         for tab in window.tabs.values_mut() {
+            cancel_folder_sizes(tab);
             tab.cancel_pending();
         }
         self.icons
@@ -1665,6 +1736,7 @@ impl AppState {
         let closing_was_active = closing == self.active_window_state().active_tab;
         let removed = self.active_window_state_mut().tabs.remove(&closing);
         if let Some(mut tab) = removed {
+            cancel_folder_sizes(&mut tab);
             tab.cancel_pending();
             self.icons.retain(|(tab_id, _, _), _| *tab_id != closing);
             if tab.kind == TabKind::Files
@@ -1925,9 +1997,7 @@ enum EverythingRequest {
     },
     FolderSize {
         tab_id: TabId,
-        request_id: RequestId,
-        entry_id: EntryId,
-        path: PathBuf,
+        query: FolderSizeQuery,
     },
     Configure(crate::domain::EverythingConfig),
     TestConnection,
@@ -1958,9 +2028,7 @@ enum EverythingEvent {
     },
     FolderSize {
         tab_id: TabId,
-        request_id: RequestId,
-        entry_id: EntryId,
-        path: PathBuf,
+        query: FolderSizeQuery,
         state: FolderSizeState,
     },
     Status(
@@ -1974,9 +2042,7 @@ enum EverythingEvent {
 enum FolderSizeWork {
     Query {
         tab_id: TabId,
-        request_id: RequestId,
-        entry_id: EntryId,
-        path: PathBuf,
+        query: FolderSizeQuery,
     },
     Configure(crate::domain::EverythingConfig),
 }
@@ -2202,7 +2268,8 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         .expect("app state mutex is not poisoned")
         .everything_config
         .clone();
-    let (everything_sender, everything_receiver) = spawn_everything_worker(everything_config);
+    let (everything_sender, everything_receiver) =
+        spawn_everything_worker(everything_config, state.clone());
     let (icon_sender, icon_receiver) = spawn_icon_workers(ICON_WORKER_COUNT, state.clone());
     let (operation_sender, operation_receiver) = spawn_file_operation_worker();
     let (clipboard_sender, clipboard_receiver) = spawn_clipboard_worker();
@@ -2468,6 +2535,9 @@ fn submit_navigation(
 ) -> bool {
     let request = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
+        if let Some(tab) = app.tab_mut(tab_id) {
+            cancel_folder_sizes(tab);
+        }
         app.icons.retain(|(icon_tab, _, _), _| *icon_tab != tab_id);
         app.thumbnail_requests
             .retain(|(request_tab, _, _, _)| *request_tab != tab_id);
@@ -4187,6 +4257,24 @@ fn wire_callbacks(
         }
     });
 
+    let state_for_folder_range = state.clone();
+    let everything_for_folder_range = everything_sender.clone();
+    ui.on_request_folder_size_range(move |viewport_y, viewport_height| {
+        let target = state_for_folder_range.lock().ok().and_then(|app| {
+            let tab = app.active();
+            (tab.page_source == PageSource::Directory).then_some((tab.id, tab.latest_request))
+        });
+        if let Some((tab_id, request_id)) = target {
+            submit_visible_folder_sizes(
+                &everything_for_folder_range,
+                &state_for_folder_range.shared,
+                tab_id,
+                request_id,
+                viewport_y,
+                viewport_height,
+            );
+        }
+    });
     let weak = ui.as_weak();
     let state_for_search_edit = state.clone();
     ui.on_begin_search(move || {
@@ -4627,18 +4715,32 @@ fn wire_callbacks(
             .lock()
             .expect("app state mutex is not poisoned");
         let tab_id = app.active_window_state().active_tab;
+        let mut folder_queries = Vec::new();
         let search_query = if let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) {
             if tab.page_source == PageSource::Search {
                 tab.set_search_sort(field);
                 Some(tab.search_query.clone())
             } else {
+                cancel_folder_sizes(tab);
                 tab.set_sort(field);
+                if tab.sort_field == SortField::Size {
+                    let request_id = tab.latest_request;
+                    folder_queries = with_folder_scheduler(tab, |scheduler, entries| {
+                        scheduler.begin_complete_sort(request_id, entries)
+                    });
+                }
                 None
             }
         } else {
             None
         };
         drop(app);
+        submit_folder_size_queries(
+            &everything_for_sort,
+            &state_for_sort.shared,
+            tab_id,
+            folder_queries,
+        );
         if let Some(query) = search_query
             && let Some(ui) = weak.upgrade()
         {
@@ -8344,7 +8446,21 @@ fn start_event_pump(
                         }
                     } else {
                         if let Some((tab_id, request_id)) = finished {
-                            submit_folder_sizes(&everything_sender, &state, tab_id, request_id);
+                            let viewport = state
+                                .lock()
+                                .ok()
+                                .and_then(|app| app.window_for_tab(tab_id))
+                                .and_then(window_ui)
+                                .map(|ui| (ui.get_file_viewport_y(), ui.get_file_viewport_height()))
+                                .unwrap_or((0.0, 640.0));
+                            submit_visible_folder_sizes(
+                                &everything_sender,
+                                &state,
+                                tab_id,
+                                request_id,
+                                viewport.0,
+                                viewport.1,
+                            );
                         }
                         if let Some(tab_id) = routed_tab {
                             refresh_tab_window(&state, tab_id);
@@ -8570,43 +8686,70 @@ fn search_grouped_page(
 }
 fn spawn_everything_worker(
     config: crate::domain::EverythingConfig,
+    state: SharedSessions,
 ) -> (
     mpsc::Sender<EverythingRequest>,
     mpsc::Receiver<EverythingEvent>,
 ) {
     let (request_sender, request_receiver) = mpsc::channel::<EverythingRequest>();
     let (event_sender, event_receiver) = mpsc::channel::<EverythingEvent>();
-    let (folder_sender, folder_receiver) = mpsc::channel::<FolderSizeWork>();
+    let (folder_sender, folder_receiver) =
+        mpsc::sync_channel::<FolderSizeWork>(FOLDER_SIZE_QUEUE_CAPACITY);
     let folder_events = event_sender.clone();
     let folder_config = config.clone();
+    let folder_state = state.clone();
     thread::spawn(move || {
         let mut client = platform_everything_config(&folder_config)
             .and_then(|value| platform::windows::everything::EverythingClient::new(value).ok());
-        while let Ok(work) = folder_receiver.recv() {
-            match work {
-                FolderSizeWork::Query {
-                    tab_id,
-                    request_id,
-                    entry_id,
-                    path,
-                } => {
-                    let state = client
-                        .as_ref()
-                        .map_or(FolderSizeState::Disconnected, |client| {
-                            folder_size_state(client.folder_size(&path, Duration::from_secs(2)))
-                        });
-                    let _ = folder_events.send(EverythingEvent::FolderSize {
-                        tab_id,
-                        request_id,
-                        entry_id,
-                        path,
-                        state,
-                    });
+        while let Ok(first) = folder_receiver.recv() {
+            let mut batch = vec![first];
+            while batch.len() < FOLDER_SIZE_QUEUE_CAPACITY {
+                match folder_receiver.try_recv() {
+                    Ok(work) => batch.push(work),
+                    Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
                 }
-                FolderSizeWork::Configure(config) => {
-                    client = platform_everything_config(&config).and_then(|value| {
-                        platform::windows::everything::EverythingClient::new(value).ok()
+            }
+            batch.sort_by_key(|work| match work {
+                FolderSizeWork::Query { tab_id, .. } => {
+                    let active = folder_state.lock().ok().is_some_and(|app| {
+                        app.window_for_tab(*tab_id) == Some(app.active_window)
+                            && app.active_window_state().active_tab == *tab_id
                     });
+                    !active
+                }
+                FolderSizeWork::Configure(_) => false,
+            });
+            for work in batch {
+                match work {
+                    FolderSizeWork::Query { tab_id, query } => {
+                        let valid = folder_state.lock().ok().is_some_and(|app| {
+                            app.tab(tab_id).is_some_and(|tab| {
+                                tab.accepts_page(query.request_id, PageSource::Directory)
+                                    && tab.folder_sizes.accepts(&query)
+                            })
+                        });
+                        if !valid {
+                            continue;
+                        }
+                        let state =
+                            client
+                                .as_ref()
+                                .map_or(FolderSizeState::Disconnected, |client| {
+                                    folder_size_state(
+                                        client.folder_size(&query.key.path, Duration::from_secs(2)),
+                                    )
+                                });
+                        let _ = folder_events.send(EverythingEvent::FolderSize {
+                            tab_id,
+                            query,
+                            state,
+                        });
+                    }
+                    FolderSizeWork::Configure(config) => {
+                        client = platform_everything_config(&config).and_then(|value| {
+                            platform::windows::everything::EverythingClient::new(value).ok()
+                        });
+                    }
                 }
             }
         }
@@ -8732,18 +8875,27 @@ fn spawn_everything_worker(
                         }
                     }
                 }
-                EverythingRequest::FolderSize {
-                    tab_id,
-                    request_id,
-                    entry_id,
-                    path,
-                } => {
-                    let _ = folder_sender.send(FolderSizeWork::Query {
+                EverythingRequest::FolderSize { tab_id, query } => {
+                    match folder_sender.try_send(FolderSizeWork::Query {
                         tab_id,
-                        request_id,
-                        entry_id,
-                        path,
-                    });
+                        query: query.clone(),
+                    }) {
+                        Ok(()) => {}
+                        Err(mpsc::TrySendError::Full(_)) => {
+                            let _ = event_sender.send(EverythingEvent::FolderSize {
+                                tab_id,
+                                query,
+                                state: FolderSizeState::TimedOut,
+                            });
+                        }
+                        Err(mpsc::TrySendError::Disconnected(_)) => {
+                            let _ = event_sender.send(EverythingEvent::FolderSize {
+                                tab_id,
+                                query,
+                                state: FolderSizeState::Disconnected,
+                            });
+                        }
+                    }
                 }
                 EverythingRequest::Configure(config) => {
                     let _ = folder_sender.send(FolderSizeWork::Configure(config.clone()));
@@ -8807,33 +8959,53 @@ fn protocol_reports_not_found(message: &str) -> bool {
         .split(|character: char| !character.is_ascii_digit())
         .any(|part| part == "404")
 }
-fn apply_folder_size_event(
-    app: &mut AppState,
-    tab_id: TabId,
-    request_id: RequestId,
-    entry_id: EntryId,
-    path: &Path,
-    state: FolderSizeState,
-) -> bool {
+fn with_folder_scheduler<T>(
+    tab: &mut TabSession,
+    action: impl FnOnce(
+        &mut crate::domain::folder_size_scheduler::FolderSizeScheduler,
+        &mut Vec<FileEntry>,
+    ) -> T,
+) -> T {
+    let mut scheduler = std::mem::take(&mut tab.folder_sizes);
+    let result = action(&mut scheduler, Arc::make_mut(&mut tab.entries));
+    tab.folder_sizes = scheduler;
+    result
+}
+
+fn cancel_folder_sizes(tab: &mut TabSession) {
+    let request_id = tab.latest_request;
+    with_folder_scheduler(tab, |scheduler, entries| {
+        for entry in entries {
+            if entry.folder_size == FolderSizeState::Querying {
+                entry.folder_size = FolderSizeState::Unknown;
+            }
+        }
+        scheduler.cancel(request_id);
+    });
+}
+
+fn start_folder_size_query(app: &mut AppState, tab_id: TabId, query: &FolderSizeQuery) -> bool {
     let Some(tab) = app.tab_mut(tab_id) else {
         return false;
     };
-    if !tab.accepts_page(request_id, PageSource::Directory) {
-        return false;
-    }
-    let Some(index) = tab.entry_indices.get(&entry_id).copied() else {
-        return false;
+    tab.accepts_page(query.request_id, PageSource::Directory) && tab.folder_sizes.start(query)
+}
+
+fn apply_folder_size_event(
+    app: &mut AppState,
+    tab_id: TabId,
+    query: &FolderSizeQuery,
+    state: FolderSizeState,
+) -> FolderSizeCommit {
+    let Some(tab) = app.tab_mut(tab_id) else {
+        return FolderSizeCommit::Ignored;
     };
-    let updated = {
-        let Some(entry) = Arc::make_mut(&mut tab.entries).get_mut(index) else {
-            return false;
-        };
-        entry.set_folder_size(entry_id, path, state)
-    };
-    if updated && tab.sort_field == SortField::Size {
-        tab.resort_entries();
+    if !tab.accepts_page(query.request_id, PageSource::Directory) {
+        return FolderSizeCommit::Ignored;
     }
-    updated
+    with_folder_scheduler(tab, |scheduler, entries| {
+        scheduler.complete(query, state, entries)
+    })
 }
 
 #[cfg(test)]
@@ -9005,26 +9177,42 @@ fn start_everything_event_pump(
                     }
                     return;
                 },
-                EverythingEvent::FolderSize { tab_id, request_id, entry_id, path, state: size } => {
-                    let size_sort = app
-                        .tab(tab_id)
-                        .is_some_and(|tab| tab.sort_field == SortField::Size);
-                    if apply_folder_size_event(
-                        &mut app,
-                        tab_id,
-                        request_id,
-                        entry_id,
-                        &path,
-                        size,
-                    ) {
-                        let changed = if size_sort {
-                            app.tab(tab_id)
-                                .map(|tab| tab.entries.iter().map(|entry| entry.id).collect())
-                                .unwrap_or_default()
-                        } else {
-                            HashSet::from([entry_id])
-                        };
-                        folder_size_update = Some((tab_id, changed));
+                EverythingEvent::FolderSize { tab_id, query, state: size } => {
+                    let commit = apply_folder_size_event(&mut app, tab_id, &query, size);
+                    let next = app
+                        .tab_mut(tab_id)
+                        .map(|tab| {
+                            with_folder_scheduler(tab, |scheduler, entries| match commit {
+                                FolderSizeCommit::Staged => scheduler.next_complete_queries(entries),
+                                FolderSizeCommit::Visible(_) => scheduler.next_visible_queries(entries),
+                                FolderSizeCommit::Ignored | FolderSizeCommit::CompleteSort => Vec::new(),
+                            })
+                        })
+                        .unwrap_or_default();
+                    for query in next {
+                        if start_folder_size_query(&mut app, tab_id, &query) {
+                            let _ = sender_for_search_consistency.send(
+                                EverythingRequest::FolderSize { tab_id, query }
+                            );
+                        }
+                    }
+                    match commit {
+                        FolderSizeCommit::Visible(entry_id) => {
+                            folder_size_update = Some((tab_id, HashSet::from([entry_id])));
+                        }
+                        FolderSizeCommit::CompleteSort => {
+                            if let Some(tab) = app.tab_mut(tab_id) {
+                                tab.resort_entries();
+                                folder_size_update = Some((
+                                    tab_id,
+                                    tab.entries.iter().map(|entry| entry.id).collect(),
+                                ));
+                            }
+                        }
+                        FolderSizeCommit::Staged => {
+                            folder_size_update = Some((tab_id, HashSet::new()));
+                        }
+                        FolderSizeCommit::Ignored => {}
                     }
                 }
                 EverythingEvent::Status(result) => match result {
@@ -9038,6 +9226,7 @@ fn start_everything_event_pump(
                     && let Some(target_ui) = window_ui(window_id)
                 {
                     update_file_rows(&target_ui, &state, tab_id, &changed);
+                    update_tab_status(&target_ui, &state, tab_id);
                 }
                 return;
             }
@@ -9179,13 +9368,46 @@ fn submit_search_page(
     };
     let _ = sender.send(request);
 }
-fn submit_folder_sizes(
+fn submit_folder_size_queries(
+    sender: &mpsc::Sender<EverythingRequest>,
+    state: &SharedSessions,
+    tab_id: TabId,
+    queries: Vec<FolderSizeQuery>,
+) {
+    for query in queries {
+        let started = state
+            .lock()
+            .ok()
+            .is_some_and(|mut app| start_folder_size_query(&mut app, tab_id, &query));
+        if !started {
+            continue;
+        }
+        if sender
+            .send(EverythingRequest::FolderSize {
+                tab_id,
+                query: query.clone(),
+            })
+            .is_err()
+            && let Ok(mut app) = state.lock()
+            && let Some(tab) = app.tab_mut(tab_id)
+        {
+            with_folder_scheduler(tab, |scheduler, entries| {
+                scheduler.reject(&query, entries);
+            });
+        }
+    }
+}
+
+fn submit_visible_folder_sizes(
     sender: &mpsc::Sender<EverythingRequest>,
     state: &SharedSessions,
     tab_id: TabId,
     request_id: RequestId,
+    viewport_y: f32,
+    viewport_height: f32,
 ) {
-    let requests = {
+    const ROW_HEIGHT: f32 = 40.0;
+    let queries = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         if app.everything_folder_sizes_indexed == Some(false) {
             return;
@@ -9193,24 +9415,19 @@ fn submit_folder_sizes(
         let Some(tab) = app.tab_mut(tab_id) else {
             return;
         };
-        Arc::make_mut(&mut tab.entries)
-            .iter_mut()
-            .filter(|entry| entry.kind == crate::domain::EntryKind::Directory)
-            .take(48)
-            .map(|entry| {
-                entry.folder_size = FolderSizeState::Querying;
-                (entry.id, entry.path.clone())
+        if tab.sort_field == SortField::Size {
+            with_folder_scheduler(tab, |scheduler, entries| {
+                scheduler.begin_complete_sort(request_id, entries)
             })
-            .collect::<Vec<_>>()
+        } else {
+            let first_row = ((-viewport_y).max(0.0) / ROW_HEIGHT).floor() as usize;
+            let visible_rows = (viewport_height.max(ROW_HEIGHT) / ROW_HEIGHT).ceil() as usize + 1;
+            with_folder_scheduler(tab, |scheduler, entries| {
+                scheduler.visible_queries(request_id, entries, first_row, visible_rows)
+            })
+        }
     };
-    for (entry_id, path) in requests {
-        let _ = sender.send(EverythingRequest::FolderSize {
-            tab_id,
-            request_id,
-            entry_id,
-            path,
-        });
-    }
+    submit_folder_size_queries(sender, state, tab_id, queries);
 }
 fn spawn_icon_workers(
     worker_count: usize,
@@ -9561,6 +9778,24 @@ fn mutate_active_selection(
     let mut changed = before;
     changed.extend(selection_projection_ids(tab));
     Some((tab_id, changed))
+}
+fn update_tab_status(ui: &AppWindow, state: &SharedSessions, tab_id: TabId) {
+    let app = state.lock().expect("app state mutex is not poisoned");
+    let Some(window) = app
+        .window_for_tab(tab_id)
+        .and_then(|window_id| app.window(window_id))
+    else {
+        return;
+    };
+    let Some(tab) = window.tabs.get(&tab_id) else {
+        return;
+    };
+    if window.active_tab == tab_id
+        && ui.get_projected_file_tab_id() == tab_id.0 as i32
+        && ui.get_projected_file_request_id() == tab.latest_request.0 as i32
+    {
+        ui.set_status_text(status_text(tab, Texts::new(app.language)).into());
+    }
 }
 fn update_file_rows(
     ui: &AppWindow,
@@ -10304,6 +10539,20 @@ fn shell_icon_image(icon: &platform::windows_shell_icons::ShellIconRgba) -> Imag
 }
 
 fn status_text(tab: &TabSession, texts: Texts) -> String {
+    if let Some(progress) = tab.folder_sizes.progress()
+        && progress.completed < progress.total
+    {
+        return match texts.language {
+            Language::Chinese => format!(
+                "正在获取文件夹大小（已完成 {}/{}）",
+                progress.completed, progress.total
+            ),
+            Language::English => format!(
+                "Getting folder sizes ({}/{})",
+                progress.completed, progress.total
+            ),
+        };
+    }
     if tab.page_source == PageSource::Search {
         return match tab.search_total {
             Some(total) if total as usize > tab.entries.len() => match texts.language {
@@ -12022,34 +12271,48 @@ mod tests {
             modified: None,
         }]);
 
-        assert!(!apply_folder_size_event(
-            &mut app,
-            TabId(1),
-            RequestId(7),
-            EntryId(1),
-            Path::new(r"C:\old\same-id"),
-            FolderSizeState::Value(12),
-        ));
-        assert!(!apply_folder_size_event(
-            &mut app,
-            TabId(1),
-            RequestId(8),
-            EntryId(1),
-            Path::new(r"C:\old\same-id"),
-            FolderSizeState::Value(12),
-        ));
+        let queries = {
+            let tab = app
+                .active_window_state_mut()
+                .tabs
+                .get_mut(&TabId(1))
+                .unwrap();
+            tab.entries = Arc::new(vec![{
+                let mut entry = tab.entries[0].clone();
+                entry.folder_size = FolderSizeState::Unknown;
+                entry
+            }]);
+            with_folder_scheduler(tab, |scheduler, entries| {
+                scheduler.visible_queries(RequestId(8), entries, 0, 1)
+            })
+        };
+        let current = queries[0].clone();
+        assert!(start_folder_size_query(&mut app, TabId(1), &current));
+        let mut stale_request = current.clone();
+        stale_request.request_id = RequestId(7);
+        assert_eq!(
+            apply_folder_size_event(
+                &mut app,
+                TabId(1),
+                &stale_request,
+                FolderSizeState::Value(12),
+            ),
+            FolderSizeCommit::Ignored
+        );
+        let mut stale_path = current.clone();
+        stale_path.key.path = PathBuf::from(r"C:\old\same-id");
+        assert_eq!(
+            apply_folder_size_event(&mut app, TabId(1), &stale_path, FolderSizeState::Value(12)),
+            FolderSizeCommit::Ignored
+        );
         assert_eq!(
             app.active_window_state().tabs[&TabId(1)].entries[0].folder_size,
             FolderSizeState::Querying
         );
-        assert!(apply_folder_size_event(
-            &mut app,
-            TabId(1),
-            RequestId(8),
-            EntryId(1),
-            Path::new(r"C:\current\same-id"),
-            FolderSizeState::Value(0),
-        ));
+        assert_eq!(
+            apply_folder_size_event(&mut app, TabId(1), &current, FolderSizeState::Value(0)),
+            FolderSizeCommit::Visible(EntryId(1))
+        );
         assert_eq!(
             app.active_window_state().tabs[&TabId(1)].entries[0].folder_size,
             FolderSizeState::Value(0)

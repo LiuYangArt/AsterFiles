@@ -39,6 +39,7 @@ pub enum AgentScenario {
     TabCrossWindow,
     ExplorerPins,
     ShellThumbnail,
+    FolderSizeScheduler,
 }
 
 impl AgentScenario {
@@ -55,6 +56,7 @@ impl AgentScenario {
             Self::TabCrossWindow => "tab-cross-window",
             Self::ExplorerPins => "explorer-pins",
             Self::ShellThumbnail => "shell-thumbnail",
+            Self::FolderSizeScheduler => "folder-size-scheduler",
         }
     }
 
@@ -123,6 +125,7 @@ fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
         "tab-cross-window" => Ok(AgentScenario::TabCrossWindow),
         "explorer-pins" => Ok(AgentScenario::ExplorerPins),
         "shell-thumbnail" => Ok(AgentScenario::ShellThumbnail),
+        "folder-size-scheduler" => Ok(AgentScenario::FolderSizeScheduler),
         _ => Err(format!("unknown agent scenario: {value}")),
     }
 }
@@ -161,6 +164,10 @@ pub fn apply_scenario(session: &mut TabSession, scenario: AgentScenario) {
         }
         AgentScenario::ShellThumbnail => {
             session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\ShellThumbnail"));
+            session.load_state = LoadState::Complete;
+        }
+        AgentScenario::FolderSizeScheduler => {
+            session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\FolderSizes"));
             session.load_state = LoadState::Complete;
         }
         AgentScenario::FileOperationRunning
@@ -281,6 +288,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
             | AgentScenario::TabCrossWindow
             | AgentScenario::ExplorerPins
             | AgentScenario::ShellThumbnail
+            | AgentScenario::FolderSizeScheduler
     ) {
         return None;
     }
@@ -338,6 +346,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
         AgentScenario::TabCrossWindow => unreachable!(),
         AgentScenario::ExplorerPins => unreachable!(),
         AgentScenario::ShellThumbnail => unreachable!(),
+        AgentScenario::FolderSizeScheduler => unreachable!(),
         AgentScenario::PermissionDenied => unreachable!(),
     }
     manager.task(id).map(|task| match task.state {

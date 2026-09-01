@@ -117,6 +117,10 @@ def main() -> int:
             "cargo", "run", "--", "--agent-scenario", "shell-thumbnail",
             "--no-ui", "--agent-state-out", str(STATE_DIR / "thumbnails" / "shell-png.json"),
         ]),
+        ("agent-folder-size-scheduler", [
+            "cargo", "run", "--", "--agent-scenario", "folder-size-scheduler",
+            "--no-ui", "--agent-state-out", str(STATE_DIR / "folder-size" / "scheduler.json"),
+        ]),
         ("release", ["cargo", "build", "--release"])
         if release_requested
         else ("debug", ["cargo", "build"]),

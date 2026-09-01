@@ -748,6 +748,7 @@ export component AppWindow inherits Window {
     callback navigate-path(string);
     callback address-input-changed(string);
     callback request-search-position(float);
+    callback request-folder-size-range(float, float);
     callback begin-search();
     callback toggle-search-depth();
 
@@ -1291,6 +1292,7 @@ list := ListView {
                         }
                         changed width => { root.file-viewport-width = self.width; }
                         changed visible-height => { root.file-viewport-height = self.visible-height; }
+                        changed viewport-y => { if !root.search-results-mode { root.request-folder-size-range(self.viewport-y / 1px, self.visible-height / 1px); } }
                         for entry in root.files: Rectangle {
                             width: max(list.width, root.file-columns-width + 16px);
                             x: 0px;
@@ -1522,6 +1524,7 @@ accessible-label: entry.name;
                         }
                         changed width => { root.file-viewport-width = self.width; }
                         changed visible-height => { root.file-viewport-height = self.visible-height; }
+                        changed viewport-y => { if !root.search-results-mode { root.request-folder-size-range(self.viewport-y / 1px, self.visible-height / 1px); } }
                         for row in root.grid-rows: HorizontalLayout {
                             height: 148px;
                             spacing: 8px;
