@@ -881,34 +881,16 @@ export component AppWindow inherits Window {
     in-out property <bool> tab-dragging: false;
     private property <bool> tab-drag-pointer-active: false;
     in-out property <bool> suppress-tab-click: false;
-    private property <bool> external-tab-dragging: false;
-    private property <int> external-tab-insertion-index: -1;
     private property <int> tab-drag-source-index: -1;
-    in-out property <int> tab-drag-insertion-index: -1;
     private property <length> tab-drag-pointer-x: 0px;
     private property <length> tab-drag-pointer-y: 0px;
-    private property <length> tab-drag-grab-x: 0px;
-    private property <string> tab-drag-title: "";
-    private property <image> tab-drag-icon;
-    private property <bool> tab-drag-is-drive: false;
-    private property <bool> tab-drag-active: false;
     public function clear-tab-drag() {
         root.tab-dragging = false;
         root.tab-drag-pointer-active = false;
         root.tab-drag-source-index = -1;
-        root.tab-drag-insertion-index = -1;
-        root.tab-drag-title = "";
     }
     public function release-tab-drag-pointer() {
         root.tab-drag-pointer-active = false;
-    }
-    public function project-external-tab-drag(insertion-index: int) {
-        root.external-tab-dragging = true;
-        root.external-tab-insertion-index = insertion-index;
-    }
-    public function clear-external-tab-drag() {
-        root.external-tab-dragging = false;
-        root.external-tab-insertion-index = -1;
     }
     in property <int> active-tab-index: 0;
     changed active-tab-index => { root.reveal-tab(root.active-tab-index); }
@@ -1031,11 +1013,6 @@ export component AppWindow inherits Window {
                                     if event.button == PointerEventButton.left && event.kind == PointerEventKind.down && !tab.is-settings {
                                         root.tab-drag-pointer-active = true;
                                         root.tab-drag-source-index = index;
-                                        root.tab-drag-grab-x = self.mouse-x;
-                                        root.tab-drag-title = tab.title;
-                                        root.tab-drag-icon = tab.icon;
-                                        root.tab-drag-is-drive = tab.is-drive;
-                                        root.tab-drag-active = tab.active;
                                         root.begin-tab-drag(tab.id, index, ((8 + 34 + 5) * 1px + index * (root.tab-width + 5px) + tab-strip.viewport-x + self.mouse-x) / 1px, (12px + self.mouse-y) / 1px);
                                     }
                                     if (event.button == PointerEventButton.middle && event.kind == PointerEventKind.up && root.can-close-tab) {
@@ -1050,7 +1027,6 @@ export component AppWindow inherits Window {
                                         if insertion >= -1 {
                                             root.tab-dragging = true;
                                             root.suppress-tab-click = true;
-                                            root.tab-drag-insertion-index = insertion;
                                         }
                                     }
                                 }
@@ -1079,20 +1055,6 @@ export component AppWindow inherits Window {
                                 }
                             }
                             Tooltip { text: @markdown("\{tab.title}"); }
-                        }
-                        Rectangle {
-                            property <bool> external: root.external-tab-dragging && root.external-tab-insertion-index >= 0;
-                            property <bool> local: root.tab-dragging && root.tab-drag-insertion-index >= 0;
-                            property <int> visual-slot: self.external ? root.external-tab-insertion-index : root.tab-drag-insertion-index;
-                            visible: self.external || self.local;
-                            x: self.visual-slot <= 0
-                                ? 0px
-                                : min(parent.width - 5px, self.visual-slot * (root.tab-width + 5px) - 5px);
-                            y: 0px;
-                            width: 5px;
-                            height: 34px;
-                            border-radius: 2.5px;
-                            background: VisualStyle.c4f6bed;
                         }
                     }
                     }

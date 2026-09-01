@@ -727,18 +727,6 @@ fn project_native_insertion_indicator(target: Option<(WindowId, usize)>) {
 
 fn project_cross_window_drop(target: Option<(WindowId, usize)>) {
     project_native_insertion_indicator(target);
-    WINDOW_RUNTIMES.with_borrow(|runtimes| {
-        for (window_id, runtime) in runtimes {
-            if target.is_some_and(|(target_id, _)| target_id == *window_id) {
-                runtime
-                    .ui
-                    .invoke_project_external_tab_drag(target.expect("target exists").1 as i32);
-            } else {
-                runtime.ui.invoke_clear_external_tab_drag();
-            }
-            runtime.ui.window().request_redraw();
-        }
-    });
 }
 
 fn project_native_tab_target(
@@ -785,9 +773,7 @@ fn project_native_tab_target(
                             ui.get_tab_current_width(),
                         )
                     });
-                    ui.set_tab_drag_insertion_index(insertion.map_or(-1, |index| index as i32));
                     project_native_insertion_indicator(insertion.map(|index| (window_id, index)));
-                    ui.window().request_redraw();
                     None
                 } else {
                     cross_window_drop_target(source_window, screen_x, screen_y, state)
@@ -2656,7 +2642,6 @@ fn move_tab_into_existing_window(
     };
     restart_detached_tab(&outcome, senders, state);
     if let Some(destination) = window_ui(destination_window) {
-        destination.invoke_clear_external_tab_drag();
         refresh_window_ui(&destination, state, destination_window);
     }
     if outcome.source_window_closed {

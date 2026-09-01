@@ -2,12 +2,13 @@ use std::{cell::Cell, io, ptr};
 
 use windows_sys::Win32::{
     Foundation::HWND,
-    Graphics::Gdi::CreateSolidBrush,
+    Graphics::Gdi::{CreateSolidBrush, HBRUSH},
     UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, HWND_TOPMOST, LWA_ALPHA, RegisterClassW,
-        SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetWindowPos,
-        ShowWindow, WM_NCHITTEST, WNDCLASSW, WS_DISABLED, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_HWNDPARENT, HWND_TOP, IsWindow,
+        LWA_ALPHA, RegisterClassW, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+        SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_NCHITTEST,
+        WNDCLASSW, WS_DISABLED, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_EX_TRANSPARENT, WS_POPUP,
     },
 };
 
@@ -19,17 +20,28 @@ const ACCENT_COLORREF: u32 = 0x00ed_6b4f;
 
 thread_local! {
     static INDICATOR: Cell<HWND> = const { Cell::new(ptr::null_mut()) };
+    static INDICATOR_BRUSH: Cell<HBRUSH> = const { Cell::new(ptr::null_mut()) };
 }
 
 pub fn show(owner: isize, x: i32, y: i32, width: i32, height: i32) -> io::Result<()> {
     let hwnd = INDICATOR.with(|indicator| {
         let existing = indicator.get();
-        if !existing.is_null() {
+        if !existing.is_null() && unsafe { IsWindow(existing) } != 0 {
             return existing;
         }
+        indicator.set(ptr::null_mut());
         let class = WNDCLASSW {
             lpfnWndProc: Some(indicator_window_proc),
-            hbrBackground: unsafe { CreateSolidBrush(ACCENT_COLORREF) },
+            hbrBackground: INDICATOR_BRUSH.with(|brush| {
+                let existing = brush.get();
+                if !existing.is_null() {
+                    existing
+                } else {
+                    let created = unsafe { CreateSolidBrush(ACCENT_COLORREF) };
+                    brush.set(created);
+                    created
+                }
+            }),
             lpszClassName: CLASS_NAME.as_ptr(),
             ..Default::default()
         };
@@ -61,10 +73,11 @@ pub fn show(owner: isize, x: i32, y: i32, width: i32, height: i32) -> io::Result
     if hwnd.is_null() {
         return Err(io::Error::last_os_error());
     }
+    unsafe { SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner) };
     if unsafe {
         SetWindowPos(
             hwnd,
-            HWND_TOPMOST,
+            HWND_TOP,
             x,
             y,
             width.max(1),
