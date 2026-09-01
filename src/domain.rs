@@ -158,6 +158,13 @@ pub enum ViewMode {
     Grid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RectangleSelectionMode {
+    Replace,
+    Extend,
+    Toggle,
+}
+
 #[derive(Debug)]
 struct DirectorySnapshot {
     entries: Arc<Vec<FileEntry>>,
@@ -808,6 +815,47 @@ impl TabSession {
             self.selected.push(entry_id);
             self.selection_anchor = Some(entry_id);
         }
+    }
+
+    pub fn apply_rectangle_selection(
+        &mut self,
+        snapshot: &[EntryId],
+        hits: &HashSet<EntryId>,
+        mode: RectangleSelectionMode,
+    ) {
+        let visible_ids = self
+            .visible_entries()
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<HashSet<_>>();
+        let snapshot = snapshot
+            .iter()
+            .copied()
+            .filter(|id| visible_ids.contains(id))
+            .collect::<HashSet<_>>();
+        let hits = hits
+            .iter()
+            .copied()
+            .filter(|id| visible_ids.contains(id))
+            .collect::<HashSet<_>>();
+        self.selected = self
+            .visible_entries()
+            .iter()
+            .map(|entry| entry.id)
+            .filter(|id| match mode {
+                RectangleSelectionMode::Replace => hits.contains(id),
+                RectangleSelectionMode::Extend => snapshot.contains(id) || hits.contains(id),
+                RectangleSelectionMode::Toggle => snapshot.contains(id) ^ hits.contains(id),
+            })
+            .collect();
+        self.focused = self
+            .visible_entries()
+            .iter()
+            .rev()
+            .map(|entry| entry.id)
+            .find(|id| hits.contains(id))
+            .or_else(|| self.selected.last().copied());
+        self.selection_anchor = self.focused;
     }
 
     pub fn move_focus(&mut self, delta: isize, extend: bool) {
@@ -1573,6 +1621,25 @@ mod tests {
         assert!(!session.selected.contains(&EntryId(2)));
         session.move_focus(-1, false);
         assert_eq!(session.focused, Some(EntryId(1)));
+    }
+
+    #[test]
+    fn rectangle_selection_uses_the_starting_snapshot_for_each_modifier() {
+        let mut session = TabSession::new(TabId(1));
+        session.replace_entries(
+            (1..=4)
+                .map(|id| entry(id, &format!("{id}.txt"), EntryKind::File, Some(1)))
+                .collect(),
+        );
+        let snapshot = vec![EntryId(1), EntryId(3)];
+        let hits = HashSet::from([EntryId(2), EntryId(3)]);
+
+        session.apply_rectangle_selection(&snapshot, &hits, RectangleSelectionMode::Replace);
+        assert_eq!(session.selected, vec![EntryId(2), EntryId(3)]);
+        session.apply_rectangle_selection(&snapshot, &hits, RectangleSelectionMode::Extend);
+        assert_eq!(session.selected, vec![EntryId(1), EntryId(2), EntryId(3)]);
+        session.apply_rectangle_selection(&snapshot, &hits, RectangleSelectionMode::Toggle);
+        assert_eq!(session.selected, vec![EntryId(1), EntryId(2)]);
     }
 
     #[test]

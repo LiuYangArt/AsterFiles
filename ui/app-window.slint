@@ -21,6 +21,8 @@ export global VisualStyle {
     out property <color> c3b4f83: dark-theme ? #9db5ff : #3b4f83;
     out property <color> c4f535d: dark-theme ? #d0d0d0 : #4f535d;
     out property <color> c4f6bed: dark-theme ? #7fa0ff : #4f6bed;
+    out property <color> rectangle-selection-fill: dark-theme ? #197fa0ff : #194f6bed;
+    out property <color> rectangle-selection-border: dark-theme ? #997fa0ff : #994f6bed;
     out property <color> c62656f: dark-theme ? #c6c6c6 : #62656f;
     out property <color> c666a74: dark-theme ? #bcbcbc : #666a74;
     out property <color> c696b74: dark-theme ? #bdbdbd : #696b74;
@@ -624,6 +626,9 @@ export component AppWindow inherits Window {
     in property <[OperationRow]> operations;
     in-out property <length> file-viewport-y: 0px;
     out property <length> file-list-top: 0px;
+    out property <length> rectangle-viewport-top: 0px;
+    out property <length> file-viewport-width: 0px;
+    out property <length> file-viewport-height: 0px;
     in-out property <int> view-mode: 0;
     in-out property <bool> context-menu-open: false;
     in-out property <bool> drop-menu-open: false;
@@ -757,6 +762,26 @@ export component AppWindow inherits Window {
     callback navigate-breadcrumb(int);
     callback select-entry(int, bool, bool);
     callback clear-selection();
+    callback begin-rectangle-selection(float, float, bool, bool);
+    callback update-rectangle-selection(float, float);
+    callback end-rectangle-selection();
+    callback cancel-rectangle-selection();
+    public function show-rectangle-selection(x: float, y: float, width: float, height: float) {
+        root.rectangle-selection-x = x * 1px;
+        root.rectangle-selection-y = y * 1px;
+        root.rectangle-selection-width = width * 1px;
+        root.rectangle-selection-height = height * 1px;
+        root.rectangle-selection-visible = true;
+    }
+    public function clear-rectangle-selection() {
+        root.rectangle-selection-pointer-active = false;
+        root.rectangle-selection-visible = false;
+        root.rectangle-selection-width = 0px;
+        root.rectangle-selection-height = 0px;
+    }
+    public function ensure-visible-search-page(viewport-y: float) {
+        root.request-visible-search-page(viewport-y * 1px);
+    }
     callback select-all();
     callback move-focus(int, bool);
     callback focus-boundary(bool, bool);
@@ -814,6 +839,12 @@ export component AppWindow inherits Window {
     callback start-window-trace();
 
     private property <bool> compact: root.window-width < 1000px;
+    in-out property <bool> rectangle-selection-visible: false;
+    in-out property <bool> rectangle-selection-pointer-active: false;
+    private property <length> rectangle-selection-x: 0px;
+    private property <length> rectangle-selection-y: 0px;
+    private property <length> rectangle-selection-width: 0px;
+    private property <length> rectangle-selection-height: 0px;
     in-out property <length> file-viewport-x: 0px;
     in-out property <length> normal-name-width: 480px;
     in-out property <length> normal-kind-width: 160px;
@@ -950,7 +981,7 @@ export component AppWindow inherits Window {
         KeyBinding { keys: @keys(Shift + Home); enabled: !root.active-is-settings && !root.address-editing; activated => { root.focus-boundary(false, true); } }
         KeyBinding { keys: @keys(Shift + End); enabled: !root.active-is-settings && !root.address-editing; activated => { root.focus-boundary(true, true); } }
         KeyBinding { keys: @keys(Return); enabled: !root.active-is-settings && !root.address-editing; activated => { root.open-entry(-1); } }
-        KeyBinding { keys: @keys(Escape); enabled: !root.active-is-settings && !root.address-editing; activated => { root.clear-selection(); } }
+        KeyBinding { keys: @keys(Escape); enabled: !root.active-is-settings && !root.address-editing && !root.rectangle-selection-pointer-active; activated => { root.clear-selection(); } }
         KeyBinding { keys: @keys(Control + T); activated => { root.new-tab(); } }
         KeyBinding { keys: @keys(Control + W); enabled: root.can-close-tab; activated => { root.close-tab(-1); } }
         KeyBinding { keys: @keys(Control + C); enabled: !root.active-is-settings && !root.address-editing; activated => { root.copy-selection(false); } }
@@ -1214,6 +1245,22 @@ export component AppWindow inherits Window {
                     vertical-stretch: 1; background: VisualStyle.cffffff;
                     background-touch := TouchArea {
                         pointer-event(event) => {
+                            if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                                root.rectangle-selection-pointer-active = true;
+                                root.begin-rectangle-selection(
+                                    self.mouse-x / 1px,
+                                    self.mouse-y / 1px,
+                                    event.modifiers.control,
+                                    event.modifiers.shift
+                                );
+                            }
+                            if event.kind == PointerEventKind.move && self.pressed {
+                                root.update-rectangle-selection(self.mouse-x / 1px, self.mouse-y / 1px);
+                            }
+                            if event.kind == PointerEventKind.up && event.button == PointerEventButton.left {
+                                root.rectangle-selection-pointer-active = false;
+                                root.end-rectangle-selection();
+                            }
                             if event.kind == PointerEventKind.down && event.button == PointerEventButton.right {
                                 root.context-menu-anchor-x = self.absolute-position.x + self.mouse-x - root.absolute-position.x;
                                 root.context-menu-anchor-y = self.absolute-position.y + self.mouse-y - root.absolute-position.y;
@@ -1225,15 +1272,22 @@ export component AppWindow inherits Window {
                                 );
                             }
                         }
-                        clicked => { root.clear-selection(); }
                     }
 list := ListView {
                         visible: root.files.length > 0 && root.view-mode != 2;
+                        mouse-drag-pan-enabled: false;
                         width: parent.width - 28px;
                         viewport-width: self.width;
                         vertical-scrollbar-policy: ScrollBarPolicy.always-off;
                         viewport-y <=> root.file-viewport-y;
-                        init => { root.file-list-top = self.absolute-position.y - root.absolute-position.y; }
+                        init => {
+                            root.file-list-top = self.absolute-position.y - root.absolute-position.y;
+                            root.rectangle-viewport-top = self.absolute-position.y - content-area.absolute-position.y;
+                            root.file-viewport-width = self.width;
+                            root.file-viewport-height = self.visible-height;
+                        }
+                        changed width => { root.file-viewport-width = self.width; }
+                        changed visible-height => { root.file-viewport-height = self.visible-height; }
                         for entry in root.files: Rectangle {
                             width: max(list.width, root.file-columns-width + 16px);
                             x: 0px;
@@ -1450,10 +1504,18 @@ accessible-label: entry.name;
                     }
                     grid := ListView {
                         visible: root.files.length > 0 && root.view-mode == 2;
+                        mouse-drag-pan-enabled: false;
                         width: parent.width - 28px;
                         viewport-width: self.width;
                         vertical-scrollbar-policy: ScrollBarPolicy.always-off;
                         viewport-y <=> root.file-viewport-y;
+                        init => {
+                            root.rectangle-viewport-top = self.absolute-position.y - content-area.absolute-position.y;
+                            root.file-viewport-width = self.width;
+                            root.file-viewport-height = self.visible-height;
+                        }
+                        changed width => { root.file-viewport-width = self.width; }
+                        changed visible-height => { root.file-viewport-height = self.visible-height; }
                         for row in root.grid-rows: HorizontalLayout {
                             height: 148px;
                             spacing: 8px;
@@ -1474,10 +1536,55 @@ accessible-label: entry.name;
                                 card-touch := TouchArea {
                                     enabled: entry.loaded;
                                     mouse-cursor: pointer;
-                                    clicked => { root.activate-entry(entry.id, false, false); }
+                                    private property <bool> click-control: false;
+                                    private property <bool> click-shift: false;
+                                    pointer-event(event) => {
+                                        if event.kind == PointerEventKind.down {
+                                            self.click-control = event.modifiers.control;
+                                            self.click-shift = event.modifiers.shift;
+                                            if event.button == PointerEventButton.left || event.button == PointerEventButton.right {
+                                                root.internal-drag-pointer-active = true;
+                                                root.begin-internal-drag(
+                                                    entry.id,
+                                                    (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
+                                                    (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px,
+                                                    event.modifiers.control,
+                                                    event.modifiers.shift,
+                                                    event.button == PointerEventButton.right
+                                                );
+                                            }
+                                        }
+                                        if event.kind == PointerEventKind.move && self.pressed && root.internal-drag-pointer-active {
+                                            root.update-internal-drag(
+                                                (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
+                                                (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px
+                                            );
+                                        }
+                                        if event.kind == PointerEventKind.up && (event.button == PointerEventButton.left || event.button == PointerEventButton.right) && root.internal-drag-pointer-active {
+                                            root.internal-drag-pointer-active = false;
+                                            root.end-internal-drag(
+                                                (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
+                                                (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px,
+                                                event.modifiers.control,
+                                                event.modifiers.shift,
+                                                event.button == PointerEventButton.right
+                                            );
+                                        }
+                                    }
+                                    clicked => { root.activate-entry(entry.id, self.click-control, self.click-shift); }
                                 }
                             }
                         }
+                    }
+                    if root.rectangle-selection-visible: Rectangle {
+                        x: root.rectangle-selection-x;
+                        y: root.rectangle-selection-y;
+                        width: root.rectangle-selection-width;
+                        height: root.rectangle-selection-height;
+                        z: 90;
+                        background: VisualStyle.rectangle-selection-fill;
+                        border-color: VisualStyle.rectangle-selection-border;
+                        border-width: 1px;
                     }
                     LightScrollBar {
                         x: parent.width - self.width - 9px;

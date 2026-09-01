@@ -18,8 +18,8 @@ use crate::{
     agent_debug::{self, AgentScenario},
     domain::{
         AddressMode, EntryId, FileEntry, FolderSizeState, LoadState, NameHighlightSegment,
-        NavigationKind, PageSource, RequestId, SearchDepth, SearchScope, SearchState,
-        SortDirection, SortField, TabId, TabKind, TabSession, ViewMode,
+        NavigationKind, PageSource, RectangleSelectionMode, RequestId, SearchDepth, SearchScope,
+        SearchState, SortDirection, SortField, TabId, TabKind, TabSession, ViewMode,
         file_operations::{
             FileOperationKind, ItemState, OperationId, OperationItem, OperationManager,
             OperationResult, OperationState,
@@ -407,6 +407,7 @@ impl Deref for WindowSessions {
 struct WindowRuntime {
     ui: AppWindow,
     _native_drop_timer: slint::Timer,
+    _rectangle_selection_timer: slint::Timer,
 }
 
 thread_local! {
@@ -1822,6 +1823,94 @@ impl Model for SearchFileModel {
     }
 }
 
+struct SearchGridModel {
+    total: usize,
+    columns: usize,
+    rows: std::cell::RefCell<HashMap<usize, FileRow>>,
+    placeholder: FileRow,
+    notify: ModelNotify,
+}
+
+impl SearchGridModel {
+    fn new(total: usize, columns: usize, placeholder: FileRow) -> Self {
+        Self {
+            total,
+            columns: columns.max(1),
+            rows: std::cell::RefCell::new(HashMap::new()),
+            placeholder,
+            notify: ModelNotify::default(),
+        }
+    }
+
+    fn update_rows(&self, rows: impl IntoIterator<Item = FileRow>) {
+        for row in rows {
+            self.update_row(row);
+        }
+    }
+
+    fn update_row(&self, row: FileRow) -> bool {
+        let Some(target) = row.id.checked_sub(1).map(|id| id as usize) else {
+            return false;
+        };
+        if target >= self.total {
+            return false;
+        }
+        self.rows.borrow_mut().insert(target, row);
+        self.notify.row_changed(target / self.columns);
+        true
+    }
+
+    fn clear_page(&self, offset: usize, count: usize) {
+        let end = offset.saturating_add(count).min(self.total);
+        let mut rows = self.rows.borrow_mut();
+        for target in offset..end {
+            rows.remove(&target);
+        }
+        drop(rows);
+        let start_row = offset / self.columns;
+        let end_row = end.saturating_sub(1) / self.columns;
+        for row in start_row..=end_row {
+            self.notify.row_changed(row);
+        }
+    }
+}
+
+impl Model for SearchGridModel {
+    type Data = GridRow;
+
+    fn row_count(&self) -> usize {
+        self.total.div_ceil(self.columns)
+    }
+
+    fn row_data(&self, row: usize) -> Option<Self::Data> {
+        (row < self.row_count()).then(|| {
+            let slots = self.rows.borrow();
+            let start = row * self.columns;
+            let end = (start + self.columns).min(self.total);
+            GridRow {
+                entries: ModelRc::new(VecModel::from(
+                    (start..end)
+                        .map(|slot| {
+                            slots
+                                .get(&slot)
+                                .cloned()
+                                .unwrap_or_else(|| self.placeholder.clone())
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+            }
+        })
+    }
+
+    fn model_tracker(&self) -> &dyn ModelTracker {
+        &self.notify
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 #[derive(Debug)]
 enum EverythingRequest {
     Search {
@@ -2147,6 +2236,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         request_sender.clone(),
         scoped_state.clone(),
     );
+    let rectangle_selection_timer = wire_rectangle_selection(&ui, scoped_state.clone());
     wire_mouse_navigation(
         &ui,
         ConfirmationWindows::new(&delete_ui, &conflict_ui, &exit_ui),
@@ -2248,6 +2338,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             WindowRuntime {
                 ui: ui.clone_strong(),
                 _native_drop_timer: drag_drop_target_timer,
+                _rectangle_selection_timer: rectangle_selection_timer,
             },
         );
     });
@@ -2505,6 +2596,7 @@ fn install_app_window_at(
         senders.directory.clone(),
         scoped.clone(),
     );
+    let rectangle_selection_timer = wire_rectangle_selection(&ui, scoped.clone());
     wire_mouse_navigation(
         &ui,
         ConfirmationWindows::new(delete_ui, conflict_ui, exit_ui),
@@ -2525,6 +2617,7 @@ fn install_app_window_at(
             WindowRuntime {
                 ui,
                 _native_drop_timer: native_drop_timer,
+                _rectangle_selection_timer: rectangle_selection_timer,
             },
         );
     });
@@ -3333,6 +3426,438 @@ fn wire_internal_drag_drop(
             );
         }
     });
+}
+
+const RECTANGLE_SELECTION_THRESHOLD: f32 = 5.0;
+const RECTANGLE_SELECTION_EDGE: f32 = 20.0;
+const RECTANGLE_SELECTION_MAX_SCROLL: f32 = 40.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SelectionRect {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
+impl SelectionRect {
+    fn from_points(start_x: f32, start_y: f32, end_x: f32, end_y: f32) -> Self {
+        Self {
+            left: start_x.min(end_x),
+            top: start_y.min(end_y),
+            right: start_x.max(end_x),
+            bottom: start_y.max(end_y),
+        }
+    }
+
+    fn intersects(self, other: Self) -> bool {
+        self.left <= other.right
+            && self.right >= other.left
+            && self.top <= other.bottom
+            && self.bottom >= other.top
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilePointerOwner {
+    BackgroundSelection,
+    EntryDrag,
+}
+
+#[derive(Debug)]
+struct RectangleSelectionGesture {
+    tab_id: TabId,
+    request_id: RequestId,
+    start_x: f32,
+    start_content_y: f32,
+    pointer_x: f32,
+    pointer_y: f32,
+    snapshot: Vec<EntryId>,
+    focused: Option<EntryId>,
+    anchor: Option<EntryId>,
+    mode: RectangleSelectionMode,
+    active: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn file_pointer_owner(started_on_entry: bool) -> FilePointerOwner {
+    if started_on_entry {
+        FilePointerOwner::EntryDrag
+    } else {
+        FilePointerOwner::BackgroundSelection
+    }
+}
+
+fn rectangle_selection_started(start_x: f32, start_y: f32, x: f32, y: f32) -> bool {
+    (x - start_x).hypot(y - start_y) >= RECTANGLE_SELECTION_THRESHOLD
+}
+
+fn rectangle_selection_scroll_delta(pointer_y: f32, top: f32, bottom: f32) -> f32 {
+    if pointer_y < top + RECTANGLE_SELECTION_EDGE {
+        (top + RECTANGLE_SELECTION_EDGE - pointer_y).min(RECTANGLE_SELECTION_MAX_SCROLL)
+    } else if pointer_y > bottom - RECTANGLE_SELECTION_EDGE {
+        -(pointer_y - (bottom - RECTANGLE_SELECTION_EDGE)).min(RECTANGLE_SELECTION_MAX_SCROLL)
+    } else {
+        0.0
+    }
+}
+
+fn rectangle_selection_scroll_maximum(
+    item_count: usize,
+    view_mode: ViewMode,
+    grid_columns: usize,
+    visible_height: f32,
+) -> f32 {
+    let content_height = match view_mode {
+        ViewMode::Details => item_count as f32 * 40.0,
+        ViewMode::List => item_count as f32 * 34.0,
+        ViewMode::Grid => item_count.div_ceil(grid_columns.max(1)) as f32 * 148.0,
+    };
+    (content_height - visible_height).max(0.0)
+}
+
+fn rectangle_selection_hits(
+    tab: &TabSession,
+    view_mode: ViewMode,
+    grid_columns: usize,
+    viewport_width: f32,
+    rect: SelectionRect,
+) -> HashSet<EntryId> {
+    let (row_height, card_width, card_height, gap) = match view_mode {
+        ViewMode::Details => (40.0, 0.0, 0.0, 0.0),
+        ViewMode::List => (34.0, 0.0, 0.0, 0.0),
+        ViewMode::Grid => (148.0, 140.0, 140.0, 8.0),
+    };
+    tab.visible_entries()
+        .iter()
+        .enumerate()
+        .filter_map(|(loaded_index, entry)| {
+            let index = if tab.page_source == PageSource::Search {
+                entry.id.0.saturating_sub(1) as usize
+            } else {
+                loaded_index
+            };
+            let item = match view_mode {
+                ViewMode::Details | ViewMode::List => SelectionRect {
+                    left: 0.0,
+                    top: index as f32 * row_height,
+                    right: viewport_width,
+                    bottom: (index + 1) as f32 * row_height,
+                },
+                ViewMode::Grid => {
+                    let columns = grid_columns.max(1);
+                    let column = index % columns;
+                    let row = index / columns;
+                    let left = column as f32 * (card_width + gap);
+                    let top = row as f32 * row_height;
+                    SelectionRect {
+                        left,
+                        top,
+                        right: left + card_width,
+                        bottom: top + card_height,
+                    }
+                }
+            };
+            rect.intersects(item).then_some(entry.id)
+        })
+        .collect()
+}
+
+fn selection_mode(control: bool, shift: bool) -> RectangleSelectionMode {
+    if control {
+        RectangleSelectionMode::Toggle
+    } else if shift {
+        RectangleSelectionMode::Extend
+    } else {
+        RectangleSelectionMode::Replace
+    }
+}
+
+fn finish_rectangle_selection(
+    ui: &AppWindow,
+    gesture: &Arc<Mutex<Option<RectangleSelectionGesture>>>,
+) -> bool {
+    let cancelled = gesture
+        .lock()
+        .is_ok_and(|mut gesture| gesture.take().is_some());
+    if cancelled || ui.get_rectangle_selection_visible() {
+        ui.invoke_clear_rectangle_selection();
+    }
+    cancelled
+}
+
+fn restore_rectangle_selection_snapshot(
+    tab: &mut TabSession,
+    snapshot: &[EntryId],
+    focused: Option<EntryId>,
+    anchor: Option<EntryId>,
+) {
+    tab.apply_rectangle_selection(
+        &[],
+        &snapshot.iter().copied().collect(),
+        RectangleSelectionMode::Replace,
+    );
+    tab.focused = focused.filter(|id| tab.visible_entry(*id).is_some());
+    tab.selection_anchor = anchor.filter(|id| tab.visible_entry(*id).is_some());
+}
+
+fn cancel_rectangle_selection(
+    ui: &AppWindow,
+    state: &WindowSessions,
+    gesture: &Arc<Mutex<Option<RectangleSelectionGesture>>>,
+) -> bool {
+    let snapshot = gesture.lock().ok().and_then(|gesture| {
+        gesture.as_ref().map(|gesture| {
+            (
+                gesture.tab_id,
+                gesture.request_id,
+                gesture.snapshot.clone(),
+                gesture.focused,
+                gesture.anchor,
+            )
+        })
+    });
+    let Some((tab_id, request_id, snapshot, focused, anchor)) = snapshot else {
+        return finish_rectangle_selection(ui, gesture);
+    };
+    let update = {
+        let Ok(mut app) = state.lock() else {
+            return finish_rectangle_selection(ui, gesture);
+        };
+        if app.active_window_state().active_tab != tab_id {
+            None
+        } else {
+            let tab = app.active_window_state_mut().tabs.get_mut(&tab_id).unwrap();
+            if tab.latest_request != request_id {
+                None
+            } else {
+                let before = selection_projection_ids(tab);
+                restore_rectangle_selection_snapshot(tab, &snapshot, focused, anchor);
+                let mut changed = before;
+                changed.extend(selection_projection_ids(tab));
+                Some((tab_id, changed))
+            }
+        }
+    };
+    if let Some((tab_id, changed)) = update {
+        update_file_rows(ui, state, tab_id, &changed);
+        update_selection_summary(ui, state);
+    }
+    finish_rectangle_selection(ui, gesture)
+}
+
+fn update_rectangle_selection(
+    ui: &AppWindow,
+    state: &WindowSessions,
+    gesture: &Arc<Mutex<Option<RectangleSelectionGesture>>>,
+) -> bool {
+    let (tab_id, request_id, snapshot, mode, start_x, start_content_y, pointer_x, pointer_y) = {
+        let Ok(mut gesture) = gesture.lock() else {
+            return false;
+        };
+        let Some(gesture) = gesture.as_mut() else {
+            return false;
+        };
+        if !gesture.active
+            && !rectangle_selection_started(
+                gesture.start_x,
+                gesture.start_content_y + ui.get_file_viewport_y(),
+                gesture.pointer_x,
+                gesture.pointer_y,
+            )
+        {
+            return false;
+        }
+        gesture.active = true;
+        (
+            gesture.tab_id,
+            gesture.request_id,
+            gesture.snapshot.clone(),
+            gesture.mode,
+            gesture.start_x,
+            gesture.start_content_y,
+            gesture.pointer_x,
+            gesture.pointer_y,
+        )
+    };
+    let identity_is_current = state.lock().is_ok_and(|app| {
+        app.active_window_state().active_tab == tab_id && app.active().latest_request == request_id
+    });
+    if !identity_is_current {
+        finish_rectangle_selection(ui, gesture);
+        return false;
+    }
+    let current_content_y = pointer_y - ui.get_file_viewport_y();
+    let rect = SelectionRect::from_points(start_x, start_content_y, pointer_x, current_content_y);
+    let viewport_top = ui.get_rectangle_viewport_top();
+    let viewport_bottom = viewport_top + ui.get_file_viewport_height();
+    let visual_top = (rect.top + ui.get_file_viewport_y()).max(viewport_top);
+    let visual_bottom = (rect.bottom + ui.get_file_viewport_y()).min(viewport_bottom);
+    ui.invoke_show_rectangle_selection(
+        rect.left.max(0.0),
+        visual_top,
+        (rect.right.min(ui.get_file_viewport_width()) - rect.left.max(0.0)).max(0.0),
+        (visual_bottom - visual_top).max(0.0),
+    );
+    let update = {
+        let Ok(mut app) = state.lock() else {
+            return false;
+        };
+        if app.active_window_state().active_tab != tab_id {
+            return false;
+        }
+        let view_mode = app
+            .active()
+            .visible_path()
+            .and_then(|path| app.directory_view_modes.get(path))
+            .copied()
+            .unwrap_or(ViewMode::Details);
+        let grid_columns = ui.get_grid_column_count().max(1) as usize;
+        let viewport_width = ui.get_file_viewport_width();
+        let tab = app.active_window_state_mut().tabs.get_mut(&tab_id).unwrap();
+        if tab.latest_request != request_id {
+            return false;
+        }
+        let before = selection_projection_ids(tab);
+        let hits = rectangle_selection_hits(tab, view_mode, grid_columns, viewport_width, rect);
+        tab.apply_rectangle_selection(&snapshot, &hits, mode);
+        let mut changed = before;
+        changed.extend(selection_projection_ids(tab));
+        (tab_id, changed)
+    };
+    update_file_rows(ui, state, update.0, &update.1);
+    update_selection_summary(ui, state);
+    true
+}
+
+fn wire_rectangle_selection(ui: &AppWindow, state: WindowSessions) -> slint::Timer {
+    let gesture = Arc::new(Mutex::new(None::<RectangleSelectionGesture>));
+    let gesture_for_begin = gesture.clone();
+    let state_for_begin = state.clone();
+    let weak_for_begin = ui.as_weak();
+    ui.on_begin_rectangle_selection(move |x, y, control, shift| {
+        let Some(ui) = weak_for_begin.upgrade() else {
+            return;
+        };
+        let Ok(app) = state_for_begin.lock() else {
+            return;
+        };
+        let tab = app.active();
+        if tab.kind != TabKind::Files {
+            return;
+        }
+        if let Ok(mut gesture) = gesture_for_begin.lock() {
+            *gesture = Some(RectangleSelectionGesture {
+                tab_id: tab.id,
+                request_id: tab.latest_request,
+                start_x: x,
+                start_content_y: y - ui.get_file_viewport_y(),
+                pointer_x: x,
+                pointer_y: y,
+                snapshot: tab.selected.clone(),
+                focused: tab.focused,
+                anchor: tab.selection_anchor,
+                mode: selection_mode(control, shift),
+                active: false,
+            });
+        }
+    });
+
+    let gesture_for_update = gesture.clone();
+    let state_for_update = state.clone();
+    let weak_for_update = ui.as_weak();
+    ui.on_update_rectangle_selection(move |x, y| {
+        let Some(ui) = weak_for_update.upgrade() else {
+            return;
+        };
+        if let Ok(mut gesture) = gesture_for_update.lock()
+            && let Some(gesture) = gesture.as_mut()
+        {
+            gesture.pointer_x = x;
+            gesture.pointer_y = y;
+        }
+        update_rectangle_selection(&ui, &state_for_update, &gesture_for_update);
+    });
+
+    let gesture_for_end = gesture.clone();
+    let state_for_end = state.clone();
+    let weak_for_end = ui.as_weak();
+    ui.on_end_rectangle_selection(move || {
+        let Some(ui) = weak_for_end.upgrade() else {
+            return;
+        };
+        let active = gesture_for_end
+            .lock()
+            .ok()
+            .and_then(|gesture| gesture.as_ref().map(|gesture| gesture.active))
+            .unwrap_or(false);
+        if active {
+            update_rectangle_selection(&ui, &state_for_end, &gesture_for_end);
+        } else {
+            let update = mutate_active_selection(&state_for_end, TabSession::clear_selection);
+            if let Some((tab_id, changed)) = update {
+                update_file_rows(&ui, &state_for_end, tab_id, &changed);
+                update_selection_summary(&ui, &state_for_end);
+            }
+        }
+        finish_rectangle_selection(&ui, &gesture_for_end);
+    });
+
+    let gesture_for_cancel = gesture.clone();
+    let state_for_cancel = state.clone();
+    let weak_for_cancel = ui.as_weak();
+    ui.on_cancel_rectangle_selection(move || {
+        if let Some(ui) = weak_for_cancel.upgrade() {
+            cancel_rectangle_selection(&ui, &state_for_cancel, &gesture_for_cancel);
+        }
+    });
+
+    let timer = slint::Timer::default();
+    let gesture_for_timer = gesture.clone();
+    let state_for_timer = state.clone();
+    let weak_for_timer = ui.as_weak();
+    timer.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(16),
+        move || {
+            let Some(ui) = weak_for_timer.upgrade() else {
+                return;
+            };
+            let pointer_y = gesture_for_timer.lock().ok().and_then(|gesture| {
+                gesture
+                    .as_ref()
+                    .filter(|gesture| gesture.active)
+                    .map(|gesture| gesture.pointer_y)
+            });
+            let Some(pointer_y) = pointer_y else {
+                return;
+            };
+            let top = ui.get_rectangle_viewport_top();
+            let bottom = top + ui.get_file_viewport_height();
+            let delta = rectangle_selection_scroll_delta(pointer_y, top, bottom);
+            if delta == 0.0 {
+                return;
+            }
+            let maximum = rectangle_selection_scroll_maximum(
+                ui.get_files().row_count(),
+                match ui.get_view_mode() {
+                    1 => ViewMode::List,
+                    2 => ViewMode::Grid,
+                    _ => ViewMode::Details,
+                },
+                ui.get_grid_column_count().max(1) as usize,
+                ui.get_file_viewport_height(),
+            );
+            let viewport = (ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0);
+            if viewport != ui.get_file_viewport_y() {
+                ui.set_file_viewport_y(viewport);
+                ui.invoke_ensure_visible_search_page(viewport);
+                update_rectangle_selection(&ui, &state_for_timer, &gesture_for_timer);
+            }
+        },
+    );
+    timer
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4785,6 +5310,9 @@ fn wire_mouse_navigation(
                 platform::windows::release_pointer_capture();
             }
             if let Some(ui) = weak.upgrade() {
+                if ui.get_rectangle_selection_pointer_active() {
+                    ui.invoke_cancel_rectangle_selection();
+                }
                 ui.set_context_menu_open(false);
                 ui.set_drop_menu_open(false);
                 if state
@@ -4832,6 +5360,10 @@ fn wire_mouse_navigation(
                     && matches!(event.logical_key, Key::Named(NamedKey::Escape))
         ) {
             let mut cancelled = false;
+            if ui.get_rectangle_selection_pointer_active() {
+                ui.invoke_cancel_rectangle_selection();
+                cancelled = true;
+            }
             if ui.get_drop_menu_open() {
                 ui.set_drop_menu_open(false);
                 if let Ok(mut app) = state.lock() {
@@ -8207,6 +8739,33 @@ fn project_search_page(
         model.update_page(offset as usize, rows);
         ui.set_files(ModelRc::new(model));
     }
+    let columns = ui.get_grid_column_count().max(1) as usize;
+    let grid_model = ui.get_grid_rows();
+    if let Some(grid_model) = grid_model.as_any().downcast_ref::<SearchGridModel>()
+        && grid_model.total == total as usize
+        && grid_model.columns == columns
+    {
+        for offset in evicted {
+            grid_model.clear_page(*offset as usize, SEARCH_PAGE_LIMIT as usize);
+        }
+        grid_model.update_rows(
+            tab.entries
+                .iter()
+                .filter(|entry| {
+                    (offset.saturating_add(1)..=offset.saturating_add(SEARCH_PAGE_LIMIT))
+                        .contains(&entry.id.0)
+                })
+                .map(|entry| file_row(entry, tab, Texts::new(app.language), &app)),
+        );
+    } else {
+        let grid_model = SearchGridModel::new(total as usize, columns, empty_file_row());
+        grid_model.update_rows(
+            tab.entries
+                .iter()
+                .map(|entry| file_row(entry, tab, Texts::new(app.language), &app)),
+        );
+        ui.set_grid_rows(ModelRc::new(grid_model));
+    }
     ui.set_status_text(status_text(tab, Texts::new(app.language)).into());
     ui.set_page_state(if total == 0 { 3 } else { 4 });
 }
@@ -9040,6 +9599,9 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
     if ui.get_projected_file_tab_id() != projected_tab_id
         || ui.get_projected_file_request_id() != projected_request_id
     {
+        if ui.get_rectangle_selection_pointer_active() {
+            ui.invoke_cancel_rectangle_selection();
+        }
         ui.set_file_viewport_y(0.0);
         ui.set_projected_file_tab_id(projected_tab_id);
         ui.set_projected_file_request_id(projected_request_id);
@@ -9047,13 +9609,20 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
     if tab.page_source == PageSource::Search {
         let total = tab.search_total.unwrap_or(tab.entries.len() as u32) as usize;
         let model = SearchFileModel::new(total, empty_file_row());
-        model.update_rows(file_rows);
+        model.update_rows(file_rows.clone());
         ui.set_files(ModelRc::new(model));
     } else {
-        ui.set_files(ModelRc::new(VecModel::from(file_rows)));
+        ui.set_files(ModelRc::new(VecModel::from(file_rows.clone())));
     }
     ui.set_grid_column_count(grid_columns as i32);
-    ui.set_grid_rows(ModelRc::new(VecModel::from(grid_rows)));
+    if tab.page_source == PageSource::Search {
+        let total = tab.search_total.unwrap_or(tab.entries.len() as u32) as usize;
+        let model = SearchGridModel::new(total, grid_columns, empty_file_row());
+        model.update_rows(file_rows);
+        ui.set_grid_rows(ModelRc::new(model));
+    } else {
+        ui.set_grid_rows(ModelRc::new(VecModel::from(grid_rows)));
+    }
     ui.set_window_width(ui.window().size().width as f32 / ui.window().scale_factor());
     let visible_path = tab.visible_path().map(display_path).unwrap_or_default();
     let address_input = if tab.address_editing {
@@ -9765,6 +10334,25 @@ mod tests {
         assert_eq!(updated.id, 3);
         assert!(!model.update_row(test_file_row(0, true, true)));
         assert!(!model.update_row(test_file_row(9, true, true)));
+    }
+    #[test]
+    fn search_grid_model_is_sparse_and_projects_loaded_slots_by_identity() {
+        use slint::Model;
+
+        let model = SearchGridModel::new(1_000_000, 4, empty_file_row());
+        assert_eq!(model.row_count(), 250_000);
+        assert_eq!(model.rows.borrow().len(), 0);
+        assert!(model.update_row(test_file_row(257, true, true)));
+        assert_eq!(model.rows.borrow().len(), 1);
+        let row = model.row_data(64).unwrap();
+        let entries = row
+            .entries
+            .as_any()
+            .downcast_ref::<VecModel<FileRow>>()
+            .unwrap();
+        assert_eq!(entries.row_data(0).unwrap().id, 257);
+        assert!(entries.row_data(0).unwrap().selected);
+        assert!(!entries.row_data(1).unwrap().loaded);
     }
     #[test]
     fn tab_drop_routes_physical_screen_cursor_at_each_dpi() {
@@ -11479,6 +12067,162 @@ mod tests {
         assert!(!should_release_internal_pointer_grab(3.9, false));
         assert!(should_release_internal_pointer_grab(4.0, false));
         assert!(!should_release_internal_pointer_grab(8.0, true));
+    }
+
+    #[test]
+    fn rectangle_selection_threshold_and_pointer_owner_split_gestures() {
+        assert!(!rectangle_selection_started(10.0, 10.0, 13.0, 13.0));
+        assert!(rectangle_selection_started(10.0, 10.0, 13.0, 14.0));
+        assert_eq!(
+            file_pointer_owner(false),
+            FilePointerOwner::BackgroundSelection
+        );
+        assert_eq!(file_pointer_owner(true), FilePointerOwner::EntryDrag);
+    }
+
+    #[test]
+    fn cancelling_rectangle_selection_restores_the_starting_snapshot() {
+        let mut tab = TabSession::new(TabId(1));
+        tab.replace_entries(
+            (1..=3)
+                .map(|id| focus_entry(id, &format!(r"C:\test\{id}.txt")))
+                .collect(),
+        );
+        let snapshot = vec![EntryId(1)];
+        tab.apply_rectangle_selection(
+            &snapshot,
+            &HashSet::from([EntryId(2)]),
+            RectangleSelectionMode::Replace,
+        );
+        assert_eq!(tab.selected, vec![EntryId(2)]);
+
+        restore_rectangle_selection_snapshot(
+            &mut tab,
+            &snapshot,
+            Some(EntryId(1)),
+            Some(EntryId(1)),
+        );
+
+        assert_eq!(tab.selected, snapshot);
+        assert_eq!(tab.focused, Some(EntryId(1)));
+        assert_eq!(tab.selection_anchor, Some(EntryId(1)));
+    }
+
+    #[test]
+    fn rectangle_selection_intersects_in_all_directions() {
+        let item = SelectionRect {
+            left: 20.0,
+            top: 20.0,
+            right: 40.0,
+            bottom: 40.0,
+        };
+        for rect in [
+            SelectionRect::from_points(0.0, 0.0, 25.0, 25.0),
+            SelectionRect::from_points(25.0, 0.0, 0.0, 25.0),
+            SelectionRect::from_points(0.0, 25.0, 25.0, 0.0),
+            SelectionRect::from_points(25.0, 25.0, 0.0, 0.0),
+        ] {
+            assert!(rect.intersects(item));
+        }
+        assert!(!SelectionRect::from_points(0.0, 0.0, 19.0, 19.0).intersects(item));
+    }
+
+    #[test]
+    fn rectangle_selection_hits_detail_list_and_grid_geometry() {
+        let mut tab = TabSession::new(TabId(1));
+        tab.replace_entries(
+            (1..=6)
+                .map(|id| focus_entry(id, &format!(r"C:\test\{id}.txt")))
+                .collect(),
+        );
+        assert_eq!(
+            rectangle_selection_hits(
+                &tab,
+                ViewMode::Details,
+                1,
+                600.0,
+                SelectionRect::from_points(0.0, 39.0, 20.0, 41.0),
+            ),
+            HashSet::from([EntryId(1), EntryId(2)])
+        );
+        assert_eq!(
+            rectangle_selection_hits(
+                &tab,
+                ViewMode::List,
+                1,
+                600.0,
+                SelectionRect::from_points(0.0, 35.0, 20.0, 67.0),
+            ),
+            HashSet::from([EntryId(2)])
+        );
+        assert_eq!(
+            rectangle_selection_hits(
+                &tab,
+                ViewMode::Grid,
+                3,
+                600.0,
+                SelectionRect::from_points(145.0, 145.0, 155.0, 155.0),
+            ),
+            HashSet::from([EntryId(5)])
+        );
+    }
+
+    #[test]
+    fn rectangle_selection_search_geometry_uses_sparse_result_identity() {
+        let mut tab = TabSession::new(TabId(1));
+        tab.begin_search(SearchScope::Global, ".txt".into());
+        tab.merge_search_page(
+            256,
+            vec![focus_entry(257, r"C:\test\257.txt")],
+            1_000,
+            1_000,
+            256,
+        );
+        assert_eq!(
+            rectangle_selection_hits(
+                &tab,
+                ViewMode::Details,
+                1,
+                600.0,
+                SelectionRect::from_points(0.0, 256.0 * 40.0, 20.0, 257.0 * 40.0),
+            ),
+            HashSet::from([EntryId(257)])
+        );
+        assert!(
+            rectangle_selection_hits(
+                &tab,
+                ViewMode::Details,
+                1,
+                600.0,
+                SelectionRect::from_points(0.0, 0.0, 20.0, 40.0),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn rectangle_selection_auto_scroll_uses_edge_distance_and_clamps_speed() {
+        assert_eq!(rectangle_selection_scroll_delta(110.0, 100.0, 500.0), 10.0);
+        assert_eq!(rectangle_selection_scroll_delta(490.0, 100.0, 500.0), -10.0);
+        assert_eq!(rectangle_selection_scroll_delta(0.0, 100.0, 500.0), 40.0);
+        assert_eq!(rectangle_selection_scroll_delta(600.0, 100.0, 500.0), -40.0);
+        assert_eq!(rectangle_selection_scroll_delta(250.0, 100.0, 500.0), 0.0);
+        assert_eq!(
+            rectangle_selection_scroll_maximum(100, ViewMode::Details, 1, 400.0),
+            3_600.0
+        );
+        assert_eq!(
+            rectangle_selection_scroll_maximum(100, ViewMode::List, 1, 400.0),
+            3_000.0
+        );
+        assert_eq!(
+            rectangle_selection_scroll_maximum(10, ViewMode::Grid, 3, 400.0),
+            192.0
+        );
+        assert_eq!(
+            rectangle_selection_scroll_maximum(2, ViewMode::Grid, 3, 400.0),
+            0.0
+        );
     }
 
     #[test]
