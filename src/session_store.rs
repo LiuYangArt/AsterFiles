@@ -45,8 +45,6 @@ pub type SearchColumnOrder = [u8; 4];
 pub type ColumnWidths = [u32; 4];
 pub type SearchColumnWidths = [u32; 4];
 pub const DEFAULT_COLUMN_ORDER: ColumnOrder = [0, 1, 2, 3];
-#[allow(dead_code)]
-pub const DEFAULT_SEARCH_COLUMN_ORDER: SearchColumnOrder = [0, 1, 2, 3];
 pub const DEFAULT_COLUMN_WIDTHS: ColumnWidths = [480, 160, 120, 200];
 pub const DEFAULT_SEARCH_COLUMN_WIDTHS: SearchColumnWidths = [400, 320, 120, 200];
 const MIN_COLUMN_WIDTH: u32 = 64;
@@ -95,81 +93,6 @@ impl SessionState {
         tab_paths: Vec<PathBuf>,
         column_order: ColumnOrder,
     ) -> io::Result<Self> {
-        Self::with_settings(
-            window,
-            active_tab,
-            tab_paths,
-            column_order,
-            ThemeMode::System,
-            Language::Chinese,
-        )
-    }
-
-    #[allow(dead_code)]
-    pub fn with_settings(
-        window: WindowPlacement,
-        active_tab: usize,
-        tab_paths: Vec<PathBuf>,
-        column_order: ColumnOrder,
-        theme_mode: ThemeMode,
-        language: Language,
-    ) -> io::Result<Self> {
-        Self::with_everything_settings(
-            window,
-            active_tab,
-            tab_paths,
-            column_order,
-            DEFAULT_SEARCH_COLUMN_ORDER,
-            DEFAULT_COLUMN_WIDTHS,
-            DEFAULT_SEARCH_COLUMN_WIDTHS,
-            theme_mode,
-            language,
-            EverythingConfig::default(),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_everything_settings(
-        window: WindowPlacement,
-        active_tab: usize,
-        tab_paths: Vec<PathBuf>,
-        column_order: ColumnOrder,
-        search_column_order: SearchColumnOrder,
-        column_widths: ColumnWidths,
-        search_column_widths: SearchColumnWidths,
-        theme_mode: ThemeMode,
-        language: Language,
-        everything: EverythingConfig,
-    ) -> io::Result<Self> {
-        Self::with_file_visibility_settings(
-            window,
-            active_tab,
-            tab_paths,
-            column_order,
-            search_column_order,
-            column_widths,
-            search_column_widths,
-            theme_mode,
-            language,
-            everything,
-            FileVisibility::default(),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_file_visibility_settings(
-        window: WindowPlacement,
-        active_tab: usize,
-        tab_paths: Vec<PathBuf>,
-        column_order: ColumnOrder,
-        search_column_order: SearchColumnOrder,
-        column_widths: ColumnWidths,
-        search_column_widths: SearchColumnWidths,
-        theme_mode: ThemeMode,
-        language: Language,
-        everything: EverythingConfig,
-        file_visibility: FileVisibility,
-    ) -> io::Result<Self> {
         Self::with_windows_and_settings(
             vec![WindowSessionState {
                 placement: window,
@@ -177,13 +100,13 @@ impl SessionState {
                 tab_paths,
             }],
             column_order,
-            search_column_order,
-            column_widths,
-            search_column_widths,
-            theme_mode,
-            language,
-            everything,
-            file_visibility,
+            [0, 1, 2, 3],
+            DEFAULT_COLUMN_WIDTHS,
+            DEFAULT_SEARCH_COLUMN_WIDTHS,
+            ThemeMode::System,
+            Language::Chinese,
+            EverythingConfig::default(),
+            FileVisibility::default(),
         )
     }
 
@@ -593,7 +516,7 @@ mod tests {
     use super::*;
 
     fn sample_state() -> SessionState {
-        SessionState::with_settings(
+        let mut state = SessionState::new(
             WindowPlacement {
                 x: -120,
                 y: 84,
@@ -606,10 +529,11 @@ mod tests {
                 PathBuf::from(r"\\server\共享\資料"),
             ],
             [2, 0, 3, 1],
-            ThemeMode::Dark,
-            Language::English,
         )
-        .expect("valid state")
+        .expect("valid state");
+        state.theme_mode = ThemeMode::Dark;
+        state.language = Language::English;
+        state
     }
 
     #[test]
@@ -660,15 +584,17 @@ mod tests {
 
     #[test]
     fn everything_settings_and_search_columns_round_trip() {
-        let state = SessionState::with_everything_settings(
-            WindowPlacement {
-                x: 20,
-                y: 30,
-                width: 1200,
-                height: 800,
-            },
-            0,
-            vec![PathBuf::from(r"\\LiuYanghomeNAS\Multimedia")],
+        let state = SessionState::with_windows_and_settings(
+            vec![WindowSessionState {
+                placement: WindowPlacement {
+                    x: 20,
+                    y: 30,
+                    width: 1200,
+                    height: 800,
+                },
+                active_tab: 0,
+                tab_paths: vec![PathBuf::from(r"\\LiuYanghomeNAS\Multimedia")],
+            }],
             DEFAULT_COLUMN_ORDER,
             [1, 0, 3, 2],
             [560, 180, 128, 240],
@@ -683,6 +609,7 @@ mod tests {
                 verified_version: Some("1.5.0.1396a x64".to_owned()),
                 allow_launch: false,
             },
+            FileVisibility::default(),
         )
         .unwrap();
 

@@ -77,7 +77,6 @@ struct WatchShared {
 impl DirectoryWatch {
     pub fn start(
         root: impl AsRef<Path>,
-        recursive: bool,
         events: mpsc::Sender<DirectoryWatchEvent>,
     ) -> io::Result<Self> {
         let root = root.as_ref().to_path_buf();
@@ -90,7 +89,7 @@ impl DirectoryWatch {
         let worker_root = root.clone();
         let worker = thread::Builder::new()
             .name("asterfiles-directory-watch".into())
-            .spawn(move || watch_directory(worker_root, recursive, events, worker_shared));
+            .spawn(move || watch_directory(worker_root, events, worker_shared));
 
         match worker {
             Ok(worker) => Ok(Self {
@@ -164,7 +163,6 @@ fn open_directory(path: &Path) -> io::Result<HANDLE> {
 
 fn watch_directory(
     root: PathBuf,
-    recursive: bool,
     events: mpsc::Sender<DirectoryWatchEvent>,
     shared: Arc<WatchShared>,
 ) {
@@ -195,7 +193,7 @@ fn watch_directory(
                 directory,
                 buffer.as_mut_ptr().cast(),
                 buffer.len() as u32,
-                recursive.into(),
+                0,
                 NOTIFY_FILTER,
                 ptr::null_mut(),
                 &mut overlapped,

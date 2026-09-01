@@ -183,23 +183,6 @@ pub fn rename_path(source: &Path, new_name: &OsStr) -> Result<PathBuf, Operation
 pub type FileProgressCallback<'a> = dyn FnMut(u64, bool, &Path) + 'a;
 pub type DestinationCreatedCallback<'a> = dyn FnMut(&Path) + 'a;
 
-#[allow(dead_code)]
-pub fn copy_path(
-    source: &Path,
-    destination: &Path,
-    cancel: &CancellationToken,
-    resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
-) -> Result<FileOperationReport, OperationError> {
-    copy_path_with_progress(
-        source,
-        destination,
-        cancel,
-        resolve_conflict,
-        &mut |_, _, _| {},
-        &mut |_| {},
-    )
-}
-
 pub fn copy_path_with_progress(
     source: &Path,
     destination: &Path,
@@ -223,22 +206,6 @@ pub fn copy_path_with_progress(
         &mut report,
     )?;
     Ok(report)
-}
-
-#[allow(dead_code)]
-pub fn move_path(
-    source: &Path,
-    destination: &Path,
-    cancel: &CancellationToken,
-    resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
-) -> Result<FileOperationReport, OperationError> {
-    move_path_with_progress(
-        source,
-        destination,
-        cancel,
-        resolve_conflict,
-        &mut |_, _, _| {},
-    )
 }
 
 pub fn move_path_with_progress(
@@ -905,6 +872,35 @@ mod tests {
     }
     fn replace(_: ConflictCategory, _: &Path, _: &Path) -> ConflictAction {
         ConflictAction::Replace
+    }
+    fn copy_path(
+        source: &Path,
+        destination: &Path,
+        cancel: &CancellationToken,
+        resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
+    ) -> Result<FileOperationReport, OperationError> {
+        copy_path_with_progress(
+            source,
+            destination,
+            cancel,
+            resolve_conflict,
+            &mut |_, _, _| {},
+            &mut |_| {},
+        )
+    }
+    fn move_path(
+        source: &Path,
+        destination: &Path,
+        cancel: &CancellationToken,
+        resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
+    ) -> Result<FileOperationReport, OperationError> {
+        move_path_with_progress(
+            source,
+            destination,
+            cancel,
+            resolve_conflict,
+            &mut |_, _, _| {},
+        )
     }
     fn temporary_siblings(parent: &Path) -> Vec<PathBuf> {
         fs::read_dir(parent)

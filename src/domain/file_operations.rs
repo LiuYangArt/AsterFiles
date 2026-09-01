@@ -15,9 +15,6 @@ use crate::domain::TabId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OperationId(pub u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EventSequence(pub u64);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileOperationKind {
     CreateFolder,
@@ -164,30 +161,6 @@ pub struct OperationResult {
     pub affected_directories: Vec<PathBuf>,
 }
 
-impl OperationResult {
-    pub fn is_partial(&self) -> bool {
-        (!self.succeeded.is_empty() || !self.skipped.is_empty()) && !self.failed.is_empty()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FileChange {
-    Created(PathBuf),
-    Removed(PathBuf),
-    Renamed { from: PathBuf, to: PathBuf },
-    Moved { from: PathBuf, to: PathBuf },
-    ContentMayHaveChanged(PathBuf),
-    RecheckDirectory(PathBuf),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OperationEvent {
-    pub operation_id: OperationId,
-    pub sequence: EventSequence,
-    pub state: OperationState,
-    pub changes: Vec<FileChange>,
-}
-
 #[derive(Debug, Default)]
 struct PauseState {
     paused: bool,
@@ -284,7 +257,6 @@ pub struct OperationTask {
     pub conflict: Option<OperationConflict>,
     pub result: Option<OperationResult>,
     pub cancellation: CancellationToken,
-    pub sequence: EventSequence,
     conflict_defaults: HashMap<ConflictCategory, ConflictAction>,
 }
 
@@ -312,7 +284,6 @@ impl OperationTask {
             conflict: None,
             result: None,
             cancellation: CancellationToken::new(),
-            sequence: EventSequence(0),
             conflict_defaults: HashMap::new(),
         }
     }
@@ -324,7 +295,6 @@ impl OperationTask {
             });
         }
         self.state = next;
-        self.sequence.0 += 1;
         Ok(())
     }
     pub fn conflict_default(&self, category: ConflictCategory) -> Option<ConflictAction> {
@@ -414,7 +384,6 @@ impl OperationTask {
         self.finished_at = None;
         self.cancellation = CancellationToken::new();
         self.conflict_defaults.clear();
-        self.sequence.0 += 1;
         true
     }
 }

@@ -1,6 +1,6 @@
 use std::time::SystemTime;
 
-use crate::domain::{AddressMode, EntryKind, FolderSizeState, LoadState, SearchScope, SearchState};
+use crate::domain::{EntryKind, FolderSizeState, LoadState, SearchState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
@@ -43,49 +43,6 @@ impl Texts {
     pub fn settings(self) -> &'static str {
         self.choose("设置", "Settings")
     }
-    pub fn everything(self) -> &'static str {
-        self.choose("Everything", "Everything")
-    }
-
-    pub fn everything_program_path(self) -> &'static str {
-        self.choose("程序路径", "Program path")
-    }
-
-    pub fn everything_instance(self) -> &'static str {
-        self.choose("实例", "Instance")
-    }
-
-    pub fn everything_version(self) -> &'static str {
-        self.choose("已验证版本", "Verified version")
-    }
-
-    pub fn everything_allow_launch(self) -> &'static str {
-        self.choose("需要时启动 Everything", "Start Everything when needed")
-    }
-
-    pub fn everything_test_connection(self) -> &'static str {
-        self.choose("测试连接", "Test connection")
-    }
-
-    pub fn everything_start(self) -> &'static str {
-        self.choose("启动 Everything", "Start Everything")
-    }
-
-    pub fn address_accessible_name(self, mode: AddressMode) -> &'static str {
-        match mode {
-            AddressMode::Normal => self.choose("地址栏", "Address bar"),
-            AddressMode::Smart => self.choose("智能地址栏", "Smart address bar"),
-        }
-    }
-
-    pub fn search_scope(self, scope: &SearchScope) -> &'static str {
-        match scope {
-            SearchScope::Global => self.choose("全部位置", "Everywhere"),
-            SearchScope::Directory(_) => {
-                self.choose("当前文件夹及子文件夹", "Current folder and subfolders")
-            }
-        }
-    }
 
     pub fn search_state(self, state: SearchState) -> &'static str {
         match state {
@@ -109,22 +66,6 @@ impl Texts {
             SearchState::Cancelled => self.choose("搜索已取消", "Search cancelled"),
             SearchState::Failed => self.choose("搜索失败", "Search failed"),
         }
-    }
-
-    pub fn search_name_column(self) -> &'static str {
-        self.choose("名称", "Name")
-    }
-
-    pub fn search_parent_column(self) -> &'static str {
-        self.choose("父目录", "Parent folder")
-    }
-
-    pub fn search_size_column(self) -> &'static str {
-        self.choose("大小", "Size")
-    }
-
-    pub fn search_modified_column(self) -> &'static str {
-        self.choose("修改时间", "Date modified")
     }
 
     pub fn state(self, state: LoadState) -> &'static str {
