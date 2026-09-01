@@ -32,7 +32,7 @@ python tools/verify.py
 - 每个 issue 经用户明确确认完成后，必须构建一版 Release；用户确认前不得因该规则提前构建 Release。
 
 ## task
-@docs/task-list.md
+
 - 任务完成后更新文档状态
 - 涉及路径、后台加载、多标签页、本地化或网络边界时，同时遵守并更新 `docs/foundation-plan.md`
 
