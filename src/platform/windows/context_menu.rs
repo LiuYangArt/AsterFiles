@@ -39,6 +39,8 @@ use windows::{
 
 const FIRST_COMMAND_ID: u32 = 1;
 const LAST_COMMAND_ID: u32 = 0x7fff;
+const DYNAMIC_SUBMENU_WAIT: Duration = Duration::from_millis(300);
+const DYNAMIC_SUBMENU_POLL: Duration = Duration::from_millis(10);
 const MENU_WINDOW_CLASS: PCWSTR = w!("AsterFiles.ClassicMenuOwner");
 
 thread_local! {
@@ -491,10 +493,11 @@ impl ClassicMenuSession {
             return Ok(items);
         }
 
-        // Some shell extensions publish dynamic submenu items through the STA queue
-        // immediately after WM_INITMENUPOPUP instead of during the call itself.
-        for _ in 0..4 {
-            thread::sleep(Duration::from_millis(10));
+        // Background-menu extensions can publish dynamic items noticeably later than
+        // selection-menu extensions, so keep the STA responsive until a fixed deadline.
+        let deadline = std::time::Instant::now() + DYNAMIC_SUBMENU_WAIT;
+        while std::time::Instant::now() < deadline {
+            thread::sleep(DYNAMIC_SUBMENU_POLL);
             pump_sta_messages();
             submenu = submenu_at_position(registration.parent, position)?;
             self.submenus[index].menu = submenu;

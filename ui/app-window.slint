@@ -1985,6 +1985,7 @@ accessible-label: entry.name;
                                 root.context-submenu-anchor-y = self.absolute-position.y - root.absolute-position.y;
                                 root.hover-context-submenu(command.submenu ? index : -2147483647);
                             }
+                            else if command.submenu { root.cancel-context-submenu-hover(); }
                         }
                         changed command-active => {
                             if command-active { root.context-active-anchor-y = self.absolute-position.y - root.absolute-position.y; }
@@ -2044,6 +2045,7 @@ accessible-label: entry.name;
                                 if command.submenu { root.hover-context-submenu(-index - 1); }
                                 else { root.cancel-context-submenu-hover(); }
                             }
+                            else if command.submenu { root.cancel-context-submenu-hover(); }
                         }
                         changed submenu-active => {
                             if submenu-active { root.context-submenu-active-anchor-y = self.absolute-position.y - root.absolute-position.y; }
@@ -2092,6 +2094,7 @@ accessible-label: entry.name;
                         }
                         else { root.cancel-context-submenu-hover(); }
                     }
+                    else if command.submenu { root.cancel-context-submenu-hover(); }
                 }
             }
         }

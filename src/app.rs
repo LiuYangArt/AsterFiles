@@ -3531,6 +3531,14 @@ fn context_menu_content_height(rows: &[ContextCommandRow]) -> f32 {
         .sum()
 }
 
+fn submenu_request_is_duplicate(
+    submenu_is_open: bool,
+    active_token: Option<u64>,
+    requested_token: u64,
+) -> bool {
+    submenu_is_open && active_token == Some(requested_token)
+}
+
 fn wire_context_submenu_hover(ui: &AppWindow) -> Rc<slint::Timer> {
     let timer = Rc::new(slint::Timer::default());
     let timer_for_hover = timer.clone();
@@ -5998,9 +6006,13 @@ fn wire_callbacks(
         if !row.enabled || !row.submenu || row.node_id <= 0 {
             return;
         }
+        let submenu_is_open = ui.get_context_submenu_open();
         let request = quick_menu_for_submenu.lock().ok().and_then(|mut menu| {
             let identity = menu.identity.clone()?;
             let token = *menu.submenu_tokens.get(&row.node_id)?;
+            if submenu_request_is_duplicate(submenu_is_open, menu.active_submenu_token, token) {
+                return None;
+            }
             if encoded_index < 0 {
                 if let Some(token) = menu.active_submenu_token {
                     let rows = menu.submenu_rows.clone();
@@ -8247,6 +8259,7 @@ fn start_shell_menu_event_pump(
                         items,
                         elapsed_ms,
                     } => {
+                        let item_count = items.len();
                         let accepted = menu_state.lock().ok().is_some_and(|menu| {
                             menu.identity.as_ref().is_some_and(|identity| {
                                 identity.session_id == session_id
@@ -8272,7 +8285,7 @@ fn start_shell_menu_event_pump(
                         ui.set_context_submenu_loading(false);
                         project_context_submenu(&ui, &menu_state);
                         eprintln!(
-                            "{{\"event\":\"shell_submenu_loaded\",\"session\":{session_id},\"request\":{request_id},\"submenu_request\":{submenu_request_id},\"token\":{token},\"elapsed_ms\":{elapsed_ms}}}"
+                            "{{\"event\":\"shell_submenu_loaded\",\"session\":{session_id},\"request\":{request_id},\"submenu_request\":{submenu_request_id},\"token\":{token},\"item_count\":{item_count},\"elapsed_ms\":{elapsed_ms}}}"
                         );
                     }
                     platform::windows::context_menu::ShellMenuEvent::SubmenuError {
@@ -12027,6 +12040,13 @@ mod tests {
         ];
 
         assert_eq!(context_menu_content_height(&rows), 65.0);
+    }
+
+    #[test]
+    fn quick_menu_ignores_duplicate_request_for_visible_submenu() {
+        assert!(submenu_request_is_duplicate(true, Some(7), 7));
+        assert!(!submenu_request_is_duplicate(false, Some(7), 7));
+        assert!(!submenu_request_is_duplicate(true, Some(7), 8));
     }
 
     #[test]
