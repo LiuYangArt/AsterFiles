@@ -819,41 +819,26 @@ impl TabSession {
 
     pub fn apply_rectangle_selection(
         &mut self,
-        snapshot: &[EntryId],
+        snapshot: &HashSet<EntryId>,
         hits: &HashSet<EntryId>,
         mode: RectangleSelectionMode,
     ) {
-        let visible_ids = self
-            .visible_entries()
+        let mut selected = match mode {
+            RectangleSelectionMode::Replace => hits.clone(),
+            RectangleSelectionMode::Extend => snapshot.union(hits).copied().collect(),
+            RectangleSelectionMode::Toggle => {
+                snapshot.symmetric_difference(hits).copied().collect()
+            }
+        };
+        selected.retain(|id| self.entry_indices.contains_key(id));
+        self.selected = selected.into_iter().collect();
+        self.selected
+            .sort_unstable_by_key(|id| self.entry_indices.get(id).copied().unwrap_or(usize::MAX));
+        self.focused = hits
             .iter()
-            .map(|entry| entry.id)
-            .collect::<HashSet<_>>();
-        let snapshot = snapshot
-            .iter()
+            .filter(|id| self.entry_indices.contains_key(id))
             .copied()
-            .filter(|id| visible_ids.contains(id))
-            .collect::<HashSet<_>>();
-        let hits = hits
-            .iter()
-            .copied()
-            .filter(|id| visible_ids.contains(id))
-            .collect::<HashSet<_>>();
-        self.selected = self
-            .visible_entries()
-            .iter()
-            .map(|entry| entry.id)
-            .filter(|id| match mode {
-                RectangleSelectionMode::Replace => hits.contains(id),
-                RectangleSelectionMode::Extend => snapshot.contains(id) || hits.contains(id),
-                RectangleSelectionMode::Toggle => snapshot.contains(id) ^ hits.contains(id),
-            })
-            .collect();
-        self.focused = self
-            .visible_entries()
-            .iter()
-            .rev()
-            .map(|entry| entry.id)
-            .find(|id| hits.contains(id))
+            .max_by_key(|id| self.entry_indices.get(id).copied())
             .or_else(|| self.selected.last().copied());
         self.selection_anchor = self.focused;
     }
@@ -1631,7 +1616,7 @@ mod tests {
                 .map(|id| entry(id, &format!("{id}.txt"), EntryKind::File, Some(1)))
                 .collect(),
         );
-        let snapshot = vec![EntryId(1), EntryId(3)];
+        let snapshot = HashSet::from([EntryId(1), EntryId(3)]);
         let hits = HashSet::from([EntryId(2), EntryId(3)]);
 
         session.apply_rectangle_selection(&snapshot, &hits, RectangleSelectionMode::Replace);

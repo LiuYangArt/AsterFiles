@@ -4,6 +4,7 @@ use std::{
     io,
     ops::Deref,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
@@ -407,7 +408,7 @@ impl Deref for WindowSessions {
 struct WindowRuntime {
     ui: AppWindow,
     _native_drop_timer: slint::Timer,
-    _rectangle_selection_timer: slint::Timer,
+    _rectangle_selection_timer: Rc<slint::Timer>,
 }
 
 thread_local! {
@@ -1843,11 +1844,24 @@ impl SearchGridModel {
     }
 
     fn update_rows(&self, rows: impl IntoIterator<Item = FileRow>) {
+        let mut changed_rows = HashSet::new();
+        let mut slots = self.rows.borrow_mut();
         for row in rows {
-            self.update_row(row);
+            let Some(target) = row.id.checked_sub(1).map(|id| id as usize) else {
+                continue;
+            };
+            if target < self.total {
+                slots.insert(target, row);
+                changed_rows.insert(target / self.columns);
+            }
+        }
+        drop(slots);
+        for row in changed_rows {
+            self.notify.row_changed(row);
         }
     }
 
+    #[cfg(test)]
     fn update_row(&self, row: FileRow) -> bool {
         let Some(target) = row.id.checked_sub(1).map(|id| id as usize) else {
             return false;
@@ -3473,11 +3487,15 @@ struct RectangleSelectionGesture {
     start_content_y: f32,
     pointer_x: f32,
     pointer_y: f32,
-    snapshot: Vec<EntryId>,
+    snapshot: Arc<HashSet<EntryId>>,
+    snapshot_order: Vec<EntryId>,
     focused: Option<EntryId>,
     anchor: Option<EntryId>,
     mode: RectangleSelectionMode,
     active: bool,
+    dirty: bool,
+    committed: bool,
+    last_hits: HashSet<EntryId>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3529,39 +3547,85 @@ fn rectangle_selection_hits(
         ViewMode::List => (34.0, 0.0, 0.0, 0.0),
         ViewMode::Grid => (148.0, 140.0, 140.0, 8.0),
     };
-    tab.visible_entries()
-        .iter()
-        .enumerate()
-        .filter_map(|(loaded_index, entry)| {
-            let index = if tab.page_source == PageSource::Search {
-                entry.id.0.saturating_sub(1) as usize
-            } else {
-                loaded_index
-            };
-            let item = match view_mode {
-                ViewMode::Details | ViewMode::List => SelectionRect {
+    let slot_count = if tab.page_source == PageSource::Search {
+        tab.search_total.unwrap_or(0) as usize
+    } else {
+        tab.visible_entries().len()
+    };
+    if slot_count == 0 || rect.bottom < 0.0 || rect.right < 0.0 {
+        return HashSet::new();
+    }
+    let entry_at = |slot: usize| {
+        if tab.page_source == PageSource::Search {
+            u32::try_from(slot)
+                .ok()
+                .and_then(|slot| slot.checked_add(1))
+                .and_then(|id| tab.visible_entry(EntryId(id)))
+        } else {
+            tab.visible_entries().get(slot)
+        }
+    };
+    let candidate_start = |position: f32, extent: f32| {
+        ((position.max(0.0) / extent).floor() as usize).saturating_sub(1)
+    };
+    let mut hits = HashSet::new();
+    match view_mode {
+        ViewMode::Details | ViewMode::List => {
+            if rect.left > viewport_width {
+                return hits;
+            }
+            let first = candidate_start(rect.top, row_height);
+            let last = ((rect.bottom.max(0.0) / row_height).floor() as usize)
+                .min(slot_count.saturating_sub(1));
+            for slot in first..=last {
+                let Some(entry) = entry_at(slot) else {
+                    continue;
+                };
+                let item = SelectionRect {
                     left: 0.0,
-                    top: index as f32 * row_height,
+                    top: slot as f32 * row_height,
                     right: viewport_width,
-                    bottom: (index + 1) as f32 * row_height,
-                },
-                ViewMode::Grid => {
-                    let columns = grid_columns.max(1);
-                    let column = index % columns;
-                    let row = index / columns;
-                    let left = column as f32 * (card_width + gap);
+                    bottom: (slot + 1) as f32 * row_height,
+                };
+                if rect.intersects(item) {
+                    hits.insert(entry.id);
+                }
+            }
+        }
+        ViewMode::Grid => {
+            let columns = grid_columns.max(1);
+            let column_extent = card_width + gap;
+            let first_column = candidate_start(rect.left, column_extent).min(columns - 1);
+            let last_column =
+                ((rect.right.max(0.0) / column_extent).floor() as usize).min(columns - 1);
+            let first_row = candidate_start(rect.top, row_height);
+            let last_row = ((rect.bottom.max(0.0) / row_height).floor() as usize)
+                .min(slot_count.saturating_sub(1) / columns);
+            for row in first_row..=last_row {
+                for column in first_column..=last_column {
+                    let slot = row * columns + column;
+                    if slot >= slot_count {
+                        break;
+                    }
+                    let Some(entry) = entry_at(slot) else {
+                        continue;
+                    };
+                    let left = column as f32 * column_extent;
                     let top = row as f32 * row_height;
-                    SelectionRect {
+                    let item = SelectionRect {
                         left,
                         top,
                         right: left + card_width,
                         bottom: top + card_height,
+                    };
+                    if rect.intersects(item) {
+                        hits.insert(entry.id);
                     }
                 }
-            };
-            rect.intersects(item).then_some(entry.id)
-        })
-        .collect()
+            }
+        }
+    }
+    hits
 }
 
 fn selection_mode(control: bool, shift: bool) -> RectangleSelectionMode {
@@ -3577,14 +3641,15 @@ fn selection_mode(control: bool, shift: bool) -> RectangleSelectionMode {
 fn finish_rectangle_selection(
     ui: &AppWindow,
     gesture: &Arc<Mutex<Option<RectangleSelectionGesture>>>,
-) -> bool {
-    let cancelled = gesture
+    timer: &slint::Timer,
+) {
+    timer.stop();
+    let had_gesture = gesture
         .lock()
         .is_ok_and(|mut gesture| gesture.take().is_some());
-    if cancelled || ui.get_rectangle_selection_visible() {
+    if had_gesture || ui.get_rectangle_selection_visible() {
         ui.invoke_clear_rectangle_selection();
     }
-    cancelled
 }
 
 fn restore_rectangle_selection_snapshot(
@@ -3593,11 +3658,11 @@ fn restore_rectangle_selection_snapshot(
     focused: Option<EntryId>,
     anchor: Option<EntryId>,
 ) {
-    tab.apply_rectangle_selection(
-        &[],
-        &snapshot.iter().copied().collect(),
-        RectangleSelectionMode::Replace,
-    );
+    tab.selected = snapshot
+        .iter()
+        .copied()
+        .filter(|id| tab.visible_entry(*id).is_some())
+        .collect();
     tab.focused = focused.filter(|id| tab.visible_entry(*id).is_some());
     tab.selection_anchor = anchor.filter(|id| tab.visible_entry(*id).is_some());
 }
@@ -3606,24 +3671,27 @@ fn cancel_rectangle_selection(
     ui: &AppWindow,
     state: &WindowSessions,
     gesture: &Arc<Mutex<Option<RectangleSelectionGesture>>>,
-) -> bool {
+    timer: &slint::Timer,
+) {
     let snapshot = gesture.lock().ok().and_then(|gesture| {
         gesture.as_ref().map(|gesture| {
             (
                 gesture.tab_id,
                 gesture.request_id,
-                gesture.snapshot.clone(),
+                gesture.snapshot_order.clone(),
                 gesture.focused,
                 gesture.anchor,
             )
         })
     });
     let Some((tab_id, request_id, snapshot, focused, anchor)) = snapshot else {
-        return finish_rectangle_selection(ui, gesture);
+        finish_rectangle_selection(ui, gesture, timer);
+        return;
     };
     let update = {
         let Ok(mut app) = state.lock() else {
-            return finish_rectangle_selection(ui, gesture);
+            finish_rectangle_selection(ui, gesture, timer);
+            return;
         };
         if app.active_window_state().active_tab != tab_id {
             None
@@ -3633,7 +3701,7 @@ fn cancel_rectangle_selection(
                 None
             } else {
                 let before = selection_projection_ids(tab);
-                restore_rectangle_selection_snapshot(tab, &snapshot, focused, anchor);
+                restore_rectangle_selection_snapshot(tab, snapshot.as_ref(), focused, anchor);
                 let mut changed = before;
                 changed.extend(selection_projection_ids(tab));
                 Some((tab_id, changed))
@@ -3642,17 +3710,16 @@ fn cancel_rectangle_selection(
     };
     if let Some((tab_id, changed)) = update {
         update_file_rows(ui, state, tab_id, &changed);
-        update_selection_summary(ui, state);
+        update_selection_status(ui, state);
     }
-    finish_rectangle_selection(ui, gesture)
+    finish_rectangle_selection(ui, gesture, timer);
 }
 
-fn update_rectangle_selection(
+fn project_rectangle_selection_visual(
     ui: &AppWindow,
-    state: &WindowSessions,
     gesture: &Arc<Mutex<Option<RectangleSelectionGesture>>>,
 ) -> bool {
-    let (tab_id, request_id, snapshot, mode, start_x, start_content_y, pointer_x, pointer_y) = {
+    let (start_x, start_content_y, pointer_x, pointer_y) = {
         let Ok(mut gesture) = gesture.lock() else {
             return false;
         };
@@ -3671,23 +3738,12 @@ fn update_rectangle_selection(
         }
         gesture.active = true;
         (
-            gesture.tab_id,
-            gesture.request_id,
-            gesture.snapshot.clone(),
-            gesture.mode,
             gesture.start_x,
             gesture.start_content_y,
             gesture.pointer_x,
             gesture.pointer_y,
         )
     };
-    let identity_is_current = state.lock().is_ok_and(|app| {
-        app.active_window_state().active_tab == tab_id && app.active().latest_request == request_id
-    });
-    if !identity_is_current {
-        finish_rectangle_selection(ui, gesture);
-        return false;
-    }
     let current_content_y = pointer_y - ui.get_file_viewport_y();
     let rect = SelectionRect::from_points(start_x, start_content_y, pointer_x, current_content_y);
     let viewport_top = ui.get_rectangle_viewport_top();
@@ -3700,40 +3756,118 @@ fn update_rectangle_selection(
         (rect.right.min(ui.get_file_viewport_width()) - rect.left.max(0.0)).max(0.0),
         (visual_bottom - visual_top).max(0.0),
     );
+    true
+}
+
+fn update_rectangle_selection(
+    ui: &AppWindow,
+    state: &WindowSessions,
+    gesture: &Arc<Mutex<Option<RectangleSelectionGesture>>>,
+    timer: &slint::Timer,
+) -> bool {
+    let (
+        tab_id,
+        request_id,
+        snapshot,
+        mode,
+        start_x,
+        start_content_y,
+        pointer_x,
+        pointer_y,
+        previous_hits,
+        committed,
+    ) = {
+        let Ok(mut gesture) = gesture.lock() else {
+            return false;
+        };
+        let Some(gesture) = gesture.as_mut() else {
+            return false;
+        };
+        if !gesture.active || !gesture.dirty {
+            return false;
+        }
+        gesture.dirty = false;
+        (
+            gesture.tab_id,
+            gesture.request_id,
+            gesture.snapshot.clone(),
+            gesture.mode,
+            gesture.start_x,
+            gesture.start_content_y,
+            gesture.pointer_x,
+            gesture.pointer_y,
+            gesture.last_hits.clone(),
+            gesture.committed,
+        )
+    };
+    let current_content_y = pointer_y - ui.get_file_viewport_y();
+    let rect = SelectionRect::from_points(start_x, start_content_y, pointer_x, current_content_y);
     let update = {
         let Ok(mut app) = state.lock() else {
             return false;
         };
         if app.active_window_state().active_tab != tab_id {
-            return false;
+            None
+        } else {
+            let view_mode = app
+                .active()
+                .visible_path()
+                .and_then(|path| app.directory_view_modes.get(path))
+                .copied()
+                .unwrap_or(ViewMode::Details);
+            let grid_columns = ui.get_grid_column_count().max(1) as usize;
+            let viewport_width = ui.get_file_viewport_width();
+            let tab = app.active_window_state_mut().tabs.get_mut(&tab_id).unwrap();
+            if tab.latest_request != request_id {
+                None
+            } else {
+                let previous_focus = tab.focused;
+                let hits =
+                    rectangle_selection_hits(tab, view_mode, grid_columns, viewport_width, rect);
+                if committed && previous_hits == hits {
+                    return false;
+                }
+                tab.apply_rectangle_selection(snapshot.as_ref(), &hits, mode);
+                let mut changed = if committed {
+                    previous_hits
+                        .symmetric_difference(&hits)
+                        .copied()
+                        .collect::<HashSet<_>>()
+                } else {
+                    match mode {
+                        RectangleSelectionMode::Replace => snapshot.union(&hits).copied().collect(),
+                        RectangleSelectionMode::Extend => {
+                            hits.difference(snapshot.as_ref()).copied().collect()
+                        }
+                        RectangleSelectionMode::Toggle => hits.clone(),
+                    }
+                };
+                changed.extend(previous_focus);
+                changed.extend(tab.focused);
+                Some((tab_id, changed, hits))
+            }
         }
-        let view_mode = app
-            .active()
-            .visible_path()
-            .and_then(|path| app.directory_view_modes.get(path))
-            .copied()
-            .unwrap_or(ViewMode::Details);
-        let grid_columns = ui.get_grid_column_count().max(1) as usize;
-        let viewport_width = ui.get_file_viewport_width();
-        let tab = app.active_window_state_mut().tabs.get_mut(&tab_id).unwrap();
-        if tab.latest_request != request_id {
-            return false;
-        }
-        let before = selection_projection_ids(tab);
-        let hits = rectangle_selection_hits(tab, view_mode, grid_columns, viewport_width, rect);
-        tab.apply_rectangle_selection(&snapshot, &hits, mode);
-        let mut changed = before;
-        changed.extend(selection_projection_ids(tab));
-        (tab_id, changed)
     };
+    let Some(update) = update else {
+        finish_rectangle_selection(ui, gesture, timer);
+        return false;
+    };
+    if let Ok(mut gesture) = gesture.lock()
+        && let Some(gesture) = gesture.as_mut()
+    {
+        gesture.last_hits = update.2;
+        gesture.committed = true;
+    }
     update_file_rows(ui, state, update.0, &update.1);
-    update_selection_summary(ui, state);
+    update_selection_status(ui, state);
     true
 }
 
-fn wire_rectangle_selection(ui: &AppWindow, state: WindowSessions) -> slint::Timer {
+fn wire_rectangle_selection(ui: &AppWindow, state: WindowSessions) -> Rc<slint::Timer> {
     let gesture = Arc::new(Mutex::new(None::<RectangleSelectionGesture>));
+    let timer = Rc::new(slint::Timer::default());
     let gesture_for_begin = gesture.clone();
+    let timer_for_begin = timer.clone();
     let state_for_begin = state.clone();
     let weak_for_begin = ui.as_weak();
     ui.on_begin_rectangle_selection(move |x, y, control, shift| {
@@ -3755,17 +3889,21 @@ fn wire_rectangle_selection(ui: &AppWindow, state: WindowSessions) -> slint::Tim
                 start_content_y: y - ui.get_file_viewport_y(),
                 pointer_x: x,
                 pointer_y: y,
-                snapshot: tab.selected.clone(),
+                snapshot: Arc::new(tab.selected.iter().copied().collect()),
+                snapshot_order: tab.selected.clone(),
                 focused: tab.focused,
                 anchor: tab.selection_anchor,
                 mode: selection_mode(control, shift),
                 active: false,
+                dirty: false,
+                committed: false,
+                last_hits: HashSet::new(),
             });
+            timer_for_begin.restart();
         }
     });
 
     let gesture_for_update = gesture.clone();
-    let state_for_update = state.clone();
     let weak_for_update = ui.as_weak();
     ui.on_update_rectangle_selection(move |x, y| {
         let Some(ui) = weak_for_update.upgrade() else {
@@ -3776,11 +3914,13 @@ fn wire_rectangle_selection(ui: &AppWindow, state: WindowSessions) -> slint::Tim
         {
             gesture.pointer_x = x;
             gesture.pointer_y = y;
+            gesture.dirty = true;
         }
-        update_rectangle_selection(&ui, &state_for_update, &gesture_for_update);
+        project_rectangle_selection_visual(&ui, &gesture_for_update);
     });
 
     let gesture_for_end = gesture.clone();
+    let timer_for_end = timer.clone();
     let state_for_end = state.clone();
     let weak_for_end = ui.as_weak();
     ui.on_end_rectangle_selection(move || {
@@ -3793,7 +3933,13 @@ fn wire_rectangle_selection(ui: &AppWindow, state: WindowSessions) -> slint::Tim
             .and_then(|gesture| gesture.as_ref().map(|gesture| gesture.active))
             .unwrap_or(false);
         if active {
-            update_rectangle_selection(&ui, &state_for_end, &gesture_for_end);
+            if let Ok(mut gesture) = gesture_for_end.lock()
+                && let Some(gesture) = gesture.as_mut()
+            {
+                gesture.dirty = true;
+            }
+            project_rectangle_selection_visual(&ui, &gesture_for_end);
+            update_rectangle_selection(&ui, &state_for_end, &gesture_for_end, &timer_for_end);
         } else {
             let update = mutate_active_selection(&state_for_end, TabSession::clear_selection);
             if let Some((tab_id, changed)) = update {
@@ -3801,20 +3947,26 @@ fn wire_rectangle_selection(ui: &AppWindow, state: WindowSessions) -> slint::Tim
                 update_selection_summary(&ui, &state_for_end);
             }
         }
-        finish_rectangle_selection(&ui, &gesture_for_end);
+        finish_rectangle_selection(&ui, &gesture_for_end, &timer_for_end);
     });
 
     let gesture_for_cancel = gesture.clone();
+    let timer_for_cancel = timer.clone();
     let state_for_cancel = state.clone();
     let weak_for_cancel = ui.as_weak();
     ui.on_cancel_rectangle_selection(move || {
         if let Some(ui) = weak_for_cancel.upgrade() {
-            cancel_rectangle_selection(&ui, &state_for_cancel, &gesture_for_cancel);
+            cancel_rectangle_selection(
+                &ui,
+                &state_for_cancel,
+                &gesture_for_cancel,
+                &timer_for_cancel,
+            );
         }
     });
 
-    let timer = slint::Timer::default();
     let gesture_for_timer = gesture.clone();
+    let timer_for_tick = timer.clone();
     let state_for_timer = state.clone();
     let weak_for_timer = ui.as_weak();
     timer.start(
@@ -3824,39 +3976,53 @@ fn wire_rectangle_selection(ui: &AppWindow, state: WindowSessions) -> slint::Tim
             let Some(ui) = weak_for_timer.upgrade() else {
                 return;
             };
-            let pointer_y = gesture_for_timer.lock().ok().and_then(|gesture| {
+            let state = gesture_for_timer.lock().ok().and_then(|gesture| {
                 gesture
                     .as_ref()
-                    .filter(|gesture| gesture.active)
-                    .map(|gesture| gesture.pointer_y)
+                    .map(|gesture| (gesture.active, gesture.dirty, gesture.pointer_y))
             });
-            let Some(pointer_y) = pointer_y else {
+            let Some((active, dirty, pointer_y)) = state else {
                 return;
             };
-            let top = ui.get_rectangle_viewport_top();
-            let bottom = top + ui.get_file_viewport_height();
-            let delta = rectangle_selection_scroll_delta(pointer_y, top, bottom);
-            if delta == 0.0 {
-                return;
+            let mut viewport_changed = false;
+            if active {
+                let top = ui.get_rectangle_viewport_top();
+                let bottom = top + ui.get_file_viewport_height();
+                let delta = rectangle_selection_scroll_delta(pointer_y, top, bottom);
+                let maximum = rectangle_selection_scroll_maximum(
+                    ui.get_files().row_count(),
+                    match ui.get_view_mode() {
+                        1 => ViewMode::List,
+                        2 => ViewMode::Grid,
+                        _ => ViewMode::Details,
+                    },
+                    ui.get_grid_column_count().max(1) as usize,
+                    ui.get_file_viewport_height(),
+                );
+                let viewport = (ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0);
+                if viewport != ui.get_file_viewport_y() {
+                    ui.set_file_viewport_y(viewport);
+                    ui.invoke_ensure_visible_search_page(viewport);
+                    viewport_changed = true;
+                    if let Ok(mut gesture) = gesture_for_timer.lock()
+                        && let Some(gesture) = gesture.as_mut()
+                    {
+                        gesture.dirty = true;
+                    }
+                    project_rectangle_selection_visual(&ui, &gesture_for_timer);
+                }
             }
-            let maximum = rectangle_selection_scroll_maximum(
-                ui.get_files().row_count(),
-                match ui.get_view_mode() {
-                    1 => ViewMode::List,
-                    2 => ViewMode::Grid,
-                    _ => ViewMode::Details,
-                },
-                ui.get_grid_column_count().max(1) as usize,
-                ui.get_file_viewport_height(),
-            );
-            let viewport = (ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0);
-            if viewport != ui.get_file_viewport_y() {
-                ui.set_file_viewport_y(viewport);
-                ui.invoke_ensure_visible_search_page(viewport);
-                update_rectangle_selection(&ui, &state_for_timer, &gesture_for_timer);
+            if active && (dirty || viewport_changed) {
+                update_rectangle_selection(
+                    &ui,
+                    &state_for_timer,
+                    &gesture_for_timer,
+                    &timer_for_tick,
+                );
             }
         },
     );
+    timer.stop();
     timer
 }
 
@@ -9267,10 +9433,9 @@ fn update_file_rows(
     }
 
     let texts = Texts::new(app.language);
-    let rows = tab
-        .visible_entries()
+    let rows = changed
         .iter()
-        .filter(|entry| changed.contains(&entry.id))
+        .filter_map(|id| tab.visible_entry(*id))
         .map(|entry| (entry.id, file_row(entry, tab, texts, &app)))
         .collect::<HashMap<_, _>>();
     if rows.is_empty() {
@@ -9286,8 +9451,8 @@ fn update_file_rows(
             );
         }
     } else if let Some(model) = model.as_any().downcast_ref::<VecModel<FileRow>>() {
-        for (index, entry) in tab.visible_entries().iter().enumerate() {
-            if let Some(row) = rows.get(&entry.id)
+        for (id, row) in &rows {
+            if let Some(index) = tab.visible_entry_index(*id)
                 && index < model.row_count()
             {
                 model.set_row_data(index, row.clone());
@@ -9298,10 +9463,12 @@ fn update_file_rows(
     }
 
     let grid_model = ui.get_grid_rows();
-    if let Some(grid_model) = grid_model.as_any().downcast_ref::<VecModel<GridRow>>() {
+    if let Some(grid_model) = grid_model.as_any().downcast_ref::<SearchGridModel>() {
+        grid_model.update_rows(rows.values().cloned());
+    } else if let Some(grid_model) = grid_model.as_any().downcast_ref::<VecModel<GridRow>>() {
         let columns = ui.get_grid_column_count().max(1) as usize;
-        for (index, entry) in tab.visible_entries().iter().enumerate() {
-            let Some(updated) = rows.get(&entry.id) else {
+        for (id, updated) in &rows {
+            let Some(index) = tab.visible_entry_index(*id) else {
                 continue;
             };
             let row_index = index / columns;
@@ -9321,6 +9488,14 @@ fn update_file_rows(
             }
         }
     }
+}
+
+fn update_selection_status(ui: &AppWindow, state: &SharedSessions) {
+    let app = state.lock().expect("app state mutex is not poisoned");
+    let tab = app.active();
+    ui.set_selected_count(tab.selected.len() as i32);
+    ui.set_context_menu_has_entry(!tab.selected.is_empty() || tab.focused.is_some());
+    ui.set_status_text(status_text(tab, Texts::new(app.language)).into());
 }
 
 fn update_selection_summary(ui: &AppWindow, state: &SharedSessions) {
@@ -12088,7 +12263,7 @@ mod tests {
                 .map(|id| focus_entry(id, &format!(r"C:\test\{id}.txt")))
                 .collect(),
         );
-        let snapshot = vec![EntryId(1)];
+        let snapshot = HashSet::from([EntryId(1)]);
         tab.apply_rectangle_selection(
             &snapshot,
             &HashSet::from([EntryId(2)]),
@@ -12098,12 +12273,12 @@ mod tests {
 
         restore_rectangle_selection_snapshot(
             &mut tab,
-            &snapshot,
+            &snapshot.iter().copied().collect::<Vec<_>>(),
             Some(EntryId(1)),
             Some(EntryId(1)),
         );
 
-        assert_eq!(tab.selected, snapshot);
+        assert_eq!(tab.selected, vec![EntryId(1)]);
         assert_eq!(tab.focused, Some(EntryId(1)));
         assert_eq!(tab.selection_anchor, Some(EntryId(1)));
     }
