@@ -1,6 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     ops::Deref,
     path::{Path, PathBuf},
@@ -1766,21 +1766,21 @@ impl SearchFileModel {
     }
 
     fn update_rows(&self, rows: Vec<FileRow>) {
-        let mut slots = self.rows.borrow_mut();
-        let mut changed = Vec::new();
         for row in rows {
-            let Some(target) = row.id.checked_sub(1).map(|id| id as usize) else {
-                continue;
-            };
-            if target < self.total {
-                slots.insert(target, row);
-                changed.push(target);
-            }
+            self.update_row(row);
         }
-        drop(slots);
-        for target in changed {
-            self.notify.row_changed(target);
+    }
+
+    fn update_row(&self, row: FileRow) -> bool {
+        let Some(target) = row.id.checked_sub(1).map(|id| id as usize) else {
+            return false;
+        };
+        if target >= self.total {
+            return false;
         }
+        self.rows.borrow_mut().insert(target, row);
+        self.notify.row_changed(target);
+        true
     }
 
     fn clear_page(&self, offset: usize, count: usize) {
@@ -3726,14 +3726,14 @@ fn wire_callbacks(
                 .collect::<std::collections::HashSet<_>>()
         };
         if let Some(ui) = weak.upgrade() {
-            update_file_rows(&ui, &state_for_activate_entry, &changed_rows);
+            update_file_rows(&ui, &state_for_activate_entry, tab_id, &changed_rows);
             update_selection_summary(&ui, &state_for_activate_entry);
         }
     });
     let weak = ui.as_weak();
     let state_for_select = state.clone();
     ui.on_select_entry(move |entry_id, toggle, extend| {
-        let changed_rows = {
+        let (tab_id, changed_rows) = {
             let mut app = state_for_select
                 .lock()
                 .expect("app state mutex is not poisoned");
@@ -3744,15 +3744,16 @@ fn wire_callbacks(
             let previous_selected = tab.selected.clone();
             let previous_focused = tab.focused;
             tab.select_entry(EntryId(entry_id as u32), toggle, extend);
-            previous_selected
+            let changed = previous_selected
                 .into_iter()
                 .chain(tab.selected.iter().copied())
                 .chain(previous_focused)
                 .chain(tab.focused)
-                .collect::<std::collections::HashSet<_>>()
+                .collect::<std::collections::HashSet<_>>();
+            (tab_id, changed)
         };
         if let Some(ui) = weak.upgrade() {
-            update_file_rows(&ui, &state_for_select, &changed_rows);
+            update_file_rows(&ui, &state_for_select, tab_id, &changed_rows);
             update_selection_summary(&ui, &state_for_select);
         }
     });
@@ -3760,80 +3761,54 @@ fn wire_callbacks(
     let weak = ui.as_weak();
     let state_for_clear = state.clone();
     ui.on_clear_selection(move || {
-        let mut app = state_for_clear
-            .lock()
-            .expect("app state mutex is not poisoned");
-        let tab_id = app.active_window_state().active_tab;
-        if let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) {
-            tab.clear_selection();
-        }
-        drop(app);
-        if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state_for_clear);
+        let update = mutate_active_selection(&state_for_clear, TabSession::clear_selection);
+        if let (Some(ui), Some((tab_id, changed))) = (weak.upgrade(), update) {
+            update_file_rows(&ui, &state_for_clear, tab_id, &changed);
+            update_selection_summary(&ui, &state_for_clear);
         }
     });
 
     let weak = ui.as_weak();
     let state_for_all = state.clone();
     ui.on_select_all(move || {
-        let mut app = state_for_all
-            .lock()
-            .expect("app state mutex is not poisoned");
-        let tab_id = app.active_window_state().active_tab;
-        if let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) {
-            tab.select_all();
-        }
-        drop(app);
-        if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state_for_all);
+        let update = mutate_active_selection(&state_for_all, TabSession::select_all);
+        if let (Some(ui), Some((tab_id, changed))) = (weak.upgrade(), update) {
+            update_file_rows(&ui, &state_for_all, tab_id, &changed);
+            update_selection_summary(&ui, &state_for_all);
         }
     });
 
     let weak = ui.as_weak();
     let state_for_focus = state.clone();
     ui.on_move_focus(move |delta, extend| {
-        let mut app = state_for_focus
-            .lock()
-            .expect("app state mutex is not poisoned");
-        let tab_id = app.active_window_state().active_tab;
-        if let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) {
+        let update = mutate_active_selection(&state_for_focus, |tab| {
             tab.move_focus(delta as isize, extend);
-        }
-        drop(app);
-        if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state_for_focus);
+        });
+        if let (Some(ui), Some((tab_id, changed))) = (weak.upgrade(), update) {
+            update_file_rows(&ui, &state_for_focus, tab_id, &changed);
+            update_selection_summary(&ui, &state_for_focus);
         }
     });
 
     let weak = ui.as_weak();
     let state_for_boundary = state.clone();
     ui.on_focus_boundary(move |last, extend| {
-        let mut app = state_for_boundary
-            .lock()
-            .expect("app state mutex is not poisoned");
-        let tab_id = app.active_window_state().active_tab;
-        if let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) {
+        let update = mutate_active_selection(&state_for_boundary, |tab| {
             tab.focus_boundary(last, extend);
-        }
-        drop(app);
-        if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state_for_boundary);
+        });
+        if let (Some(ui), Some((tab_id, changed))) = (weak.upgrade(), update) {
+            update_file_rows(&ui, &state_for_boundary, tab_id, &changed);
+            update_selection_summary(&ui, &state_for_boundary);
         }
     });
 
     let weak = ui.as_weak();
     let state_for_toggle = state.clone();
     ui.on_toggle_focused(move || {
-        let mut app = state_for_toggle
-            .lock()
-            .expect("app state mutex is not poisoned");
-        let tab_id = app.active_window_state().active_tab;
-        if let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) {
-            tab.toggle_focused();
-        }
-        drop(app);
-        if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state_for_toggle);
+        let update = mutate_active_selection(&state_for_toggle, TabSession::toggle_focused);
+        if let (Some(ui), Some((tab_id, changed))) = (weak.upgrade(), update) {
+            update_file_rows(&ui, &state_for_toggle, tab_id, &changed);
+            update_selection_summary(&ui, &state_for_toggle);
         }
     });
 
@@ -4732,6 +4707,12 @@ enum SideNavigation {
     Forward,
 }
 
+fn is_side_navigation_mouse_button(button: winit::event::MouseButton) -> bool {
+    matches!(
+        button,
+        winit::event::MouseButton::Back | winit::event::MouseButton::Forward
+    )
+}
 fn side_navigation_for_mouse_button(
     state: winit::event::ElementState,
     button: winit::event::MouseButton,
@@ -5107,6 +5088,11 @@ fn wire_mouse_navigation(
                     EventResult::Propagate
                 }
             }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button,
+                ..
+            } if is_side_navigation_mouse_button(*button) => EventResult::PreventDefault,
             WindowEvent::MouseInput { state, button, .. }
                 if side_navigation_for_mouse_button(*state, *button)
                     == Some(SideNavigation::Back) =>
@@ -8001,10 +7987,10 @@ fn start_everything_event_pump(
             let routed_tab = match &event {
                 EverythingEvent::SearchPage { tab_id, .. }
                 | EverythingEvent::SearchFailed { tab_id, .. }
-                | EverythingEvent::SearchSkipped { tab_id, .. }
-                | EverythingEvent::FolderSize { tab_id, .. } => Some(*tab_id),
-                EverythingEvent::Status(_) => None,
+                | EverythingEvent::SearchSkipped { tab_id, .. } => Some(*tab_id),
+                EverythingEvent::FolderSize { .. } | EverythingEvent::Status(_) => None,
             };
+            let mut folder_size_update = None;
             let mut app = state.lock().expect("app state mutex is not poisoned");
             match event {
                 EverythingEvent::SearchPage { tab_id, request_id, offset, entries, total, file_total } => if let Some(tab) = app.tab_mut(tab_id) && tab.accepts_page(request_id, PageSource::Search) {
@@ -8107,14 +8093,26 @@ fn start_everything_event_pump(
                     return;
                 },
                 EverythingEvent::FolderSize { tab_id, request_id, entry_id, path, state: size } => {
-                    apply_folder_size_event(
+                    let size_sort = app
+                        .tab(tab_id)
+                        .is_some_and(|tab| tab.sort_field == SortField::Size);
+                    if apply_folder_size_event(
                         &mut app,
                         tab_id,
                         request_id,
                         entry_id,
                         &path,
                         size,
-                    );
+                    ) {
+                        let changed = if size_sort {
+                            app.tab(tab_id)
+                                .map(|tab| tab.entries.iter().map(|entry| entry.id).collect())
+                                .unwrap_or_default()
+                        } else {
+                            HashSet::from([entry_id])
+                        };
+                        folder_size_update = Some((tab_id, changed));
+                    }
                 }
                 EverythingEvent::Status(result) => match result {
                     Ok(status) => { app.everything_status = format!("Everything {} · {}", status.version, if status.folder_size_indexed { "文件夹大小已索引" } else { "文件夹大小未索引" }); app.everything_folder_sizes_indexed = Some(status.folder_size_indexed); app.everything_config.verified_version = Some(status.version.to_string()); }
@@ -8122,6 +8120,14 @@ fn start_everything_event_pump(
                 },
             }
             drop(app);
+            if let Some((tab_id, changed)) = folder_size_update {
+                if let Some(window_id) = state.lock().ok().and_then(|app| app.window_for_tab(tab_id))
+                    && let Some(target_ui) = window_ui(window_id)
+                {
+                    update_file_rows(&target_ui, &state, tab_id, &changed);
+                }
+                return;
+            }
             if let Some(tab_id) = routed_tab {
                 refresh_tab_window(&state, tab_id);
             } else {
@@ -8628,13 +8634,19 @@ fn append_active_file_rows(
 }
 
 fn update_icon_row(ui: &AppWindow, state: &SharedSessions, update: IconUpdate) {
-    use slint::Model;
-
     let app = state.lock().expect("app state mutex is not poisoned");
-    if app.active_window_state().active_tab != update.tab_id {
+    let Some(window_id) = app.window_for_tab(update.tab_id) else {
+        return;
+    };
+    let Some(window) = app.window(window_id) else {
+        return;
+    };
+    if window.active_tab != update.tab_id {
         return;
     }
-    let tab = app.active();
+    let Some(tab) = window.tabs.get(&update.tab_id) else {
+        return;
+    };
     let Some(entry_id) = update.entry_id else {
         let path = tab.visible_path();
         ui.set_current_location_icon(
@@ -8644,48 +8656,110 @@ fn update_icon_row(ui: &AppWindow, state: &SharedSessions, update: IconUpdate) {
         );
         return;
     };
-    let grid_mode = tab
-        .visible_path()
-        .is_some_and(|path| app.directory_view_modes.get(path) == Some(&ViewMode::Grid));
-    if grid_mode {
-        drop(app);
-        refresh_tab_window(state, update.tab_id);
-        return;
-    }
-    let Some(index) = tab.visible_entry_index(entry_id) else {
-        return;
-    };
-    let Some(entry) = tab.visible_entry(entry_id) else {
-        return;
-    };
-    let model = ui.get_files();
-    let Some(model) = model.as_any().downcast_ref::<VecModel<FileRow>>() else {
-        return;
-    };
-    if index < model.row_count() {
-        model.set_row_data(index, file_row(entry, tab, Texts::new(app.language), &app));
-    }
+    drop(app);
+    update_file_rows(ui, state, update.tab_id, &HashSet::from([entry_id]));
+}
+
+fn selection_projection_ids(tab: &TabSession) -> HashSet<EntryId> {
+    tab.selected.iter().copied().chain(tab.focused).collect()
+}
+
+fn mutate_active_selection(
+    state: &WindowSessions,
+    mutate: impl FnOnce(&mut TabSession),
+) -> Option<(TabId, HashSet<EntryId>)> {
+    let mut app = state.lock().ok()?;
+    let tab_id = app.active_window_state().active_tab;
+    let tab = app.active_window_state_mut().tabs.get_mut(&tab_id)?;
+    let before = selection_projection_ids(tab);
+    mutate(tab);
+    let mut changed = before;
+    changed.extend(selection_projection_ids(tab));
+    Some((tab_id, changed))
 }
 fn update_file_rows(
     ui: &AppWindow,
     state: &SharedSessions,
-    changed: &std::collections::HashSet<EntryId>,
+    tab_id: TabId,
+    changed: &HashSet<EntryId>,
 ) {
     use slint::Model;
 
-    let app = state.lock().expect("app state mutex is not poisoned");
-    let tab = app.active();
-    if !matches!(tab.load_state, LoadState::Complete) {
+    if changed.is_empty() {
         return;
     }
-    let texts = Texts::new(app.language);
-    let model = ui.get_files();
-    let Some(model) = model.as_any().downcast_ref::<VecModel<FileRow>>() else {
+    let app = state.lock().expect("app state mutex is not poisoned");
+    let Some(window_id) = app.window_for_tab(tab_id) else {
         return;
     };
-    for (index, entry) in tab.entries.iter().enumerate() {
-        if changed.contains(&entry.id) {
-            model.set_row_data(index, file_row(entry, tab, texts, &app));
+    let Some(window) = app.window(window_id) else {
+        return;
+    };
+    if window.active_tab != tab_id {
+        return;
+    }
+    let Some(tab) = window.tabs.get(&tab_id) else {
+        return;
+    };
+    if ui.get_projected_file_tab_id() != tab_id.0 as i32
+        || ui.get_projected_file_request_id() != tab.latest_request.0 as i32
+    {
+        return;
+    }
+
+    let texts = Texts::new(app.language);
+    let rows = tab
+        .visible_entries()
+        .iter()
+        .filter(|entry| changed.contains(&entry.id))
+        .map(|entry| (entry.id, file_row(entry, tab, texts, &app)))
+        .collect::<HashMap<_, _>>();
+    if rows.is_empty() {
+        return;
+    }
+
+    let model = ui.get_files();
+    if let Some(model) = model.as_any().downcast_ref::<SearchFileModel>() {
+        for row in rows.values() {
+            assert!(
+                model.update_row(row.clone()),
+                "search row identity must map to a virtual result slot"
+            );
+        }
+    } else if let Some(model) = model.as_any().downcast_ref::<VecModel<FileRow>>() {
+        for (index, entry) in tab.visible_entries().iter().enumerate() {
+            if let Some(row) = rows.get(&entry.id)
+                && index < model.row_count()
+            {
+                model.set_row_data(index, row.clone());
+            }
+        }
+    } else {
+        panic!("file projection model must be directory or search model");
+    }
+
+    let grid_model = ui.get_grid_rows();
+    if let Some(grid_model) = grid_model.as_any().downcast_ref::<VecModel<GridRow>>() {
+        let columns = ui.get_grid_column_count().max(1) as usize;
+        for (index, entry) in tab.visible_entries().iter().enumerate() {
+            let Some(updated) = rows.get(&entry.id) else {
+                continue;
+            };
+            let row_index = index / columns;
+            let entry_index = index % columns;
+            let Some(grid_row) = grid_model.row_data(row_index) else {
+                continue;
+            };
+            let Some(entries) = grid_row
+                .entries
+                .as_any()
+                .downcast_ref::<VecModel<FileRow>>()
+            else {
+                continue;
+            };
+            if entry_index < entries.row_count() {
+                entries.set_row_data(entry_index, updated.clone());
+            }
         }
     }
 }
@@ -9658,6 +9732,40 @@ fn initial_path() -> PathBuf {
 mod tests {
     use super::*;
 
+    fn test_file_row(id: i32, selected: bool, focused: bool) -> FileRow {
+        FileRow {
+            id,
+            loaded: true,
+            name: format!("row-{id}").into(),
+            name_segments: ModelRc::new(VecModel::default()),
+            kind: "File".into(),
+            parent_path: "C:\\test".into(),
+            size: "1 B".into(),
+            modified: "".into(),
+            is_directory: false,
+            selected,
+            focused,
+            cut: false,
+            icon: Image::default(),
+        }
+    }
+
+    #[test]
+    fn search_file_model_updates_selection_by_stable_result_identity() {
+        use slint::Model;
+
+        let model = SearchFileModel::new(8, empty_file_row());
+        assert!(model.update_row(test_file_row(3, false, false)));
+        assert!(!model.row_data(2).unwrap().selected);
+
+        assert!(model.update_row(test_file_row(3, true, true)));
+        let updated = model.row_data(2).unwrap();
+        assert!(updated.selected);
+        assert!(updated.focused);
+        assert_eq!(updated.id, 3);
+        assert!(!model.update_row(test_file_row(0, true, true)));
+        assert!(!model.update_row(test_file_row(9, true, true)));
+    }
     #[test]
     fn tab_drop_routes_physical_screen_cursor_at_each_dpi() {
         assert_eq!(
@@ -11177,9 +11285,20 @@ mod tests {
         );
     }
     #[test]
-    fn side_navigation_routes_only_released_back_and_forward_buttons() {
+    fn side_navigation_consumes_both_phases_and_routes_only_release() {
         use winit::event::{ElementState, MouseButton};
 
+        assert!(is_side_navigation_mouse_button(MouseButton::Back));
+        assert!(is_side_navigation_mouse_button(MouseButton::Forward));
+        assert!(!is_side_navigation_mouse_button(MouseButton::Left));
+        assert_eq!(
+            side_navigation_for_mouse_button(ElementState::Pressed, MouseButton::Back),
+            None
+        );
+        assert_eq!(
+            side_navigation_for_mouse_button(ElementState::Pressed, MouseButton::Forward),
+            None
+        );
         assert_eq!(
             side_navigation_for_mouse_button(ElementState::Released, MouseButton::Back),
             Some(SideNavigation::Back)
@@ -11187,10 +11306,6 @@ mod tests {
         assert_eq!(
             side_navigation_for_mouse_button(ElementState::Released, MouseButton::Forward),
             Some(SideNavigation::Forward)
-        );
-        assert_eq!(
-            side_navigation_for_mouse_button(ElementState::Pressed, MouseButton::Back),
-            None
         );
         assert_eq!(
             side_navigation_for_mouse_button(ElementState::Released, MouseButton::Left),

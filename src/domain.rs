@@ -583,6 +583,12 @@ impl TabSession {
                     .map(|entry| (*id, entry.path.clone()))
             })
             .collect::<HashMap<_, _>>();
+        let focused_path = self
+            .focused
+            .and_then(|id| self.visible_entry(id).map(|entry| (id, entry.path.clone())));
+        let anchor_path = self
+            .selection_anchor
+            .and_then(|id| self.visible_entry(id).map(|entry| (id, entry.path.clone())));
         let current = Arc::make_mut(&mut self.entries);
         for entry in entries {
             if let Some(index) = current.iter().position(|existing| existing.id == entry.id) {
@@ -597,7 +603,10 @@ impl TabSession {
         while self.search_cached_pages.len() > CACHE_PAGE_LIMIT {
             let Some(position) = self.search_cached_pages.iter().position(|cached| {
                 let end = cached.saturating_add(page_size);
-                !self.selected.iter().any(|id| id.0 > *cached && id.0 <= end)
+                let protects_page = |id: EntryId| id.0 > *cached && id.0 <= end;
+                !self.selected.iter().copied().any(protects_page)
+                    && self.focused.is_none_or(|id| !protects_page(id))
+                    && self.selection_anchor.is_none_or(|id| !protects_page(id))
             }) else {
                 break;
             };
@@ -618,12 +627,15 @@ impl TabSession {
                 .get(id)
                 .is_none_or(|expected_path| entry_paths.get(id) == Some(expected_path))
         });
-        if self.focused.is_some_and(|id| !self.selected.contains(&id)) {
+        if focused_path
+            .as_ref()
+            .is_some_and(|(id, expected_path)| entry_paths.get(id) != Some(expected_path))
+        {
             self.focused = None;
         }
-        if self
-            .selection_anchor
-            .is_some_and(|id| !self.selected.contains(&id))
+        if anchor_path
+            .as_ref()
+            .is_some_and(|(id, expected_path)| entry_paths.get(id) != Some(expected_path))
         {
             self.selection_anchor = None;
         }
@@ -1224,6 +1236,96 @@ mod tests {
         assert_eq!(session.search_state, SearchState::Partial);
     }
 
+    #[test]
+    fn unselected_search_focus_survives_loading_another_page() {
+        let mut session = TabSession::new(TabId(1));
+        session.begin_search(SearchScope::Global, ".md".into());
+        session.merge_search_page(
+            0,
+            vec![entry(1, "one.md", EntryKind::File, Some(1))],
+            512,
+            512,
+            256,
+        );
+        session.select_entry(EntryId(1), false, false);
+        session.select_entry(EntryId(1), true, false);
+        assert!(session.selected.is_empty());
+        assert_eq!(session.focused, Some(EntryId(1)));
+        assert_eq!(session.selection_anchor, Some(EntryId(1)));
+
+        session.merge_search_page(
+            256,
+            vec![entry(257, "later.md", EntryKind::File, Some(1))],
+            512,
+            512,
+            256,
+        );
+
+        assert_eq!(session.focused, Some(EntryId(1)));
+        assert_eq!(session.selection_anchor, Some(EntryId(1)));
+    }
+    #[test]
+    fn search_page_replacement_clears_focus_when_result_identity_changes() {
+        let mut session = TabSession::new(TabId(1));
+        session.begin_search(SearchScope::Global, ".md".into());
+        session.merge_search_page(
+            0,
+            vec![entry(1, "old.md", EntryKind::File, Some(1))],
+            256,
+            256,
+            256,
+        );
+        session.select_entry(EntryId(1), false, false);
+        session.select_entry(EntryId(1), true, false);
+
+        session.merge_search_page(
+            0,
+            vec![entry(1, "new.md", EntryKind::File, Some(1))],
+            256,
+            256,
+            256,
+        );
+
+        assert!(session.selected.is_empty());
+        assert_eq!(session.focused, None);
+        assert_eq!(session.selection_anchor, None);
+    }
+    #[test]
+    fn search_cache_keeps_page_with_unselected_focus_and_anchor() {
+        let mut session = TabSession::new(TabId(1));
+        session.begin_search(SearchScope::Global, ".md".into());
+        session.merge_search_page(
+            0,
+            vec![entry(1, "focused.md", EntryKind::File, Some(1))],
+            100_000,
+            80_000,
+            256,
+        );
+        session.select_entry(EntryId(1), false, false);
+        session.select_entry(EntryId(1), true, false);
+
+        for page in 1..=8 {
+            let offset = page * 256;
+            session.merge_search_page(
+                offset,
+                vec![entry(
+                    offset + 1,
+                    &format!("result-{page}.md"),
+                    EntryKind::File,
+                    Some(1),
+                )],
+                100_000,
+                80_000,
+                256,
+            );
+        }
+
+        assert_eq!(session.search_cached_pages.len(), 7);
+        assert!(session.search_cached_pages.contains(&0));
+        assert!(session.visible_entry(EntryId(1)).is_some());
+        assert_eq!(session.focused, Some(EntryId(1)));
+        assert_eq!(session.selection_anchor, Some(EntryId(1)));
+    }
     #[test]
     fn random_search_pages_merge_by_absolute_result_position() {
         let mut session = TabSession::new(TabId(1));
