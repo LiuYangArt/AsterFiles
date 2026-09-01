@@ -682,7 +682,51 @@ fn physical_client_to_logical(
     )
 }
 
+fn insertion_indicator_screen_rect(
+    ui: &AppWindow,
+    insertion_index: usize,
+) -> Option<(i32, i32, i32, i32)> {
+    let (left, top, _, _) =
+        platform::windows::drag_drop::client_screen_rect(native_window_handle(ui)).ok()?;
+    let scale = ui.window().scale_factor();
+    let strip_width = ui.get_tab_strip_width();
+    let logical_x = (47.0
+        + ui.get_tab_viewport_x()
+        + if insertion_index == 0 {
+            0.0
+        } else {
+            insertion_index as f32 * (ui.get_tab_current_width() + 5.0) - 5.0
+        })
+    .clamp(47.0, 47.0 + strip_width - 5.0);
+    Some((
+        left + (logical_x * scale).round() as i32,
+        top + (12.0 * scale).round() as i32,
+        (5.0 * scale).round().max(1.0) as i32,
+        (34.0 * scale).round().max(1.0) as i32,
+    ))
+}
+
+fn project_native_insertion_indicator(target: Option<(WindowId, usize)>) {
+    let projected = target.and_then(|(window_id, insertion_index)| {
+        let ui = window_ui(window_id)?;
+        let (x, y, width, height) = insertion_indicator_screen_rect(&ui, insertion_index)?;
+        platform::windows::tab_insertion_indicator::show(
+            native_window_handle(&ui),
+            x,
+            y,
+            width,
+            height,
+        )
+        .ok()?;
+        Some(())
+    });
+    if projected.is_none() {
+        platform::windows::tab_insertion_indicator::hide();
+    }
+}
+
 fn project_cross_window_drop(target: Option<(WindowId, usize)>) {
+    project_native_insertion_indicator(target);
     WINDOW_RUNTIMES.with_borrow(|runtimes| {
         for (window_id, runtime) in runtimes {
             if target.is_some_and(|(target_id, _)| target_id == *window_id) {
@@ -705,6 +749,14 @@ fn project_native_tab_target(
     let Some(ui) = window_ui(window_id) else {
         return;
     };
+    let source_hover = matches!(
+        event,
+        platform::windows::drag_drop::TabTargetEvent::Hover { .. }
+    ) && state
+        .lock()
+        .ok()
+        .and_then(|app| app.tab_drag.map(|drag| drag.window_id))
+        == Some(window_id);
     let target = match event {
         platform::windows::drag_drop::TabTargetEvent::Hover { screen_x, screen_y } => {
             let source_window = state
@@ -734,6 +786,7 @@ fn project_native_tab_target(
                         )
                     });
                     ui.set_tab_drag_insertion_index(insertion.map_or(-1, |index| index as i32));
+                    project_native_insertion_indicator(insertion.map(|index| (window_id, index)));
                     ui.window().request_redraw();
                     None
                 } else {
@@ -744,7 +797,9 @@ fn project_native_tab_target(
         platform::windows::drag_drop::TabTargetEvent::Leave
         | platform::windows::drag_drop::TabTargetEvent::Drop { .. } => None,
     };
-    project_cross_window_drop(target);
+    if !source_hover {
+        project_cross_window_drop(target);
+    }
 }
 
 fn remove_window_runtime(window_id: WindowId) {
@@ -756,6 +811,7 @@ fn remove_window_runtime(window_id: WindowId) {
 }
 
 fn clear_window_runtimes() {
+    platform::windows::tab_insertion_indicator::destroy();
     WINDOW_RUNTIMES.with_borrow_mut(HashMap::clear);
 }
 
@@ -1398,7 +1454,8 @@ impl AppState {
         let Some(window) = self.windows.get(&window_id) else {
             return false;
         };
-        if window.tab_order.get(source_index) != Some(&tab_id)
+        if window.tab_order.len() <= 1
+            || window.tab_order.get(source_index) != Some(&tab_id)
             || window
                 .tabs
                 .get(&tab_id)
@@ -10028,6 +10085,17 @@ mod tests {
     }
 
     #[test]
+    fn single_tab_window_rejects_tab_drag() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
+        let window = app.active_window;
+        let tab = app.active_window_state().active_tab;
+
+        assert!(!app.begin_tab_drag(window, tab, 0, 100.0, 20.0));
+        assert!(app.tab_drag.is_none());
+        assert_eq!(app.active_window_state().tab_order, [tab]);
+    }
+
+    #[test]
     fn tab_drag_reorders_only_ids_and_preserves_request_identity() {
         let mut app = AppState::new_for_test(
             vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")],
@@ -10142,7 +10210,11 @@ mod tests {
 
     #[test]
     fn cross_window_move_failure_and_cancel_leave_source_untouched() {
-        let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
+        let mut app = AppState::new_for_test(
+            vec![PathBuf::from("a"), PathBuf::from("b")],
+            0,
+            [0, 1, 2, 3],
+        );
         let source = app.active_window;
         let tab_id = app.window(source).unwrap().active_tab;
         app.begin_tab_drag(source, tab_id, 0, 100.0, 20.0);
@@ -10150,12 +10222,16 @@ mod tests {
         assert!(app.move_dragged_tab_to_window(WindowId(999), 0).is_none());
         assert!(app.cancel_tab_drag());
         assert_eq!(app.window_for_tab(tab_id), Some(source));
-        assert_eq!(app.window(source).unwrap().tab_order, [tab_id]);
+        assert_eq!(app.window(source).unwrap().tab_order, [tab_id, TabId(2)]);
     }
 
     #[test]
     fn closing_target_window_does_not_cancel_source_drag() {
-        let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
+        let mut app = AppState::new_for_test(
+            vec![PathBuf::from("a"), PathBuf::from("c")],
+            0,
+            [0, 1, 2, 3],
+        );
         let source = app.active_window;
         let target = app.register_window(vec![PathBuf::from("b")], 0, test_window_placement(160));
         let tab_id = app.window(source).unwrap().active_tab;
@@ -10177,7 +10253,11 @@ mod tests {
 
     #[test]
     fn closing_source_window_cancels_its_drag() {
-        let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
+        let mut app = AppState::new_for_test(
+            vec![PathBuf::from("a"), PathBuf::from("c")],
+            0,
+            [0, 1, 2, 3],
+        );
         let source = app.active_window;
         let target = app.register_window(vec![PathBuf::from("b")], 0, test_window_placement(160));
         let tab_id = app.window(source).unwrap().active_tab;
@@ -10237,19 +10317,18 @@ mod tests {
     }
 
     #[test]
-    fn detaching_last_file_tab_closes_source_after_commit() {
+    fn single_tab_cannot_detach_into_an_equivalent_new_window() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
         let source = app.active_window;
-        let (_, tab_id) = begin_drag_at(&mut app, 0);
-        app.update_tab_drag(100.0, 80.0, 47.0, 540.0, 0.0, 178.0);
+        let tab_id = app.active_window_state().active_tab;
+        assert!(!app.begin_tab_drag(source, tab_id, 0, 100.0, 20.0));
         let destination = app.reserve_window_id();
-        let outcome = app
-            .detach_dragged_tab_to_window(destination, test_window_placement(160))
-            .unwrap();
-
-        assert!(outcome.source_window_closed);
-        assert!(app.window(source).is_none());
-        assert_eq!(app.window_for_tab(tab_id), Some(destination));
+        assert!(
+            app.detach_dragged_tab_to_window(destination, test_window_placement(160))
+                .is_none()
+        );
+        assert!(app.window(source).is_some());
+        assert_eq!(app.window_for_tab(tab_id), Some(source));
     }
 
     #[test]
@@ -10272,7 +10351,11 @@ mod tests {
 
     #[test]
     fn cancelled_or_below_threshold_detach_restores_source() {
-        let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
+        let mut app = AppState::new_for_test(
+            vec![PathBuf::from("a"), PathBuf::from("b")],
+            0,
+            [0, 1, 2, 3],
+        );
         let source = app.active_window;
         let (_, tab_id) = begin_drag_at(&mut app, 0);
         app.update_tab_drag(103.0, 20.0, 47.0, 540.0, 0.0, 178.0);

@@ -7,6 +7,7 @@ pub mod drag_drop;
 pub mod everything;
 pub mod file_operation;
 pub mod shortcut;
+pub mod tab_insertion_indicator;
 pub mod window_trace;
 
 use std::io;
