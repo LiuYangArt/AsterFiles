@@ -193,6 +193,7 @@ pub struct TabSession {
     pub search_requested_pages: HashSet<u32>,
     pub search_pending_pages: VecDeque<u32>,
     pub search_cached_pages: VecDeque<u32>,
+    pub search_page_retries: HashMap<u32, u8>,
     directory_snapshot: Option<DirectorySnapshot>,
     pub navigation_kind: NavigationKind,
     pub back_history: Vec<PathBuf>,
@@ -233,6 +234,7 @@ impl TabSession {
             search_requested_pages: HashSet::new(),
             search_pending_pages: VecDeque::new(),
             search_cached_pages: VecDeque::new(),
+            search_page_retries: HashMap::new(),
             directory_snapshot: None,
             navigation_kind: NavigationKind::Normal,
             back_history: Vec::new(),
@@ -280,6 +282,7 @@ impl TabSession {
             search_requested_pages: HashSet::new(),
             search_pending_pages: VecDeque::new(),
             search_cached_pages: VecDeque::new(),
+            search_page_retries: HashMap::new(),
             directory_snapshot: None,
             navigation_kind: NavigationKind::Normal,
             back_history: source.back_history.clone(),
@@ -447,6 +450,7 @@ impl TabSession {
         self.search_requested_pages.insert(0);
         self.search_pending_pages.clear();
         self.search_cached_pages.clear();
+        self.search_page_retries.clear();
         self.error = None;
         self.pending_entries.clear();
         self.replace_entries(Vec::new());
@@ -461,16 +465,6 @@ impl TabSession {
     }
     pub fn accepts_page(&self, request_id: RequestId, source: PageSource) -> bool {
         self.page_source == source && self.accepts(request_id)
-    }
-
-    #[allow(dead_code)]
-    pub fn finish_search(&mut self) {
-        self.commit_pending();
-        self.search_state = if self.entries.is_empty() {
-            SearchState::NoResults
-        } else {
-            SearchState::Complete
-        };
     }
 
     pub fn cancel_address_edit(&mut self) {
@@ -497,6 +491,7 @@ impl TabSession {
         self.search_requested_pages.clear();
         self.search_pending_pages.clear();
         self.search_cached_pages.clear();
+        self.search_page_retries.clear();
         self.search_state = SearchState::Waiting;
     }
 
@@ -515,6 +510,7 @@ impl TabSession {
         self.search_requested_pages.clear();
         self.search_pending_pages.clear();
         self.search_cached_pages.clear();
+        self.search_page_retries.clear();
         self.address_mode = AddressMode::Normal;
         self.navigation_kind = kind;
         self.load_state = LoadState::Loading;
@@ -580,7 +576,7 @@ impl TabSession {
         total: u32,
         file_total: u32,
         page_size: u32,
-    ) -> Vec<u32> {
+    ) {
         const CACHE_PAGE_LIMIT: usize = 7;
         let selected_paths = self
             .selected
@@ -604,9 +600,10 @@ impl TabSession {
                 current.push(entry);
             }
         }
+        self.search_page_retries.remove(&offset);
         self.search_cached_pages.retain(|cached| *cached != offset);
         self.search_cached_pages.push_back(offset);
-        let mut evicted = Vec::new();
+
         while self.search_cached_pages.len() > CACHE_PAGE_LIMIT {
             let Some(position) = self.search_cached_pages.iter().position(|cached| {
                 let end = cached.saturating_add(page_size);
@@ -620,7 +617,6 @@ impl TabSession {
             let cached = self.search_cached_pages.remove(position).unwrap();
             let end = cached.saturating_add(page_size);
             current.retain(|entry| entry.id.0 <= cached || entry.id.0 > end);
-            evicted.push(cached);
         }
         current.sort_unstable_by_key(|entry| entry.id.0);
         self.rebuild_entry_indices();
@@ -656,9 +652,21 @@ impl TabSession {
         } else {
             SearchState::Partial
         };
-        evicted
     }
 
+    pub fn retry_unexpected_search_page(&mut self, offset: u32) -> bool {
+        const MAX_RETRIES: u8 = 2;
+        self.search_requested_pages.remove(&offset);
+        self.search_pending_pages
+            .retain(|pending| *pending != offset);
+        let retries = self.search_page_retries.entry(offset).or_default();
+        if *retries >= MAX_RETRIES {
+            return false;
+        }
+        *retries += 1;
+        self.search_requested_pages.insert(offset);
+        true
+    }
     pub fn queue_search_pages(&mut self, offsets: &[u32], page_size: u32) -> Option<u32> {
         if self.page_source != PageSource::Search {
             return None;
@@ -1393,6 +1401,97 @@ mod tests {
         assert_eq!(session.search_total, Some(100_000));
     }
 
+    #[test]
+    fn deep_search_offsets_and_last_page_keep_absolute_result_identity() {
+        const PAGE_SIZE: u32 = 256;
+        const TOTAL: u32 = 133_796;
+        let mut session = TabSession::new(TabId(1));
+        session.begin_search(SearchScope::Global, ".md".into());
+        session.merge_search_page(
+            0,
+            vec![entry(1, "result-1.md", EntryKind::File, Some(1))],
+            TOTAL,
+            100_000,
+            PAGE_SIZE,
+        );
+        assert_eq!(session.finish_search_page_request(0), None);
+
+        for offset in [65_024, 65_536, 66_816] {
+            assert_eq!(
+                session.queue_search_pages(&[offset], PAGE_SIZE),
+                Some(offset)
+            );
+            session.merge_search_page(
+                offset,
+                vec![entry(
+                    offset + 1,
+                    &format!("result-{}.md", offset + 1),
+                    EntryKind::File,
+                    Some(1),
+                )],
+                TOTAL,
+                100_000,
+                PAGE_SIZE,
+            );
+            assert_eq!(session.finish_search_page_request(offset), None);
+            assert!(session.visible_entry(EntryId(offset + 1)).is_some());
+        }
+
+        let last_offset = TOTAL / PAGE_SIZE * PAGE_SIZE;
+        assert_eq!(last_offset, 133_632);
+        assert_eq!(
+            session.queue_search_pages(&[TOTAL - 1], PAGE_SIZE),
+            Some(last_offset)
+        );
+        session.merge_search_page(
+            last_offset,
+            (last_offset + 1..=TOTAL)
+                .map(|id| entry(id, &format!("result-{id}.md"), EntryKind::File, Some(1)))
+                .collect(),
+            TOTAL,
+            100_000,
+            PAGE_SIZE,
+        );
+        assert_eq!(session.finish_search_page_request(last_offset), None);
+        assert!(session.visible_entry(EntryId(TOTAL)).is_some());
+        assert!(session.search_cached_pages.contains(&last_offset));
+    }
+
+    #[test]
+    fn unexpected_empty_search_page_retries_twice_then_stops() {
+        const PAGE_SIZE: u32 = 256;
+        const TOTAL: u32 = 133_796;
+        const OFFSET: u32 = 65_536;
+        let mut session = TabSession::new(TabId(1));
+        session.begin_search(SearchScope::Global, ".md".into());
+        session.merge_search_page(
+            0,
+            vec![entry(1, "result-1.md", EntryKind::File, Some(1))],
+            TOTAL,
+            100_000,
+            PAGE_SIZE,
+        );
+        assert_eq!(session.finish_search_page_request(0), None);
+
+        assert_eq!(
+            session.queue_search_pages(&[OFFSET], PAGE_SIZE),
+            Some(OFFSET)
+        );
+        for attempt in 0..2 {
+            assert!(session.retry_unexpected_search_page(OFFSET));
+            assert!(
+                session.search_requested_pages.contains(&OFFSET),
+                "retry {attempt} should remain in flight"
+            );
+            assert!(!session.search_cached_pages.contains(&OFFSET));
+        }
+        assert!(!session.retry_unexpected_search_page(OFFSET));
+        assert!(!session.search_requested_pages.contains(&OFFSET));
+        assert_eq!(
+            session.queue_search_pages(&[OFFSET], PAGE_SIZE),
+            Some(OFFSET)
+        );
+    }
     #[test]
     fn search_page_cache_evicts_the_oldest_unselected_page() {
         let mut session = TabSession::new(TabId(1));

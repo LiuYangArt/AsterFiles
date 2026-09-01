@@ -409,7 +409,7 @@ component WindowButton inherits Rectangle {
 }
 
 component LightScrollBar inherits Rectangle {
-    in-out property <length> value;
+    in property <length> value;
     in property <length> maximum;
     in property <length> page-size;
     callback scrolled(length);
@@ -444,8 +444,7 @@ component LightScrollBar inherits Rectangle {
         }
         moved => {
             if self.pressed && root.thumb-travel > 0px {
-                root.value = max(-root.maximum, min(0px, self.press-value - (self.mouse-y - self.press-y) * root.maximum / root.thumb-travel));
-                root.scrolled(root.value);
+                root.scrolled(max(-root.maximum, min(0px, self.press-value - (self.mouse-y - self.press-y) * root.maximum / root.thumb-travel)));
             }
         }
     }
@@ -625,6 +624,8 @@ export component AppWindow inherits Window {
     in property <[ContextCommandRow]> context-commands;
     in property <[OperationRow]> operations;
     in-out property <length> file-viewport-y: 0px;
+    in-out property <length> search-scroll-y: 0px;
+    in property <int> search-total-items: 0;
     out property <length> file-list-top: 0px;
     out property <length> rectangle-viewport-top: 0px;
     out property <length> file-viewport-width: 0px;
@@ -746,7 +747,7 @@ export component AppWindow inherits Window {
 
     callback navigate-path(string);
     callback address-input-changed(string);
-    callback request-search-page(int);
+    callback request-search-position(float);
     callback begin-search();
     callback toggle-search-depth();
 
@@ -779,9 +780,7 @@ export component AppWindow inherits Window {
         root.rectangle-selection-width = 0px;
         root.rectangle-selection-height = 0px;
     }
-    public function ensure-visible-search-page(viewport-y: float) {
-        root.request-visible-search-page(viewport-y * 1px);
-    }
+
     callback select-all();
     callback move-focus(int, bool);
     callback focus-boundary(bool, bool);
@@ -879,10 +878,14 @@ export component AppWindow inherits Window {
     function clamp-file-viewport(available: length) {
         root.file-viewport-x = max(min(0px, available - root.file-columns-width), min(0px, root.file-viewport-x));
     }
-    function request-visible-search-page(viewport-y: length) {
-        if root.search-results-mode {
-            root.request-search-page(floor(max(0px, -viewport-y) / 40px / 256) * 256);
-        }
+    function search-row-height() -> length {
+        return root.view-mode == 1 ? 34px : root.view-mode == 2 ? 148px : 40px;
+    }
+    function search-scroll-maximum(visible-height: length) -> length {
+        let rows = root.view-mode == 2
+            ? ceil(root.search-total-items / max(1, root.grid-column-count))
+            : root.search-total-items;
+        return max(0px, rows * root.search-row-height() - visible-height);
     }
     function dismiss-menus-and-drag-window(pointer-x: length, pointer-y: length) {
         root.context-menu-open = false;
@@ -1455,8 +1458,11 @@ accessible-label: entry.name;
                                     }
                                 }
                                 scroll-event(event) => {
-                                    list.viewport-y = max(-(list.viewport-height - list.visible-height), min(0px, list.viewport-y + event.delta-y));
-                                    root.request-visible-search-page(list.viewport-y);
+                                    if root.search-results-mode {
+                                        root.request-search-position((root.search-scroll-y + event.delta-y) / 1px);
+                                    } else {
+                                        list.viewport-y = max(-(list.viewport-height - list.visible-height), min(0px, list.viewport-y + event.delta-y));
+                                    }
                                     return accept;
                                 }
                                 clicked => { root.activate-entry(entry.id, self.click-control, self.click-shift); }
@@ -1589,11 +1595,17 @@ accessible-label: entry.name;
                     LightScrollBar {
                         x: parent.width - self.width - 9px;
                         height: parent.height;
-                        value <=> root.file-viewport-y;
-                        maximum: root.view-mode == 2 ? max(0px, grid.viewport-height - grid.visible-height) : max(0px, list.viewport-height - list.visible-height);
+                        value: root.search-results-mode ? root.search-scroll-y : root.file-viewport-y;
+                        maximum: root.search-results-mode
+                            ? root.search-scroll-maximum(root.view-mode == 2 ? grid.visible-height : list.visible-height)
+                            : (root.view-mode == 2 ? max(0px, grid.viewport-height - grid.visible-height) : max(0px, list.viewport-height - list.visible-height));
                         page-size: root.view-mode == 2 ? grid.visible-height : list.visible-height;
                         scrolled(viewport-y) => {
-                            root.request-visible-search-page(viewport-y);
+                            if root.search-results-mode {
+                                root.request-search-position(viewport-y / 1px);
+                            } else {
+                                root.file-viewport-y = viewport-y;
+                            }
                         }
                     }
                     if root.page-state == 1 || root.page-state == 3: VerticalLayout {

@@ -11,7 +11,7 @@ use std::{
 };
 
 use slint::{
-    Image, Model, ModelNotify, ModelRc, ModelTracker, Rgba8Pixel, SharedPixelBuffer, VecModel,
+    Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel,
     winit_030::{EventResult, WinitWindowAccessor, winit},
 };
 
@@ -501,17 +501,30 @@ fn grid_thumbnail_requests(
         return Vec::new();
     }
     let entries = tab.visible_entries();
+    let search_window = (tab.page_source == PageSource::Search).then(|| {
+        search_window_for_scroll(
+            ui.get_search_scroll_y(),
+            tab.search_total.unwrap_or(0),
+            ViewMode::Grid,
+            columns,
+        )
+    });
+    let projected_count = search_window.map_or(entries.len(), |window| window.len);
     let indices = grid_thumbnail_request_indices(
-        entries.len(),
+        projected_count,
         columns,
         ui.get_file_viewport_y() / 1.0,
         visible_height,
     );
     let requests = indices
         .into_iter()
-        .take_while(|index| *index < entries.len())
         .filter_map(|index| {
-            let entry = &entries[index];
+            let entry = if let Some(window) = search_window {
+                let id = window.start.checked_add(index as u32)?.checked_add(1)?;
+                tab.visible_entry(EntryId(id))?
+            } else {
+                entries.get(index)?
+            };
             (!app
                 .thumbnail_cache
                 .contains_key(&(entry.path.clone(), requested_px))
@@ -1733,196 +1746,119 @@ enum DirectoryEvent {
 }
 
 const SEARCH_PAGE_LIMIT: u32 = 256;
+const SEARCH_WINDOW_PAGE_COUNT: u32 = 3;
+const SEARCH_WINDOW_ITEM_LIMIT: usize = (SEARCH_PAGE_LIMIT * SEARCH_WINDOW_PAGE_COUNT) as usize;
 
-struct SearchFileModel {
-    total: usize,
-    rows: std::cell::RefCell<HashMap<usize, FileRow>>,
-    placeholder: FileRow,
-    notify: ModelNotify,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SearchWindow {
+    start: u32,
+    len: usize,
 }
 
-impl SearchFileModel {
-    fn new(total: usize, placeholder: FileRow) -> Self {
-        Self {
-            total,
-            rows: std::cell::RefCell::new(HashMap::new()),
-            placeholder,
-            notify: ModelNotify::default(),
-        }
-    }
-
-    fn update_page(&self, offset: usize, rows: Vec<FileRow>) {
-        let mut slots = self.rows.borrow_mut();
-        let mut changed = Vec::new();
-        for (index, row) in rows.into_iter().enumerate() {
-            let target = offset + index;
-            if target < self.total {
-                slots.insert(target, row);
-                changed.push(target);
-            }
-        }
-        drop(slots);
-        for target in changed {
-            self.notify.row_changed(target);
-        }
-    }
-
-    fn update_rows(&self, rows: Vec<FileRow>) {
-        for row in rows {
-            self.update_row(row);
-        }
-    }
-
-    fn update_row(&self, row: FileRow) -> bool {
-        let Some(target) = row.id.checked_sub(1).map(|id| id as usize) else {
-            return false;
-        };
-        if target >= self.total {
-            return false;
-        }
-        self.rows.borrow_mut().insert(target, row);
-        self.notify.row_changed(target);
-        true
-    }
-
-    fn clear_page(&self, offset: usize, count: usize) {
-        let end = offset.saturating_add(count).min(self.total);
-        let mut slots = self.rows.borrow_mut();
-        for target in offset..end {
-            slots.remove(&target);
-        }
-        drop(slots);
-        for target in offset..end {
-            self.notify.row_changed(target);
-        }
+fn search_row_height(view_mode: ViewMode) -> f32 {
+    match view_mode {
+        ViewMode::Details => 40.0,
+        ViewMode::List => 34.0,
+        ViewMode::Grid => 148.0,
     }
 }
 
-impl Model for SearchFileModel {
-    type Data = FileRow;
-
-    fn row_count(&self) -> usize {
-        self.total
-    }
-
-    fn row_data(&self, row: usize) -> Option<Self::Data> {
-        (row < self.total).then(|| {
-            self.rows
-                .borrow()
-                .get(&row)
-                .cloned()
-                .unwrap_or_else(|| self.placeholder.clone())
-        })
-    }
-
-    fn model_tracker(&self) -> &dyn ModelTracker {
-        &self.notify
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
-struct SearchGridModel {
-    total: usize,
+fn search_logical_maximum(
+    total: u32,
+    view_mode: ViewMode,
     columns: usize,
-    rows: std::cell::RefCell<HashMap<usize, FileRow>>,
-    placeholder: FileRow,
-    notify: ModelNotify,
+    visible_height: f32,
+) -> f32 {
+    let rows = match view_mode {
+        ViewMode::Grid => (total as usize).div_ceil(columns.max(1)),
+        ViewMode::Details | ViewMode::List => total as usize,
+    };
+    (rows as f32 * search_row_height(view_mode) - visible_height).max(0.0)
 }
 
-impl SearchGridModel {
-    fn new(total: usize, columns: usize, placeholder: FileRow) -> Self {
-        Self {
-            total,
-            columns: columns.max(1),
-            rows: std::cell::RefCell::new(HashMap::new()),
-            placeholder,
-            notify: ModelNotify::default(),
-        }
+fn search_result_index_at_scroll(
+    scroll_y: f32,
+    total: u32,
+    view_mode: ViewMode,
+    columns: usize,
+) -> u32 {
+    if total == 0 {
+        return 0;
     }
-
-    fn update_rows(&self, rows: impl IntoIterator<Item = FileRow>) {
-        let mut changed_rows = HashSet::new();
-        let mut slots = self.rows.borrow_mut();
-        for row in rows {
-            let Some(target) = row.id.checked_sub(1).map(|id| id as usize) else {
-                continue;
-            };
-            if target < self.total {
-                slots.insert(target, row);
-                changed_rows.insert(target / self.columns);
-            }
-        }
-        drop(slots);
-        for row in changed_rows {
-            self.notify.row_changed(row);
-        }
-    }
-
-    #[cfg(test)]
-    fn update_row(&self, row: FileRow) -> bool {
-        let Some(target) = row.id.checked_sub(1).map(|id| id as usize) else {
-            return false;
-        };
-        if target >= self.total {
-            return false;
-        }
-        self.rows.borrow_mut().insert(target, row);
-        self.notify.row_changed(target / self.columns);
-        true
-    }
-
-    fn clear_page(&self, offset: usize, count: usize) {
-        let end = offset.saturating_add(count).min(self.total);
-        let mut rows = self.rows.borrow_mut();
-        for target in offset..end {
-            rows.remove(&target);
-        }
-        drop(rows);
-        let start_row = offset / self.columns;
-        let end_row = end.saturating_sub(1) / self.columns;
-        for row in start_row..=end_row {
-            self.notify.row_changed(row);
-        }
-    }
+    let row = ((-scroll_y).max(0.0) / search_row_height(view_mode)).floor() as usize;
+    let index = match view_mode {
+        ViewMode::Grid => row.saturating_mul(columns.max(1)),
+        ViewMode::Details | ViewMode::List => row,
+    };
+    index.min(total.saturating_sub(1) as usize) as u32
 }
 
-impl Model for SearchGridModel {
-    type Data = GridRow;
-
-    fn row_count(&self) -> usize {
-        self.total.div_ceil(self.columns)
+fn search_window_for_index(index: u32, total: u32, columns: usize) -> SearchWindow {
+    if total == 0 {
+        return SearchWindow { start: 0, len: 0 };
     }
+    let page = index / SEARCH_PAGE_LIMIT * SEARCH_PAGE_LIMIT;
+    let start = page.saturating_sub(SEARCH_PAGE_LIMIT);
+    let columns = columns.max(1) as u32;
+    let start = start / columns * columns;
+    SearchWindow {
+        start,
+        len: total
+            .saturating_sub(start)
+            .min(SEARCH_WINDOW_ITEM_LIMIT as u32) as usize,
+    }
+}
+fn search_window_for_scroll(
+    scroll_y: f32,
+    total: u32,
+    view_mode: ViewMode,
+    columns: usize,
+) -> SearchWindow {
+    search_window_for_index(
+        search_result_index_at_scroll(scroll_y, total, view_mode, columns),
+        total,
+        columns,
+    )
+}
 
-    fn row_data(&self, row: usize) -> Option<Self::Data> {
-        (row < self.row_count()).then(|| {
-            let slots = self.rows.borrow();
-            let start = row * self.columns;
-            let end = (start + self.columns).min(self.total);
-            GridRow {
-                entries: ModelRc::new(VecModel::from(
-                    (start..end)
-                        .map(|slot| {
-                            slots
-                                .get(&slot)
-                                .cloned()
-                                .unwrap_or_else(|| self.placeholder.clone())
-                        })
-                        .collect::<Vec<_>>(),
-                )),
-            }
+fn search_window_local_index(entry_id: EntryId, window_start: u32) -> Option<usize> {
+    entry_id
+        .0
+        .checked_sub(window_start.saturating_add(1))
+        .map(|index| index as usize)
+}
+
+fn search_window_viewport_y(
+    index: u32,
+    window: SearchWindow,
+    view_mode: ViewMode,
+    columns: usize,
+) -> f32 {
+    let local = index.saturating_sub(window.start) as usize;
+    let row = match view_mode {
+        ViewMode::Grid => local / columns.max(1),
+        ViewMode::Details | ViewMode::List => local,
+    };
+    -(row as f32 * search_row_height(view_mode))
+}
+fn search_scroll_for_index(index: u32, view_mode: ViewMode, columns: usize) -> f32 {
+    let row = match view_mode {
+        ViewMode::Grid => index as usize / columns.max(1),
+        ViewMode::Details | ViewMode::List => index as usize,
+    };
+    -(row as f32 * search_row_height(view_mode))
+}
+
+fn search_window_rows(tab: &TabSession, app: &AppState, window: SearchWindow) -> Vec<FileRow> {
+    let texts = Texts::new(app.language);
+    (0..window.len)
+        .map(|local| {
+            let result_index = window.start.saturating_add(local as u32);
+            tab.visible_entry(EntryId(result_index.saturating_add(1)))
+                .map(|entry| file_row(entry, tab, texts, app))
+                .unwrap_or_else(empty_file_row)
         })
-    }
-
-    fn model_tracker(&self) -> &dyn ModelTracker {
-        &self.notify
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
+        .collect()
 }
 
 #[derive(Debug)]
@@ -1957,6 +1893,7 @@ enum EverythingEvent {
         entries: Vec<FileEntry>,
         total: u32,
         file_total: u32,
+        response_valid: bool,
     },
     SearchFailed {
         tab_id: TabId,
@@ -2853,25 +2790,52 @@ fn selected_paths(app: &AppState) -> Vec<PathBuf> {
 
 fn context_target_at(
     state: &SharedSessions,
+    window_x: f32,
     window_y: f32,
     list_top: f32,
     viewport_y: f32,
+    search_scroll_y: f32,
+    grid_columns: usize,
 ) -> (Option<EntryId>, bool) {
-    const ROW_HEIGHT: f32 = 40.0;
     let app = state.lock().expect("app state mutex is not poisoned");
     if window_y < list_top {
         return (None, true);
     }
-    let index = ((window_y - list_top + (-viewport_y).max(0.0)) / ROW_HEIGHT).floor() as usize;
     let active = app.active();
+    let view_mode = active
+        .visible_path()
+        .and_then(|path| app.directory_view_modes.get(path))
+        .copied()
+        .unwrap_or(ViewMode::Details);
+    let local_row = ((window_y - list_top + (-viewport_y).max(0.0)) / search_row_height(view_mode))
+        .floor() as usize;
+    let local_index = match view_mode {
+        ViewMode::Grid => {
+            let column = (window_x.max(0.0) / 148.0).floor() as usize;
+            local_row
+                .saturating_mul(grid_columns.max(1))
+                .saturating_add(column.min(grid_columns.max(1) - 1))
+        }
+        ViewMode::Details | ViewMode::List => local_row,
+    };
     let entry = if active.page_source == PageSource::Search {
-        u32::try_from(index)
-            .ok()
+        let window = search_window_for_scroll(
+            search_scroll_y,
+            active.search_total.unwrap_or(0),
+            view_mode,
+            grid_columns,
+        );
+        window
+            .start
+            .checked_add(local_index as u32)
             .and_then(|index| index.checked_add(1))
             .and_then(|id| active.visible_entry(EntryId(id)))
             .map(|entry| entry.id)
     } else {
-        active.visible_entries().get(index).map(|entry| entry.id)
+        active
+            .visible_entries()
+            .get(local_index)
+            .map(|entry| entry.id)
     };
     (entry, entry.is_none())
 }
@@ -3399,8 +3363,15 @@ fn wire_internal_drag_drop(
             return;
         }
         let target = state_for_end.lock().ok().and_then(|app| {
-            internal_drag_target(&app, y, ui.get_file_list_top(), ui.get_file_viewport_y())
-                .map(|(_, path)| path)
+            internal_drag_target(
+                &app,
+                y,
+                ui.get_file_list_top(),
+                ui.get_file_viewport_y(),
+                ui.get_search_scroll_y(),
+                ui.get_grid_column_count().max(1) as usize,
+            )
+            .map(|(_, path)| path)
         });
         let Some(target) = target else {
             return;
@@ -3472,13 +3443,6 @@ impl SelectionRect {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FilePointerOwner {
-    BackgroundSelection,
-    EntryDrag,
-}
-
 #[derive(Debug)]
 struct RectangleSelectionGesture {
     tab_id: TabId,
@@ -3496,15 +3460,6 @@ struct RectangleSelectionGesture {
     dirty: bool,
     committed: bool,
     last_hits: HashSet<EntryId>,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn file_pointer_owner(started_on_entry: bool) -> FilePointerOwner {
-    if started_on_entry {
-        FilePointerOwner::EntryDrag
-    } else {
-        FilePointerOwner::BackgroundSelection
-    }
 }
 
 fn rectangle_selection_started(start_x: f32, start_y: f32, x: f32, y: f32) -> bool {
@@ -3817,6 +3772,7 @@ fn update_rectangle_selection(
                 .unwrap_or(ViewMode::Details);
             let grid_columns = ui.get_grid_column_count().max(1) as usize;
             let viewport_width = ui.get_file_viewport_width();
+
             let tab = app.active_window_state_mut().tabs.get_mut(&tab_id).unwrap();
             if tab.latest_request != request_id {
                 None
@@ -3989,21 +3945,27 @@ fn wire_rectangle_selection(ui: &AppWindow, state: WindowSessions) -> Rc<slint::
                 let top = ui.get_rectangle_viewport_top();
                 let bottom = top + ui.get_file_viewport_height();
                 let delta = rectangle_selection_scroll_delta(pointer_y, top, bottom);
-                let maximum = rectangle_selection_scroll_maximum(
-                    ui.get_files().row_count(),
-                    match ui.get_view_mode() {
-                        1 => ViewMode::List,
-                        2 => ViewMode::Grid,
-                        _ => ViewMode::Details,
-                    },
-                    ui.get_grid_column_count().max(1) as usize,
-                    ui.get_file_viewport_height(),
-                );
-                let viewport = (ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0);
-                if viewport != ui.get_file_viewport_y() {
-                    ui.set_file_viewport_y(viewport);
-                    ui.invoke_ensure_visible_search_page(viewport);
+                if delta != 0.0 && ui.get_search_results_mode() {
+                    ui.invoke_request_search_position(ui.get_search_scroll_y() + delta);
                     viewport_changed = true;
+                } else {
+                    let maximum = rectangle_selection_scroll_maximum(
+                        ui.get_files().row_count(),
+                        match ui.get_view_mode() {
+                            1 => ViewMode::List,
+                            2 => ViewMode::Grid,
+                            _ => ViewMode::Details,
+                        },
+                        ui.get_grid_column_count().max(1) as usize,
+                        ui.get_file_viewport_height(),
+                    );
+                    let viewport = (ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0);
+                    if viewport != ui.get_file_viewport_y() {
+                        ui.set_file_viewport_y(viewport);
+                        viewport_changed = true;
+                    }
+                }
+                if viewport_changed {
                     if let Ok(mut gesture) = gesture_for_timer.lock()
                         && let Some(gesture) = gesture.as_mut()
                     {
@@ -4216,20 +4178,44 @@ fn wire_callbacks(
         }
     });
 
+    let weak = ui.as_weak();
     let state_for_next_search_page = state.clone();
     let everything_for_next_search_page = everything_sender.clone();
-    ui.on_request_search_page(move |offset| {
-        let tab_id = state_for_next_search_page
-            .lock()
-            .expect("app state mutex is not poisoned")
-            .active_window_state()
-            .active_tab;
+    ui.on_request_search_position(move |requested_scroll| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let (tab_id, total, view_mode) = {
+            let app = state_for_next_search_page
+                .lock()
+                .expect("app state mutex is not poisoned");
+            let tab = app.active();
+            let mode = tab
+                .visible_path()
+                .and_then(|path| app.directory_view_modes.get(path))
+                .copied()
+                .unwrap_or(ViewMode::Details);
+            (
+                app.active_window_state().active_tab,
+                tab.search_total.unwrap_or(0),
+                mode,
+            )
+        };
+        let columns = ui.get_grid_column_count().max(1) as usize;
+        let maximum =
+            search_logical_maximum(total, view_mode, columns, ui.get_file_viewport_height());
+        let scroll = requested_scroll.clamp(-maximum, 0.0);
+        ui.set_search_scroll_y(scroll);
+        let index = search_result_index_at_scroll(scroll, total, view_mode, columns);
+        let window = search_window_for_index(index, total, columns);
+        ui.set_file_viewport_y(search_window_viewport_y(index, window, view_mode, columns));
         submit_search_page(
             &everything_for_next_search_page,
             &state_for_next_search_page,
             tab_id,
-            offset.max(0) as u32,
+            index,
         );
+        refresh_tab_window(&state_for_next_search_page.shared, tab_id);
     });
     let weak = ui.as_weak();
     let sender_for_entry = sender.clone();
@@ -4554,13 +4540,37 @@ fn wire_callbacks(
             2 => ViewMode::Grid,
             _ => ViewMode::Details,
         };
+        let mut preserved_search_index = None;
         if let Ok(mut app) = state_for_view.lock() {
             let path = app.active().visible_path().map(Path::to_path_buf);
+            if app.active().page_source == PageSource::Search {
+                let previous_mode = path
+                    .as_deref()
+                    .and_then(|path| app.directory_view_modes.get(path))
+                    .copied()
+                    .unwrap_or(ViewMode::Details);
+                let total = app.active().search_total.unwrap_or(0);
+                preserved_search_index = weak.upgrade().map(|ui| {
+                    search_result_index_at_scroll(
+                        ui.get_search_scroll_y(),
+                        total,
+                        previous_mode,
+                        ui.get_grid_column_count().max(1) as usize,
+                    )
+                });
+            }
             if let Some(path) = path {
                 app.directory_view_modes.insert(path, mode);
             }
         }
         if let Some(ui) = weak.upgrade() {
+            if let Some(index) = preserved_search_index {
+                ui.set_search_scroll_y(search_scroll_for_index(
+                    index,
+                    mode,
+                    ui.get_grid_column_count().max(1) as usize,
+                ));
+            }
             refresh_ui(&ui, &state_for_view);
             request_grid_thumbnails(
                 &ui,
@@ -5155,11 +5165,16 @@ fn wire_callbacks(
     let anchor_for_reopen = context_anchor.clone();
     let clipboard_for_reopen = clipboard_sender.clone();
     ui.on_reopen_context_menu(move |x, y| {
+        let ui = weak.upgrade();
         let (entry_id, background) = context_target_at(
             &state_for_reopen_menu,
+            x,
             y,
-            weak.upgrade().map_or(0.0, |ui| ui.get_file_list_top()),
-            weak.upgrade().map_or(0.0, |ui| ui.get_file_viewport_y()),
+            ui.as_ref().map_or(0.0, |ui| ui.get_file_list_top()),
+            ui.as_ref().map_or(0.0, |ui| ui.get_file_viewport_y()),
+            ui.as_ref().map_or(0.0, |ui| ui.get_search_scroll_y()),
+            ui.as_ref()
+                .map_or(1, |ui| ui.get_grid_column_count().max(1) as usize),
         );
         *anchor_for_reopen.lock().expect("context anchor mutex") =
             (background, x.round() as i32, y.round() as i32);
@@ -5572,18 +5587,17 @@ fn wire_mouse_navigation(
                 if logical.y >= window_height - 30.0 {
                     return EventResult::Propagate;
                 }
-                let visible_height = (window_height - ui.get_file_list_top() - 30.0).max(0.0);
-                let maximum = (ui.get_files().row_count() as f32 * 40.0 - visible_height).max(0.0);
-                let viewport = (ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0);
-                ui.set_file_viewport_y(viewport);
+                if ui.get_search_results_mode() {
+                    ui.invoke_request_search_position(ui.get_search_scroll_y() + delta);
+                } else {
+                    let visible_height = (window_height - ui.get_file_list_top() - 30.0).max(0.0);
+                    let maximum =
+                        (ui.get_files().row_count() as f32 * 40.0 - visible_height).max(0.0);
+                    let viewport = (ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0);
+                    ui.set_file_viewport_y(viewport);
+                }
                 if ui.get_view_mode() == 2 {
                     request_grid_thumbnails(&ui, &shared_state, window_id, &senders.icon);
-                }
-                if ui.get_search_results_mode() {
-                    ui.invoke_request_search_page(
-                        ((-viewport).max(0.0) / 40.0) as i32 / SEARCH_PAGE_LIMIT as i32
-                            * SEARCH_PAGE_LIMIT as i32,
-                    );
                 }
                 EventResult::PreventDefault
             }
@@ -6098,6 +6112,10 @@ fn auto_scroll_drag_edge(ui: &AppWindow, drag: &platform::windows::drag_drop::Dr
     if delta == 0.0 {
         return;
     }
+    if ui.get_search_results_mode() {
+        ui.invoke_request_search_position(ui.get_search_scroll_y() + delta);
+        return;
+    }
     let visible_height = ((bottom - list_top).max(0) as f32 / scale).max(0.0);
     let maximum = (ui.get_files().row_count() as f32 * 40.0 - visible_height).max(0.0);
     ui.set_file_viewport_y((ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0));
@@ -6148,13 +6166,37 @@ fn internal_drag_target(
     y: f32,
     list_top: f32,
     viewport_y: f32,
+    search_scroll_y: f32,
+    grid_columns: usize,
 ) -> Option<(EntryId, PathBuf)> {
-    let index = ((y - list_top + (-viewport_y).max(0.0)) / 40.0).floor() as usize;
-    app.active()
-        .visible_entries()
-        .get(index)
-        .filter(|entry| entry.kind == crate::domain::EntryKind::Directory)
-        .map(|entry| (entry.id, entry.path.clone()))
+    let tab = app.active();
+    let view_mode = tab
+        .visible_path()
+        .and_then(|path| app.directory_view_modes.get(path))
+        .copied()
+        .unwrap_or(ViewMode::Details);
+    let local_row =
+        ((y - list_top + (-viewport_y).max(0.0)) / search_row_height(view_mode)).floor() as usize;
+    let local_index = match view_mode {
+        ViewMode::Grid => local_row.saturating_mul(grid_columns.max(1)),
+        ViewMode::Details | ViewMode::List => local_row,
+    };
+    let entry = if tab.page_source == PageSource::Search {
+        let window = search_window_for_scroll(
+            search_scroll_y,
+            tab.search_total.unwrap_or(0),
+            view_mode,
+            grid_columns,
+        );
+        let id = window
+            .start
+            .checked_add(local_index as u32)?
+            .checked_add(1)?;
+        tab.visible_entry(EntryId(id))?
+    } else {
+        tab.visible_entries().get(local_index)?
+    };
+    (entry.kind == crate::domain::EntryKind::Directory).then(|| (entry.id, entry.path.clone()))
 }
 
 fn create_drop_shortcuts(shortcuts: Vec<(PathBuf, PathBuf)>) -> Result<(), String> {
@@ -7952,7 +7994,6 @@ fn start_directory_watchers(
                 }
                 if let Ok(watcher) = platform::windows::directory_watch::DirectoryWatch::start(
                     &root,
-                    false,
                     event_sender.clone(),
                 ) {
                     watchers.insert(root, watcher);
@@ -8351,6 +8392,14 @@ fn platform_everything_config(
     })
 }
 
+#[derive(Debug)]
+struct GroupedSearchPage {
+    items: Vec<platform::windows::everything::EverythingSearchItem>,
+    total: u32,
+    file_total: u32,
+    response_offsets_valid: bool,
+}
+
 fn search_grouped_page(
     client: &platform::windows::everything::EverythingClient,
     scope: (Option<PathBuf>, bool),
@@ -8359,14 +8408,7 @@ fn search_grouped_page(
     offset: u32,
     limit: u32,
     timeout: Duration,
-) -> Result<
-    (
-        Vec<platform::windows::everything::EverythingSearchItem>,
-        u32,
-        u32,
-    ),
-    platform::windows::everything::EverythingError,
-> {
+) -> Result<GroupedSearchPage, platform::windows::everything::EverythingError> {
     use platform::windows::everything::{EverythingItemKind, EverythingSearchRequest};
     let (scope, recursive) = scope;
 
@@ -8377,6 +8419,7 @@ fn search_grouped_page(
     files.offset = offset;
     files.max_results = limit;
     let file_page = client.search(&files, timeout)?;
+    let file_offset_valid = file_page.offset == files.offset;
 
     let mut folders = EverythingSearchRequest::new(query, scope);
     folders.recursive = recursive;
@@ -8385,14 +8428,21 @@ fn search_grouped_page(
     folders.offset = offset.saturating_sub(file_page.total);
     folders.max_results = limit.saturating_sub(file_page.items.len() as u32);
     let folder_page = client.search(&folders, timeout)?;
+    let folder_offset_valid = folder_page.offset == folders.offset;
 
     let total = file_page.total.saturating_add(folder_page.total);
+    let file_total = file_page.total;
     let mut items = file_page.items;
     if offset >= file_page.total || items.len() < limit as usize {
         items.extend(folder_page.items);
     }
     items.truncate(limit as usize);
-    Ok((items, total, file_page.total))
+    Ok(GroupedSearchPage {
+        items,
+        total,
+        file_total,
+        response_offsets_valid: file_offset_valid && folder_offset_valid,
+    })
 }
 fn spawn_everything_worker(
     config: crate::domain::EverythingConfig,
@@ -8484,7 +8534,13 @@ fn spawn_everything_worker(
                         Duration::from_secs(3),
                     );
                     match page_result {
-                        Ok((items, total, file_total)) => {
+                        Ok(page) => {
+                            let GroupedSearchPage {
+                                items,
+                                total,
+                                file_total,
+                                response_offsets_valid,
+                            } = page;
                             let entries = items
                                 .into_iter()
                                 .enumerate()
@@ -8523,6 +8579,8 @@ fn spawn_everything_worker(
                                 })
                                 .collect::<Vec<_>>();
                             if !cancel.load(std::sync::atomic::Ordering::Acquire) {
+                                let response_valid = response_offsets_valid
+                                    && !(offset < total && entries.is_empty());
                                 let _ = event_sender.send(EverythingEvent::SearchPage {
                                     tab_id,
                                     request_id,
@@ -8530,6 +8588,7 @@ fn spawn_everything_worker(
                                     entries,
                                     total,
                                     file_total,
+                                    response_valid,
                                 });
                             } else {
                                 let _ = event_sender.send(EverythingEvent::SearchSkipped {
@@ -8662,13 +8721,14 @@ fn apply_search_page_event(
     entries: Vec<FileEntry>,
     total: u32,
     file_total: u32,
-) -> Option<Vec<u32>> {
+) -> Option<()> {
     let tab = app.tab_mut(tab_id)?;
     if !tab.accepts_page(request_id, PageSource::Search) {
         return None;
     }
     tab.finish_search_page_request(offset);
-    Some(tab.merge_search_page(offset, entries, total, file_total, SEARCH_PAGE_LIMIT))
+    tab.merge_search_page(offset, entries, total, file_total, SEARCH_PAGE_LIMIT);
+    Some(())
 }
 fn start_everything_event_pump(
     ui: &AppWindow,
@@ -8691,7 +8751,45 @@ fn start_everything_event_pump(
             let mut folder_size_update = None;
             let mut app = state.lock().expect("app state mutex is not poisoned");
             match event {
-                EverythingEvent::SearchPage { tab_id, request_id, offset, entries, total, file_total } => if let Some(tab) = app.tab_mut(tab_id) && tab.accepts_page(request_id, PageSource::Search) {
+                EverythingEvent::SearchPage { tab_id, request_id, offset, entries, total, file_total, response_valid } => if let Some(tab) = app.tab_mut(tab_id) && tab.accepts_page(request_id, PageSource::Search) {
+                    if !response_valid {
+                        let retry = tab.retry_unexpected_search_page(offset);
+                        let retry_request = retry
+                            .then(|| tab.search_cancel_token())
+                            .flatten()
+                            .map(|cancel| EverythingRequest::Search {
+                                tab_id,
+                                request_id,
+                                scope: tab.search_scope.clone(),
+                                depth: tab.search_depth,
+                                query: tab.search_query.clone(),
+                                sort: everything_sort(
+                                    tab.search_sort_field,
+                                    tab.search_sort_direction,
+                                ),
+                                offset,
+                                cancel,
+                            });
+                        eprintln!(
+                            "everything search page rejected tab={} request={} offset={} count={} total={} retry={}",
+                            tab_id.0,
+                            request_id.0,
+                            offset,
+                            entries.len(),
+                            total,
+                            retry
+                        );
+                        if !retry {
+                            tab.error = Some(format!(
+                                "Everything returned an invalid page at offset {offset}"
+                            ));
+                        }
+                        drop(app);
+                        if let Some(request) = retry_request {
+                            let _ = sender_for_search_consistency.send(request);
+                        }
+                        return;
+                    }
                     let pending_offset = tab.finish_search_page_request(offset);
                     if tab.search_file_total.is_some_and(|known| known != file_total) {
                         let scope = tab.search_scope.clone();
@@ -8712,7 +8810,7 @@ fn start_everything_event_pump(
                         });
                         return;
                     }
-                    let evicted = tab.merge_search_page(
+                    tab.merge_search_page(
                         offset,
                         entries,
                         total,
@@ -8738,15 +8836,8 @@ fn start_everything_event_pump(
                         let _ = sender_for_search_consistency.send(request);
                     }
                     if active {
-                        project_search_page(
-                            &ui,
-                            &state,
-                            tab_id,
-                            request_id,
-                            offset,
-                            total,
-                            &evicted,
-                        );
+                        project_search_page(&ui, &state, tab_id, request_id, offset, total);
+
                     }
                     return;
                 },
@@ -8861,78 +8952,22 @@ fn project_search_page(
     request_id: RequestId,
     offset: u32,
     total: u32,
-    evicted: &[u32],
 ) {
-    let app = state.lock().expect("app state mutex is not poisoned");
-    if app.window_for_tab(tab_id) != Some(app.active_window)
-        || app.active_window_state().active_tab != tab_id
-    {
-        return;
-    }
-    let tab = app.tab(tab_id).expect("routed tab exists");
-    if tab.latest_request != request_id || tab.page_source != PageSource::Search {
+    let should_refresh = state.lock().ok().is_some_and(|app| {
+        app.window_for_tab(tab_id) == Some(app.active_window)
+            && app.active_window_state().active_tab == tab_id
+            && app.tab(tab_id).is_some_and(|tab| {
+                tab.latest_request == request_id && tab.page_source == PageSource::Search
+            })
+    });
+    if !should_refresh {
         return;
     }
     if offset == 0 {
         ui.set_file_viewport_y(0.0);
+        ui.set_search_scroll_y(0.0);
     }
-    let model = ui.get_files();
-    if let Some(model) = model.as_any().downcast_ref::<SearchFileModel>()
-        && model.row_count() == total as usize
-    {
-        for offset in evicted {
-            model.clear_page(*offset as usize, SEARCH_PAGE_LIMIT as usize);
-        }
-        let start_id = offset.saturating_add(1);
-        let end_id = offset.saturating_add(SEARCH_PAGE_LIMIT);
-        let rows = tab
-            .entries
-            .iter()
-            .filter(|entry| (start_id..=end_id).contains(&entry.id.0))
-            .map(|entry| file_row(entry, tab, Texts::new(app.language), &app))
-            .collect();
-        model.update_page(offset as usize, rows);
-    } else {
-        let model = SearchFileModel::new(total as usize, empty_file_row());
-        let start_id = offset.saturating_add(1);
-        let end_id = offset.saturating_add(SEARCH_PAGE_LIMIT);
-        let rows = tab
-            .entries
-            .iter()
-            .filter(|entry| (start_id..=end_id).contains(&entry.id.0))
-            .map(|entry| file_row(entry, tab, Texts::new(app.language), &app))
-            .collect();
-        model.update_page(offset as usize, rows);
-        ui.set_files(ModelRc::new(model));
-    }
-    let columns = ui.get_grid_column_count().max(1) as usize;
-    let grid_model = ui.get_grid_rows();
-    if let Some(grid_model) = grid_model.as_any().downcast_ref::<SearchGridModel>()
-        && grid_model.total == total as usize
-        && grid_model.columns == columns
-    {
-        for offset in evicted {
-            grid_model.clear_page(*offset as usize, SEARCH_PAGE_LIMIT as usize);
-        }
-        grid_model.update_rows(
-            tab.entries
-                .iter()
-                .filter(|entry| {
-                    (offset.saturating_add(1)..=offset.saturating_add(SEARCH_PAGE_LIMIT))
-                        .contains(&entry.id.0)
-                })
-                .map(|entry| file_row(entry, tab, Texts::new(app.language), &app)),
-        );
-    } else {
-        let grid_model = SearchGridModel::new(total as usize, columns, empty_file_row());
-        grid_model.update_rows(
-            tab.entries
-                .iter()
-                .map(|entry| file_row(entry, tab, Texts::new(app.language), &app)),
-        );
-        ui.set_grid_rows(ModelRc::new(grid_model));
-    }
-    ui.set_status_text(status_text(tab, Texts::new(app.language)).into());
+    refresh_tab_window(state, tab_id);
     ui.set_page_state(if total == 0 { 3 } else { 4 });
 }
 
@@ -8980,6 +9015,7 @@ fn submit_search(
     };
     if let Some(ui) = ui {
         ui.set_file_viewport_y(0.0);
+        ui.set_search_scroll_y(0.0);
         refresh_tab_window(state, tab_id);
     }
     let _ = sender.send(request);
@@ -9443,32 +9479,49 @@ fn update_file_rows(
     }
 
     let model = ui.get_files();
-    if let Some(model) = model.as_any().downcast_ref::<SearchFileModel>() {
-        for row in rows.values() {
-            assert!(
-                model.update_row(row.clone()),
-                "search row identity must map to a virtual result slot"
-            );
-        }
-    } else if let Some(model) = model.as_any().downcast_ref::<VecModel<FileRow>>() {
-        for (id, row) in &rows {
-            if let Some(index) = tab.visible_entry_index(*id)
-                && index < model.row_count()
-            {
-                model.set_row_data(index, row.clone());
-            }
-        }
+    let Some(model) = model.as_any().downcast_ref::<VecModel<FileRow>>() else {
+        return;
+    };
+    let window_start = if tab.page_source == PageSource::Search {
+        let total = tab.search_total.unwrap_or(tab.entries.len() as u32);
+        let view_mode = tab
+            .visible_path()
+            .and_then(|path| app.directory_view_modes.get(path))
+            .copied()
+            .unwrap_or(ViewMode::Details);
+
+        Some(
+            search_window_for_scroll(
+                ui.get_search_scroll_y(),
+                total,
+                view_mode,
+                ui.get_grid_column_count().max(1) as usize,
+            )
+            .start,
+        )
     } else {
-        panic!("file projection model must be directory or search model");
+        None
+    };
+    for (id, row) in &rows {
+        let index = window_start
+            .and_then(|start| search_window_local_index(*id, start))
+            .or_else(|| tab.visible_entry_index(*id));
+        if let Some(index) = index
+            && index < model.row_count()
+        {
+            model.set_row_data(index, row.clone());
+        }
     }
 
     let grid_model = ui.get_grid_rows();
-    if let Some(grid_model) = grid_model.as_any().downcast_ref::<SearchGridModel>() {
-        grid_model.update_rows(rows.values().cloned());
-    } else if let Some(grid_model) = grid_model.as_any().downcast_ref::<VecModel<GridRow>>() {
+    if let Some(grid_model) = grid_model.as_any().downcast_ref::<VecModel<GridRow>>() {
         let columns = ui.get_grid_column_count().max(1) as usize;
         for (id, updated) in &rows {
-            let Some(index) = tab.visible_entry_index(*id) else {
+            let index = window_start
+                .and_then(|start| id.0.checked_sub(start.saturating_add(1)))
+                .map(|index| index as usize)
+                .or_else(|| tab.visible_entry_index(*id));
+            let Some(index) = index else {
                 continue;
             };
             let row_index = index / columns;
@@ -9748,27 +9801,6 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
         ViewMode::List => 1,
         ViewMode::Grid => 2,
     });
-    let display_entries = if matches!(tab.load_state, LoadState::Partial) {
-        &tab.pending_entries
-    } else if tab.has_failed_location() {
-        &[] as &[FileEntry]
-    } else {
-        &tab.entries
-    };
-    let file_rows = display_entries
-        .iter()
-        .map(|entry| file_row(entry, tab, texts, &app))
-        .collect::<Vec<_>>();
-    let grid_columns = (((ui.window().size().width as f32 / ui.window().scale_factor()) - 260.0)
-        / 148.0)
-        .floor()
-        .max(1.0) as usize;
-    let grid_rows = file_rows
-        .chunks(grid_columns)
-        .map(|entries| GridRow {
-            entries: ModelRc::new(VecModel::from(entries.to_vec())),
-        })
-        .collect::<Vec<_>>();
     let projected_tab_id = tab.id.0 as i32;
     let projected_request_id = tab.latest_request.0 as i32;
     if ui.get_projected_file_tab_id() != projected_tab_id
@@ -9778,26 +9810,52 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
             ui.invoke_cancel_rectangle_selection();
         }
         ui.set_file_viewport_y(0.0);
+        ui.set_search_scroll_y(0.0);
         ui.set_projected_file_tab_id(projected_tab_id);
         ui.set_projected_file_request_id(projected_request_id);
     }
-    if tab.page_source == PageSource::Search {
-        let total = tab.search_total.unwrap_or(tab.entries.len() as u32) as usize;
-        let model = SearchFileModel::new(total, empty_file_row());
-        model.update_rows(file_rows.clone());
-        ui.set_files(ModelRc::new(model));
+    let display_entries = if matches!(tab.load_state, LoadState::Partial) {
+        &tab.pending_entries
+    } else if tab.has_failed_location() {
+        &[] as &[FileEntry]
     } else {
-        ui.set_files(ModelRc::new(VecModel::from(file_rows.clone())));
+        &tab.entries
+    };
+    let directory_rows = display_entries
+        .iter()
+        .map(|entry| file_row(entry, tab, texts, &app))
+        .collect::<Vec<_>>();
+    let grid_columns = (((ui.window().size().width as f32 / ui.window().scale_factor()) - 260.0)
+        / 148.0)
+        .floor()
+        .max(1.0) as usize;
+    let total = tab.search_total.unwrap_or(tab.entries.len() as u32);
+    let search_index =
+        search_result_index_at_scroll(ui.get_search_scroll_y(), total, view_mode, grid_columns);
+    let search_window = search_window_for_index(search_index, total, grid_columns);
+    if tab.page_source == PageSource::Search {
+        ui.set_file_viewport_y(search_window_viewport_y(
+            search_index,
+            search_window,
+            view_mode,
+            grid_columns,
+        ));
     }
+    let file_rows = if tab.page_source == PageSource::Search {
+        search_window_rows(tab, &app, search_window)
+    } else {
+        directory_rows
+    };
+    let grid_rows = file_rows
+        .chunks(grid_columns)
+        .map(|entries| GridRow {
+            entries: ModelRc::new(VecModel::from(entries.to_vec())),
+        })
+        .collect::<Vec<_>>();
+    ui.set_files(ModelRc::new(VecModel::from(file_rows)));
     ui.set_grid_column_count(grid_columns as i32);
-    if tab.page_source == PageSource::Search {
-        let total = tab.search_total.unwrap_or(tab.entries.len() as u32) as usize;
-        let model = SearchGridModel::new(total, grid_columns, empty_file_row());
-        model.update_rows(file_rows);
-        ui.set_grid_rows(ModelRc::new(model));
-    } else {
-        ui.set_grid_rows(ModelRc::new(VecModel::from(grid_rows)));
-    }
+    ui.set_grid_rows(ModelRc::new(VecModel::from(grid_rows)));
+    ui.set_search_total_items(total.min(i32::MAX as u32) as i32);
     ui.set_window_width(ui.window().size().width as f32 / ui.window().scale_factor());
     let visible_path = tab.visible_path().map(display_path).unwrap_or_default();
     let address_input = if tab.address_editing {
@@ -10476,58 +10534,57 @@ fn initial_path() -> PathBuf {
 mod tests {
     use super::*;
 
-    fn test_file_row(id: i32, selected: bool, focused: bool) -> FileRow {
-        FileRow {
-            id,
-            loaded: true,
-            name: format!("row-{id}").into(),
-            name_segments: ModelRc::new(VecModel::default()),
-            kind: "File".into(),
-            parent_path: "C:\\test".into(),
-            size: "1 B".into(),
-            modified: "".into(),
-            is_directory: false,
-            selected,
-            focused,
-            cut: false,
-            icon: Image::default(),
-        }
+    #[test]
+    fn search_window_keeps_slint_model_bounded_at_deep_offsets() {
+        assert_eq!(
+            search_window_for_index(65_536, 133_796, 1),
+            SearchWindow {
+                start: 65_280,
+                len: SEARCH_WINDOW_ITEM_LIMIT,
+            }
+        );
+        assert_eq!(
+            search_window_for_index(133_795, 133_796, 1),
+            SearchWindow {
+                start: 133_376,
+                len: 420,
+            }
+        );
+        assert_eq!(SEARCH_WINDOW_ITEM_LIMIT, 768);
     }
 
     #[test]
-    fn search_file_model_updates_selection_by_stable_result_identity() {
-        use slint::Model;
-
-        let model = SearchFileModel::new(8, empty_file_row());
-        assert!(model.update_row(test_file_row(3, false, false)));
-        assert!(!model.row_data(2).unwrap().selected);
-
-        assert!(model.update_row(test_file_row(3, true, true)));
-        let updated = model.row_data(2).unwrap();
-        assert!(updated.selected);
-        assert!(updated.focused);
-        assert_eq!(updated.id, 3);
-        assert!(!model.update_row(test_file_row(0, true, true)));
-        assert!(!model.update_row(test_file_row(9, true, true)));
+    fn search_window_preserves_position_inside_the_loaded_window() {
+        let window = search_window_for_index(65_536, 133_796, 1);
+        assert_eq!(
+            search_window_viewport_y(65_536, window, ViewMode::Details, 1),
+            -256.0 * 40.0
+        );
+        let grid_window = search_window_for_index(65_536, 133_796, 4);
+        assert_eq!(grid_window.start % 4, 0);
+        assert_eq!(
+            search_window_viewport_y(65_536, grid_window, ViewMode::Grid, 4),
+            -64.0 * 148.0
+        );
     }
     #[test]
-    fn search_grid_model_is_sparse_and_projects_loaded_slots_by_identity() {
-        use slint::Model;
-
-        let model = SearchGridModel::new(1_000_000, 4, empty_file_row());
-        assert_eq!(model.row_count(), 250_000);
-        assert_eq!(model.rows.borrow().len(), 0);
-        assert!(model.update_row(test_file_row(257, true, true)));
-        assert_eq!(model.rows.borrow().len(), 1);
-        let row = model.row_data(64).unwrap();
-        let entries = row
-            .entries
-            .as_any()
-            .downcast_ref::<VecModel<FileRow>>()
-            .unwrap();
-        assert_eq!(entries.row_data(0).unwrap().id, 257);
-        assert!(entries.row_data(0).unwrap().selected);
-        assert!(!entries.row_data(1).unwrap().loaded);
+    fn logical_search_scroll_maps_each_view_mode_to_absolute_result_index() {
+        assert_eq!(
+            search_result_index_at_scroll(-65_536.0 * 40.0, 133_796, ViewMode::Details, 1),
+            65_536
+        );
+        assert_eq!(
+            search_result_index_at_scroll(-65_536.0 * 34.0, 133_796, ViewMode::List, 1),
+            65_536
+        );
+        assert_eq!(
+            search_result_index_at_scroll(-16_384.0 * 148.0, 133_796, ViewMode::Grid, 4),
+            65_536
+        );
+        assert_eq!(
+            search_result_index_at_scroll(-f32::MAX, 133_796, ViewMode::Details, 1),
+            133_795
+        );
     }
     #[test]
     fn tab_drop_routes_physical_screen_cursor_at_each_dpi() {
@@ -11549,7 +11606,12 @@ mod tests {
             },
         )
         .unwrap();
-        let (items, total, file_total) = search_grouped_page(
+        let GroupedSearchPage {
+            items,
+            total,
+            file_total,
+            response_offsets_valid,
+        } = search_grouped_page(
             &client,
             (None, true),
             ".md".into(),
@@ -11559,6 +11621,7 @@ mod tests {
             Duration::from_secs(3),
         )
         .unwrap();
+        assert!(response_offsets_valid);
         assert_eq!(items.len(), 30);
         assert!(total > items.len() as u32);
         assert!(file_total <= total);
@@ -11992,10 +12055,13 @@ mod tests {
             }]);
         }
         assert_eq!(
-            context_target_at(&state, 170.0, 166.0, 0.0),
+            context_target_at(&state, 0.0, 170.0, 166.0, 0.0, 0.0, 1),
             (Some(EntryId(1)), false)
         );
-        assert_eq!(context_target_at(&state, 250.0, 166.0, 0.0), (None, true));
+        assert_eq!(
+            context_target_at(&state, 0.0, 250.0, 166.0, 0.0, 0.0, 1),
+            (None, true)
+        );
     }
 
     #[test]
@@ -12030,7 +12096,7 @@ mod tests {
                 );
         }
         assert_eq!(
-            context_target_at(&state, 170.0, 166.0, -80.0),
+            context_target_at(&state, 0.0, 170.0, 166.0, -80.0, 0.0, 1),
             (Some(EntryId(3)), false)
         );
     }
@@ -12111,9 +12177,9 @@ mod tests {
                 },
             ]);
 
-        assert_eq!(internal_drag_target(&app, 20.0, 0.0, 0.0), None);
+        assert_eq!(internal_drag_target(&app, 20.0, 0.0, 0.0, 0.0, 1), None);
         assert_eq!(
-            internal_drag_target(&app, 20.0, 0.0, -40.0),
+            internal_drag_target(&app, 20.0, 0.0, -40.0, 0.0, 1),
             Some((EntryId(2), PathBuf::from(r"C:\test\folder")))
         );
     }
@@ -12245,14 +12311,9 @@ mod tests {
     }
 
     #[test]
-    fn rectangle_selection_threshold_and_pointer_owner_split_gestures() {
+    fn rectangle_selection_starts_only_after_threshold() {
         assert!(!rectangle_selection_started(10.0, 10.0, 13.0, 13.0));
         assert!(rectangle_selection_started(10.0, 10.0, 13.0, 14.0));
-        assert_eq!(
-            file_pointer_owner(false),
-            FilePointerOwner::BackgroundSelection
-        );
-        assert_eq!(file_pointer_owner(true), FilePointerOwner::EntryDrag);
     }
 
     #[test]
