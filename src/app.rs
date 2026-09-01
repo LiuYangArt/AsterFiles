@@ -12,6 +12,7 @@ use std::{
 
 use slint::{
     Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel,
+    winit_030::winit::event::MouseScrollDelta,
     winit_030::{EventResult, WinitWindowAccessor, winit},
 };
 
@@ -1877,7 +1878,14 @@ struct SearchWindow {
     len: usize,
 }
 
-fn search_row_height(view_mode: ViewMode) -> f32 {
+fn view_mode_from_ui(mode: i32) -> ViewMode {
+    match mode {
+        1 => ViewMode::List,
+        2 => ViewMode::Grid,
+        _ => ViewMode::Details,
+    }
+}
+fn file_row_height(view_mode: ViewMode) -> f32 {
     match view_mode {
         ViewMode::Details => 40.0,
         ViewMode::List => 34.0,
@@ -1885,17 +1893,34 @@ fn search_row_height(view_mode: ViewMode) -> f32 {
     }
 }
 
+fn file_scroll_maximum(
+    item_count: usize,
+    view_mode: ViewMode,
+    grid_columns: usize,
+    visible_height: f32,
+) -> f32 {
+    let rows = match view_mode {
+        ViewMode::Grid => item_count.div_ceil(grid_columns.max(1)),
+        ViewMode::Details | ViewMode::List => item_count,
+    };
+    (rows as f32 * file_row_height(view_mode) - visible_height).max(0.0)
+}
+
+fn logical_scroll_delta(delta: &MouseScrollDelta, view_mode: ViewMode, scale_factor: f32) -> f32 {
+    match delta {
+        MouseScrollDelta::LineDelta(_, y) => *y * file_row_height(view_mode) * 3.0,
+        MouseScrollDelta::PixelDelta(position) => {
+            position.y as f32 / scale_factor.max(f32::EPSILON)
+        }
+    }
+}
 fn search_logical_maximum(
     total: u32,
     view_mode: ViewMode,
     columns: usize,
     visible_height: f32,
 ) -> f32 {
-    let rows = match view_mode {
-        ViewMode::Grid => (total as usize).div_ceil(columns.max(1)),
-        ViewMode::Details | ViewMode::List => total as usize,
-    };
-    (rows as f32 * search_row_height(view_mode) - visible_height).max(0.0)
+    file_scroll_maximum(total as usize, view_mode, columns, visible_height)
 }
 
 fn search_result_index_at_scroll(
@@ -1907,7 +1932,7 @@ fn search_result_index_at_scroll(
     if total == 0 {
         return 0;
     }
-    let row = ((-scroll_y).max(0.0) / search_row_height(view_mode)).floor() as usize;
+    let row = ((-scroll_y).max(0.0) / file_row_height(view_mode)).floor() as usize;
     let index = match view_mode {
         ViewMode::Grid => row.saturating_mul(columns.max(1)),
         ViewMode::Details | ViewMode::List => row,
@@ -1961,14 +1986,14 @@ fn search_window_viewport_y(
         ViewMode::Grid => local / columns.max(1),
         ViewMode::Details | ViewMode::List => local,
     };
-    -(row as f32 * search_row_height(view_mode))
+    -(row as f32 * file_row_height(view_mode))
 }
 fn search_scroll_for_index(index: u32, view_mode: ViewMode, columns: usize) -> f32 {
     let row = match view_mode {
         ViewMode::Grid => index as usize / columns.max(1),
         ViewMode::Details | ViewMode::List => index as usize,
     };
-    -(row as f32 * search_row_height(view_mode))
+    -(row as f32 * file_row_height(view_mode))
 }
 
 fn search_window_rows(tab: &TabSession, app: &AppState, window: SearchWindow) -> Vec<FileRow> {
@@ -3001,7 +3026,7 @@ fn context_target_at(
         .and_then(|path| app.directory_view_modes.get(path))
         .copied()
         .unwrap_or(ViewMode::Details);
-    let local_row = ((window_y - list_top + (-viewport_y).max(0.0)) / search_row_height(view_mode))
+    let local_row = ((window_y - list_top + (-viewport_y).max(0.0)) / file_row_height(view_mode))
         .floor() as usize;
     let local_index = match view_mode {
         ViewMode::Grid => {
@@ -3670,20 +3695,6 @@ fn rectangle_selection_scroll_delta(pointer_y: f32, top: f32, bottom: f32) -> f3
     }
 }
 
-fn rectangle_selection_scroll_maximum(
-    item_count: usize,
-    view_mode: ViewMode,
-    grid_columns: usize,
-    visible_height: f32,
-) -> f32 {
-    let content_height = match view_mode {
-        ViewMode::Details => item_count as f32 * 40.0,
-        ViewMode::List => item_count as f32 * 34.0,
-        ViewMode::Grid => item_count.div_ceil(grid_columns.max(1)) as f32 * 148.0,
-    };
-    (content_height - visible_height).max(0.0)
-}
-
 fn rectangle_selection_hits(
     tab: &TabSession,
     view_mode: ViewMode,
@@ -4143,13 +4154,9 @@ fn wire_rectangle_selection(ui: &AppWindow, state: WindowSessions) -> Rc<slint::
                     ui.invoke_request_search_position(ui.get_search_scroll_y() + delta);
                     viewport_changed = true;
                 } else {
-                    let maximum = rectangle_selection_scroll_maximum(
+                    let maximum = file_scroll_maximum(
                         ui.get_files().row_count(),
-                        match ui.get_view_mode() {
-                            1 => ViewMode::List,
-                            2 => ViewMode::Grid,
-                            _ => ViewMode::Details,
-                        },
+                        view_mode_from_ui(ui.get_view_mode()),
                         ui.get_grid_column_count().max(1) as usize,
                         ui.get_file_viewport_height(),
                     );
@@ -4761,11 +4768,7 @@ fn wire_callbacks(
     let state_for_view = state.clone();
     let icon_for_view = icon_sender.clone();
     ui.on_change_view_mode(move |mode| {
-        let mode = match mode {
-            1 => ViewMode::List,
-            2 => ViewMode::Grid,
-            _ => ViewMode::Details,
-        };
+        let mode = view_mode_from_ui(mode);
         let mut preserved_search_index = None;
         if let Ok(mut app) = state_for_view.lock() {
             let path = app.active().visible_path().map(Path::to_path_buf);
@@ -4798,6 +4801,9 @@ fn wire_callbacks(
                 ));
             }
             refresh_ui(&ui, &state_for_view);
+            if preserved_search_index.is_none() {
+                ui.set_file_viewport_y(0.0);
+            }
             request_grid_thumbnails(
                 &ui,
                 &state_for_view.shared,
@@ -5667,7 +5673,7 @@ fn wire_mouse_navigation(
     shared_state: SharedSessions,
 ) {
     use winit::{
-        event::{ElementState, MouseScrollDelta, WindowEvent},
+        event::{ElementState, WindowEvent},
         keyboard::{Key, ModifiersState, NamedKey},
     };
 
@@ -5805,20 +5811,20 @@ fn wire_mouse_navigation(
                 if logical.y < ui.get_file_list_top() {
                     return EventResult::Propagate;
                 }
-                let delta = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => *y * 40.0 * 3.0,
-                    MouseScrollDelta::PixelDelta(position) => position.y as f32,
-                };
-                let window_height = ui.window().size().height as f32 / ui.window().scale_factor();
-                if logical.y >= window_height - 30.0 {
+                let view_mode = view_mode_from_ui(ui.get_view_mode());
+                let delta = logical_scroll_delta(delta, view_mode, ui.window().scale_factor());
+                if logical.y >= ui.get_file_list_top() + ui.get_file_viewport_height() {
                     return EventResult::Propagate;
                 }
                 if ui.get_search_results_mode() {
                     ui.invoke_request_search_position(ui.get_search_scroll_y() + delta);
                 } else {
-                    let visible_height = (window_height - ui.get_file_list_top() - 30.0).max(0.0);
-                    let maximum =
-                        (ui.get_files().row_count() as f32 * 40.0 - visible_height).max(0.0);
+                    let maximum = file_scroll_maximum(
+                        ui.get_files().row_count(),
+                        view_mode,
+                        ui.get_grid_column_count().max(1) as usize,
+                        ui.get_file_viewport_height(),
+                    );
                     let viewport = (ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0);
                     ui.set_file_viewport_y(viewport);
                 }
@@ -6319,14 +6325,15 @@ fn auto_scroll_drag_edge(ui: &AppWindow, drag: &platform::windows::drag_drop::Dr
     let Some(cursor_y) = drag.cursor_y else {
         return;
     };
-    let Ok((_, client_top, _, client_bottom)) =
+    let Ok((_, client_top, _, _)) =
         platform::windows::drag_drop::client_screen_rect(native_window_handle(ui))
     else {
         return;
     };
     let scale = ui.window().scale_factor();
     let list_top = client_top + (ui.get_file_list_top() * scale).round() as i32;
-    let bottom = client_bottom - (30.0 * scale).round() as i32;
+    let bottom = client_top
+        + ((ui.get_file_list_top() + ui.get_file_viewport_height()) * scale).round() as i32;
     let edge = (32.0 * scale).round() as i32;
     let delta = if cursor_y < list_top + edge {
         24.0
@@ -6342,8 +6349,13 @@ fn auto_scroll_drag_edge(ui: &AppWindow, drag: &platform::windows::drag_drop::Dr
         ui.invoke_request_search_position(ui.get_search_scroll_y() + delta);
         return;
     }
-    let visible_height = ((bottom - list_top).max(0) as f32 / scale).max(0.0);
-    let maximum = (ui.get_files().row_count() as f32 * 40.0 - visible_height).max(0.0);
+    let view_mode = view_mode_from_ui(ui.get_view_mode());
+    let maximum = file_scroll_maximum(
+        ui.get_files().row_count(),
+        view_mode,
+        ui.get_grid_column_count().max(1) as usize,
+        ui.get_file_viewport_height(),
+    );
     ui.set_file_viewport_y((ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0));
 }
 
@@ -6402,7 +6414,7 @@ fn internal_drag_target(
         .copied()
         .unwrap_or(ViewMode::Details);
     let local_row =
-        ((y - list_top + (-viewport_y).max(0.0)) / search_row_height(view_mode)).floor() as usize;
+        ((y - list_top + (-viewport_y).max(0.0)) / file_row_height(view_mode)).floor() as usize;
     let local_index = match view_mode {
         ViewMode::Grid => local_row.saturating_mul(grid_columns.max(1)),
         ViewMode::Details | ViewMode::List => local_row,
@@ -12933,6 +12945,106 @@ mod tests {
         );
     }
 
+    fn test_grid_rows() -> ModelRc<GridRow> {
+        ModelRc::new(VecModel::from(
+            (0..12)
+                .map(|_| GridRow {
+                    entries: ModelRc::new(VecModel::from(vec![empty_file_row(); 6])),
+                })
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn headless_file_view() -> AppWindow {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().expect("headless app window should initialize");
+        ui.window()
+            .set_size(slint::LogicalSize::new(1_180.0, 760.0));
+        ui.set_files(ModelRc::new(VecModel::from(vec![empty_file_row(); 67])));
+        ui.set_grid_column_count(6);
+        ui.set_grid_rows(test_grid_rows());
+        ui.show().expect("headless app window should show");
+        update_test_layout(&ui);
+        ui
+    }
+
+    fn update_test_layout(ui: &AppWindow) {
+        use i_slint_backend_testing::ElementRoot;
+
+        ui.window().request_redraw();
+        let _ = ui.root_element().query_descendants().find_all();
+    }
+
+    #[test]
+    fn inactive_grid_model_updates_do_not_rewind_the_details_viewport() {
+        let ui = headless_file_view();
+        ui.set_view_mode(0);
+        ui.set_file_viewport_y(-1_500.0);
+
+        for _ in 0..5 {
+            ui.set_files(ModelRc::new(VecModel::from(vec![empty_file_row(); 67])));
+            ui.set_grid_rows(test_grid_rows());
+            update_test_layout(&ui);
+        }
+
+        assert_eq!(ui.get_file_viewport_y(), -1_500.0);
+    }
+
+    #[test]
+    fn switching_file_view_modes_resets_and_routes_only_the_active_viewport() {
+        let ui = headless_file_view();
+        ui.set_file_viewport_y(-1_000.0);
+        update_test_layout(&ui);
+
+        ui.set_file_viewport_y(0.0);
+        ui.set_view_mode(2);
+        update_test_layout(&ui);
+        assert_eq!(ui.get_file_viewport_y(), 0.0);
+        ui.set_file_viewport_y(-500.0);
+        update_test_layout(&ui);
+
+        ui.set_file_viewport_y(0.0);
+        ui.set_view_mode(0);
+        update_test_layout(&ui);
+        assert_eq!(ui.get_file_viewport_y(), 0.0);
+    }
+
+    #[test]
+    fn scroll_delta_uses_active_row_height_and_logical_dpi_units() {
+        for (mode, expected) in [
+            (ViewMode::Details, -120.0),
+            (ViewMode::List, -102.0),
+            (ViewMode::Grid, -444.0),
+        ] {
+            assert_eq!(
+                logical_scroll_delta(&MouseScrollDelta::LineDelta(0.0, -1.0), mode, 1.0),
+                expected
+            );
+        }
+
+        let pixels = MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, -150.0));
+        for (scale, expected) in [(1.0, -150.0), (1.25, -120.0), (1.5, -100.0)] {
+            assert_eq!(
+                logical_scroll_delta(&pixels, ViewMode::Details, scale),
+                expected
+            );
+        }
+    }
+    #[test]
+    fn file_scroll_geometry_matches_every_view_mode_and_grid_remainder() {
+        assert_eq!(
+            file_scroll_maximum(67, ViewMode::Details, 6, 590.0),
+            2_090.0
+        );
+        assert_eq!(file_scroll_maximum(67, ViewMode::List, 6, 590.0), 1_688.0);
+        assert_eq!(file_scroll_maximum(67, ViewMode::Grid, 6, 590.0), 1_186.0);
+        assert_eq!(file_scroll_maximum(66, ViewMode::Grid, 6, 590.0), 1_038.0);
+        assert_eq!(file_scroll_maximum(2, ViewMode::Grid, 6, 590.0), 0.0);
+        assert_eq!(
+            file_scroll_maximum(67, ViewMode::Details, 6, 590.5),
+            2_089.5
+        );
+    }
     #[test]
     fn rectangle_selection_auto_scroll_uses_edge_distance_and_clamps_speed() {
         assert_eq!(rectangle_selection_scroll_delta(110.0, 100.0, 500.0), 10.0);
@@ -12941,21 +13053,12 @@ mod tests {
         assert_eq!(rectangle_selection_scroll_delta(600.0, 100.0, 500.0), -40.0);
         assert_eq!(rectangle_selection_scroll_delta(250.0, 100.0, 500.0), 0.0);
         assert_eq!(
-            rectangle_selection_scroll_maximum(100, ViewMode::Details, 1, 400.0),
+            file_scroll_maximum(100, ViewMode::Details, 1, 400.0),
             3_600.0
         );
-        assert_eq!(
-            rectangle_selection_scroll_maximum(100, ViewMode::List, 1, 400.0),
-            3_000.0
-        );
-        assert_eq!(
-            rectangle_selection_scroll_maximum(10, ViewMode::Grid, 3, 400.0),
-            192.0
-        );
-        assert_eq!(
-            rectangle_selection_scroll_maximum(2, ViewMode::Grid, 3, 400.0),
-            0.0
-        );
+        assert_eq!(file_scroll_maximum(100, ViewMode::List, 1, 400.0), 3_000.0);
+        assert_eq!(file_scroll_maximum(10, ViewMode::Grid, 3, 400.0), 192.0);
+        assert_eq!(file_scroll_maximum(2, ViewMode::Grid, 3, 400.0), 0.0);
     }
 
     #[test]

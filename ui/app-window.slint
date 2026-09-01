@@ -436,14 +436,25 @@ component LightScrollBar inherits Rectangle {
     scroll-touch := TouchArea {
         property <length> press-value;
         property <length> press-y;
+        property <bool> dragging-thumb;
         pointer-event(event) => {
             if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
-                self.press-value = root.value;
-                self.press-y = self.mouse-y;
+                if self.mouse-y < thumb.y {
+                    root.scrolled(min(0px, root.value + root.page-size));
+                } else if self.mouse-y > thumb.y + thumb.height {
+                    root.scrolled(max(-root.maximum, root.value - root.page-size));
+                } else {
+                    self.press-value = root.value;
+                    self.press-y = self.mouse-y;
+                    self.dragging-thumb = true;
+                }
+            }
+            if event.button == PointerEventButton.left && event.kind == PointerEventKind.up {
+                self.dragging-thumb = false;
             }
         }
         moved => {
-            if self.pressed && root.thumb-travel > 0px {
+            if self.pressed && self.dragging-thumb && root.thumb-travel > 0px {
                 root.scrolled(max(-root.maximum, min(0px, self.press-value - (self.mouse-y - self.press-y) * root.maximum / root.thumb-travel)));
             }
         }
@@ -624,6 +635,9 @@ export component AppWindow inherits Window {
     in property <[ContextCommandRow]> context-commands;
     in property <[OperationRow]> operations;
     in-out property <length> file-viewport-y: 0px;
+    private property <length> list-viewport-y: 0px;
+    private property <length> grid-viewport-y: 0px;
+    private property <int> active-geometry-revision: root.view-mode;
     in-out property <length> search-scroll-y: 0px;
     in property <int> search-total-items: 0;
     out property <length> file-list-top: 0px;
@@ -631,6 +645,15 @@ export component AppWindow inherits Window {
     out property <length> file-viewport-width: 0px;
     out property <length> file-viewport-height: 0px;
     in-out property <int> view-mode: 0;
+    function sync-active-file-viewport() {
+        if root.view-mode == 2 {
+            root.grid-viewport-y = root.file-viewport-y;
+        } else {
+            root.list-viewport-y = root.file-viewport-y;
+        }
+    }
+    changed file-viewport-y => { root.sync-active-file-viewport(); }
+
     in-out property <bool> context-menu-open: false;
     in-out property <bool> drop-menu-open: false;
     private property <bool> internal-drag-pointer-active: false;
@@ -1283,16 +1306,16 @@ list := ListView {
                         width: parent.width - 28px;
                         viewport-width: self.width;
                         vertical-scrollbar-policy: ScrollBarPolicy.always-off;
-                        viewport-y <=> root.file-viewport-y;
-                        init => {
-                            root.file-list-top = self.absolute-position.y - root.absolute-position.y;
-                            root.rectangle-viewport-top = self.absolute-position.y - content-area.absolute-position.y;
-                            root.file-viewport-width = self.width;
-                            root.file-viewport-height = self.visible-height;
-                        }
-                        changed width => { root.file-viewport-width = self.width; }
-                        changed visible-height => { root.file-viewport-height = self.visible-height; }
-                        changed viewport-y => { if !root.search-results-mode { root.request-folder-size-range(self.viewport-y / 1px, self.visible-height / 1px); } }
+                        viewport-y <=> root.list-viewport-y;
+
+                        function sync-file-geometry() { if root.view-mode != 2 { root.file-list-top = self.absolute-position.y - root.absolute-position.y; root.rectangle-viewport-top = self.absolute-position.y - content-area.absolute-position.y; root.file-viewport-width = self.width; root.file-viewport-height = self.visible-height; } }
+                        init => { self.sync-file-geometry(); }
+                        private property <int> geometry-revision: root.active-geometry-revision;
+                        changed geometry-revision => { self.sync-file-geometry(); }
+                        changed absolute-position => { self.sync-file-geometry(); }
+                        changed width => { self.sync-file-geometry(); }
+                        changed visible-height => { self.sync-file-geometry(); }
+                        changed viewport-y => { if root.view-mode != 2 { root.file-viewport-y = self.viewport-y; if !root.search-results-mode { root.request-folder-size-range(self.viewport-y / 1px, self.visible-height / 1px); } } }
                         for entry in root.files: Rectangle {
                             width: max(list.width, root.file-columns-width + 16px);
                             x: 0px;
@@ -1516,15 +1539,16 @@ accessible-label: entry.name;
                         width: parent.width - 28px;
                         viewport-width: self.width;
                         vertical-scrollbar-policy: ScrollBarPolicy.always-off;
-                        viewport-y <=> root.file-viewport-y;
-                        init => {
-                            root.rectangle-viewport-top = self.absolute-position.y - content-area.absolute-position.y;
-                            root.file-viewport-width = self.width;
-                            root.file-viewport-height = self.visible-height;
-                        }
-                        changed width => { root.file-viewport-width = self.width; }
-                        changed visible-height => { root.file-viewport-height = self.visible-height; }
-                        changed viewport-y => { if !root.search-results-mode { root.request-folder-size-range(self.viewport-y / 1px, self.visible-height / 1px); } }
+                        viewport-y <=> root.grid-viewport-y;
+
+                        function sync-file-geometry() { if root.view-mode == 2 { root.file-list-top = self.absolute-position.y - root.absolute-position.y; root.rectangle-viewport-top = self.absolute-position.y - content-area.absolute-position.y; root.file-viewport-width = self.width; root.file-viewport-height = self.visible-height; } }
+                        init => { self.sync-file-geometry(); }
+                        private property <int> geometry-revision: root.active-geometry-revision;
+                        changed geometry-revision => { self.sync-file-geometry(); }
+                        changed absolute-position => { self.sync-file-geometry(); }
+                        changed width => { self.sync-file-geometry(); }
+                        changed visible-height => { self.sync-file-geometry(); }
+                        changed viewport-y => { if root.view-mode == 2 { root.file-viewport-y = self.viewport-y; if !root.search-results-mode { root.request-folder-size-range(self.viewport-y / 1px, self.visible-height / 1px); } } }
                         for row in root.grid-rows: HorizontalLayout {
                             height: 148px;
                             spacing: 8px;
