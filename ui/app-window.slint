@@ -1008,12 +1008,8 @@ export component AppWindow inherits Window {
                     Rectangle {
                         width: root.tab-content-width; height: 34px;
                         for tab[index] in root.tabs: Rectangle {
-                            x: root.external-tab-dragging
-                                ? index * (root.tab-width + 5px)
-                                    + (index >= root.external-tab-insertion-index && root.external-tab-insertion-index >= 0 ? root.tab-width + 5px : 0px)
-                                : root.tab-dragging
+                            x: root.tab-dragging
                                 ? (index < root.tab-drag-source-index ? index : index > root.tab-drag-source-index ? index - 1 : index) * (root.tab-width + 5px)
-                                    + ((index != root.tab-drag-source-index && (index < root.tab-drag-source-index ? index : index - 1) >= root.tab-drag-insertion-index && root.tab-drag-insertion-index >= 0) ? root.tab-width + 5px : 0px)
                                 : index * (root.tab-width + 5px);
                             width: root.tab-width; height: 34px;
                             visible: !root.tab-dragging || index != root.tab-drag-source-index;
@@ -1083,6 +1079,20 @@ export component AppWindow inherits Window {
                                 }
                             }
                             Tooltip { text: @markdown("\{tab.title}"); }
+                        }
+                        Rectangle {
+                            property <bool> external: root.external-tab-dragging && root.external-tab-insertion-index >= 0;
+                            property <bool> local: root.tab-dragging && root.tab-drag-insertion-index >= 0;
+                            property <int> visual-slot: self.external ? root.external-tab-insertion-index : root.tab-drag-insertion-index;
+                            visible: self.external || self.local;
+                            x: self.visual-slot <= 0
+                                ? 0px
+                                : min(root.tab-content-width - 5px, self.visual-slot * (root.tab-width + 5px) - 5px);
+                            y: 2px;
+                            width: 5px;
+                            height: 30px;
+                            border-radius: 2.5px;
+                            background: VisualStyle.c4f6bed;
                         }
                     }
                     }
