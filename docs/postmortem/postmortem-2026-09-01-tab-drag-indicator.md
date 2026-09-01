@@ -50,7 +50,7 @@ Slint 里留下 `external-tab-dragging`、`external-tab-insertion-index`、`tab-
 - 离开目标窗口、Escape、无效释放、目标窗口关闭、拖动完成/取消时隐藏并销毁。
 - 同窗排序与跨窗口移动复用同一指示器逻辑。
 - 清理所有 Slint 侧临时状态属性、Rectangle 覆盖层和回调。
-- 单标签窗口从状态层直接拒绝拖动，避免无意义的“拖出创建新窗口”。
+- 单文件标签窗口从状态层允许拖动；命中另一标签栏时合并，窗外释放时只移动原窗口，仍避免无意义的等价新窗口。
 
 ## 回归证据
 
@@ -59,7 +59,7 @@ Slint 里留下 `external-tab-dragging`、`external-tab-insertion-index`、`tab-
   - 插槽计算：首/尾、中点边界、5px 缝隙、左右滚动、栏外、设置标签前后区间。
   - 拖动状态机：阈值前不排序、阈值后进入拖动、释放后提交、取消后恢复。
   - 跨窗口：目标命中、来源保留、事务提交/回滚、100%→150% DPI 缩放。
-  - 单标签拒绝拖动。
+  - 单标签合并、窗外原窗移动、取消与 DPI 抓取偏移。
 - `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --no-fail-fast`、`python tools/verify.py` 全部通过。
 - Debug 构建产物：`target/debug/asterfiles.exe`，SHA-256 在提交信息中。
 - 未构建 Release（按项目规则等待用户确认 issue 完成后才构建）。

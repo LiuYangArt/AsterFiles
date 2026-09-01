@@ -19,6 +19,33 @@ pub fn cursor_screen_position() -> io::Result<(i32, i32)> {
     }
     Ok((cursor.x, cursor.y))
 }
+pub fn move_window(hwnd: isize, x: i32, y: i32) -> io::Result<()> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
+    };
+
+    if hwnd == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "main window handle is not available",
+        ));
+    }
+    if unsafe {
+        SetWindowPos(
+            hwnd as windows_sys::Win32::Foundation::HWND,
+            std::ptr::null_mut(),
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 pub fn begin_window_drag(hwnd: isize) -> io::Result<()> {
     if hwnd == 0 {

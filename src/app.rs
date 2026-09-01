@@ -1009,6 +1009,25 @@ enum WindowCloseAction {
     Ignore,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnmatchedTabDropAction {
+    MoveSourceWindow,
+    DetachToNewWindow,
+}
+
+fn unmatched_tab_drop_action(
+    source_has_single_file_tab: bool,
+    target_window_hit: bool,
+) -> Option<UnmatchedTabDropAction> {
+    if source_has_single_file_tab {
+        Some(UnmatchedTabDropAction::MoveSourceWindow)
+    } else if !target_window_hit {
+        Some(UnmatchedTabDropAction::DetachToNewWindow)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug)]
 struct AppState {
     windows: HashMap<WindowId, WindowState>,
@@ -1448,8 +1467,7 @@ impl AppState {
         let Some(window) = self.windows.get(&window_id) else {
             return false;
         };
-        if window.tab_order.len() <= 1
-            || window.tab_order.get(source_index) != Some(&tab_id)
+        if window.tab_order.get(source_index) != Some(&tab_id)
             || window
                 .tabs
                 .get(&tab_id)
@@ -1523,6 +1541,38 @@ impl AppState {
         let target = insertion_index.min(window.tab_order.len());
         window.tab_order.insert(target, moved);
         target != drag.source_index
+    }
+
+    fn drag_source_is_single_file_tab_window(&self, source_window: WindowId) -> bool {
+        let Some(drag) = self.tab_drag.filter(|drag| drag.window_id == source_window) else {
+            return false;
+        };
+        self.windows.get(&source_window).is_some_and(|window| {
+            window.tab_order.len() == 1
+                && window.tab_order[0] == drag.tab_id
+                && window
+                    .tabs
+                    .get(&drag.tab_id)
+                    .is_some_and(|tab| tab.kind == TabKind::Files)
+        })
+    }
+
+    fn commit_drag_source_window_move(&mut self, source_window: WindowId, x: i32, y: i32) -> bool {
+        if !self.drag_source_is_single_file_tab_window(source_window)
+            || !self.tab_drag.is_some_and(|drag| {
+                drag.window_id == source_window
+                    && matches!(drag.phase, TabDragPhase::Dragging { .. })
+            })
+        {
+            return false;
+        }
+        let Some(window) = self.windows.get_mut(&source_window) else {
+            return false;
+        };
+        window.placement.x = x;
+        window.placement.y = y;
+        self.tab_drag = None;
+        true
     }
 
     fn cancel_tab_drag(&mut self) -> bool {
@@ -2738,22 +2788,32 @@ fn finish_native_tab_drag(
     });
     let (valid_source, _) = source_tab_drop_is_valid(source_ui, screen_x, screen_y)
         .unwrap_or((false, winit::dpi::PhysicalPosition::new(0.0, 0.0)));
-    let detached = !moved
-        && cross_target.is_none()
-        && target_window.is_none()
-        && !valid_source
-        && detach_tab_into_new_window(
-            source_ui,
-            source_window,
-            screen_x,
-            screen_y,
-            senders,
-            confirmations,
-            state,
-        );
+    let source_has_single_file_tab = state
+        .lock()
+        .is_ok_and(|app| app.drag_source_is_single_file_tab_window(source_window));
+    let unmatched_action = (!moved && cross_target.is_none() && !valid_source)
+        .then(|| unmatched_tab_drop_action(source_has_single_file_tab, target_window.is_some()))
+        .flatten();
+    let moved_source_window =
+        matches!(
+            unmatched_action,
+            Some(UnmatchedTabDropAction::MoveSourceWindow)
+        ) && move_single_tab_source_window(source_ui, source_window, screen_x, screen_y, state);
+    let detached = matches!(
+        unmatched_action,
+        Some(UnmatchedTabDropAction::DetachToNewWindow)
+    ) && detach_tab_into_new_window(
+        source_ui,
+        source_window,
+        screen_x,
+        screen_y,
+        senders,
+        confirmations,
+        state,
+    );
     let finished = if valid_source {
         state.lock().is_ok_and(|mut app| app.finish_tab_drag(true))
-    } else if moved || detached {
+    } else if moved || moved_source_window || detached {
         false
     } else {
         state.lock().is_ok_and(|mut app| app.cancel_tab_drag())
@@ -2763,7 +2823,71 @@ fn finish_native_tab_drag(
     if !moved && !detached {
         refresh_window_ui(source_ui, state, source_window);
     }
-    finished || moved || detached
+    finished || moved || moved_source_window || detached
+}
+
+fn move_single_tab_source_window(
+    source_ui: &AppWindow,
+    source_window: WindowId,
+    screen_x: i32,
+    screen_y: i32,
+    state: &SharedSessions,
+) -> bool {
+    let scale = source_ui.window().scale_factor();
+    let Some((grab_x, grab_y)) = state.lock().ok().and_then(|app| {
+        let drag = app
+            .tab_drag
+            .filter(|drag| drag.window_id == source_window)?;
+        Some((drag.press_x, drag.press_y))
+    }) else {
+        return false;
+    };
+    let outer = source_ui.window().position();
+    let Ok((client_left, client_top, _, _)) =
+        platform::windows::drag_drop::client_screen_rect(native_window_handle(source_ui))
+    else {
+        return false;
+    };
+    let (x, y) = single_tab_window_drop_position(
+        screen_x,
+        screen_y,
+        grab_x,
+        grab_y,
+        scale,
+        client_left - outer.x,
+        client_top - outer.y,
+    );
+    let committed = state
+        .lock()
+        .is_ok_and(|mut app| app.commit_drag_source_window_move(source_window, x, y));
+    if !committed {
+        return false;
+    }
+    if platform::windows::move_window(native_window_handle(source_ui), x, y).is_err() {
+        if let Ok(mut app) = state.lock()
+            && let Some(window) = app.windows.get_mut(&source_window)
+        {
+            window.placement.x = outer.x;
+            window.placement.y = outer.y;
+        }
+        return false;
+    }
+    true
+}
+
+fn single_tab_window_drop_position(
+    screen_x: i32,
+    screen_y: i32,
+    grab_x: f32,
+    grab_y: f32,
+    scale: f32,
+    client_offset_x: i32,
+    client_offset_y: i32,
+) -> (i32, i32) {
+    (
+        screen_x - (grab_x * scale).round() as i32 - client_offset_x,
+        screen_y - (grab_y * scale).round() as i32 - client_offset_y,
+    )
 }
 
 fn drag_paths_for_pressed_entry(app: &AppState, entry_id: EntryId) -> Vec<PathBuf> {
@@ -10991,13 +11115,13 @@ mod tests {
     }
 
     #[test]
-    fn single_tab_window_rejects_tab_drag() {
+    fn single_file_tab_window_can_begin_drag() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
         let window = app.active_window;
         let tab = app.active_window_state().active_tab;
 
-        assert!(!app.begin_tab_drag(window, tab, 0, 100.0, 20.0));
-        assert!(app.tab_drag.is_none());
+        assert!(app.begin_tab_drag(window, tab, 0, 100.0, 20.0));
+        assert!(app.drag_source_is_single_file_tab_window(window));
         assert_eq!(app.active_window_state().tab_order, [tab]);
     }
 
@@ -11081,6 +11205,32 @@ mod tests {
             Some(DetachedTabRestart::Directory(PathBuf::from("pending")))
         );
         assert_eq!(app.window_for_tab(tab_id), Some(destination));
+    }
+
+    #[test]
+    fn single_tab_cross_window_move_closes_source_and_keeps_identity() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
+        let source = app.active_window;
+        let destination = app.register_window(
+            vec![PathBuf::from("c"), PathBuf::from("d")],
+            0,
+            test_window_placement(160),
+        );
+        let tab_id = app.window(source).unwrap().active_tab;
+        let request = app.tab(tab_id).unwrap().latest_request;
+        assert!(app.begin_tab_drag(source, tab_id, 0, 100.0, 20.0));
+        app.update_tab_drag(100.0, 80.0, 47.0, 540.0, 0.0, 178.0);
+
+        let outcome = app.move_dragged_tab_to_window(destination, 1).unwrap();
+
+        assert!(outcome.source_window_closed);
+        assert!(app.window(source).is_none());
+        assert_eq!(app.window_for_tab(tab_id), Some(destination));
+        assert_eq!(
+            app.window(destination).unwrap().tab_order,
+            [TabId(2), tab_id, TabId(3)]
+        );
+        assert_eq!(app.tab(tab_id).unwrap().latest_request, request);
     }
 
     #[test]
@@ -11223,22 +11373,106 @@ mod tests {
     }
 
     #[test]
-    fn single_tab_cannot_detach_into_an_equivalent_new_window() {
+    fn single_tab_unmatched_drop_moves_original_window_without_detaching() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
         let source = app.active_window;
         let tab_id = app.active_window_state().active_tab;
-        assert!(!app.begin_tab_drag(source, tab_id, 0, 100.0, 20.0));
-        let destination = app.reserve_window_id();
-        assert!(
-            app.detach_dragged_tab_to_window(destination, test_window_placement(160))
-                .is_none()
+        {
+            let tab = app.tab_mut(tab_id).unwrap();
+            tab.current_path = Some(PathBuf::from("a/current"));
+            tab.back_history = vec![PathBuf::from("a/previous")];
+            tab.forward_history = vec![PathBuf::from("a/next")];
+            tab.replace_entries(vec![focus_entry(7, "a/current/item.txt")]);
+            tab.selected = vec![EntryId(7)];
+            tab.focused = Some(EntryId(7));
+            tab.selection_anchor = Some(EntryId(7));
+            tab.sort_field = SortField::Size;
+            tab.sort_direction = SortDirection::Descending;
+            tab.search_query = "needle".to_owned();
+            tab.search_state = SearchState::Complete;
+            tab.load_state = LoadState::Complete;
+        }
+        let request = app.tab(tab_id).unwrap().latest_request;
+        let before_entries = app.tab(tab_id).unwrap().entries.clone();
+        assert!(app.begin_tab_drag(source, tab_id, 0, 100.0, 20.0));
+        app.update_tab_drag(140.0, 80.0, 47.0, 540.0, 0.0, 178.0);
+
+        assert_eq!(
+            unmatched_tab_drop_action(true, false),
+            Some(UnmatchedTabDropAction::MoveSourceWindow)
         );
-        assert!(app.window(source).is_some());
+        assert!(app.commit_drag_source_window_move(source, 320, 240));
+        assert_eq!(app.windows.len(), 1);
         assert_eq!(app.window_for_tab(tab_id), Some(source));
+        assert_eq!(app.window(source).unwrap().placement.x, 320);
+        assert_eq!(app.window(source).unwrap().placement.y, 240);
+        let tab = app.tab(tab_id).unwrap();
+        assert_eq!(tab.latest_request, request);
+        assert_eq!(tab.current_path.as_deref(), Some(Path::new("a/current")));
+        assert_eq!(tab.back_history, [PathBuf::from("a/previous")]);
+        assert_eq!(tab.forward_history, [PathBuf::from("a/next")]);
+        assert_eq!(tab.selected, [EntryId(7)]);
+        assert_eq!(tab.focused, Some(EntryId(7)));
+        assert_eq!(tab.selection_anchor, Some(EntryId(7)));
+        assert_eq!(tab.sort_field, SortField::Size);
+        assert_eq!(tab.sort_direction, SortDirection::Descending);
+        assert_eq!(tab.search_query, "needle");
+        assert_eq!(tab.search_state, SearchState::Complete);
+        assert_eq!(tab.load_state, LoadState::Complete);
+        assert!(Arc::ptr_eq(&tab.entries, &before_entries));
+        assert!(app.tab_drag.is_none());
     }
 
     #[test]
-    fn settings_window_stays_open_when_its_only_file_tab_is_detached() {
+    fn settings_tab_keeps_single_file_tab_on_multi_tab_detach_route() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
+        let source = app.active_window;
+        let file_tab = app.active_window_state().active_tab;
+        app.open_settings();
+        assert!(app.begin_tab_drag(source, file_tab, 0, 100.0, 20.0));
+        app.update_tab_drag(140.0, 80.0, 47.0, 540.0, 0.0, 178.0);
+
+        assert!(!app.drag_source_is_single_file_tab_window(source));
+        assert_eq!(
+            unmatched_tab_drop_action(false, false),
+            Some(UnmatchedTabDropAction::DetachToNewWindow)
+        );
+    }
+    #[test]
+    fn unmatched_drop_routing_preserves_multi_tab_detach_and_rejects_known_windows() {
+        assert_eq!(
+            unmatched_tab_drop_action(false, false),
+            Some(UnmatchedTabDropAction::DetachToNewWindow)
+        );
+        assert_eq!(unmatched_tab_drop_action(false, true), None);
+        assert_eq!(
+            unmatched_tab_drop_action(true, false),
+            Some(UnmatchedTabDropAction::MoveSourceWindow)
+        );
+        assert_eq!(
+            unmatched_tab_drop_action(true, true),
+            Some(UnmatchedTabDropAction::MoveSourceWindow)
+        );
+    }
+
+    #[test]
+    fn single_tab_window_drop_keeps_grab_offset_across_dpi() {
+        assert_eq!(
+            single_tab_window_drop_position(800, 500, 100.0, 20.0, 1.0, 8, 8),
+            (692, 472)
+        );
+        assert_eq!(
+            single_tab_window_drop_position(800, 500, 100.0, 20.0, 1.25, 8, 8),
+            (667, 467)
+        );
+        assert_eq!(
+            single_tab_window_drop_position(800, 500, 100.0, 20.0, 1.5, 8, 8),
+            (642, 462)
+        );
+    }
+
+    #[test]
+    fn settings_window_stays_open_when_its_file_tab_is_detached() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
         let source = app.active_window;
         let file_tab = app.active_window_state().active_tab;
