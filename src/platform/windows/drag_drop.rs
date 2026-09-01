@@ -51,6 +51,7 @@ use windows::{
             SHCreateDataObject, SHCreateStdEnumFmtEtc, SHDRAGIMAGE, SHGetDesktopFolder,
             SHGetIDListFromObject, SHParseDisplayName,
         },
+        UI::WindowsAndMessaging::{IDC_ARROW, LoadCursorW, SetCursor},
     },
     core::{Error as WindowsError, HRESULT, PCWSTR, Ref, implement},
 };
@@ -821,7 +822,9 @@ pub fn begin_tab_drag(payload: TabDragPayload, image: &TabDragImage) -> io::Resu
             crColorKey: COLORREF(0x00ff00ff),
         };
         unsafe { helper.InitializeFromBitmap(&drag_image, &data) }.map_err(windows_error)?;
-        let drop_source = IDropSource::from(NativeDropSource);
+        let drop_source = IDropSource::from(NativeDropSource {
+            feedback: DragCursorFeedback::Arrow,
+        });
         let mut effect = DROPEFFECT_NONE;
         let result = unsafe { DoDragDrop(&data, &drop_source, DROPEFFECT_MOVE, &mut effect) };
         Ok::<_, io::Error>((result, effect))
@@ -1047,7 +1050,9 @@ pub fn begin_outbound_drag(
         accept_extra_set_data: false,
     });
     let data_object = shell_data_object(paths, &supplemental)?;
-    let drop_source = IDropSource::from(NativeDropSource);
+    let drop_source = IDropSource::from(NativeDropSource {
+        feedback: DragCursorFeedback::System,
+    });
     let allowed = DROPEFFECT(DROPEFFECT_COPY.0 | DROPEFFECT_MOVE.0 | DROPEFFECT_LINK.0);
     let mut native_effect = DROPEFFECT_NONE;
     let result = unsafe { DoDragDrop(&data_object, &drop_source, allowed, &mut native_effect) };
@@ -1148,7 +1153,15 @@ impl Drop for OleApartment {
 }
 
 #[implement(IDropSource)]
-struct NativeDropSource;
+struct NativeDropSource {
+    feedback: DragCursorFeedback,
+}
+
+#[derive(Clone, Copy)]
+enum DragCursorFeedback {
+    System,
+    Arrow,
+}
 
 #[allow(non_snake_case)]
 impl IDropSource_Impl for NativeDropSource_Impl {
@@ -1161,7 +1174,20 @@ impl IDropSource_Impl for NativeDropSource_Impl {
     }
 
     fn GiveFeedback(&self, _effect: DROPEFFECT) -> HRESULT {
-        DRAGDROP_S_USEDEFAULTCURSORS
+        drag_feedback_result(self.feedback)
+    }
+}
+
+fn drag_feedback_result(feedback: DragCursorFeedback) -> HRESULT {
+    match feedback {
+        DragCursorFeedback::System => DRAGDROP_S_USEDEFAULTCURSORS,
+        DragCursorFeedback::Arrow => match unsafe { LoadCursorW(None, IDC_ARROW) } {
+            Ok(cursor) => {
+                unsafe { SetCursor(Some(cursor)) };
+                HRESULT(0)
+            }
+            Err(_) => DRAGDROP_S_USEDEFAULTCURSORS,
+        },
     }
 }
 
@@ -1774,6 +1800,15 @@ mod tests {
         };
 
         unsafe { helper.InitializeFromBitmap(&drag_image, &data) }.unwrap();
+    }
+
+    #[test]
+    fn native_tab_drag_uses_arrow_cursor_feedback() {
+        assert_eq!(drag_feedback_result(DragCursorFeedback::Arrow), HRESULT(0));
+        assert_eq!(
+            drag_feedback_result(DragCursorFeedback::System),
+            DRAGDROP_S_USEDEFAULTCURSORS
+        );
     }
 
     #[test]
