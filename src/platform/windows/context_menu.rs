@@ -58,7 +58,10 @@ pub struct ClassicMenuItem {
 pub enum ClassicMenuItemKind {
     Command,
     Separator,
-    Submenu(Vec<ClassicMenuItem>),
+    Submenu {
+        token: ShellMenuSubmenuToken,
+        items: Vec<ClassicMenuItem>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +72,7 @@ pub enum ClassicMenuInvocation {
 
 pub type ShellMenuSessionId = u64;
 pub type ShellMenuRequestId = u64;
+pub type ShellMenuSubmenuToken = u64;
 
 #[derive(Debug, Clone)]
 pub enum ShellMenuLoadTarget {
@@ -84,6 +88,12 @@ pub enum ShellMenuCommand {
         target: ShellMenuLoadTarget,
         include_extended_verbs: bool,
         owner_window: isize,
+    },
+    LoadSubmenu {
+        session_id: ShellMenuSessionId,
+        request_id: ShellMenuRequestId,
+        submenu_request_id: ShellMenuRequestId,
+        token: ShellMenuSubmenuToken,
     },
     Invoke {
         session_id: ShellMenuSessionId,
@@ -105,6 +115,22 @@ pub enum ShellMenuEvent {
         session_id: ShellMenuSessionId,
         request_id: ShellMenuRequestId,
         items: Vec<ClassicMenuItem>,
+        elapsed_ms: u128,
+    },
+    SubmenuLoaded {
+        session_id: ShellMenuSessionId,
+        request_id: ShellMenuRequestId,
+        submenu_request_id: ShellMenuRequestId,
+        token: ShellMenuSubmenuToken,
+        items: Vec<ClassicMenuItem>,
+        elapsed_ms: u128,
+    },
+    SubmenuError {
+        session_id: ShellMenuSessionId,
+        request_id: ShellMenuRequestId,
+        submenu_request_id: ShellMenuRequestId,
+        token: ShellMenuSubmenuToken,
+        message: String,
         elapsed_ms: u128,
     },
     Invoked {
@@ -175,7 +201,7 @@ fn shell_menu_worker_loop(
                         )
                     }
                 }
-                .and_then(|menu| {
+                .and_then(|mut menu| {
                     let items = menu.items_top_level()?;
                     session = Some((session_id, request_id, menu));
                     Ok(items)
@@ -194,6 +220,43 @@ fn shell_menu_worker_loop(
                             session_id,
                             request_id,
                             operation: "load",
+                            message: error.to_string(),
+                            elapsed_ms: started.elapsed().as_millis(),
+                        });
+                    }
+                }
+            }
+            ShellMenuCommand::LoadSubmenu {
+                session_id,
+                request_id,
+                submenu_request_id,
+                token,
+            } => {
+                let started = std::time::Instant::now();
+                let result = session
+                    .as_mut()
+                    .filter(|(id, req, _)| *id == session_id && *req == request_id)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "shell menu session not found")
+                    })
+                    .and_then(|(_, _, menu)| menu.load_submenu(token));
+                match result {
+                    Ok(items) => {
+                        let _ = events.send(ShellMenuEvent::SubmenuLoaded {
+                            session_id,
+                            request_id,
+                            submenu_request_id,
+                            token,
+                            items,
+                            elapsed_ms: started.elapsed().as_millis(),
+                        });
+                    }
+                    Err(error) => {
+                        let _ = events.send(ShellMenuEvent::SubmenuError {
+                            session_id,
+                            request_id,
+                            submenu_request_id,
+                            token,
                             message: error.to_string(),
                             elapsed_ms: started.elapsed().as_millis(),
                         });
@@ -263,7 +326,14 @@ pub struct ClassicMenuSession {
     context_menu2: Option<IContextMenu2>,
     context_menu3: Option<IContextMenu3>,
     com_initialized: bool,
+    submenus: Vec<SubmenuRegistration>,
     _thread_affinity: PhantomData<Rc<()>>,
+}
+
+#[derive(Clone, Copy)]
+struct SubmenuRegistration {
+    menu: HMENU,
+    parent: HMENU,
 }
 
 impl ClassicMenuSession {
@@ -337,16 +407,47 @@ impl ClassicMenuSession {
             context_menu2,
             context_menu3,
             com_initialized: true,
+            submenus: Vec::new(),
             _thread_affinity: PhantomData,
         })
     }
 
     pub fn items(&self) -> io::Result<Vec<ClassicMenuItem>> {
-        read_menu(self.menu, self, true)
+        read_menu_recursive(self.menu, self)
     }
 
-    fn items_top_level(&self) -> io::Result<Vec<ClassicMenuItem>> {
-        read_menu(self.menu, self, false)
+    fn items_top_level(&mut self) -> io::Result<Vec<ClassicMenuItem>> {
+        let menu = self.menu;
+        self.read_menu_level(menu)
+    }
+
+    fn read_menu_level(&mut self, menu: HMENU) -> io::Result<Vec<ClassicMenuItem>> {
+        read_menu_level(menu, self)
+    }
+
+    fn register_submenu(&mut self, menu: HMENU, parent: HMENU) -> ShellMenuSubmenuToken {
+        if let Some(index) = self
+            .submenus
+            .iter()
+            .position(|registration| registration.menu == menu)
+        {
+            return index as ShellMenuSubmenuToken + 1;
+        }
+        self.submenus.push(SubmenuRegistration { menu, parent });
+        self.submenus.len() as ShellMenuSubmenuToken
+    }
+
+    fn load_submenu(&mut self, token: ShellMenuSubmenuToken) -> io::Result<Vec<ClassicMenuItem>> {
+        let index = token
+            .checked_sub(1)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid submenu token"))?;
+        let registration = *self.submenus.get(index).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "shell submenu token not found")
+        })?;
+        let position = submenu_position(registration.parent, registration.menu)?;
+        self.initialize_submenu(registration.menu, position);
+        self.read_menu_level(registration.menu)
     }
 
     fn invoke_command(
@@ -607,10 +708,9 @@ fn free_pidls(pidls: Vec<*mut windows::Win32::UI::Shell::Common::ITEMIDLIST>) {
     }
 }
 
-fn read_menu(
+fn read_menu_level(
     menu: HMENU,
-    session: &ClassicMenuSession,
-    recurse: bool,
+    session: &mut ClassicMenuSession,
 ) -> io::Result<Vec<ClassicMenuItem>> {
     let count = unsafe { GetMenuItemCount(Some(menu)) };
     if count < 0 {
@@ -645,11 +745,90 @@ fn read_menu(
             .then_some(info.wID);
         let kind = if info.hSubMenu.is_invalid() {
             ClassicMenuItemKind::Command
-        } else if recurse {
-            session.initialize_submenu(info.hSubMenu, position);
-            ClassicMenuItemKind::Submenu(read_menu(info.hSubMenu, session, true)?)
         } else {
-            ClassicMenuItemKind::Submenu(Vec::new())
+            ClassicMenuItemKind::Submenu {
+                token: session.register_submenu(info.hSubMenu, menu),
+                items: Vec::new(),
+            }
+        };
+        items.push(ClassicMenuItem {
+            command_id,
+            title: clean_menu_title(&String::from_utf16_lossy(&title[..info.cch as usize])),
+            verb: command_id.and_then(|id| command_verb(&session.context_menu, id)),
+            enabled: !info.fState.contains(MFS_DISABLED),
+            checked: info.fState.contains(MFS_CHECKED),
+            default: info.fState.contains(MFS_DEFAULT),
+            kind,
+        });
+    }
+    Ok(items)
+}
+
+fn submenu_position(parent: HMENU, submenu: HMENU) -> io::Result<u32> {
+    let count = unsafe { GetMenuItemCount(Some(parent)) };
+    if count < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for position in 0..count as u32 {
+        let mut info = MENUITEMINFOW {
+            cbSize: size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_SUBMENU,
+            ..Default::default()
+        };
+        unsafe { GetMenuItemInfoW(parent, position, true, &mut info) }.map_err(windows_error)?;
+        if info.hSubMenu == submenu {
+            return Ok(position);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "shell submenu is no longer attached to its parent",
+    ))
+}
+
+fn read_menu_recursive(
+    menu: HMENU,
+    session: &ClassicMenuSession,
+) -> io::Result<Vec<ClassicMenuItem>> {
+    let count = unsafe { GetMenuItemCount(Some(menu)) };
+    if count < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut items = Vec::with_capacity(count as usize);
+    for position in 0..count as u32 {
+        let mut info = MENUITEMINFOW {
+            cbSize: size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_FTYPE | MIIM_ID | MIIM_STATE | MIIM_STRING | MIIM_SUBMENU,
+            ..Default::default()
+        };
+        unsafe { GetMenuItemInfoW(menu, position, true, &mut info) }.map_err(windows_error)?;
+        if info.fType.contains(MFT_SEPARATOR) {
+            items.push(ClassicMenuItem {
+                command_id: None,
+                title: String::new(),
+                verb: None,
+                enabled: false,
+                checked: false,
+                default: false,
+                kind: ClassicMenuItemKind::Separator,
+            });
+            continue;
+        }
+        let mut title = vec![0_u16; info.cch as usize + 1];
+        info.dwTypeData = PWSTR(title.as_mut_ptr());
+        info.cch = title.len() as u32;
+        unsafe { GetMenuItemInfoW(menu, position, true, &mut info) }.map_err(windows_error)?;
+        let command_id = (FIRST_COMMAND_ID..=LAST_COMMAND_ID)
+            .contains(&info.wID)
+            .then_some(info.wID);
+        let kind = if info.hSubMenu.is_invalid() {
+            ClassicMenuItemKind::Command
+        } else {
+            session.initialize_submenu(info.hSubMenu, position);
+            ClassicMenuItemKind::Submenu {
+                token: 0,
+                items: read_menu_recursive(info.hSubMenu, session)?,
+            }
         };
         items.push(ClassicMenuItem {
             command_id,
@@ -760,5 +939,27 @@ mod tests {
         assert_eq!(clean_menu_title("&Open"), "Open");
         assert_eq!(clean_menu_title("A && B"), "A & B");
         assert_eq!(clean_menu_title("Save &as"), "Save as");
+    }
+
+    #[test]
+    fn submenu_token_is_not_a_native_handle_or_command_id() {
+        let token: ShellMenuSubmenuToken = 7;
+        let item = ClassicMenuItem {
+            command_id: None,
+            title: "Open with".to_owned(),
+            verb: None,
+            enabled: true,
+            checked: false,
+            default: false,
+            kind: ClassicMenuItemKind::Submenu {
+                token,
+                items: Vec::new(),
+            },
+        };
+        assert!(matches!(
+            item.kind,
+            ClassicMenuItemKind::Submenu { token: 7, .. }
+        ));
+        assert_eq!(item.command_id, None);
     }
 }

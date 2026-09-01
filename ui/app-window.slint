@@ -9,7 +9,7 @@ export struct BreadcrumbRow { index: int, label: string, current: bool }
 export struct TabRow { id: int, title: string, active: bool, loading: bool, icon: image, is-drive: bool, is-settings: bool }
 export struct SidebarRow { index: int, label: string, icon-kind: int, is-drive: bool, icon: image }
 export struct ColumnRow { kind: int, min-width: length, content-left: length, content-right: length, icon-slot: length }
-export struct ContextCommandRow { id: int, label: string, search-text: string, hint: string, enabled: bool, separator: bool, shell: bool, checked: bool, default: bool, submenu: bool }
+export struct ContextCommandRow { id: int, node-id: int, label: string, search-text: string, hint: string, enabled: bool, separator: bool, shell: bool, checked: bool, default: bool, submenu: bool }
 export struct OperationRow { id: int, title: string, percent: string, file-progress: string, transferred: string, speed: string, eta: string, current-item: string, source: string, destination: string, progress: float, state: int, paused: bool, can-pause: bool, can-cancel: bool, can-retry: bool }
 export global VisualStyle {
     in-out property <bool> dark-theme: false;
@@ -633,8 +633,20 @@ export component AppWindow inherits Window {
     in property <[SidebarRow]> sidebar-items;
     in property <[ColumnRow]> columns;
     in property <[ContextCommandRow]> context-commands;
+    in property <[ContextCommandRow]> context-submenu-commands;
+    in property <[ContextCommandRow]> context-submenu-parent-commands;
     in-out property <string> context-search: "";
     in-out property <int> context-active-index: -1;
+    in-out property <int> context-submenu-active-index: -1;
+    in-out property <bool> context-submenu-open: false;
+    in-out property <bool> context-submenu-loading: false;
+    in-out property <bool> context-submenu-parent-open: false;
+    in-out property <length> context-submenu-anchor-y: 0px;
+    private property <length> context-menu-panel-x: min(
+        max(12px, root.context-menu-anchor-x + 320px + 12px <= root.width ? root.context-menu-anchor-x : root.context-menu-anchor-x - 320px),
+        max(12px, root.width - 320px - 12px)
+    );
+    private property <length> context-submenu-first-x: root.context-menu-panel-x + 320px + 280px + 4px <= root.width - 12px ? root.context-menu-panel-x + 324px : max(12px, root.context-menu-panel-x - 284px);
     in-out property <bool> context-shell-loading: false;
     in-out property <int> context-shell-elapsed-ms: 0;
     in property <string> text-context-search: "搜索命令";
@@ -858,7 +870,13 @@ export component AppWindow inherits Window {
     callback invoke-context-command(int);
     callback filter-context-menu(string);
     callback move-context-selection(int);
+    callback move-context-submenu-selection(int);
     callback activate-context-selection();
+    callback activate-context-submenu-selection();
+    callback open-context-submenu(int);
+    callback hover-context-submenu(int);
+    callback cancel-context-submenu-hover();
+    callback close-context-submenu();
     callback dismiss-context-menu();
     callback copy-selection(bool);
     callback paste-files();
@@ -1890,36 +1908,39 @@ accessible-label: entry.name;
             self.reopened-by-right-click = false;
         }
     }
-    if root.context-menu-open: Rectangle {
+    if root.context-menu-open: quick-menu-panel := Rectangle {
         z: 29;
-        x: min(
-            max(12px, root.context-menu-anchor-x + self.width + 12px <= parent.width ? root.context-menu-anchor-x : root.context-menu-anchor-x - self.width),
-            max(12px, parent.width - self.width - 12px)
-        );
+        x: root.context-menu-panel-x;
         y: min(
             max(12px, root.context-menu-anchor-y + self.height + 12px <= parent.height ? root.context-menu-anchor-y : root.context-menu-anchor-y - self.height),
             max(12px, parent.height - self.height - 12px)
         );
         width: 320px;
-        height: min(parent.height - 24px, 64px + root.context-commands.length * 36px + (root.context-shell-loading ? 28px : 0px));
+        height: min(parent.height - 24px, 48px + root.context-commands.length * 28px + (root.context-shell-loading ? 22px : 0px));
         background: VisualStyle.cffffff; border-color: VisualStyle.ce0e2e7; border-width: 1px; border-radius: 8px;
         VerticalLayout {
-            padding: 6px; spacing: 2px;
+            padding: 4px; spacing: 1px;
             search-box := Rectangle {
-                height: 40px; border-radius: 6px; background: VisualStyle.cf5f6f8; border-color: VisualStyle.ce0e2e7; border-width: 1px;
-                Text { x: 10px; width: parent.width - 20px; text: root.context-search == "" ? root.text-context-search : ""; color: VisualStyle.c9a9da3; font-size: 12px; vertical-alignment: center; }
+                height: 32px; border-radius: 5px; background: VisualStyle.cf5f6f8; border-color: VisualStyle.ce0e2e7; border-width: 1px;
+                Text { x: 8px; width: parent.width - 16px; text: root.context-search == "" ? root.text-context-search : ""; color: VisualStyle.c9a9da3; font-size: 12px; vertical-alignment: center; }
                 context-search-editor := TextInput {
-                    x: 10px; width: parent.width - 20px; height: parent.height;
-                    text <=> root.context-search; single-line: true; color: VisualStyle.c30333a; font-size: 13px; vertical-alignment: center;
+                    x: 8px; width: parent.width - 16px; height: parent.height;
+                    text <=> root.context-search; single-line: true; color: VisualStyle.c30333a; font-size: 12px; vertical-alignment: center;
                     accessible-role: text-input; accessible-label: root.text-context-search;
                     edited => { root.filter-context-menu(root.context-search); }
-                    accepted => { root.activate-context-selection(); }
+                    accepted => {
+                        if root.context-submenu-open { root.activate-context-submenu-selection(); }
+                        else { root.activate-context-selection(); }
+                    }
                     key-pressed(event) => {
-                        if event.text == Key.UpArrow { root.move-context-selection(-1); return accept; }
-                        if event.text == Key.DownArrow { root.move-context-selection(1); return accept; }
+                        if event.text == Key.UpArrow { if root.context-submenu-open { root.move-context-submenu-selection(-1); } else { root.move-context-selection(-1); } return accept; }
+                        if event.text == Key.DownArrow { if root.context-submenu-open { root.move-context-submenu-selection(1); } else { root.move-context-selection(1); } return accept; }
+                        if event.text == Key.RightArrow { root.open-context-submenu(root.context-submenu-open ? -root.context-submenu-active-index - 1 : root.context-active-index); return accept; }
+                        if event.text == Key.LeftArrow && root.context-submenu-open { root.close-context-submenu(); return accept; }
                         if event.text == Key.Escape {
                             if root.context-search != "" { root.context-search = ""; root.filter-context-menu(""); }
-                            else { root.context-menu-open = false; root.dismiss-context-menu(); root.dismiss-context-menu(); }
+                            else if root.context-submenu-open { root.close-context-submenu(); }
+                            else { root.context-menu-open = false; root.dismiss-context-menu(); }
                             return accept;
                         }
                         return reject;
@@ -1931,17 +1952,20 @@ accessible-label: entry.name;
                 command-list := VerticalLayout {
                     width: menu-scroll.width;
                     for command[index] in root.context-commands: Rectangle {
-                        height: 36px; border-radius: 5px;
+                        height: command.separator ? 9px : 28px; border-radius: 4px;
                         background: command.enabled && !command.separator && (index == root.context-active-index || command-touch.has-hover) ? VisualStyle.cedf1f6 : transparent;
-                        Rectangle { visible: command.separator; x: 4px; width: parent.width - 8px; height: 1px; y: 17px; background: VisualStyle.ce0e2e7; }
+                        Rectangle { visible: command.separator; x: 4px; width: parent.width - 8px; height: 1px; y: 4px; background: VisualStyle.ce0e2e7; }
                         Text { visible: !command.separator && command.checked; x: 8px; width: 14px; text: "✓"; color: VisualStyle.c4f6bed; font-size: 12px; vertical-alignment: center; }
                         Text { visible: !command.separator; x: 26px; width: parent.width - 76px; text: command.label; color: command.enabled ? VisualStyle.c30333a : VisualStyle.c9a9da3; font-size: command.default ? 13px : 12px; font-weight: command.default ? 600 : 400; vertical-alignment: center; overflow: elide; }
                         Text { visible: !command.separator; x: parent.width - 48px; width: 38px; text: command.submenu ? "›" : command.hint; color: VisualStyle.c72747d; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
                         command-touch := TouchArea {
                             enabled: command.enabled && !command.separator;
                             mouse-cursor: pointer;
-                            moved => { root.context-active-index = index; }
-                            clicked => { root.context-menu-open = false; root.invoke-context-command(command.id); root.dismiss-context-menu(); }
+                            moved => { root.context-active-index = index; root.context-submenu-anchor-y = self.absolute-position.y - root.absolute-position.y; root.hover-context-submenu(command.submenu ? index : -2147483647); }
+                            clicked => {
+                                if command.submenu { root.open-context-submenu(index); }
+                                else { root.context-menu-open = false; root.invoke-context-command(command.id); if !command.shell { root.dismiss-context-menu(); } }
+                            }
                         }
                         accessible-role: button; accessible-label: command.label; accessible-enabled: command.enabled;
                     }
@@ -1954,6 +1978,70 @@ accessible-label: entry.name;
             }
         }
         init => { context-search-editor.focus(); }
+    }
+    if root.context-menu-open && root.context-submenu-open: Rectangle {
+        z: 30;
+        x: root.context-submenu-parent-open ? (root.context-submenu-first-x > root.context-menu-panel-x ? root.context-submenu-first-x + 284px : max(12px, root.context-submenu-first-x - self.width - 4px)) : root.context-submenu-first-x;
+        y: min(parent.height - self.height - 12px, max(12px, root.context-submenu-anchor-y));
+        width: 280px;
+        height: min(parent.height - 24px, max(36px, 8px + root.context-submenu-commands.length * 28px + (root.context-submenu-loading ? 22px : 0px)));
+        background: VisualStyle.cffffff; border-color: VisualStyle.ce0e2e7; border-width: 1px; border-radius: 6px;
+        VerticalLayout {
+            padding: 4px;
+            submenu-scroll := Flickable {
+                vertical-stretch: 1; viewport-height: max(self.height, submenu-list.preferred-height);
+                submenu-list := VerticalLayout {
+                    width: submenu-scroll.width;
+                    for command[index] in root.context-submenu-commands: Rectangle {
+                        height: command.separator ? 9px : 28px; border-radius: 4px;
+                        background: command.enabled && !command.separator && (index == root.context-submenu-active-index || submenu-touch.has-hover) ? VisualStyle.cedf1f6 : transparent;
+                        Rectangle { visible: command.separator; x: 4px; width: parent.width - 8px; height: 1px; y: 4px; background: VisualStyle.ce0e2e7; }
+                        Text { visible: !command.separator && command.checked; x: 8px; width: 14px; text: "✓"; color: VisualStyle.c4f6bed; font-size: 12px; vertical-alignment: center; }
+                        Text { visible: !command.separator; x: 26px; width: parent.width - 76px; text: command.label; color: command.enabled ? VisualStyle.c30333a : VisualStyle.c9a9da3; font-size: command.default ? 13px : 12px; font-weight: command.default ? 600 : 400; vertical-alignment: center; overflow: elide; }
+                        Text { visible: !command.separator; x: parent.width - 48px; width: 38px; text: command.submenu ? "›" : command.hint; color: VisualStyle.c72747d; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+                        submenu-touch := TouchArea {
+                            enabled: command.enabled && !command.separator;
+                            mouse-cursor: pointer;
+                            moved => { root.context-submenu-active-index = index; root.context-submenu-anchor-y = self.absolute-position.y - root.absolute-position.y; if command.submenu { root.hover-context-submenu(-index - 1); } else { root.cancel-context-submenu-hover(); } }
+                            clicked => {
+                                if command.submenu { root.open-context-submenu(-index - 1); }
+                                else { root.context-menu-open = false; root.invoke-context-command(command.id); if !command.shell { root.dismiss-context-menu(); } }
+                            }
+                        }
+                    }
+                }
+            }
+            Text { visible: root.context-submenu-loading; height: root.context-submenu-loading ? 20px : 0px; text: root.text-context-loading; color: VisualStyle.c72747d; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+        }
+    }
+    if root.context-menu-open && root.context-submenu-parent-open: Rectangle {
+        z: 30;
+        x: root.context-submenu-first-x;
+        y: min(parent.height - self.height - 12px, max(12px, root.context-submenu-anchor-y));
+        width: 280px;
+        height: min(parent.height - 24px, max(36px, 8px + root.context-submenu-parent-commands.length * 28px));
+        background: VisualStyle.cffffff; border-color: VisualStyle.ce0e2e7; border-width: 1px; border-radius: 6px;
+        VerticalLayout {
+            padding: 4px;
+            for command[index] in root.context-submenu-parent-commands: Rectangle {
+                height: command.separator ? 9px : 28px; border-radius: 4px;
+                background: parent-submenu-touch.has-hover && command.enabled && !command.separator ? VisualStyle.cedf1f6 : transparent;
+                Rectangle { visible: command.separator; x: 4px; width: parent.width - 8px; height: 1px; y: 4px; background: VisualStyle.ce0e2e7; }
+                Text { visible: !command.separator && command.checked; x: 8px; width: 14px; text: "✓"; color: VisualStyle.c4f6bed; font-size: 12px; vertical-alignment: center; }
+                Text { visible: !command.separator; x: 26px; width: parent.width - 76px; text: command.label; color: command.enabled ? VisualStyle.c30333a : VisualStyle.c9a9da3; font-size: command.default ? 13px : 12px; font-weight: command.default ? 600 : 400; vertical-alignment: center; overflow: elide; }
+                Text { visible: !command.separator; x: parent.width - 48px; width: 38px; text: command.submenu ? "›" : command.hint; color: VisualStyle.c72747d; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+                parent-submenu-touch := TouchArea {
+                    enabled: command.enabled && !command.separator;
+                    mouse-cursor: pointer;
+                    moved => { if command.submenu { root.close-context-submenu(); root.hover-context-submenu(-index - 1); } else { root.cancel-context-submenu-hover(); } }
+                    clicked => {
+                        root.close-context-submenu();
+                        if command.submenu { root.open-context-submenu(-index - 1); }
+                        else { root.context-menu-open = false; root.invoke-context-command(command.id); if !command.shell { root.dismiss-context-menu(); } }
+                    }
+                }
+            }
+        }
     }
 if root.tabs-menu-open: TouchArea {
         z: 19;
