@@ -706,27 +706,17 @@ fn insertion_indicator_screen_rect(
     ))
 }
 
-fn project_native_insertion_indicator(target: Option<(WindowId, usize)>) {
+fn project_native_insertion_indicator(target: Option<(WindowId, usize)>, state: &SharedSessions) {
+    let dark_theme = state.lock().ok().is_some_and(|app| app.dark_theme());
     let projected = target.and_then(|(window_id, insertion_index)| {
         let ui = window_ui(window_id)?;
         let (x, y, width, height) = insertion_indicator_screen_rect(&ui, insertion_index)?;
-        platform::windows::tab_insertion_indicator::show(
-            native_window_handle(&ui),
-            x,
-            y,
-            width,
-            height,
-        )
-        .ok()?;
+        platform::windows::tab_insertion_indicator::show(x, y, width, height, dark_theme).ok()?;
         Some(())
     });
     if projected.is_none() {
         platform::windows::tab_insertion_indicator::hide();
     }
-}
-
-fn project_cross_window_drop(target: Option<(WindowId, usize)>) {
-    project_native_insertion_indicator(target);
 }
 
 fn project_native_tab_target(
@@ -773,7 +763,10 @@ fn project_native_tab_target(
                             ui.get_tab_current_width(),
                         )
                     });
-                    project_native_insertion_indicator(insertion.map(|index| (window_id, index)));
+                    project_native_insertion_indicator(
+                        insertion.map(|index| (window_id, index)),
+                        state,
+                    );
                     None
                 } else {
                     cross_window_drop_target(source_window, screen_x, screen_y, state)
@@ -784,7 +777,7 @@ fn project_native_tab_target(
         | platform::windows::drag_drop::TabTargetEvent::Drop { .. } => None,
     };
     if !source_hover {
-        project_cross_window_drop(target);
+        project_native_insertion_indicator(target, state);
     }
 }
 
@@ -2674,7 +2667,7 @@ fn finish_native_tab_drag(
         if let Ok(mut app) = state.lock() {
             app.cancel_tab_drag();
         }
-        project_cross_window_drop(None);
+        project_native_insertion_indicator(None, state);
         source_ui.invoke_clear_tab_drag();
         refresh_window_ui(source_ui, state, source_window);
         return false;
@@ -2721,7 +2714,7 @@ fn finish_native_tab_drag(
     } else {
         state.lock().is_ok_and(|mut app| app.cancel_tab_drag())
     };
-    project_cross_window_drop(None);
+    project_native_insertion_indicator(None, state);
     source_ui.invoke_clear_tab_drag();
     if !moved && !detached {
         refresh_window_ui(source_ui, state, source_window);
@@ -4137,7 +4130,7 @@ fn wire_callbacks(
         if let Some(ui) = weak.upgrade() {
             ui.invoke_clear_tab_drag();
         }
-        project_cross_window_drop(None);
+        project_native_insertion_indicator(None, &state_for_tab_drag.shared);
     });
 
     let weak = ui.as_weak();
@@ -4703,7 +4696,7 @@ fn wire_callbacks(
             }
             WindowCloseAction::CloseWindow => {
                 if let Ok(mut app) = state_for_close.lock() {
-                    app.cancel_tab_drag();
+                    app.cancel_tab_drag_for_window(state_for_close.window_id);
                     let _ = app.close_window(state_for_close.window_id);
                 }
                 if let Some(ui) = weak.upgrade() {
@@ -4795,7 +4788,7 @@ fn wire_mouse_navigation(
                         app.cancel_tab_drag_for_window(window_id);
                         let _ = app.close_window(window_id);
                     }
-                    project_cross_window_drop(None);
+                    project_native_insertion_indicator(None, &state);
                     remove_window_runtime(window_id);
                     return EventResult::Propagate;
                 }
@@ -4823,7 +4816,7 @@ fn wire_mouse_navigation(
             if let Ok(mut app) = state.lock() {
                 app.pending_right_drop = None;
             }
-            project_cross_window_drop(None);
+            project_native_insertion_indicator(None, &state);
             return EventResult::Propagate;
         }
         if let WindowEvent::ModifiersChanged(changed) = event {

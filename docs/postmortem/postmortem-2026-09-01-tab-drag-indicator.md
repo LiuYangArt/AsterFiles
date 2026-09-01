@@ -43,9 +43,9 @@ Slint 里留下 `external-tab-dragging`、`external-tab-insertion-index`、`tab-
 
 - 不再依赖 Slint 绘制指示器。
 - 新增独立的 `NativeInsertionIndicator` 原生窗口：
-  - `WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST`
+  - `WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT`
   - 不接收输入、不抢焦点、不注册 `IDropTarget`。
-  - 使用 `UpdateLayeredWindow` 用纯 GDI 绘制 `5px` 宽、标签栏高度、强调色、圆角的竖条。
+  - 使用原生窗口背景绘制 `5px` 宽、标签栏高度的主题强调色竖条，并通过窗口层级保持在标签栏上方。
 - 拖动落点更新时，直接按目标窗口标签栏物理坐标定位指示器窗口，独立于 Slint 重绘循环。
 - 离开目标窗口、Escape、无效释放、目标窗口关闭、拖动完成/取消时隐藏并销毁。
 - 同窗排序与跨窗口移动复用同一指示器逻辑。
