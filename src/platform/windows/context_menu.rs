@@ -9,6 +9,8 @@ use std::{
     path::{Path, PathBuf},
     ptr,
     rc::Rc,
+    sync::mpsc,
+    thread,
 };
 use windows::{
     Win32::{
@@ -63,6 +65,196 @@ pub enum ClassicMenuItemKind {
 pub enum ClassicMenuInvocation {
     BuiltIn { verb: String },
     Shell { verb: Option<String> },
+}
+
+pub type ShellMenuSessionId = u64;
+pub type ShellMenuRequestId = u64;
+
+#[derive(Debug, Clone)]
+pub enum ShellMenuLoadTarget {
+    Paths(Vec<PathBuf>),
+    Background(PathBuf),
+}
+
+#[derive(Debug)]
+pub enum ShellMenuCommand {
+    Load {
+        session_id: ShellMenuSessionId,
+        request_id: ShellMenuRequestId,
+        target: ShellMenuLoadTarget,
+        include_extended_verbs: bool,
+        owner_window: isize,
+    },
+    Invoke {
+        session_id: ShellMenuSessionId,
+        request_id: ShellMenuRequestId,
+        command_id: u32,
+        owner_window: isize,
+        screen_x: i32,
+        screen_y: i32,
+    },
+    Close {
+        session_id: ShellMenuSessionId,
+        request_id: ShellMenuRequestId,
+    },
+}
+
+#[derive(Debug)]
+pub enum ShellMenuEvent {
+    Loaded {
+        session_id: ShellMenuSessionId,
+        request_id: ShellMenuRequestId,
+        items: Vec<ClassicMenuItem>,
+        elapsed_ms: u128,
+    },
+    Invoked {
+        session_id: ShellMenuSessionId,
+        request_id: ShellMenuRequestId,
+        invocation: ClassicMenuInvocation,
+        elapsed_ms: u128,
+    },
+    Error {
+        session_id: ShellMenuSessionId,
+        request_id: ShellMenuRequestId,
+        operation: &'static str,
+        message: String,
+        elapsed_ms: u128,
+    },
+    Closed {
+        session_id: ShellMenuSessionId,
+        request_id: ShellMenuRequestId,
+    },
+}
+
+#[derive(Clone)]
+pub struct ShellMenuWorker {
+    commands: mpsc::Sender<ShellMenuCommand>,
+}
+
+impl ShellMenuWorker {
+    pub fn spawn() -> (Self, mpsc::Receiver<ShellMenuEvent>) {
+        let (commands, command_rx) = mpsc::channel();
+        let (event_tx, events) = mpsc::channel();
+        thread::spawn(move || shell_menu_worker_loop(command_rx, event_tx));
+        (Self { commands }, events)
+    }
+
+    pub fn send(&self, command: ShellMenuCommand) -> io::Result<()> {
+        self.commands
+            .send(command)
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "shell menu worker stopped"))
+    }
+}
+
+fn shell_menu_worker_loop(
+    commands: mpsc::Receiver<ShellMenuCommand>,
+    events: mpsc::Sender<ShellMenuEvent>,
+) {
+    let mut session: Option<(ShellMenuSessionId, ShellMenuRequestId, ClassicMenuSession)> = None;
+    while let Ok(command) = commands.recv() {
+        match command {
+            ShellMenuCommand::Load {
+                session_id,
+                request_id,
+                target,
+                include_extended_verbs,
+                owner_window,
+            } => {
+                let started = std::time::Instant::now();
+                let result = match target {
+                    ShellMenuLoadTarget::Paths(paths) => ClassicMenuSession::for_paths_with_owner(
+                        &paths,
+                        include_extended_verbs,
+                        owner_window,
+                    ),
+                    ShellMenuLoadTarget::Background(folder) => {
+                        ClassicMenuSession::for_background_with_owner(
+                            &folder,
+                            include_extended_verbs,
+                            owner_window,
+                        )
+                    }
+                }
+                .and_then(|menu| {
+                    let items = menu.items_top_level()?;
+                    session = Some((session_id, request_id, menu));
+                    Ok(items)
+                });
+                match result {
+                    Ok(items) => {
+                        let _ = events.send(ShellMenuEvent::Loaded {
+                            session_id,
+                            request_id,
+                            items,
+                            elapsed_ms: started.elapsed().as_millis(),
+                        });
+                    }
+                    Err(error) => {
+                        let _ = events.send(ShellMenuEvent::Error {
+                            session_id,
+                            request_id,
+                            operation: "load",
+                            message: error.to_string(),
+                            elapsed_ms: started.elapsed().as_millis(),
+                        });
+                    }
+                }
+            }
+            ShellMenuCommand::Invoke {
+                session_id,
+                request_id,
+                command_id,
+                owner_window,
+                screen_x,
+                screen_y,
+            } => {
+                let started = std::time::Instant::now();
+                let result = session
+                    .as_ref()
+                    .filter(|(id, req, _)| *id == session_id && *req == request_id)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "shell menu session not found")
+                    })
+                    .and_then(|(_, _, menu)| {
+                        menu.invoke_command(command_id, owner_window, screen_x, screen_y)
+                    });
+                match result {
+                    Ok(invocation) => {
+                        let _ = events.send(ShellMenuEvent::Invoked {
+                            session_id,
+                            request_id,
+                            invocation,
+                            elapsed_ms: started.elapsed().as_millis(),
+                        });
+                    }
+                    Err(error) => {
+                        let _ = events.send(ShellMenuEvent::Error {
+                            session_id,
+                            request_id,
+                            operation: "invoke",
+                            message: error.to_string(),
+                            elapsed_ms: started.elapsed().as_millis(),
+                        });
+                    }
+                }
+            }
+            ShellMenuCommand::Close {
+                session_id,
+                request_id,
+            } => {
+                if session
+                    .as_ref()
+                    .is_some_and(|(id, req, _)| *id == session_id && *req == request_id)
+                {
+                    session = None;
+                }
+                let _ = events.send(ShellMenuEvent::Closed {
+                    session_id,
+                    request_id,
+                });
+            }
+        }
+    }
 }
 
 pub struct ClassicMenuSession {
@@ -150,38 +342,28 @@ impl ClassicMenuSession {
     }
 
     pub fn items(&self) -> io::Result<Vec<ClassicMenuItem>> {
-        read_menu(self.menu, self)
+        read_menu(self.menu, self, true)
     }
 
-    pub fn show_native_and_invoke(
+    fn items_top_level(&self) -> io::Result<Vec<ClassicMenuItem>> {
+        read_menu(self.menu, self, false)
+    }
+
+    fn invoke_command(
         &self,
+        command_id: u32,
         owner_window: isize,
         screen_x: i32,
         screen_y: i32,
-    ) -> io::Result<Option<ClassicMenuInvocation>> {
-        let popup_owner = PopupOwner::create(HWND(owner_window as *mut _), self)?;
-        let selected = unsafe {
-            TrackPopupMenuEx(
-                self.menu,
-                (TPM_RETURNCMD | TPM_RIGHTBUTTON).0,
-                screen_x,
-                screen_y,
-                popup_owner.hwnd,
-                None,
-            )
-        };
-        if selected.0 == 0 {
-            return Ok(None);
-        }
-        let command_id = selected.0 as u32;
+    ) -> io::Result<ClassicMenuInvocation> {
         let offset = command_id
             .checked_sub(FIRST_COMMAND_ID)
             .ok_or_else(|| io::Error::other("shell returned an invalid menu command"))?;
         let verb = command_verb(&self.context_menu, command_id);
         if let Some(verb) = verb.as_deref().filter(|verb| is_builtin_verb(verb)) {
-            return Ok(Some(ClassicMenuInvocation::BuiltIn {
+            return Ok(ClassicMenuInvocation::BuiltIn {
                 verb: verb.to_owned(),
-            }));
+            });
         }
         let invocation = CMINVOKECOMMANDINFOEX {
             cbSize: size_of::<CMINVOKECOMMANDINFOEX>() as u32,
@@ -205,7 +387,31 @@ impl ClassicMenuSession {
         };
         let base = (&invocation as *const CMINVOKECOMMANDINFOEX).cast();
         unsafe { self.context_menu.InvokeCommand(&*base) }.map_err(windows_error)?;
-        Ok(Some(ClassicMenuInvocation::Shell { verb }))
+        Ok(ClassicMenuInvocation::Shell { verb })
+    }
+    pub fn show_native_and_invoke(
+        &self,
+        owner_window: isize,
+        screen_x: i32,
+        screen_y: i32,
+    ) -> io::Result<Option<ClassicMenuInvocation>> {
+        let popup_owner = PopupOwner::create(HWND(owner_window as *mut _), self)?;
+        let selected = unsafe {
+            TrackPopupMenuEx(
+                self.menu,
+                (TPM_RETURNCMD | TPM_RIGHTBUTTON).0,
+                screen_x,
+                screen_y,
+                popup_owner.hwnd,
+                None,
+            )
+        };
+        if selected.0 == 0 {
+            return Ok(None);
+        }
+        let command_id = selected.0 as u32;
+        self.invoke_command(command_id, owner_window, screen_x, screen_y)
+            .map(Some)
     }
 
     fn initialize_submenu(&self, submenu: HMENU, position: u32) {
@@ -401,7 +607,11 @@ fn free_pidls(pidls: Vec<*mut windows::Win32::UI::Shell::Common::ITEMIDLIST>) {
     }
 }
 
-fn read_menu(menu: HMENU, session: &ClassicMenuSession) -> io::Result<Vec<ClassicMenuItem>> {
+fn read_menu(
+    menu: HMENU,
+    session: &ClassicMenuSession,
+    recurse: bool,
+) -> io::Result<Vec<ClassicMenuItem>> {
     let count = unsafe { GetMenuItemCount(Some(menu)) };
     if count < 0 {
         return Err(io::Error::last_os_error());
@@ -435,9 +645,11 @@ fn read_menu(menu: HMENU, session: &ClassicMenuSession) -> io::Result<Vec<Classi
             .then_some(info.wID);
         let kind = if info.hSubMenu.is_invalid() {
             ClassicMenuItemKind::Command
-        } else {
+        } else if recurse {
             session.initialize_submenu(info.hSubMenu, position);
-            ClassicMenuItemKind::Submenu(read_menu(info.hSubMenu, session)?)
+            ClassicMenuItemKind::Submenu(read_menu(info.hSubMenu, session, true)?)
+        } else {
+            ClassicMenuItemKind::Submenu(Vec::new())
         };
         items.push(ClassicMenuItem {
             command_id,

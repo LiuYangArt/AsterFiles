@@ -51,6 +51,23 @@ cargo run -- --agent-scenario folder-size-scheduler --no-ui --agent-state-out ar
 ```
 
 场景不启动窗口、不扫描真实目录、不写 Everything 配置。产物记录普通首屏、重复滚动和后部滚动的提交数，完整大小排序的终态数量与最终刷新次数，以及取消后旧代次是否被拒绝。统一验证执行该场景；日志位于 `artifacts/logs/`，后续人工性能测量写入 `artifacts/perf/`。
+## Issue #13 快速菜单搜索
+
+无界面导出纯菜单模型状态，不创建窗口、不读取真实 Shell 菜单，也不执行文件操作：
+
+```powershell
+cargo run -- --agent-scenario quick-menu-search --no-ui --agent-state-out artifacts/state/context-menu/search.json
+```
+
+产物记录大小写搜索、中文搜索、空结果、原始 Shell command ID 保留，以及过滤不会发起 Shell 查询。专项单元测试：
+
+```powershell
+cargo test quick_menu --quiet
+cargo test context_menu --quiet
+```
+
+真实窗口的中文输入法、第三方扩展、动态/自绘菜单、DPI、多屏和边缘定位禁止 Agent 自动操作，由用户手动验证。菜单加载、迟到结果、调用和错误写入程序日志；实测耗时汇总放在 `artifacts/perf/`，用户截图放在 `artifacts/ui/`。
+
 ## P2 文件任务状态
 
 文件任务提供三个确定性无界面场景，不执行真实磁盘写入：

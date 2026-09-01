@@ -9,7 +9,7 @@ export struct BreadcrumbRow { index: int, label: string, current: bool }
 export struct TabRow { id: int, title: string, active: bool, loading: bool, icon: image, is-drive: bool, is-settings: bool }
 export struct SidebarRow { index: int, label: string, icon-kind: int, is-drive: bool, icon: image }
 export struct ColumnRow { kind: int, min-width: length, content-left: length, content-right: length, icon-slot: length }
-export struct ContextCommandRow { id: int, label: string, enabled: bool, separator: bool }
+export struct ContextCommandRow { id: int, label: string, search-text: string, hint: string, enabled: bool, separator: bool, shell: bool, checked: bool, default: bool, submenu: bool }
 export struct OperationRow { id: int, title: string, percent: string, file-progress: string, transferred: string, speed: string, eta: string, current-item: string, source: string, destination: string, progress: float, state: int, paused: bool, can-pause: bool, can-cancel: bool, can-retry: bool }
 export global VisualStyle {
     in-out property <bool> dark-theme: false;
@@ -633,6 +633,13 @@ export component AppWindow inherits Window {
     in property <[SidebarRow]> sidebar-items;
     in property <[ColumnRow]> columns;
     in property <[ContextCommandRow]> context-commands;
+    in-out property <string> context-search: "";
+    in-out property <int> context-active-index: -1;
+    in-out property <bool> context-shell-loading: false;
+    in-out property <int> context-shell-elapsed-ms: 0;
+    in property <string> text-context-search: "搜索命令";
+    in property <string> text-context-loading: "正在加载 Windows 菜单…";
+    in property <string> text-context-empty: "没有匹配的命令";
     in property <[OperationRow]> operations;
     in-out property <length> file-viewport-y: 0px;
     private property <length> list-viewport-y: 0px;
@@ -825,7 +832,8 @@ export component AppWindow inherits Window {
     public function show-drop-menu(x: float, y: float) {
         root.context-menu-anchor-x = x * 1px;
         root.context-menu-anchor-y = y * 1px;
-        root.context-menu-open = false;
+        root.context-menu-open = false; root.dismiss-context-menu();
+        root.context-search = "";
         root.drop-menu-open = true;
     }
     callback new-tab();
@@ -848,6 +856,10 @@ export component AppWindow inherits Window {
     callback show-background-menu(float, float);
     callback reopen-context-menu(float, float);
     callback invoke-context-command(int);
+    callback filter-context-menu(string);
+    callback move-context-selection(int);
+    callback activate-context-selection();
+    callback dismiss-context-menu();
     callback copy-selection(bool);
     callback paste-files();
     callback begin-rename();
@@ -912,7 +924,7 @@ export component AppWindow inherits Window {
         return max(0px, rows * root.search-row-height() - visible-height);
     }
     function dismiss-menus-and-drag-window(pointer-x: length, pointer-y: length) {
-        root.context-menu-open = false;
+        root.context-menu-open = false; root.dismiss-context-menu();
         root.tabs-menu-open = false;
         root.menu-open = false;
         if pointer-y < 46px && pointer-x >= 8px + 34px + 5px + root.tab-strip-width + (root.tabs-overflow ? 33px : 0px) + 5px + 34px + 5px && pointer-x < root.width - 3 * 46px {
@@ -1137,7 +1149,7 @@ export component AppWindow inherits Window {
             }
             HorizontalLayout {
                 x: parent.width - 3 * 46px; y: 0px; width: 3 * 46px; height: 40px; spacing: 0px;
-                WindowButton { kind: 0; label: root.text-window-minimize; clicked => { root.context-menu-open = false; root.minimized = true; } }
+                WindowButton { kind: 0; label: root.text-window-minimize; clicked => { root.context-menu-open = false; root.dismiss-context-menu(); root.minimized = true; } }
                 WindowButton { kind: 1; label: root.maximized ? root.text-window-restore : root.text-window-maximize; clicked => { root.maximized = !root.maximized; } }
                 WindowButton { kind: 2; label: root.text-window-close; clicked => { root.request-close(); } }
             }
@@ -1864,7 +1876,7 @@ accessible-label: entry.name;
             }
             if event.kind == PointerEventKind.down && event.button == PointerEventButton.right {
                 self.reopened-by-right-click = true;
-                root.context-menu-open = false;
+                root.context-menu-open = false; root.dismiss-context-menu();
                 root.reopen-context-menu(
                     (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
                     (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px
@@ -1873,7 +1885,7 @@ accessible-label: entry.name;
         }
         clicked => {
             if !self.reopened-by-right-click {
-                root.context-menu-open = false;
+                root.context-menu-open = false; root.dismiss-context-menu();
             }
             self.reopened-by-right-click = false;
         }
@@ -1888,18 +1900,60 @@ accessible-label: entry.name;
             max(12px, root.context-menu-anchor-y + self.height + 12px <= parent.height ? root.context-menu-anchor-y : root.context-menu-anchor-y - self.height),
             max(12px, parent.height - self.height - 12px)
         );
-        width: 240px; height: 12px + root.context-commands.length * 36px;
-        background: VisualStyle.cffffff; border-color: VisualStyle.ce0e2e7; border-width: 1px; border-radius: 7px;
-        VerticalLayout { padding: 6px;
-            for command in root.context-commands: Rectangle {
-                height: 36px; border-radius: 5px;
-                background: command.enabled && command-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
-                Rectangle { visible: command.separator; x: 4px; width: parent.width - 8px; height: 1px; y: 17px; background: VisualStyle.ce0e2e7; }
-                Text { visible: !command.separator; x: 10px; text: command.label; color: command.enabled ? VisualStyle.c30333a : VisualStyle.c9a9da3; font-size: 12px; vertical-alignment: center; }
-                command-touch := TouchArea { enabled: command.enabled && !command.separator; clicked => { root.context-menu-open = false; root.invoke-context-command(command.id); } }
-                accessible-role: button; accessible-label: command.label; accessible-enabled: command.enabled;
+        width: 320px;
+        height: min(parent.height - 24px, 64px + root.context-commands.length * 36px + (root.context-shell-loading ? 28px : 0px));
+        background: VisualStyle.cffffff; border-color: VisualStyle.ce0e2e7; border-width: 1px; border-radius: 8px;
+        VerticalLayout {
+            padding: 6px; spacing: 2px;
+            search-box := Rectangle {
+                height: 40px; border-radius: 6px; background: VisualStyle.cf5f6f8; border-color: VisualStyle.ce0e2e7; border-width: 1px;
+                Text { x: 10px; width: parent.width - 20px; text: root.context-search == "" ? root.text-context-search : ""; color: VisualStyle.c9a9da3; font-size: 12px; vertical-alignment: center; }
+                context-search-editor := TextInput {
+                    x: 10px; width: parent.width - 20px; height: parent.height;
+                    text <=> root.context-search; single-line: true; color: VisualStyle.c30333a; font-size: 13px; vertical-alignment: center;
+                    accessible-role: text-input; accessible-label: root.text-context-search;
+                    edited => { root.filter-context-menu(root.context-search); }
+                    accepted => { root.activate-context-selection(); }
+                    key-pressed(event) => {
+                        if event.text == Key.UpArrow { root.move-context-selection(-1); return accept; }
+                        if event.text == Key.DownArrow { root.move-context-selection(1); return accept; }
+                        if event.text == Key.Escape {
+                            if root.context-search != "" { root.context-search = ""; root.filter-context-menu(""); }
+                            else { root.context-menu-open = false; root.dismiss-context-menu(); root.dismiss-context-menu(); }
+                            return accept;
+                        }
+                        return reject;
+                    }
+                }
+            }
+            menu-scroll := Flickable {
+                vertical-stretch: 1; viewport-height: max(self.height, command-list.preferred-height);
+                command-list := VerticalLayout {
+                    width: menu-scroll.width;
+                    for command[index] in root.context-commands: Rectangle {
+                        height: 36px; border-radius: 5px;
+                        background: command.enabled && !command.separator && (index == root.context-active-index || command-touch.has-hover) ? VisualStyle.cedf1f6 : transparent;
+                        Rectangle { visible: command.separator; x: 4px; width: parent.width - 8px; height: 1px; y: 17px; background: VisualStyle.ce0e2e7; }
+                        Text { visible: !command.separator && command.checked; x: 8px; width: 14px; text: "✓"; color: VisualStyle.c4f6bed; font-size: 12px; vertical-alignment: center; }
+                        Text { visible: !command.separator; x: 26px; width: parent.width - 76px; text: command.label; color: command.enabled ? VisualStyle.c30333a : VisualStyle.c9a9da3; font-size: command.default ? 13px : 12px; font-weight: command.default ? 600 : 400; vertical-alignment: center; overflow: elide; }
+                        Text { visible: !command.separator; x: parent.width - 48px; width: 38px; text: command.submenu ? "›" : command.hint; color: VisualStyle.c72747d; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+                        command-touch := TouchArea {
+                            enabled: command.enabled && !command.separator;
+                            mouse-cursor: pointer;
+                            moved => { root.context-active-index = index; }
+                            clicked => { root.context-menu-open = false; root.invoke-context-command(command.id); root.dismiss-context-menu(); }
+                        }
+                        accessible-role: button; accessible-label: command.label; accessible-enabled: command.enabled;
+                    }
+                }
+            }
+            Text {
+                visible: root.context-shell-loading; height: root.context-shell-loading ? 24px : 0px;
+                text: root.text-context-loading + (root.context-shell-elapsed-ms >= 100 ? " " + root.context-shell-elapsed-ms + " ms" : "");
+                color: VisualStyle.c72747d; font-size: 11px; horizontal-alignment: center; vertical-alignment: center;
             }
         }
+        init => { context-search-editor.focus(); }
     }
 if root.tabs-menu-open: TouchArea {
         z: 19;

@@ -40,6 +40,7 @@ pub enum AgentScenario {
     ExplorerPins,
     ShellThumbnail,
     FolderSizeScheduler,
+    QuickMenuSearch,
 }
 
 impl AgentScenario {
@@ -57,6 +58,7 @@ impl AgentScenario {
             Self::ExplorerPins => "explorer-pins",
             Self::ShellThumbnail => "shell-thumbnail",
             Self::FolderSizeScheduler => "folder-size-scheduler",
+            Self::QuickMenuSearch => "quick-menu-search",
         }
     }
 
@@ -126,6 +128,7 @@ fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
         "explorer-pins" => Ok(AgentScenario::ExplorerPins),
         "shell-thumbnail" => Ok(AgentScenario::ShellThumbnail),
         "folder-size-scheduler" => Ok(AgentScenario::FolderSizeScheduler),
+        "quick-menu-search" => Ok(AgentScenario::QuickMenuSearch),
         _ => Err(format!("unknown agent scenario: {value}")),
     }
 }
@@ -166,7 +169,7 @@ pub fn apply_scenario(session: &mut TabSession, scenario: AgentScenario) {
             session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\ShellThumbnail"));
             session.load_state = LoadState::Complete;
         }
-        AgentScenario::FolderSizeScheduler => {
+        AgentScenario::FolderSizeScheduler | AgentScenario::QuickMenuSearch => {
             session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\FolderSizes"));
             session.load_state = LoadState::Complete;
         }
@@ -289,6 +292,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
             | AgentScenario::ExplorerPins
             | AgentScenario::ShellThumbnail
             | AgentScenario::FolderSizeScheduler
+            | AgentScenario::QuickMenuSearch
     ) {
         return None;
     }
@@ -347,6 +351,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
         AgentScenario::ExplorerPins => unreachable!(),
         AgentScenario::ShellThumbnail => unreachable!(),
         AgentScenario::FolderSizeScheduler => unreachable!(),
+        AgentScenario::QuickMenuSearch => unreachable!(),
         AgentScenario::PermissionDenied => unreachable!(),
     }
     manager.task(id).map(|task| match task.state {
