@@ -4,6 +4,7 @@ mod agent_debug;
 mod app;
 mod domain;
 mod fs;
+mod group_projection;
 mod i18n;
 mod platform;
 mod session_store;

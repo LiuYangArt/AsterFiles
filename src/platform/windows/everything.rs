@@ -44,6 +44,7 @@ const REQ_NAME: u32 = 1;
 const REQ_PATH: u32 = 2;
 const REQ_FULL: u32 = 4;
 const REQ_SIZE: u32 = 0x10;
+const REQ_CREATED: u32 = 0x20;
 const REQ_MODIFIED: u32 = 0x40;
 const REQ_ATTRIBUTES: u32 = 0x100;
 const REQ_HIGHLIGHTED_NAME: u32 = 0x2000;
@@ -103,6 +104,8 @@ pub enum EverythingSort {
     ExtensionDescending,
     SizeAscending,
     SizeDescending,
+    CreatedAscending,
+    CreatedDescending,
     ModifiedAscending,
     ModifiedDescending,
 }
@@ -124,6 +127,8 @@ impl EverythingSort {
             Self::ExtensionDescending => 10,
             Self::SizeAscending => 5,
             Self::SizeDescending => 6,
+            Self::CreatedAscending => 11,
+            Self::CreatedDescending => 12,
             Self::ModifiedAscending => 13,
             Self::ModifiedDescending => 14,
         }
@@ -164,6 +169,7 @@ pub struct EverythingSearchItem {
     pub name: OsString,
     pub parent: PathBuf,
     pub size: Option<u64>,
+    pub created: Option<SystemTime>,
     pub modified: Option<SystemTime>,
     pub is_directory: bool,
     pub name_highlights: Vec<EverythingHighlightSegment>,
@@ -519,6 +525,7 @@ fn query_ipc(
         | REQ_PATH
         | REQ_FULL
         | REQ_SIZE
+        | REQ_CREATED
         | REQ_MODIFIED
         | REQ_ATTRIBUTES
         | REQ_HIGHLIGHTED_NAME;
@@ -680,6 +687,7 @@ fn parse_item(
     let mut parent = None;
     let mut full = None;
     let mut size = None;
+    let mut created = None;
     let mut modified = None;
     let mut attributes = 0;
     let mut name_highlights = Vec::new();
@@ -694,6 +702,9 @@ fn parse_item(
     }
     if flags & REQ_SIZE != 0 {
         size = Some(get64a(b, &mut c)?)
+    }
+    if flags & REQ_CREATED != 0 {
+        created = filetime(get64a(b, &mut c)?)
     }
     if flags & REQ_MODIFIED != 0 {
         modified = filetime(get64a(b, &mut c)?)
@@ -714,6 +725,7 @@ fn parse_item(
             .unwrap_or_else(|| path.parent().unwrap_or(Path::new("")).into()),
         path,
         size,
+        created,
         modified,
         is_directory: item_flags & 1 != 0 || attributes & 0x10 != 0,
         name_highlights,
@@ -1349,6 +1361,44 @@ mod tests {
         assert_eq!(get32(&encoded, 12).unwrap(), 256);
         assert_eq!(get32(&encoded, 16).unwrap(), 256);
         assert_eq!(get32(&encoded, 24).unwrap(), 14);
+    }
+    #[test]
+    fn query2_created_time_uses_official_request_and_sort_values() {
+        let encoded = encode_query(
+            123usize as HWND,
+            ".md",
+            0,
+            16,
+            REQ_FULL | REQ_CREATED,
+            EverythingSort::CreatedDescending.ipc(),
+        );
+        assert_eq!(get32(&encoded, 20).unwrap(), REQ_FULL | 0x20);
+        assert_eq!(get32(&encoded, 24).unwrap(), 12);
+    }
+
+    #[test]
+    fn query2_parser_reads_created_before_modified() {
+        let created_ticks = 116_444_736_000_000_000_u64 + 10_000_000;
+        let modified_ticks = created_ticks + 10_000_000;
+        let full = wide(r"C:\data\asset.txt");
+        let full_len = (full.len() - 1) as u32;
+        let table_end = LIST_HEADER + ITEM_SIZE;
+        let mut bytes = vec![0_u8; table_end];
+        put32(&mut bytes, 0, 1);
+        put32(&mut bytes, 4, 1);
+        put32(&mut bytes, 12, REQ_FULL | REQ_CREATED | REQ_MODIFIED);
+        put32(&mut bytes, LIST_HEADER + 4, table_end as u32);
+        bytes.extend_from_slice(&full_len.to_le_bytes());
+        for unit in full {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&created_ticks.to_le_bytes());
+        bytes.extend_from_slice(&modified_ticks.to_le_bytes());
+
+        let page = parse_results(&bytes).unwrap();
+        let item = &page.items[0];
+        assert_eq!(item.created, Some(UNIX_EPOCH + Duration::from_secs(1)));
+        assert_eq!(item.modified, Some(UNIX_EPOCH + Duration::from_secs(2)));
     }
     #[test]
     fn highlighted_name_parser_preserves_compact_text_and_literal_stars() {

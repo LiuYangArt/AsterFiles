@@ -1,18 +1,30 @@
 use std::{
+    collections::HashSet,
     ffi::{OsStr, OsString},
     fs, io,
     path::{Path, PathBuf},
 };
 
 use crate::{
-    domain::{EverythingConfig, FileVisibility},
+    domain::{
+        ColumnKind, ColumnLayout, DirectoryViewPreference, EverythingConfig, FileVisibility,
+        GroupField, MAX_DIRECTORY_VIEW_PREFERENCES, SearchViewPreference, SortDirection, SortField,
+        ViewMode,
+    },
     i18n::Language,
 };
 
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-const MAGIC: &[u8; 5] = b"ASTF8";
+const MAGIC: &[u8; 5] = b"ASTF9";
+const MAX_TABS: usize = 1_024;
+const MAX_WINDOWS: usize = 128;
+const MAX_PATH_UNITS: usize = 32_767;
+const MIN_WINDOW_WIDTH: u32 = 820;
+const MIN_WINDOW_HEIGHT: u32 = 520;
+const MAX_WINDOW_WIDTH: u32 = 7_680;
+const MAX_WINDOW_HEIGHT: u32 = 4_320;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ThemeMode {
@@ -40,22 +52,6 @@ impl ThemeMode {
         }
     }
 }
-pub type ColumnOrder = [u8; 4];
-pub type SearchColumnOrder = [u8; 4];
-pub type ColumnWidths = [u32; 4];
-pub type SearchColumnWidths = [u32; 4];
-pub const DEFAULT_COLUMN_ORDER: ColumnOrder = [0, 1, 2, 3];
-pub const DEFAULT_COLUMN_WIDTHS: ColumnWidths = [480, 160, 120, 200];
-pub const DEFAULT_SEARCH_COLUMN_WIDTHS: SearchColumnWidths = [400, 320, 120, 200];
-const MIN_COLUMN_WIDTH: u32 = 64;
-const MAX_COLUMN_WIDTH: u32 = 4_096;
-const MAX_TABS: usize = 1_024;
-const MAX_WINDOWS: usize = 128;
-const MAX_PATH_UNITS: usize = 32_767;
-const MIN_WINDOW_WIDTH: u32 = 820;
-const MIN_WINDOW_HEIGHT: u32 = 520;
-const MAX_WINDOW_WIDTH: u32 = 7_680;
-const MAX_WINDOW_HEIGHT: u32 = 4_320;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WindowPlacement {
@@ -68,10 +64,9 @@ pub struct WindowPlacement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionState {
     pub windows: Vec<WindowSessionState>,
-    pub column_order: ColumnOrder,
-    pub search_column_order: SearchColumnOrder,
-    pub column_widths: ColumnWidths,
-    pub search_column_widths: SearchColumnWidths,
+    pub default_directory_view: DirectoryViewPreference,
+    pub search_view: SearchViewPreference,
+    pub directory_views: Vec<(PathBuf, DirectoryViewPreference)>,
     pub theme_mode: ThemeMode,
     pub language: Language,
     pub everything: EverythingConfig,
@@ -91,7 +86,6 @@ impl SessionState {
         window: WindowPlacement,
         active_tab: usize,
         tab_paths: Vec<PathBuf>,
-        column_order: ColumnOrder,
     ) -> io::Result<Self> {
         Self::with_windows_and_settings(
             vec![WindowSessionState {
@@ -99,10 +93,9 @@ impl SessionState {
                 active_tab,
                 tab_paths,
             }],
-            column_order,
-            [0, 1, 2, 3],
-            DEFAULT_COLUMN_WIDTHS,
-            DEFAULT_SEARCH_COLUMN_WIDTHS,
+            DirectoryViewPreference::default(),
+            SearchViewPreference::default(),
+            Vec::new(),
             ThemeMode::System,
             Language::Chinese,
             EverythingConfig::default(),
@@ -113,10 +106,9 @@ impl SessionState {
     #[allow(clippy::too_many_arguments)]
     pub fn with_windows_and_settings(
         mut windows: Vec<WindowSessionState>,
-        column_order: ColumnOrder,
-        search_column_order: SearchColumnOrder,
-        column_widths: ColumnWidths,
-        search_column_widths: SearchColumnWidths,
+        default_directory_view: DirectoryViewPreference,
+        search_view: SearchViewPreference,
+        directory_views: Vec<(PathBuf, DirectoryViewPreference)>,
         theme_mode: ThemeMode,
         language: Language,
         everything: EverythingConfig,
@@ -130,23 +122,24 @@ impl SessionState {
             if window.tab_paths.len() > MAX_TABS {
                 return Err(invalid_data("invalid session tab count"));
             }
+            for path in &window.tab_paths {
+                validate_path(path)?;
+            }
             window.active_tab = if window.tab_paths.is_empty() {
                 0
             } else {
                 window.active_tab.min(window.tab_paths.len() - 1)
             };
         }
-        validate_column_order(column_order)?;
-        validate_column_order(search_column_order)?;
-        validate_column_widths(column_widths)?;
-        validate_column_widths(search_column_widths)?;
+        validate_directory_preference(default_directory_view)?;
+        validate_search_preference(search_view)?;
+        validate_directory_views(&directory_views)?;
         validate_everything_config(&everything)?;
         Ok(Self {
             windows,
-            column_order,
-            search_column_order,
-            column_widths,
-            search_column_widths,
+            default_directory_view,
+            search_view,
+            directory_views,
             theme_mode,
             language,
             everything,
@@ -176,10 +169,9 @@ pub fn save(path: &Path, state: &SessionState) -> io::Result<()> {
 fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
     let state = SessionState::with_windows_and_settings(
         state.windows.clone(),
-        state.column_order,
-        state.search_column_order,
-        state.column_widths,
-        state.search_column_widths,
+        state.default_directory_view,
+        state.search_view,
+        state.directory_views.clone(),
         state.theme_mode,
         state.language,
         state.everything.clone(),
@@ -188,10 +180,13 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(MAGIC);
     bytes.extend_from_slice(&(state.windows.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(&state.column_order);
-    bytes.extend_from_slice(&state.search_column_order);
-    write_four_u32(&mut bytes, state.column_widths);
-    write_four_u32(&mut bytes, state.search_column_widths);
+    write_directory_preference(&mut bytes, state.default_directory_view);
+    write_search_preference(&mut bytes, state.search_view);
+    bytes.extend_from_slice(&(state.directory_views.len() as u32).to_le_bytes());
+    for (path, preference) in &state.directory_views {
+        write_os(&mut bytes, path.as_os_str())?;
+        write_directory_preference(&mut bytes, *preference);
+    }
     bytes.push(state.theme_mode.storage_code());
     bytes.push(state.language.storage_code());
     write_optional_os(&mut bytes, state.everything.executable_path.as_deref())?;
@@ -219,33 +214,33 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
     if bytes.len() < MAGIC.len() || &bytes[..MAGIC.len()] != MAGIC {
         return Err(invalid_data("invalid AsterFiles session"));
     }
-
     let mut offset = MAGIC.len();
     let window_count = read_u32(bytes, &mut offset)? as usize;
     if window_count == 0 || window_count > MAX_WINDOWS {
         return Err(invalid_data("invalid session window count"));
     }
-    let column_order = read_four(bytes, &mut offset)?;
-    let search_column_order = read_four(bytes, &mut offset)?;
-    let column_widths = read_four_u32(bytes, &mut offset)?;
-    let search_column_widths = read_four_u32(bytes, &mut offset)?;
+    let default_directory_view = read_directory_preference(bytes, &mut offset)?;
+    let search_view = read_search_preference(bytes, &mut offset)?;
+    let directory_count = read_u32(bytes, &mut offset)? as usize;
+    if directory_count > MAX_DIRECTORY_VIEW_PREFERENCES {
+        return Err(invalid_data("too many directory view preferences"));
+    }
+    let mut directory_views = Vec::with_capacity(directory_count);
+    for _ in 0..directory_count {
+        directory_views.push((
+            PathBuf::from(read_os(bytes, &mut offset)?),
+            read_directory_preference(bytes, &mut offset)?,
+        ));
+    }
     let theme_mode = ThemeMode::from_storage_code(read_u8(bytes, &mut offset)?)
         .ok_or_else(|| invalid_data("invalid session theme mode"))?;
     let language = Language::from_storage_code(read_u8(bytes, &mut offset)?)
         .ok_or_else(|| invalid_data("invalid session language"))?;
-    let executable_path = read_optional_os(bytes, &mut offset)?.map(PathBuf::from);
-    let instance_name = read_string(bytes, &mut offset)?;
-    let verified_version = read_optional_string(bytes, &mut offset)?;
-    let allow_launch = match read_u8(bytes, &mut offset)? {
-        0 => false,
-        1 => true,
-        _ => return Err(invalid_data("invalid Everything launch setting")),
-    };
     let everything = EverythingConfig {
-        executable_path,
-        instance_name,
-        verified_version,
-        allow_launch,
+        executable_path: read_optional_os(bytes, &mut offset)?.map(PathBuf::from),
+        instance_name: read_string(bytes, &mut offset)?,
+        verified_version: read_optional_string(bytes, &mut offset)?,
+        allow_launch: read_bool(bytes, &mut offset, "invalid Everything launch setting")?,
     };
     let file_visibility = FileVisibility {
         show_hidden: read_bool(bytes, &mut offset, "invalid hidden-file setting")?,
@@ -275,17 +270,14 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
             tab_paths,
         });
     }
-
     if offset != bytes.len() {
         return Err(invalid_data("unexpected trailing session data"));
     }
-
     SessionState::with_windows_and_settings(
         windows,
-        column_order,
-        search_column_order,
-        column_widths,
-        search_column_widths,
+        default_directory_view,
+        search_view,
+        directory_views,
         theme_mode,
         language,
         everything,
@@ -293,44 +285,141 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
     )
 }
 
-fn validate_column_order(column_order: ColumnOrder) -> io::Result<()> {
-    let mut seen = [false; DEFAULT_COLUMN_ORDER.len()];
-    for column in column_order {
-        let index = usize::from(column);
-        if index >= seen.len() || seen[index] {
-            return Err(invalid_data("invalid session column order"));
+fn validate_directory_views(values: &[(PathBuf, DirectoryViewPreference)]) -> io::Result<()> {
+    if values.len() > MAX_DIRECTORY_VIEW_PREFERENCES {
+        return Err(invalid_data("too many directory view preferences"));
+    }
+    let mut paths = HashSet::with_capacity(values.len());
+    for (path, preference) in values {
+        validate_path(path)?;
+        if !paths.insert(path) {
+            return Err(invalid_data("duplicate directory view preference"));
         }
-        seen[index] = true;
+        validate_directory_preference(*preference)?;
     }
     Ok(())
 }
 
-fn validate_column_widths(column_widths: ColumnWidths) -> io::Result<()> {
-    if column_widths
-        .into_iter()
-        .any(|width| !(MIN_COLUMN_WIDTH..=MAX_COLUMN_WIDTH).contains(&width))
-    {
-        return Err(invalid_data("invalid session column width"));
+fn validate_directory_preference(value: DirectoryViewPreference) -> io::Result<()> {
+    if value.is_valid() {
+        Ok(())
+    } else {
+        Err(invalid_data("invalid directory view preference"))
     }
-    Ok(())
 }
+
+fn validate_search_preference(value: SearchViewPreference) -> io::Result<()> {
+    if value.is_valid() {
+        Ok(())
+    } else {
+        Err(invalid_data("invalid search view preference"))
+    }
+}
+
+fn validate_path(path: &Path) -> io::Result<()> {
+    if encode_os(path.as_os_str()).len() > MAX_PATH_UNITS {
+        Err(invalid_data("stored path is too long"))
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_everything_config(config: &EverythingConfig) -> io::Result<()> {
     if config.instance_name.encode_utf16().count() > MAX_PATH_UNITS
         || config
             .verified_version
             .as_deref()
             .is_some_and(|version| version.encode_utf16().count() > MAX_PATH_UNITS)
+        || config
+            .executable_path
+            .as_deref()
+            .is_some_and(|path| encode_os(path.as_os_str()).len() > MAX_PATH_UNITS)
     {
         return Err(invalid_data("Everything setting is too long"));
     }
-    if config
-        .executable_path
-        .as_deref()
-        .is_some_and(|path| encode_os(path.as_os_str()).len() > MAX_PATH_UNITS)
-    {
-        return Err(invalid_data("Everything executable path is too long"));
-    }
     Ok(())
+}
+
+fn write_directory_preference(bytes: &mut Vec<u8>, value: DirectoryViewPreference) {
+    bytes.push(value.view_mode.storage_code());
+    bytes.push(value.sort_field.storage_code());
+    bytes.push(value.sort_direction.storage_code());
+    bytes.push(value.group_field.storage_code());
+    bytes.push(value.group_direction.storage_code());
+    write_column_layout(bytes, value.columns);
+}
+
+fn write_search_preference(bytes: &mut Vec<u8>, value: SearchViewPreference) {
+    bytes.push(value.view_mode.storage_code());
+    bytes.push(value.sort_field.storage_code());
+    bytes.push(value.sort_direction.storage_code());
+    write_column_layout(bytes, value.columns);
+}
+
+fn write_column_layout(bytes: &mut Vec<u8>, value: ColumnLayout) {
+    bytes.extend(value.order.map(ColumnKind::storage_code));
+    for width in value.widths {
+        bytes.extend_from_slice(&width.to_le_bytes());
+    }
+    for visible in value.visible {
+        bytes.push(u8::from(visible));
+    }
+}
+
+fn read_directory_preference(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> io::Result<DirectoryViewPreference> {
+    let value = DirectoryViewPreference {
+        view_mode: ViewMode::from_storage_code(read_u8(bytes, offset)?)
+            .ok_or_else(|| invalid_data("invalid view mode"))?,
+        sort_field: SortField::from_storage_code(read_u8(bytes, offset)?)
+            .ok_or_else(|| invalid_data("invalid sort field"))?,
+        sort_direction: SortDirection::from_storage_code(read_u8(bytes, offset)?)
+            .ok_or_else(|| invalid_data("invalid sort direction"))?,
+        group_field: GroupField::from_storage_code(read_u8(bytes, offset)?)
+            .ok_or_else(|| invalid_data("invalid group field"))?,
+        group_direction: SortDirection::from_storage_code(read_u8(bytes, offset)?)
+            .ok_or_else(|| invalid_data("invalid group direction"))?,
+        columns: read_column_layout(bytes, offset)?,
+    };
+    validate_directory_preference(value)?;
+    Ok(value)
+}
+
+fn read_search_preference(bytes: &[u8], offset: &mut usize) -> io::Result<SearchViewPreference> {
+    let value = SearchViewPreference {
+        view_mode: ViewMode::from_storage_code(read_u8(bytes, offset)?)
+            .ok_or_else(|| invalid_data("invalid view mode"))?,
+        sort_field: SortField::from_storage_code(read_u8(bytes, offset)?)
+            .ok_or_else(|| invalid_data("invalid sort field"))?,
+        sort_direction: SortDirection::from_storage_code(read_u8(bytes, offset)?)
+            .ok_or_else(|| invalid_data("invalid sort direction"))?,
+        columns: read_column_layout(bytes, offset)?,
+    };
+    validate_search_preference(value)?;
+    Ok(value)
+}
+
+fn read_column_layout(bytes: &[u8], offset: &mut usize) -> io::Result<ColumnLayout> {
+    let mut order = [ColumnKind::Name; ColumnKind::COUNT];
+    for column in &mut order {
+        *column = ColumnKind::from_storage_code(read_u8(bytes, offset)?)
+            .ok_or_else(|| invalid_data("invalid column kind"))?;
+    }
+    let mut widths = [0; ColumnKind::COUNT];
+    for width in &mut widths {
+        *width = read_u32(bytes, offset)?;
+    }
+    let mut visible = [false; ColumnKind::COUNT];
+    for item in &mut visible {
+        *item = read_bool(bytes, offset, "invalid column visibility")?;
+    }
+    Ok(ColumnLayout {
+        order,
+        widths,
+        visible,
+    })
 }
 
 fn write_optional_os(bytes: &mut Vec<u8>, value: Option<&Path>) -> io::Result<()> {
@@ -383,11 +472,6 @@ fn write_optional_string(bytes: &mut Vec<u8>, value: Option<&str>) -> io::Result
     }
 }
 
-fn write_four_u32(bytes: &mut Vec<u8>, values: [u32; 4]) {
-    for value in values {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-}
 fn read_optional_os(bytes: &[u8], offset: &mut usize) -> io::Result<Option<OsString>> {
     match read_u8(bytes, offset)? {
         0 => Ok(None),
@@ -402,7 +486,7 @@ fn read_os(bytes: &[u8], offset: &mut usize) -> io::Result<OsString> {
 
 fn read_string(bytes: &[u8], offset: &mut usize) -> io::Result<String> {
     String::from_utf16(&read_units(bytes, offset)?)
-        .map_err(|_| invalid_data("invalid stored string"))
+        .map_err(|_| invalid_data("invalid UTF-16 string"))
 }
 
 fn read_optional_string(bytes: &[u8], offset: &mut usize) -> io::Result<Option<String>> {
@@ -414,39 +498,30 @@ fn read_optional_string(bytes: &[u8], offset: &mut usize) -> io::Result<Option<S
 }
 
 fn read_units(bytes: &[u8], offset: &mut usize) -> io::Result<Vec<u16>> {
-    let length = read_u32(bytes, offset)? as usize;
-    if length > MAX_PATH_UNITS {
-        return Err(invalid_data("stored value is too long"));
+    let count = read_u32(bytes, offset)? as usize;
+    if count > MAX_PATH_UNITS {
+        return Err(invalid_data("stored string is too long"));
     }
-    let byte_length = length
+    let byte_count = count
         .checked_mul(2)
-        .ok_or_else(|| invalid_data("invalid stored value length"))?;
+        .ok_or_else(|| invalid_data("invalid string length"))?;
     let end = offset
-        .checked_add(byte_length)
+        .checked_add(byte_count)
         .filter(|end| *end <= bytes.len())
-        .ok_or_else(|| invalid_data("truncated session"))?;
-    let units = bytes[*offset..end]
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-        .collect();
+        .ok_or_else(|| invalid_data("truncated session data"))?;
+    let mut units = Vec::with_capacity(count);
+    for pair in bytes[*offset..end].chunks_exact(2) {
+        units.push(u16::from_le_bytes([pair[0], pair[1]]));
+    }
     *offset = end;
     Ok(units)
 }
-fn read_four_u32(bytes: &[u8], offset: &mut usize) -> io::Result<[u32; 4]> {
-    Ok([
-        read_u32(bytes, offset)?,
-        read_u32(bytes, offset)?,
-        read_u32(bytes, offset)?,
-        read_u32(bytes, offset)?,
-    ])
-}
+
 fn validate_window(window: WindowPlacement) -> io::Result<()> {
-    if window.width < MIN_WINDOW_WIDTH
-        || window.height < MIN_WINDOW_HEIGHT
-        || window.width > MAX_WINDOW_WIDTH
-        || window.height > MAX_WINDOW_HEIGHT
+    if !(MIN_WINDOW_WIDTH..=MAX_WINDOW_WIDTH).contains(&window.width)
+        || !(MIN_WINDOW_HEIGHT..=MAX_WINDOW_HEIGHT).contains(&window.height)
     {
-        return Err(invalid_data("invalid session window size"));
+        return Err(invalid_data("invalid session window placement"));
     }
     Ok(())
 }
@@ -458,31 +533,31 @@ fn read_bool(bytes: &[u8], offset: &mut usize, message: &'static str) -> io::Res
         _ => Err(invalid_data(message)),
     }
 }
+
 fn read_u8(bytes: &[u8], offset: &mut usize) -> io::Result<u8> {
-    let value = bytes
+    let value = *bytes
         .get(*offset)
-        .copied()
-        .ok_or_else(|| invalid_data("truncated session"))?;
+        .ok_or_else(|| invalid_data("truncated session data"))?;
     *offset += 1;
     Ok(value)
 }
 
 fn read_i32(bytes: &[u8], offset: &mut usize) -> io::Result<i32> {
-    Ok(i32::from_le_bytes(read_four(bytes, offset)?))
+    read_array::<4>(bytes, offset).map(i32::from_le_bytes)
 }
 
 fn read_u32(bytes: &[u8], offset: &mut usize) -> io::Result<u32> {
-    Ok(u32::from_le_bytes(read_four(bytes, offset)?))
+    read_array::<4>(bytes, offset).map(u32::from_le_bytes)
 }
 
-fn read_four(bytes: &[u8], offset: &mut usize) -> io::Result<[u8; 4]> {
+fn read_array<const N: usize>(bytes: &[u8], offset: &mut usize) -> io::Result<[u8; N]> {
     let end = offset
-        .checked_add(4)
+        .checked_add(N)
         .filter(|end| *end <= bytes.len())
-        .ok_or_else(|| invalid_data("truncated session"))?;
+        .ok_or_else(|| invalid_data("truncated session data"))?;
     let value = bytes[*offset..end]
         .try_into()
-        .expect("four-byte slice has fixed size");
+        .map_err(|_| invalid_data("truncated session data"))?;
     *offset = end;
     Ok(value)
 }
@@ -516,220 +591,86 @@ mod tests {
     use super::*;
 
     fn sample_state() -> SessionState {
-        let mut state = SessionState::new(
-            WindowPlacement {
-                x: -120,
-                y: 84,
-                width: 1440,
-                height: 900,
-            },
-            1,
-            vec![
-                PathBuf::from(r"C:\中文\📁"),
-                PathBuf::from(r"\\server\共享\資料"),
-            ],
-            [2, 0, 3, 1],
-        )
-        .expect("valid state");
-        state.theme_mode = ThemeMode::Dark;
-        state.language = Language::English;
-        state
-    }
-
-    #[test]
-    fn round_trips_complete_session() {
-        let state = sample_state();
-        assert_eq!(decode(&encode(&state).expect("encodable")).unwrap(), state);
-    }
-
-    #[test]
-    fn round_trips_multiple_windows_with_independent_layout_and_order() {
-        let mut state = sample_state();
-        state.windows.push(WindowSessionState {
-            placement: WindowPlacement {
-                x: 420,
-                y: 180,
-                width: 1024,
-                height: 700,
-            },
-            active_tab: 0,
-            tab_paths: vec![PathBuf::from(r"D:\three"), PathBuf::from(r"D:\four")],
-        });
-        let restored = decode(&encode(&state).unwrap()).unwrap();
-        assert_eq!(restored, state);
-        assert_eq!(restored.windows[1].tab_paths[0], PathBuf::from(r"D:\three"));
-    }
-
-    #[test]
-    fn default_constructor_uses_system_theme_and_chinese() {
-        let state = SessionState::new(
-            WindowPlacement {
-                x: 0,
-                y: 0,
-                width: 900,
-                height: 600,
-            },
-            0,
-            Vec::new(),
-            DEFAULT_COLUMN_ORDER,
-        )
-        .unwrap();
-
-        assert_eq!(state.theme_mode, ThemeMode::System);
-        assert_eq!(state.language, Language::Chinese);
-        assert_eq!(state.column_widths, DEFAULT_COLUMN_WIDTHS);
-        assert_eq!(state.search_column_widths, DEFAULT_SEARCH_COLUMN_WIDTHS);
-        assert_eq!(state.file_visibility, FileVisibility::default());
-    }
-
-    #[test]
-    fn everything_settings_and_search_columns_round_trip() {
-        let state = SessionState::with_windows_and_settings(
+        let mut columns = ColumnLayout::default();
+        columns.visible[usize::from(ColumnKind::Created.storage_code())] = true;
+        let directory_preference = DirectoryViewPreference {
+            view_mode: ViewMode::LargeIcons,
+            sort_field: SortField::Created,
+            sort_direction: SortDirection::Descending,
+            group_field: GroupField::Kind,
+            group_direction: SortDirection::Ascending,
+            columns,
+        };
+        SessionState::with_windows_and_settings(
             vec![WindowSessionState {
                 placement: WindowPlacement {
-                    x: 20,
-                    y: 30,
-                    width: 1200,
-                    height: 800,
+                    x: -120,
+                    y: 80,
+                    width: 1180,
+                    height: 760,
                 },
                 active_tab: 0,
-                tab_paths: vec![PathBuf::from(r"\\LiuYanghomeNAS\Multimedia")],
+                tab_paths: vec![PathBuf::from(r"C:\项目\📁")],
             }],
-            DEFAULT_COLUMN_ORDER,
-            [1, 0, 3, 2],
-            [560, 180, 128, 240],
-            [440, 420, 128, 240],
+            DirectoryViewPreference::default(),
+            SearchViewPreference {
+                view_mode: ViewMode::Content,
+                sort_field: SortField::Modified,
+                sort_direction: SortDirection::Descending,
+                columns,
+            },
+            vec![(PathBuf::from(r"C:\项目\📁"), directory_preference)],
             ThemeMode::Dark,
             Language::English,
             EverythingConfig {
-                executable_path: Some(PathBuf::from(
-                    r"C:\Program Files\Everything 1.5a\Everything64.exe",
-                )),
-                instance_name: "1.5a 特殊".to_owned(),
-                verified_version: Some("1.5.0.1396a x64".to_owned()),
+                executable_path: Some(PathBuf::from(r"C:\Tools\Everything.exe")),
+                instance_name: "1.5a".to_owned(),
+                verified_version: Some("1.5.0.1400a".to_owned()),
                 allow_launch: false,
             },
-            FileVisibility::default(),
-        )
-        .unwrap();
-
-        assert_eq!(decode(&encode(&state).unwrap()).unwrap(), state);
-    }
-    #[test]
-    fn file_visibility_settings_round_trip_independently() {
-        let mut state = sample_state();
-        state.file_visibility = FileVisibility {
-            show_hidden: false,
-            show_system: true,
-        };
-
-        assert_eq!(decode(&encode(&state).unwrap()).unwrap(), state);
-    }
-
-    #[test]
-    fn rejects_invalid_file_visibility_flags() {
-        let mut bytes = encode(&sample_state()).unwrap();
-        let flags_offset = bytes.len()
-            - sample_state().windows[0]
-                .tab_paths
-                .iter()
-                .map(|path| 4 + encode_os(path.as_os_str()).len() * 2)
-                .sum::<usize>()
-            - 2;
-        bytes[flags_offset] = 2;
-        assert_eq!(
-            decode(&bytes).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-
-        let mut bytes = encode(&sample_state()).unwrap();
-        bytes[flags_offset + 1] = 2;
-        assert_eq!(
-            decode(&bytes).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-    }
-    #[test]
-    fn setting_storage_codes_are_stable() {
-        assert_eq!(ThemeMode::System.storage_code(), 0);
-        assert_eq!(ThemeMode::Light.storage_code(), 1);
-        assert_eq!(ThemeMode::Dark.storage_code(), 2);
-        assert_eq!(ThemeMode::from_storage_code(0), Some(ThemeMode::System));
-        assert_eq!(ThemeMode::from_storage_code(1), Some(ThemeMode::Light));
-        assert_eq!(ThemeMode::from_storage_code(2), Some(ThemeMode::Dark));
-        assert_eq!(ThemeMode::from_storage_code(3), None);
-        assert_eq!(ThemeMode::from_storage_code(u8::MAX), None);
-    }
-
-    #[test]
-    fn rejects_invalid_setting_codes() {
-        let mut invalid_theme = encode(&sample_state()).unwrap();
-        invalid_theme[49] = u8::MAX;
-        assert_eq!(
-            decode(&invalid_theme).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-
-        let mut invalid_language = encode(&sample_state()).unwrap();
-        invalid_language[50] = u8::MAX;
-        assert_eq!(
-            decode(&invalid_language).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn round_trips_unpaired_utf16_path_units() {
-        let raw_path =
-            OsString::from_wide(&[b'C' as u16, b':' as u16, b'\\' as u16, 0xd800, b'x' as u16]);
-        let state = SessionState::new(
-            WindowPlacement {
-                x: 0,
-                y: 0,
-                width: 900,
-                height: 600,
+            FileVisibility {
+                show_hidden: true,
+                show_system: false,
             },
-            0,
-            vec![PathBuf::from(raw_path)],
-            DEFAULT_COLUMN_ORDER,
         )
-        .unwrap();
+        .unwrap()
+    }
 
+    #[test]
+    fn astf9_round_trip_preserves_view_preferences_and_raw_paths() {
+        let state = sample_state();
         assert_eq!(decode(&encode(&state).unwrap()).unwrap(), state);
     }
 
     #[test]
-    fn saves_over_an_existing_session_file() {
-        let directory =
-            std::env::temp_dir().join(format!("asterfiles-session-store-{}", std::process::id()));
-        fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("session.bin");
-        fs::write(&path, b"ASTF2 stale session").unwrap();
-
-        let state = sample_state();
-        save(&path, &state).unwrap();
-        assert_eq!(load(&path).unwrap(), state);
-
-        fs::remove_file(path).unwrap();
-        fs::remove_dir(directory).unwrap();
-    }
-    #[test]
-    fn rejects_truncated_data() {
-        let encoded = encode(&sample_state()).unwrap();
-        for length in 0..encoded.len() {
+    fn rejects_old_formats() {
+        for version in 1..=8 {
+            let bytes = format!("ASTF{version}\0\0\0\0");
             assert_eq!(
-                decode(&encoded[..length]).unwrap_err().kind(),
-                io::ErrorKind::InvalidData,
-                "prefix length {length} should be rejected"
+                decode(bytes.as_bytes()).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
             );
         }
     }
 
     #[test]
-    fn rejects_invalid_window_dimensions() {
+    fn rejects_duplicate_and_excess_directory_preferences() {
         let mut state = sample_state();
-        state.windows[0].placement.width = 0;
+        state.directory_views.push(state.directory_views[0].clone());
+        assert_eq!(
+            encode(&state).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut state = sample_state();
+        state.directory_views = (0..=MAX_DIRECTORY_VIEW_PREFERENCES)
+            .map(|index| {
+                (
+                    PathBuf::from(format!(r"C:\{index}")),
+                    DirectoryViewPreference::default(),
+                )
+            })
+            .collect();
         assert_eq!(
             encode(&state).unwrap_err().kind(),
             io::ErrorKind::InvalidData
@@ -737,43 +678,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unreasonable_window_dimensions() {
-        for window in [
-            WindowPlacement {
-                x: 0,
-                y: 0,
-                width: 819,
-                height: 760,
-            },
-            WindowPlacement {
-                x: 0,
-                y: 0,
-                width: 1180,
-                height: 519,
-            },
-            WindowPlacement {
-                x: 0,
-                y: 0,
-                width: 7_681,
-                height: 760,
-            },
-            WindowPlacement {
-                x: 0,
-                y: 0,
-                width: 1180,
-                height: 4_321,
-            },
-        ] {
-            assert_eq!(
-                SessionState::new(window, 0, vec![PathBuf::from(r"C:\")], DEFAULT_COLUMN_ORDER,)
-                    .unwrap_err()
-                    .kind(),
-                io::ErrorKind::InvalidData
-            );
-        }
+    fn rejects_hidden_name_and_invalid_column_width() {
+        let mut state = sample_state();
+        state.default_directory_view.columns.visible
+            [usize::from(ColumnKind::Name.storage_code())] = false;
+        assert_eq!(
+            encode(&state).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut state = sample_state();
+        state.search_view.columns.widths[0] = crate::domain::MIN_COLUMN_WIDTH - 1;
+        assert_eq!(
+            encode(&state).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
+
     #[test]
-    fn corrects_active_tab_index() {
+    fn corrects_active_tab_index_and_rejects_invalid_windows() {
         let state = SessionState::new(
             WindowPlacement {
                 x: 0,
@@ -783,120 +706,39 @@ mod tests {
             },
             99,
             vec![PathBuf::from(r"C:\one"), PathBuf::from(r"C:\two")],
-            DEFAULT_COLUMN_ORDER,
         )
         .unwrap();
         assert_eq!(state.windows[0].active_tab, 1);
-    }
 
-    #[test]
-    fn empty_session_uses_zero_active_tab() {
-        let state = SessionState::new(
-            WindowPlacement {
-                x: 0,
-                y: 0,
-                width: 900,
-                height: 600,
-            },
-            99,
-            Vec::new(),
-            DEFAULT_COLUMN_ORDER,
-        )
-        .unwrap();
-        assert_eq!(state.windows[0].active_tab, 0);
-    }
-
-    #[test]
-    fn rejects_invalid_column_orders() {
-        for column_order in [[0, 1, 2, 2], [0, 1, 2, 4]] {
-            assert_eq!(
-                SessionState::new(
-                    WindowPlacement {
-                        x: 0,
-                        y: 0,
-                        width: 900,
-                        height: 600,
-                    },
-                    0,
-                    Vec::new(),
-                    column_order,
-                )
-                .unwrap_err()
-                .kind(),
-                io::ErrorKind::InvalidData
-            );
-        }
-
-        let mut bytes = encode(&sample_state()).unwrap();
-        bytes[9..13].copy_from_slice(&[0, 1, 1, 3]);
         assert_eq!(
-            decode(&bytes).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-        let mut bytes = encode(&sample_state()).unwrap();
-        bytes[13..17].copy_from_slice(&[0, 1, 1, 3]);
-        assert_eq!(
-            decode(&bytes).unwrap_err().kind(),
+            SessionState::new(
+                WindowPlacement {
+                    x: 0,
+                    y: 0,
+                    width: 819,
+                    height: 600,
+                },
+                0,
+                Vec::new(),
+            )
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::InvalidData
         );
     }
 
     #[test]
-    fn accepts_column_width_boundaries() {
-        let mut state = sample_state();
-        state.column_widths = [MIN_COLUMN_WIDTH, 160, 120, MAX_COLUMN_WIDTH];
-        state.search_column_widths = [MAX_COLUMN_WIDTH, 320, 120, MIN_COLUMN_WIDTH];
-
-        assert_eq!(decode(&encode(&state).unwrap()).unwrap(), state);
-    }
-
-    #[test]
-    fn rejects_invalid_column_widths() {
-        for invalid_width in [MIN_COLUMN_WIDTH - 1, MAX_COLUMN_WIDTH + 1] {
-            let mut state = sample_state();
-            state.column_widths[0] = invalid_width;
-            assert_eq!(
-                encode(&state).unwrap_err().kind(),
-                io::ErrorKind::InvalidData
-            );
-
-            let mut state = sample_state();
-            state.search_column_widths[1] = invalid_width;
-            assert_eq!(
-                encode(&state).unwrap_err().kind(),
-                io::ErrorKind::InvalidData
-            );
-        }
-
-        let mut bytes = encode(&sample_state()).unwrap();
-        bytes[17..21].copy_from_slice(&(MIN_COLUMN_WIDTH - 1).to_le_bytes());
+    fn rejects_truncated_or_trailing_data() {
+        let bytes = encode(&sample_state()).unwrap();
         assert_eq!(
-            decode(&bytes).unwrap_err().kind(),
+            decode(&bytes[..bytes.len() - 1]).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
-
-        let mut bytes = encode(&sample_state()).unwrap();
-        bytes[33..37].copy_from_slice(&(MAX_COLUMN_WIDTH + 1).to_le_bytes());
+        let mut trailing = bytes;
+        trailing.push(0);
         assert_eq!(
-            decode(&bytes).unwrap_err().kind(),
+            decode(&trailing).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
-    }
-    #[test]
-    fn rejects_old_format() {
-        for bytes in [
-            b"ASTF1\0\0\0\0".as_slice(),
-            b"ASTF2\0\0\0\0".as_slice(),
-            b"ASTF3\0\0\0\0".as_slice(),
-            b"ASTF4\0\0\0\0".as_slice(),
-            b"ASTF5\0\0\0\0".as_slice(),
-            b"ASTF6\0\0\0\0".as_slice(),
-            b"ASTF7\0\0\0\0".as_slice(),
-        ] {
-            assert_eq!(
-                decode(bytes).unwrap_err().kind(),
-                io::ErrorKind::InvalidData
-            );
-        }
     }
 }

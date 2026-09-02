@@ -91,6 +91,7 @@ pub fn read_directory_batches_filtered(
             size_bytes: metadata.is_file().then_some(metadata.len()),
             folder_size: crate::domain::FolderSizeState::Unknown,
             modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
         });
         next_id += 1;
 

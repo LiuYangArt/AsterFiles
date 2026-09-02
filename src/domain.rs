@@ -144,6 +144,30 @@ pub enum SortField {
     Kind,
     Size,
     Modified,
+    Created,
+}
+
+impl SortField {
+    pub const fn storage_code(self) -> u8 {
+        match self {
+            Self::Name => 0,
+            Self::Kind => 1,
+            Self::Size => 2,
+            Self::Modified => 3,
+            Self::Created => 4,
+        }
+    }
+
+    pub const fn from_storage_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Name),
+            1 => Some(Self::Kind),
+            2 => Some(Self::Size),
+            3 => Some(Self::Modified),
+            4 => Some(Self::Created),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,11 +176,266 @@ pub enum SortDirection {
     Descending,
 }
 
+impl SortDirection {
+    pub const fn storage_code(self) -> u8 {
+        match self {
+            Self::Ascending => 0,
+            Self::Descending => 1,
+        }
+    }
+
+    pub const fn from_storage_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Ascending),
+            1 => Some(Self::Descending),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
     Details,
     List,
-    Grid,
+    MediumIcons,
+    SmallIcons,
+    LargeIcons,
+    ExtraLargeIcons,
+    Tiles,
+    Content,
+}
+
+impl ViewMode {
+    pub const fn uses_grid_layout(self) -> bool {
+        matches!(
+            self,
+            Self::MediumIcons
+                | Self::SmallIcons
+                | Self::LargeIcons
+                | Self::ExtraLargeIcons
+                | Self::Tiles
+        )
+    }
+    pub const CTRL_WHEEL_ORDER: [Self; 8] = [
+        Self::Content,
+        Self::Tiles,
+        Self::Details,
+        Self::List,
+        Self::SmallIcons,
+        Self::MediumIcons,
+        Self::LargeIcons,
+        Self::ExtraLargeIcons,
+    ];
+
+    pub const fn storage_code(self) -> u8 {
+        match self {
+            Self::Details => 0,
+            Self::List => 1,
+            Self::MediumIcons => 2,
+            Self::SmallIcons => 3,
+            Self::LargeIcons => 4,
+            Self::ExtraLargeIcons => 5,
+            Self::Tiles => 6,
+            Self::Content => 7,
+        }
+    }
+
+    pub const fn from_storage_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Details),
+            1 => Some(Self::List),
+            2 => Some(Self::MediumIcons),
+            3 => Some(Self::SmallIcons),
+            4 => Some(Self::LargeIcons),
+            5 => Some(Self::ExtraLargeIcons),
+            6 => Some(Self::Tiles),
+            7 => Some(Self::Content),
+            _ => None,
+        }
+    }
+
+    pub fn step_ctrl_wheel(self, toward_larger: bool) -> Self {
+        let index = Self::CTRL_WHEEL_ORDER
+            .iter()
+            .position(|mode| *mode == self)
+            .expect("all view modes are present in the Ctrl+wheel order");
+        let next = if toward_larger {
+            index
+                .saturating_add(1)
+                .min(Self::CTRL_WHEEL_ORDER.len() - 1)
+        } else {
+            index.saturating_sub(1)
+        };
+        Self::CTRL_WHEEL_ORDER[next]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupField {
+    None,
+    Name,
+    Modified,
+    Created,
+    Kind,
+    Size,
+}
+
+impl GroupField {
+    pub const fn storage_code(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Name => 1,
+            Self::Modified => 2,
+            Self::Created => 3,
+            Self::Kind => 4,
+            Self::Size => 5,
+        }
+    }
+
+    pub const fn from_storage_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::None),
+            1 => Some(Self::Name),
+            2 => Some(Self::Modified),
+            3 => Some(Self::Created),
+            4 => Some(Self::Kind),
+            5 => Some(Self::Size),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnKind {
+    Name,
+    Kind,
+    Size,
+    Modified,
+    Created,
+}
+
+impl ColumnKind {
+    pub const COUNT: usize = 5;
+
+    pub const fn storage_code(self) -> u8 {
+        match self {
+            Self::Name => 0,
+            Self::Kind => 1,
+            Self::Size => 2,
+            Self::Modified => 3,
+            Self::Created => 4,
+        }
+    }
+
+    pub const fn from_storage_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Name),
+            1 => Some(Self::Kind),
+            2 => Some(Self::Size),
+            3 => Some(Self::Modified),
+            4 => Some(Self::Created),
+            _ => None,
+        }
+    }
+}
+
+pub const MIN_COLUMN_WIDTH: u32 = 64;
+pub const MAX_COLUMN_WIDTH: u32 = 4_096;
+pub const MAX_DIRECTORY_VIEW_PREFERENCES: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnLayout {
+    pub order: [ColumnKind; ColumnKind::COUNT],
+    pub widths: [u32; ColumnKind::COUNT],
+    pub visible: [bool; ColumnKind::COUNT],
+}
+
+impl Default for ColumnLayout {
+    fn default() -> Self {
+        Self {
+            order: [
+                ColumnKind::Name,
+                ColumnKind::Modified,
+                ColumnKind::Kind,
+                ColumnKind::Size,
+                ColumnKind::Created,
+            ],
+            widths: [480, 160, 120, 200, 200],
+            visible: [true, true, true, true, false],
+        }
+    }
+}
+
+impl ColumnLayout {
+    pub fn is_valid(&self) -> bool {
+        let mut seen = [false; ColumnKind::COUNT];
+        for column in self.order {
+            let index = usize::from(column.storage_code());
+            if seen[index] {
+                return false;
+            }
+            seen[index] = true;
+        }
+        self.visible[usize::from(ColumnKind::Name.storage_code())]
+            && self
+                .widths
+                .iter()
+                .all(|width| (MIN_COLUMN_WIDTH..=MAX_COLUMN_WIDTH).contains(width))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectoryViewPreference {
+    pub view_mode: ViewMode,
+    pub sort_field: SortField,
+    pub sort_direction: SortDirection,
+    pub group_field: GroupField,
+    pub group_direction: SortDirection,
+    pub columns: ColumnLayout,
+}
+
+impl Default for DirectoryViewPreference {
+    fn default() -> Self {
+        Self {
+            view_mode: ViewMode::Details,
+            sort_field: SortField::Name,
+            sort_direction: SortDirection::Ascending,
+            group_field: GroupField::None,
+            group_direction: SortDirection::Ascending,
+            columns: ColumnLayout::default(),
+        }
+    }
+}
+
+impl DirectoryViewPreference {
+    pub fn is_valid(&self) -> bool {
+        self.columns.is_valid()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchViewPreference {
+    pub view_mode: ViewMode,
+    pub sort_field: SortField,
+    pub sort_direction: SortDirection,
+    pub columns: ColumnLayout,
+}
+
+impl Default for SearchViewPreference {
+    fn default() -> Self {
+        Self {
+            view_mode: ViewMode::Details,
+            sort_field: SortField::Name,
+            sort_direction: SortDirection::Ascending,
+            columns: ColumnLayout::default(),
+        }
+    }
+}
+
+impl SearchViewPreference {
+    pub fn is_valid(&self) -> bool {
+        self.columns.is_valid()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1044,6 +1323,7 @@ fn compare_entries(
         SortField::Kind => entry_type_key(left).cmp(&entry_type_key(right)),
         SortField::Size => entry_size_key(left).cmp(&entry_size_key(right)),
         SortField::Modified => left.modified.cmp(&right.modified),
+        SortField::Created => left.created.cmp(&right.created),
     };
     let value_order = match direction {
         SortDirection::Ascending => value_order,
@@ -1097,6 +1377,7 @@ pub struct FileEntry {
     pub size_bytes: Option<u64>,
     pub folder_size: FolderSizeState,
     pub modified: Option<std::time::SystemTime>,
+    pub created: Option<std::time::SystemTime>,
 }
 
 impl FileEntry {
@@ -1141,9 +1422,68 @@ mod tests {
             size_bytes: size,
             folder_size: FolderSizeState::Unknown,
             modified: None,
+            created: None,
         }
     }
 
+    #[test]
+    fn view_mode_storage_codes_and_ctrl_wheel_order_are_stable() {
+        let expected = [
+            (ViewMode::Details, 0),
+            (ViewMode::List, 1),
+            (ViewMode::MediumIcons, 2),
+            (ViewMode::SmallIcons, 3),
+            (ViewMode::LargeIcons, 4),
+            (ViewMode::ExtraLargeIcons, 5),
+            (ViewMode::Tiles, 6),
+            (ViewMode::Content, 7),
+        ];
+        for (mode, code) in expected {
+            assert_eq!(mode.storage_code(), code);
+            assert_eq!(ViewMode::from_storage_code(code), Some(mode));
+        }
+        assert_eq!(ViewMode::from_storage_code(8), None);
+        assert_eq!(ViewMode::Content.step_ctrl_wheel(false), ViewMode::Content);
+        assert_eq!(ViewMode::Content.step_ctrl_wheel(true), ViewMode::Tiles);
+        assert_eq!(
+            ViewMode::LargeIcons.step_ctrl_wheel(true),
+            ViewMode::ExtraLargeIcons
+        );
+        assert_eq!(
+            ViewMode::ExtraLargeIcons.step_ctrl_wheel(true),
+            ViewMode::ExtraLargeIcons
+        );
+    }
+
+    #[test]
+    fn default_columns_keep_name_visible_and_created_hidden() {
+        let columns = ColumnLayout::default();
+        assert!(columns.is_valid());
+        assert!(columns.visible[usize::from(ColumnKind::Name.storage_code())]);
+        assert!(!columns.visible[usize::from(ColumnKind::Created.storage_code())]);
+
+        let mut invalid = columns;
+        invalid.visible[usize::from(ColumnKind::Name.storage_code())] = false;
+        assert!(!invalid.is_valid());
+    }
+
+    #[test]
+    fn created_sort_uses_path_as_stable_tie_breaker() {
+        use std::time::{Duration, SystemTime};
+
+        let mut older = entry(1, "same", EntryKind::File, Some(1));
+        older.path = PathBuf::from(r"C:\b\same");
+        older.created = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        let mut newer = entry(2, "same", EntryKind::File, Some(1));
+        newer.path = PathBuf::from(r"C:\a\same");
+        newer.created = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2));
+        let mut session = TabSession::new(TabId(1));
+        session.replace_entries(vec![newer, older]);
+        session.set_sort(SortField::Created);
+        assert_eq!(session.entries[0].id, EntryId(1));
+        session.set_sort(SortField::Created);
+        assert_eq!(session.entries[0].id, EntryId(2));
+    }
     #[test]
     fn search_requests_are_isolated_by_request_and_page_source() {
         let mut session = TabSession::new(TabId(7));
@@ -1536,6 +1876,7 @@ mod tests {
             size_bytes: None,
             folder_size: FolderSizeState::Querying,
             modified: None,
+            created: None,
         };
         assert!(!item.set_folder_size(EntryId(4), &original, FolderSizeState::Value(0)));
         assert!(!item.set_folder_size(
@@ -1870,6 +2211,7 @@ mod tests {
             size_bytes: None,
             folder_size: FolderSizeState::Unknown,
             modified: None,
+            created: None,
         }]);
         assert_eq!(
             session

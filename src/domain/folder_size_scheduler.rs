@@ -314,6 +314,7 @@ mod tests {
             size_bytes: None,
             folder_size: FolderSizeState::Unknown,
             modified: None,
+            created: None,
         }
     }
 

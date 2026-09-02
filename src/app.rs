@@ -19,9 +19,11 @@ use slint::{
 use crate::{
     agent_debug::{self, AgentScenario},
     domain::{
-        AddressMode, EntryId, FileEntry, FolderSizeState, LoadState, NameHighlightSegment,
-        NavigationKind, PageSource, RectangleSelectionMode, RequestId, SearchDepth, SearchScope,
-        SearchState, SortDirection, SortField, TabId, TabKind, TabSession, ViewMode,
+        AddressMode, ColumnKind, ColumnLayout, DirectoryViewPreference, EntryId, FileEntry,
+        FolderSizeState, GroupField, LoadState, MAX_DIRECTORY_VIEW_PREFERENCES,
+        NameHighlightSegment, NavigationKind, PageSource, RectangleSelectionMode, RequestId,
+        SearchDepth, SearchScope, SearchState, SearchViewPreference, SortDirection, SortField,
+        TabId, TabKind, TabSession, ViewMode,
         file_operations::{
             FileOperationKind, ItemState, OperationId, OperationItem, OperationManager,
             OperationResult, OperationState,
@@ -29,6 +31,9 @@ use crate::{
         folder_size_scheduler::{FOLDER_SIZE_QUEUE_CAPACITY, FolderSizeCommit, FolderSizeQuery},
     },
     fs::{ReadOutcome, read_directory_batches_filtered},
+    group_projection::{
+        self, GroupProjectionContext, IconProjection, IconVisualRow, ListProjection, ListVisualRow,
+    },
     i18n::{Language, Texts},
     platform::{self, KnownLocation, KnownLocationKind},
     session_store,
@@ -58,6 +63,7 @@ pub fn export_folder_size_scheduler_state(path: &Path) -> io::Result<()> {
         size_bytes: None,
         folder_size: FolderSizeState::Unknown,
         modified: None,
+        created: None,
     };
     let mut visible_entries = (1..=80).map(entry).collect::<Vec<_>>();
     let mut visible = FolderSizeScheduler::new();
@@ -124,6 +130,7 @@ pub fn export_quick_menu_search_state(path: &Path) -> io::Result<()> {
             submenu: false,
             loading: false,
             placeholder: false,
+            icon_kind: 0,
         },
         ContextCommandRow {
             id: -1,
@@ -139,6 +146,7 @@ pub fn export_quick_menu_search_state(path: &Path) -> io::Result<()> {
             submenu: false,
             loading: false,
             placeholder: false,
+            icon_kind: 0,
         },
         ContextCommandRow {
             id: SHELL_CONTEXT_COMMAND_BASE + 42,
@@ -154,6 +162,7 @@ pub fn export_quick_menu_search_state(path: &Path) -> io::Result<()> {
             submenu: false,
             loading: false,
             placeholder: false,
+            icon_kind: 0,
         },
     ];
     let english = filtered_context_rows(&rows, "COPY");
@@ -178,10 +187,9 @@ pub fn export_multi_window_state_layering(path: &Path) -> io::Result<()> {
     let mut app = AppState::new(
         vec![PathBuf::from(r"C:\AgentScenarios\WindowA")],
         0,
-        [0, 1, 2, 3],
-        [0, 1, 2, 3],
-        session_store::DEFAULT_COLUMN_WIDTHS,
-        session_store::DEFAULT_SEARCH_COLUMN_WIDTHS,
+        DirectoryViewPreference::default(),
+        SearchViewPreference::default(),
+        HashMap::new(),
         crate::domain::EverythingConfig::default(),
         session_store::ThemeMode::System,
         Language::Chinese,
@@ -262,10 +270,9 @@ pub fn export_tab_reorder_state(path: &Path) -> io::Result<()> {
     let mut app = AppState::new(
         vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")],
         1,
-        [0, 1, 2, 3],
-        [0, 1, 2, 3],
-        session_store::DEFAULT_COLUMN_WIDTHS,
-        session_store::DEFAULT_SEARCH_COLUMN_WIDTHS,
+        DirectoryViewPreference::default(),
+        SearchViewPreference::default(),
+        HashMap::new(),
         crate::domain::EverythingConfig::default(),
         session_store::ThemeMode::System,
         Language::Chinese,
@@ -333,10 +340,9 @@ pub fn export_tab_detach_state(path: &Path) -> io::Result<()> {
     let mut app = AppState::new(
         vec![PathBuf::from("a"), PathBuf::from("b")],
         0,
-        [0, 1, 2, 3],
-        [0, 1, 2, 3],
-        session_store::DEFAULT_COLUMN_WIDTHS,
-        session_store::DEFAULT_SEARCH_COLUMN_WIDTHS,
+        DirectoryViewPreference::default(),
+        SearchViewPreference::default(),
+        HashMap::new(),
         crate::domain::EverythingConfig::default(),
         session_store::ThemeMode::System,
         Language::Chinese,
@@ -408,10 +414,9 @@ pub fn export_tab_cross_window_state(path: &Path) -> io::Result<()> {
     let mut app = AppState::new(
         vec![PathBuf::from("source-a"), PathBuf::from("source-b")],
         0,
-        [0, 1, 2, 3],
-        [0, 1, 2, 3],
-        session_store::DEFAULT_COLUMN_WIDTHS,
-        session_store::DEFAULT_SEARCH_COLUMN_WIDTHS,
+        DirectoryViewPreference::default(),
+        SearchViewPreference::default(),
+        HashMap::new(),
         crate::domain::EverythingConfig::default(),
         session_store::ThemeMode::System,
         Language::Chinese,
@@ -596,8 +601,10 @@ fn screen_to_client_physical(screen_x: i32, screen_y: i32, left: i32, top: i32) 
     (f64::from(screen_x - left), f64::from(screen_y - top))
 }
 
-fn grid_thumbnail_request_px(scale: f32) -> u32 {
-    (100.0 * scale).round().max(64.0) as u32
+fn grid_thumbnail_request_px(view_mode: ViewMode, scale: f32) -> u32 {
+    (file_layout_geometry(view_mode).icon_request_px as f32 * scale)
+        .round()
+        .max(32.0) as u32
 }
 
 fn grid_thumbnail_request_indices(
@@ -605,13 +612,15 @@ fn grid_thumbnail_request_indices(
     columns: usize,
     viewport_y: f32,
     visible_height: f32,
+    row_height: f32,
 ) -> Vec<usize> {
     if entry_count == 0 {
         return Vec::new();
     }
     let columns = columns.max(1);
-    let first_row = ((-viewport_y).max(0.0) / 148.0).floor() as usize;
-    let visible_rows = (visible_height.max(148.0) / 148.0).ceil() as usize + 1;
+    let row_height = row_height.max(1.0);
+    let first_row = ((-viewport_y).max(0.0) / row_height).floor() as usize;
+    let visible_rows = (visible_height.max(row_height) / row_height).ceil() as usize + 1;
     let first = first_row.saturating_sub(2) * columns;
     let last = ((first_row + visible_rows + 2) * columns).min(entry_count);
     (first..last).collect()
@@ -622,7 +631,6 @@ fn grid_thumbnail_requests(
     state: &SharedSessions,
     window_id: WindowId,
 ) -> Vec<IconRequest> {
-    let requested_px = grid_thumbnail_request_px(ui.window().scale_factor());
     let columns = ui.get_grid_column_count().max(1) as usize;
     let visible_height = ui.window().size().height as f32 / ui.window().scale_factor()
         - ui.get_file_list_top()
@@ -634,19 +642,17 @@ fn grid_thumbnail_requests(
     let Some(tab) = window.tabs.get(&window.active_tab) else {
         return Vec::new();
     };
-    if tab.kind != TabKind::Files
-        || tab
-            .visible_path()
-            .is_none_or(|path| app.directory_view_modes.get(path) != Some(&ViewMode::Grid))
-    {
+    let view_mode = app.active_view_mode();
+    if tab.kind != TabKind::Files || !view_mode.uses_grid_layout() {
         return Vec::new();
     }
+    let requested_px = grid_thumbnail_request_px(view_mode, ui.window().scale_factor());
     let entries = tab.visible_entries();
     let search_window = (tab.page_source == PageSource::Search).then(|| {
         search_window_for_scroll(
             ui.get_search_scroll_y(),
             tab.search_total.unwrap_or(0),
-            ViewMode::Grid,
+            ViewMode::MediumIcons,
             columns,
         )
     });
@@ -654,8 +660,9 @@ fn grid_thumbnail_requests(
     let indices = grid_thumbnail_request_indices(
         projected_count,
         columns,
-        ui.get_file_viewport_y() / 1.0,
+        ui.get_file_viewport_y(),
         visible_height,
+        file_layout_geometry(view_mode).row_height,
     );
     let requests = indices
         .into_iter()
@@ -1214,9 +1221,10 @@ struct AppState {
     large_icon_cache: HashMap<(PathBuf, u32), platform::windows_shell_icons::ShellIconRgba>,
     thumbnail_requests: std::collections::HashSet<(TabId, RequestId, PathBuf, u32)>,
     sidebar: Vec<KnownLocation>,
-    directory_view_modes: HashMap<PathBuf, crate::domain::ViewMode>,
-    column_order: [u8; 4],
-    column_widths: session_store::ColumnWidths,
+    default_directory_view: DirectoryViewPreference,
+    directory_views: HashMap<PathBuf, DirectoryViewPreference>,
+    directory_view_lru: VecDeque<PathBuf>,
+    search_view: SearchViewPreference,
     operations: OperationManager,
     operation_errors: Vec<String>,
     rename_target: Option<(TabId, EntryId)>,
@@ -1229,8 +1237,7 @@ struct AppState {
     cut_generation: u64,
     conflict_responses:
         HashMap<OperationId, mpsc::Sender<crate::domain::file_operations::ConflictDecision>>,
-    search_column_order: [u8; 4],
-    search_column_widths: session_store::SearchColumnWidths,
+
     everything_config: crate::domain::EverythingConfig,
     everything_status: String,
     everything_folder_sizes_indexed: Option<bool>,
@@ -1268,20 +1275,85 @@ impl AppState {
             .iter()
             .find_map(|(id, window)| window.tabs.contains_key(&tab_id).then_some(*id))
     }
+    fn directory_preference(&self, path: &Path) -> DirectoryViewPreference {
+        self.directory_views
+            .get(path)
+            .copied()
+            .unwrap_or(self.default_directory_view)
+    }
+
+    fn active_view_mode(&self) -> ViewMode {
+        if self.active().page_source == PageSource::Search {
+            self.search_view.view_mode
+        } else {
+            self.active()
+                .visible_path()
+                .map(|path| self.directory_preference(path).view_mode)
+                .unwrap_or(self.default_directory_view.view_mode)
+        }
+    }
+
+    fn active_column_layout(&self) -> ColumnLayout {
+        if self.active().page_source == PageSource::Search {
+            self.search_view.columns
+        } else {
+            self.active()
+                .visible_path()
+                .map(|path| self.directory_preference(path).columns)
+                .unwrap_or(self.default_directory_view.columns)
+        }
+    }
+
+    fn update_directory_preference(
+        &mut self,
+        path: PathBuf,
+        update: impl FnOnce(&mut DirectoryViewPreference),
+    ) {
+        let preference = self
+            .directory_views
+            .entry(path.clone())
+            .or_insert(self.default_directory_view);
+        update(preference);
+        self.directory_view_lru
+            .retain(|candidate| candidate != &path);
+        self.directory_view_lru.push_back(path);
+        while self.directory_view_lru.len() > MAX_DIRECTORY_VIEW_PREFERENCES {
+            if let Some(evicted) = self.directory_view_lru.pop_front() {
+                self.directory_views.remove(&evicted);
+            }
+        }
+    }
+
+    fn update_active_column_layout(&mut self, update: impl FnOnce(&mut ColumnLayout)) {
+        if self.active().page_source == PageSource::Search {
+            update(&mut self.search_view.columns);
+        } else if let Some(path) = self.active().visible_path().map(Path::to_path_buf) {
+            self.update_directory_preference(path, |preference| update(&mut preference.columns));
+        } else {
+            update(&mut self.default_directory_view.columns);
+        }
+    }
 
     #[cfg(test)]
     fn new_for_test(
         initial_paths: Vec<PathBuf>,
         active_index: usize,
-        column_order: [u8; 4],
+        _column_order: [u8; 4],
     ) -> Self {
+        let mut default_directory_view = DirectoryViewPreference::default();
+        default_directory_view.columns.order = [
+            ColumnKind::Name,
+            ColumnKind::Kind,
+            ColumnKind::Size,
+            ColumnKind::Modified,
+            ColumnKind::Created,
+        ];
         Self::new(
             initial_paths,
             active_index,
-            column_order,
-            [0, 1, 2, 3],
-            session_store::DEFAULT_COLUMN_WIDTHS,
-            session_store::DEFAULT_SEARCH_COLUMN_WIDTHS,
+            default_directory_view,
+            SearchViewPreference::default(),
+            HashMap::new(),
             crate::domain::EverythingConfig::default(),
             session_store::ThemeMode::System,
             Language::Chinese,
@@ -1293,10 +1365,9 @@ impl AppState {
     fn new(
         initial_paths: Vec<PathBuf>,
         active_index: usize,
-        column_order: [u8; 4],
-        search_column_order: [u8; 4],
-        column_widths: session_store::ColumnWidths,
-        search_column_widths: session_store::SearchColumnWidths,
+        default_directory_view: DirectoryViewPreference,
+        search_view: SearchViewPreference,
+        directory_views: HashMap<PathBuf, DirectoryViewPreference>,
         everything_config: crate::domain::EverythingConfig,
         theme_mode: session_store::ThemeMode,
         language: Language,
@@ -1315,6 +1386,14 @@ impl AppState {
             let id = TabId(next_tab_id);
             next_tab_id += 1;
             let mut tab = TabSession::new(id);
+            let preference = directory_views
+                .get(&path)
+                .copied()
+                .unwrap_or(default_directory_view);
+            tab.sort_field = preference.sort_field;
+            tab.sort_direction = preference.sort_direction;
+            tab.search_sort_field = search_view.sort_field;
+            tab.search_sort_direction = search_view.sort_direction;
             tab.current_path = Some(path);
             tabs.insert(id, tab);
             tab_order.push(id);
@@ -1348,9 +1427,10 @@ impl AppState {
             large_icon_cache: HashMap::new(),
             thumbnail_requests: std::collections::HashSet::new(),
             sidebar: Vec::new(),
-            directory_view_modes: HashMap::new(),
-            column_order,
-            column_widths,
+            default_directory_view,
+            directory_view_lru: directory_views.keys().cloned().collect(),
+            directory_views,
+            search_view,
             operations: OperationManager::new(),
             operation_errors: Vec::new(),
             rename_target: None,
@@ -1362,8 +1442,7 @@ impl AppState {
             cut_paths: Vec::new(),
             cut_generation: 0,
             conflict_responses: HashMap::new(),
-            search_column_order,
-            search_column_widths,
+
             everything_config,
             everything_status: String::new(),
             everything_folder_sizes_indexed: None,
@@ -1757,7 +1836,7 @@ impl AppState {
         press_x: f32,
         press_y: f32,
     ) -> bool {
-        if kind >= 4 || !press_x.is_finite() || !press_y.is_finite() {
+        if kind >= ColumnKind::COUNT as u8 || !press_x.is_finite() || !press_y.is_finite() {
             return false;
         }
         let Some(window) = self.windows.get(&window_id) else {
@@ -1765,11 +1844,17 @@ impl AppState {
         };
         let source = window.active().page_source;
         let order = if source == PageSource::Search {
-            self.search_column_order
+            self.search_view.columns.order
         } else {
-            self.column_order
+            let path = window.active().visible_path().map(Path::to_path_buf);
+            path.as_deref()
+                .map(|path| self.directory_preference(path).columns.order)
+                .unwrap_or(self.default_directory_view.columns.order)
         };
-        if !order.contains(&kind) {
+        let Some(column_kind) = ColumnKind::from_storage_code(kind) else {
+            return false;
+        };
+        if !order.contains(&column_kind) {
             return false;
         }
         self.column_drag = Some(ColumnDragSession {
@@ -1806,11 +1891,14 @@ impl AppState {
             self.column_drag = None;
             return None;
         }
-        let (order, widths) = if drag.source == PageSource::Search {
-            (&self.search_column_order, &self.search_column_widths)
+        let layout = if drag.source == PageSource::Search {
+            self.search_view.columns
         } else {
-            (&self.column_order, &self.column_widths)
+            let path = self.windows.get(&drag.window_id)?.active().visible_path()?;
+            self.directory_preference(path).columns
         };
+        let order = layout.order;
+        let widths = layout.widths;
         let insertion_slot = column_insertion_slot(
             pointer_x,
             pointer_y,
@@ -1820,8 +1908,8 @@ impl AppState {
                 width: header_width,
                 viewport_x,
             },
-            order,
-            widths,
+            &order,
+            &widths,
         );
         drag.phase = ColumnDragPhase::Dragging { insertion_slot };
         self.column_drag = Some(drag);
@@ -1857,16 +1945,24 @@ impl AppState {
         kind: u8,
         insertion_slot: usize,
     ) -> bool {
-        let order = if source == PageSource::Search {
-            &mut self.search_column_order
-        } else {
-            &mut self.column_order
-        };
-        let Some(source_index) = order.iter().position(|candidate| *candidate == kind) else {
+        let Some(kind) = ColumnKind::from_storage_code(kind) else {
             return false;
         };
-        let target = normalized_column_slot(source_index, insertion_slot, order.len());
-        reorder_column_to_slot(order, kind, target)
+        let mut changed = false;
+        let mut reorder = |layout: &mut ColumnLayout| {
+            let Some(source_index) = layout.order.iter().position(|candidate| *candidate == kind)
+            else {
+                return;
+            };
+            let target = normalized_column_slot(source_index, insertion_slot, layout.order.len());
+            changed = reorder_column_to_slot(&mut layout.order, kind, target);
+        };
+        if source == PageSource::Search {
+            reorder(&mut self.search_view.columns);
+        } else if let Some(path) = self.active().visible_path().map(Path::to_path_buf) {
+            self.update_directory_preference(path, |preference| reorder(&mut preference.columns));
+        }
+        changed
     }
 
     fn cancel_column_drag(&mut self) -> bool {
@@ -2039,7 +2135,11 @@ impl WindowState {
     }
 }
 
-fn reorder_column_to_slot(order: &mut [u8; 4], kind: u8, insertion_slot: usize) -> bool {
+fn reorder_column_to_slot(
+    order: &mut [ColumnKind; 5],
+    kind: ColumnKind,
+    insertion_slot: usize,
+) -> bool {
     let Some(from) = order.iter().position(|candidate| *candidate == kind) else {
         return false;
     };
@@ -2061,8 +2161,8 @@ fn column_insertion_slot(
     pointer_x: f32,
     pointer_y: f32,
     geometry: ColumnHeaderGeometry,
-    order: &[u8; 4],
-    widths: &[u32; 4],
+    order: &[ColumnKind; 5],
+    widths: &[u32; 5],
 ) -> Option<usize> {
     if !pointer_x.is_finite()
         || !geometry.x.is_finite()
@@ -2077,7 +2177,7 @@ fn column_insertion_slot(
     let content_x = pointer_x - geometry.x - geometry.viewport_x;
     let mut left = 0.0;
     for (index, kind) in order.iter().enumerate() {
-        let width = widths.get(*kind as usize).copied()? as f32;
+        let width = widths.get(kind.storage_code() as usize).copied()? as f32;
         if content_x < left + width / 2.0 {
             return Some(index);
         }
@@ -2135,33 +2235,194 @@ struct SearchWindow {
 }
 
 fn view_mode_from_ui(mode: i32) -> ViewMode {
-    match mode {
-        1 => ViewMode::List,
-        2 => ViewMode::Grid,
-        _ => ViewMode::Details,
-    }
+    ViewMode::from_storage_code(mode.clamp(0, u8::MAX as i32) as u8).unwrap_or(ViewMode::Details)
 }
-fn file_row_height(view_mode: ViewMode) -> f32 {
+
+fn view_mode_to_ui(mode: ViewMode) -> i32 {
+    i32::from(mode.storage_code())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FileLayoutGeometry {
+    row_height: f32,
+    card_width: f32,
+    card_height: f32,
+    icon_request_px: u32,
+    grid: bool,
+}
+
+fn file_layout_geometry(view_mode: ViewMode) -> FileLayoutGeometry {
     match view_mode {
-        ViewMode::Details => 40.0,
-        ViewMode::List => 34.0,
-        ViewMode::Grid => 148.0,
+        ViewMode::Details => FileLayoutGeometry {
+            row_height: 40.0,
+            card_width: 0.0,
+            card_height: 40.0,
+            icon_request_px: 32,
+            grid: false,
+        },
+        ViewMode::List => FileLayoutGeometry {
+            row_height: 34.0,
+            card_width: 0.0,
+            card_height: 34.0,
+            icon_request_px: 32,
+            grid: false,
+        },
+        ViewMode::SmallIcons => FileLayoutGeometry {
+            row_height: 86.0,
+            card_width: 88.0,
+            card_height: 78.0,
+            icon_request_px: 32,
+            grid: true,
+        },
+        ViewMode::MediumIcons => FileLayoutGeometry {
+            row_height: 148.0,
+            card_width: 140.0,
+            card_height: 140.0,
+            icon_request_px: 100,
+            grid: true,
+        },
+        ViewMode::LargeIcons => FileLayoutGeometry {
+            row_height: 196.0,
+            card_width: 188.0,
+            card_height: 188.0,
+            icon_request_px: 148,
+            grid: true,
+        },
+        ViewMode::ExtraLargeIcons => FileLayoutGeometry {
+            row_height: 220.0,
+            card_width: 196.0,
+            card_height: 212.0,
+            icon_request_px: 168,
+            grid: true,
+        },
+        ViewMode::Tiles => FileLayoutGeometry {
+            row_height: 86.0,
+            card_width: 292.0,
+            card_height: 78.0,
+            icon_request_px: 48,
+            grid: true,
+        },
+        ViewMode::Content => FileLayoutGeometry {
+            row_height: 76.0,
+            card_width: 0.0,
+            card_height: 76.0,
+            icon_request_px: 48,
+            grid: false,
+        },
     }
 }
 
+fn file_row_height(view_mode: ViewMode) -> f32 {
+    file_layout_geometry(view_mode).row_height
+}
+
+fn projected_scroll_maximum(ui: &AppWindow, view_mode: ViewMode, visible_height: f32) -> f32 {
+    if view_mode.uses_grid_layout() {
+        let extent = ui
+            .get_grid_rows()
+            .iter()
+            .map(|row| {
+                if row.group_header {
+                    32.0
+                } else {
+                    file_row_height(view_mode)
+                }
+            })
+            .sum::<f32>();
+        (extent - visible_height).max(0.0)
+    } else {
+        let extent = ui
+            .get_files()
+            .iter()
+            .map(|row| {
+                if row.group_header {
+                    32.0
+                } else {
+                    file_row_height(view_mode)
+                }
+            })
+            .sum::<f32>();
+        (extent - visible_height).max(0.0)
+    }
+}
 fn file_scroll_maximum(
     item_count: usize,
     view_mode: ViewMode,
     grid_columns: usize,
     visible_height: f32,
 ) -> f32 {
-    let rows = match view_mode {
-        ViewMode::Grid => item_count.div_ceil(grid_columns.max(1)),
-        ViewMode::Details | ViewMode::List => item_count,
+    let rows = if file_layout_geometry(view_mode).grid {
+        item_count.div_ceil(grid_columns.max(1))
+    } else {
+        item_count
     };
     (rows as f32 * file_row_height(view_mode) - visible_height).max(0.0)
 }
 
+const CTRL_WHEEL_PIXEL_THRESHOLD: f32 = 80.0;
+
+fn ctrl_wheel_step(
+    delta: &MouseScrollDelta,
+    scale_factor: f32,
+    accumulator: &mut f32,
+) -> Option<bool> {
+    match delta {
+        MouseScrollDelta::LineDelta(_, y) if *y != 0.0 => {
+            *accumulator = 0.0;
+            Some(*y > 0.0)
+        }
+        MouseScrollDelta::PixelDelta(position) => {
+            let value = position.y as f32 / scale_factor.max(f32::EPSILON);
+            if value == 0.0 {
+                return None;
+            }
+            if accumulator.signum() != value.signum() {
+                *accumulator = 0.0;
+            }
+            *accumulator += value;
+            if accumulator.abs() >= CTRL_WHEEL_PIXEL_THRESHOLD {
+                let toward_larger = *accumulator > 0.0;
+                *accumulator -= CTRL_WHEEL_PIXEL_THRESHOLD.copysign(*accumulator);
+                Some(toward_larger)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn anchored_viewport(
+    old_viewport: f32,
+    pointer_y: f32,
+    old_mode: ViewMode,
+    new_mode: ViewMode,
+    columns: usize,
+    item_count: usize,
+    visible_height: f32,
+) -> f32 {
+    if item_count == 0 {
+        return 0.0;
+    }
+    let old = file_layout_geometry(old_mode);
+    let old_row = ((-old_viewport + pointer_y).max(0.0) / old.row_height).floor() as usize;
+    let anchor_index = if old.grid {
+        old_row.saturating_mul(columns.max(1))
+    } else {
+        old_row
+    }
+    .min(item_count - 1);
+    let new = file_layout_geometry(new_mode);
+    let new_row = if new.grid {
+        anchor_index / columns.max(1)
+    } else {
+        anchor_index
+    };
+    let relative = (-old_viewport + pointer_y) - old_row as f32 * old.row_height;
+    let candidate = -(new_row as f32 * new.row_height + relative - pointer_y);
+    let maximum = file_scroll_maximum(item_count, new_mode, columns, visible_height);
+    candidate.clamp(-maximum, 0.0)
+}
 fn logical_scroll_delta(delta: &MouseScrollDelta, view_mode: ViewMode, scale_factor: f32) -> f32 {
     match delta {
         MouseScrollDelta::LineDelta(_, y) => *y * file_row_height(view_mode) * 3.0,
@@ -2189,9 +2450,10 @@ fn search_result_index_at_scroll(
         return 0;
     }
     let row = ((-scroll_y).max(0.0) / file_row_height(view_mode)).floor() as usize;
-    let index = match view_mode {
-        ViewMode::Grid => row.saturating_mul(columns.max(1)),
-        ViewMode::Details | ViewMode::List => row,
+    let index = if file_layout_geometry(view_mode).grid {
+        row.saturating_mul(columns.max(1))
+    } else {
+        row
     };
     index.min(total.saturating_sub(1) as usize) as u32
 }
@@ -2224,13 +2486,6 @@ fn search_window_for_scroll(
     )
 }
 
-fn search_window_local_index(entry_id: EntryId, window_start: u32) -> Option<usize> {
-    entry_id
-        .0
-        .checked_sub(window_start.saturating_add(1))
-        .map(|index| index as usize)
-}
-
 fn search_window_viewport_y(
     index: u32,
     window: SearchWindow,
@@ -2238,16 +2493,18 @@ fn search_window_viewport_y(
     columns: usize,
 ) -> f32 {
     let local = index.saturating_sub(window.start) as usize;
-    let row = match view_mode {
-        ViewMode::Grid => local / columns.max(1),
-        ViewMode::Details | ViewMode::List => local,
+    let row = if file_layout_geometry(view_mode).grid {
+        local / columns.max(1)
+    } else {
+        local
     };
     -(row as f32 * file_row_height(view_mode))
 }
 fn search_scroll_for_index(index: u32, view_mode: ViewMode, columns: usize) -> f32 {
-    let row = match view_mode {
-        ViewMode::Grid => index as usize / columns.max(1),
-        ViewMode::Details | ViewMode::List => index as usize,
+    let row = if file_layout_geometry(view_mode).grid {
+        index as usize / columns.max(1)
+    } else {
+        index as usize
     };
     -(row as f32 * file_row_height(view_mode))
 }
@@ -2430,10 +2687,9 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         active_index,
         window,
         additional_windows,
-        column_order,
-        search_column_order,
-        column_widths,
-        search_column_widths,
+        default_directory_view,
+        search_view,
+        directory_views,
         everything_config,
         theme_mode,
         language,
@@ -2453,10 +2709,12 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 first.active_tab,
                 first.placement,
                 windows,
-                session.column_order,
-                session.search_column_order,
-                session.column_widths,
-                session.search_column_widths,
+                session.default_directory_view,
+                session.search_view,
+                session
+                    .directory_views
+                    .into_iter()
+                    .collect::<HashMap<_, _>>(),
                 session.everything,
                 session.theme_mode,
                 session.language,
@@ -2469,10 +2727,9 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 0,
                 default_window,
                 Vec::new(),
-                [0, 1, 2, 3],
-                [0, 1, 2, 3],
-                session_store::DEFAULT_COLUMN_WIDTHS,
-                session_store::DEFAULT_SEARCH_COLUMN_WIDTHS,
+                DirectoryViewPreference::default(),
+                SearchViewPreference::default(),
+                HashMap::new(),
                 crate::domain::EverythingConfig::default(),
                 session_store::ThemeMode::System,
                 Language::Chinese,
@@ -2488,10 +2745,9 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     let state = Arc::new(Mutex::new(AppState::new(
         restored_paths,
         active_index,
-        column_order,
-        search_column_order,
-        column_widths,
-        search_column_widths,
+        default_directory_view,
+        search_view,
+        directory_views,
         everything_config,
         theme_mode,
         language,
@@ -2768,10 +3024,9 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     });
     let (
         windows,
-        column_order,
-        search_column_order,
-        column_widths,
-        search_column_widths,
+        default_directory_view,
+        search_view,
+        directory_views,
         everything_config,
         theme_mode,
         language,
@@ -2797,12 +3052,22 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 })
             })
             .collect::<Vec<_>>();
+        let mut directory_views = app
+            .directory_views
+            .iter()
+            .map(|(path, preference)| (path.clone(), *preference))
+            .collect::<Vec<_>>();
+        directory_views.sort_by_key(|(path, _)| {
+            app.directory_view_lru
+                .iter()
+                .position(|candidate| candidate == path)
+                .unwrap_or(usize::MAX)
+        });
         (
             windows,
-            app.column_order,
-            app.search_column_order,
-            app.column_widths,
-            app.search_column_widths,
+            app.default_directory_view,
+            app.search_view,
+            directory_views,
             app.everything_config.clone(),
             app.theme_mode,
             app.language,
@@ -2813,10 +3078,9 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         && let Some(path) = session_store::default_path()
         && let Ok(session) = session_store::SessionState::with_windows_and_settings(
             windows,
-            column_order,
-            search_column_order,
-            column_widths,
-            search_column_widths,
+            default_directory_view,
+            search_view,
+            directory_views,
             theme_mode,
             language,
             everything_config,
@@ -3329,6 +3593,44 @@ impl FileHitGeometry {
     }
 }
 
+fn directory_entry_at_visual_point(
+    app: &AppState,
+    tab: &TabSession,
+    view_mode: ViewMode,
+    grid_columns: usize,
+    local_x: f32,
+    content_y: f32,
+) -> Option<EntryId> {
+    if content_y < 0.0 || local_x < 16.0 {
+        return None;
+    }
+    let entries = tab.visible_entries();
+    let groups = directory_group_projections(app, tab, entries);
+    if file_layout_geometry(view_mode).grid {
+        let projection = IconProjection::from_groups(
+            &groups,
+            grid_columns,
+            32,
+            file_row_height(view_mode) as u64,
+        );
+        let location = projection.offsets.locate(content_y as u64)?;
+        let IconVisualRow::Entries { entries, .. } = projection.rows.get(location.row_index)?
+        else {
+            return None;
+        };
+        let geometry = file_layout_geometry(view_mode);
+        let column = ((local_x - 16.0) / (geometry.card_width + 8.0).max(1.0)).floor() as usize;
+        entries.get(column).copied()
+    } else {
+        let projection =
+            ListProjection::from_groups(&groups, 32, file_row_height(view_mode) as u64);
+        let location = projection.offsets.locate(content_y as u64)?;
+        match projection.rows.get(location.row_index)? {
+            ListVisualRow::Entry { entry_id } => Some(*entry_id),
+            ListVisualRow::GroupHeader { .. } => None,
+        }
+    }
+}
 fn context_target_at(
     state: &SharedSessions,
     window_x: f32,
@@ -3342,25 +3644,31 @@ fn context_target_at(
         return (None, true);
     }
     let active = app.active();
-    let view_mode = active
-        .visible_path()
-        .and_then(|path| app.directory_view_modes.get(path))
-        .copied()
-        .unwrap_or(ViewMode::Details);
+    let view_mode = app.active_view_mode();
+    let local_x = window_x - geometry.list_left;
     if view_mode == ViewMode::Details && !geometry.details_contains(window_x) {
         return (None, true);
     }
-    let local_row = ((window_y - geometry.list_top + (-geometry.viewport_y).max(0.0))
-        / file_row_height(view_mode))
-    .floor() as usize;
-    let local_index = match view_mode {
-        ViewMode::Grid => {
-            let column = (window_x.max(0.0) / 148.0).floor() as usize;
-            local_row
-                .saturating_mul(grid_columns.max(1))
-                .saturating_add(column.min(grid_columns.max(1) - 1))
+    if view_mode != ViewMode::Details
+        && (local_x < 16.0 || local_x >= geometry.viewport_width - 16.0)
+    {
+        return (None, true);
+    }
+    let content_y = window_y - geometry.list_top + (-geometry.viewport_y).max(0.0);
+    let local_row = (content_y / file_row_height(view_mode)).floor() as usize;
+    let local_index = if file_layout_geometry(view_mode).grid {
+        let local_x = window_x - geometry.list_left;
+        if local_x < 16.0 || local_x >= geometry.viewport_width - 16.0 {
+            return (None, true);
         }
-        ViewMode::Details | ViewMode::List => local_row,
+        let column = ((local_x - 16.0)
+            / (file_layout_geometry(view_mode).card_width + 8.0).max(1.0))
+        .floor() as usize;
+        local_row
+            .saturating_mul(grid_columns.max(1))
+            .saturating_add(column.min(grid_columns.max(1) - 1))
+    } else {
+        local_row
     };
     let entry = if active.page_source == PageSource::Search {
         let window = search_window_for_scroll(
@@ -3376,10 +3684,14 @@ fn context_target_at(
             .and_then(|id| active.visible_entry(EntryId(id)))
             .map(|entry| entry.id)
     } else {
-        active
-            .visible_entries()
-            .get(local_index)
-            .map(|entry| entry.id)
+        directory_entry_at_visual_point(
+            &app,
+            active,
+            view_mode,
+            grid_columns,
+            window_x - geometry.list_left,
+            content_y,
+        )
     };
     (entry, entry.is_none())
 }
@@ -3454,6 +3766,167 @@ fn request_clipboard_paste(state: &SharedSessions, sender: &mpsc::Sender<Clipboa
     if let Some(target) = target {
         let _ = sender.send(ClipboardRequest::ReadPaste { target });
     }
+}
+fn set_view_mode(state: &SharedSessions, mode: ViewMode) {
+    if let Ok(mut app) = state.lock() {
+        if app.active().page_source == PageSource::Search {
+            app.search_view.view_mode = mode;
+        } else if let Some(path) = app.active().visible_path().map(Path::to_path_buf) {
+            app.update_directory_preference(path, |preference| preference.view_mode = mode);
+        }
+    }
+}
+
+fn set_sort_field(state: &SharedSessions, field: SortField) {
+    if let Ok(mut app) = state.lock() {
+        if app.active().page_source == PageSource::Search {
+            let direction = app.search_view.sort_direction;
+            app.search_view.sort_field = field;
+            for window in app.windows.values_mut() {
+                for tab in window
+                    .tabs
+                    .values_mut()
+                    .filter(|tab| tab.page_source == PageSource::Search)
+                {
+                    tab.search_sort_field = field;
+                    tab.search_sort_direction = direction;
+                }
+            }
+        } else if let Some(path) = app.active().visible_path().map(Path::to_path_buf) {
+            let direction = app.directory_preference(&path).sort_direction;
+            app.update_directory_preference(path.clone(), |preference| {
+                preference.sort_field = field
+            });
+            for window in app.windows.values_mut() {
+                for tab in window.tabs.values_mut().filter(|tab| {
+                    tab.page_source == PageSource::Directory
+                        && tab.visible_path() == Some(path.as_path())
+                }) {
+                    tab.sort_field = field;
+                    tab.sort_direction = direction;
+                    tab.resort_entries();
+                }
+            }
+        }
+    }
+}
+
+fn set_sort_direction(state: &SharedSessions, direction: SortDirection) {
+    if let Ok(mut app) = state.lock() {
+        if app.active().page_source == PageSource::Search {
+            app.search_view.sort_direction = direction;
+            for window in app.windows.values_mut() {
+                for tab in window
+                    .tabs
+                    .values_mut()
+                    .filter(|tab| tab.page_source == PageSource::Search)
+                {
+                    tab.search_sort_direction = direction;
+                }
+            }
+        } else if let Some(path) = app.active().visible_path().map(Path::to_path_buf) {
+            app.update_directory_preference(path.clone(), |preference| {
+                preference.sort_direction = direction
+            });
+            for window in app.windows.values_mut() {
+                for tab in window.tabs.values_mut().filter(|tab| {
+                    tab.page_source == PageSource::Directory
+                        && tab.visible_path() == Some(path.as_path())
+                }) {
+                    tab.sort_direction = direction;
+                    tab.resort_entries();
+                }
+            }
+        }
+    }
+}
+
+fn set_group(state: &WindowSessions, field: GroupField, direction: Option<SortDirection>) -> bool {
+    let Ok(mut app) = state.lock() else {
+        return false;
+    };
+    if app.active().page_source == PageSource::Search {
+        return false;
+    }
+    let Some(path) = app.active().visible_path().map(Path::to_path_buf) else {
+        return false;
+    };
+    app.update_directory_preference(path, |preference| {
+        preference.group_field = field;
+        if let Some(direction) = direction {
+            preference.group_direction = direction;
+        }
+    });
+    true
+}
+
+fn apply_group_command(state: &WindowSessions, command: i32) -> bool {
+    match command {
+        command if (CMD_GROUP_BASE..CMD_GROUP_BASE + 6).contains(&command) => {
+            GroupField::from_storage_code((command - CMD_GROUP_BASE) as u8)
+                .is_some_and(|field| set_group(state, field, None))
+        }
+        CMD_GROUP_ASC | CMD_GROUP_DESC => {
+            let field = state
+                .lock()
+                .ok()
+                .and_then(|app| {
+                    app.active()
+                        .visible_path()
+                        .map(|path| app.directory_preference(path).group_field)
+                })
+                .unwrap_or(GroupField::None);
+            set_group(
+                state,
+                field,
+                Some(if command == CMD_GROUP_ASC {
+                    SortDirection::Ascending
+                } else {
+                    SortDirection::Descending
+                }),
+            )
+        }
+        _ => false,
+    }
+}
+
+fn fitted_column_width(app: &AppState, kind: ColumnKind) -> u32 {
+    let header = match (app.language, kind) {
+        (Language::Chinese, ColumnKind::Name) => "名称",
+        (Language::English, ColumnKind::Name) => "Name",
+        (Language::Chinese, ColumnKind::Kind) => "类型",
+        (Language::English, ColumnKind::Kind) => "Type",
+        (Language::Chinese, ColumnKind::Size) => "大小",
+        (Language::English, ColumnKind::Size) => "Size",
+        (Language::Chinese, ColumnKind::Modified) => "修改时间",
+        (Language::English, ColumnKind::Modified) => "Date modified",
+        (Language::Chinese, ColumnKind::Created) => "创建时间",
+        (Language::English, ColumnKind::Created) => "Date created",
+    };
+    let texts = Texts::new(app.language);
+    let max_chars = app
+        .active()
+        .visible_entries()
+        .iter()
+        .map(|entry| match kind {
+            ColumnKind::Name => entry.display_name.chars().count(),
+            ColumnKind::Kind => entry
+                .path
+                .extension()
+                .map(|value| value.to_string_lossy().chars().count() + 5)
+                .unwrap_or(6),
+            ColumnKind::Size => texts.size(entry.size_bytes).chars().count(),
+            ColumnKind::Modified => texts.modified(entry.modified).chars().count(),
+            ColumnKind::Created => texts.modified(entry.created).chars().count(),
+        })
+        .chain(std::iter::once(header.chars().count()))
+        .max()
+        .unwrap_or(8);
+    let padding = if kind == ColumnKind::Name { 54 } else { 28 };
+    (max_chars as u32 * 8 + padding).clamp(
+        crate::domain::MIN_COLUMN_WIDTH,
+        crate::domain::MAX_COLUMN_WIDTH,
+    )
 }
 fn begin_rename_ui(weak: &slint::Weak<AppWindow>, state: &SharedSessions) {
     let target = {
@@ -3602,6 +4075,21 @@ fn submit_delete(
 }
 
 const SHELL_CONTEXT_COMMAND_BASE: i32 = 100_000;
+const CMD_REFRESH: i32 = 20;
+const CMD_VIEW_BASE: i32 = 100;
+const CMD_SORT_BASE: i32 = 120;
+const CMD_SORT_ASC: i32 = 130;
+const CMD_SORT_DESC: i32 = 131;
+const CMD_GROUP_BASE: i32 = 140;
+const CMD_GROUP_ASC: i32 = 150;
+const CMD_GROUP_DESC: i32 = 151;
+const CMD_COLUMN_FIT: i32 = 160;
+const CMD_COLUMNS_FIT: i32 = 161;
+const CMD_COLUMN_TOGGLE_BASE: i32 = 170;
+const NODE_VIEW: i32 = 10_001;
+const NODE_SORT: i32 = 10_002;
+const NODE_GROUP: i32 = 10_003;
+const NODE_COLUMNS: i32 = 10_004;
 const QUICK_MENU_PLACEHOLDER_ROWS: usize = 3;
 const QUICK_MENU_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 
@@ -3639,6 +4127,8 @@ struct QuickMenuState {
     submenu_history: Vec<(u64, Vec<ContextCommandRow>)>,
     submenu_tokens: HashMap<i32, u64>,
     preloaded_submenu_rows: HashMap<u64, Vec<ContextCommandRow>>,
+    built_in_submenu_rows: HashMap<i32, Vec<ContextCommandRow>>,
+    active_column: Option<ColumnKind>,
     next_submenu_node: i32,
     active_submenu_token: Option<u64>,
     active_submenu_request: u64,
@@ -3661,6 +4151,7 @@ fn quick_menu_separator() -> ContextCommandRow {
         submenu: false,
         loading: false,
         placeholder: false,
+        icon_kind: 0,
     }
 }
 
@@ -3679,6 +4170,7 @@ fn quick_menu_placeholder() -> ContextCommandRow {
         submenu: false,
         loading: true,
         placeholder: true,
+        icon_kind: 0,
     }
 }
 
@@ -3815,6 +4307,7 @@ fn filtered_context_rows(rows: &[ContextCommandRow], query: &str) -> Vec<Context
                 submenu: false,
                 loading: false,
                 placeholder: false,
+                icon_kind: 0,
             });
         }
         pending_separator = false;
@@ -3880,6 +4373,7 @@ fn shell_menu_item_row(
         submenu,
         loading: false,
         placeholder: false,
+        icon_kind: 0,
     })
 }
 
@@ -4071,65 +4565,274 @@ fn begin_shell_menu_load(
         );
     }
 }
-fn built_in_context_rows(
-    language: Language,
-    selected: usize,
-    can_paste: bool,
-    background: bool,
-) -> Vec<ContextCommandRow> {
-    let label = |zh: &'static str, en: &'static str| -> &'static str {
-        if language == Language::Chinese {
-            zh
-        } else {
-            en
-        }
-    };
-    let row = |id: i32, zh: &'static str, en: &'static str, enabled: bool| ContextCommandRow {
+fn quick_menu_row(
+    id: i32,
+    node_id: i32,
+    label: &str,
+    enabled: bool,
+    checked: bool,
+    submenu: bool,
+) -> ContextCommandRow {
+    ContextCommandRow {
         id,
-        node_id: 0,
-        label: label(zh, en).into(),
+        node_id,
+        label: label.into(),
         enabled,
         separator: false,
         search_text: "".into(),
         hint: "".into(),
         shell: false,
-        checked: false,
+        checked,
         default: false,
-        submenu: false,
+        submenu,
         loading: false,
         placeholder: false,
-    };
-    let mut rows = Vec::new();
-    if background {
-        rows.push(row(1, "新建文件夹", "New folder", true));
-    } else {
-        rows.push(row(2, "复制", "Copy", selected > 0));
-        rows.push(row(3, "剪切", "Cut", selected > 0));
+        icon_kind: built_in_menu_icon_kind(id, node_id),
     }
-    rows.push(row(4, "粘贴", "Paste", can_paste));
-    if !background {
-        rows.push(row(5, "重命名", "Rename", selected == 1));
-        rows.push(row(6, "删除", "Delete", selected > 0));
-        rows.push(row(7, "永久删除", "Delete permanently", selected > 0));
-    }
-    rows
 }
 
+fn built_in_menu_icon_kind(id: i32, node_id: i32) -> i32 {
+    match node_id {
+        NODE_VIEW => 1,
+        NODE_SORT => 2,
+        NODE_GROUP => 3,
+        NODE_COLUMNS => 6,
+        _ => match id {
+            CMD_REFRESH => 4,
+            1 => 5,
+            _ => 0,
+        },
+    }
+}
+fn built_in_context_rows(
+    app: &AppState,
+    can_paste: bool,
+    background: bool,
+) -> (Vec<ContextCommandRow>, HashMap<i32, Vec<ContextCommandRow>>) {
+    let language = app.language;
+    let selected = app.active().selected.len();
+    let zh = |chinese: &'static str, english: &'static str| {
+        if language == Language::Chinese {
+            chinese
+        } else {
+            english
+        }
+    };
+    let mut submenus = HashMap::new();
+    let mut rows = Vec::new();
+    if background {
+        let view = app.active_view_mode();
+        let (sort_field, sort_direction, group_field, group_direction) =
+            if app.active().page_source == PageSource::Search {
+                (
+                    app.search_view.sort_field,
+                    app.search_view.sort_direction,
+                    GroupField::None,
+                    SortDirection::Ascending,
+                )
+            } else {
+                let preference = app
+                    .active()
+                    .visible_path()
+                    .map(|path| app.directory_preference(path))
+                    .unwrap_or(app.default_directory_view);
+                (
+                    preference.sort_field,
+                    preference.sort_direction,
+                    preference.group_field,
+                    preference.group_direction,
+                )
+            };
+        rows.extend([
+            quick_menu_row(-1, NODE_VIEW, zh("查看", "View"), true, false, true),
+            quick_menu_row(-1, NODE_SORT, zh("排序方式", "Sort by"), true, false, true),
+            quick_menu_row(
+                -1,
+                NODE_GROUP,
+                zh("分组依据", "Group by"),
+                app.active().page_source != PageSource::Search,
+                false,
+                true,
+            ),
+            quick_menu_row(CMD_REFRESH, 0, zh("刷新", "Refresh"), true, false, false),
+            quick_menu_separator(),
+        ]);
+        let view_labels = [
+            (ViewMode::ExtraLargeIcons, "超大图标", "Extra large icons"),
+            (ViewMode::LargeIcons, "大图标", "Large icons"),
+            (ViewMode::MediumIcons, "中等图标", "Medium icons"),
+            (ViewMode::SmallIcons, "小图标", "Small icons"),
+            (ViewMode::List, "列表", "List"),
+            (ViewMode::Details, "详细信息", "Details"),
+            (ViewMode::Tiles, "平铺", "Tiles"),
+            (ViewMode::Content, "内容", "Content"),
+        ];
+        submenus.insert(
+            NODE_VIEW,
+            view_labels
+                .into_iter()
+                .map(|(mode, chinese, english)| {
+                    quick_menu_row(
+                        CMD_VIEW_BASE + i32::from(mode.storage_code()),
+                        0,
+                        zh(chinese, english),
+                        true,
+                        view == mode,
+                        false,
+                    )
+                })
+                .collect(),
+        );
+        let sort_labels = [
+            (SortField::Name, "名称", "Name"),
+            (SortField::Modified, "修改时间", "Date modified"),
+            (SortField::Created, "创建时间", "Date created"),
+            (SortField::Kind, "类型", "Type"),
+            (SortField::Size, "大小", "Size"),
+        ];
+        let mut sort_rows = sort_labels
+            .into_iter()
+            .map(|(field, chinese, english)| {
+                quick_menu_row(
+                    CMD_SORT_BASE + i32::from(field.storage_code()),
+                    0,
+                    zh(chinese, english),
+                    true,
+                    sort_field == field,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        sort_rows.push(quick_menu_separator());
+        sort_rows.push(quick_menu_row(
+            CMD_SORT_ASC,
+            0,
+            zh("升序", "Ascending"),
+            true,
+            sort_direction == SortDirection::Ascending,
+            false,
+        ));
+        sort_rows.push(quick_menu_row(
+            CMD_SORT_DESC,
+            0,
+            zh("降序", "Descending"),
+            true,
+            sort_direction == SortDirection::Descending,
+            false,
+        ));
+        submenus.insert(NODE_SORT, sort_rows);
+        let group_labels = [
+            (GroupField::None, "无", "None"),
+            (GroupField::Name, "名称", "Name"),
+            (GroupField::Modified, "修改日期", "Date modified"),
+            (GroupField::Created, "创建日期", "Date created"),
+            (GroupField::Kind, "类型", "Type"),
+            (GroupField::Size, "大小", "Size"),
+        ];
+        let enabled = app.active().page_source != PageSource::Search;
+        let mut group_rows = group_labels
+            .into_iter()
+            .map(|(field, chinese, english)| {
+                quick_menu_row(
+                    CMD_GROUP_BASE + i32::from(field.storage_code()),
+                    0,
+                    zh(chinese, english),
+                    enabled,
+                    group_field == field,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        group_rows.push(quick_menu_separator());
+        group_rows.push(quick_menu_row(
+            CMD_GROUP_ASC,
+            0,
+            zh("分组升序", "Group ascending"),
+            enabled,
+            group_direction == SortDirection::Ascending,
+            false,
+        ));
+        group_rows.push(quick_menu_row(
+            CMD_GROUP_DESC,
+            0,
+            zh("分组降序", "Group descending"),
+            enabled,
+            group_direction == SortDirection::Descending,
+            false,
+        ));
+        submenus.insert(NODE_GROUP, group_rows);
+        rows.push(quick_menu_row(
+            1,
+            0,
+            zh("新建文件夹", "New folder"),
+            true,
+            false,
+            false,
+        ));
+    } else {
+        rows.push(quick_menu_row(
+            2,
+            0,
+            zh("复制", "Copy"),
+            selected > 0,
+            false,
+            false,
+        ));
+        rows.push(quick_menu_row(
+            3,
+            0,
+            zh("剪切", "Cut"),
+            selected > 0,
+            false,
+            false,
+        ));
+    }
+    rows.push(quick_menu_row(
+        4,
+        0,
+        zh("粘贴", "Paste"),
+        can_paste,
+        false,
+        false,
+    ));
+    if !background {
+        rows.push(quick_menu_row(
+            5,
+            0,
+            zh("重命名", "Rename"),
+            selected == 1,
+            false,
+            false,
+        ));
+        rows.push(quick_menu_row(
+            6,
+            0,
+            zh("删除", "Delete"),
+            selected > 0,
+            false,
+            false,
+        ));
+        rows.push(quick_menu_row(
+            7,
+            0,
+            zh("永久删除", "Delete permanently"),
+            selected > 0,
+            false,
+            false,
+        ));
+    }
+    (rows, submenus)
+}
 fn project_context_menu(
     ui: &AppWindow,
     state: &WindowSessions,
     menu: &SharedQuickMenu,
     background: bool,
 ) {
-    let (language, selected, can_paste) = {
+    let (built_in_rows, built_in_submenus) = {
         let app = state.lock().expect("app state mutex is not poisoned");
-        (
-            app.language,
-            app.active().selected.len(),
-            app.clipboard_has_files,
-        )
+        built_in_context_rows(&app, app.clipboard_has_files, background)
     };
-    let built_in_rows = built_in_context_rows(language, selected, can_paste, background);
     let key = quick_menu_key(state, background).map(|(key, _)| key);
     let (loading, cache_hit, session_hit) = menu
         .lock()
@@ -4148,6 +4851,7 @@ fn project_context_menu(
             menu.submenu_history.clear();
             menu.submenu_tokens.clear();
             menu.preloaded_submenu_rows.clear();
+            menu.built_in_submenu_rows = built_in_submenus.clone();
             menu.next_submenu_node = 0;
             menu.active_submenu_token = None;
             (loading, cache_hit, session_hit)
@@ -4434,11 +5138,13 @@ fn rectangle_selection_hits(
     details_columns_width: f32,
     rect: SelectionRect,
 ) -> HashSet<EntryId> {
-    let (row_height, card_width, card_height, gap) = match view_mode {
-        ViewMode::Details => (40.0, 0.0, 0.0, 0.0),
-        ViewMode::List => (34.0, 0.0, 0.0, 0.0),
-        ViewMode::Grid => (148.0, 140.0, 140.0, 8.0),
-    };
+    let geometry = file_layout_geometry(view_mode);
+    let (row_height, card_width, card_height, gap) = (
+        geometry.row_height,
+        geometry.card_width,
+        geometry.card_height,
+        if geometry.grid { 8.0 } else { 0.0 },
+    );
     let slot_count = if tab.page_source == PageSource::Search {
         tab.search_total.unwrap_or(0) as usize
     } else {
@@ -4457,73 +5163,73 @@ fn rectangle_selection_hits(
             tab.visible_entries().get(slot)
         }
     };
+    let grid_content_left = 16.0;
     let candidate_start = |position: f32, extent: f32| {
         ((position.max(0.0) / extent).floor() as usize).saturating_sub(1)
     };
     let mut hits = HashSet::new();
-    match view_mode {
-        ViewMode::Details | ViewMode::List => {
-            let (item_left, item_right) = if view_mode == ViewMode::Details {
-                FileHitGeometry {
-                    viewport_x: details_viewport_x,
-                    viewport_width,
-                    columns_width: details_columns_width,
-                    ..FileHitGeometry::default()
-                }
-                .details_range()
-            } else {
-                (0.0, viewport_width)
-            };
-            if item_right <= item_left || rect.right < item_left || rect.left >= item_right {
-                return hits;
+    if !geometry.grid {
+        let (item_left, item_right) = if view_mode == ViewMode::Details {
+            FileHitGeometry {
+                viewport_x: details_viewport_x,
+                viewport_width,
+                columns_width: details_columns_width,
+                ..FileHitGeometry::default()
             }
-            let first = candidate_start(rect.top, row_height);
-            let last = ((rect.bottom.max(0.0) / row_height).floor() as usize)
-                .min(slot_count.saturating_sub(1));
-            for slot in first..=last {
+            .details_range()
+        } else {
+            (16.0, (viewport_width - 16.0).max(16.0))
+        };
+        if item_right <= item_left || rect.right < item_left || rect.left >= item_right {
+            return hits;
+        }
+        let first = candidate_start(rect.top, row_height);
+        let last = ((rect.bottom.max(0.0) / row_height).floor() as usize)
+            .min(slot_count.saturating_sub(1));
+        for slot in first..=last {
+            let Some(entry) = entry_at(slot) else {
+                continue;
+            };
+            let item = SelectionRect {
+                left: item_left,
+                top: slot as f32 * row_height,
+                right: item_right,
+                bottom: (slot + 1) as f32 * row_height,
+            };
+            if rect.intersects(item) {
+                hits.insert(entry.id);
+            }
+        }
+    } else {
+        let columns = grid_columns.max(1);
+        let column_extent = card_width + gap;
+        let first_column =
+            candidate_start(rect.left - grid_content_left, column_extent).min(columns - 1);
+        let last_column = (((rect.right - grid_content_left).max(0.0) / column_extent).floor()
+            as usize)
+            .min(columns - 1);
+        let first_row = candidate_start(rect.top, row_height);
+        let last_row = ((rect.bottom.max(0.0) / row_height).floor() as usize)
+            .min(slot_count.saturating_sub(1) / columns);
+        for row in first_row..=last_row {
+            for column in first_column..=last_column {
+                let slot = row * columns + column;
+                if slot >= slot_count {
+                    break;
+                }
                 let Some(entry) = entry_at(slot) else {
                     continue;
                 };
+                let left = grid_content_left + column as f32 * column_extent;
+                let top = row as f32 * row_height;
                 let item = SelectionRect {
-                    left: item_left,
-                    top: slot as f32 * row_height,
-                    right: item_right,
-                    bottom: (slot + 1) as f32 * row_height,
+                    left,
+                    top,
+                    right: left + card_width,
+                    bottom: top + card_height,
                 };
                 if rect.intersects(item) {
                     hits.insert(entry.id);
-                }
-            }
-        }
-        ViewMode::Grid => {
-            let columns = grid_columns.max(1);
-            let column_extent = card_width + gap;
-            let first_column = candidate_start(rect.left, column_extent).min(columns - 1);
-            let last_column =
-                ((rect.right.max(0.0) / column_extent).floor() as usize).min(columns - 1);
-            let first_row = candidate_start(rect.top, row_height);
-            let last_row = ((rect.bottom.max(0.0) / row_height).floor() as usize)
-                .min(slot_count.saturating_sub(1) / columns);
-            for row in first_row..=last_row {
-                for column in first_column..=last_column {
-                    let slot = row * columns + column;
-                    if slot >= slot_count {
-                        break;
-                    }
-                    let Some(entry) = entry_at(slot) else {
-                        continue;
-                    };
-                    let left = column as f32 * column_extent;
-                    let top = row as f32 * row_height;
-                    let item = SelectionRect {
-                        left,
-                        top,
-                        right: left + card_width,
-                        bottom: top + card_height,
-                    };
-                    if rect.intersects(item) {
-                        hits.insert(entry.id);
-                    }
                 }
             }
         }
@@ -4531,6 +5237,93 @@ fn rectangle_selection_hits(
     hits
 }
 
+#[allow(clippy::too_many_arguments)]
+fn rectangle_selection_hits_for_app(
+    app: &AppState,
+    tab_id: TabId,
+    view_mode: ViewMode,
+    grid_columns: usize,
+    viewport_width: f32,
+    details_viewport_x: f32,
+    details_columns_width: f32,
+    rect: SelectionRect,
+) -> HashSet<EntryId> {
+    let Some(tab) = app.tab(tab_id) else {
+        return HashSet::new();
+    };
+    let group_field = tab
+        .visible_path()
+        .map(|path| app.directory_preference(path).group_field)
+        .unwrap_or(GroupField::None);
+    if tab.page_source == PageSource::Search || group_field == GroupField::None {
+        return rectangle_selection_hits(
+            tab,
+            view_mode,
+            grid_columns,
+            viewport_width,
+            details_viewport_x,
+            details_columns_width,
+            rect,
+        );
+    }
+    let groups = directory_group_projections(app, tab, tab.visible_entries());
+    let geometry = file_layout_geometry(view_mode);
+    let mut hits = HashSet::new();
+    if geometry.grid {
+        let projection =
+            IconProjection::from_groups(&groups, grid_columns, 32, geometry.row_height as u64);
+        for entry in tab.visible_entries() {
+            let Some(position) = projection.entry_position(entry.id) else {
+                continue;
+            };
+            let Some(top) = projection.offsets.row_start(position.row_index) else {
+                continue;
+            };
+            let left = 16.0 + position.column_index as f32 * (geometry.card_width + 8.0);
+            if rect.intersects(SelectionRect {
+                left,
+                top: top as f32,
+                right: left + geometry.card_width,
+                bottom: top as f32 + geometry.card_height,
+            }) {
+                hits.insert(entry.id);
+            }
+        }
+    } else {
+        let (left, right) = if view_mode == ViewMode::Details {
+            FileHitGeometry {
+                viewport_x: details_viewport_x,
+                viewport_width,
+                columns_width: details_columns_width,
+                ..FileHitGeometry::default()
+            }
+            .details_range()
+        } else {
+            (16.0, (viewport_width - 16.0).max(16.0))
+        };
+        if right <= left {
+            return hits;
+        }
+        let projection = ListProjection::from_groups(&groups, 32, geometry.row_height as u64);
+        for entry in tab.visible_entries() {
+            let Some(position) = projection.entry_position(entry.id) else {
+                continue;
+            };
+            let Some(top) = projection.offsets.row_start(position) else {
+                continue;
+            };
+            if rect.intersects(SelectionRect {
+                left,
+                top: top as f32,
+                right,
+                bottom: top as f32 + geometry.row_height,
+            }) {
+                hits.insert(entry.id);
+            }
+        }
+    }
+    hits
+}
 fn selection_mode(control: bool, shift: bool) -> RectangleSelectionMode {
     if control {
         RectangleSelectionMode::Toggle
@@ -4712,29 +5505,25 @@ fn update_rectangle_selection(
         if app.active_window_state().active_tab != tab_id {
             None
         } else {
-            let view_mode = app
-                .active()
-                .visible_path()
-                .and_then(|path| app.directory_view_modes.get(path))
-                .copied()
-                .unwrap_or(ViewMode::Details);
+            let view_mode = app.active_view_mode();
             let grid_columns = ui.get_grid_column_count().max(1) as usize;
             let viewport_width = ui.get_file_viewport_width();
 
+            let hits = rectangle_selection_hits_for_app(
+                &app,
+                tab_id,
+                view_mode,
+                grid_columns,
+                viewport_width,
+                ui.get_file_viewport_x(),
+                ui.get_details_hit_width(),
+                rect,
+            );
             let tab = app.active_window_state_mut().tabs.get_mut(&tab_id).unwrap();
             if tab.latest_request != request_id {
                 None
             } else {
                 let previous_focus = tab.focused;
-                let hits = rectangle_selection_hits(
-                    tab,
-                    view_mode,
-                    grid_columns,
-                    viewport_width,
-                    ui.get_file_viewport_x(),
-                    ui.get_details_hit_width(),
-                    rect,
-                );
                 if committed && previous_hits == hits {
                     return false;
                 }
@@ -4904,12 +5693,9 @@ fn wire_rectangle_selection(ui: &AppWindow, state: WindowSessions) -> Rc<slint::
                     ui.invoke_request_search_position(ui.get_search_scroll_y() + delta);
                     viewport_changed = true;
                 } else {
-                    let maximum = file_scroll_maximum(
-                        ui.get_files().row_count(),
-                        view_mode_from_ui(ui.get_view_mode()),
-                        ui.get_grid_column_count().max(1) as usize,
-                        ui.get_file_viewport_height(),
-                    );
+                    let mode = view_mode_from_ui(ui.get_view_mode());
+                    let maximum =
+                        projected_scroll_maximum(&ui, mode, ui.get_file_viewport_height());
                     let viewport = (ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0);
                     if viewport != ui.get_file_viewport_y() {
                         ui.set_file_viewport_y(viewport);
@@ -5161,11 +5947,7 @@ fn wire_callbacks(
                 .lock()
                 .expect("app state mutex is not poisoned");
             let tab = app.active();
-            let mode = tab
-                .visible_path()
-                .and_then(|path| app.directory_view_modes.get(path))
-                .copied()
-                .unwrap_or(ViewMode::Details);
+            let mode = app.active_view_mode();
             (
                 app.active_window_state().active_tab,
                 tab.search_total.unwrap_or(0),
@@ -5530,11 +6312,7 @@ fn wire_callbacks(
         if let Ok(mut app) = state_for_view.lock() {
             let path = app.active().visible_path().map(Path::to_path_buf);
             if app.active().page_source == PageSource::Search {
-                let previous_mode = path
-                    .as_deref()
-                    .and_then(|path| app.directory_view_modes.get(path))
-                    .copied()
-                    .unwrap_or(ViewMode::Details);
+                let previous_mode = app.search_view.view_mode;
                 let total = app.active().search_total.unwrap_or(0);
                 preserved_search_index = weak.upgrade().map(|ui| {
                     search_result_index_at_scroll(
@@ -5545,8 +6323,10 @@ fn wire_callbacks(
                     )
                 });
             }
-            if let Some(path) = path {
-                app.directory_view_modes.insert(path, mode);
+            if app.active().page_source == PageSource::Search {
+                app.search_view.view_mode = mode;
+            } else if let Some(path) = path {
+                app.update_directory_preference(path, |preference| preference.view_mode = mode);
             }
         }
         if let Some(ui) = weak.upgrade() {
@@ -5619,11 +6399,10 @@ fn wire_callbacks(
         let mut app = state_for_column_widths
             .lock()
             .expect("app state mutex is not poisoned");
-        let search = app.active().page_source == PageSource::Search;
-        if search {
-            app.search_column_widths[kind as usize] = width;
+        if app.active().page_source == PageSource::Search {
+            app.search_view.columns.widths[kind as usize] = width;
         } else {
-            app.column_widths[kind as usize] = width;
+            app.update_active_column_layout(|layout| layout.widths[kind as usize] = width);
         }
         drop(app);
     });
@@ -6170,6 +6949,88 @@ fn wire_callbacks(
     });
 
     let weak = ui.as_weak();
+    let state_for_column_menu = state.clone();
+    let quick_menu_for_column = quick_menu.clone();
+    let anchor_for_column = context_anchor.clone();
+    ui.on_show_column_menu(move |kind, x, y| {
+        let Some(ui) = weak.upgrade() else { return };
+        if !(0..ColumnKind::COUNT as i32).contains(&kind) {
+            return;
+        }
+        *anchor_for_column.lock().expect("context anchor mutex") =
+            (true, x.round() as i32, y.round() as i32);
+        let (rows, submenu_rows) = {
+            let app = state_for_column_menu
+                .lock()
+                .expect("app state mutex is not poisoned");
+            let language = app.language;
+            let layout = app.active_column_layout();
+            let zh = |chinese: &'static str, english: &'static str| {
+                if language == Language::Chinese {
+                    chinese
+                } else {
+                    english
+                }
+            };
+            let labels = [
+                (ColumnKind::Name, "名称", "Name"),
+                (ColumnKind::Modified, "修改时间", "Date modified"),
+                (ColumnKind::Kind, "类型", "Type"),
+                (ColumnKind::Size, "大小", "Size"),
+                (ColumnKind::Created, "创建时间", "Date created"),
+            ];
+            let columns = labels
+                .into_iter()
+                .map(|(column, chinese, english)| {
+                    let code = column.storage_code() as usize;
+                    quick_menu_row(
+                        CMD_COLUMN_TOGGLE_BASE + code as i32,
+                        0,
+                        zh(chinese, english),
+                        column != ColumnKind::Name,
+                        layout.visible[code],
+                        false,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let rows = vec![
+                quick_menu_row(
+                    CMD_COLUMN_FIT,
+                    0,
+                    zh("调整当前列宽以适应内容", "Size column to fit"),
+                    true,
+                    false,
+                    false,
+                ),
+                quick_menu_row(
+                    CMD_COLUMNS_FIT,
+                    0,
+                    zh("调整所有列宽以适应内容", "Size all columns to fit"),
+                    true,
+                    false,
+                    false,
+                ),
+                quick_menu_separator(),
+                quick_menu_row(-1, NODE_COLUMNS, zh("列", "Columns"), true, false, true),
+            ];
+            (rows, HashMap::from([(NODE_COLUMNS, columns)]))
+        };
+        if let Ok(mut menu) = quick_menu_for_column.lock() {
+            menu.identity = None;
+            menu.active_column = ColumnKind::from_storage_code(kind as u8);
+            menu.built_in_rows = rows.clone();
+            menu.all_rows = rows;
+            menu.built_in_submenu_rows = submenu_rows;
+            menu.submenu_rows.clear();
+            menu.submenu_history.clear();
+        }
+        ui.set_context_search("".into());
+        ui.set_context_shell_loading(false);
+        ui.set_context_submenu_open(false);
+        project_filtered_context_menu(&ui, &quick_menu_for_column, "");
+        ui.set_context_menu_open(true);
+    });
+    let weak = ui.as_weak();
     let state_for_background_menu = state.clone();
     let anchor_for_background = context_anchor.clone();
     let clipboard_for_background = clipboard_sender.clone();
@@ -6351,6 +7212,21 @@ fn wire_callbacks(
         if !row.enabled || !row.submenu || row.node_id <= 0 {
             return;
         }
+        let built_in = quick_menu_for_submenu.lock().ok().and_then(|mut menu| {
+            let rows = menu.built_in_submenu_rows.get(&row.node_id)?.clone();
+            menu.submenu_history.clear();
+            menu.submenu_rows = rows.clone();
+            Some(rows)
+        });
+        if let Some(rows) = built_in {
+            ui.set_context_submenu_open(true);
+            ui.set_context_submenu_parent_open(false);
+            ui.set_context_submenu_loading(false);
+            ui.set_context_submenu_active_index(first_enabled_context_index(&rows));
+            ui.set_context_submenu_content_height(context_menu_content_height(&rows));
+            ui.set_context_submenu_commands(ModelRc::new(VecModel::from(rows)));
+            return;
+        }
         let submenu_is_open = ui.get_context_submenu_open();
         let request = quick_menu_for_submenu.lock().ok().and_then(|mut menu| {
             let identity = menu.identity.clone()?;
@@ -6488,6 +7364,7 @@ fn wire_callbacks(
     let clipboard_for_context = clipboard_sender.clone();
     let quick_menu_for_command = quick_menu.clone();
     let shell_menu_for_command = shell_menu_worker.clone();
+    let everything_for_context_command = everything_sender.clone();
     ui.on_invoke_context_command(move |command| {
         match command {
             1 => create_default_folder(&state_for_context_command, &sender_for_context_command),
@@ -6500,6 +7377,123 @@ fn wire_callbacks(
                 &sender_for_context_command,
                 false,
             ),
+            CMD_REFRESH => {
+                if let Some(ui) = weak.upgrade() {
+                    ui.invoke_refresh();
+                }
+            }
+            command if (CMD_VIEW_BASE..CMD_VIEW_BASE + 8).contains(&command) => {
+                if let Some(mode) = ViewMode::from_storage_code((command - CMD_VIEW_BASE) as u8) {
+                    set_view_mode(&state_for_context_command, mode);
+                    refresh_all_windows(&state_for_context_command.shared);
+                    if let Some(ui) = weak.upgrade() {
+                        request_grid_thumbnails(
+                            &ui,
+                            &state_for_context_command.shared,
+                            state_for_context_command.window_id,
+                            &icon_sender,
+                        );
+                    }
+                }
+            }
+            command if (CMD_SORT_BASE..CMD_SORT_BASE + 5).contains(&command) => {
+                if let Some(field) = SortField::from_storage_code((command - CMD_SORT_BASE) as u8) {
+                    set_sort_field(&state_for_context_command, field);
+                    let search = state_for_context_command.lock().ok().and_then(|app| {
+                        let tab = app.active();
+                        (tab.page_source == PageSource::Search)
+                            .then(|| (tab.id, tab.search_query.clone()))
+                    });
+                    if let Some((tab_id, query)) = search {
+                        submit_search(
+                            &everything_for_context_command,
+                            &state_for_context_command.shared,
+                            weak.upgrade().as_ref(),
+                            tab_id,
+                            query,
+                        );
+                    }
+                    refresh_all_windows(&state_for_context_command.shared);
+                }
+            }
+            CMD_SORT_ASC | CMD_SORT_DESC => {
+                set_sort_direction(
+                    &state_for_context_command,
+                    if command == CMD_SORT_ASC {
+                        SortDirection::Ascending
+                    } else {
+                        SortDirection::Descending
+                    },
+                );
+                let search = state_for_context_command.lock().ok().and_then(|app| {
+                    let tab = app.active();
+                    (tab.page_source == PageSource::Search)
+                        .then(|| (tab.id, tab.search_query.clone()))
+                });
+                if let Some((tab_id, query)) = search {
+                    submit_search(
+                        &everything_for_context_command,
+                        &state_for_context_command.shared,
+                        weak.upgrade().as_ref(),
+                        tab_id,
+                        query,
+                    );
+                }
+                refresh_all_windows(&state_for_context_command.shared);
+            }
+            command
+                if (CMD_GROUP_BASE..CMD_GROUP_BASE + 6).contains(&command)
+                    || matches!(command, CMD_GROUP_ASC | CMD_GROUP_DESC) =>
+            {
+                if apply_group_command(&state_for_context_command, command) {
+                    refresh_all_windows(&state_for_context_command.shared);
+                }
+            }
+            CMD_COLUMN_FIT | CMD_COLUMNS_FIT => {
+                if let Ok(mut app) = state_for_context_command.lock() {
+                    let current = quick_menu_for_command
+                        .lock()
+                        .ok()
+                        .and_then(|menu| menu.active_column)
+                        .unwrap_or(ColumnKind::Name);
+                    let widths = std::array::from_fn(|index| {
+                        fitted_column_width(
+                            &app,
+                            ColumnKind::from_storage_code(index as u8).unwrap(),
+                        )
+                    });
+                    if command == CMD_COLUMNS_FIT {
+                        app.update_active_column_layout(|layout| layout.widths = widths);
+                    } else {
+                        app.update_active_column_layout(|layout| {
+                            layout.widths[current.storage_code() as usize] =
+                                widths[current.storage_code() as usize]
+                        });
+                    }
+                }
+                if let Some(ui) = weak.upgrade() {
+                    refresh_ui(&ui, &state_for_context_command);
+                }
+            }
+            command
+                if (CMD_COLUMN_TOGGLE_BASE..CMD_COLUMN_TOGGLE_BASE + ColumnKind::COUNT as i32)
+                    .contains(&command) =>
+            {
+                if let Some(kind) =
+                    ColumnKind::from_storage_code((command - CMD_COLUMN_TOGGLE_BASE) as u8)
+                    && kind != ColumnKind::Name
+                {
+                    let index = kind.storage_code() as usize;
+                    if let Ok(mut app) = state_for_context_command.lock() {
+                        app.update_active_column_layout(|layout| {
+                            layout.visible[index] = !layout.visible[index]
+                        });
+                    }
+                    if let Some(ui) = weak.upgrade() {
+                        refresh_ui(&ui, &state_for_context_command);
+                    }
+                }
+            }
             7 => {
                 if delete_weak_for_context
                     .upgrade()
@@ -6763,6 +7757,7 @@ fn wire_mouse_navigation(
     let exit_weak = confirmations.exit.clone();
     let modifiers = Cell::new(ModifiersState::empty());
     let cursor_position = Cell::new(winit::dpi::PhysicalPosition::new(0.0, 0.0));
+    let ctrl_wheel_accumulator = Cell::new(0.0_f32);
     ui.window().on_winit_window_event(move |_, event| {
         if matches!(event, WindowEvent::CloseRequested) {
             if weak
@@ -6842,7 +7837,7 @@ fn wire_mouse_navigation(
                 "winit-resized",
             );
             ui.set_window_width(size.width as f32 / ui.window().scale_factor());
-            if ui.get_view_mode() == 2 {
+            if view_mode_from_ui(ui.get_view_mode()).uses_grid_layout() {
                 request_grid_thumbnails(&ui, &shared_state, window_id, &senders.icon);
             }
             return EventResult::Propagate;
@@ -6904,6 +7899,47 @@ fn wire_mouse_navigation(
                     return EventResult::Propagate;
                 }
                 let view_mode = view_mode_from_ui(ui.get_view_mode());
+                let control = modifiers.get().control_key();
+                if control {
+                    if logical.y >= ui.get_file_list_top() + ui.get_file_viewport_height() {
+                        ctrl_wheel_accumulator.set(0.0);
+                        return EventResult::Propagate;
+                    }
+                    if ui.get_context_menu_open()
+                        || ui.get_rename_editing()
+                        || ui.get_rectangle_selection_pointer_active()
+                        || ui.get_drop_menu_open()
+                        || state
+                            .lock()
+                            .is_ok_and(|app| app.tab_drag.is_some() || app.column_drag.is_some())
+                    {
+                        ctrl_wheel_accumulator.set(0.0);
+                        return EventResult::Propagate;
+                    }
+                    let mut accumulated = ctrl_wheel_accumulator.get();
+                    let step = ctrl_wheel_step(delta, ui.window().scale_factor(), &mut accumulated);
+                    ctrl_wheel_accumulator.set(accumulated);
+                    if let Some(toward_larger) = step {
+                        let next = view_mode.step_ctrl_wheel(toward_larger);
+                        if next != view_mode {
+                            let viewport = anchored_viewport(
+                                ui.get_file_viewport_y(),
+                                logical.y - ui.get_file_list_top(),
+                                view_mode,
+                                next,
+                                ui.get_grid_column_count().max(1) as usize,
+                                ui.get_files().row_count(),
+                                ui.get_file_viewport_height(),
+                            );
+                            set_view_mode(&state, next);
+                            refresh_all_windows(&shared_state);
+                            ui.set_file_viewport_y(viewport);
+                            request_grid_thumbnails(&ui, &shared_state, window_id, &senders.icon);
+                        }
+                    }
+                    return EventResult::PreventDefault;
+                }
+                ctrl_wheel_accumulator.set(0.0);
                 let delta = logical_scroll_delta(delta, view_mode, ui.window().scale_factor());
                 if logical.y >= ui.get_file_list_top() + ui.get_file_viewport_height() {
                     return EventResult::Propagate;
@@ -6911,16 +7947,12 @@ fn wire_mouse_navigation(
                 if ui.get_search_results_mode() {
                     ui.invoke_request_search_position(ui.get_search_scroll_y() + delta);
                 } else {
-                    let maximum = file_scroll_maximum(
-                        ui.get_files().row_count(),
-                        view_mode,
-                        ui.get_grid_column_count().max(1) as usize,
-                        ui.get_file_viewport_height(),
-                    );
+                    let maximum =
+                        projected_scroll_maximum(&ui, view_mode, ui.get_file_viewport_height());
                     let viewport = (ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0);
                     ui.set_file_viewport_y(viewport);
                 }
-                if ui.get_view_mode() == 2 {
+                if view_mode_from_ui(ui.get_view_mode()).uses_grid_layout() {
                     request_grid_thumbnails(&ui, &shared_state, window_id, &senders.icon);
                 }
                 EventResult::PreventDefault
@@ -7442,12 +8474,7 @@ fn auto_scroll_drag_edge(ui: &AppWindow, drag: &platform::windows::drag_drop::Dr
         return;
     }
     let view_mode = view_mode_from_ui(ui.get_view_mode());
-    let maximum = file_scroll_maximum(
-        ui.get_files().row_count(),
-        view_mode,
-        ui.get_grid_column_count().max(1) as usize,
-        ui.get_file_viewport_height(),
-    );
+    let maximum = projected_scroll_maximum(ui, view_mode, ui.get_file_viewport_height());
     ui.set_file_viewport_y((ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0));
 }
 
@@ -7487,23 +8514,57 @@ fn drop_target_snapshot(
             left + list_left + (ui.get_file_viewport_width() * scale).round() as i32,
         )
     };
+    let groups = directory_group_projections(app, tab, tab.visible_entries());
+    let list_projection = (!view_mode.uses_grid_layout())
+        .then(|| ListProjection::from_groups(&groups, 32, file_row_height(view_mode) as u64));
+    let icon_projection = view_mode.uses_grid_layout().then(|| {
+        IconProjection::from_groups(
+            &groups,
+            ui.get_grid_column_count().max(1) as usize,
+            32,
+            file_row_height(view_mode) as u64,
+        )
+    });
     let folder_rows = tab
         .visible_entries()
         .iter()
-        .enumerate()
-        .filter(|(_, entry)| entry.kind == crate::domain::EntryKind::Directory)
-        .filter_map(|(index, entry)| {
-            let row_top = top + list_top + (index as f32 * row_height - viewport).round() as i32;
+        .filter(|entry| entry.kind == crate::domain::EntryKind::Directory)
+        .filter_map(|entry| {
+            let (visual_row, column) = if let Some(projection) = icon_projection.as_ref() {
+                let position = projection.entry_position(entry.id)?;
+                (position.row_index, position.column_index)
+            } else {
+                (list_projection.as_ref()?.entry_position(entry.id)?, 0)
+            };
+            let row_start = if let Some(projection) = icon_projection.as_ref() {
+                projection.offsets.row_start(visual_row)? as f32
+            } else {
+                list_projection.as_ref()?.offsets.row_start(visual_row)? as f32
+            };
+            let row_top = top + list_top + (row_start * scale - viewport).round() as i32;
             let row_bottom = row_top + row_height.round() as i32;
-            (target_right > target_left && row_bottom > top + list_top && row_top < bottom).then(
-                || platform::windows::drag_drop::FolderDropTarget {
-                    left: target_left,
+            let card = file_layout_geometry(view_mode);
+            let item_left = if card.grid {
+                left + list_left
+                    + (16.0 * scale).round() as i32
+                    + (column as f32 * (card.card_width + 8.0) * scale).round() as i32
+            } else {
+                target_left
+            };
+            let item_right = if card.grid {
+                item_left + (card.card_width * scale).round() as i32
+            } else {
+                target_right
+            };
+            (item_right > item_left && row_bottom > top + list_top && row_top < bottom).then(|| {
+                platform::windows::drag_drop::FolderDropTarget {
+                    left: item_left,
                     top: row_top,
-                    right: target_right,
+                    right: item_right,
                     bottom: row_bottom.min(bottom),
                     path: entry.path.clone(),
-                },
-            )
+                }
+            })
         })
         .collect();
     Some(platform::windows::drag_drop::DropTargetSnapshot {
@@ -7521,20 +8582,27 @@ fn internal_drag_target(
     grid_columns: usize,
 ) -> Option<(EntryId, PathBuf)> {
     let tab = app.active();
-    let view_mode = tab
-        .visible_path()
-        .and_then(|path| app.directory_view_modes.get(path))
-        .copied()
-        .unwrap_or(ViewMode::Details);
+    let view_mode = app.active_view_mode();
+    let local_x = x - geometry.list_left;
     if view_mode == ViewMode::Details && !geometry.details_contains(x) {
         return None;
     }
-    let local_row = ((y - geometry.list_top + (-geometry.viewport_y).max(0.0))
-        / file_row_height(view_mode))
-    .floor() as usize;
-    let local_index = match view_mode {
-        ViewMode::Grid => local_row.saturating_mul(grid_columns.max(1)),
-        ViewMode::Details | ViewMode::List => local_row,
+    if view_mode != ViewMode::Details
+        && (local_x < 16.0 || local_x >= geometry.viewport_width - 16.0)
+    {
+        return None;
+    }
+    let content_y = y - geometry.list_top + (-geometry.viewport_y).max(0.0);
+    let local_row = (content_y / file_row_height(view_mode)).floor() as usize;
+    let local_index = if file_layout_geometry(view_mode).grid {
+        let column = ((local_x - 16.0)
+            / (file_layout_geometry(view_mode).card_width + 8.0).max(1.0))
+        .floor() as usize;
+        local_row
+            .saturating_mul(grid_columns.max(1))
+            .saturating_add(column.min(grid_columns.max(1) - 1))
+    } else {
+        local_row
     };
     let entry = if tab.page_source == PageSource::Search {
         let window = search_window_for_scroll(
@@ -7549,7 +8617,15 @@ fn internal_drag_target(
             .checked_add(1)?;
         tab.visible_entry(EntryId(id))?
     } else {
-        tab.visible_entries().get(local_index)?
+        let id = directory_entry_at_visual_point(
+            app,
+            tab,
+            view_mode,
+            grid_columns,
+            x - geometry.list_left,
+            content_y,
+        )?;
+        tab.visible_entry(id)?
     };
     (entry.kind == crate::domain::EntryKind::Directory).then(|| (entry.id, entry.path.clone()))
 }
@@ -9958,8 +11034,11 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                 });
             if accepted {
                 let consumed_focus = focus.is_some();
+                let preference = app.directory_preference(&path);
                 let location_path = {
                     let tab = app.tab_mut(tab_id).expect("accepted tab exists");
+                    tab.sort_field = preference.sort_field;
+                    tab.sort_direction = preference.sort_direction;
                     tab.sort_pending();
                     tab.commit_pending();
                     tab.commit_path(path);
@@ -10243,6 +11322,7 @@ fn spawn_everything_worker(
                                         .map(FolderSizeState::Value)
                                         .unwrap_or(FolderSizeState::NotIndexed),
                                     modified: item.modified,
+                                    created: item.created,
                                 })
                                 .collect::<Vec<_>>();
                             if !cancel.load(std::sync::atomic::Ordering::Acquire) {
@@ -10644,12 +11724,16 @@ fn empty_file_row() -> FileRow {
     FileRow {
         id: 0,
         loaded: false,
+        group_header: false,
+        group_label: "".into(),
+        group_count: 0,
         name: "".into(),
         name_segments: ModelRc::new(VecModel::default()),
         kind: "".into(),
         parent_path: "".into(),
         size: "".into(),
         modified: "".into(),
+        created: "".into(),
         is_directory: false,
         selected: false,
         focused: false,
@@ -10658,6 +11742,14 @@ fn empty_file_row() -> FileRow {
     }
 }
 
+fn group_header_file_row(label: &str, entry_count: usize) -> FileRow {
+    let mut row = empty_file_row();
+    row.loaded = true;
+    row.group_header = true;
+    row.group_label = label.into();
+    row.group_count = entry_count.min(i32::MAX as usize) as i32;
+    row
+}
 fn project_search_page(
     ui: &AppWindow,
     state: &SharedSessions,
@@ -10698,6 +11790,8 @@ fn everything_sort(
         (SortField::Size, SortDirection::Descending) => EverythingSort::SizeDescending,
         (SortField::Modified, SortDirection::Ascending) => EverythingSort::ModifiedAscending,
         (SortField::Modified, SortDirection::Descending) => EverythingSort::ModifiedDescending,
+        (SortField::Created, SortDirection::Ascending) => EverythingSort::CreatedAscending,
+        (SortField::Created, SortDirection::Descending) => EverythingSort::CreatedDescending,
     }
 }
 fn submit_search(
@@ -10881,18 +11975,24 @@ fn spawn_icon_workers(
                                 .contains_key(&(request.path.clone(), request.requested_px))
                         });
                         (Some(cached), actual)
-                    } else if let Ok(thumbnail) =
+                    } else if let Some(thumbnail) =
                         platform::windows_shell_icons::shell_thumbnail_rgba(
                             &request.path,
                             request.requested_px,
                             true,
                         )
-                        .or_else(|_| {
+                        .ok()
+                        .filter(|thumbnail| {
+                            thumbnail.image.width.max(thumbnail.image.height)
+                                >= request.requested_px
+                        })
+                        .or_else(|| {
                             platform::windows_shell_icons::shell_thumbnail_rgba(
                                 &request.path,
                                 request.requested_px,
                                 false,
                             )
+                            .ok()
                         })
                     {
                         let _source = thumbnail.source;
@@ -11128,6 +12228,15 @@ fn append_active_file_rows(
         return;
     }
     let texts = Texts::new(app.language);
+    let grouped = tab
+        .visible_path()
+        .map(|path| app.directory_preference(path).group_field != GroupField::None)
+        .unwrap_or(false);
+    if grouped || app.active_view_mode().uses_grid_layout() {
+        drop(app);
+        refresh_tab_window(state, tab_id);
+        return;
+    }
     model.extend(
         tab.pending_entries[start..]
             .iter()
@@ -11242,50 +12351,18 @@ fn update_file_rows(
     let Some(model) = model.as_any().downcast_ref::<VecModel<FileRow>>() else {
         return;
     };
-    let window_start = if tab.page_source == PageSource::Search {
-        let total = tab.search_total.unwrap_or(tab.entries.len() as u32);
-        let view_mode = tab
-            .visible_path()
-            .and_then(|path| app.directory_view_modes.get(path))
-            .copied()
-            .unwrap_or(ViewMode::Details);
-
-        Some(
-            search_window_for_scroll(
-                ui.get_search_scroll_y(),
-                total,
-                view_mode,
-                ui.get_grid_column_count().max(1) as usize,
-            )
-            .start,
-        )
-    } else {
-        None
-    };
-    for (id, row) in &rows {
-        let index = window_start
-            .and_then(|start| search_window_local_index(*id, start))
-            .or_else(|| tab.visible_entry_index(*id));
-        if let Some(index) = index
-            && index < model.row_count()
-        {
-            model.set_row_data(index, row.clone());
+    for index in 0..model.row_count() {
+        let Some(existing) = model.row_data(index) else {
+            continue;
+        };
+        if let Some(updated) = rows.get(&EntryId(existing.id as u32)) {
+            model.set_row_data(index, updated.clone());
         }
     }
 
     let grid_model = ui.get_grid_rows();
     if let Some(grid_model) = grid_model.as_any().downcast_ref::<VecModel<GridRow>>() {
-        let columns = ui.get_grid_column_count().max(1) as usize;
-        for (id, updated) in &rows {
-            let index = window_start
-                .and_then(|start| id.0.checked_sub(start.saturating_add(1)))
-                .map(|index| index as usize)
-                .or_else(|| tab.visible_entry_index(*id));
-            let Some(index) = index else {
-                continue;
-            };
-            let row_index = index / columns;
-            let entry_index = index % columns;
+        for row_index in 0..grid_model.row_count() {
             let Some(grid_row) = grid_model.row_data(row_index) else {
                 continue;
             };
@@ -11296,8 +12373,13 @@ fn update_file_rows(
             else {
                 continue;
             };
-            if entry_index < entries.row_count() {
-                entries.set_row_data(entry_index, updated.clone());
+            for entry_index in 0..entries.row_count() {
+                let Some(existing) = entries.row_data(entry_index) else {
+                    continue;
+                };
+                if let Some(updated) = rows.get(&EntryId(existing.id as u32)) {
+                    entries.set_row_data(entry_index, updated.clone());
+                }
             }
         }
     }
@@ -11311,35 +12393,69 @@ fn update_selection_status(ui: &AppWindow, state: &SharedSessions) {
     ui.set_status_text(status_text(tab, Texts::new(app.language)).into());
 }
 
+fn project_column_layout(ui: &AppWindow, tab: &TabSession, app: &AppState) {
+    let normal = tab
+        .visible_path()
+        .map(|path| app.directory_preference(path).columns)
+        .unwrap_or(app.default_directory_view.columns);
+    let search = app.search_view.columns;
+    ui.set_normal_name_width(normal.widths[ColumnKind::Name.storage_code() as usize] as f32);
+    ui.set_normal_kind_width(normal.widths[ColumnKind::Kind.storage_code() as usize] as f32);
+    ui.set_normal_size_width(normal.widths[ColumnKind::Size.storage_code() as usize] as f32);
+    ui.set_normal_modified_width(
+        normal.widths[ColumnKind::Modified.storage_code() as usize] as f32,
+    );
+    ui.set_normal_created_width(normal.widths[ColumnKind::Created.storage_code() as usize] as f32);
+    ui.set_search_name_width(search.widths[ColumnKind::Name.storage_code() as usize] as f32);
+    ui.set_search_parent_width(search.widths[ColumnKind::Kind.storage_code() as usize] as f32);
+    ui.set_search_size_width(search.widths[ColumnKind::Size.storage_code() as usize] as f32);
+    ui.set_search_modified_width(
+        search.widths[ColumnKind::Modified.storage_code() as usize] as f32,
+    );
+    ui.set_search_created_width(search.widths[ColumnKind::Created.storage_code() as usize] as f32);
+    let layout = if tab.page_source == PageSource::Search {
+        search
+    } else {
+        normal
+    };
+    let label = |kind: ColumnKind| match (app.language, kind, tab.page_source) {
+        (Language::Chinese, ColumnKind::Name, _) => "名称",
+        (Language::English, ColumnKind::Name, _) => "Name",
+        (Language::Chinese, ColumnKind::Kind, PageSource::Search) => "父目录",
+        (Language::English, ColumnKind::Kind, PageSource::Search) => "Parent path",
+        (Language::Chinese, ColumnKind::Kind, _) => "类型",
+        (Language::English, ColumnKind::Kind, _) => "Type",
+        (Language::Chinese, ColumnKind::Size, _) => "大小",
+        (Language::English, ColumnKind::Size, _) => "Size",
+        (Language::Chinese, ColumnKind::Modified, _) => "修改时间",
+        (Language::English, ColumnKind::Modified, _) => "Date modified",
+        (Language::Chinese, ColumnKind::Created, _) => "创建时间",
+        (Language::English, ColumnKind::Created, _) => "Date created",
+    };
+    ui.set_columns(ModelRc::new(VecModel::from(
+        layout
+            .order
+            .iter()
+            .map(|kind| {
+                let code = kind.storage_code() as usize;
+                ColumnRow {
+                    kind: code as i32,
+                    label: label(*kind).into(),
+                    visible: layout.visible[code],
+                    min_width: 64.0,
+                    content_left: if *kind == ColumnKind::Name { 10.0 } else { 8.0 },
+                    content_right: 8.0,
+                    icon_slot: if *kind == ColumnKind::Name { 25.0 } else { 0.0 },
+                }
+            })
+            .collect::<Vec<_>>(),
+    )));
+}
 fn update_selection_summary(ui: &AppWindow, state: &SharedSessions) {
     let app = state.lock().expect("app state mutex is not poisoned");
     let tab = app.active();
 
-    ui.set_normal_name_width(app.column_widths[0] as f32);
-    ui.set_normal_kind_width(app.column_widths[1] as f32);
-    ui.set_normal_size_width(app.column_widths[2] as f32);
-    ui.set_normal_modified_width(app.column_widths[3] as f32);
-    ui.set_search_name_width(app.search_column_widths[0] as f32);
-    ui.set_search_parent_width(app.search_column_widths[1] as f32);
-    ui.set_search_size_width(app.search_column_widths[2] as f32);
-    ui.set_search_modified_width(app.search_column_widths[3] as f32);
-    ui.set_columns(ModelRc::new(VecModel::from(
-        (if tab.page_source == PageSource::Search {
-            app.search_column_order
-        } else {
-            app.column_order
-        })
-        .iter()
-        .map(|kind| ColumnRow {
-            kind: i32::from(*kind),
-
-            min_width: 64.0,
-            content_left: if *kind == 0 { 10.0 } else { 8.0 },
-            content_right: 8.0,
-            icon_slot: if *kind == 0 { 25.0 } else { 0.0 },
-        })
-        .collect::<Vec<_>>(),
-    )));
+    project_column_layout(ui, tab, &app);
     let operation_rows = operation_rows(&app);
     ui.set_operations(ModelRc::new(VecModel::from(operation_rows)));
     ui.set_operation_error(
@@ -11545,22 +12661,120 @@ fn refresh_ui(ui: &AppWindow, state: &WindowSessions) {
     refresh_window_ui(ui, &state.shared, state.window_id);
 }
 
+fn local_utc_offset_seconds() -> i32 {
+    use windows_sys::Win32::System::Time::{
+        GetTimeZoneInformation, TIME_ZONE_ID_INVALID, TIME_ZONE_INFORMATION,
+    };
+    let mut information = TIME_ZONE_INFORMATION::default();
+    let state = unsafe { GetTimeZoneInformation(&mut information) };
+    if state == TIME_ZONE_ID_INVALID {
+        return 0;
+    }
+    let seasonal_bias = match state {
+        1 => information.StandardBias,
+        2 => information.DaylightBias,
+        _ => 0,
+    };
+    -(information.Bias.saturating_add(seasonal_bias)).saturating_mul(60)
+}
+
+fn directory_group_projections(
+    app: &AppState,
+    tab: &TabSession,
+    entries: &[FileEntry],
+) -> Vec<group_projection::GroupProjection> {
+    let preference = tab
+        .visible_path()
+        .map(|path| app.directory_preference(path))
+        .unwrap_or(app.default_directory_view);
+    group_projection::project_groups(
+        entries,
+        preference.group_field,
+        preference.group_direction,
+        GroupProjectionContext {
+            language: app.language,
+            now: std::time::SystemTime::now(),
+            utc_offset_seconds: local_utc_offset_seconds(),
+        },
+    )
+}
+
+fn projected_directory_rows(
+    entries: &[FileEntry],
+    tab: &TabSession,
+    texts: Texts,
+    app: &AppState,
+) -> Vec<FileRow> {
+    let groups = directory_group_projections(app, tab, entries);
+    let by_id = entries
+        .iter()
+        .map(|entry| (entry.id, entry))
+        .collect::<HashMap<_, _>>();
+    ListProjection::from_groups(&groups, 32, file_row_height(app.active_view_mode()) as u64)
+        .rows
+        .into_iter()
+        .filter_map(|visual| match visual {
+            ListVisualRow::GroupHeader {
+                label, entry_count, ..
+            } => Some(group_header_file_row(&label, entry_count)),
+            ListVisualRow::Entry { entry_id } => by_id
+                .get(&entry_id)
+                .map(|entry| file_row(entry, tab, texts, app)),
+        })
+        .collect()
+}
+
+fn projected_directory_grid_rows(
+    entries: &[FileEntry],
+    tab: &TabSession,
+    texts: Texts,
+    app: &AppState,
+    columns: usize,
+) -> Vec<GridRow> {
+    let groups = directory_group_projections(app, tab, entries);
+    let by_id = entries
+        .iter()
+        .map(|entry| (entry.id, entry))
+        .collect::<HashMap<_, _>>();
+    IconProjection::from_groups(
+        &groups,
+        columns,
+        32,
+        file_row_height(app.active_view_mode()) as u64,
+    )
+    .rows
+    .into_iter()
+    .map(|visual| match visual {
+        IconVisualRow::GroupHeader {
+            label, entry_count, ..
+        } => GridRow {
+            group_header: true,
+            group_label: label.into(),
+            group_count: entry_count.min(i32::MAX as usize) as i32,
+            entries: ModelRc::new(VecModel::default()),
+        },
+        IconVisualRow::Entries { entries, .. } => GridRow {
+            group_header: false,
+            group_label: "".into(),
+            group_count: 0,
+            entries: ModelRc::new(VecModel::from(
+                entries
+                    .into_iter()
+                    .filter_map(|id| by_id.get(&id).map(|entry| file_row(entry, tab, texts, app)))
+                    .collect::<Vec<_>>(),
+            )),
+        },
+    })
+    .collect()
+}
 fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
     let app = state.lock().expect("app state mutex is not poisoned");
     let texts = Texts::new(app.language);
     let tab = app.active();
     let active_is_settings = tab.kind == TabKind::Settings;
     ui.set_active_is_settings(active_is_settings);
-    let view_mode = tab
-        .visible_path()
-        .and_then(|path| app.directory_view_modes.get(path))
-        .copied()
-        .unwrap_or(ViewMode::Details);
-    ui.set_view_mode(match view_mode {
-        ViewMode::Details => 0,
-        ViewMode::List => 1,
-        ViewMode::Grid => 2,
-    });
+    let view_mode = app.active_view_mode();
+    ui.set_view_mode(view_mode_to_ui(view_mode));
     let projected_tab_id = tab.id.0 as i32;
     let projected_request_id = tab.latest_request.0 as i32;
     if ui.get_projected_file_tab_id() != projected_tab_id
@@ -11581,14 +12795,11 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
     } else {
         &tab.entries
     };
-    let directory_rows = display_entries
-        .iter()
-        .map(|entry| file_row(entry, tab, texts, &app))
-        .collect::<Vec<_>>();
-    let grid_columns = (((ui.window().size().width as f32 / ui.window().scale_factor()) - 260.0)
-        / 148.0)
-        .floor()
-        .max(1.0) as usize;
+    let geometry = file_layout_geometry(view_mode);
+    let grid_columns = (((ui.window().size().width as f32 / ui.window().scale_factor()) - 292.0)
+        / (geometry.card_width + 8.0).max(1.0))
+    .floor()
+    .max(1.0) as usize;
     let total = tab.search_total.unwrap_or(tab.entries.len() as u32);
     let search_index =
         search_result_index_at_scroll(ui.get_search_scroll_y(), total, view_mode, grid_columns);
@@ -11604,17 +12815,36 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
     let file_rows = if tab.page_source == PageSource::Search {
         search_window_rows(tab, &app, search_window)
     } else {
-        directory_rows
+        projected_directory_rows(display_entries, tab, texts, &app)
     };
-    let grid_rows = file_rows
-        .chunks(grid_columns)
-        .map(|entries| GridRow {
-            entries: ModelRc::new(VecModel::from(entries.to_vec())),
-        })
-        .collect::<Vec<_>>();
+    let grid_rows = if tab.page_source == PageSource::Search {
+        file_rows
+            .chunks(grid_columns)
+            .map(|entries| GridRow {
+                group_header: false,
+                group_label: "".into(),
+                group_count: 0,
+                entries: ModelRc::new(VecModel::from(entries.to_vec())),
+            })
+            .collect::<Vec<_>>()
+    } else {
+        projected_directory_grid_rows(display_entries, tab, texts, &app, grid_columns)
+    };
     ui.set_files(ModelRc::new(VecModel::from(file_rows)));
     ui.set_grid_column_count(grid_columns as i32);
     ui.set_grid_rows(ModelRc::new(VecModel::from(grid_rows)));
+    let preference_revision = if tab.page_source == PageSource::Search {
+        0
+    } else {
+        tab.visible_path()
+            .map(|path| app.directory_preference(path).group_field.storage_code() as i32)
+            .unwrap_or(0)
+    };
+    ui.set_projected_content_revision(
+        projected_request_id
+            .wrapping_mul(31)
+            .wrapping_add(preference_revision),
+    );
     ui.set_search_total_items(total.min(i32::MAX as u32) as i32);
     ui.set_window_width(ui.window().size().width as f32 / ui.window().scale_factor());
     let visible_path = tab.visible_path().map(display_path).unwrap_or_default();
@@ -11743,31 +12973,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
             .collect::<Vec<_>>(),
     )));
     ui.set_selected_count(tab.selected.len() as i32);
-    ui.set_normal_name_width(app.column_widths[0] as f32);
-    ui.set_normal_kind_width(app.column_widths[1] as f32);
-    ui.set_normal_size_width(app.column_widths[2] as f32);
-    ui.set_normal_modified_width(app.column_widths[3] as f32);
-    ui.set_search_name_width(app.search_column_widths[0] as f32);
-    ui.set_search_parent_width(app.search_column_widths[1] as f32);
-    ui.set_search_size_width(app.search_column_widths[2] as f32);
-    ui.set_search_modified_width(app.search_column_widths[3] as f32);
-    ui.set_columns(ModelRc::new(VecModel::from(
-        (if tab.page_source == PageSource::Search {
-            app.search_column_order
-        } else {
-            app.column_order
-        })
-        .iter()
-        .map(|kind| ColumnRow {
-            kind: i32::from(*kind),
-
-            min_width: 64.0,
-            content_left: if *kind == 0 { 10.0 } else { 8.0 },
-            content_right: 8.0,
-            icon_slot: if *kind == 0 { 25.0 } else { 0.0 },
-        })
-        .collect::<Vec<_>>(),
-    )));
+    project_column_layout(ui, tab, &app);
     let (sort_field, sort_direction) = if tab.page_source == PageSource::Search {
         (tab.search_sort_field, tab.search_sort_direction)
     } else {
@@ -11778,6 +12984,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
         SortField::Kind => 1,
         SortField::Size => 2,
         SortField::Modified => 3,
+        SortField::Created => 4,
     });
     ui.set_sort_descending(sort_direction == crate::domain::SortDirection::Descending);
     let page_projection = agent_debug::page_projection(tab.load_state, tab.entries.is_empty());
@@ -11881,25 +13088,26 @@ fn file_row(entry: &FileEntry, tab: &TabSession, texts: Texts, app: &AppState) -
             })
             .collect::<Vec<_>>()
     };
-    let grid_image = tab
-        .visible_path()
-        .is_some_and(|path| app.directory_view_modes.get(path) == Some(&ViewMode::Grid))
+    let grid_image = app
+        .active_view_mode()
+        .uses_grid_layout()
         .then(|| {
+            let target_px = file_layout_geometry(app.active_view_mode()).icon_request_px;
             let thumbnail = app
                 .thumbnail_cache
                 .iter()
-                .filter(|((path, _), _)| path == &entry.path)
-                .max_by_key(|((_, requested_px), image)| {
-                    (*requested_px, image.width.min(image.height))
+                .filter(|((path, requested_px), _)| {
+                    path == &entry.path && *requested_px >= target_px
                 })
+                .min_by_key(|((_, requested_px), _)| *requested_px)
                 .map(|(_, image)| image);
             thumbnail.or_else(|| {
                 app.large_icon_cache
                     .iter()
-                    .filter(|((path, _), _)| path == &entry.path)
-                    .max_by_key(|((_, requested_px), image)| {
-                        (*requested_px, image.width.min(image.height))
+                    .filter(|((path, requested_px), _)| {
+                        path == &entry.path && *requested_px >= target_px
                     })
+                    .min_by_key(|((_, requested_px), _)| *requested_px)
                     .map(|(_, image)| image)
             })
         })
@@ -11912,6 +13120,9 @@ fn file_row(entry: &FileEntry, tab: &TabSession, texts: Texts, app: &AppState) -
     FileRow {
         id: entry.id.0 as i32,
         loaded: true,
+        group_header: false,
+        group_label: "".into(),
+        group_count: 0,
         name: entry.display_name.clone().into(),
         name_segments: ModelRc::new(VecModel::from(name_segments)),
         kind: if entry.kind == crate::domain::EntryKind::File {
@@ -11933,6 +13144,7 @@ fn file_row(entry: &FileEntry, tab: &TabSession, texts: Texts, app: &AppState) -
             texts.size(entry.size_bytes).into()
         },
         modified: texts.modified(entry.modified).into(),
+        created: texts.modified(entry.created).into(),
         is_directory: entry.kind == crate::domain::EntryKind::Directory,
         selected: tab.selected.contains(&entry.id),
         focused: tab.focused == Some(entry.id),
@@ -12347,9 +13559,30 @@ mod tests {
             submenu: false,
             loading: false,
             placeholder: false,
+            icon_kind: 0,
         }
     }
 
+    #[test]
+    fn issue_18_builtin_menu_rows_expose_only_their_own_icons() {
+        let app = AppState::new_for_test(vec![PathBuf::from(r"C:\menu")], 0, [0, 1, 2, 3]);
+        let (rows, submenus) = built_in_context_rows(&app, false, true);
+        assert_eq!(rows[0].icon_kind, 1);
+        assert_eq!(rows[1].icon_kind, 2);
+        assert_eq!(rows[2].icon_kind, 3);
+        assert_eq!(rows[3].icon_kind, 4);
+        assert_eq!(rows[5].icon_kind, 5);
+        assert!(
+            submenus
+                .values()
+                .flatten()
+                .filter(|row| row.checked)
+                .all(|row| row.icon_kind == 0)
+        );
+
+        let shell = context_test_row(SHELL_CONTEXT_COMMAND_BASE + 1, "Shell", "", false);
+        assert_eq!(shell.icon_kind, 0);
+    }
     #[test]
     fn quick_menu_composes_built_ins_before_single_shell_separator() {
         let built_ins = vec![
@@ -12639,7 +13872,7 @@ mod tests {
         let grid_window = search_window_for_index(65_536, 133_796, 4);
         assert_eq!(grid_window.start % 4, 0);
         assert_eq!(
-            search_window_viewport_y(65_536, grid_window, ViewMode::Grid, 4),
+            search_window_viewport_y(65_536, grid_window, ViewMode::MediumIcons, 4),
             -64.0 * 148.0
         );
     }
@@ -12654,7 +13887,7 @@ mod tests {
             65_536
         );
         assert_eq!(
-            search_result_index_at_scroll(-16_384.0 * 148.0, 133_796, ViewMode::Grid, 4),
+            search_result_index_at_scroll(-16_384.0 * 148.0, 133_796, ViewMode::MediumIcons, 4),
             65_536
         );
         assert_eq!(
@@ -12668,15 +13901,61 @@ mod tests {
             screen_to_client_physical(800, 400, 640, 250),
             (160.0, 150.0)
         );
-        assert_eq!(grid_thumbnail_request_px(1.0), 100);
-        assert_eq!(grid_thumbnail_request_px(1.5), 150);
+        assert_eq!(grid_thumbnail_request_px(ViewMode::MediumIcons, 1.0), 100);
+        assert_eq!(grid_thumbnail_request_px(ViewMode::LargeIcons, 1.5), 222);
+        assert_eq!(
+            grid_thumbnail_request_px(ViewMode::ExtraLargeIcons, 1.5),
+            252
+        );
     }
 
     #[test]
+    fn grid_rows_never_reuse_a_thumbnail_smaller_than_the_active_view() {
+        let path = PathBuf::from(r"C:\grid\photo.png");
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\grid")], 0, [0, 1, 2, 3]);
+        app.update_directory_preference(PathBuf::from(r"C:\grid"), |preference| {
+            preference.view_mode = ViewMode::LargeIcons
+        });
+        app.thumbnail_cache.insert(
+            (path.clone(), 100),
+            platform::windows_shell_icons::ShellIconRgba {
+                width: 100,
+                height: 100,
+                pixels: vec![0; 100 * 100 * 4],
+            },
+        );
+        let tab = app.active();
+        let row = file_row(
+            &focus_entry(1, path.to_str().unwrap()),
+            tab,
+            Texts::new(Language::Chinese),
+            &app,
+        );
+        assert_eq!(row.icon.size().width, 0);
+
+        app.thumbnail_cache.insert(
+            (path, 148),
+            platform::windows_shell_icons::ShellIconRgba {
+                width: 148,
+                height: 148,
+                pixels: vec![0; 148 * 148 * 4],
+            },
+        );
+        let tab = app.active();
+        let row = file_row(
+            &focus_entry(1, r"C:\grid\photo.png"),
+            tab,
+            Texts::new(Language::Chinese),
+            &app,
+        );
+        assert_eq!(row.icon.size().width, 148);
+    }
+    #[test]
     fn grid_directory_batch_keeps_icon_loading_separate_from_thumbnail_planning() {
         let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\grid")], 0, [0, 1, 2, 3]);
-        app.directory_view_modes
-            .insert(PathBuf::from(r"C:\grid"), ViewMode::Grid);
+        app.update_directory_preference(PathBuf::from(r"C:\grid"), |preference| {
+            preference.view_mode = ViewMode::MediumIcons
+        });
         let tab = app.tab_mut(TabId(1)).unwrap();
         tab.latest_request = RequestId(4);
         tab.load_state = LoadState::Loading;
@@ -12695,11 +13974,15 @@ mod tests {
         assert!(!requests[0].thumbnail);
         assert_eq!(requests[0].requested_px, 0);
         assert_eq!(
-            grid_thumbnail_request_indices(500, 4, -296.0, 444.0),
+            grid_thumbnail_request_indices(500, 4, -296.0, 444.0, 148.0),
             (0..32).collect::<Vec<_>>()
         );
         assert_eq!(
-            grid_thumbnail_request_indices(500, 4, -1480.0, 296.0),
+            grid_thumbnail_request_indices(500, 4, -1480.0, 296.0, 148.0),
+            (32..60).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            grid_thumbnail_request_indices(500, 4, -2_200.0, 440.0, 220.0),
             (32..60).collect::<Vec<_>>()
         );
     }
@@ -12764,23 +14047,33 @@ mod tests {
 
     #[test]
     fn reorders_columns_to_normalized_slots_and_clamps_edges() {
-        let mut order = [0, 1, 2, 3];
-        assert!(reorder_column_to_slot(&mut order, 1, 0));
-        assert_eq!(order, [1, 0, 2, 3]);
-        assert!(reorder_column_to_slot(&mut order, 1, 8));
-        assert_eq!(order, [0, 2, 3, 1]);
-        assert!(!reorder_column_to_slot(&mut order, 9, 0));
-        assert!(!reorder_column_to_slot(&mut order, 2, 1));
-        assert_eq!(normalized_column_slot(1, 0, 4), 0);
-        assert_eq!(normalized_column_slot(1, 1, 4), 1);
-        assert_eq!(normalized_column_slot(1, 2, 4), 1);
-        assert_eq!(normalized_column_slot(1, 4, 4), 3);
+        let mut order = [
+            ColumnKind::Name,
+            ColumnKind::Kind,
+            ColumnKind::Size,
+            ColumnKind::Modified,
+            ColumnKind::Created,
+        ];
+        assert!(reorder_column_to_slot(&mut order, ColumnKind::Kind, 0));
+        assert_eq!(order[0], ColumnKind::Kind);
+        assert!(reorder_column_to_slot(&mut order, ColumnKind::Kind, 8));
+        assert_eq!(order[4], ColumnKind::Kind);
+        assert!(!reorder_column_to_slot(&mut order, ColumnKind::Size, 1));
+        assert_eq!(normalized_column_slot(1, 0, 5), 0);
+        assert_eq!(normalized_column_slot(1, 2, 5), 1);
+        assert_eq!(normalized_column_slot(1, 5, 5), 4);
     }
 
     #[test]
     fn column_insertion_slot_uses_real_widths_midpoints_and_viewport_offset() {
-        let order = [0, 1, 2, 3];
-        let widths = [100, 240, 80, 160];
+        let order = [
+            ColumnKind::Name,
+            ColumnKind::Kind,
+            ColumnKind::Size,
+            ColumnKind::Modified,
+            ColumnKind::Created,
+        ];
+        let widths = [100, 240, 80, 160, 120];
         let geometry = ColumnHeaderGeometry {
             x: 100.0,
             y: 0.0,
@@ -12837,7 +14130,7 @@ mod tests {
     #[test]
     fn column_drag_threshold_cancel_and_source_isolation_preserve_state() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
-        let widths = app.column_widths;
+        let widths = app.active_column_layout().widths;
         let request = app.active().latest_request;
         let sort = app.active().sort_field;
         assert!(app.begin_column_drag(app.active_window, 1, 100.0, 20.0));
@@ -12865,7 +14158,16 @@ mod tests {
             ColumnDragPhase::Dragging { .. }
         ));
         assert!(app.cancel_column_drag());
-        assert_eq!(app.column_order, [0, 1, 2, 3]);
+        assert_eq!(
+            app.default_directory_view.columns.order,
+            [
+                ColumnKind::Name,
+                ColumnKind::Kind,
+                ColumnKind::Size,
+                ColumnKind::Modified,
+                ColumnKind::Created
+            ]
+        );
 
         assert!(app.begin_column_drag(app.active_window, 1, 100.0, 20.0));
         assert_eq!(
@@ -12873,8 +14175,17 @@ mod tests {
             Some(4)
         );
         assert!(app.cancel_column_drag());
-        assert_eq!(app.column_order, [0, 1, 2, 3]);
-        assert_eq!(app.column_widths, widths);
+        assert_eq!(
+            app.default_directory_view.columns.order,
+            [
+                ColumnKind::Name,
+                ColumnKind::Kind,
+                ColumnKind::Size,
+                ColumnKind::Modified,
+                ColumnKind::Created
+            ]
+        );
+        assert_eq!(app.active_column_layout().widths, widths);
         assert_eq!(app.active().latest_request, request);
         assert_eq!(app.active().sort_field, sort);
 
@@ -12883,11 +14194,29 @@ mod tests {
         assert!(app.begin_column_drag(app.active_window, 0, 10.0, 20.0));
         assert_eq!(
             app.update_column_drag(799.0, 20.0, 0.0, 0.0, 800.0, -300.0),
-            Some(4)
+            Some(5)
         );
         assert!(app.finish_column_drag(true));
-        assert_eq!(app.column_order, [0, 1, 2, 3]);
-        assert_eq!(app.search_column_order, [1, 2, 3, 0]);
+        assert_eq!(
+            app.default_directory_view.columns.order,
+            [
+                ColumnKind::Name,
+                ColumnKind::Kind,
+                ColumnKind::Size,
+                ColumnKind::Modified,
+                ColumnKind::Created
+            ]
+        );
+        assert_eq!(
+            app.search_view.columns.order,
+            [
+                ColumnKind::Modified,
+                ColumnKind::Kind,
+                ColumnKind::Size,
+                ColumnKind::Created,
+                ColumnKind::Name
+            ]
+        );
     }
 
     #[test]
@@ -12899,7 +14228,16 @@ mod tests {
             Some(0)
         );
         assert!(!app.finish_column_drag(false));
-        assert_eq!(app.column_order, [0, 1, 2, 3]);
+        assert_eq!(
+            app.default_directory_view.columns.order,
+            [
+                ColumnKind::Name,
+                ColumnKind::Kind,
+                ColumnKind::Size,
+                ColumnKind::Modified,
+                ColumnKind::Created
+            ]
+        );
 
         assert!(app.begin_column_drag(app.active_window, 2, 100.0, 20.0));
         assert_eq!(
@@ -12907,7 +14245,16 @@ mod tests {
             None
         );
         assert!(!app.finish_column_drag(true));
-        assert_eq!(app.column_order, [0, 1, 2, 3]);
+        assert_eq!(
+            app.default_directory_view.columns.order,
+            [
+                ColumnKind::Name,
+                ColumnKind::Kind,
+                ColumnKind::Size,
+                ColumnKind::Modified,
+                ColumnKind::Created
+            ]
+        );
 
         assert!(app.begin_column_drag(app.active_window, 2, 100.0, 20.0));
         let tab_id = app.active_window_state().active_tab;
@@ -12917,19 +14264,55 @@ mod tests {
             None
         );
         assert!(app.column_drag.is_none());
-        assert_eq!(app.column_order, [0, 1, 2, 3]);
-        assert_eq!(app.search_column_order, [0, 1, 2, 3]);
+        assert_eq!(
+            app.default_directory_view.columns.order,
+            [
+                ColumnKind::Name,
+                ColumnKind::Kind,
+                ColumnKind::Size,
+                ColumnKind::Modified,
+                ColumnKind::Created
+            ]
+        );
+        assert_eq!(app.search_view.columns.order, ColumnLayout::default().order);
     }
 
     #[test]
     fn column_reorder_commit_isolated_by_page_source() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
         assert!(app.commit_column_reorder(PageSource::Directory, 0, 4));
-        assert_eq!(app.column_order, [1, 2, 3, 0]);
-        assert_eq!(app.search_column_order, [0, 1, 2, 3]);
+        assert_eq!(
+            app.directory_preference(Path::new("a")).columns.order,
+            [
+                ColumnKind::Kind,
+                ColumnKind::Size,
+                ColumnKind::Modified,
+                ColumnKind::Name,
+                ColumnKind::Created
+            ]
+        );
+        assert_eq!(app.search_view.columns.order, ColumnLayout::default().order);
         assert!(app.commit_column_reorder(PageSource::Search, 3, 0));
-        assert_eq!(app.column_order, [1, 2, 3, 0]);
-        assert_eq!(app.search_column_order, [3, 0, 1, 2]);
+        assert_eq!(
+            app.directory_preference(Path::new("a")).columns.order,
+            [
+                ColumnKind::Kind,
+                ColumnKind::Size,
+                ColumnKind::Modified,
+                ColumnKind::Name,
+                ColumnKind::Created
+            ]
+        );
+        assert_eq!(
+            app.search_view.columns.order,
+            [
+                ColumnKind::Modified,
+                ColumnKind::Name,
+                ColumnKind::Kind,
+                ColumnKind::Size,
+                ColumnKind::Created
+            ]
+        );
         assert!(!app.commit_column_reorder(PageSource::Search, 3, 1));
     }
 
@@ -13764,7 +15147,6 @@ mod tests {
             test_window_placement(80),
             app.stable_active_path_index(),
             app.stable_paths(),
-            [0, 1, 2, 3],
         )
         .unwrap();
         session_store::save(&temporary, &session).unwrap();
@@ -13798,6 +15180,7 @@ mod tests {
             size_bytes: Some(1),
             folder_size: crate::domain::FolderSizeState::Unknown,
             modified: None,
+            created: None,
         }]);
         let source_entries = source.entries.clone();
 
@@ -13915,6 +15298,68 @@ mod tests {
     }
 
     #[test]
+    fn group_menu_command_updates_the_window_directory_and_projects_headers() {
+        let shared = Arc::new(Mutex::new(AppState::new_for_test(
+            vec![PathBuf::from(r"C:\group")],
+            0,
+            [0, 1, 2, 3],
+        )));
+        {
+            let mut app = shared.lock().unwrap();
+            let tab = app
+                .active_window_state_mut()
+                .tabs
+                .get_mut(&TabId(1))
+                .unwrap();
+            let mut folder = focus_entry(1, r"C:\group\folder");
+            folder.kind = crate::domain::EntryKind::Directory;
+            tab.replace_entries(vec![
+                folder,
+                focus_entry(2, r"C:\group\model.obj"),
+                focus_entry(3, r"C:\group\material.mtl"),
+            ]);
+        }
+        let window_id = shared.lock().unwrap().active_window;
+        let state = WindowSessions::new(shared.clone(), window_id);
+
+        assert!(apply_group_command(
+            &state,
+            CMD_GROUP_BASE + i32::from(GroupField::Kind.storage_code()),
+        ));
+
+        {
+            let app = shared.lock().unwrap();
+            assert_eq!(
+                app.directory_preference(Path::new(r"C:\group")).group_field,
+                GroupField::Kind
+            );
+            let tab = app.active();
+            let rows = projected_directory_rows(
+                tab.visible_entries(),
+                tab,
+                Texts::new(Language::Chinese),
+                &app,
+            );
+            let labels = rows
+                .iter()
+                .filter(|row| row.group_header)
+                .map(|row| row.group_label.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(labels, ["文件夹", "MTL 文件", "OBJ 文件"]);
+            assert_eq!(rows.iter().filter(|row| !row.group_header).count(), 3);
+        }
+
+        let ui = headless_file_view();
+        refresh_ui(&ui, &state);
+        let labels = ui
+            .get_files()
+            .iter()
+            .filter(|row| row.group_header)
+            .map(|row| row.group_label.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["文件夹", "MTL 文件", "OBJ 文件"]);
+    }
+    #[test]
     fn directory_view_modes_are_shared_by_raw_path_without_touching_requests() {
         let mut app = AppState::new_for_test(
             vec![PathBuf::from("A"), PathBuf::from("B")],
@@ -13923,17 +15368,19 @@ mod tests {
         );
         let tab_a = app.active_window_state().tab_order[0];
         let request = app.tab(tab_a).unwrap().latest_request;
-        app.directory_view_modes
-            .insert(PathBuf::from("A"), ViewMode::Grid);
-        app.directory_view_modes
-            .insert(PathBuf::from("B"), ViewMode::List);
+        app.update_directory_preference(PathBuf::from("A"), |preference| {
+            preference.view_mode = ViewMode::MediumIcons
+        });
+        app.update_directory_preference(PathBuf::from("B"), |preference| {
+            preference.view_mode = ViewMode::List
+        });
         assert_eq!(
-            app.directory_view_modes.get(Path::new("A")),
-            Some(&ViewMode::Grid)
+            app.directory_preference(Path::new("A")).view_mode,
+            ViewMode::MediumIcons
         );
         assert_eq!(
-            app.directory_view_modes.get(Path::new("B")),
-            Some(&ViewMode::List)
+            app.directory_preference(Path::new("B")).view_mode,
+            ViewMode::List
         );
         assert_eq!(app.tab(tab_a).unwrap().latest_request, request);
     }
@@ -14035,6 +15482,7 @@ mod tests {
             size_bytes: Some(1),
             folder_size: crate::domain::FolderSizeState::Unknown,
             modified: None,
+            created: None,
         }]);
         let event = IconEvent {
             tab_id: TabId(1),
@@ -14132,6 +15580,7 @@ mod tests {
             size_bytes: None,
             folder_size: FolderSizeState::Querying,
             modified: None,
+            created: None,
         }]);
 
         let queries = {
@@ -14199,6 +15648,7 @@ mod tests {
             size_bytes: Some(1),
             folder_size: crate::domain::FolderSizeState::Unknown,
             modified: None,
+            created: None,
         }
     }
 
@@ -14447,6 +15897,7 @@ mod tests {
                 size_bytes: Some(1),
                 folder_size: crate::domain::FolderSizeState::Unknown,
                 modified: None,
+                created: None,
             }]);
         }
         assert_eq!(
@@ -14459,6 +15910,39 @@ mod tests {
         );
         assert_eq!(
             context_target_at(&state, 16.0, 250.0, test_hit_geometry(166.0, 0.0), 0.0, 1,),
+            (None, true)
+        );
+    }
+
+    #[test]
+    fn non_details_context_menu_gutters_are_background() {
+        let state = Arc::new(Mutex::new(AppState::new_for_test(
+            vec![PathBuf::from("C:/test")],
+            0,
+            [0, 1, 2, 3],
+        )));
+        {
+            let mut app = state.lock().unwrap();
+            app.update_directory_preference(PathBuf::from("C:/test"), |preference| {
+                preference.view_mode = ViewMode::List
+            });
+            app.active_window_state_mut()
+                .tabs
+                .get_mut(&TabId(1))
+                .unwrap()
+                .replace_entries(vec![focus_entry(1, r"C:\test\item.txt")]);
+        }
+
+        assert_eq!(
+            context_target_at(&state, 15.9, 4.0, test_hit_geometry(0.0, 0.0), 0.0, 1),
+            (None, true)
+        );
+        assert_eq!(
+            context_target_at(&state, 16.0, 4.0, test_hit_geometry(0.0, 0.0), 0.0, 1),
+            (Some(EntryId(1)), false)
+        );
+        assert_eq!(
+            context_target_at(&state, 584.0, 4.0, test_hit_geometry(0.0, 0.0), 0.0, 1),
             (None, true)
         );
     }
@@ -14490,6 +15974,7 @@ mod tests {
                             size_bytes: Some(1),
                             folder_size: crate::domain::FolderSizeState::Unknown,
                             modified: None,
+                            created: None,
                         })
                         .collect(),
                 );
@@ -14560,6 +16045,7 @@ mod tests {
                     size_bytes: Some(1),
                     folder_size: crate::domain::FolderSizeState::Unknown,
                     modified: None,
+                    created: None,
                 },
                 FileEntry {
                     id: EntryId(2),
@@ -14573,6 +16059,7 @@ mod tests {
                     size_bytes: None,
                     folder_size: crate::domain::FolderSizeState::Unknown,
                     modified: None,
+                    created: None,
                 },
             ]);
 
@@ -14797,24 +16284,66 @@ mod tests {
                 600.0,
                 0.0,
                 400.0,
-                SelectionRect::from_points(0.0, 35.0, 20.0, 67.0),
+                SelectionRect::from_points(16.0, 35.0, 20.0, 67.0),
             ),
             HashSet::from([EntryId(2)])
         );
         assert_eq!(
             rectangle_selection_hits(
                 &tab,
-                ViewMode::Grid,
+                ViewMode::MediumIcons,
                 3,
                 600.0,
                 0.0,
                 400.0,
-                SelectionRect::from_points(145.0, 145.0, 155.0, 155.0),
+                SelectionRect::from_points(161.0, 145.0, 171.0, 155.0),
             ),
             HashSet::from([EntryId(5)])
         );
     }
 
+    #[test]
+    fn rectangle_selection_leaves_sixteen_pixel_background_gutters() {
+        let mut tab = TabSession::new(TabId(1));
+        tab.replace_entries(vec![focus_entry(1, r"C:\test\one.txt")]);
+
+        assert!(
+            rectangle_selection_hits(
+                &tab,
+                ViewMode::List,
+                1,
+                600.0,
+                0.0,
+                400.0,
+                SelectionRect::from_points(0.0, 0.0, 15.0, 33.0),
+            )
+            .is_empty()
+        );
+        assert!(
+            rectangle_selection_hits(
+                &tab,
+                ViewMode::MediumIcons,
+                3,
+                600.0,
+                0.0,
+                400.0,
+                SelectionRect::from_points(0.0, 0.0, 15.0, 140.0),
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            rectangle_selection_hits(
+                &tab,
+                ViewMode::MediumIcons,
+                3,
+                600.0,
+                0.0,
+                400.0,
+                SelectionRect::from_points(16.0, 0.0, 30.0, 140.0),
+            ),
+            HashSet::from([EntryId(1)])
+        );
+    }
     #[test]
     fn rectangle_selection_details_hits_only_visible_column_region() {
         let mut tab = TabSession::new(TabId(1));
@@ -14898,6 +16427,9 @@ mod tests {
         ModelRc::new(VecModel::from(
             (0..12)
                 .map(|_| GridRow {
+                    group_header: false,
+                    group_label: "".into(),
+                    group_count: 0,
                     entries: ModelRc::new(VecModel::from(vec![empty_file_row(); 6])),
                 })
                 .collect::<Vec<_>>(),
@@ -14963,7 +16495,7 @@ mod tests {
         for (mode, expected) in [
             (ViewMode::Details, -120.0),
             (ViewMode::List, -102.0),
-            (ViewMode::Grid, -444.0),
+            (ViewMode::MediumIcons, -444.0),
         ] {
             assert_eq!(
                 logical_scroll_delta(&MouseScrollDelta::LineDelta(0.0, -1.0), mode, 1.0),
@@ -14980,15 +16512,63 @@ mod tests {
         }
     }
     #[test]
+    fn ctrl_wheel_steps_once_accumulates_pixels_and_clamps_views() {
+        let mut accumulated = 0.0;
+        assert_eq!(
+            ctrl_wheel_step(
+                &MouseScrollDelta::LineDelta(0.0, 1.0),
+                1.0,
+                &mut accumulated
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            ViewMode::ExtraLargeIcons.step_ctrl_wheel(true),
+            ViewMode::ExtraLargeIcons
+        );
+        assert_eq!(ViewMode::Content.step_ctrl_wheel(false), ViewMode::Content);
+
+        let pixels = MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, 60.0));
+        assert_eq!(ctrl_wheel_step(&pixels, 1.0, &mut accumulated), None);
+        assert_eq!(ctrl_wheel_step(&pixels, 1.0, &mut accumulated), Some(true));
+        let reverse = MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, -80.0));
+        assert_eq!(
+            ctrl_wheel_step(&reverse, 1.0, &mut accumulated),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn ctrl_wheel_anchor_preserves_visible_item_without_resetting_to_top() {
+        let viewport = anchored_viewport(
+            -400.0,
+            100.0,
+            ViewMode::Details,
+            ViewMode::MediumIcons,
+            4,
+            100,
+            500.0,
+        );
+        assert!(viewport < 0.0);
+        assert!(viewport >= -file_scroll_maximum(100, ViewMode::MediumIcons, 4, 500.0));
+    }
+
+    #[test]
     fn file_scroll_geometry_matches_every_view_mode_and_grid_remainder() {
         assert_eq!(
             file_scroll_maximum(67, ViewMode::Details, 6, 590.0),
             2_090.0
         );
         assert_eq!(file_scroll_maximum(67, ViewMode::List, 6, 590.0), 1_688.0);
-        assert_eq!(file_scroll_maximum(67, ViewMode::Grid, 6, 590.0), 1_186.0);
-        assert_eq!(file_scroll_maximum(66, ViewMode::Grid, 6, 590.0), 1_038.0);
-        assert_eq!(file_scroll_maximum(2, ViewMode::Grid, 6, 590.0), 0.0);
+        assert_eq!(
+            file_scroll_maximum(67, ViewMode::MediumIcons, 6, 590.0),
+            1_186.0
+        );
+        assert_eq!(
+            file_scroll_maximum(66, ViewMode::MediumIcons, 6, 590.0),
+            1_038.0
+        );
+        assert_eq!(file_scroll_maximum(2, ViewMode::MediumIcons, 6, 590.0), 0.0);
         assert_eq!(
             file_scroll_maximum(67, ViewMode::Details, 6, 590.5),
             2_089.5
@@ -15006,8 +16586,11 @@ mod tests {
             3_600.0
         );
         assert_eq!(file_scroll_maximum(100, ViewMode::List, 1, 400.0), 3_000.0);
-        assert_eq!(file_scroll_maximum(10, ViewMode::Grid, 3, 400.0), 192.0);
-        assert_eq!(file_scroll_maximum(2, ViewMode::Grid, 3, 400.0), 0.0);
+        assert_eq!(
+            file_scroll_maximum(10, ViewMode::MediumIcons, 3, 400.0),
+            192.0
+        );
+        assert_eq!(file_scroll_maximum(2, ViewMode::MediumIcons, 3, 400.0), 0.0);
     }
 
     #[test]
