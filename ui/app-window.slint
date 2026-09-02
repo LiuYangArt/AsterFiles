@@ -9,7 +9,7 @@ export struct BreadcrumbRow { index: int, label: string, current: bool }
 export struct TabRow { id: int, title: string, active: bool, loading: bool, icon: image, is-drive: bool, is-settings: bool }
 export struct SidebarRow { index: int, label: string, icon-kind: int, is-drive: bool, icon: image }
 export struct ColumnRow { kind: int, min-width: length, content-left: length, content-right: length, icon-slot: length }
-export struct ContextCommandRow { id: int, node-id: int, label: string, search-text: string, hint: string, enabled: bool, separator: bool, shell: bool, checked: bool, default: bool, submenu: bool }
+export struct ContextCommandRow { id: int, node-id: int, label: string, search-text: string, hint: string, enabled: bool, separator: bool, shell: bool, checked: bool, default: bool, submenu: bool, loading: bool, placeholder: bool }
 export struct OperationRow { id: int, title: string, percent: string, file-progress: string, transferred: string, speed: string, eta: string, current-item: string, source: string, destination: string, progress: float, state: int, paused: bool, can-pause: bool, can-cancel: bool, can-retry: bool }
 export global VisualStyle {
     in-out property <bool> dark-theme: false;
@@ -1961,16 +1961,18 @@ accessible-label: entry.name;
                 command-list := VerticalLayout {
                     width: menu-scroll.width;
                     for command[index] in root.context-commands: Rectangle {
-                        property <bool> command-hovered: command-touch.has-hover;
-                        property <bool> command-active: root.context-active-index == index;
+                        property <bool> command-loading: command.loading || command.placeholder;
+                        property <bool> command-hovered: !command-loading && command-touch.has-hover;
+                        property <bool> command-active: !command-loading && root.context-active-index == index;
                         height: command.separator ? 9px : 28px; border-radius: 4px;
-                        background: command.enabled && !command.separator && (index == root.context-active-index || command-touch.has-hover) ? VisualStyle.cedf1f6 : transparent;
+                        background: command.enabled && !command-loading && !command.separator && (index == root.context-active-index || command-touch.has-hover) ? VisualStyle.cedf1f6 : transparent;
                         Rectangle { visible: command.separator; x: 4px; width: parent.width - 8px; height: 1px; y: 4px; background: VisualStyle.ce0e2e7; }
-                        Text { visible: !command.separator && command.checked; x: 8px; width: 14px; text: "✓"; color: VisualStyle.c4f6bed; font-size: 12px; vertical-alignment: center; }
-                        Text { visible: !command.separator; x: 26px; width: parent.width - 76px; text: command.label; color: command.enabled ? VisualStyle.c30333a : VisualStyle.c9a9da3; font-size: command.default ? 13px : 12px; font-weight: command.default ? 600 : 400; vertical-alignment: center; overflow: elide; }
-                        Text { visible: !command.separator; x: parent.width - 48px; width: 38px; text: command.submenu ? "›" : command.hint; color: VisualStyle.c72747d; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+                        Rectangle { visible: command.placeholder && !command.separator; x: 26px; width: Math.mod(index, 3) == 0 ? 178px : Math.mod(index, 3) == 1 ? 132px : 204px; height: 8px; y: 10px; border-radius: 4px; background: VisualStyle.c9a9da3; }
+                        Text { visible: !command.separator && command.checked && !command-loading; x: 8px; width: 14px; text: "✓"; color: VisualStyle.c4f6bed; font-size: 12px; vertical-alignment: center; }
+                        Text { visible: !command.separator; x: 26px; width: parent.width - 76px; text: command.placeholder ? " " : command.label; color: command-loading ? VisualStyle.c9a9da3 : command.enabled ? VisualStyle.c30333a : VisualStyle.c9a9da3; font-size: command.default && !command-loading ? 13px : 12px; font-weight: command.default && !command-loading ? 600 : 400; vertical-alignment: center; overflow: elide; }
+                        Text { visible: !command.separator && !command-loading; x: parent.width - 48px; width: 38px; text: command.submenu ? "›" : command.hint; color: VisualStyle.c72747d; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
                         command-touch := TouchArea {
-                            enabled: command.enabled && !command.separator;
+                            enabled: command.enabled && !command-loading && !command.separator;
                             mouse-cursor: pointer;
                             moved => { root.context-active-index = index; }
                             clicked => {
@@ -1989,7 +1991,7 @@ accessible-label: entry.name;
                         changed command-active => {
                             if command-active { root.context-active-anchor-y = self.absolute-position.y - root.absolute-position.y; }
                         }
-                        accessible-role: button; accessible-label: command.label; accessible-enabled: command.enabled;
+                        accessible-role: button; accessible-label: command.label; accessible-enabled: command.enabled && !command-loading;
                     }
                 }
             }
@@ -2010,16 +2012,18 @@ accessible-label: entry.name;
                 submenu-list := VerticalLayout {
                     width: submenu-scroll.width;
                     for command[index] in root.context-submenu-commands: Rectangle {
-                        property <bool> submenu-hovered: submenu-touch.has-hover;
-                        property <bool> submenu-active: root.context-submenu-active-index == index;
+                        property <bool> submenu-loading: command.loading || command.placeholder;
+                        property <bool> submenu-hovered: !submenu-loading && submenu-touch.has-hover;
+                        property <bool> submenu-active: !submenu-loading && root.context-submenu-active-index == index;
                         height: command.separator ? 9px : 28px; border-radius: 4px;
-                        background: command.enabled && !command.separator && (index == root.context-submenu-active-index || submenu-touch.has-hover) ? VisualStyle.cedf1f6 : transparent;
+                        background: command.enabled && !submenu-loading && !command.separator && (index == root.context-submenu-active-index || submenu-touch.has-hover) ? VisualStyle.cedf1f6 : transparent;
                         Rectangle { visible: command.separator; x: 4px; width: parent.width - 8px; height: 1px; y: 4px; background: VisualStyle.ce0e2e7; }
-                        Text { visible: !command.separator && command.checked; x: 8px; width: 14px; text: "✓"; color: VisualStyle.c4f6bed; font-size: 12px; vertical-alignment: center; }
-                        Text { visible: !command.separator; x: 26px; width: parent.width - 76px; text: command.label; color: command.enabled ? VisualStyle.c30333a : VisualStyle.c9a9da3; font-size: command.default ? 13px : 12px; font-weight: command.default ? 600 : 400; vertical-alignment: center; overflow: elide; }
-                        Text { visible: !command.separator; x: parent.width - 48px; width: 38px; text: command.submenu ? "›" : command.hint; color: VisualStyle.c72747d; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+                        Rectangle { visible: command.placeholder && !command.separator; x: 26px; width: Math.mod(index, 3) == 0 ? 178px : Math.mod(index, 3) == 1 ? 132px : 204px; height: 8px; y: 10px; border-radius: 4px; background: VisualStyle.c9a9da3; }
+                        Text { visible: !command.separator && command.checked && !submenu-loading; x: 8px; width: 14px; text: "✓"; color: VisualStyle.c4f6bed; font-size: 12px; vertical-alignment: center; }
+                        Text { visible: !command.separator; x: 26px; width: parent.width - 76px; text: command.placeholder ? " " : command.label; color: submenu-loading ? VisualStyle.c9a9da3 : command.enabled ? VisualStyle.c30333a : VisualStyle.c9a9da3; font-size: command.default && !submenu-loading ? 13px : 12px; font-weight: command.default && !submenu-loading ? 600 : 400; vertical-alignment: center; overflow: elide; }
+                        Text { visible: !command.separator && !submenu-loading; x: parent.width - 48px; width: 38px; text: command.submenu ? "›" : command.hint; color: VisualStyle.c72747d; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
                         submenu-touch := TouchArea {
-                            enabled: command.enabled && !command.separator;
+                            enabled: command.enabled && !submenu-loading && !command.separator;
                             mouse-cursor: pointer;
                             moved => { root.context-submenu-active-index = index; }
                             clicked => {
@@ -2058,15 +2062,16 @@ accessible-label: entry.name;
         VerticalLayout {
             padding: 4px;
             for command[index] in root.context-submenu-parent-commands: Rectangle {
-                property <bool> parent-submenu-hovered: parent-submenu-touch.has-hover;
+                property <bool> parent-submenu-loading: command.loading || command.placeholder;
+                property <bool> parent-submenu-hovered: !parent-submenu-loading && parent-submenu-touch.has-hover;
                 height: command.separator ? 9px : 28px; border-radius: 4px;
-                background: parent-submenu-touch.has-hover && command.enabled && !command.separator ? VisualStyle.cedf1f6 : transparent;
+                background: parent-submenu-hovered && command.enabled && !parent-submenu-loading && !command.separator ? VisualStyle.cedf1f6 : transparent;
                 Rectangle { visible: command.separator; x: 4px; width: parent.width - 8px; height: 1px; y: 4px; background: VisualStyle.ce0e2e7; }
-                Text { visible: !command.separator && command.checked; x: 8px; width: 14px; text: "✓"; color: VisualStyle.c4f6bed; font-size: 12px; vertical-alignment: center; }
-                Text { visible: !command.separator; x: 26px; width: parent.width - 76px; text: command.label; color: command.enabled ? VisualStyle.c30333a : VisualStyle.c9a9da3; font-size: command.default ? 13px : 12px; font-weight: command.default ? 600 : 400; vertical-alignment: center; overflow: elide; }
-                Text { visible: !command.separator; x: parent.width - 48px; width: 38px; text: command.submenu ? "›" : command.hint; color: VisualStyle.c72747d; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+                Text { visible: !command.separator && command.checked && !parent-submenu-loading; x: 8px; width: 14px; text: "✓"; color: VisualStyle.c4f6bed; font-size: 12px; vertical-alignment: center; }
+                Text { visible: !command.separator; x: 26px; width: parent.width - 76px; text: command.placeholder ? " " : command.label; color: parent-submenu-loading ? VisualStyle.c9a9da3 : command.enabled ? VisualStyle.c30333a : VisualStyle.c9a9da3; font-size: command.default && !parent-submenu-loading ? 13px : 12px; font-weight: command.default && !parent-submenu-loading ? 600 : 400; vertical-alignment: center; overflow: elide; }
+                Text { visible: !command.separator && !parent-submenu-loading; x: parent.width - 48px; width: 38px; text: command.submenu ? "›" : command.hint; color: VisualStyle.c72747d; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
                 parent-submenu-touch := TouchArea {
-                    enabled: command.enabled && !command.separator;
+                    enabled: command.enabled && !parent-submenu-loading && !command.separator;
                     mouse-cursor: pointer;
                     clicked => {
                         root.close-context-submenu();

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::{
+    collections::{HashMap, VecDeque},
     io,
     marker::PhantomData,
     mem::size_of,
@@ -37,9 +38,13 @@ use windows_sys::Win32::System::Registry::{HKEY_CLASSES_ROOT, RRF_RT_REG_SZ, Reg
 
 const FIRST_COMMAND_ID: u32 = 1;
 const LAST_COMMAND_ID: u32 = 0x7fff;
+const FIRST_SYNTHETIC_COMMAND_ID: u32 = LAST_COMMAND_ID + 1;
 const DYNAMIC_SUBMENU_WAIT: Duration = Duration::from_millis(300);
 const DYNAMIC_SUBMENU_POLL: Duration = Duration::from_millis(10);
-const REGISTRY_COMMAND_VERB_PREFIX: &str = "registry-command:";
+const POWERSHELL_BACKGROUND_VERB: &str = "powershell7x64";
+const POWERSHELL_CASCADE_KEY: &str = r"Directory\ContextMenus\PowerShell7x64";
+const POWERSHELL_COMMAND_VERB_PREFIX: &str = "powershell-background:";
+const POWERSHELL_PARAMETERS: &str = "-NoExit";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassicMenuItem {
@@ -71,6 +76,82 @@ pub enum ClassicMenuInvocation {
 pub type ShellMenuSessionId = u64;
 pub type ShellMenuRequestId = u64;
 pub type ShellMenuSubmenuToken = u64;
+
+const MAX_SHELL_MENU_SESSIONS: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ShellMenuSessionKey {
+    session_id: ShellMenuSessionId,
+    request_id: ShellMenuRequestId,
+}
+
+impl ShellMenuSessionKey {
+    fn new(session_id: ShellMenuSessionId, request_id: ShellMenuRequestId) -> Self {
+        Self {
+            session_id,
+            request_id,
+        }
+    }
+}
+
+struct BoundedSessionStore<T> {
+    capacity: usize,
+    entries: HashMap<ShellMenuSessionKey, T>,
+    oldest_first: VecDeque<ShellMenuSessionKey>,
+}
+
+impl<T> BoundedSessionStore<T> {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "shell menu session capacity must be positive");
+        Self {
+            capacity,
+            entries: HashMap::new(),
+            oldest_first: VecDeque::new(),
+        }
+    }
+
+    fn insert(&mut self, key: ShellMenuSessionKey, value: T) -> Option<(ShellMenuSessionKey, T)> {
+        self.remove(key);
+        let evicted = if self.entries.len() >= self.capacity {
+            self.pop_oldest()
+        } else {
+            None
+        };
+        self.entries.insert(key, value);
+        self.oldest_first.push_back(key);
+        evicted
+    }
+
+    fn get(&self, key: ShellMenuSessionKey) -> Option<&T> {
+        self.entries.get(&key)
+    }
+
+    fn get_mut(&mut self, key: ShellMenuSessionKey) -> Option<&mut T> {
+        self.entries.get_mut(&key)
+    }
+
+    fn remove(&mut self, key: ShellMenuSessionKey) -> Option<T> {
+        let removed = self.entries.remove(&key);
+        if removed.is_some()
+            && let Some(index) = self
+                .oldest_first
+                .iter()
+                .position(|candidate| *candidate == key)
+        {
+            self.oldest_first.remove(index);
+        }
+        removed
+    }
+
+    fn pop_oldest(&mut self) -> Option<(ShellMenuSessionKey, T)> {
+        while let Some(key) = self.oldest_first.pop_front() {
+            if let Some(value) = self.entries.remove(&key) {
+                return Some((key, value));
+            }
+        }
+        None
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum ShellMenuLoadTarget {
@@ -174,7 +255,7 @@ fn shell_menu_worker_loop(
     commands: mpsc::Receiver<ShellMenuCommand>,
     events: mpsc::Sender<ShellMenuEvent>,
 ) {
-    let mut session: Option<(ShellMenuSessionId, ShellMenuRequestId, ClassicMenuSession)> = None;
+    let mut sessions = BoundedSessionStore::new(MAX_SHELL_MENU_SESSIONS);
     ensure_sta_message_queue();
     loop {
         pump_sta_messages();
@@ -192,6 +273,7 @@ fn shell_menu_worker_loop(
                 owner_window,
             } => {
                 let started = std::time::Instant::now();
+                let key = ShellMenuSessionKey::new(session_id, request_id);
                 let result = match target {
                     ShellMenuLoadTarget::Paths(paths) => ClassicMenuSession::for_paths_with_owner(
                         &paths,
@@ -208,15 +290,25 @@ fn shell_menu_worker_loop(
                 }
                 .and_then(|mut menu| {
                     let mut items = menu.items_top_level()?;
-                    menu.preload_background_submenus(&mut items);
+                    menu.preload_powershell_background_submenu(&mut items);
                     if menu.folder.is_some() {
                         items.retain(|item| item.verb.as_deref() != Some("windows.share"));
                     }
-                    session = Some((session_id, request_id, menu));
-                    Ok(items)
+                    Ok((menu, items))
                 });
                 match result {
-                    Ok(items) => {
+                    Ok((menu, items)) => {
+                        if let Some((evicted, _)) = sessions.insert(key, menu) {
+                            let _ = events.send(ShellMenuEvent::Error {
+                                session_id: evicted.session_id,
+                                request_id: evicted.request_id,
+                                operation: "evict",
+                                message: format!(
+                                    "shell menu session evicted after reaching limit {MAX_SHELL_MENU_SESSIONS}"
+                                ),
+                                elapsed_ms: 0,
+                            });
+                        }
                         let _ = events.send(ShellMenuEvent::Loaded {
                             session_id,
                             request_id,
@@ -242,13 +334,13 @@ fn shell_menu_worker_loop(
                 token,
             } => {
                 let started = std::time::Instant::now();
-                let result = session
-                    .as_mut()
-                    .filter(|(id, req, _)| *id == session_id && *req == request_id)
+                let key = ShellMenuSessionKey::new(session_id, request_id);
+                let result = sessions
+                    .get_mut(key)
                     .ok_or_else(|| {
                         io::Error::new(io::ErrorKind::NotFound, "shell menu session not found")
                     })
-                    .and_then(|(_, _, menu)| menu.load_submenu(token));
+                    .and_then(|menu| menu.load_submenu(token));
                 match result {
                     Ok(items) => {
                         let _ = events.send(ShellMenuEvent::SubmenuLoaded {
@@ -281,13 +373,13 @@ fn shell_menu_worker_loop(
                 screen_y,
             } => {
                 let started = std::time::Instant::now();
-                let result = session
-                    .as_ref()
-                    .filter(|(id, req, _)| *id == session_id && *req == request_id)
+                let key = ShellMenuSessionKey::new(session_id, request_id);
+                let result = sessions
+                    .get(key)
                     .ok_or_else(|| {
                         io::Error::new(io::ErrorKind::NotFound, "shell menu session not found")
                     })
-                    .and_then(|(_, _, menu)| {
+                    .and_then(|menu| {
                         menu.invoke_command(command_id, owner_window, screen_x, screen_y)
                     });
                 match result {
@@ -314,12 +406,7 @@ fn shell_menu_worker_loop(
                 session_id,
                 request_id,
             } => {
-                if session
-                    .as_ref()
-                    .is_some_and(|(id, req, _)| *id == session_id && *req == request_id)
-                {
-                    session = None;
-                }
+                sessions.remove(ShellMenuSessionKey::new(session_id, request_id));
                 let _ = events.send(ShellMenuEvent::Closed {
                     session_id,
                     request_id,
@@ -354,7 +441,7 @@ pub struct ClassicMenuSession {
     context_menu3: Option<IContextMenu3>,
     com_initialized: bool,
     submenus: Vec<SubmenuRegistration>,
-    registry_commands: std::collections::HashMap<u32, RegistryCascadeCommand>,
+    powershell_commands: HashMap<u32, PowerShellBackgroundCommand>,
     folder: Option<PathBuf>,
     preloaded_submenus: std::collections::HashMap<ShellMenuSubmenuToken, Vec<ClassicMenuItem>>,
     _thread_affinity: PhantomData<Rc<()>>,
@@ -366,8 +453,10 @@ struct SubmenuRegistration {
     parent: HMENU,
 }
 
-struct RegistryCascadeCommand {
-    command: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PowerShellBackgroundCommand {
+    executable: PathBuf,
+    working_directory: PathBuf,
     elevated: bool,
 }
 
@@ -453,7 +542,7 @@ impl ClassicMenuSession {
             context_menu3,
             com_initialized: true,
             submenus: Vec::new(),
-            registry_commands: std::collections::HashMap::new(),
+            powershell_commands: HashMap::new(),
             folder,
             preloaded_submenus: std::collections::HashMap::new(),
             _thread_affinity: PhantomData,
@@ -485,6 +574,33 @@ impl ClassicMenuSession {
         self.submenus.len() as ShellMenuSubmenuToken
     }
 
+    fn preload_powershell_background_submenu(&mut self, items: &mut [ClassicMenuItem]) {
+        let Some(folder) = self.folder.clone() else {
+            return;
+        };
+        for item in items {
+            let ClassicMenuItemKind::Submenu {
+                token,
+                items: children,
+            } = &mut item.kind
+            else {
+                continue;
+            };
+            if !item
+                .verb
+                .as_deref()
+                .is_some_and(|verb| verb.eq_ignore_ascii_case(POWERSHELL_BACKGROUND_VERB))
+            {
+                continue;
+            }
+            let Some(loaded) = powershell_background_items(&folder, &mut self.powershell_commands)
+            else {
+                continue;
+            };
+            *children = loaded.clone();
+            self.preloaded_submenus.insert(*token, loaded);
+        }
+    }
     fn load_submenu(&mut self, token: ShellMenuSubmenuToken) -> io::Result<Vec<ClassicMenuItem>> {
         if let Some(items) = self.preloaded_submenus.get(&token) {
             return Ok(items.clone());
@@ -519,39 +635,7 @@ impl ClassicMenuSession {
                 return Ok(items);
             }
         }
-        let verb = menu_item_verb(registration.parent, position, self);
-        if let Some(verb) = verb.as_deref()
-            && let Some(items) = registry_cascade_items(verb, &mut self.registry_commands)
-        {
-            return Ok(items);
-        }
         Ok(Vec::new())
-    }
-
-    fn preload_background_submenus(&mut self, items: &mut [ClassicMenuItem]) {
-        if self.folder.is_none() {
-            return;
-        }
-        for item in items {
-            let ClassicMenuItemKind::Submenu {
-                token,
-                items: children,
-            } = &mut item.kind
-            else {
-                continue;
-            };
-            if item.verb.as_deref() != Some("powershell7x64") {
-                continue;
-            }
-            let Ok(loaded) = self.load_submenu(*token) else {
-                continue;
-            };
-            if loaded.is_empty() {
-                continue;
-            }
-            *children = loaded.clone();
-            self.preloaded_submenus.insert(*token, loaded);
-        }
     }
     fn submenu_verb(&self, token: ShellMenuSubmenuToken) -> Option<String> {
         let index = token
@@ -569,19 +653,20 @@ impl ClassicMenuSession {
         screen_x: i32,
         screen_y: i32,
     ) -> io::Result<ClassicMenuInvocation> {
+        if let Some(command) = self.powershell_commands.get(&command_id) {
+            launch_powershell_background_command(command, owner_window)?;
+            return Ok(ClassicMenuInvocation::Shell {
+                verb: Some(format!("{POWERSHELL_COMMAND_VERB_PREFIX}{command_id}")),
+            });
+        }
         let offset = command_id
             .checked_sub(FIRST_COMMAND_ID)
+            .filter(|_| command_id <= LAST_COMMAND_ID)
             .ok_or_else(|| io::Error::other("shell returned an invalid menu command"))?;
         let context_menu = self
             .context_menu
             .as_ref()
             .ok_or_else(|| io::Error::other("shell context menu was already released"))?;
-        if let Some(command) = self.registry_commands.get(&command_id) {
-            launch_registry_command(command, owner_window)?;
-            return Ok(ClassicMenuInvocation::Shell {
-                verb: Some(format!("{REGISTRY_COMMAND_VERB_PREFIX}{command_id}")),
-            });
-        }
         let verb = command_verb(context_menu, command_id);
         if let Some(verb) = verb.as_deref().filter(|verb| is_builtin_verb(verb)) {
             return Ok(ClassicMenuInvocation::BuiltIn {
@@ -682,48 +767,87 @@ fn menu_item_verb(parent: HMENU, position: u32, session: &ClassicMenuSession) ->
         })
 }
 
-fn registry_cascade_items(
-    verb: &str,
-    commands: &mut std::collections::HashMap<u32, RegistryCascadeCommand>,
+fn powershell_background_items(
+    folder: &Path,
+    commands: &mut HashMap<u32, PowerShellBackgroundCommand>,
 ) -> Option<Vec<ClassicMenuItem>> {
     let cascade_key = registry_string(
         HKEY_CLASSES_ROOT,
-        &format!(r"Directory\Background\shell\{verb}"),
+        &format!(r"Directory\Background\shell\{POWERSHELL_BACKGROUND_VERB}"),
         "ExtendedSubCommandsKey",
     )?;
-    let shell_key = format!(r"{cascade_key}\shell");
-    let mut items = Vec::new();
-    for key in registry_subkeys(HKEY_CLASSES_ROOT, &shell_key)? {
-        let item_key = format!(r"{shell_key}\{key}");
-        let title = registry_string(HKEY_CLASSES_ROOT, &item_key, "MUIVerb")
-            .or_else(|| registry_default_string(HKEY_CLASSES_ROOT, &item_key))
-            .unwrap_or_else(|| key.clone());
-        let command = registry_default_string(HKEY_CLASSES_ROOT, &format!(r"{item_key}\command"))?;
-        let command_id = LAST_COMMAND_ID.checked_sub(u32::try_from(commands.len()).ok()?)?;
-        let elevated = registry_value_exists(HKEY_CLASSES_ROOT, &item_key, "HasLUAShield")
-            || key.eq_ignore_ascii_case("runas");
-        commands.insert(command_id, RegistryCascadeCommand { command, elevated });
+    if !cascade_key.eq_ignore_ascii_case(POWERSHELL_CASCADE_KEY) {
+        return None;
+    }
+    let executable = registry_string(
+        HKEY_CLASSES_ROOT,
+        &format!(r"Directory\Background\shell\{POWERSHELL_BACKGROUND_VERB}"),
+        "Icon",
+    )
+    .map(PathBuf::from)
+    .filter(|path| powershell_executable_is_allowed(path))?;
+    let shell_key = format!(r"{POWERSHELL_CASCADE_KEY}\shell");
+    let subkeys = registry_subkeys(HKEY_CLASSES_ROOT, &shell_key)?;
+    if subkeys.len() != 2
+        || !["openpwsh", "runas"]
+            .iter()
+            .all(|expected| subkeys.iter().any(|key| key.eq_ignore_ascii_case(expected)))
+    {
+        return None;
+    }
+    let definitions = [("openpwsh", false), ("runas", true)]
+        .into_iter()
+        .map(|(key, elevated)| {
+            let item_key = format!(r"{shell_key}\{key}");
+            let title = registry_string(HKEY_CLASSES_ROOT, &item_key, "MUIVerb")
+                .or_else(|| registry_default_string(HKEY_CLASSES_ROOT, &item_key))?;
+            let has_lua_shield =
+                registry_string(HKEY_CLASSES_ROOT, &item_key, "HasLUAShield").is_some();
+            (has_lua_shield == elevated).then_some((title, elevated))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let mut items = Vec::with_capacity(definitions.len());
+    let mut prepared_commands = Vec::with_capacity(definitions.len());
+    for (offset, (title, elevated)) in definitions.into_iter().enumerate() {
+        let command_id = FIRST_SYNTHETIC_COMMAND_ID.checked_add(u32::try_from(offset).ok()?)?;
+        prepared_commands.push((
+            command_id,
+            PowerShellBackgroundCommand {
+                executable: executable.clone(),
+                working_directory: folder.to_path_buf(),
+                elevated,
+            },
+        ));
         items.push(ClassicMenuItem {
             command_id: Some(command_id),
             title: clean_menu_title(&title),
-            verb: Some(format!("{REGISTRY_COMMAND_VERB_PREFIX}{command_id}")),
+            verb: Some(format!("{POWERSHELL_COMMAND_VERB_PREFIX}{command_id}")),
             enabled: true,
             checked: false,
             default: false,
             kind: ClassicMenuItemKind::Command,
         });
     }
-    (!items.is_empty()).then_some(items)
+    commands.extend(prepared_commands);
+    Some(items)
 }
 
-fn launch_registry_command(
-    command: &RegistryCascadeCommand,
+fn powershell_executable_is_allowed(path: &Path) -> bool {
+    path.is_absolute()
+        && path
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("pwsh.exe"))
+}
+
+fn launch_powershell_background_command(
+    command: &PowerShellBackgroundCommand,
     owner_window: isize,
 ) -> io::Result<()> {
     use windows_sys::Win32::UI::Shell::{SEE_MASK_UNICODE, SHELLEXECUTEINFOW, ShellExecuteExW};
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-    let executable = wide_null_str("cmd.exe");
-    let parameters = wide_null_str(&format!("/S /C \"{}\"", command.command));
+    let executable = wide_null(&command.executable);
+    let parameters = wide_null_str(POWERSHELL_PARAMETERS);
+    let directory = wide_null(&command.working_directory);
     let verb = command.elevated.then(|| wide_null_str("runas"));
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
@@ -732,6 +856,7 @@ fn launch_registry_command(
         lpVerb: verb.as_ref().map_or(ptr::null(), |verb| verb.as_ptr()),
         lpFile: executable.as_ptr(),
         lpParameters: parameters.as_ptr(),
+        lpDirectory: directory.as_ptr(),
         nShow: SW_SHOWNORMAL,
         ..Default::default()
     };
@@ -739,26 +864,6 @@ fn launch_registry_command(
         return Err(io::Error::last_os_error());
     }
     Ok(())
-}
-
-fn registry_value_exists(
-    root: windows_sys::Win32::System::Registry::HKEY,
-    key: &str,
-    value: &str,
-) -> bool {
-    let key = wide_null_str(key);
-    let value = wide_null_str(value);
-    (unsafe {
-        RegGetValueW(
-            root,
-            key.as_ptr(),
-            value.as_ptr(),
-            0,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-        )
-    }) == 0
 }
 
 fn registry_string(
@@ -1192,6 +1297,53 @@ mod tests {
         );
     }
     #[test]
+    fn bounded_session_store_routes_by_session_and_request() {
+        let mut sessions = BoundedSessionStore::new(3);
+        let first = ShellMenuSessionKey::new(1, 10);
+        let second = ShellMenuSessionKey::new(1, 11);
+
+        assert_eq!(sessions.insert(first, "first"), None);
+        assert_eq!(sessions.insert(second, "second"), None);
+        assert_eq!(sessions.get(first), Some(&"first"));
+        assert_eq!(sessions.get(second), Some(&"second"));
+        assert_eq!(sessions.get(ShellMenuSessionKey::new(2, 10)), None);
+
+        assert_eq!(sessions.remove(first), Some("first"));
+        assert_eq!(sessions.get(first), None);
+        assert_eq!(sessions.get(second), Some(&"second"));
+    }
+
+    #[test]
+    fn bounded_session_store_evicts_oldest_live_session() {
+        let mut sessions = BoundedSessionStore::new(2);
+        let first = ShellMenuSessionKey::new(1, 1);
+        let second = ShellMenuSessionKey::new(2, 2);
+        let third = ShellMenuSessionKey::new(3, 3);
+
+        assert_eq!(sessions.insert(first, "first"), None);
+        assert_eq!(sessions.insert(second, "second"), None);
+        assert_eq!(sessions.insert(third, "third"), Some((first, "first")));
+        assert_eq!(sessions.get(first), None);
+        assert_eq!(sessions.get(second), Some(&"second"));
+        assert_eq!(sessions.get(third), Some(&"third"));
+    }
+
+    #[test]
+    fn replacing_session_refreshes_its_eviction_age() {
+        let mut sessions = BoundedSessionStore::new(2);
+        let first = ShellMenuSessionKey::new(1, 1);
+        let second = ShellMenuSessionKey::new(2, 2);
+        let third = ShellMenuSessionKey::new(3, 3);
+
+        assert_eq!(sessions.insert(first, "old"), None);
+        assert_eq!(sessions.insert(second, "second"), None);
+        assert_eq!(sessions.insert(first, "new"), None);
+        assert_eq!(sessions.insert(third, "third"), Some((second, "second")));
+        assert_eq!(sessions.get(first), Some(&"new"));
+        assert_eq!(sessions.get(second), None);
+    }
+
+    #[test]
     fn background_requires_a_folder_identity() {
         assert!(validate_background(Path::new("")).is_err());
         assert!(validate_background(Path::new(r"C:\one")).is_ok());
@@ -1224,9 +1376,33 @@ mod tests {
     }
 
     #[test]
-    fn background_registry_cascade_resolves_powershell_children() {
-        let mut commands = std::collections::HashMap::new();
-        let items = registry_cascade_items("powershell7x64", &mut commands)
+    fn powershell_executable_requires_absolute_pwsh_path() {
+        assert!(powershell_executable_is_allowed(Path::new(
+            r"C:\Program Files\PowerShell\7\pwsh.exe"
+        )));
+        assert!(powershell_executable_is_allowed(Path::new(
+            r"C:\Tools\PWSH.EXE"
+        )));
+        assert!(!powershell_executable_is_allowed(Path::new("pwsh.exe")));
+        assert!(!powershell_executable_is_allowed(Path::new(
+            r"C:\Windows\System32\cmd.exe"
+        )));
+    }
+
+    #[test]
+    fn powershell_synthetic_commands_do_not_overlap_native_shell_ids() {
+        assert_eq!(FIRST_SYNTHETIC_COMMAND_ID, 0x8000);
+        assert_eq!(FIRST_SYNTHETIC_COMMAND_ID.checked_add(1), Some(0x8001));
+        assert!(!POWERSHELL_PARAMETERS.contains("cmd"));
+        assert!(!POWERSHELL_PARAMETERS.contains("%V"));
+        assert!(!POWERSHELL_PARAMETERS.contains("/C"));
+    }
+
+    #[test]
+    fn powershell_background_registry_matches_supported_shape() {
+        let folder = Path::new(r"C:\Users\Public\Folder & 100%!");
+        let mut commands = HashMap::new();
+        let items = powershell_background_items(folder, &mut commands)
             .expect("PowerShell 7 background cascade is registered on this machine");
         assert_eq!(
             items
@@ -1235,7 +1411,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Open here", "Open here as Administrator"]
         );
+        assert_eq!(
+            items
+                .iter()
+                .filter_map(|item| item.command_id)
+                .collect::<Vec<_>>(),
+            [FIRST_SYNTHETIC_COMMAND_ID, FIRST_SYNTHETIC_COMMAND_ID + 1]
+        );
         assert_eq!(commands.len(), 2);
+        assert!(commands.values().all(|command| {
+            command.working_directory == folder
+                && powershell_executable_is_allowed(&command.executable)
+        }));
         assert!(commands.values().any(|command| command.elevated));
         assert!(commands.values().any(|command| !command.elevated));
     }

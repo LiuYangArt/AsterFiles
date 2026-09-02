@@ -205,6 +205,7 @@ P3 已确认的产品范围、隐藏/系统文件默认值和缩略图后移决�
 - [x] 第二阶段首项：菜单收紧为 Windows 式密度；普通子菜单以独立 token 在所属 STA 会话内按需加载，支持点击、250ms 悬停、右方向键展开与左方向键返回，叶子保留原始 command ID。
 - [x] 用户确认菜单显示、搜索、紧凑密度、子菜单悬停/定位和 PowerShell 级联达到本次交付范围；目录空白菜单中无效的 `Give access to` 暂时隐藏，并由 [Issue #23](https://github.com/LiuYangArt/AsterFiles/issues/23) 独立跟踪。
 - [x] 依据真实数据决定不在本 Issue 引入辅助进程；首版搜索只覆盖已加载项目。Shell 图标、跨次缓存、DPI/多屏和完整无障碍实证按后续独立需求处理。
+- [x] Issue #24 已完成并通过真实 UI 验收：自有命令固定在上，Windows 区域位于单分隔线之后；冷加载显示不可交互骨架，相同上下文缓存先变暗展示，准确会话就绪后原位恢复；每窗口后台预热与有界 STA 多会话互不覆盖，PowerShell 7 背景级联直接预载并绕开 300ms 动态等待。范围见 [GitHub Issue #24](https://github.com/LiuYangArt/AsterFiles/issues/24)。
 
 验收：自动验证通过，用户已确认 Issue #13 按当前范围收尾；本次需同时产出 Debug 与 Release，真实 UI 证据仅来自用户反馈，不以自动化代替。
 

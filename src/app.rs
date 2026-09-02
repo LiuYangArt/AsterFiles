@@ -122,6 +122,8 @@ pub fn export_quick_menu_search_state(path: &Path) -> io::Result<()> {
             checked: false,
             default: false,
             submenu: false,
+            loading: false,
+            placeholder: false,
         },
         ContextCommandRow {
             id: -1,
@@ -135,6 +137,8 @@ pub fn export_quick_menu_search_state(path: &Path) -> io::Result<()> {
             checked: false,
             default: false,
             submenu: false,
+            loading: false,
+            placeholder: false,
         },
         ContextCommandRow {
             id: SHELL_CONTEXT_COMMAND_BASE + 42,
@@ -148,6 +152,8 @@ pub fn export_quick_menu_search_state(path: &Path) -> io::Result<()> {
             checked: false,
             default: false,
             submenu: false,
+            loading: false,
+            placeholder: false,
         },
     ];
     let english = filtered_context_rows(&rows, "COPY");
@@ -479,7 +485,6 @@ struct WorkerSenders {
     operation: mpsc::Sender<FileOperationRequest>,
     clipboard: mpsc::Sender<ClipboardRequest>,
     shell_menu: platform::windows::context_menu::ShellMenuWorker,
-    quick_menu: SharedQuickMenu,
     everything: mpsc::Sender<EverythingRequest>,
     icon: mpsc::Sender<IconRequest>,
 }
@@ -544,6 +549,7 @@ struct WindowRuntime {
     _rectangle_selection_timer: Rc<slint::Timer>,
     _quick_menu: SharedQuickMenu,
     _quick_submenu_timer: Rc<slint::Timer>,
+    _quick_menu_prewarm_timer: slint::Timer,
 }
 
 thread_local! {
@@ -2371,7 +2377,6 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         operation: operation_sender.clone(),
         clipboard: clipboard_sender.clone(),
         shell_menu: shell_menu_worker.clone(),
-        quick_menu: quick_menu.clone(),
         everything: everything_sender.clone(),
         icon: icon_sender.clone(),
     };
@@ -2379,8 +2384,8 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         .lock()
         .expect("app state mutex is not poisoned")
         .active_window;
+
     let scoped_state = WindowSessions::new(state.clone(), initial_window_id);
-    let quick_menu = Arc::new(Mutex::new(QuickMenuState::default()));
 
     wire_callbacks(
         &ui,
@@ -2397,6 +2402,12 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         scoped_state.clone(),
     );
     let quick_submenu_timer = wire_context_submenu_hover(&ui);
+    let quick_menu_prewarm_timer = wire_quick_menu_prewarm(
+        &ui,
+        scoped_state.clone(),
+        quick_menu.clone(),
+        shell_menu_worker.clone(),
+    );
     wire_internal_drag_drop(
         &ui,
         operation_sender.clone(),
@@ -2516,6 +2527,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 _rectangle_selection_timer: rectangle_selection_timer,
                 _quick_menu: quick_menu.clone(),
                 _quick_submenu_timer: quick_submenu_timer.clone(),
+                _quick_menu_prewarm_timer: quick_menu_prewarm_timer,
             },
         );
     });
@@ -2752,7 +2764,7 @@ fn install_app_window_at(
     state: SharedSessions,
 ) -> Result<(), slint::PlatformError> {
     let scoped = WindowSessions::new(state.clone(), window_id);
-    let quick_menu = senders.quick_menu.clone();
+    let quick_menu = Arc::new(Mutex::new(QuickMenuState::default()));
     ui.window()
         .set_position(slint::PhysicalPosition::new(placement.x, placement.y));
     ui.window().set_size(slint::LogicalSize::new(
@@ -2774,6 +2786,12 @@ fn install_app_window_at(
         scoped.clone(),
     );
     let quick_submenu_timer = wire_context_submenu_hover(&ui);
+    let quick_menu_prewarm_timer = wire_quick_menu_prewarm(
+        &ui,
+        scoped.clone(),
+        quick_menu.clone(),
+        senders.shell_menu.clone(),
+    );
     wire_internal_drag_drop(
         &ui,
         senders.operation.clone(),
@@ -2804,6 +2822,7 @@ fn install_app_window_at(
                 _rectangle_selection_timer: rectangle_selection_timer,
                 _quick_menu: quick_menu.clone(),
                 _quick_submenu_timer: quick_submenu_timer.clone(),
+                _quick_menu_prewarm_timer: quick_menu_prewarm_timer,
             },
         );
     });
@@ -3367,24 +3386,39 @@ fn submit_delete(
 }
 
 const SHELL_CONTEXT_COMMAND_BASE: i32 = 100_000;
+const QUICK_MENU_PLACEHOLDER_ROWS: usize = 3;
+const QUICK_MENU_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct QuickMenuKey {
+    window_id: WindowId,
+    tab_id: TabId,
+    navigation_request: RequestId,
+    paths: Vec<PathBuf>,
+    folder: Option<PathBuf>,
+}
 
 #[derive(Clone)]
 struct QuickMenuIdentity {
     session_id: u64,
     request_id: u64,
-    window_id: WindowId,
-    tab_id: TabId,
-    navigation_request: RequestId,
+    key: QuickMenuKey,
+    ready: bool,
+}
 
-    paths: Vec<PathBuf>,
-    folder: Option<PathBuf>,
+#[derive(Clone)]
+struct QuickMenuSnapshot {
+    rows: Vec<ContextCommandRow>,
+    captured_at: Instant,
 }
 
 #[derive(Default)]
 struct QuickMenuState {
     next_request: u64,
     identity: Option<QuickMenuIdentity>,
+    snapshots: HashMap<QuickMenuKey, QuickMenuSnapshot>,
     all_rows: Vec<ContextCommandRow>,
+    built_in_rows: Vec<ContextCommandRow>,
     submenu_rows: Vec<ContextCommandRow>,
     submenu_history: Vec<(u64, Vec<ContextCommandRow>)>,
     submenu_tokens: HashMap<i32, u64>,
@@ -3396,6 +3430,139 @@ struct QuickMenuState {
 
 type SharedQuickMenu = Arc<Mutex<QuickMenuState>>;
 
+fn quick_menu_separator() -> ContextCommandRow {
+    ContextCommandRow {
+        id: -1,
+        node_id: 0,
+        label: "".into(),
+        search_text: "".into(),
+        hint: "".into(),
+        enabled: false,
+        separator: true,
+        shell: true,
+        checked: false,
+        default: false,
+        submenu: false,
+        loading: false,
+        placeholder: false,
+    }
+}
+
+fn quick_menu_placeholder() -> ContextCommandRow {
+    ContextCommandRow {
+        id: -1,
+        node_id: 0,
+        label: "".into(),
+        search_text: "".into(),
+        hint: "".into(),
+        enabled: false,
+        separator: false,
+        shell: true,
+        checked: false,
+        default: false,
+        submenu: false,
+        loading: true,
+        placeholder: true,
+    }
+}
+
+fn pending_shell_rows(rows: &[ContextCommandRow]) -> Vec<ContextCommandRow> {
+    rows.iter()
+        .cloned()
+        .map(|mut row| {
+            if !row.separator {
+                row.enabled = false;
+                row.loading = true;
+            }
+            row
+        })
+        .collect()
+}
+
+fn compose_quick_menu_rows(
+    built_in_rows: &[ContextCommandRow],
+    shell_rows: &[ContextCommandRow],
+) -> Vec<ContextCommandRow> {
+    let mut rows = built_in_rows.to_vec();
+    if !rows.is_empty() && !shell_rows.is_empty() {
+        rows.push(quick_menu_separator());
+    }
+    rows.extend(shell_rows.iter().cloned());
+    filtered_context_rows(&rows, "")
+}
+
+fn project_cached_shell_rows(
+    session_ready: bool,
+    snapshot: Option<&QuickMenuSnapshot>,
+) -> (Vec<ContextCommandRow>, bool, bool, bool) {
+    let snapshot =
+        snapshot.filter(|snapshot| snapshot.captured_at.elapsed() <= QUICK_MENU_SNAPSHOT_TTL);
+    let cache_hit = snapshot.is_some();
+    let session_hit = session_ready && cache_hit;
+    let rows = match (session_hit, snapshot) {
+        (true, Some(snapshot)) => snapshot.rows.clone(),
+        (false, Some(snapshot)) => pending_shell_rows(&snapshot.rows),
+        (_, None) => (0..QUICK_MENU_PLACEHOLDER_ROWS)
+            .map(|_| quick_menu_placeholder())
+            .collect(),
+    };
+    (rows, !session_hit, cache_hit, session_hit)
+}
+
+fn quick_menu_key(
+    state: &WindowSessions,
+    background: bool,
+) -> Option<(
+    QuickMenuKey,
+    platform::windows::context_menu::ShellMenuLoadTarget,
+)> {
+    let app = state.lock().ok()?;
+    let tab = app.active();
+    let paths = if background {
+        Vec::new()
+    } else {
+        selected_paths(&app)
+    };
+    let folder = tab.visible_path().map(Path::to_path_buf);
+    if background && folder.is_none() || !background && paths.is_empty() {
+        return None;
+    }
+    let key = QuickMenuKey {
+        window_id: state.window_id,
+        tab_id: tab.id,
+        navigation_request: tab.latest_request,
+        paths: paths.clone(),
+        folder: folder.clone(),
+    };
+    let target = if background {
+        platform::windows::context_menu::ShellMenuLoadTarget::Background(folder?)
+    } else {
+        platform::windows::context_menu::ShellMenuLoadTarget::Paths(paths)
+    };
+    Some((key, target))
+}
+
+fn quick_menu_key_is_current(state: &SharedSessions, key: &QuickMenuKey) -> bool {
+    state.lock().ok().is_some_and(|app| {
+        app.window_for_tab(key.tab_id) == Some(key.window_id)
+            && app.tab(key.tab_id).is_some_and(|tab| {
+                tab.latest_request == key.navigation_request
+                    && tab.visible_path().map(Path::to_path_buf) == key.folder
+                    && if key.paths.is_empty() {
+                        tab.selected.is_empty()
+                    } else {
+                        key.paths
+                            == tab
+                                .selected
+                                .iter()
+                                .filter_map(|id| {
+                                    tab.visible_entry(*id).map(|entry| entry.path.clone())
+                                })
+                                .collect::<Vec<_>>()
+                    }
+            })
+    })
+}
 fn context_row_matches(row: &ContextCommandRow, query: &str) -> bool {
     if row.separator {
         return false;
@@ -3430,6 +3597,8 @@ fn filtered_context_rows(rows: &[ContextCommandRow], query: &str) -> Vec<Context
                 checked: false,
                 default: false,
                 submenu: false,
+                loading: false,
+                placeholder: false,
             });
         }
         pending_separator = false;
@@ -3493,6 +3662,8 @@ fn shell_menu_item_row(
         checked: item.checked,
         default: item.default,
         submenu,
+        loading: false,
+        placeholder: false,
     })
 }
 
@@ -3576,6 +3747,45 @@ fn wire_context_submenu_hover(ui: &AppWindow) -> Rc<slint::Timer> {
     timer
 }
 
+fn wire_quick_menu_prewarm(
+    ui: &AppWindow,
+    state: WindowSessions,
+    menu: SharedQuickMenu,
+    worker: platform::windows::context_menu::ShellMenuWorker,
+) -> slint::Timer {
+    let timer = slint::Timer::default();
+    let weak = ui.as_weak();
+    timer.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(350),
+        move || {
+            let Some(ui) = weak.upgrade() else { return };
+            if ui.get_context_menu_open() {
+                return;
+            }
+            let background = state
+                .lock()
+                .map(|app| app.active().selected.is_empty())
+                .unwrap_or(true);
+            let Some((key, _)) = quick_menu_key(&state, background) else {
+                return;
+            };
+            let already_loaded = menu.lock().ok().is_some_and(|menu| {
+                menu.identity.as_ref().is_some_and(|identity| {
+                    identity.key == key
+                        && (!identity.ready
+                            || menu.snapshots.get(&key).is_some_and(|snapshot| {
+                                snapshot.captured_at.elapsed() <= QUICK_MENU_SNAPSHOT_TTL
+                            }))
+                })
+            });
+            if !already_loaded {
+                begin_shell_menu_load(&ui, &state, &menu, &worker, background);
+            }
+        },
+    );
+    timer
+}
 fn project_filtered_context_menu(ui: &AppWindow, menu: &SharedQuickMenu, query: &str) {
     let rows = menu
         .lock()
@@ -3593,50 +3803,35 @@ fn begin_shell_menu_load(
     worker: &platform::windows::context_menu::ShellMenuWorker,
     background: bool,
 ) {
-    let (tab_id, navigation_request, paths, folder) = state
-        .lock()
-        .map(|app| {
-            let tab = app.active();
-            (
-                tab.id,
-                tab.latest_request,
-                selected_paths(&app),
-                tab.visible_path().map(Path::to_path_buf),
-            )
-        })
-        .unwrap_or((TabId(0), RequestId(0), Vec::new(), None));
-    if background && folder.is_none() || !background && paths.is_empty() {
+    let Some((key, target)) = quick_menu_key(state, background) else {
         ui.set_context_shell_loading(false);
         return;
-    }
+    };
     let identity = {
         let mut menu = menu.lock().expect("quick menu mutex is not poisoned");
-        menu.next_request = menu.next_request.wrapping_add(1).max(1);
-        QuickMenuIdentity {
-            session_id: menu.next_request,
-            request_id: menu.next_request,
-            window_id: state.window_id,
-            tab_id,
-            navigation_request,
-
-            paths: paths.clone(),
-            folder: folder.clone(),
+        if let Some(identity) = menu.identity.as_ref()
+            && identity.key == key
+        {
+            let snapshot_is_fresh = menu
+                .snapshots
+                .get(&key)
+                .is_some_and(|snapshot| snapshot.captured_at.elapsed() <= QUICK_MENU_SNAPSHOT_TTL);
+            if !identity.ready || snapshot_is_fresh {
+                ui.set_context_shell_loading(!identity.ready);
+                return;
+            }
         }
-    };
-    if let Ok(mut menu) = menu.lock()
-        && let Some(old) = menu.identity.replace(identity.clone())
-    {
-        let _ = worker.send(platform::windows::context_menu::ShellMenuCommand::Close {
-            session_id: old.session_id,
-            request_id: old.request_id,
-        });
-    }
-    let target = if background {
-        platform::windows::context_menu::ShellMenuLoadTarget::Background(
-            folder.expect("validated folder"),
-        )
-    } else {
-        platform::windows::context_menu::ShellMenuLoadTarget::Paths(paths)
+        menu.next_request = menu.next_request.wrapping_add(1).max(1);
+        let request_id = menu.next_request;
+        let session_id = (u64::from(key.window_id.0) << 32) | request_id;
+        let identity = QuickMenuIdentity {
+            session_id,
+            request_id,
+            key,
+            ready: false,
+        };
+        menu.identity = Some(identity.clone());
+        identity
     };
     if worker
         .send(platform::windows::context_menu::ShellMenuCommand::Load {
@@ -3649,12 +3844,64 @@ fn begin_shell_menu_load(
         .is_err()
     {
         ui.set_context_shell_loading(false);
+    } else {
+        eprintln!(
+            "{{\"event\":\"shell_menu_load_started\",\"session\":{},\"request\":{},\"window\":{},\"tab\":{},\"navigation_request\":{}}}",
+            identity.session_id,
+            identity.request_id,
+            identity.key.window_id.0,
+            identity.key.tab_id.0,
+            identity.key.navigation_request.0,
+        );
     }
+}
+fn built_in_context_rows(
+    language: Language,
+    selected: usize,
+    can_paste: bool,
+    background: bool,
+) -> Vec<ContextCommandRow> {
+    let label = |zh: &'static str, en: &'static str| -> &'static str {
+        if language == Language::Chinese {
+            zh
+        } else {
+            en
+        }
+    };
+    let row = |id: i32, zh: &'static str, en: &'static str, enabled: bool| ContextCommandRow {
+        id,
+        node_id: 0,
+        label: label(zh, en).into(),
+        enabled,
+        separator: false,
+        search_text: "".into(),
+        hint: "".into(),
+        shell: false,
+        checked: false,
+        default: false,
+        submenu: false,
+        loading: false,
+        placeholder: false,
+    };
+    let mut rows = Vec::new();
+    if background {
+        rows.push(row(1, "新建文件夹", "New folder", true));
+    } else {
+        rows.push(row(2, "复制", "Copy", selected > 0));
+        rows.push(row(3, "剪切", "Cut", selected > 0));
+    }
+    rows.push(row(4, "粘贴", "Paste", can_paste));
+    if !background {
+        rows.push(row(5, "重命名", "Rename", selected == 1));
+        rows.push(row(6, "删除", "Delete", selected > 0));
+        rows.push(row(7, "永久删除", "Delete permanently", selected > 0));
+    }
+    rows
 }
 
 fn project_context_menu(
     ui: &AppWindow,
-    state: &SharedSessions,
+    state: &WindowSessions,
     menu: &SharedQuickMenu,
     background: bool,
 ) {
@@ -3666,122 +3913,32 @@ fn project_context_menu(
             app.clipboard_has_files,
         )
     };
-    let label = |zh: &'static str, en: &'static str| -> &'static str {
-        if language == Language::Chinese {
-            zh
-        } else {
-            en
-        }
-    };
-    let mut rows = Vec::new();
-    if background {
-        rows.push(ContextCommandRow {
-            id: 1,
-            node_id: 0,
-            label: label("新建文件夹", "New folder").into(),
-            enabled: true,
-            separator: false,
-            search_text: "".into(),
-            hint: "".into(),
-            shell: false,
-            checked: false,
-            default: false,
-            submenu: false,
-        });
-    }
-    if !background {
-        rows.push(ContextCommandRow {
-            id: 2,
-            node_id: 0,
-            label: label("复制", "Copy").into(),
-            enabled: selected > 0,
-            separator: false,
-            search_text: "".into(),
-            hint: "".into(),
-            shell: false,
-            checked: false,
-            default: false,
-            submenu: false,
-        });
-        rows.push(ContextCommandRow {
-            id: 3,
-            node_id: 0,
-            label: label("剪切", "Cut").into(),
-            enabled: selected > 0,
-            separator: false,
-            search_text: "".into(),
-            hint: "".into(),
-            shell: false,
-            checked: false,
-            default: false,
-            submenu: false,
-        });
-    }
-    rows.push(ContextCommandRow {
-        id: 4,
-        node_id: 0,
-        label: label("粘贴", "Paste").into(),
-        enabled: can_paste,
-        separator: false,
-        search_text: "".into(),
-        hint: "".into(),
-        shell: false,
-        checked: false,
-        default: false,
-        submenu: false,
-    });
-    if !background {
-        rows.push(ContextCommandRow {
-            id: 5,
-            node_id: 0,
-            label: label("重命名", "Rename").into(),
-            enabled: selected == 1,
-            separator: false,
-            search_text: "".into(),
-            hint: "".into(),
-            shell: false,
-            checked: false,
-            default: false,
-            submenu: false,
-        });
-        rows.push(ContextCommandRow {
-            id: 6,
-            node_id: 0,
-            label: label("删除", "Delete").into(),
-            enabled: selected > 0,
-            separator: false,
-            search_text: "".into(),
-            hint: "".into(),
-            shell: false,
-            checked: false,
-            default: false,
-            submenu: false,
-        });
-        rows.push(ContextCommandRow {
-            id: 7,
-            node_id: 0,
-            label: label("永久删除", "Delete permanently").into(),
-            enabled: selected > 0,
-            separator: false,
-            search_text: "".into(),
-            hint: "".into(),
-            shell: false,
-            checked: false,
-            default: false,
-            submenu: false,
-        });
-    }
-    if let Ok(mut menu) = menu.lock() {
-        menu.all_rows = rows;
-        menu.submenu_rows.clear();
-        menu.submenu_history.clear();
-        menu.submenu_tokens.clear();
-        menu.preloaded_submenu_rows.clear();
-        menu.next_submenu_node = 0;
-        menu.active_submenu_token = None;
-    }
+    let built_in_rows = built_in_context_rows(language, selected, can_paste, background);
+    let key = quick_menu_key(state, background).map(|(key, _)| key);
+    let (loading, cache_hit, session_hit) = menu
+        .lock()
+        .map(|mut menu| {
+            let session_ready = key.as_ref().is_some_and(|key| {
+                menu.identity
+                    .as_ref()
+                    .is_some_and(|identity| &identity.key == key && identity.ready)
+            });
+            let snapshot = key.as_ref().and_then(|key| menu.snapshots.get(key));
+            let (shell_rows, loading, cache_hit, session_hit) =
+                project_cached_shell_rows(session_ready, snapshot);
+            menu.built_in_rows = built_in_rows.clone();
+            menu.all_rows = compose_quick_menu_rows(&built_in_rows, &shell_rows);
+            menu.submenu_rows.clear();
+            menu.submenu_history.clear();
+            menu.submenu_tokens.clear();
+            menu.preloaded_submenu_rows.clear();
+            menu.next_submenu_node = 0;
+            menu.active_submenu_token = None;
+            (loading, cache_hit, session_hit)
+        })
+        .unwrap_or_default();
     ui.set_context_search("".into());
-    ui.set_context_shell_loading(true);
+    ui.set_context_shell_loading(loading);
     ui.set_context_shell_elapsed_ms(0);
     ui.set_context_submenu_open(false);
     ui.set_context_submenu_parent_open(false);
@@ -3791,8 +3948,11 @@ fn project_context_menu(
     ));
     project_filtered_context_menu(ui, menu, "");
     ui.set_context_menu_open(true);
+    eprintln!(
+        "{{\"event\":\"quick_menu_projected\",\"background\":{},\"cache_hit\":{},\"session_hit\":{}}}",
+        background, cache_hit, session_hit
+    );
 }
-
 fn native_window_handle(ui: &AppWindow) -> isize {
     component_window_handle(ui)
 }
@@ -5312,7 +5472,6 @@ fn wire_callbacks(
         operation: operation_sender.clone(),
         clipboard: clipboard_sender.clone(),
         shell_menu: shell_menu_worker.clone(),
-        quick_menu: quick_menu.clone(),
         everything: everything_sender.clone(),
         icon: icon_sender.clone(),
     };
@@ -6024,9 +6183,11 @@ fn wire_callbacks(
     let quick_menu_for_dismiss = quick_menu.clone();
     let shell_menu_for_dismiss = shell_menu_worker.clone();
     ui.on_dismiss_context_menu(move || {
-        if let Ok(mut menu) = quick_menu_for_dismiss.lock()
-            && let Some(identity) = menu.identity.take()
-        {
+        let identity = quick_menu_for_dismiss
+            .lock()
+            .ok()
+            .and_then(|mut menu| menu.identity.take());
+        if let Some(identity) = identity {
             let _ = shell_menu_for_dismiss.send(
                 platform::windows::context_menu::ShellMenuCommand::Close {
                     session_id: identity.session_id,
@@ -6084,12 +6245,13 @@ fn wire_callbacks(
                     .lock()
                     .ok()
                     .and_then(|menu| menu.identity.clone())
+                    .filter(|identity| identity.ready)
                 else {
                     return;
                 };
                 let command_id = (command - SHELL_CONTEXT_COMMAND_BASE) as u32;
                 let current = state_for_context_command.lock().ok().and_then(|app| {
-                    let tab = app.tab(identity.tab_id)?;
+                    let tab = app.tab(identity.key.tab_id)?;
                     Some((
                         tab.latest_request,
                         selected_paths(&app),
@@ -6097,9 +6259,9 @@ fn wire_callbacks(
                     ))
                 });
                 if current.is_none_or(|(request, paths, folder)| {
-                    request != identity.navigation_request
-                        || paths != identity.paths
-                        || folder != identity.folder
+                    request != identity.key.navigation_request
+                        || paths != identity.key.paths
+                        || folder != identity.key.folder
                 }) {
                     if let Ok(mut app) = state_for_context_command.lock() {
                         app.operation_errors
@@ -8015,12 +8177,28 @@ fn spawn_clipboard_worker() -> (
     (request_sender, event_receiver)
 }
 
+fn quick_menu_for_session(
+    session_id: u64,
+    request_id: u64,
+) -> Option<(SharedQuickMenu, AppWindow)> {
+    WINDOW_RUNTIMES.with_borrow(|runtimes| {
+        runtimes.values().find_map(|runtime| {
+            let matches = runtime._quick_menu.lock().ok().is_some_and(|menu| {
+                menu.identity.as_ref().is_some_and(|identity| {
+                    identity.session_id == session_id && identity.request_id == request_id
+                })
+            });
+            matches.then(|| (runtime._quick_menu.clone(), runtime.ui.clone_strong()))
+        })
+    })
+}
+
 fn start_shell_menu_event_pump(
     ui: &AppWindow,
     receiver: mpsc::Receiver<platform::windows::context_menu::ShellMenuEvent>,
     worker: platform::windows::context_menu::ShellMenuWorker,
     directory_sender: mpsc::Sender<DirectoryRequest>,
-    quick_menu: SharedQuickMenu,
+    _quick_menu: SharedQuickMenu,
     state: SharedSessions,
 ) {
     let weak = ui.as_weak();
@@ -8030,213 +8208,58 @@ fn start_shell_menu_event_pump(
             let worker = worker.clone();
             let directory_sender = directory_sender.clone();
             let state = state.clone();
-            let quick_menu = quick_menu.clone();
             let _ = slint::invoke_from_event_loop(move || {
-                let Some(ui) = WINDOW_RUNTIMES
-                    .with_borrow(|runtimes| {
-                        quick_menu.lock().ok().and_then(|menu| {
-                            menu.identity.as_ref().and_then(|identity| {
-                                runtimes
-                                    .get(&identity.window_id)
-                                    .map(|runtime| runtime.ui.clone_strong())
-                            })
-                        })
-                    })
-                    .or_else(|| weak.upgrade())
-                else {
-                    return;
-                };
-                let menu_state = quick_menu.clone();
-                match event {
+                let (session_id, request_id) = match &event {
                     platform::windows::context_menu::ShellMenuEvent::Loaded {
                         session_id,
                         request_id,
+                        ..
+                    }
+                    | platform::windows::context_menu::ShellMenuEvent::SubmenuLoaded {
+                        session_id,
+                        request_id,
+                        ..
+                    }
+                    | platform::windows::context_menu::ShellMenuEvent::SubmenuError {
+                        session_id,
+                        request_id,
+                        ..
+                    }
+                    | platform::windows::context_menu::ShellMenuEvent::Invoked {
+                        session_id,
+                        request_id,
+                        ..
+                    }
+                    | platform::windows::context_menu::ShellMenuEvent::Error {
+                        session_id,
+                        request_id,
+                        ..
+                    }
+                    | platform::windows::context_menu::ShellMenuEvent::Closed {
+                        session_id,
+                        request_id,
+                    } => (*session_id, *request_id),
+                };
+                let Some((menu_state, ui)) = quick_menu_for_session(session_id, request_id)
+                    .or_else(|| {
+                        weak.upgrade()
+                            .map(|ui| (Arc::new(Mutex::new(QuickMenuState::default())), ui))
+                    })
+                else {
+                    return;
+                };
+                match event {
+                    platform::windows::context_menu::ShellMenuEvent::Loaded {
                         items,
                         elapsed_ms,
-                    } => {
-                        let accepted = menu_state
-                            .lock()
-                            .ok()
-                            .and_then(|menu| menu.identity.clone())
-                            .is_some_and(|identity| {
-                                identity.session_id == session_id
-                                    && identity.request_id == request_id
-                                    && state
-                                        .lock()
-                                        .ok()
-                                        .and_then(|app| {
-                                            app.tab(identity.tab_id).map(|tab| {
-                                                (
-                                                    tab.latest_request,
-                                                    selected_paths(&app),
-                                                    tab.visible_path().map(Path::to_path_buf),
-                                                )
-                                            })
-                                        })
-                                        .is_some_and(|(request, paths, folder)| {
-                                            request == identity.navigation_request
-                                                && paths == identity.paths
-                                                && folder == identity.folder
-                                        })
-                                    && ui.get_context_menu_open()
-                            });
-                        if !accepted {
-                            ui.set_context_submenu_loading(false);
-                            ui.set_context_submenu_open(false);
-                            ui.set_context_submenu_parent_open(false);
-                            let _ = worker.send(
-                                platform::windows::context_menu::ShellMenuCommand::Close {
-                                    session_id,
-                                    request_id,
-                                },
-                            );
-                            if let Ok(mut app) = state.lock() {
-                                app.operation_errors.push(format!("Shell menu late result discarded: session={session_id} request={request_id} elapsed_ms={elapsed_ms}"));
-                            }
-                            return;
-                        }
-                        if let Ok(mut menu) = menu_state.lock() {
-                            let projected = project_shell_menu_items(&mut menu, items);
-                            let classic = menu.all_rows.pop();
-                            if menu.all_rows.last().is_some_and(|row| row.separator) {
-                                menu.all_rows.pop();
-                            }
-                            menu.all_rows.push(ContextCommandRow {
-                                id: -1,
-                                node_id: 0,
-                                label: "".into(),
-                                search_text: "".into(),
-                                hint: "".into(),
-                                enabled: false,
-                                separator: true,
-                                shell: true,
-                                checked: false,
-                                default: false,
-                                submenu: false,
-                            });
-                            menu.all_rows.extend(projected);
-                            if let Some(classic) = classic {
-                                if menu.all_rows.last().is_some_and(|row| row.separator) {
-                                    menu.all_rows.pop();
-                                }
-                                menu.all_rows.push(ContextCommandRow {
-                                    id: -1,
-                                    node_id: 0,
-                                    label: "".into(),
-                                    search_text: "".into(),
-                                    hint: "".into(),
-                                    enabled: false,
-                                    separator: true,
-                                    shell: true,
-                                    checked: false,
-                                    default: false,
-                                    submenu: false,
-                                });
-                                menu.all_rows.push(classic);
-                            }
-                        }
-                        ui.set_context_shell_loading(false);
-                        ui.set_context_shell_elapsed_ms(elapsed_ms.min(i32::MAX as u128) as i32);
-                        project_filtered_context_menu(
-                            &ui,
-                            &menu_state,
-                            ui.get_context_search().as_str(),
-                        );
-                        eprintln!(
-                            "{{\"event\":\"shell_menu_loaded\",\"session\":{session_id},\"request\":{request_id},\"elapsed_ms\":{elapsed_ms}}}"
-                        );
-                    }
-                    platform::windows::context_menu::ShellMenuEvent::SubmenuLoaded {
-                        session_id,
-                        request_id,
-                        submenu_request_id,
-                        token,
-                        items,
-                        elapsed_ms,
-                    } => {
-                        let item_count = items.len();
-                        let accepted = menu_state.lock().ok().is_some_and(|menu| {
-                            menu.identity.as_ref().is_some_and(|identity| {
-                                identity.session_id == session_id
-                                    && identity.request_id == request_id
-                            }) && menu.active_submenu_token == Some(token)
-                                && menu.active_submenu_request == submenu_request_id
-                                && ui.get_context_menu_open()
-                                && ui.get_context_submenu_open()
-                        });
-                        if !accepted {
-                            if let Ok(mut app) = state.lock() {
-                                app.operation_errors.push(format!(
-                                    "Shell submenu late result discarded: session={session_id} request={request_id} submenu_request={submenu_request_id} token={token} elapsed_ms={elapsed_ms}"
-                                ));
-                            }
-                            return;
-                        }
-                        if let Ok(mut menu) = menu_state.lock() {
-                            let rows = project_shell_menu_items(&mut menu, items);
-                            let rows = filtered_context_rows(&rows, "");
-                            menu.submenu_rows = rows;
-                        }
-                        ui.set_context_submenu_loading(false);
-                        project_context_submenu(&ui, &menu_state);
-                        eprintln!(
-                            "{{\"event\":\"shell_submenu_loaded\",\"session\":{session_id},\"request\":{request_id},\"submenu_request\":{submenu_request_id},\"token\":{token},\"item_count\":{item_count},\"elapsed_ms\":{elapsed_ms}}}"
-                        );
-                    }
-                    platform::windows::context_menu::ShellMenuEvent::SubmenuError {
-                        session_id,
-                        request_id,
-                        submenu_request_id,
-                        token,
-                        message,
-                        elapsed_ms,
-                    } => {
-                        let accepted = menu_state.lock().ok().is_some_and(|menu| {
-                            menu.identity.as_ref().is_some_and(|identity| {
-                                identity.session_id == session_id
-                                    && identity.request_id == request_id
-                            }) && menu.active_submenu_token == Some(token)
-                                && menu.active_submenu_request == submenu_request_id
-                        });
-                        if accepted {
-                            ui.set_context_submenu_loading(false);
-                        }
-                        if let Ok(mut app) = state.lock() {
-                            app.operation_errors.push(format!(
-                                "Shell submenu load failed after {elapsed_ms} ms: session={session_id} request={request_id} submenu_request={submenu_request_id} token={token}: {message}"
-                            ));
-                        }
-                    }
-                    platform::windows::context_menu::ShellMenuEvent::Invoked {
-                        session_id,
-                        request_id,
-                        invocation,
-                        elapsed_ms,
+                        ..
                     } => {
                         let identity = menu_state
                             .lock()
                             .ok()
                             .and_then(|menu| menu.identity.clone());
                         let accepted = identity.as_ref().is_some_and(|identity| {
-                            identity.session_id == session_id
-                                && identity.request_id == request_id
-                                && state
-                                    .lock()
-                                    .ok()
-                                    .and_then(|app| {
-                                        app.tab(identity.tab_id).map(|tab| {
-                                            (
-                                                tab.latest_request,
-                                                selected_paths(&app),
-                                                tab.visible_path().map(Path::to_path_buf),
-                                            )
-                                        })
-                                    })
-                                    .is_some_and(|(request, paths, folder)| {
-                                        request == identity.navigation_request
-                                            && paths == identity.paths
-                                            && folder == identity.folder
-                                    })
+                            quick_menu_key_is_current(&state, &identity.key)
                         });
                         if !accepted {
                             let _ = worker.send(
@@ -8245,11 +8268,114 @@ fn start_shell_menu_event_pump(
                                     request_id,
                                 },
                             );
+                            eprintln!(
+                                "{{\"event\":\"shell_menu_stale\",\"session\":{session_id},\"request\":{request_id},\"phase\":\"load\"}}"
+                            );
+                            return;
+                        }
+                        if let Ok(mut menu) = menu_state.lock() {
+                            menu.submenu_tokens.clear();
+                            menu.preloaded_submenu_rows.clear();
+                            menu.next_submenu_node = 0;
+                            let projected = project_shell_menu_items(&mut menu, items);
+                            if let Some(identity) = identity.as_ref() {
+                                menu.snapshots.insert(
+                                    identity.key.clone(),
+                                    QuickMenuSnapshot {
+                                        rows: projected.clone(),
+                                        captured_at: Instant::now(),
+                                    },
+                                );
+                                if let Some(current) = menu.identity.as_mut()
+                                    && current.session_id == session_id
+                                    && current.request_id == request_id
+                                {
+                                    current.ready = true;
+                                }
+                            }
+                            menu.all_rows =
+                                compose_quick_menu_rows(&menu.built_in_rows, &projected);
+                        }
+                        if ui.get_context_menu_open() {
+                            ui.set_context_shell_loading(false);
+                            ui.set_context_shell_elapsed_ms(elapsed_ms.min(i32::MAX as u128) as i32);
+                            project_filtered_context_menu(
+                                &ui,
+                                &menu_state,
+                                ui.get_context_search().as_str(),
+                            );
+                        }
+                        eprintln!(
+                            "{{\"event\":\"shell_menu_loaded\",\"session\":{session_id},\"request\":{request_id},\"elapsed_ms\":{elapsed_ms}}}"
+                        );
+                    }
+                    platform::windows::context_menu::ShellMenuEvent::SubmenuLoaded {
+                        submenu_request_id,
+                        token,
+                        items,
+                        elapsed_ms,
+                        ..
+                    } => {
+                        let accepted = menu_state.lock().ok().is_some_and(|menu| {
+                            menu.identity.as_ref().is_some_and(|identity| {
+                                quick_menu_key_is_current(&state, &identity.key)
+                            }) && menu.active_submenu_request == submenu_request_id
+                                && menu.active_submenu_token == Some(token)
+                        });
+                        if !accepted {
+                            return;
+                        }
+                        if let Ok(mut menu) = menu_state.lock() {
+                            menu.submenu_rows = project_shell_menu_items(&mut menu, items);
+                        }
+                        ui.set_context_submenu_loading(false);
+                        project_context_submenu(&ui, &menu_state);
+                        eprintln!(
+                            "{{\"event\":\"shell_submenu_loaded\",\"session\":{session_id},\"request\":{request_id},\"elapsed_ms\":{elapsed_ms}}}"
+                        );
+                    }
+                    platform::windows::context_menu::ShellMenuEvent::SubmenuError {
+                        submenu_request_id,
+                        token,
+                        message,
+                        elapsed_ms,
+                        ..
+                    } => {
+                        let accepted = menu_state.lock().ok().is_some_and(|menu| {
+                            menu.identity.as_ref().is_some_and(|identity| {
+                                identity.session_id == session_id
+                                    && identity.request_id == request_id
+                                    && quick_menu_key_is_current(&state, &identity.key)
+                            }) && menu.active_submenu_request == submenu_request_id
+                                && menu.active_submenu_token == Some(token)
+                        });
+                        if accepted {
+                            ui.set_context_submenu_loading(false);
                             if let Ok(mut app) = state.lock() {
                                 app.operation_errors.push(format!(
-                                    "Shell menu stale invocation discarded: session={session_id} request={request_id}"
+                                    "Shell submenu failed after {elapsed_ms} ms: {message}"
                                 ));
                             }
+                        }
+                    }
+                    platform::windows::context_menu::ShellMenuEvent::Invoked {
+                        invocation,
+                        elapsed_ms,
+                        ..
+                    } => {
+                        let identity = menu_state
+                            .lock()
+                            .ok()
+                            .and_then(|menu| menu.identity.clone());
+                        if !identity.as_ref().is_some_and(|identity| {
+                            quick_menu_key_is_current(&state, &identity.key)
+                        }) {
+                            let _ = worker.send(
+                                platform::windows::context_menu::ShellMenuCommand::Close {
+                                    session_id,
+                                    request_id,
+                                },
+                            );
                             return;
                         }
                         if let platform::windows::context_menu::ClassicMenuInvocation::BuiltIn {
@@ -8264,7 +8390,9 @@ fn start_shell_menu_event_pump(
                                 "rename" => ui.invoke_begin_rename(),
                                 _ => {}
                             }
-                        } else if let Some(folder) = identity.and_then(|identity| identity.folder) {
+                        } else if let Some(folder) =
+                            identity.and_then(|identity| identity.key.folder)
+                        {
                             refresh_affected_tabs(&directory_sender, &state, &[folder]);
                         }
                         let _ =
@@ -8277,17 +8405,31 @@ fn start_shell_menu_event_pump(
                         );
                     }
                     platform::windows::context_menu::ShellMenuEvent::Error {
-                        session_id,
-                        request_id,
                         operation,
                         message,
                         elapsed_ms,
+                        ..
                     } => {
-                        ui.set_context_shell_loading(false);
-                        if let Ok(mut app) = state.lock() {
-                            app.operation_errors.push(format!(
-                                "Shell menu {operation} failed after {elapsed_ms} ms: {message}"
-                            ));
+                        let current = menu_state.lock().ok().is_some_and(|menu| {
+                            menu.identity.as_ref().is_some_and(|identity| {
+                                identity.session_id == session_id
+                                    && identity.request_id == request_id
+                            })
+                        });
+                        if current {
+                            ui.set_context_shell_loading(false);
+                            if let Ok(mut menu) = menu_state.lock() {
+                                menu.identity = None;
+                            }
+                            if let Ok(mut app) = state.lock() {
+                                app.operation_errors.push(format!(
+                                    "Shell menu {operation} failed after {elapsed_ms} ms: {message}"
+                                ));
+                            }
+                        } else {
+                            eprintln!(
+                                "{{\"event\":\"shell_menu_stale_error\",\"session\":{session_id},\"request\":{request_id},\"operation\":\"{operation}\",\"elapsed_ms\":{elapsed_ms}}}"
+                            );
                         }
                         let _ =
                             worker.send(platform::windows::context_menu::ShellMenuCommand::Close {
@@ -8295,13 +8437,21 @@ fn start_shell_menu_event_pump(
                                 request_id,
                             });
                     }
-                    platform::windows::context_menu::ShellMenuEvent::Closed { .. } => {}
+                    platform::windows::context_menu::ShellMenuEvent::Closed { .. } => {
+                        if let Ok(mut menu) = menu_state.lock()
+                            && menu.identity.as_ref().is_some_and(|identity| {
+                                identity.session_id == session_id
+                                    && identity.request_id == request_id
+                            })
+                        {
+                            menu.identity = None;
+                        }
+                    }
                 }
             });
         }
     });
 }
-
 fn start_clipboard_event_pump(
     ui: &AppWindow,
     receiver: mpsc::Receiver<ClipboardEvent>,
@@ -11870,9 +12020,107 @@ mod tests {
             checked: false,
             default: false,
             submenu: false,
+            loading: false,
+            placeholder: false,
         }
     }
 
+    #[test]
+    fn quick_menu_composes_built_ins_before_single_shell_separator() {
+        let built_ins = vec![
+            context_test_row(1, "New folder", "", false),
+            context_test_row(4, "Paste", "", false),
+        ];
+        let shell = vec![
+            context_test_row(SHELL_CONTEXT_COMMAND_BASE + 1, "Open terminal", "", false),
+            context_test_row(SHELL_CONTEXT_COMMAND_BASE + 2, "Properties", "", false),
+        ];
+        let rows = compose_quick_menu_rows(&built_ins, &shell);
+        assert_eq!(
+            rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [
+                1,
+                4,
+                -1,
+                SHELL_CONTEXT_COMMAND_BASE + 1,
+                SHELL_CONTEXT_COMMAND_BASE + 2
+            ]
+        );
+        assert_eq!(rows.iter().filter(|row| row.separator).count(), 1);
+        assert!(rows[..2].iter().all(|row| !row.shell));
+        assert!(rows[3..].iter().all(|row| row.shell));
+    }
+
+    #[test]
+    fn quick_menu_placeholder_and_pending_snapshot_are_not_interactive() {
+        let placeholder = quick_menu_placeholder();
+        assert!(placeholder.placeholder && placeholder.loading && !placeholder.enabled);
+        let pending = pending_shell_rows(&[
+            context_test_row(SHELL_CONTEXT_COMMAND_BASE + 1, "Properties", "", false),
+            quick_menu_separator(),
+        ]);
+        assert!(!pending[0].enabled && pending[0].loading && !pending[0].placeholder);
+        assert!(pending[1].separator && !pending[1].enabled && !pending[1].loading);
+        assert_eq!(first_enabled_context_index(&pending), -1);
+    }
+
+    #[test]
+    fn quick_menu_inflight_prewarm_projects_placeholders_until_snapshot_arrives() {
+        let (rows, loading, cache_hit, session_hit) = project_cached_shell_rows(true, None);
+        assert!(loading && !cache_hit && !session_hit);
+        assert_eq!(rows.len(), QUICK_MENU_PLACEHOLDER_ROWS);
+        assert!(
+            rows.iter()
+                .all(|row| row.placeholder && row.loading && !row.enabled)
+        );
+    }
+
+    #[test]
+    fn quick_menu_expired_snapshot_projects_placeholders() {
+        let snapshot = QuickMenuSnapshot {
+            rows: vec![context_test_row(
+                SHELL_CONTEXT_COMMAND_BASE + 1,
+                "Old",
+                "",
+                false,
+            )],
+            captured_at: Instant::now() - QUICK_MENU_SNAPSHOT_TTL - Duration::from_millis(1),
+        };
+        let (rows, loading, cache_hit, session_hit) =
+            project_cached_shell_rows(true, Some(&snapshot));
+        assert!(loading && !cache_hit && !session_hit);
+        assert_eq!(rows.len(), QUICK_MENU_PLACEHOLDER_ROWS);
+        assert!(rows.iter().all(|row| row.placeholder));
+    }
+    #[test]
+    fn quick_menu_snapshots_are_isolated_by_full_context_key() {
+        let first = QuickMenuKey {
+            window_id: WindowId(1),
+            tab_id: TabId(2),
+            navigation_request: RequestId(3),
+            paths: vec![PathBuf::from(r"C:\first.txt")],
+            folder: Some(PathBuf::from(r"C:\")),
+        };
+        let second = QuickMenuKey {
+            paths: vec![PathBuf::from(r"C:\second.txt")],
+            ..first.clone()
+        };
+        let mut snapshots = HashMap::new();
+        snapshots.insert(
+            first.clone(),
+            QuickMenuSnapshot {
+                rows: vec![context_test_row(
+                    SHELL_CONTEXT_COMMAND_BASE + 1,
+                    "First",
+                    "",
+                    false,
+                )],
+                captured_at: Instant::now(),
+            },
+        );
+        assert!(snapshots.contains_key(&first));
+        assert!(!snapshots.contains_key(&second));
+    }
     #[test]
     fn quick_menu_filter_matches_case_chinese_and_command_verb_without_shell_work() {
         let rows = vec![
