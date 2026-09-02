@@ -11968,8 +11968,8 @@ mod tests {
             &mut menu,
             vec![ClassicMenuItem {
                 command_id: Some(31),
-                title: "Give access to".to_owned(),
-                verb: Some("windows.share".to_owned()),
+                title: "PowerShell 7".to_owned(),
+                verb: Some("powershell7x64".to_owned()),
                 enabled: true,
                 checked: false,
                 default: false,
@@ -11977,7 +11977,7 @@ mod tests {
                     token: 2,
                     items: vec![ClassicMenuItem {
                         command_id: Some(32_770),
-                        title: "Remove access".to_owned(),
+                        title: "Open here".to_owned(),
                         verb: None,
                         enabled: true,
                         checked: false,
@@ -11992,9 +11992,9 @@ mod tests {
         let children = menu
             .preloaded_submenu_rows
             .get(&2)
-            .expect("preloaded sharing rows");
+            .expect("preloaded PowerShell rows");
         assert_eq!(children.len(), 1);
-        assert_eq!(children[0].label.as_str(), "Remove access");
+        assert_eq!(children[0].label.as_str(), "Open here");
         assert_eq!(children[0].id, SHELL_CONTEXT_COMMAND_BASE + 32_770);
     }
     #[test]

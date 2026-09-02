@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 use std::{
-    cell::Cell,
     io,
     marker::PhantomData,
     mem::size_of,
@@ -24,17 +23,15 @@ use windows::{
                 SHBindToParent, SHParseDisplayName,
             },
             WindowsAndMessaging::{
-                CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-                DispatchMessageW, GetMenuItemCount, GetMenuItemInfoW, HMENU, MENUITEMINFOW,
-                MFS_CHECKED, MFS_DEFAULT, MFS_DISABLED, MFT_SEPARATOR, MIIM_FTYPE, MIIM_ID,
-                MIIM_STATE, MIIM_STRING, MIIM_SUBMENU, MSG, PM_NOREMOVE, PM_REMOVE, PeekMessageW,
-                RegisterClassW, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
-                TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DRAWITEM, WM_INITMENUPOPUP,
-                WM_MEASUREITEM, WM_MENUCHAR, WNDCLASSW,
+                CreatePopupMenu, DestroyMenu, DispatchMessageW, GetMenuItemCount, GetMenuItemInfoW,
+                HMENU, MENUITEMINFOW, MFS_CHECKED, MFS_DEFAULT, MFS_DISABLED, MFT_SEPARATOR,
+                MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING, MIIM_SUBMENU, MSG, PM_NOREMOVE,
+                PM_REMOVE, PeekMessageW, SW_SHOWNORMAL, TranslateMessage, WM_DRAWITEM,
+                WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
             },
         },
     },
-    core::{Interface, PCSTR, PCWSTR, PSTR, PWSTR, w},
+    core::{Interface, PCSTR, PCWSTR, PSTR, PWSTR},
 };
 use windows_sys::Win32::System::Registry::{HKEY_CLASSES_ROOT, RRF_RT_REG_SZ, RegGetValueW};
 
@@ -43,11 +40,6 @@ const LAST_COMMAND_ID: u32 = 0x7fff;
 const DYNAMIC_SUBMENU_WAIT: Duration = Duration::from_millis(300);
 const DYNAMIC_SUBMENU_POLL: Duration = Duration::from_millis(10);
 const REGISTRY_COMMAND_VERB_PREFIX: &str = "registry-command:";
-const MENU_WINDOW_CLASS: PCWSTR = w!("AsterFiles.ClassicMenuOwner");
-
-thread_local! {
-    static ACTIVE_MENU_SESSION: Cell<*const ClassicMenuSession> = const { Cell::new(ptr::null()) };
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassicMenuItem {
@@ -365,8 +357,6 @@ pub struct ClassicMenuSession {
     registry_commands: std::collections::HashMap<u32, RegistryCascadeCommand>,
     folder: Option<PathBuf>,
     preloaded_submenus: std::collections::HashMap<ShellMenuSubmenuToken, Vec<ClassicMenuItem>>,
-    folder_equivalent: Option<Box<ClassicMenuSession>>,
-    folder_equivalent_commands: std::collections::HashMap<u32, u32>,
     _thread_affinity: PhantomData<Rc<()>>,
 }
 
@@ -466,8 +456,6 @@ impl ClassicMenuSession {
             registry_commands: std::collections::HashMap::new(),
             folder,
             preloaded_submenus: std::collections::HashMap::new(),
-            folder_equivalent: None,
-            folder_equivalent_commands: std::collections::HashMap::new(),
             _thread_affinity: PhantomData,
         })
     }
@@ -541,18 +529,9 @@ impl ClassicMenuSession {
     }
 
     fn preload_background_submenus(&mut self, items: &mut [ClassicMenuItem]) {
-        let Some(folder) = self.folder.clone() else {
+        if self.folder.is_none() {
             return;
-        };
-        let Ok(mut equivalent) =
-            ClassicMenuSession::for_paths_with_owner(std::slice::from_ref(&folder), false, 0)
-        else {
-            return;
-        };
-        let Ok(equivalent_items) = equivalent.items_top_level() else {
-            return;
-        };
-        let mut next_command_id = LAST_COMMAND_ID + 1;
+        }
         for item in items {
             let ClassicMenuItemKind::Submenu {
                 token,
@@ -561,61 +540,17 @@ impl ClassicMenuSession {
             else {
                 continue;
             };
-            let Some(verb) = item
-                .verb
-                .as_deref()
-                .filter(|verb| matches!(*verb, "powershell7x64" | "windows.share"))
-            else {
-                continue;
-            };
-            let Some(equivalent_token) =
-                equivalent_items
-                    .iter()
-                    .find_map(|candidate| match &candidate.kind {
-                        ClassicMenuItemKind::Submenu { token, .. }
-                            if candidate.verb.as_deref() == Some(verb) =>
-                        {
-                            Some(*token)
-                        }
-                        _ => None,
-                    })
-            else {
-                continue;
-            };
-            let Ok(mut equivalent_children) = equivalent.load_submenu(equivalent_token) else {
-                continue;
-            };
-            Self::remap_equivalent_commands(
-                &mut equivalent_children,
-                &mut next_command_id,
-                &mut self.folder_equivalent_commands,
-            );
-            if equivalent_children.is_empty() {
+            if item.verb.as_deref() != Some("powershell7x64") {
                 continue;
             }
-            *children = equivalent_children.clone();
-            self.preloaded_submenus.insert(*token, equivalent_children);
-        }
-        if !self.folder_equivalent_commands.is_empty() {
-            self.folder_equivalent = Some(Box::new(equivalent));
-        }
-    }
-
-    fn remap_equivalent_commands(
-        items: &mut [ClassicMenuItem],
-        next_command_id: &mut u32,
-        commands: &mut std::collections::HashMap<u32, u32>,
-    ) {
-        for item in items {
-            if let Some(source_id) = item.command_id {
-                let projected_id = *next_command_id;
-                commands.insert(projected_id, source_id);
-                item.command_id = Some(projected_id);
-                *next_command_id = next_command_id.saturating_add(1);
+            let Ok(loaded) = self.load_submenu(*token) else {
+                continue;
+            };
+            if loaded.is_empty() {
+                continue;
             }
-            if let ClassicMenuItemKind::Submenu { items, .. } = &mut item.kind {
-                Self::remap_equivalent_commands(items, next_command_id, commands);
-            }
+            *children = loaded.clone();
+            self.preloaded_submenus.insert(*token, loaded);
         }
     }
     fn submenu_verb(&self, token: ShellMenuSubmenuToken) -> Option<String> {
@@ -634,13 +569,6 @@ impl ClassicMenuSession {
         screen_x: i32,
         screen_y: i32,
     ) -> io::Result<ClassicMenuInvocation> {
-        if let Some(source_id) = self.folder_equivalent_commands.get(&command_id) {
-            return self
-                .folder_equivalent
-                .as_ref()
-                .ok_or_else(|| io::Error::other("folder-equivalent menu was already released"))?
-                .invoke_command(*source_id, owner_window, screen_x, screen_y);
-        }
         let offset = command_id
             .checked_sub(FIRST_COMMAND_ID)
             .ok_or_else(|| io::Error::other("shell returned an invalid menu command"))?;
@@ -683,30 +611,6 @@ impl ClassicMenuSession {
         let base = (&invocation as *const CMINVOKECOMMANDINFOEX).cast();
         unsafe { context_menu.InvokeCommand(&*base) }.map_err(windows_error)?;
         Ok(ClassicMenuInvocation::Shell { verb })
-    }
-    pub fn show_native_and_invoke(
-        &self,
-        owner_window: isize,
-        screen_x: i32,
-        screen_y: i32,
-    ) -> io::Result<Option<ClassicMenuInvocation>> {
-        let popup_owner = PopupOwner::create(HWND(owner_window as *mut _), self)?;
-        let selected = unsafe {
-            TrackPopupMenuEx(
-                self.menu,
-                (TPM_RETURNCMD | TPM_RIGHTBUTTON).0,
-                screen_x,
-                screen_y,
-                popup_owner.hwnd,
-                None,
-            )
-        };
-        if selected.0 == 0 {
-            return Ok(None);
-        }
-        let command_id = selected.0 as u32;
-        self.invoke_command(command_id, owner_window, screen_x, screen_y)
-            .map(Some)
     }
 
     fn initialize_submenu(&self, parent: HMENU, submenu: HMENU, position: u32) {
@@ -963,71 +867,6 @@ impl Drop for ClassicMenuSession {
             unsafe { CoUninitialize() };
         }
     }
-}
-
-struct PopupOwner {
-    hwnd: HWND,
-}
-impl PopupOwner {
-    fn create(parent: HWND, session: &ClassicMenuSession) -> io::Result<Self> {
-        let class = WNDCLASSW {
-            lpfnWndProc: Some(menu_window_proc),
-            lpszClassName: MENU_WINDOW_CLASS,
-            ..Default::default()
-        };
-        unsafe {
-            let _ = RegisterClassW(&class);
-        }
-        ACTIVE_MENU_SESSION.with(|active| active.set(session));
-        match unsafe {
-            CreateWindowExW(
-                WINDOW_EX_STYLE::default(),
-                MENU_WINDOW_CLASS,
-                w!(""),
-                WINDOW_STYLE::default(),
-                0,
-                0,
-                0,
-                0,
-                (!parent.is_invalid()).then_some(parent),
-                None,
-                None,
-                None,
-            )
-        } {
-            Ok(hwnd) => Ok(Self { hwnd }),
-            Err(error) => {
-                ACTIVE_MENU_SESSION.with(|active| active.set(ptr::null()));
-                Err(windows_error(error))
-            }
-        }
-    }
-}
-impl Drop for PopupOwner {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = DestroyWindow(self.hwnd);
-        }
-        ACTIVE_MENU_SESSION.with(|active| active.set(ptr::null()));
-    }
-}
-
-unsafe extern "system" fn menu_window_proc(
-    hwnd: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    if let Some(result) = ACTIVE_MENU_SESSION
-        .with(|active| {
-            let session = active.get();
-            (!session.is_null()).then(|| unsafe { &*session })
-        })
-        .and_then(|session| session.forward_menu_message(message, wparam, lparam))
-    {
-        return result;
-    }
-    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
 fn validate_selection(paths: &[PathBuf]) -> io::Result<()> {
@@ -1423,32 +1262,6 @@ mod tests {
         assert_eq!(item.command_id, None);
     }
 
-    #[test]
-    #[ignore = "requires the real Windows shell extensions installed on this machine"]
-    fn probe_preloaded_background_submenus_use_folder_equivalent_items() {
-        let folder = std::env::current_dir().expect("current directory");
-        let mut background = ClassicMenuSession::for_background_with_owner(&folder, false, 0)
-            .expect("create background menu");
-        let mut items = background.items_top_level().expect("background top level");
-        background.preload_background_submenus(&mut items);
-        for verb in ["powershell7x64", "windows.share"] {
-            let (token, projected) = items
-                .iter()
-                .find_map(|item| match &item.kind {
-                    ClassicMenuItemKind::Submenu { token, items }
-                        if item.verb.as_deref() == Some(verb) =>
-                    {
-                        Some((*token, items.clone()))
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| panic!("missing background submenu {verb}"));
-            let loaded = background.load_submenu(token).expect("preloaded submenu");
-            eprintln!("preloaded {verb}: projected={projected:?} loaded={loaded:?}");
-            assert!(!projected.is_empty(), "{verb} projected children");
-            assert_eq!(loaded, projected);
-        }
-    }
     #[test]
     #[ignore = "requires the real Windows shell extensions installed on this machine"]
     fn probe_background_and_selected_folder_submenus() {
