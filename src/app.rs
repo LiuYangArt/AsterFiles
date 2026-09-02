@@ -3762,19 +3762,6 @@ fn project_context_menu(
             submenu: false,
         });
     }
-    rows.push(ContextCommandRow {
-        id: 8,
-        node_id: 0,
-        label: label("显示完整经典菜单", "Show full classic menu").into(),
-        enabled: background || selected > 0,
-        separator: false,
-        search_text: "".into(),
-        hint: "".into(),
-        shell: false,
-        checked: false,
-        default: false,
-        submenu: false,
-    });
     if let Ok(mut menu) = menu.lock() {
         menu.all_rows = rows;
         menu.submenu_rows.clear();
@@ -3793,102 +3780,7 @@ fn project_context_menu(
         VecModel::from(Vec::<ContextCommandRow>::new()),
     ));
     project_filtered_context_menu(ui, menu, "");
-    ui.set_context_menu_on_background(background);
     ui.set_context_menu_open(true);
-}
-
-fn show_classic_menu(
-    weak: slint::Weak<AppWindow>,
-    state: &SharedSessions,
-    directory_sender: mpsc::Sender<DirectoryRequest>,
-    background: bool,
-    owner_window: isize,
-    screen_x: i32,
-    screen_y: i32,
-) {
-    let (paths, folder) = state
-        .lock()
-        .map(|app| {
-            (
-                selected_paths(&app),
-                app.active().visible_path().map(Path::to_path_buf),
-            )
-        })
-        .unwrap_or_default();
-    if background && folder.is_none() || !background && paths.is_empty() {
-        return;
-    }
-    let state = state.clone();
-    thread::spawn(move || {
-        let session = if background {
-            platform::windows::context_menu::ClassicMenuSession::for_background_with_owner(
-                folder.as_deref().expect("background folder"),
-                true,
-                owner_window,
-            )
-        } else {
-            platform::windows::context_menu::ClassicMenuSession::for_paths_with_owner(
-                &paths,
-                true,
-                owner_window,
-            )
-        };
-        let affected_folders = if background {
-            folder.iter().cloned().collect::<Vec<_>>()
-        } else {
-            let mut parents = paths
-                .iter()
-                .filter_map(|path| path.parent().map(Path::to_path_buf))
-                .collect::<Vec<_>>();
-            parents.sort();
-            parents.dedup();
-            parents
-        };
-        match session.and_then(|session| {
-            let _ = session.items()?;
-            session.show_native_and_invoke(owner_window, screen_x, screen_y)
-        }) {
-            Ok(Some(platform::windows::context_menu::ClassicMenuInvocation::BuiltIn { verb })) => {
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = weak.upgrade() {
-                        match verb.as_str() {
-                            "copy" => ui.invoke_copy_selection(false),
-                            "cut" => ui.invoke_copy_selection(true),
-                            "paste" => ui.invoke_paste_files(),
-                            "delete" => ui.invoke_request_delete(false),
-                            "rename" => ui.invoke_begin_rename(),
-                            _ => {}
-                        }
-                    }
-                });
-            }
-            Ok(_) => {
-                if !affected_folders.is_empty() {
-                    let state_for_refresh = state.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(200));
-                        let _ = slint::invoke_from_event_loop(move || {
-                            refresh_affected_tabs(
-                                &directory_sender,
-                                &state_for_refresh,
-                                &affected_folders,
-                            );
-                        });
-                    });
-                }
-            }
-            Err(error) => {
-                let state_for_error = state.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Ok(mut app) = state_for_error.lock() {
-                        app.operation_errors
-                            .push(format!("Classic menu failed: {error}"));
-                    }
-                    refresh_all_windows(&state_for_error);
-                });
-            }
-        }
-    });
 }
 
 fn native_window_handle(ui: &AppWindow) -> isize {
@@ -6031,6 +5923,8 @@ fn wire_callbacks(
         };
         ui.set_context_submenu_open(true);
         if encoded_index < 0 {
+            ui.set_context_submenu_parent_anchor_y(ui.get_context_submenu_anchor_y());
+            ui.set_context_submenu_anchor_y(ui.get_context_submenu_active_anchor_y());
             let parent_rows = quick_menu_for_submenu
                 .lock()
                 .ok()
@@ -6097,8 +5991,6 @@ fn wire_callbacks(
             && !row.separator
         {
             if row.submenu {
-                ui.set_context_submenu_parent_anchor_y(ui.get_context_submenu_anchor_y());
-                ui.set_context_submenu_anchor_y(ui.get_context_submenu_active_anchor_y());
                 ui.invoke_open_context_submenu(-index - 1);
             } else {
                 ui.set_context_menu_open(false);
@@ -6166,22 +6058,6 @@ fn wire_callbacks(
                     (weak.upgrade(), delete_weak_for_context.upgrade())
                 {
                     show_confirmation_window(&ui, None, &delete_ui);
-                }
-            }
-            8 => {
-                let (background, x, y) = *context_anchor.lock().expect("context anchor mutex");
-                if let Some(ui) = weak.upgrade() {
-                    let origin = ui.window().position();
-                    let scale = ui.window().scale_factor();
-                    show_classic_menu(
-                        weak.clone(),
-                        &state_for_context_command,
-                        sender.clone(),
-                        background,
-                        native_window_handle(&ui),
-                        origin.x + (x as f32 * scale).round() as i32,
-                        origin.y + (y as f32 * scale).round() as i32,
-                    );
                 }
             }
             command if command >= SHELL_CONTEXT_COMMAND_BASE => {

@@ -689,7 +689,6 @@ export component AppWindow inherits Window {
     in property <string> text-drop-move: "移动到此处";
     in property <string> text-drop-link: "在此处创建快捷方式";
     in property <string> text-drop-cancel: "取消";
-    in property <bool> context-menu-on-background: false;
     in-out property <bool> task-center-open: false;
     in-out property <string> rename-input: "";
     in property <int> rename-entry-id: -1;
@@ -1942,7 +1941,7 @@ accessible-label: entry.name;
                         if event.text == Key.UpArrow { if root.context-submenu-open { root.move-context-submenu-selection(-1); } else { root.move-context-selection(-1); } return accept; }
                         if event.text == Key.DownArrow { if root.context-submenu-open { root.move-context-submenu-selection(1); } else { root.move-context-selection(1); } return accept; }
                         if event.text == Key.RightArrow {
-                            root.context-submenu-anchor-y = root.context-submenu-open ? root.context-submenu-active-anchor-y : root.context-active-anchor-y;
+                            if !root.context-submenu-open { root.context-submenu-anchor-y = root.context-active-anchor-y; }
                             root.open-context-submenu(root.context-submenu-open ? -root.context-submenu-active-index - 1 : root.context-active-index);
                             return accept;
                         }
@@ -2030,8 +2029,6 @@ accessible-label: entry.name;
                             moved => { root.context-submenu-active-index = index; }
                             clicked => {
                                 if command.submenu {
-                                    root.context-submenu-parent-anchor-y = submenu-panel.y;
-                                    root.context-submenu-anchor-y = self.absolute-position.y - root.absolute-position.y;
                                     root.open-context-submenu(-index - 1);
                                 }
                                 else { root.context-menu-open = false; root.invoke-context-command(command.id); if !command.shell { root.dismiss-context-menu(); } }
@@ -2040,15 +2037,15 @@ accessible-label: entry.name;
                         changed submenu-hovered => {
                             if submenu-hovered {
                                 root.context-submenu-active-index = index;
-                                root.context-submenu-parent-anchor-y = submenu-panel.y;
-                                root.context-submenu-anchor-y = self.absolute-position.y - root.absolute-position.y;
                                 if command.submenu { root.hover-context-submenu(-index - 1); }
                                 else { root.cancel-context-submenu-hover(); }
                             }
                             else if command.submenu { root.cancel-context-submenu-hover(); }
                         }
                         changed submenu-active => {
-                            if submenu-active { root.context-submenu-active-anchor-y = self.absolute-position.y - root.absolute-position.y; }
+                            if submenu-active {
+                                root.context-submenu-active-anchor-y = self.absolute-position.y - root.absolute-position.y;
+                            }
                         }
                     }
                 }
@@ -2079,7 +2076,8 @@ accessible-label: entry.name;
                     clicked => {
                         root.close-context-submenu();
                         if command.submenu {
-                            root.context-submenu-anchor-y = self.absolute-position.y - root.absolute-position.y;
+                            root.context-submenu-active-index = index;
+                            root.context-submenu-active-anchor-y = self.absolute-position.y - root.absolute-position.y;
                             root.open-context-submenu(-index - 1);
                         }
                         else { root.context-menu-open = false; root.invoke-context-command(command.id); if !command.shell { root.dismiss-context-menu(); } }
@@ -2089,7 +2087,8 @@ accessible-label: entry.name;
                     if parent-submenu-hovered {
                         if command.submenu {
                             root.close-context-submenu();
-                            root.context-submenu-anchor-y = self.absolute-position.y - root.absolute-position.y;
+                            root.context-submenu-active-index = index;
+                            root.context-submenu-active-anchor-y = self.absolute-position.y - root.absolute-position.y;
                             root.hover-context-submenu(-index - 1);
                         }
                         else { root.cancel-context-submenu-hover(); }

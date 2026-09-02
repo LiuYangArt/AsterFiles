@@ -97,7 +97,9 @@
 
 P2 的完整设计见 [P2 基础文件操作与右键菜单实施方案](p2-file-operations-plan.md)。文件任务中心属于应用级共享设施，使用独立 `OperationId` 和工作池，不复用标签导航的 `RequestId`，也不得占用目录读取或 Shell 图标线程。UI 只提交 `TabId + EntryId` 等意图；应用协调层在提交时解析为 Rust 原始路径快照，后台操作与 Windows Shell/COM 继续放在各自独立模块。
 
-文件操作完成后发出基于原始路径的变化事件，应用协调层更新所有显示源目录或目标目录的标签；无法安全局部投影时，只为受影响标签生成新的目录 `RequestId` 并定向刷新。复制、移动、回收站删除和永久删除的取消只停止未开始工作，不回滚已经完成的项目；界面必须准确显示部分完成。右键菜单是 P2 的主要功能入口，基础文件命令进入 AsterFiles 任务中心，其他 Shell 命令通过 Windows 执行。现有“显示完整经典菜单”保持为兼容入口；后续菜单改造归入独立的 [Windows Shell 菜单集成 Feature](windows-shell-menu-feature.md)，不属于 P3。
+文件操作完成后发出基于原始路径的变化事件，应用协调层更新所有显示源目录或目标目录的标签；无法安全局部投影时，只为受影响标签生成新的目录 `RequestId` 并定向刷新。复制、移动、回收站删除和永久删除的取消只停止未开始工作，不回滚已经完成的项目；界面必须准确显示部分完成。右键菜单是 P2 的主要功能入口，基础文件命令进入 AsterFiles 任务中心，其他 Shell 命令通过 Windows 执行。Windows Shell 普通项和普通子菜单直接投影到可搜索快速菜单；菜单改造归入独立的 [Windows Shell 菜单集成 Feature](windows-shell-menu-feature.md)，不属于 P3。
+
+Issue #13 第一阶段把快速菜单请求绑定窗口、`TabId + RequestId`、原始目录和选择路径快照；UI 只接收不可执行的显示模型与稳定命令句柄，搜索只过滤已加载内存模型。专用可复用 STA worker 在同一线程创建、使用和释放 `IContextMenu`/`HMENU`，加载与调用均校验会话/请求代次，导航、切换、重复右键或关闭后的迟到结果不得更新或执行当前菜单。AsterFiles 已接管命令继续进入任务中心；动态、自绘或无法可靠投影的项目记录明确诊断，不再保留重复的完整经典菜单入口。普通子菜单使用与 Shell command ID 分离的应用内 token，在所属 STA 会话内按层发送 `WM_INITMENUPOPUP` 并读取；每层携带独立请求代次，UI 只执行叶子项的原始 command ID。
 
 ## P3 Windows 拖放接入边界
 
