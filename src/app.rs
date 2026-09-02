@@ -11,7 +11,7 @@ use std::{
 };
 
 use slint::{
-    Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel,
+    Color, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel,
     winit_030::winit::event::MouseScrollDelta,
     winit_030::{EventResult, WinitWindowAccessor, winit},
 };
@@ -857,7 +857,9 @@ fn insertion_indicator_screen_rect(
     Some((
         left + (logical_x * scale).round() as i32,
         top + (12.0 * scale).round() as i32,
-        (5.0 * scale).round().max(1.0) as i32,
+        (platform::windows::tab_insertion_indicator::INDICATOR_WIDTH * scale)
+            .round()
+            .max(1.0) as i32,
         (34.0 * scale).round().max(1.0) as i32,
     ))
 }
@@ -1070,6 +1072,31 @@ fn external_tab_insertion_slot(
 }
 
 const TAB_DRAG_THRESHOLD: f32 = 6.0;
+const COLUMN_DRAG_THRESHOLD: f32 = TAB_DRAG_THRESHOLD;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnDragPhase {
+    Pressed,
+    Dragging { insertion_slot: Option<usize> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ColumnDragSession {
+    window_id: WindowId,
+    source: PageSource,
+    kind: u8,
+    press_x: f32,
+    press_y: f32,
+    phase: ColumnDragPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ColumnHeaderGeometry {
+    x: f32,
+    y: f32,
+    width: f32,
+    viewport_x: f32,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum TabDragPhase {
@@ -1209,6 +1236,7 @@ struct AppState {
     everything_folder_sizes_indexed: Option<bool>,
     pending_right_drop: Option<platform::windows::drag_drop::DropIntent>,
     tab_drag: Option<TabDragSession>,
+    column_drag: Option<ColumnDragSession>,
 }
 
 impl AppState {
@@ -1341,6 +1369,7 @@ impl AppState {
             everything_folder_sizes_indexed: None,
             pending_right_drop: None,
             tab_drag: None,
+            column_drag: None,
         }
     }
 
@@ -1721,6 +1750,129 @@ impl AppState {
         self.tab_drag.take().is_some()
     }
 
+    fn begin_column_drag(
+        &mut self,
+        window_id: WindowId,
+        kind: u8,
+        press_x: f32,
+        press_y: f32,
+    ) -> bool {
+        if kind >= 4 || !press_x.is_finite() || !press_y.is_finite() {
+            return false;
+        }
+        let Some(window) = self.windows.get(&window_id) else {
+            return false;
+        };
+        let source = window.active().page_source;
+        let order = if source == PageSource::Search {
+            self.search_column_order
+        } else {
+            self.column_order
+        };
+        if !order.contains(&kind) {
+            return false;
+        }
+        self.column_drag = Some(ColumnDragSession {
+            window_id,
+            source,
+            kind,
+            press_x,
+            press_y,
+            phase: ColumnDragPhase::Pressed,
+        });
+        true
+    }
+
+    fn update_column_drag(
+        &mut self,
+        pointer_x: f32,
+        pointer_y: f32,
+        header_x: f32,
+        header_y: f32,
+        header_width: f32,
+        viewport_x: f32,
+    ) -> Option<usize> {
+        let mut drag = self.column_drag?;
+        if !pointer_x.is_finite() || !pointer_y.is_finite() {
+            return None;
+        }
+        if matches!(drag.phase, ColumnDragPhase::Pressed)
+            && (pointer_x - drag.press_x).hypot(pointer_y - drag.press_y) < COLUMN_DRAG_THRESHOLD
+        {
+            return None;
+        }
+        let current_source = self.windows.get(&drag.window_id)?.active().page_source;
+        if current_source != drag.source {
+            self.column_drag = None;
+            return None;
+        }
+        let (order, widths) = if drag.source == PageSource::Search {
+            (&self.search_column_order, &self.search_column_widths)
+        } else {
+            (&self.column_order, &self.column_widths)
+        };
+        let insertion_slot = column_insertion_slot(
+            pointer_x,
+            pointer_y,
+            ColumnHeaderGeometry {
+                x: header_x,
+                y: header_y,
+                width: header_width,
+                viewport_x,
+            },
+            order,
+            widths,
+        );
+        drag.phase = ColumnDragPhase::Dragging { insertion_slot };
+        self.column_drag = Some(drag);
+        insertion_slot
+    }
+
+    fn finish_column_drag(&mut self, valid_release: bool) -> bool {
+        let Some(drag) = self.column_drag.take() else {
+            return false;
+        };
+        let ColumnDragPhase::Dragging {
+            insertion_slot: Some(insertion_slot),
+        } = drag.phase
+        else {
+            return false;
+        };
+        if !valid_release
+            || self
+                .windows
+                .get(&drag.window_id)
+                .map(WindowState::active)
+                .map(|tab| tab.page_source)
+                != Some(drag.source)
+        {
+            return false;
+        }
+        self.commit_column_reorder(drag.source, drag.kind, insertion_slot)
+    }
+
+    fn commit_column_reorder(
+        &mut self,
+        source: PageSource,
+        kind: u8,
+        insertion_slot: usize,
+    ) -> bool {
+        let order = if source == PageSource::Search {
+            &mut self.search_column_order
+        } else {
+            &mut self.column_order
+        };
+        let Some(source_index) = order.iter().position(|candidate| *candidate == kind) else {
+            return false;
+        };
+        let target = normalized_column_slot(source_index, insertion_slot, order.len());
+        reorder_column_to_slot(order, kind, target)
+    }
+
+    fn cancel_column_drag(&mut self) -> bool {
+        self.column_drag.take().is_some()
+    }
+
     fn cancel_tab_drag_for_window(&mut self, window_id: WindowId) -> bool {
         if self
             .tab_drag
@@ -1887,11 +2039,11 @@ impl WindowState {
     }
 }
 
-fn reorder_column(order: &mut [u8; 4], kind: u8, offset: i32) -> bool {
+fn reorder_column_to_slot(order: &mut [u8; 4], kind: u8, insertion_slot: usize) -> bool {
     let Some(from) = order.iter().position(|candidate| *candidate == kind) else {
         return false;
     };
-    let target = (from as i32 + offset).clamp(0, order.len() as i32 - 1) as usize;
+    let target = insertion_slot.min(order.len() - 1);
     if from == target {
         return false;
     }
@@ -1903,6 +2055,40 @@ fn reorder_column(order: &mut [u8; 4], kind: u8, offset: i32) -> bool {
     }
     order[target] = moved;
     true
+}
+
+fn column_insertion_slot(
+    pointer_x: f32,
+    pointer_y: f32,
+    geometry: ColumnHeaderGeometry,
+    order: &[u8; 4],
+    widths: &[u32; 4],
+) -> Option<usize> {
+    if !pointer_x.is_finite()
+        || !geometry.x.is_finite()
+        || !geometry.width.is_finite()
+        || !geometry.viewport_x.is_finite()
+        || pointer_x < geometry.x
+        || pointer_x > geometry.x + geometry.width
+        || !(geometry.y..=geometry.y + 38.0).contains(&pointer_y)
+    {
+        return None;
+    }
+    let content_x = pointer_x - geometry.x - geometry.viewport_x;
+    let mut left = 0.0;
+    for (index, kind) in order.iter().enumerate() {
+        let width = widths.get(*kind as usize).copied()? as f32;
+        if content_x < left + width / 2.0 {
+            return Some(index);
+        }
+        left += width;
+    }
+    Some(order.len())
+}
+
+fn normalized_column_slot(source_index: usize, insertion_slot: usize, len: usize) -> usize {
+    let slot = insertion_slot.min(len);
+    if slot > source_index { slot - 1 } else { slot }
 }
 #[derive(Debug)]
 struct DirectoryRequest {
@@ -2656,6 +2842,7 @@ fn submit_navigation(
 ) -> bool {
     let request = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
+        app.cancel_column_drag();
         if let Some(tab) = app.tab_mut(tab_id) {
             cancel_folder_sizes(tab);
         }
@@ -5333,6 +5520,11 @@ fn wire_callbacks(
     let state_for_view = state.clone();
     let icon_for_view = icon_sender.clone();
     ui.on_change_view_mode(move |mode| {
+        if let Some(ui) = weak.upgrade()
+            && ui.get_column_dragging()
+        {
+            ui.invoke_cancel_column_drag();
+        }
         let mode = view_mode_from_ui(mode);
         let mut preserved_search_index = None;
         if let Ok(mut app) = state_for_view.lock() {
@@ -5377,21 +5569,45 @@ fn wire_callbacks(
             );
         }
     });
+    let state_for_columns = state.clone();
+    ui.on_begin_column_drag(move |kind, press_x, press_y| {
+        if let Ok(mut app) = state_for_columns.lock() {
+            let window_id = app.active_window;
+            app.begin_column_drag(window_id, kind as u8, press_x, press_y);
+        }
+    });
+    let state_for_columns = state.clone();
+    ui.on_update_column_drag(move |x, y, header_x, header_y, header_width, viewport_x| {
+        let Ok(mut app) = state_for_columns.lock() else {
+            return -2;
+        };
+        let slot = app.update_column_drag(x, y, header_x, header_y, header_width, viewport_x);
+        match app.column_drag.map(|drag| drag.phase) {
+            Some(ColumnDragPhase::Dragging { .. }) => slot.map(|slot| slot as i32).unwrap_or(-1),
+            _ => -2,
+        }
+    });
     let weak = ui.as_weak();
     let state_for_columns = state.clone();
-    ui.on_reorder_column(move |kind, offset| {
-        let mut app = state_for_columns
+    ui.on_end_column_drag(move |valid_release| {
+        let changed = state_for_columns
             .lock()
-            .expect("app state mutex is not poisoned");
-        let search = app.active().page_source == PageSource::Search;
-        if search {
-            reorder_column(&mut app.search_column_order, kind as u8, offset);
-        } else {
-            reorder_column(&mut app.column_order, kind as u8, offset);
-        }
-        drop(app);
+            .is_ok_and(|mut app| app.finish_column_drag(valid_release));
         if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state_for_columns);
+            ui.invoke_clear_column_drag();
+            if changed {
+                refresh_ui(&ui, &state_for_columns);
+            }
+        }
+    });
+    let weak = ui.as_weak();
+    let state_for_columns = state.clone();
+    ui.on_cancel_column_drag(move || {
+        if let Ok(mut app) = state_for_columns.lock() {
+            app.cancel_column_drag();
+        }
+        if let Some(ui) = weak.upgrade() {
+            ui.invoke_clear_column_drag();
         }
     });
     let state_for_column_widths = state.clone();
@@ -5494,6 +5710,11 @@ fn wire_callbacks(
     let weak = ui.as_weak();
     let state_for_activate = state.clone();
     ui.on_activate_tab(move |tab_id| {
+        if let Some(ui) = weak.upgrade()
+            && ui.get_column_dragging()
+        {
+            ui.invoke_cancel_column_drag();
+        }
         let id = TabId(tab_id as u32);
         let mut app = state_for_activate
             .lock()
@@ -6587,6 +6808,9 @@ fn wire_mouse_navigation(
                 if ui.get_rectangle_selection_pointer_active() {
                     ui.invoke_cancel_rectangle_selection();
                 }
+                if ui.invoke_has_column_drag() {
+                    ui.invoke_cancel_column_drag_from_window();
+                }
                 if ui.get_context_menu_open() {
                     ui.set_context_menu_open(false);
                     ui.invoke_dismiss_context_menu();
@@ -6650,6 +6874,10 @@ fn wire_mouse_navigation(
             }
             if state.lock().is_ok_and(|app| app.tab_drag.is_some()) {
                 ui.invoke_cancel_tab_drag();
+                cancelled = true;
+            }
+            if state.lock().is_ok_and(|app| app.column_drag.is_some()) {
+                ui.invoke_cancel_column_drag_from_window();
                 cancelled = true;
             }
             return if cancelled {
@@ -10481,6 +10709,7 @@ fn submit_search(
 ) {
     let request = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
+        app.cancel_column_drag();
         let Some(tab) = app.tab_mut(tab_id) else {
             return;
         };
@@ -11605,7 +11834,15 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
         session_store::ThemeMode::Light => 1,
         session_store::ThemeMode::Dark => 2,
     });
-    ui.set_dark_theme(app.dark_theme());
+    let dark_theme = app.dark_theme();
+    ui.set_dark_theme(dark_theme);
+    ui.set_insertion_indicator_width(platform::windows::tab_insertion_indicator::INDICATOR_WIDTH);
+    let accent = if dark_theme {
+        platform::windows::tab_insertion_indicator::DARK_ACCENT_ARGB
+    } else {
+        platform::windows::tab_insertion_indicator::LIGHT_ACCENT_ARGB
+    };
+    ui.set_insertion_indicator_color(Color::from_argb_encoded(accent));
     apply_ui_texts(ui, app.language);
 }
 
@@ -12526,14 +12763,174 @@ mod tests {
     }
 
     #[test]
-    fn reorders_columns_in_both_directions_and_clamps_edges() {
+    fn reorders_columns_to_normalized_slots_and_clamps_edges() {
         let mut order = [0, 1, 2, 3];
-        assert!(reorder_column(&mut order, 1, -3));
+        assert!(reorder_column_to_slot(&mut order, 1, 0));
         assert_eq!(order, [1, 0, 2, 3]);
-        assert!(reorder_column(&mut order, 1, 8));
+        assert!(reorder_column_to_slot(&mut order, 1, 8));
         assert_eq!(order, [0, 2, 3, 1]);
-        assert!(!reorder_column(&mut order, 9, -1));
-        assert!(!reorder_column(&mut order, 2, 0));
+        assert!(!reorder_column_to_slot(&mut order, 9, 0));
+        assert!(!reorder_column_to_slot(&mut order, 2, 1));
+        assert_eq!(normalized_column_slot(1, 0, 4), 0);
+        assert_eq!(normalized_column_slot(1, 1, 4), 1);
+        assert_eq!(normalized_column_slot(1, 2, 4), 1);
+        assert_eq!(normalized_column_slot(1, 4, 4), 3);
+    }
+
+    #[test]
+    fn column_insertion_slot_uses_real_widths_midpoints_and_viewport_offset() {
+        let order = [0, 1, 2, 3];
+        let widths = [100, 240, 80, 160];
+        let geometry = ColumnHeaderGeometry {
+            x: 100.0,
+            y: 0.0,
+            width: 580.0,
+            viewport_x: 0.0,
+        };
+        assert_eq!(
+            column_insertion_slot(99.0, 20.0, geometry, &order, &widths),
+            None
+        );
+        assert_eq!(
+            column_insertion_slot(149.9, 20.0, geometry, &order, &widths),
+            Some(0)
+        );
+        assert_eq!(
+            column_insertion_slot(150.0, 20.0, geometry, &order, &widths),
+            Some(1)
+        );
+        assert_eq!(
+            column_insertion_slot(319.9, 20.0, geometry, &order, &widths),
+            Some(1)
+        );
+        assert_eq!(
+            column_insertion_slot(320.0, 20.0, geometry, &order, &widths),
+            Some(2)
+        );
+        assert_eq!(
+            column_insertion_slot(460.0, 20.0, geometry, &order, &widths),
+            Some(2)
+        );
+        assert_eq!(
+            column_insertion_slot(680.0, 20.0, geometry, &order, &widths),
+            Some(4)
+        );
+        let scrolled_geometry = ColumnHeaderGeometry {
+            width: 300.0,
+            viewport_x: -220.0,
+            ..geometry
+        };
+        assert_eq!(
+            column_insertion_slot(100.0, 20.0, scrolled_geometry, &order, &widths),
+            Some(2)
+        );
+        assert_eq!(
+            column_insertion_slot(401.0, 20.0, scrolled_geometry, &order, &widths),
+            None
+        );
+        assert_eq!(
+            column_insertion_slot(320.0, 39.0, geometry, &order, &widths),
+            None
+        );
+    }
+
+    #[test]
+    fn column_drag_threshold_cancel_and_source_isolation_preserve_state() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
+        let widths = app.column_widths;
+        let request = app.active().latest_request;
+        let sort = app.active().sort_field;
+        assert!(app.begin_column_drag(app.active_window, 1, 100.0, 20.0));
+        assert_eq!(
+            app.update_column_drag(
+                100.0 + COLUMN_DRAG_THRESHOLD - 0.1,
+                20.0,
+                0.0,
+                0.0,
+                800.0,
+                0.0,
+            ),
+            None
+        );
+        assert!(matches!(
+            app.column_drag.unwrap().phase,
+            ColumnDragPhase::Pressed
+        ));
+        assert_eq!(
+            app.update_column_drag(100.0 + COLUMN_DRAG_THRESHOLD, 20.0, 0.0, 0.0, 800.0, 0.0,),
+            Some(0)
+        );
+        assert!(matches!(
+            app.column_drag.unwrap().phase,
+            ColumnDragPhase::Dragging { .. }
+        ));
+        assert!(app.cancel_column_drag());
+        assert_eq!(app.column_order, [0, 1, 2, 3]);
+
+        assert!(app.begin_column_drag(app.active_window, 1, 100.0, 20.0));
+        assert_eq!(
+            app.update_column_drag(799.0, 20.0, 0.0, 0.0, 800.0, -200.0),
+            Some(4)
+        );
+        assert!(app.cancel_column_drag());
+        assert_eq!(app.column_order, [0, 1, 2, 3]);
+        assert_eq!(app.column_widths, widths);
+        assert_eq!(app.active().latest_request, request);
+        assert_eq!(app.active().sort_field, sort);
+
+        let tab_id = app.active_window_state().active_tab;
+        app.tab_mut(tab_id).unwrap().page_source = PageSource::Search;
+        assert!(app.begin_column_drag(app.active_window, 0, 10.0, 20.0));
+        assert_eq!(
+            app.update_column_drag(799.0, 20.0, 0.0, 0.0, 800.0, -300.0),
+            Some(4)
+        );
+        assert!(app.finish_column_drag(true));
+        assert_eq!(app.column_order, [0, 1, 2, 3]);
+        assert_eq!(app.search_column_order, [1, 2, 3, 0]);
+    }
+
+    #[test]
+    fn column_drag_invalid_release_and_source_change_cancel_without_commit() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
+        assert!(app.begin_column_drag(app.active_window, 2, 100.0, 20.0));
+        assert_eq!(
+            app.update_column_drag(0.0, 20.0, 0.0, 0.0, 800.0, 0.0),
+            Some(0)
+        );
+        assert!(!app.finish_column_drag(false));
+        assert_eq!(app.column_order, [0, 1, 2, 3]);
+
+        assert!(app.begin_column_drag(app.active_window, 2, 100.0, 20.0));
+        assert_eq!(
+            app.update_column_drag(0.0, 80.0, 0.0, 0.0, 800.0, 0.0),
+            None
+        );
+        assert!(!app.finish_column_drag(true));
+        assert_eq!(app.column_order, [0, 1, 2, 3]);
+
+        assert!(app.begin_column_drag(app.active_window, 2, 100.0, 20.0));
+        let tab_id = app.active_window_state().active_tab;
+        app.tab_mut(tab_id).unwrap().page_source = PageSource::Search;
+        assert_eq!(
+            app.update_column_drag(0.0, 20.0, 0.0, 0.0, 800.0, 0.0),
+            None
+        );
+        assert!(app.column_drag.is_none());
+        assert_eq!(app.column_order, [0, 1, 2, 3]);
+        assert_eq!(app.search_column_order, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn column_reorder_commit_isolated_by_page_source() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
+        assert!(app.commit_column_reorder(PageSource::Directory, 0, 4));
+        assert_eq!(app.column_order, [1, 2, 3, 0]);
+        assert_eq!(app.search_column_order, [0, 1, 2, 3]);
+        assert!(app.commit_column_reorder(PageSource::Search, 3, 0));
+        assert_eq!(app.column_order, [1, 2, 3, 0]);
+        assert_eq!(app.search_column_order, [3, 0, 1, 2]);
+        assert!(!app.commit_column_reorder(PageSource::Search, 3, 1));
     }
 
     fn test_window_placement(x: i32) -> session_store::WindowPlacement {

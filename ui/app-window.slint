@@ -632,6 +632,8 @@ export component AppWindow inherits Window {
     in property <[BreadcrumbRow]> breadcrumbs;
     in property <[SidebarRow]> sidebar-items;
     in property <[ColumnRow]> columns;
+    in property <float> insertion-indicator-width: 5;
+    in property <color> insertion-indicator-color: #4f6bed;
     in property <[ContextCommandRow]> context-commands;
     in property <[ContextCommandRow]> context-submenu-commands;
     in property <[ContextCommandRow]> context-submenu-parent-commands;
@@ -836,7 +838,10 @@ export component AppWindow inherits Window {
     callback toggle-focused();
     callback change-sort(int);
     callback change-view-mode(int);
-    callback reorder-column(int, int);
+    callback begin-column-drag(int, float, float);
+    callback update-column-drag(float, float, float, float, float, float) -> int;
+    callback end-column-drag(bool);
+    callback cancel-column-drag();
     callback resize-column(int, float);
     callback open-entry(int);
     callback activate-entry(int, bool, bool);
@@ -990,6 +995,34 @@ export component AppWindow inherits Window {
     public function release-tab-drag-pointer() {
         root.tab-drag-pointer-active = false;
     }
+    in-out property <bool> column-dragging: false;
+    private property <bool> column-drag-pointer-active: false;
+    private property <int> column-drag-source-kind: -1;
+    private property <int> column-drag-insertion-slot: -1;
+    private property <bool> suppress-column-click: false;
+    private property <length> column-drag-pointer-x: 0px;
+    private property <length> column-drag-pointer-y: 0px;
+    public function clear-column-drag() {
+        root.column-dragging = false;
+        root.column-drag-pointer-active = false;
+        root.column-drag-source-kind = -1;
+        root.column-drag-insertion-slot = -1;
+    }
+    public function cancel-column-drag-from-window() {
+        root.suppress-column-click = root.column-dragging;
+        root.cancel-column-drag();
+    }
+    public function has-column-drag() -> bool { return root.column-drag-pointer-active; }
+    function column-label(kind: int) -> string {
+        return kind == 0 ? root.text-name : kind == 1 ? (root.search-results-mode ? root.text-parent-path : root.text-type) : kind == 2 ? root.text-size : root.text-modified;
+    }
+    function column-slot-x(slot: int) -> length {
+        return slot <= 0 ? 0px
+            : slot == 1 ? root.column-width(root.columns[0].kind)
+            : slot == 2 ? root.column-width(root.columns[0].kind) + root.column-width(root.columns[1].kind)
+            : slot == 3 ? root.column-width(root.columns[0].kind) + root.column-width(root.columns[1].kind) + root.column-width(root.columns[2].kind)
+            : root.file-columns-width;
+    }
     in property <int> active-tab-index: 0;
     changed active-tab-index => { root.reveal-tab(root.active-tab-index); }
 
@@ -1048,7 +1081,7 @@ export component AppWindow inherits Window {
         KeyBinding { keys: @keys(Shift + Home); enabled: !root.active-is-settings && !root.address-editing; activated => { root.focus-boundary(false, true); } }
         KeyBinding { keys: @keys(Shift + End); enabled: !root.active-is-settings && !root.address-editing; activated => { root.focus-boundary(true, true); } }
         KeyBinding { keys: @keys(Return); enabled: !root.active-is-settings && !root.address-editing; activated => { root.open-entry(-1); } }
-        KeyBinding { keys: @keys(Escape); enabled: !root.active-is-settings && !root.address-editing && !root.rectangle-selection-pointer-active; activated => { root.clear-selection(); } }
+        KeyBinding { keys: @keys(Escape); enabled: !root.active-is-settings && !root.address-editing && !root.rectangle-selection-pointer-active && !root.column-drag-pointer-active; activated => { root.clear-selection(); } }
         KeyBinding { keys: @keys(Control + T); activated => { root.new-tab(); } }
         KeyBinding { keys: @keys(Control + W); enabled: root.can-close-tab; activated => { root.close-tab(-1); } }
         KeyBinding { keys: @keys(Control + C); enabled: !root.active-is-settings && !root.address-editing; activated => { root.copy-selection(false); } }
@@ -1239,35 +1272,56 @@ export component AppWindow inherits Window {
                             clip: true;
                             HorizontalLayout {
                                 spacing: 0px;
-                                for column in root.columns: Rectangle {
+                                for column[index] in root.columns: Rectangle {
                                     width: root.column-width(column.kind);
-
-                                    opacity: column-touch.reorder-dragging ? 0.58 : 1;
+                                    background: (column-touch.has-hover || resize-touch.has-hover) ? VisualStyle.ceff4ff : transparent;
                                     Rectangle { x: parent.width - 1px; y: 10px; width: 1px; height: 18px; background: VisualStyle.c57595c; }
                                     Rectangle { x: 0px; y: 0px; width: parent.width - 16px; height: parent.height; z: 1;
                                     Text {
                                         x: column.content-left + column.icon-slot; width: parent.width - self.x - column.content-right;
                                         horizontal-alignment: left;
-                                        text: (column.kind == 0 ? root.text-name : column.kind == 1 ? (root.search-results-mode ? root.text-parent-path : root.text-type) : column.kind == 2 ? root.text-size : root.text-modified) + (root.sort-field == column.kind ? (root.sort-descending ? " ↓" : " ↑") : "");
+                                        text: root.column-label(column.kind) + (root.sort-field == column.kind ? (root.sort-descending ? " ↓" : " ↑") : "");
                                         color: VisualStyle.c696b74; overflow: elide;
                                         font-size: 12px; font-weight: root.sort-field == column.kind ? 600 : 400; vertical-alignment: center;
                                     }
                                     column-touch := TouchArea {
                                         width: parent.width;
-                                        private property <length> press-x;
-                                        private property <bool> reorder-dragging: false;
-                                        mouse-cursor: self.reorder-dragging ? grabbing : pointer;
+                                        mouse-cursor: root.column-dragging && root.column-drag-source-kind == column.kind ? grabbing : pointer;
                                         pointer-event(event) => {
                                             if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
-                                                self.press-x = self.mouse-x;
-                                                self.reorder-dragging = false;
+                                                root.column-drag-pointer-active = true;
+                                                root.column-drag-source-kind = column.kind;
+                                                root.column-drag-pointer-x = self.absolute-position.x + self.mouse-x;
+                                                root.column-drag-pointer-y = self.absolute-position.y + self.mouse-y;
+                                                root.begin-column-drag(column.kind, root.column-drag-pointer-x / 1px, root.column-drag-pointer-y / 1px);
                                             }
-                                            if event.button == PointerEventButton.left && event.kind == PointerEventKind.up && self.reorder-dragging {
-                                                root.reorder-column(column.kind, self.mouse-x - self.press-x < -2 * parent.width ? -3 : self.mouse-x - self.press-x < -parent.width ? -2 : self.mouse-x - self.press-x < -8px ? -1 : self.mouse-x - self.press-x > 2 * parent.width ? 3 : self.mouse-x - self.press-x > parent.width ? 2 : 1);
+                                            if event.button == PointerEventButton.left && event.kind == PointerEventKind.up {
+                                                root.end-column-drag(root.column-dragging && root.column-drag-insertion-slot >= 0);
                                             }
                                         }
-                                        moved => { if self.pressed && abs(self.mouse-x - self.press-x) > 8px { self.reorder-dragging = true; } }
-                                        clicked => { if !self.reorder-dragging { root.change-sort(column.kind); } }
+                                        moved => {
+                                            if self.pressed && root.column-drag-pointer-active && root.column-drag-source-kind == column.kind {
+                                                root.column-drag-pointer-x = self.absolute-position.x + self.mouse-x;
+                                                root.column-drag-pointer-y = self.absolute-position.y + self.mouse-y;
+                                                let slot = root.update-column-drag(
+                                                    root.column-drag-pointer-x / 1px,
+                                                    root.column-drag-pointer-y / 1px,
+                                                    header-viewport.absolute-position.x / 1px,
+                                                    header-viewport.absolute-position.y / 1px,
+                                                    header-viewport.width / 1px,
+                                                    header-columns.x / 1px
+                                                );
+                                                if slot >= -1 {
+                                                    root.column-dragging = true;
+                                                    root.suppress-column-click = true;
+                                                    root.column-drag-insertion-slot = slot;
+                                                }
+                                            }
+                                        }
+                                        clicked => {
+                                            if !root.suppress-column-click { root.change-sort(column.kind); }
+                                            root.suppress-column-click = false;
+                                        }
                                     }
                                     }
                                     Rectangle {
@@ -1298,6 +1352,12 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
+                        }
+
+                        if root.column-dragging && root.column-drag-insertion-slot >= 0: Rectangle {
+                            x: header-columns.x + root.column-slot-x(root.column-drag-insertion-slot) - root.insertion-indicator-width * 1px / 2;
+                            width: root.insertion-indicator-width * 1px; height: parent.height; z: 80;
+                            background: root.insertion-indicator-color;
                         }
 
                     }
@@ -1864,6 +1924,15 @@ accessible-label: entry.name;
                 }
             }
         }
+    }
+
+    if root.column-dragging: Rectangle {
+        x: max(4px, min(root.width - self.width - 4px, root.column-drag-pointer-x + 12px));
+        y: max(50px, min(root.height - self.height - 4px, root.column-drag-pointer-y + 10px));
+        width: min(220px, max(84px, root.column-width(root.column-drag-source-kind)));
+        height: 32px; z: 100; border-radius: 5px; border-width: 1px;
+        border-color: VisualStyle.ce0e2e7; background: VisualStyle.cffffff; opacity: 0.82;
+        Text { x: 10px; width: parent.width - 20px; text: root.column-label(root.column-drag-source-kind); color: VisualStyle.c30333a; font-size: 12px; vertical-alignment: center; overflow: elide; }
     }
 
     if root.drop-menu-open: TouchArea {

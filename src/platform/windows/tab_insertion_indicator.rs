@@ -19,6 +19,9 @@ const DARK_CLASS_NAME: &[u16] = &[
     65, 115, 116, 101, 114, 70, 105, 108, 101, 115, 46, 84, 97, 98, 73, 110, 115, 101, 114, 116,
     105, 111, 110, 73, 110, 100, 105, 99, 97, 116, 111, 114, 46, 68, 97, 114, 107, 0,
 ];
+pub const INDICATOR_WIDTH: f32 = 5.0;
+pub const LIGHT_ACCENT_ARGB: u32 = 0xff4f_6bed;
+pub const DARK_ACCENT_ARGB: u32 = 0xff7f_a0ff;
 const LIGHT_ACCENT_COLORREF: u32 = 0x00ed_6b4f;
 const DARK_ACCENT_COLORREF: u32 = 0x00ff_a07f;
 
