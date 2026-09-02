@@ -484,7 +484,7 @@ impl ClassicMenuSession {
             io::Error::new(io::ErrorKind::NotFound, "shell submenu token not found")
         })?;
         let position = submenu_position(registration.parent, registration.menu)?;
-        self.initialize_submenu(registration.menu, position);
+        self.initialize_submenu(registration.parent, registration.menu, position);
         pump_sta_messages();
         let mut submenu = submenu_at_position(registration.parent, position)?;
         self.submenus[index].menu = submenu;
@@ -578,7 +578,12 @@ impl ClassicMenuSession {
             .map(Some)
     }
 
-    fn initialize_submenu(&self, submenu: HMENU, position: u32) {
+    fn initialize_submenu(&self, parent: HMENU, submenu: HMENU, position: u32) {
+        let _ = self.forward_menu_message(
+            windows::Win32::UI::WindowsAndMessaging::WM_INITMENU,
+            WPARAM(parent.0 as usize),
+            LPARAM::default(),
+        );
         let _ = self.forward_menu_message(
             WM_INITMENUPOPUP,
             WPARAM(submenu.0 as usize),
@@ -915,7 +920,7 @@ fn read_menu_recursive(
         let kind = if info.hSubMenu.is_invalid() {
             ClassicMenuItemKind::Command
         } else {
-            session.initialize_submenu(info.hSubMenu, position);
+            session.initialize_submenu(menu, info.hSubMenu, position);
             ClassicMenuItemKind::Submenu {
                 token: 0,
                 items: read_menu_recursive(info.hSubMenu, session)?,
@@ -964,7 +969,11 @@ fn is_builtin_verb(verb: &str) -> bool {
 fn is_dynamic_menu_message(message: u32) -> bool {
     matches!(
         message,
-        WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM | WM_MENUCHAR
+        windows::Win32::UI::WindowsAndMessaging::WM_INITMENU
+            | WM_INITMENUPOPUP
+            | WM_DRAWITEM
+            | WM_MEASUREITEM
+            | WM_MENUCHAR
     )
 }
 fn clean_menu_title(title: &str) -> String {
@@ -1025,7 +1034,13 @@ mod tests {
     }
     #[test]
     fn only_shell_dynamic_menu_messages_are_forwarded() {
-        for message in [WM_INITMENUPOPUP, WM_DRAWITEM, WM_MEASUREITEM, WM_MENUCHAR] {
+        for message in [
+            windows::Win32::UI::WindowsAndMessaging::WM_INITMENU,
+            WM_INITMENUPOPUP,
+            WM_DRAWITEM,
+            WM_MEASUREITEM,
+            WM_MENUCHAR,
+        ] {
             assert!(is_dynamic_menu_message(message));
         }
         assert!(!is_dynamic_menu_message(0));
