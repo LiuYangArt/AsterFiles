@@ -3388,6 +3388,7 @@ struct QuickMenuState {
     submenu_rows: Vec<ContextCommandRow>,
     submenu_history: Vec<(u64, Vec<ContextCommandRow>)>,
     submenu_tokens: HashMap<i32, u64>,
+    preloaded_submenu_items: HashMap<u64, Vec<platform::windows::context_menu::ClassicMenuItem>>,
     next_submenu_node: i32,
     active_submenu_token: Option<u64>,
     active_submenu_request: u64,
@@ -3503,9 +3504,12 @@ fn project_shell_menu_items(
     items
         .into_iter()
         .filter_map(|item| {
-            let node_id = if let ClassicMenuItemKind::Submenu { token, .. } = &item.kind {
+            let node_id = if let ClassicMenuItemKind::Submenu { token, items } = &item.kind {
                 menu.next_submenu_node = menu.next_submenu_node.saturating_add(1).max(1);
                 menu.submenu_tokens.insert(menu.next_submenu_node, *token);
+                if !items.is_empty() {
+                    menu.preloaded_submenu_items.insert(*token, items.clone());
+                }
                 menu.next_submenu_node
             } else {
                 0
@@ -3767,6 +3771,7 @@ fn project_context_menu(
         menu.submenu_rows.clear();
         menu.submenu_history.clear();
         menu.submenu_tokens.clear();
+        menu.preloaded_submenu_items.clear();
         menu.next_submenu_node = 0;
         menu.active_submenu_token = None;
     }
@@ -5915,10 +5920,11 @@ fn wire_callbacks(
             }
             menu.active_submenu_request = menu.active_submenu_request.wrapping_add(1).max(1);
             menu.active_submenu_token = Some(token);
+            let preloaded = menu.preloaded_submenu_items.get(&token).cloned();
             menu.submenu_rows.clear();
-            Some((identity, menu.active_submenu_request, token))
+            Some((identity, menu.active_submenu_request, token, preloaded))
         });
-        let Some((identity, submenu_request_id, token)) = request else {
+        let Some((identity, submenu_request_id, token, preloaded)) = request else {
             return;
         };
         ui.set_context_submenu_open(true);
@@ -5935,6 +5941,15 @@ fn wire_callbacks(
             ui.set_context_submenu_parent_open(true);
         } else {
             ui.set_context_submenu_parent_open(false);
+        }
+        if let Some(items) = preloaded {
+            if let Ok(mut menu) = quick_menu_for_submenu.lock() {
+                menu.submenu_rows =
+                    filtered_context_rows(&project_shell_menu_items(&mut menu, items), "");
+            }
+            ui.set_context_submenu_loading(false);
+            project_context_submenu(&ui, &quick_menu_for_submenu);
+            return;
         }
         ui.set_context_submenu_loading(true);
         ui.set_context_submenu_content_height(0.0);
