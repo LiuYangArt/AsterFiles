@@ -3388,7 +3388,7 @@ struct QuickMenuState {
     submenu_rows: Vec<ContextCommandRow>,
     submenu_history: Vec<(u64, Vec<ContextCommandRow>)>,
     submenu_tokens: HashMap<i32, u64>,
-    preloaded_submenu_items: HashMap<u64, Vec<platform::windows::context_menu::ClassicMenuItem>>,
+    preloaded_submenu_rows: HashMap<u64, Vec<ContextCommandRow>>,
     next_submenu_node: i32,
     active_submenu_token: Option<u64>,
     active_submenu_request: u64,
@@ -3508,7 +3508,12 @@ fn project_shell_menu_items(
                 menu.next_submenu_node = menu.next_submenu_node.saturating_add(1).max(1);
                 menu.submenu_tokens.insert(menu.next_submenu_node, *token);
                 if !items.is_empty() {
-                    menu.preloaded_submenu_items.insert(*token, items.clone());
+                    let rows = items
+                        .iter()
+                        .cloned()
+                        .filter_map(|item| shell_menu_item_row(item, 0))
+                        .collect();
+                    menu.preloaded_submenu_rows.insert(*token, rows);
                 }
                 menu.next_submenu_node
             } else {
@@ -3771,7 +3776,7 @@ fn project_context_menu(
         menu.submenu_rows.clear();
         menu.submenu_history.clear();
         menu.submenu_tokens.clear();
-        menu.preloaded_submenu_items.clear();
+        menu.preloaded_submenu_rows.clear();
         menu.next_submenu_node = 0;
         menu.active_submenu_token = None;
     }
@@ -5920,7 +5925,7 @@ fn wire_callbacks(
             }
             menu.active_submenu_request = menu.active_submenu_request.wrapping_add(1).max(1);
             menu.active_submenu_token = Some(token);
-            let preloaded = menu.preloaded_submenu_items.get(&token).cloned();
+            let preloaded = menu.preloaded_submenu_rows.get(&token).cloned();
             menu.submenu_rows.clear();
             Some((identity, menu.active_submenu_request, token, preloaded))
         });
@@ -5942,10 +5947,9 @@ fn wire_callbacks(
         } else {
             ui.set_context_submenu_parent_open(false);
         }
-        if let Some(items) = preloaded {
+        if let Some(rows) = preloaded {
             if let Ok(mut menu) = quick_menu_for_submenu.lock() {
-                menu.submenu_rows =
-                    filtered_context_rows(&project_shell_menu_items(&mut menu, items), "");
+                menu.submenu_rows = filtered_context_rows(&rows, "");
             }
             ui.set_context_submenu_loading(false);
             project_context_submenu(&ui, &quick_menu_for_submenu);
@@ -11956,6 +11960,43 @@ mod tests {
         assert_eq!(next_enabled_context_index(&rows, 1, -1), 3);
     }
 
+    #[test]
+    fn quick_menu_projects_preloaded_submenu_rows_by_original_token() {
+        use platform::windows::context_menu::{ClassicMenuItem, ClassicMenuItemKind};
+        let mut menu = QuickMenuState::default();
+        let rows = project_shell_menu_items(
+            &mut menu,
+            vec![ClassicMenuItem {
+                command_id: Some(31),
+                title: "Give access to".to_owned(),
+                verb: Some("windows.share".to_owned()),
+                enabled: true,
+                checked: false,
+                default: false,
+                kind: ClassicMenuItemKind::Submenu {
+                    token: 2,
+                    items: vec![ClassicMenuItem {
+                        command_id: Some(32_770),
+                        title: "Remove access".to_owned(),
+                        verb: None,
+                        enabled: true,
+                        checked: false,
+                        default: false,
+                        kind: ClassicMenuItemKind::Command,
+                    }],
+                },
+            }],
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(menu.submenu_tokens.get(&rows[0].node_id), Some(&2));
+        let children = menu
+            .preloaded_submenu_rows
+            .get(&2)
+            .expect("preloaded sharing rows");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].label.as_str(), "Remove access");
+        assert_eq!(children[0].id, SHELL_CONTEXT_COMMAND_BASE + 32_770);
+    }
     #[test]
     fn quick_menu_submenu_projection_keeps_token_and_leaf_command_id() {
         use platform::windows::context_menu::{ClassicMenuItem, ClassicMenuItemKind};
