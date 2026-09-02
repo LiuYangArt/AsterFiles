@@ -1,0 +1,31 @@
+name: 文档
+description: 跟踪说明、设计文档或开发文档调整
+title: ""
+labels:
+  - "type: docs"
+assignees: []
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 当前问题
+      description: 哪些内容缺失、过时、矛盾或难以理解？
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: 调整范围
+      description: 列出需要更新的文档和不应改变的产品或代码行为。
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收条件
+      description: 说明如何检查链接、命令、内容一致性和任务引用。
+      placeholder: |
+        - [ ] 文档内容与当前实现一致
+        - [ ] 链接与命令可用
+    validations:
+      required: true

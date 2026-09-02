@@ -76,6 +76,6 @@
 - 列表、网格和自绘滚动条：`ui/app-window.slint`
 - 窗口输入和统一几何：`src/app.rs`
 - Slint 依赖的列表边界：`i-slint-core` 中的 `items/flickable.rs` 与 `model/repeater.rs`
-- Everything 深滚动设计：`docs/foundation-plan.md`、`docs/task-list.md` 的 Issue #9
-- 本 Issue 状态：`docs/task-list.md` 的 Issue #11
+- Everything 深滚动设计：`docs/foundation-plan.md`；任务记录：GitHub Issue #9
+- 本问题记录：GitHub Issue #11
 - 自动验证汇总：`artifacts/verify/summary.json`

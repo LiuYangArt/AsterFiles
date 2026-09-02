@@ -28,4 +28,4 @@ python tools/verify.py
 - 文件核心不依赖 Slint，为后续替换列表实现或做性能基准保留清晰边界。
 - 优先本地路径；网络协议、全盘索引和插件系统后置。
 
-详细范围与性能目标见 [docs/architecture.md](docs/architecture.md)，前期架构实施见 [docs/foundation-plan.md](docs/foundation-plan.md)，UI 与交互约束见 [docs/ui-interaction-design.md](docs/ui-interaction-design.md)，后续实施顺序见 [docs/task-list.md](docs/task-list.md)。
+详细范围与性能目标见 [docs/architecture.md](docs/architecture.md)，基础架构边界见 [docs/foundation-plan.md](docs/foundation-plan.md)，UI 与交互约束见 [docs/ui-interaction-design.md](docs/ui-interaction-design.md)。任务与实施顺序以 [GitHub Issues](https://github.com/LiuYangArt/AsterFiles/issues) 和 [AsterFiles Development](https://github.com/users/LiuYangArt/projects/2) 为准。

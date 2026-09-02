@@ -1,0 +1,59 @@
+name: 缺陷
+description: 报告可复现的错误、回归或异常行为
+title: ""
+labels:
+  - "type: bug"
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请只提交一个可独立验收的问题。优先级由维护者在分流时添加。
+  - type: textarea
+    id: symptom
+    attributes:
+      label: 问题现象
+      description: 实际发生了什么？请包含用户可见影响。
+      placeholder: 清楚描述实际行为和影响。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 提供最短、稳定的复现路径。
+      placeholder: |
+        1. 打开……
+        2. 执行……
+        3. 观察到……
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+      description: 正确结果应该是什么？
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 环境与证据
+      description: 填写版本、Windows 版本、相关路径，以及日志、截图或状态导出位置；没有时说明原因。
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收条件
+      description: 用清单描述何时可以关闭此 Issue，包含自动验证与必要的人工验证。
+      placeholder: |
+        - [ ] 自动验证覆盖……
+        - [ ] 用户手动确认……
+    validations:
+      required: true
+  - type: textarea
+    id: boundaries
+    attributes:
+      label: 范围与非目标
+      description: 可选。写明不应顺手处理的内容、依赖或架构边界。

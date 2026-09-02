@@ -1,0 +1,38 @@
+name: 维护
+description: 跟踪重构、性能、构建、依赖或项目基础设施工作
+title: ""
+labels:
+  - "type: maintenance"
+assignees: []
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 当前问题
+      description: 当前结构、流程或工具造成了什么具体成本或风险？
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: 目标状态
+      description: 完成后应达到什么可观察状态？
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: 范围与非目标
+      description: 明确允许改变和禁止顺带改变的内容。
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收与验证
+      description: 给出可运行命令、预期证据和完成条件。
+      placeholder: |
+        - [ ] `python tools/verify.py` 通过
+        - [ ] 相关日志或指标满足……
+    validations:
+      required: true

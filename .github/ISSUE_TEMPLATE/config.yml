@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: AsterFiles 当前任务看板
+    url: https://github.com/users/LiuYangArt/projects/2
+    about: 查看任务状态、优先级和实施顺序。

@@ -31,10 +31,14 @@ python tools/verify.py
 - 每个开发任务完成后必须运行 `cargo build`，确保 `target/debug/asterfiles.exe` 已更新，供用户直接测试；交付时报告 Debug 文件时间与 SHA-256。只有用户明确要求正式构建、发布验证，或用户确认某个 issue 已完成时，才运行 Release 构建并报告其时间与 SHA-256。
 - 每个 issue 经用户明确确认完成后，必须构建一版 Release；用户确认前不得因该规则提前构建 Release。
 
-## task
+## Issue 与任务状态
 
-- 任务完成后更新文档状态
-- 涉及路径、后台加载、多标签页、本地化或网络边界时，同时遵守并更新 `docs/foundation-plan.md`
+- GitHub Issues 是任务范围、验收条件与完成状态的唯一来源；GitHub Project `AsterFiles Development` 管理实施状态和顺序。不得新增本地任务清单或在设计文档中复制任务状态。
+- 开始开发前确认 Issue 恰好有一个 `type: *` 和一个 `priority: P0–P3` 标签，并包含明确范围、非目标、验收条件和验证方式。信息不足时先完善 Issue。
+- 实施状态使用 Project：`Backlog`、`Ready`、`In progress`、`In review`、`Blocked`、`Done`。需要用户真实 UI 验收时进入 `In review`，用户确认前不得关闭 Issue。
+- 提交、方案文档和验证证据使用 `#编号` 关联 Issue；验证结果、artifact 路径和剩余风险回写 Issue。范围外问题另建 Issue，不扩大当前任务。
+- 设计文档只维护仍有效的架构与产品边界；任务完成后更新受影响的设计文档，不维护第二份勾选状态。
+- 涉及路径、后台加载、多标签页、本地化或网络边界时，同时遵守并更新 `docs/foundation-plan.md`。
 
 ## 架构红线
 

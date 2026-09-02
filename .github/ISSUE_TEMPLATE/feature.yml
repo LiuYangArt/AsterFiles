@@ -1,0 +1,54 @@
+name: 功能
+description: 提议新增或扩展一项用户能力
+title: ""
+labels:
+  - "type: feature"
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请描述用户问题和可验收结果，不要只给实现手段。优先级由维护者在分流时添加。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 用户问题
+      description: 谁在什么场景遇到了什么问题？
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: 目标结果
+      description: 完成后用户能够做什么？
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: 范围
+      description: 列出本 Issue 必须包含的行为和边界。
+    validations:
+      required: true
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: 非目标
+      description: 明确本 Issue 不处理什么，避免范围漂移。
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收条件
+      description: 使用可检查的清单，区分自动验证和必要的人工验证。
+      placeholder: |
+        - [ ] 自动验证覆盖……
+        - [ ] 用户手动确认……
+    validations:
+      required: true
+  - type: textarea
+    id: references
+    attributes:
+      label: 设计与参考
+      description: 可选。链接设计文档、相关 Issue、成熟产品行为或证据。

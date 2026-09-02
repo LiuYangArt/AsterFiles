@@ -90,5 +90,5 @@ Windows 文件资源管理器中，“大小”标题左对齐，数值右对齐
 - Everything 排序映射：`src/platform/windows/everything.rs`
 - 会话列宽格式：`src/session_store.rs`
 - 交互设计：`docs/ui-interaction-design.md`
-- 验证任务状态：`docs/task-list.md`
+- 验证任务记录：GitHub Issue #1
 - 机器可读验证：`artifacts/verify/summary.json`

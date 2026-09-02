@@ -64,4 +64,4 @@ winit 0.30.13 在发送非客户区按下消息前先把内部 `dragging` 标记
 - 标题栏移动入口：`src/app.rs`
 - Windows 消息诊断：`src/platform/windows/window_trace.rs`
 - 诊断日志：`artifacts/logs/window-interaction-diagnostic.jsonl`
-- 任务状态：`docs/task-list.md`
+- 任务记录：GitHub Issue #2

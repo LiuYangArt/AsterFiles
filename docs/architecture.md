@@ -21,7 +21,7 @@ Rust 文件核心
 
 ## 下一阶段
 
-实施顺序以 [task-list.md](task-list.md) 为准。当前先完成本地浏览闭环和视觉/图标系统，再实现基础文件操作与 Windows Shell 集成。专项性能验证推迟到主要功能稳定后执行，但继续保持后台读取、列表虚拟化、任务可取消和可见区域优先等性能边界。
+任务范围与完成状态以 [GitHub Issues](https://github.com/LiuYangArt/AsterFiles/issues) 为准，实施状态和顺序由 [AsterFiles Development](https://github.com/users/LiuYangArt/projects/2) 管理。本文只记录当前有效的架构边界，不维护任务清单。
 
 路径身份、标签会话、后台加载和本地化的前期实施顺序见 [foundation-plan.md](foundation-plan.md)。这些边界从 P0 开始生效；具体网络协议仍属于后置范围。
 
