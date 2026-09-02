@@ -665,6 +665,7 @@ export component AppWindow inherits Window {
     private property <int> active-geometry-revision: root.view-mode;
     in-out property <length> search-scroll-y: 0px;
     in property <int> search-total-items: 0;
+    out property <length> file-list-left: 0px;
     out property <length> file-list-top: 0px;
     out property <length> rectangle-viewport-top: 0px;
     out property <length> file-viewport-width: 0px;
@@ -913,6 +914,10 @@ export component AppWindow inherits Window {
     in-out property <length> search-size-width: 120px;
     in-out property <length> search-modified-width: 200px;
     private property <length> file-columns-width: root.column-width(0) + root.column-width(1) + root.column-width(2) + root.column-width(3);
+    out property <length> details-hit-left: 16px + root.file-viewport-x;
+    out property <length> details-hit-width: root.file-columns-width;
+    out property <length> details-hit-visible-left: max(16px, root.details-hit-left);
+    out property <length> details-hit-visible-right: min(root.file-viewport-width, root.details-hit-left + root.details-hit-width);
     private property <length> header-available-width: max(0px, root.width - (root.minimal ? 0px : (root.compact ? 184px : 218px)) - 44px);
     changed header-available-width => { root.clamp-file-viewport(root.header-available-width); }
     changed search-results-mode => { root.file-viewport-x = 0px; }
@@ -1231,6 +1236,7 @@ export component AppWindow inherits Window {
                         width: parent.width - 28px; height: parent.height; clip: true;
                         header-columns := Rectangle {
                             x: 16px + root.file-viewport-x; width: root.file-columns-width; height: parent.height;
+                            clip: true;
                             HorizontalLayout {
                                 spacing: 0px;
                                 for column in root.columns: Rectangle {
@@ -1343,7 +1349,7 @@ list := ListView {
                         vertical-scrollbar-policy: ScrollBarPolicy.always-off;
                         viewport-y <=> root.list-viewport-y;
 
-                        function sync-file-geometry() { if root.view-mode != 2 { root.file-list-top = self.absolute-position.y - root.absolute-position.y; root.rectangle-viewport-top = self.absolute-position.y - content-area.absolute-position.y; root.file-viewport-width = self.width; root.file-viewport-height = self.visible-height; } }
+                        function sync-file-geometry() { if root.view-mode != 2 { root.file-list-left = self.absolute-position.x - root.absolute-position.x; root.file-list-top = self.absolute-position.y - root.absolute-position.y; root.rectangle-viewport-top = self.absolute-position.y - content-area.absolute-position.y; root.file-viewport-width = self.width; root.file-viewport-height = self.visible-height; } }
                         init => { self.sync-file-geometry(); }
                         private property <int> geometry-revision: root.active-geometry-revision;
                         changed geometry-revision => { self.sync-file-geometry(); }
@@ -1358,12 +1364,16 @@ list := ListView {
                             background: VisualStyle.cffffff;
                             opacity: !entry.loaded ? 0 : (entry.cut ? 0.52 : 1);
                             Rectangle {
-                                x: 6px; y: 2px; width: parent.width - 12px; height: parent.height - 4px;
+                                x: root.view-mode == 0 ? root.details-hit-visible-left : 6px;
+                                y: 2px;
+                                width: root.view-mode == 0 ? max(0px, root.details-hit-visible-right - self.x) : parent.width - 12px;
+                                height: parent.height - 4px;
                                 border-radius: 5px;
                                 border-width: 0px;
+                                clip: true;
                                 background: entry.id == root.drop-hover-entry-id ? VisualStyle.cc7d7ff : (entry.selected ? VisualStyle.cdce6ff : (mouse.has-hover ? VisualStyle.ceff4ff : transparent));
                                 Rectangle {
-                                x: 10px + (root.view-mode == 0 ? root.file-viewport-x : 0px); width: root.view-mode == 0 ? root.file-columns-width : parent.width - 20px;
+                                x: root.view-mode == 0 ? root.details-hit-left - parent.x : 10px; width: root.view-mode == 0 ? root.file-columns-width : parent.width - 20px;
                                 HorizontalLayout {
                                 spacing: 0px;
                                 for column in root.columns: Rectangle {
@@ -1477,6 +1487,8 @@ accessible-label: entry.name;
                             }
                             }
                             mouse := TouchArea {
+                                x: root.view-mode == 0 ? root.details-hit-visible-left : 0px;
+                                width: root.view-mode == 0 ? max(0px, root.details-hit-visible-right - self.x) : parent.width;
                                 enabled: entry.loaded && !(root.rename-editing && root.rename-entry-id == entry.id);
                                 private property <bool> click-control: false;
                                 private property <bool> click-shift: false;
@@ -1576,7 +1588,7 @@ accessible-label: entry.name;
                         vertical-scrollbar-policy: ScrollBarPolicy.always-off;
                         viewport-y <=> root.grid-viewport-y;
 
-                        function sync-file-geometry() { if root.view-mode == 2 { root.file-list-top = self.absolute-position.y - root.absolute-position.y; root.rectangle-viewport-top = self.absolute-position.y - content-area.absolute-position.y; root.file-viewport-width = self.width; root.file-viewport-height = self.visible-height; } }
+                        function sync-file-geometry() { if root.view-mode == 2 { root.file-list-left = self.absolute-position.x - root.absolute-position.x; root.file-list-top = self.absolute-position.y - root.absolute-position.y; root.rectangle-viewport-top = self.absolute-position.y - content-area.absolute-position.y; root.file-viewport-width = self.width; root.file-viewport-height = self.visible-height; } }
                         init => { self.sync-file-geometry(); }
                         private property <int> geometry-revision: root.active-geometry-revision;
                         changed geometry-revision => { self.sync-file-geometry(); }

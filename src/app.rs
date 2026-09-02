@@ -3116,17 +3116,42 @@ fn selected_paths(app: &AppState) -> Vec<PathBuf> {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct FileHitGeometry {
+    list_left: f32,
+    list_top: f32,
+    viewport_x: f32,
+    viewport_y: f32,
+    viewport_width: f32,
+    columns_width: f32,
+}
+
+impl FileHitGeometry {
+    fn details_range(self) -> (f32, f32) {
+        (
+            16.0_f32.max(16.0 + self.viewport_x),
+            self.viewport_width
+                .min(16.0 + self.viewport_x + self.columns_width),
+        )
+    }
+
+    fn details_contains(self, window_x: f32) -> bool {
+        let local_x = window_x - self.list_left;
+        let (left, right) = self.details_range();
+        right > left && local_x >= left && local_x < right
+    }
+}
+
 fn context_target_at(
     state: &SharedSessions,
     window_x: f32,
     window_y: f32,
-    list_top: f32,
-    viewport_y: f32,
+    geometry: FileHitGeometry,
     search_scroll_y: f32,
     grid_columns: usize,
 ) -> (Option<EntryId>, bool) {
     let app = state.lock().expect("app state mutex is not poisoned");
-    if window_y < list_top {
+    if window_y < geometry.list_top {
         return (None, true);
     }
     let active = app.active();
@@ -3135,8 +3160,12 @@ fn context_target_at(
         .and_then(|path| app.directory_view_modes.get(path))
         .copied()
         .unwrap_or(ViewMode::Details);
-    let local_row = ((window_y - list_top + (-viewport_y).max(0.0)) / file_row_height(view_mode))
-        .floor() as usize;
+    if view_mode == ViewMode::Details && !geometry.details_contains(window_x) {
+        return (None, true);
+    }
+    let local_row = ((window_y - geometry.list_top + (-geometry.viewport_y).max(0.0))
+        / file_row_height(view_mode))
+    .floor() as usize;
     let local_index = match view_mode {
         ViewMode::Grid => {
             let column = (window_x.max(0.0) / 148.0).floor() as usize;
@@ -4091,9 +4120,16 @@ fn wire_internal_drag_drop(
         let target = state_for_end.lock().ok().and_then(|app| {
             internal_drag_target(
                 &app,
+                x,
                 y,
-                ui.get_file_list_top(),
-                ui.get_file_viewport_y(),
+                FileHitGeometry {
+                    list_left: ui.get_file_list_left(),
+                    list_top: ui.get_file_list_top(),
+                    viewport_x: ui.get_file_viewport_x(),
+                    viewport_y: ui.get_file_viewport_y(),
+                    viewport_width: ui.get_file_viewport_width(),
+                    columns_width: ui.get_details_hit_width(),
+                },
                 ui.get_search_scroll_y(),
                 ui.get_grid_column_count().max(1) as usize,
             )
@@ -4207,6 +4243,8 @@ fn rectangle_selection_hits(
     view_mode: ViewMode,
     grid_columns: usize,
     viewport_width: f32,
+    details_viewport_x: f32,
+    details_columns_width: f32,
     rect: SelectionRect,
 ) -> HashSet<EntryId> {
     let (row_height, card_width, card_height, gap) = match view_mode {
@@ -4238,7 +4276,18 @@ fn rectangle_selection_hits(
     let mut hits = HashSet::new();
     match view_mode {
         ViewMode::Details | ViewMode::List => {
-            if rect.left > viewport_width {
+            let (item_left, item_right) = if view_mode == ViewMode::Details {
+                FileHitGeometry {
+                    viewport_x: details_viewport_x,
+                    viewport_width,
+                    columns_width: details_columns_width,
+                    ..FileHitGeometry::default()
+                }
+                .details_range()
+            } else {
+                (0.0, viewport_width)
+            };
+            if item_right <= item_left || rect.right < item_left || rect.left >= item_right {
                 return hits;
             }
             let first = candidate_start(rect.top, row_height);
@@ -4249,9 +4298,9 @@ fn rectangle_selection_hits(
                     continue;
                 };
                 let item = SelectionRect {
-                    left: 0.0,
+                    left: item_left,
                     top: slot as f32 * row_height,
-                    right: viewport_width,
+                    right: item_right,
                     bottom: (slot + 1) as f32 * row_height,
                 };
                 if rect.intersects(item) {
@@ -4490,8 +4539,15 @@ fn update_rectangle_selection(
                 None
             } else {
                 let previous_focus = tab.focused;
-                let hits =
-                    rectangle_selection_hits(tab, view_mode, grid_columns, viewport_width, rect);
+                let hits = rectangle_selection_hits(
+                    tab,
+                    view_mode,
+                    grid_columns,
+                    viewport_width,
+                    ui.get_file_viewport_x(),
+                    ui.get_details_hit_width(),
+                    rect,
+                );
                 if committed && previous_hits == hits {
                     return false;
                 }
@@ -5937,8 +5993,15 @@ fn wire_callbacks(
             &state_for_reopen_menu,
             x,
             y,
-            ui.as_ref().map_or(0.0, |ui| ui.get_file_list_top()),
-            ui.as_ref().map_or(0.0, |ui| ui.get_file_viewport_y()),
+            ui.as_ref()
+                .map_or_else(FileHitGeometry::default, |ui| FileHitGeometry {
+                    list_left: ui.get_file_list_left(),
+                    list_top: ui.get_file_list_top(),
+                    viewport_x: ui.get_file_viewport_x(),
+                    viewport_y: ui.get_file_viewport_y(),
+                    viewport_width: ui.get_file_viewport_width(),
+                    columns_width: ui.get_details_hit_width(),
+                }),
             ui.as_ref().map_or(0.0, |ui| ui.get_search_scroll_y()),
             ui.as_ref()
                 .map_or(1, |ui| ui.get_grid_column_count().max(1) as usize),
@@ -7170,11 +7233,32 @@ fn drop_target_snapshot(
     }
     let current = tab.visible_path()?.to_path_buf();
     let hwnd = native_window_handle(ui);
-    let (left, top, right, bottom) = platform::windows::drag_drop::client_screen_rect(hwnd).ok()?;
+    let (left, top, _right, bottom) =
+        platform::windows::drag_drop::client_screen_rect(hwnd).ok()?;
     let scale = ui.window().scale_factor();
     let list_top = (ui.get_file_list_top() * scale).round() as i32;
+    let list_left = (ui.get_file_list_left() * scale).round() as i32;
     let viewport = (-ui.get_file_viewport_y() * scale).max(0.0);
-    let row_height = 40.0 * scale;
+    let view_mode = view_mode_from_ui(ui.get_view_mode());
+    let row_height = file_row_height(view_mode) * scale;
+    let (target_left, target_right) = if view_mode == ViewMode::Details {
+        let geometry = FileHitGeometry {
+            viewport_x: ui.get_file_viewport_x(),
+            viewport_width: ui.get_file_viewport_width(),
+            columns_width: ui.get_details_hit_width(),
+            ..FileHitGeometry::default()
+        };
+        let (target_left, target_right) = geometry.details_range();
+        (
+            left + list_left + (target_left * scale).round() as i32,
+            left + list_left + (target_right * scale).round() as i32,
+        )
+    } else {
+        (
+            left + list_left,
+            left + list_left + (ui.get_file_viewport_width() * scale).round() as i32,
+        )
+    };
     let folder_rows = tab
         .visible_entries()
         .iter()
@@ -7183,15 +7267,15 @@ fn drop_target_snapshot(
         .filter_map(|(index, entry)| {
             let row_top = top + list_top + (index as f32 * row_height - viewport).round() as i32;
             let row_bottom = row_top + row_height.round() as i32;
-            (row_bottom > top + list_top && row_top < bottom).then(|| {
-                platform::windows::drag_drop::FolderDropTarget {
-                    left,
+            (target_right > target_left && row_bottom > top + list_top && row_top < bottom).then(
+                || platform::windows::drag_drop::FolderDropTarget {
+                    left: target_left,
                     top: row_top,
-                    right,
+                    right: target_right,
                     bottom: row_bottom.min(bottom),
                     path: entry.path.clone(),
-                }
-            })
+                },
+            )
         })
         .collect();
     Some(platform::windows::drag_drop::DropTargetSnapshot {
@@ -7202,9 +7286,9 @@ fn drop_target_snapshot(
 
 fn internal_drag_target(
     app: &AppState,
+    x: f32,
     y: f32,
-    list_top: f32,
-    viewport_y: f32,
+    geometry: FileHitGeometry,
     search_scroll_y: f32,
     grid_columns: usize,
 ) -> Option<(EntryId, PathBuf)> {
@@ -7214,8 +7298,12 @@ fn internal_drag_target(
         .and_then(|path| app.directory_view_modes.get(path))
         .copied()
         .unwrap_or(ViewMode::Details);
-    let local_row =
-        ((y - list_top + (-viewport_y).max(0.0)) / file_row_height(view_mode)).floor() as usize;
+    if view_mode == ViewMode::Details && !geometry.details_contains(x) {
+        return None;
+    }
+    let local_row = ((y - geometry.list_top + (-geometry.viewport_y).max(0.0))
+        / file_row_height(view_mode))
+    .floor() as usize;
     let local_index = match view_mode {
         ViewMode::Grid => local_row.saturating_mul(grid_columns.max(1)),
         ViewMode::Details | ViewMode::List => local_row,
@@ -13902,6 +13990,41 @@ mod tests {
     }
 
     #[test]
+    fn details_horizontal_hit_boundary_respects_margins_and_scroll() {
+        let geometry = |list_left, viewport_x, viewport_width, columns_width| FileHitGeometry {
+            list_left,
+            list_top: 0.0,
+            viewport_x,
+            viewport_y: 0.0,
+            viewport_width,
+            columns_width,
+        };
+        assert!(!geometry(0.0, 0.0, 600.0, 400.0).details_contains(15.9));
+        assert!(geometry(0.0, 0.0, 600.0, 400.0).details_contains(16.0));
+        assert!(geometry(0.0, 0.0, 600.0, 400.0).details_contains(415.9));
+        assert!(!geometry(0.0, 0.0, 600.0, 400.0).details_contains(416.0));
+
+        assert!(!geometry(20.0, 0.0, 600.0, 400.0).details_contains(35.9));
+        assert!(geometry(20.0, 0.0, 600.0, 400.0).details_contains(36.0));
+        assert!(geometry(0.0, 0.0, 340.0, 400.0).details_contains(339.9));
+        assert!(!geometry(0.0, 0.0, 340.0, 400.0).details_contains(340.0));
+
+        assert!(!geometry(0.0, -120.0, 340.0, 400.0).details_contains(15.9));
+        assert!(geometry(0.0, -120.0, 340.0, 400.0).details_contains(16.0));
+        assert!(geometry(0.0, -120.0, 340.0, 400.0).details_contains(295.9));
+        assert!(!geometry(0.0, -120.0, 340.0, 400.0).details_contains(296.0));
+    }
+    fn test_hit_geometry(list_top: f32, viewport_y: f32) -> FileHitGeometry {
+        FileHitGeometry {
+            list_left: 0.0,
+            list_top,
+            viewport_x: 0.0,
+            viewport_y,
+            viewport_width: 600.0,
+            columns_width: 400.0,
+        }
+    }
+    #[test]
     fn repeated_context_menu_hit_test_switches_between_entry_and_background() {
         let state = Arc::new(Mutex::new(AppState::new_for_test(
             vec![PathBuf::from("C:/test")],
@@ -13930,11 +14053,15 @@ mod tests {
             }]);
         }
         assert_eq!(
-            context_target_at(&state, 0.0, 170.0, 166.0, 0.0, 0.0, 1),
+            context_target_at(&state, 16.0, 170.0, test_hit_geometry(166.0, 0.0), 0.0, 1),
             (Some(EntryId(1)), false)
         );
         assert_eq!(
-            context_target_at(&state, 0.0, 250.0, 166.0, 0.0, 0.0, 1),
+            context_target_at(&state, 416.0, 170.0, test_hit_geometry(166.0, 0.0), 0.0, 1,),
+            (None, true)
+        );
+        assert_eq!(
+            context_target_at(&state, 16.0, 250.0, test_hit_geometry(166.0, 0.0), 0.0, 1,),
             (None, true)
         );
     }
@@ -13971,7 +14098,7 @@ mod tests {
                 );
         }
         assert_eq!(
-            context_target_at(&state, 0.0, 170.0, 166.0, -80.0, 0.0, 1),
+            context_target_at(&state, 16.0, 170.0, test_hit_geometry(166.0, -80.0), 0.0, 1),
             (Some(EntryId(3)), false)
         );
     }
@@ -14052,9 +14179,16 @@ mod tests {
                 },
             ]);
 
-        assert_eq!(internal_drag_target(&app, 20.0, 0.0, 0.0, 0.0, 1), None);
         assert_eq!(
-            internal_drag_target(&app, 20.0, 0.0, -40.0, 0.0, 1),
+            internal_drag_target(&app, 16.0, 20.0, test_hit_geometry(0.0, 0.0), 0.0, 1),
+            None
+        );
+        assert_eq!(
+            internal_drag_target(&app, 416.0, 20.0, test_hit_geometry(0.0, -40.0), 0.0, 1,),
+            None
+        );
+        assert_eq!(
+            internal_drag_target(&app, 16.0, 20.0, test_hit_geometry(0.0, -40.0), 0.0, 1),
             Some((EntryId(2), PathBuf::from(r"C:\test\folder")))
         );
     }
@@ -14252,6 +14386,8 @@ mod tests {
                 ViewMode::Details,
                 1,
                 600.0,
+                0.0,
+                400.0,
                 SelectionRect::from_points(0.0, 39.0, 20.0, 41.0),
             ),
             HashSet::from([EntryId(1), EntryId(2)])
@@ -14262,6 +14398,8 @@ mod tests {
                 ViewMode::List,
                 1,
                 600.0,
+                0.0,
+                400.0,
                 SelectionRect::from_points(0.0, 35.0, 20.0, 67.0),
             ),
             HashSet::from([EntryId(2)])
@@ -14272,12 +14410,56 @@ mod tests {
                 ViewMode::Grid,
                 3,
                 600.0,
+                0.0,
+                400.0,
                 SelectionRect::from_points(145.0, 145.0, 155.0, 155.0),
             ),
             HashSet::from([EntryId(5)])
         );
     }
 
+    #[test]
+    fn rectangle_selection_details_hits_only_visible_column_region() {
+        let mut tab = TabSession::new(TabId(1));
+        tab.replace_entries(vec![focus_entry(1, r"C:\test\1.txt")]);
+
+        assert!(
+            rectangle_selection_hits(
+                &tab,
+                ViewMode::Details,
+                1,
+                600.0,
+                0.0,
+                400.0,
+                SelectionRect::from_points(416.0, 0.0, 580.0, 40.0),
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            rectangle_selection_hits(
+                &tab,
+                ViewMode::Details,
+                1,
+                340.0,
+                -120.0,
+                400.0,
+                SelectionRect::from_points(295.0, 0.0, 310.0, 40.0),
+            ),
+            HashSet::from([EntryId(1)])
+        );
+        assert!(
+            rectangle_selection_hits(
+                &tab,
+                ViewMode::Details,
+                1,
+                340.0,
+                -120.0,
+                400.0,
+                SelectionRect::from_points(296.0, 0.0, 324.0, 40.0),
+            )
+            .is_empty()
+        );
+    }
     #[test]
     fn rectangle_selection_search_geometry_uses_sparse_result_identity() {
         let mut tab = TabSession::new(TabId(1));
@@ -14295,6 +14477,8 @@ mod tests {
                 ViewMode::Details,
                 1,
                 600.0,
+                0.0,
+                400.0,
                 SelectionRect::from_points(0.0, 256.0 * 40.0, 20.0, 257.0 * 40.0),
             ),
             HashSet::from([EntryId(257)])
@@ -14305,6 +14489,8 @@ mod tests {
                 ViewMode::Details,
                 1,
                 600.0,
+                0.0,
+                400.0,
                 SelectionRect::from_points(0.0, 0.0, 20.0, 40.0),
             )
             .is_empty()
