@@ -216,6 +216,7 @@ fn shell_menu_worker_loop(
                 }
                 .and_then(|mut menu| {
                     let items = menu.items_top_level()?;
+                    menu.preload_background_submenus(&items);
                     session = Some((session_id, request_id, menu));
                     Ok(items)
                 });
@@ -359,6 +360,8 @@ pub struct ClassicMenuSession {
     com_initialized: bool,
     submenus: Vec<SubmenuRegistration>,
     registry_commands: std::collections::HashMap<u32, RegistryCascadeCommand>,
+    folder: Option<PathBuf>,
+    preloaded_submenus: std::collections::HashMap<ShellMenuSubmenuToken, Vec<ClassicMenuItem>>,
     _thread_affinity: PhantomData<Rc<()>>,
 }
 
@@ -380,7 +383,7 @@ impl ClassicMenuSession {
         owner_window: isize,
     ) -> io::Result<Self> {
         validate_selection(paths)?;
-        Self::create(include_extended_verbs, || {
+        Self::create(include_extended_verbs, None, || {
             create_selection_context_menu(paths, HWND(owner_window as *mut _))
         })
     }
@@ -391,13 +394,14 @@ impl ClassicMenuSession {
         owner_window: isize,
     ) -> io::Result<Self> {
         validate_background(folder)?;
-        Self::create(include_extended_verbs, || {
+        Self::create(include_extended_verbs, Some(folder.to_path_buf()), || {
             create_background_context_menu(folder, HWND(owner_window as *mut _))
         })
     }
 
     fn create(
         include_extended_verbs: bool,
+        folder: Option<PathBuf>,
         create_context_menu: impl FnOnce() -> io::Result<IContextMenu>,
     ) -> io::Result<Self> {
         let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
@@ -455,6 +459,8 @@ impl ClassicMenuSession {
             com_initialized: true,
             submenus: Vec::new(),
             registry_commands: std::collections::HashMap::new(),
+            folder,
+            preloaded_submenus: std::collections::HashMap::new(),
             _thread_affinity: PhantomData,
         })
     }
@@ -485,6 +491,9 @@ impl ClassicMenuSession {
     }
 
     fn load_submenu(&mut self, token: ShellMenuSubmenuToken) -> io::Result<Vec<ClassicMenuItem>> {
+        if let Some(items) = self.preloaded_submenus.get(&token) {
+            return Ok(items.clone());
+        }
         let index = token
             .checked_sub(1)
             .and_then(|value| usize::try_from(value).ok())
@@ -521,7 +530,48 @@ impl ClassicMenuSession {
         {
             return Ok(items);
         }
+        if verb.as_deref() == Some("windows.share")
+            && let Some(folder) = self.folder.clone()
+        {
+            return load_selected_folder_submenu(&folder, "windows.share");
+        }
         Ok(Vec::new())
+    }
+
+    fn preload_background_submenus(&mut self, items: &[ClassicMenuItem]) {
+        if self.folder.is_none() {
+            return;
+        }
+        let candidates = items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                ClassicMenuItemKind::Submenu { token, .. }
+                    if matches!(
+                        item.verb.as_deref(),
+                        Some("powershell7x64" | "windows.share")
+                    ) =>
+                {
+                    Some(*token)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for token in candidates {
+            if let Ok(items) = self.load_submenu(token)
+                && !items.is_empty()
+            {
+                self.preloaded_submenus.insert(token, items);
+            }
+        }
+    }
+
+    fn submenu_verb(&self, token: ShellMenuSubmenuToken) -> Option<String> {
+        let index = token
+            .checked_sub(1)
+            .and_then(|value| usize::try_from(value).ok())?;
+        let registration = *self.submenus.get(index)?;
+        let position = submenu_position(registration.parent, registration.menu).ok()?;
+        menu_item_verb(registration.parent, position, self)
     }
 
     fn invoke_command(
@@ -648,6 +698,26 @@ impl ClassicMenuSession {
         self.context_menu2 = None;
         self.context_menu = None;
     }
+}
+
+fn load_selected_folder_submenu(folder: &Path, verb: &str) -> io::Result<Vec<ClassicMenuItem>> {
+    let mut session = ClassicMenuSession::for_paths_with_owner(&[folder.to_path_buf()], false, 0)?;
+    let items = session.items_top_level()?;
+    let token = items
+        .iter()
+        .find_map(|item| match &item.kind {
+            ClassicMenuItemKind::Submenu { token, .. } if item.verb.as_deref() == Some(verb) => {
+                Some(*token)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "folder-equivalent submenu not found",
+            )
+        })?;
+    session.load_submenu(token)
 }
 
 fn menu_item_verb(parent: HMENU, position: u32, session: &ClassicMenuSession) -> Option<String> {
@@ -1344,5 +1414,49 @@ mod tests {
         let mut selected = ClassicMenuSession::for_paths_with_owner(&[folder], false, 0)
             .expect("create selected-folder menu");
         probe("selected-folder", &mut selected);
+    }
+
+    #[test]
+    #[ignore = "requires the real Windows shell sharing extension"]
+    fn probe_background_sharing_after_selected_folder_menu() {
+        let folder = std::env::current_dir().expect("current directory");
+        let mut selected =
+            ClassicMenuSession::for_paths_with_owner(std::slice::from_ref(&folder), false, 0)
+                .expect("create selected-folder menu");
+        let selected_items = selected.items_top_level().expect("selected top level");
+        let selected_token = selected_items
+            .iter()
+            .find_map(|item| match &item.kind {
+                ClassicMenuItemKind::Submenu { token, .. }
+                    if item.verb.as_deref() == Some("windows.share") =>
+                {
+                    Some(*token)
+                }
+                _ => None,
+            })
+            .expect("selected sharing submenu");
+        let selected_children = selected
+            .load_submenu(selected_token)
+            .expect("selected sharing");
+        eprintln!("selected sharing children={selected_children:?}");
+
+        let mut background = ClassicMenuSession::for_background_with_owner(&folder, false, 0)
+            .expect("create background menu");
+        let background_items = background.items_top_level().expect("background top level");
+        let background_token = background_items
+            .iter()
+            .find_map(|item| match &item.kind {
+                ClassicMenuItemKind::Submenu { token, .. }
+                    if item.verb.as_deref() == Some("windows.share") =>
+                {
+                    Some(*token)
+                }
+                _ => None,
+            })
+            .expect("background sharing submenu");
+        let background_children = background
+            .load_submenu(background_token)
+            .expect("background sharing");
+        eprintln!("background sharing children={background_children:?}");
     }
 }
