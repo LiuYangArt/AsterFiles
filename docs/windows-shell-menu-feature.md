@@ -19,6 +19,8 @@
 
 第三轮人工复验确认空白处 PowerShell 7 仍只短暂显示加载状态。背景 Shell 菜单在 `WM_INITMENUPOPUP` 前还依赖根菜单的 `WM_INITMENU` 初始化；快速菜单现补齐与原生菜单一致的两段初始化消息，仍在所属 STA 会话和原始 HMENU 上执行。
 
+第四轮复验后增加真实 Shell 探针，确认差异来自 PowerShell 7 的注册方式：文件夹对象菜单由 `IContextMenu` 正常返回两个子项，而目录空白背景菜单只返回一个带 `ExtendedSubCommandsKey` 的空占位 HMENU，向同一接口发送初始化消息也不会填充。快速菜单仅在 Shell 子菜单最终为空且顶层 verb 能精确映射到 `Directory\Background\shell` 时读取该系统级联定义，保留“Open here”和带 UAC 的管理员入口；其他动态扩展继续走原 STA Shell 会话，无法可靠投影时仍使用完整经典菜单。
+
 第二阶段其余部分尚未完成：普通 Shell 图标与快捷键列、STA 预热和活动目录空白菜单短缓存、100%–200% DPI/多屏边缘实证及完整无障碍复验。辅助进程隔离继续以真实慢加载或崩溃数据为决策依据，不在首个切片中预设。
 
 ## 1. 拆分原因

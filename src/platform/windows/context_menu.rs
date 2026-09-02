@@ -36,11 +36,13 @@ use windows::{
     },
     core::{Interface, PCSTR, PCWSTR, PSTR, PWSTR, w},
 };
+use windows_sys::Win32::System::Registry::{HKEY_CLASSES_ROOT, RRF_RT_REG_SZ, RegGetValueW};
 
 const FIRST_COMMAND_ID: u32 = 1;
 const LAST_COMMAND_ID: u32 = 0x7fff;
 const DYNAMIC_SUBMENU_WAIT: Duration = Duration::from_millis(300);
 const DYNAMIC_SUBMENU_POLL: Duration = Duration::from_millis(10);
+const REGISTRY_COMMAND_VERB_PREFIX: &str = "registry-command:";
 const MENU_WINDOW_CLASS: PCWSTR = w!("AsterFiles.ClassicMenuOwner");
 
 thread_local! {
@@ -356,6 +358,7 @@ pub struct ClassicMenuSession {
     context_menu3: Option<IContextMenu3>,
     com_initialized: bool,
     submenus: Vec<SubmenuRegistration>,
+    registry_commands: std::collections::HashMap<u32, RegistryCascadeCommand>,
     _thread_affinity: PhantomData<Rc<()>>,
 }
 
@@ -363,6 +366,11 @@ pub struct ClassicMenuSession {
 struct SubmenuRegistration {
     menu: HMENU,
     parent: HMENU,
+}
+
+struct RegistryCascadeCommand {
+    command: String,
+    elevated: bool,
 }
 
 impl ClassicMenuSession {
@@ -446,6 +454,7 @@ impl ClassicMenuSession {
             context_menu3,
             com_initialized: true,
             submenus: Vec::new(),
+            registry_commands: std::collections::HashMap::new(),
             _thread_affinity: PhantomData,
         })
     }
@@ -506,6 +515,12 @@ impl ClassicMenuSession {
                 return Ok(items);
             }
         }
+        let verb = menu_item_verb(registration.parent, position, self);
+        if let Some(verb) = verb.as_deref()
+            && let Some(items) = registry_cascade_items(verb, &mut self.registry_commands)
+        {
+            return Ok(items);
+        }
         Ok(Vec::new())
     }
 
@@ -523,6 +538,12 @@ impl ClassicMenuSession {
             .context_menu
             .as_ref()
             .ok_or_else(|| io::Error::other("shell context menu was already released"))?;
+        if let Some(command) = self.registry_commands.get(&command_id) {
+            launch_registry_command(command, owner_window)?;
+            return Ok(ClassicMenuInvocation::Shell {
+                verb: Some(format!("{REGISTRY_COMMAND_VERB_PREFIX}{command_id}")),
+            });
+        }
         let verb = command_verb(context_menu, command_id);
         if let Some(verb) = verb.as_deref().filter(|verb| is_builtin_verb(verb)) {
             return Ok(ClassicMenuInvocation::BuiltIn {
@@ -600,6 +621,14 @@ impl ClassicMenuSession {
         if !is_dynamic_menu_message(message) {
             return None;
         }
+        if matches!(
+            message,
+            windows::Win32::UI::WindowsAndMessaging::WM_INITMENU | WM_INITMENUPOPUP
+        ) && let Some(menu2) = &self.context_menu2
+            && unsafe { menu2.HandleMenuMsg(message, wparam, lparam) }.is_ok()
+        {
+            return Some(LRESULT::default());
+        }
         if let Some(menu3) = &self.context_menu3 {
             let mut result = LRESULT::default();
             if unsafe { menu3.HandleMenuMsg2(message, wparam, lparam, Some(&mut result)) }.is_ok() {
@@ -619,6 +648,199 @@ impl ClassicMenuSession {
         self.context_menu2 = None;
         self.context_menu = None;
     }
+}
+
+fn menu_item_verb(parent: HMENU, position: u32, session: &ClassicMenuSession) -> Option<String> {
+    let mut info = MENUITEMINFOW {
+        cbSize: size_of::<MENUITEMINFOW>() as u32,
+        fMask: MIIM_ID,
+        ..Default::default()
+    };
+    unsafe { GetMenuItemInfoW(parent, position, true, &mut info) }.ok()?;
+    (FIRST_COMMAND_ID..=LAST_COMMAND_ID)
+        .contains(&info.wID)
+        .then_some(info.wID)
+        .and_then(|id| {
+            session
+                .context_menu
+                .as_ref()
+                .and_then(|menu| command_verb(menu, id))
+        })
+}
+
+fn registry_cascade_items(
+    verb: &str,
+    commands: &mut std::collections::HashMap<u32, RegistryCascadeCommand>,
+) -> Option<Vec<ClassicMenuItem>> {
+    let cascade_key = registry_string(
+        HKEY_CLASSES_ROOT,
+        &format!(r"Directory\Background\shell\{verb}"),
+        "ExtendedSubCommandsKey",
+    )?;
+    let shell_key = format!(r"{cascade_key}\shell");
+    let mut items = Vec::new();
+    for key in registry_subkeys(HKEY_CLASSES_ROOT, &shell_key)? {
+        let item_key = format!(r"{shell_key}\{key}");
+        let title = registry_string(HKEY_CLASSES_ROOT, &item_key, "MUIVerb")
+            .or_else(|| registry_default_string(HKEY_CLASSES_ROOT, &item_key))
+            .unwrap_or_else(|| key.clone());
+        let command = registry_default_string(HKEY_CLASSES_ROOT, &format!(r"{item_key}\command"))?;
+        let command_id = LAST_COMMAND_ID.checked_sub(u32::try_from(commands.len()).ok()?)?;
+        let elevated = registry_value_exists(HKEY_CLASSES_ROOT, &item_key, "HasLUAShield")
+            || key.eq_ignore_ascii_case("runas");
+        commands.insert(command_id, RegistryCascadeCommand { command, elevated });
+        items.push(ClassicMenuItem {
+            command_id: Some(command_id),
+            title: clean_menu_title(&title),
+            verb: Some(format!("{REGISTRY_COMMAND_VERB_PREFIX}{command_id}")),
+            enabled: true,
+            checked: false,
+            default: false,
+            kind: ClassicMenuItemKind::Command,
+        });
+    }
+    (!items.is_empty()).then_some(items)
+}
+
+fn launch_registry_command(
+    command: &RegistryCascadeCommand,
+    owner_window: isize,
+) -> io::Result<()> {
+    use windows_sys::Win32::UI::Shell::{SEE_MASK_UNICODE, SHELLEXECUTEINFOW, ShellExecuteExW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let executable = wide_null_str("cmd.exe");
+    let parameters = wide_null_str(&format!("/S /C \"{}\"", command.command));
+    let verb = command.elevated.then(|| wide_null_str("runas"));
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_UNICODE,
+        hwnd: owner_window as *mut _,
+        lpVerb: verb.as_ref().map_or(ptr::null(), |verb| verb.as_ptr()),
+        lpFile: executable.as_ptr(),
+        lpParameters: parameters.as_ptr(),
+        nShow: SW_SHOWNORMAL,
+        ..Default::default()
+    };
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn registry_value_exists(
+    root: windows_sys::Win32::System::Registry::HKEY,
+    key: &str,
+    value: &str,
+) -> bool {
+    let key = wide_null_str(key);
+    let value = wide_null_str(value);
+    (unsafe {
+        RegGetValueW(
+            root,
+            key.as_ptr(),
+            value.as_ptr(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    }) == 0
+}
+
+fn registry_string(
+    root: windows_sys::Win32::System::Registry::HKEY,
+    key: &str,
+    value: &str,
+) -> Option<String> {
+    let key = wide_null_str(key);
+    let value = wide_null_str(value);
+    let mut bytes = 0_u32;
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut bytes,
+        )
+    };
+    if status != 0 || bytes < 2 {
+        return None;
+    }
+    let mut buffer = vec![0_u16; bytes as usize / 2];
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            ptr::null_mut(),
+            buffer.as_mut_ptr().cast(),
+            &mut bytes,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    let length = buffer
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(buffer.len());
+    Some(String::from_utf16_lossy(&buffer[..length]))
+}
+
+fn registry_default_string(
+    root: windows_sys::Win32::System::Registry::HKEY,
+    key: &str,
+) -> Option<String> {
+    registry_string(root, key, "")
+}
+
+fn registry_subkeys(
+    root: windows_sys::Win32::System::Registry::HKEY,
+    key: &str,
+) -> Option<Vec<String>> {
+    use windows_sys::Win32::System::Registry::{
+        KEY_READ, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW,
+    };
+    let key = wide_null_str(key);
+    let mut handle = ptr::null_mut();
+    if unsafe { RegOpenKeyExW(root, key.as_ptr(), 0, KEY_READ, &mut handle) } != 0 {
+        return None;
+    }
+    let mut names = Vec::new();
+    for index in 0.. {
+        let mut buffer = vec![0_u16; 256];
+        let mut length = buffer.len() as u32;
+        let status = unsafe {
+            RegEnumKeyExW(
+                handle,
+                index,
+                buffer.as_mut_ptr(),
+                &mut length,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        if status == 259 {
+            break;
+        }
+        if status != 0 {
+            unsafe { RegCloseKey(handle) };
+            return None;
+        }
+        names.push(String::from_utf16_lossy(&buffer[..length as usize]));
+    }
+    unsafe { RegCloseKey(handle) };
+    Some(names)
+}
+
+fn wide_null_str(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
 }
 
 impl Drop for ClassicMenuSession {
@@ -1053,6 +1275,23 @@ mod tests {
     }
 
     #[test]
+    fn background_registry_cascade_resolves_powershell_children() {
+        let mut commands = std::collections::HashMap::new();
+        let items = registry_cascade_items("powershell7x64", &mut commands)
+            .expect("PowerShell 7 background cascade is registered on this machine");
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Open here", "Open here as Administrator"]
+        );
+        assert_eq!(commands.len(), 2);
+        assert!(commands.values().any(|command| command.elevated));
+        assert!(commands.values().any(|command| !command.elevated));
+    }
+
+    #[test]
     fn submenu_token_is_not_a_native_handle_or_command_id() {
         let token: ShellMenuSubmenuToken = 7;
         let item = ClassicMenuItem {
@@ -1072,5 +1311,38 @@ mod tests {
             ClassicMenuItemKind::Submenu { token: 7, .. }
         ));
         assert_eq!(item.command_id, None);
+    }
+
+    #[test]
+    #[ignore = "requires the real Windows shell extensions installed on this machine"]
+    fn probe_background_and_selected_folder_submenus() {
+        fn probe(name: &str, session: &mut ClassicMenuSession) {
+            let items = session.items_top_level().expect("read top-level menu");
+            eprintln!("{name}: top_level_count={}", items.len());
+            for item in &items {
+                if let ClassicMenuItemKind::Submenu { token, .. } = item.kind {
+                    let children = session.load_submenu(token).expect("load submenu");
+                    eprintln!(
+                        "{name}: submenu={:?} command_id={:?} verb={:?} token={token} child_count={} children={:?}",
+                        item.title,
+                        item.command_id,
+                        item.verb,
+                        children.len(),
+                        children
+                            .iter()
+                            .map(|child| child.title.as_str())
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+
+        let folder = std::env::current_dir().expect("current directory");
+        let mut background = ClassicMenuSession::for_background_with_owner(&folder, false, 0)
+            .expect("create background menu");
+        probe("background", &mut background);
+        let mut selected = ClassicMenuSession::for_paths_with_owner(&[folder], false, 0)
+            .expect("create selected-folder menu");
+        probe("selected-folder", &mut selected);
     }
 }
