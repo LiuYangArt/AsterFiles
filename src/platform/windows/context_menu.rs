@@ -217,6 +217,9 @@ fn shell_menu_worker_loop(
                 .and_then(|mut menu| {
                     let mut items = menu.items_top_level()?;
                     menu.preload_background_submenus(&mut items);
+                    if menu.folder.is_some() {
+                        items.retain(|item| item.verb.as_deref() != Some("windows.share"));
+                    }
                     session = Some((session_id, request_id, menu));
                     Ok(items)
                 });
