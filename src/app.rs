@@ -43,6 +43,10 @@ slint::include_modules!();
 
 const WORKER_COUNT: usize = 4;
 const ICON_WORKER_COUNT: usize = 2;
+const DIRECTORY_EVENT_INTERVAL: Duration = Duration::from_millis(16);
+const REBUILT_PROJECTION_BATCH_SIZE: usize = 256;
+const THUMBNAIL_CACHE_CAPACITY: usize = 128;
+const LARGE_ICON_CACHE_CAPACITY: usize = 128;
 
 pub fn export_folder_size_scheduler_state(path: &Path) -> io::Result<()> {
     use crate::domain::{
@@ -602,28 +606,36 @@ fn screen_to_client_physical(screen_x: i32, screen_y: i32, left: i32, top: i32) 
 }
 
 fn grid_thumbnail_request_px(view_mode: ViewMode, scale: f32) -> u32 {
-    (file_layout_geometry(view_mode).icon_request_px as f32 * scale)
+    const STANDARD_SIZES: [u32; 8] = [16, 24, 32, 48, 64, 96, 128, 256];
+    let requested = (file_layout_geometry(view_mode).icon_request_px as f32 * scale)
         .round()
-        .max(32.0) as u32
+        .max(32.0) as u32;
+    STANDARD_SIZES
+        .into_iter()
+        .find(|size| *size >= requested)
+        .unwrap_or(requested)
 }
 
-fn grid_thumbnail_request_indices(
-    entry_count: usize,
-    columns: usize,
+fn grid_thumbnail_request_rows(
+    row_extents: &[f32],
     viewport_y: f32,
     visible_height: f32,
-    row_height: f32,
+    prefetch_extent: f32,
 ) -> Vec<usize> {
-    if entry_count == 0 {
-        return Vec::new();
-    }
-    let columns = columns.max(1);
-    let row_height = row_height.max(1.0);
-    let first_row = ((-viewport_y).max(0.0) / row_height).floor() as usize;
-    let visible_rows = (visible_height.max(row_height) / row_height).ceil() as usize + 1;
-    let first = first_row.saturating_sub(2) * columns;
-    let last = ((first_row + visible_rows + 2) * columns).min(entry_count);
-    (first..last).collect()
+    let visible_top = (-viewport_y).max(0.0);
+    let request_top = (visible_top - prefetch_extent).max(0.0);
+    let request_bottom = visible_top + visible_height.max(0.0) + prefetch_extent;
+    let mut row_top = 0.0;
+    row_extents
+        .iter()
+        .enumerate()
+        .filter_map(|(index, extent)| {
+            let row_bottom = row_top + extent.max(0.0);
+            let visible = row_bottom >= request_top && row_top <= request_bottom;
+            row_top = row_bottom;
+            visible.then_some(index)
+        })
+        .collect()
 }
 
 fn grid_thumbnail_requests(
@@ -631,7 +643,6 @@ fn grid_thumbnail_requests(
     state: &SharedSessions,
     window_id: WindowId,
 ) -> Vec<IconRequest> {
-    let columns = ui.get_grid_column_count().max(1) as usize;
     let visible_height = ui.window().size().height as f32 / ui.window().scale_factor()
         - ui.get_file_list_top()
         - 30.0;
@@ -642,37 +653,40 @@ fn grid_thumbnail_requests(
     let Some(tab) = window.tabs.get(&window.active_tab) else {
         return Vec::new();
     };
-    let view_mode = app.active_view_mode();
+    let Some(view_mode) = app.view_mode_for_tab(tab.id) else {
+        return Vec::new();
+    };
     if tab.kind != TabKind::Files || !view_mode.uses_grid_layout() {
         return Vec::new();
     }
     let requested_px = grid_thumbnail_request_px(view_mode, ui.window().scale_factor());
-    let entries = tab.visible_entries();
-    let search_window = (tab.page_source == PageSource::Search).then(|| {
-        search_window_for_scroll(
-            ui.get_search_scroll_y(),
-            tab.search_total.unwrap_or(0),
-            ViewMode::MediumIcons,
-            columns,
-        )
-    });
-    let projected_count = search_window.map_or(entries.len(), |window| window.len);
-    let indices = grid_thumbnail_request_indices(
-        projected_count,
-        columns,
+
+    let row_height = file_layout_geometry(view_mode).row_height;
+    let grid_rows = ui.get_grid_rows();
+    let request_rows = grid_thumbnail_request_rows(
+        &grid_rows
+            .iter()
+            .map(|row| if row.group_header { 32.0 } else { row_height })
+            .collect::<Vec<_>>(),
         ui.get_file_viewport_y(),
         visible_height,
-        file_layout_geometry(view_mode).row_height,
+        row_height * 2.0,
     );
-    let requests = indices
+    let entry_ids = request_rows
         .into_iter()
-        .filter_map(|index| {
-            let entry = if let Some(window) = search_window {
-                let id = window.start.checked_add(index as u32)?.checked_add(1)?;
-                tab.visible_entry(EntryId(id))?
-            } else {
-                entries.get(index)?
-            };
+        .flat_map(|row_index| {
+            grid_rows.row_data(row_index).map_or_else(Vec::new, |row| {
+                row.entries
+                    .iter()
+                    .filter_map(|entry| (entry.id > 0).then_some(EntryId(entry.id as u32)))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+    let requests = entry_ids
+        .into_iter()
+        .filter_map(|entry_id| {
+            let entry = tab.visible_entry(entry_id)?;
             (!app
                 .thumbnail_cache
                 .contains_key(&(entry.path.clone(), requested_px))
@@ -715,6 +729,18 @@ fn request_grid_thumbnails(
     for request in grid_thumbnail_requests(ui, state, window_id) {
         let _ = sender.send(request);
     }
+}
+
+fn defer_grid_thumbnails(state: SharedSessions, tab_id: TabId, sender: mpsc::Sender<IconRequest>) {
+    slint::Timer::single_shot(DIRECTORY_EVENT_INTERVAL, move || {
+        let Some(window_id) = state.lock().ok().and_then(|app| app.window_for_tab(tab_id)) else {
+            return;
+        };
+        let Some(ui) = window_ui(window_id) else {
+            return;
+        };
+        request_grid_thumbnails(&ui, &state, window_id, &sender);
+    });
 }
 
 fn refresh_all_windows(state: &SharedSessions) {
@@ -1218,7 +1244,9 @@ struct AppState {
     icon_cache: HashMap<PathBuf, platform::windows_shell_icons::ShellIconRgba>,
     sidebar_icons: HashMap<PathBuf, platform::windows_shell_icons::ShellIconRgba>,
     thumbnail_cache: HashMap<(PathBuf, u32), platform::windows_shell_icons::ShellIconRgba>,
+    thumbnail_cache_order: VecDeque<(PathBuf, u32)>,
     large_icon_cache: HashMap<(PathBuf, u32), platform::windows_shell_icons::ShellIconRgba>,
+    large_icon_cache_order: VecDeque<(PathBuf, u32)>,
     thumbnail_requests: std::collections::HashSet<(TabId, RequestId, PathBuf, u32)>,
     sidebar: Vec<KnownLocation>,
     default_directory_view: DirectoryViewPreference,
@@ -1282,15 +1310,20 @@ impl AppState {
             .unwrap_or(self.default_directory_view)
     }
 
-    fn active_view_mode(&self) -> ViewMode {
-        if self.active().page_source == PageSource::Search {
+    fn view_mode_for_tab(&self, tab_id: TabId) -> Option<ViewMode> {
+        let tab = self.tab(tab_id)?;
+        Some(if tab.page_source == PageSource::Search {
             self.search_view.view_mode
         } else {
-            self.active()
-                .visible_path()
+            tab.visible_path()
                 .map(|path| self.directory_preference(path).view_mode)
                 .unwrap_or(self.default_directory_view.view_mode)
-        }
+        })
+    }
+
+    fn active_view_mode(&self) -> ViewMode {
+        self.view_mode_for_tab(self.active_window_state().active_tab)
+            .unwrap_or(self.default_directory_view.view_mode)
     }
 
     fn active_column_layout(&self) -> ColumnLayout {
@@ -1424,7 +1457,9 @@ impl AppState {
             icon_cache: HashMap::new(),
             sidebar_icons: HashMap::new(),
             thumbnail_cache: HashMap::new(),
+            thumbnail_cache_order: VecDeque::new(),
             large_icon_cache: HashMap::new(),
+            large_icon_cache_order: VecDeque::new(),
             thumbnail_requests: std::collections::HashSet::new(),
             sidebar: Vec::new(),
             default_directory_view,
@@ -2509,13 +2544,18 @@ fn search_scroll_for_index(index: u32, view_mode: ViewMode, columns: usize) -> f
     -(row as f32 * file_row_height(view_mode))
 }
 
-fn search_window_rows(tab: &TabSession, app: &AppState, window: SearchWindow) -> Vec<FileRow> {
+fn search_window_rows(
+    tab: &TabSession,
+    app: &AppState,
+    window: SearchWindow,
+    grid_requested_px: Option<u32>,
+) -> Vec<FileRow> {
     let texts = Texts::new(app.language);
     (0..window.len)
         .map(|local| {
             let result_index = window.start.saturating_add(local as u32);
             tab.visible_entry(EntryId(result_index.saturating_add(1)))
-                .map(|entry| file_row(entry, tab, texts, app))
+                .map(|entry| file_row(entry, tab, texts, app, grid_requested_px))
                 .unwrap_or_else(empty_file_row)
         })
         .collect()
@@ -3769,11 +3809,14 @@ fn request_clipboard_paste(state: &SharedSessions, sender: &mpsc::Sender<Clipboa
 }
 fn set_view_mode(state: &SharedSessions, mode: ViewMode) {
     if let Ok(mut app) = state.lock() {
+        let tab_id = app.active_window_state().active_tab;
         if app.active().page_source == PageSource::Search {
             app.search_view.view_mode = mode;
         } else if let Some(path) = app.active().visible_path().map(Path::to_path_buf) {
             app.update_directory_preference(path, |preference| preference.view_mode = mode);
         }
+        app.thumbnail_requests
+            .retain(|(request_tab, _, _, _)| *request_tab != tab_id);
     }
 }
 
@@ -6323,11 +6366,14 @@ fn wire_callbacks(
                     )
                 });
             }
+            let tab_id = app.active_window_state().active_tab;
             if app.active().page_source == PageSource::Search {
                 app.search_view.view_mode = mode;
             } else if let Some(path) = path {
                 app.update_directory_preference(path, |preference| preference.view_mode = mode);
             }
+            app.thumbnail_requests
+                .retain(|(request_tab, _, _, _)| *request_tab != tab_id);
         }
         if let Some(ui) = weak.upgrade() {
             if let Some(index) = preserved_search_index {
@@ -7928,7 +7974,11 @@ fn wire_mouse_navigation(
                                 view_mode,
                                 next,
                                 ui.get_grid_column_count().max(1) as usize,
-                                ui.get_files().row_count(),
+                                state
+                                    .lock()
+                                    .ok()
+                                    .map(|app| app.active().visible_entries().len())
+                                    .unwrap_or(0),
                                 ui.get_file_viewport_height(),
                             );
                             set_view_mode(&state, next);
@@ -10914,12 +10964,7 @@ fn start_event_pump(
                         } else {
                             append_active_file_rows(&ui, &state, tab_id, request_id);
                         }
-                        if let Some(window_id) =
-                            state.lock().ok().and_then(|app| app.window_for_tab(tab_id))
-                            && let Some(target_ui) = window_ui(window_id)
-                        {
-                            request_grid_thumbnails(&target_ui, &state, window_id, &icon_sender);
-                        }
+                        defer_grid_thumbnails(state.clone(), tab_id, icon_sender.clone());
                     } else {
                         if let Some((tab_id, request_id)) = finished {
                             let viewport = state
@@ -11001,19 +11046,24 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
         } => {
             let accepted = app.tab(tab_id).is_some_and(|tab| tab.accepts(request_id));
             if accepted {
-                icon_requests.extend(
-                    entries
-                        .iter()
-                        .filter(|entry| !app.icon_cache.contains_key(&entry.path))
-                        .map(|entry| IconRequest {
-                            tab_id,
-                            request_id,
-                            target: IconTarget::Entry(entry.id),
-                            path: entry.path.clone(),
-                            thumbnail: false,
-                            requested_px: 0,
-                        }),
-                );
+                if !app
+                    .view_mode_for_tab(tab_id)
+                    .is_some_and(ViewMode::uses_grid_layout)
+                {
+                    icon_requests.extend(
+                        entries
+                            .iter()
+                            .filter(|entry| !app.icon_cache.contains_key(&entry.path))
+                            .map(|entry| IconRequest {
+                                tab_id,
+                                request_id,
+                                target: IconTarget::Entry(entry.id),
+                                path: entry.path.clone(),
+                                thumbnail: false,
+                                requested_px: 0,
+                            }),
+                    );
+                }
                 app.tab_mut(tab_id)
                     .expect("accepted tab exists")
                     .append_pending(entries);
@@ -11936,6 +11986,7 @@ fn spawn_icon_workers(
         let events = event_sender.clone();
         let state = state.clone();
         thread::spawn(move || {
+            let _shell_apartment = platform::windows_shell_icons::initialize_shell_worker().ok();
             loop {
                 let request = requests
                     .lock()
@@ -11944,14 +11995,17 @@ fn spawn_icon_workers(
                 let Ok(request) = request else {
                     break;
                 };
-                let is_current = state
-                    .lock()
-                    .ok()
-                    .and_then(|app| {
-                        app.tab(request.tab_id)
-                            .map(|tab| tab.latest_request == request.request_id)
-                    })
-                    .unwrap_or(false);
+                let is_current = state.lock().ok().is_some_and(|app| {
+                    app.tab(request.tab_id)
+                        .is_some_and(|tab| tab.latest_request == request.request_id)
+                        && (!request.thumbnail
+                            || app.thumbnail_requests.contains(&(
+                                request.tab_id,
+                                request.request_id,
+                                request.path.clone(),
+                                request.requested_px,
+                            )))
+                });
                 if !is_current {
                     continue;
                 }
@@ -12051,6 +12105,7 @@ fn start_sidebar_icon_loader(ui: &AppWindow, state: SharedSessions) {
         .collect::<Vec<_>>();
     let weak = ui.as_weak();
     thread::spawn(move || {
+        let _shell_apartment = platform::windows_shell_icons::initialize_shell_worker().ok();
         for path in locations {
             let Ok(icon) = platform::windows_shell_icons::shell_icon_rgba(&path) else {
                 continue;
@@ -12135,6 +12190,30 @@ struct IconUpdate {
     entry_id: Option<EntryId>,
 }
 
+fn insert_bounded_image(
+    cache: &mut HashMap<(PathBuf, u32), platform::windows_shell_icons::ShellIconRgba>,
+    order: &mut VecDeque<(PathBuf, u32)>,
+    key: (PathBuf, u32),
+    image: platform::windows_shell_icons::ShellIconRgba,
+    capacity: usize,
+) {
+    if let std::collections::hash_map::Entry::Occupied(mut existing) = cache.entry(key.clone()) {
+        order.retain(|candidate| candidate != &key);
+        order.push_back(key);
+        existing.insert(image);
+        return;
+    }
+    while cache.len() >= capacity {
+        let Some(oldest) = order.pop_front() else {
+            cache.clear();
+            break;
+        };
+        cache.remove(&oldest);
+    }
+    order.push_back(key.clone());
+    cache.insert(key, image);
+}
+
 fn apply_icon_event(state: &SharedSessions, event: IconEvent) -> Option<IconUpdate> {
     let mut app = state.lock().expect("app state mutex is not poisoned");
     if event.requested_px > 0 {
@@ -12150,20 +12229,34 @@ fn apply_icon_event(state: &SharedSessions, event: IconEvent) -> Option<IconUpda
     }
     let entry_id = match event.target {
         IconTarget::Entry(entry_id) => {
-            app.icons.insert(
-                (event.tab_id, event.request_id, entry_id),
-                event.icon.clone(),
-            );
+            if event.requested_px == 0 {
+                app.icons.insert(
+                    (event.tab_id, event.request_id, entry_id),
+                    event.icon.clone(),
+                );
+            }
             Some(entry_id)
         }
         IconTarget::Location => None,
     };
     if event.actual_thumbnail {
-        app.thumbnail_cache
-            .insert((event.path.clone(), event.requested_px), event.icon.clone());
+        let app = &mut *app;
+        insert_bounded_image(
+            &mut app.thumbnail_cache,
+            &mut app.thumbnail_cache_order,
+            (event.path.clone(), event.requested_px),
+            event.icon.clone(),
+            THUMBNAIL_CACHE_CAPACITY,
+        );
     } else if event.requested_px > 0 {
-        app.large_icon_cache
-            .insert((event.path.clone(), event.requested_px), event.icon.clone());
+        let app = &mut *app;
+        insert_bounded_image(
+            &mut app.large_icon_cache,
+            &mut app.large_icon_cache_order,
+            (event.path.clone(), event.requested_px),
+            event.icon.clone(),
+            LARGE_ICON_CACHE_CAPACITY,
+        );
     } else {
         app.icon_cache.insert(event.path, event.icon);
     }
@@ -12197,6 +12290,11 @@ fn classify_error(kind: io::ErrorKind) -> LoadState {
     }
 }
 
+fn should_rebuild_projection(projected_entries: usize, pending_entries: usize) -> bool {
+    projected_entries == 0
+        || pending_entries.saturating_sub(projected_entries) >= REBUILT_PROJECTION_BATCH_SIZE
+}
+
 fn append_active_file_rows(
     ui: &AppWindow,
     state: &SharedSessions,
@@ -12218,10 +12316,8 @@ fn append_active_file_rows(
         refresh_tab_window(state, tab_id);
         return;
     };
-    let start = model.row_count();
     if ui.get_projected_file_tab_id() != tab_id.0 as i32
         || ui.get_projected_file_request_id() != request_id.0 as i32
-        || start > tab.pending_entries.len()
     {
         drop(app);
         refresh_tab_window(state, tab_id);
@@ -12232,7 +12328,32 @@ fn append_active_file_rows(
         .visible_path()
         .map(|path| app.directory_preference(path).group_field != GroupField::None)
         .unwrap_or(false);
-    if grouped || app.active_view_mode().uses_grid_layout() {
+    let grid_layout = app.active_view_mode().uses_grid_layout();
+    if grouped || grid_layout {
+        let projected_entries = if grid_layout {
+            ui.get_grid_rows()
+                .iter()
+                .filter(|row| !row.group_header)
+                .map(|row| row.entries.row_count())
+                .sum()
+        } else {
+            (0..model.row_count())
+                .filter_map(|index| model.row_data(index))
+                .filter(|row| row.loaded && !row.group_header)
+                .count()
+        };
+        let pending_entries = tab.pending_entries.len();
+        let should_refresh = should_rebuild_projection(projected_entries, pending_entries);
+        drop(app);
+        if should_refresh {
+            refresh_tab_window(state, tab_id);
+        } else {
+            update_tab_status(ui, state, tab_id);
+        }
+        return;
+    }
+    let start = model.row_count();
+    if start > tab.pending_entries.len() {
         drop(app);
         refresh_tab_window(state, tab_id);
         return;
@@ -12240,7 +12361,7 @@ fn append_active_file_rows(
     model.extend(
         tab.pending_entries[start..]
             .iter()
-            .map(|entry| file_row(entry, tab, texts, &app)),
+            .map(|entry| file_row(entry, tab, texts, &app, None)),
     );
     ui.set_status_text(status_text(tab, texts).into());
 }
@@ -12338,10 +12459,21 @@ fn update_file_rows(
     }
 
     let texts = Texts::new(app.language);
+    let Some(view_mode) = app.view_mode_for_tab(tab_id) else {
+        return;
+    };
+    let grid_requested_px = view_mode
+        .uses_grid_layout()
+        .then(|| grid_thumbnail_request_px(view_mode, ui.window().scale_factor()));
     let rows = changed
         .iter()
         .filter_map(|id| tab.visible_entry(*id))
-        .map(|entry| (entry.id, file_row(entry, tab, texts, &app)))
+        .map(|entry| {
+            (
+                entry.id,
+                file_row(entry, tab, texts, &app, grid_requested_px),
+            )
+        })
         .collect::<HashMap<_, _>>();
     if rows.is_empty() {
         return;
@@ -12719,7 +12851,7 @@ fn projected_directory_rows(
             } => Some(group_header_file_row(&label, entry_count)),
             ListVisualRow::Entry { entry_id } => by_id
                 .get(&entry_id)
-                .map(|entry| file_row(entry, tab, texts, app)),
+                .map(|entry| file_row(entry, tab, texts, app, None)),
         })
         .collect()
 }
@@ -12730,6 +12862,7 @@ fn projected_directory_grid_rows(
     texts: Texts,
     app: &AppState,
     columns: usize,
+    requested_px: u32,
 ) -> Vec<GridRow> {
     let groups = directory_group_projections(app, tab, entries);
     let by_id = entries
@@ -12760,13 +12893,27 @@ fn projected_directory_grid_rows(
             entries: ModelRc::new(VecModel::from(
                 entries
                     .into_iter()
-                    .filter_map(|id| by_id.get(&id).map(|entry| file_row(entry, tab, texts, app)))
+                    .filter_map(|id| {
+                        by_id
+                            .get(&id)
+                            .map(|entry| file_row(entry, tab, texts, app, Some(requested_px)))
+                    })
                     .collect::<Vec<_>>(),
             )),
         },
     })
     .collect()
 }
+fn directory_display_entries(tab: &TabSession) -> &[FileEntry] {
+    if matches!(tab.load_state, LoadState::Loading | LoadState::Partial) {
+        &tab.pending_entries
+    } else if tab.has_failed_location() {
+        &[]
+    } else {
+        &tab.entries
+    }
+}
+
 fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
     let app = state.lock().expect("app state mutex is not poisoned");
     let texts = Texts::new(app.language);
@@ -12788,13 +12935,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
         ui.set_projected_file_tab_id(projected_tab_id);
         ui.set_projected_file_request_id(projected_request_id);
     }
-    let display_entries = if matches!(tab.load_state, LoadState::Partial) {
-        &tab.pending_entries
-    } else if tab.has_failed_location() {
-        &[] as &[FileEntry]
-    } else {
-        &tab.entries
-    };
+    let display_entries = directory_display_entries(tab);
     let geometry = file_layout_geometry(view_mode);
     let grid_columns = (((ui.window().size().width as f32 / ui.window().scale_factor()) - 292.0)
         / (geometry.card_width + 8.0).max(1.0))
@@ -12812,23 +12953,36 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
             grid_columns,
         ));
     }
-    let file_rows = if tab.page_source == PageSource::Search {
-        search_window_rows(tab, &app, search_window)
+    let (file_rows, grid_rows) = if view_mode.uses_grid_layout() {
+        let requested_px = grid_thumbnail_request_px(view_mode, ui.window().scale_factor());
+        let grid_rows = if tab.page_source == PageSource::Search {
+            search_window_rows(tab, &app, search_window, Some(requested_px))
+                .chunks(grid_columns)
+                .map(|entries| GridRow {
+                    group_header: false,
+                    group_label: "".into(),
+                    group_count: 0,
+                    entries: ModelRc::new(VecModel::from(entries.to_vec())),
+                })
+                .collect::<Vec<_>>()
+        } else {
+            projected_directory_grid_rows(
+                display_entries,
+                tab,
+                texts,
+                &app,
+                grid_columns,
+                requested_px,
+            )
+        };
+        (Vec::new(), grid_rows)
     } else {
-        projected_directory_rows(display_entries, tab, texts, &app)
-    };
-    let grid_rows = if tab.page_source == PageSource::Search {
-        file_rows
-            .chunks(grid_columns)
-            .map(|entries| GridRow {
-                group_header: false,
-                group_label: "".into(),
-                group_count: 0,
-                entries: ModelRc::new(VecModel::from(entries.to_vec())),
-            })
-            .collect::<Vec<_>>()
-    } else {
-        projected_directory_grid_rows(display_entries, tab, texts, &app, grid_columns)
+        let file_rows = if tab.page_source == PageSource::Search {
+            search_window_rows(tab, &app, search_window, None)
+        } else {
+            projected_directory_rows(display_entries, tab, texts, &app)
+        };
+        (file_rows, Vec::new())
     };
     ui.set_files(ModelRc::new(VecModel::from(file_rows)));
     ui.set_grid_column_count(grid_columns as i32);
@@ -13067,7 +13221,13 @@ fn operation_state_index(state: OperationState) -> i32 {
         OperationState::Failed => 8,
     }
 }
-fn file_row(entry: &FileEntry, tab: &TabSession, texts: Texts, app: &AppState) -> FileRow {
+fn file_row(
+    entry: &FileEntry,
+    tab: &TabSession,
+    texts: Texts,
+    app: &AppState,
+    grid_requested_px: Option<u32>,
+) -> FileRow {
     debug_assert_eq!(
         entry.path.file_name(),
         Some(entry.original_name.as_os_str()),
@@ -13088,30 +13248,14 @@ fn file_row(entry: &FileEntry, tab: &TabSession, texts: Texts, app: &AppState) -
             })
             .collect::<Vec<_>>()
     };
-    let grid_image = app
-        .active_view_mode()
-        .uses_grid_layout()
-        .then(|| {
-            let target_px = file_layout_geometry(app.active_view_mode()).icon_request_px;
-            let thumbnail = app
-                .thumbnail_cache
-                .iter()
-                .filter(|((path, requested_px), _)| {
-                    path == &entry.path && *requested_px >= target_px
-                })
-                .min_by_key(|((_, requested_px), _)| *requested_px)
-                .map(|(_, image)| image);
-            thumbnail.or_else(|| {
+    let grid_image = grid_requested_px.and_then(|requested_px| {
+        app.thumbnail_cache
+            .get(&(entry.path.clone(), requested_px))
+            .or_else(|| {
                 app.large_icon_cache
-                    .iter()
-                    .filter(|((path, requested_px), _)| {
-                        path == &entry.path && *requested_px >= target_px
-                    })
-                    .min_by_key(|((_, requested_px), _)| *requested_px)
-                    .map(|(_, image)| image)
+                    .get(&(entry.path.clone(), requested_px))
             })
-        })
-        .flatten();
+    });
     let image = grid_image.or_else(|| {
         app.icons
             .get(&(tab.id, tab.latest_request, entry.id))
@@ -13539,6 +13683,135 @@ fn initial_path() -> PathBuf {
 mod tests {
     use super::*;
 
+    fn test_image(size: u32) -> platform::windows_shell_icons::ShellIconRgba {
+        platform::windows_shell_icons::ShellIconRgba {
+            width: size,
+            height: size,
+            pixels: vec![0; size as usize * size as usize * 4],
+        }
+    }
+
+    #[test]
+    fn issue_18_navigation_uses_pending_entries_before_the_first_thumbnail() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\old")], 0, [0, 1, 2, 3]);
+        let tab = app.tab_mut(TabId(1)).unwrap();
+        tab.begin_navigation(PathBuf::from(r"C:\new"), NavigationKind::Normal);
+        assert!(directory_display_entries(tab).is_empty());
+        tab.append_pending(vec![focus_entry(1, r"C:\new\photo.png")]);
+        assert_eq!(directory_display_entries(tab).len(), 1);
+        assert!(app.icons.is_empty());
+        assert!(app.thumbnail_cache.is_empty());
+    }
+    #[test]
+    fn issue_18_active_projection_avoids_building_the_hidden_view_model() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\grid")], 0, [0, 1, 2, 3]);
+        app.update_directory_preference(PathBuf::from(r"C:\grid"), |preference| {
+            preference.view_mode = ViewMode::MediumIcons
+        });
+        let tab_id = app.active_window_state().active_tab;
+        app.tab_mut(tab_id)
+            .unwrap()
+            .replace_entries(vec![focus_entry(1, r"C:\grid\photo.png")]);
+        app.tab_mut(tab_id).unwrap().load_state = LoadState::Complete;
+        let state = WindowSessions::new(Arc::new(Mutex::new(app)), WindowId(1));
+        let ui = headless_file_view();
+
+        refresh_ui(&ui, &state);
+
+        assert_eq!(ui.get_files().row_count(), 0);
+        assert_eq!(
+            ui.get_grid_rows()
+                .iter()
+                .map(|row| row.entries.row_count())
+                .sum::<usize>(),
+            1
+        );
+    }
+
+    #[test]
+    fn issue_18_thumbnail_sizes_use_files_style_standard_buckets() {
+        assert_eq!(grid_thumbnail_request_px(ViewMode::MediumIcons, 1.0), 128);
+        assert_eq!(grid_thumbnail_request_px(ViewMode::LargeIcons, 1.5), 256);
+        assert_eq!(
+            grid_thumbnail_request_px(ViewMode::ExtraLargeIcons, 1.5),
+            256
+        );
+    }
+
+    #[test]
+    fn issue_18_grid_batches_skip_eager_icons_but_details_keep_them() {
+        let mut grid = AppState::new_for_test(vec![PathBuf::from(r"C:\grid")], 0, [0, 1, 2, 3]);
+        grid.update_directory_preference(PathBuf::from(r"C:\grid"), |preference| {
+            preference.view_mode = ViewMode::ExtraLargeIcons
+        });
+        let tab = grid.tab_mut(TabId(1)).unwrap();
+        tab.latest_request = RequestId(4);
+        tab.load_state = LoadState::Loading;
+        let grid = Arc::new(Mutex::new(grid));
+        let grid_requests = apply_event(
+            &grid,
+            DirectoryEvent::Batch {
+                tab_id: TabId(1),
+                request_id: RequestId(4),
+                entries: vec![focus_entry(1, r"C:\grid\photo.png")],
+            },
+        );
+        assert!(grid_requests.is_empty());
+
+        let mut details =
+            AppState::new_for_test(vec![PathBuf::from(r"C:\details")], 0, [0, 1, 2, 3]);
+        let tab = details.tab_mut(TabId(1)).unwrap();
+        tab.latest_request = RequestId(5);
+        tab.load_state = LoadState::Loading;
+        let details = Arc::new(Mutex::new(details));
+        let details_requests = apply_event(
+            &details,
+            DirectoryEvent::Batch {
+                tab_id: TabId(1),
+                request_id: RequestId(5),
+                entries: vec![focus_entry(1, r"C:\details\photo.png")],
+            },
+        );
+        assert_eq!(details_requests.len(), 1);
+        assert!(!details_requests[0].thumbnail);
+    }
+    #[test]
+    fn issue_18_rebuilt_projection_is_coalesced_for_large_directories() {
+        assert!(should_rebuild_projection(0, 32));
+        assert!(!should_rebuild_projection(32, 255));
+        assert!(should_rebuild_projection(32, 288));
+    }
+
+    #[test]
+    fn issue_18_thumbnail_cache_evicts_the_oldest_entry() {
+        let mut cache = HashMap::new();
+        let mut order = VecDeque::new();
+        insert_bounded_image(
+            &mut cache,
+            &mut order,
+            (PathBuf::from("first.png"), 256),
+            test_image(1),
+            2,
+        );
+        insert_bounded_image(
+            &mut cache,
+            &mut order,
+            (PathBuf::from("second.png"), 256),
+            test_image(1),
+            2,
+        );
+        insert_bounded_image(
+            &mut cache,
+            &mut order,
+            (PathBuf::from("third.png"), 256),
+            test_image(1),
+            2,
+        );
+
+        assert!(!cache.contains_key(&(PathBuf::from("first.png"), 256)));
+        assert!(cache.contains_key(&(PathBuf::from("second.png"), 256)));
+        assert!(cache.contains_key(&(PathBuf::from("third.png"), 256)));
+    }
     fn context_test_row(
         id: i32,
         label: &str,
@@ -13901,11 +14174,11 @@ mod tests {
             screen_to_client_physical(800, 400, 640, 250),
             (160.0, 150.0)
         );
-        assert_eq!(grid_thumbnail_request_px(ViewMode::MediumIcons, 1.0), 100);
-        assert_eq!(grid_thumbnail_request_px(ViewMode::LargeIcons, 1.5), 222);
+        assert_eq!(grid_thumbnail_request_px(ViewMode::MediumIcons, 1.0), 128);
+        assert_eq!(grid_thumbnail_request_px(ViewMode::LargeIcons, 1.5), 256);
         assert_eq!(
             grid_thumbnail_request_px(ViewMode::ExtraLargeIcons, 1.5),
-            252
+            256
         );
     }
 
@@ -13930,6 +14203,7 @@ mod tests {
             tab,
             Texts::new(Language::Chinese),
             &app,
+            Some(148),
         );
         assert_eq!(row.icon.size().width, 0);
 
@@ -13947,6 +14221,7 @@ mod tests {
             tab,
             Texts::new(Language::Chinese),
             &app,
+            Some(148),
         );
         assert_eq!(row.icon.size().width, 148);
     }
@@ -13970,20 +14245,23 @@ mod tests {
             },
         );
 
-        assert_eq!(requests.len(), 1);
-        assert!(!requests[0].thumbnail);
-        assert_eq!(requests[0].requested_px, 0);
+        assert!(requests.is_empty());
         assert_eq!(
-            grid_thumbnail_request_indices(500, 4, -296.0, 444.0, 148.0),
-            (0..32).collect::<Vec<_>>()
+            grid_thumbnail_request_rows(&vec![148.0; 125], -296.0, 444.0, 296.0),
+            (0..=7).collect::<Vec<_>>()
         );
         assert_eq!(
-            grid_thumbnail_request_indices(500, 4, -1480.0, 296.0, 148.0),
-            (32..60).collect::<Vec<_>>()
+            grid_thumbnail_request_rows(&vec![148.0; 125], -1480.0, 296.0, 296.0),
+            (7..=14).collect::<Vec<_>>()
         );
         assert_eq!(
-            grid_thumbnail_request_indices(500, 4, -2_200.0, 440.0, 220.0),
-            (32..60).collect::<Vec<_>>()
+            grid_thumbnail_request_rows(
+                &[32.0, 220.0, 220.0, 32.0, 220.0, 220.0, 220.0],
+                -500.0,
+                220.0,
+                0.0,
+            ),
+            vec![3, 4]
         );
     }
 

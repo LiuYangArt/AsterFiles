@@ -1708,7 +1708,7 @@ accessible-label: entry.name;
                         }
                     }
                     grid := ListView {
-                        visible: root.files.length > 0 && root.is-grid-view-mode(root.view-mode);
+                        visible: root.grid-rows.length > 0 && root.is-grid-view-mode(root.view-mode);
                         mouse-drag-pan-enabled: false;
                         width: parent.width - 28px;
                         viewport-width: self.width;

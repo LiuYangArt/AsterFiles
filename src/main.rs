@@ -233,6 +233,7 @@ fn export_shell_thumbnail_probe(
         png
     };
     let requested = 128_u32;
+    let _shell_apartment = platform::windows_shell_icons::initialize_shell_worker()?;
     let result = platform::windows_shell_icons::shell_thumbnail_rgba(&png, requested, false);
     let json = match result {
         Ok(result) => {

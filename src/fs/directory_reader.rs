@@ -9,7 +9,8 @@ use std::{
 
 use crate::domain::{EntryId, EntryKind, FileEntry, FileVisibility};
 
-pub const DIRECTORY_BATCH_SIZE: usize = 64;
+pub const DIRECTORY_FIRST_BATCH_SIZE: usize = 32;
+pub const DIRECTORY_BATCH_SIZE: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadOutcome {
@@ -31,7 +32,8 @@ pub fn read_directory_batches_filtered(
     visibility: FileVisibility,
     mut on_batch: impl FnMut(Vec<FileEntry>),
 ) -> io::Result<ReadOutcome> {
-    let mut batch = Vec::with_capacity(DIRECTORY_BATCH_SIZE);
+    let mut batch_limit = DIRECTORY_FIRST_BATCH_SIZE;
+    let mut batch = Vec::with_capacity(batch_limit);
     let mut skipped = 0;
     let mut next_id = 1_u32;
 
@@ -95,9 +97,10 @@ pub fn read_directory_batches_filtered(
         });
         next_id += 1;
 
-        if batch.len() == DIRECTORY_BATCH_SIZE {
+        if batch.len() == batch_limit {
             on_batch(std::mem::take(&mut batch));
-            batch = Vec::with_capacity(DIRECTORY_BATCH_SIZE);
+            batch_limit = DIRECTORY_BATCH_SIZE;
+            batch = Vec::with_capacity(batch_limit);
         }
     }
     if !batch.is_empty() {
@@ -131,6 +134,11 @@ fn metadata_is_visible(_: &fs::Metadata, _: FileVisibility) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn first_batch_is_small_and_following_batches_are_larger() {
+        assert_eq!(DIRECTORY_FIRST_BATCH_SIZE, 32);
+        assert_eq!(DIRECTORY_BATCH_SIZE, 256);
+    }
     #[test]
     fn default_visibility_shows_hidden_but_not_system_entries() {
         assert_eq!(

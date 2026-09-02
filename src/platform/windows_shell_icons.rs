@@ -60,12 +60,12 @@ mod windows_impl {
             Storage::FileSystem::{
                 FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES,
             },
-            System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize},
+            System::Ole::{OleInitialize, OleUninitialize},
             UI::{
                 Shell::{
-                    IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SHFILEINFOW,
-                    SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW,
-                    SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
+                    IShellItemImageFactory, SHCreateItemFromParsingName, SHFILEINFOW, SHGFI_ICON,
+                    SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SIIGBF_BIGGERSIZEOK,
+                    SIIGBF_ICONONLY, SIIGBF_INCACHEONLY, SIIGBF_SCALEUP, SIIGBF_THUMBNAILONLY,
                 },
                 WindowsAndMessaging::{
                     DI_NORMAL, DestroyIcon, DrawIconEx, GetSystemMetrics, HICON, SM_CXICON,
@@ -78,15 +78,21 @@ mod windows_impl {
 
     use super::{Path, ShellIconRgba, ShellThumbnailRgba, ThumbnailSource, io};
 
+    pub struct ShellWorkerApartment {
+        _com: ComInitialization,
+    }
+
+    pub fn initialize_shell_worker() -> io::Result<ShellWorkerApartment> {
+        ComInitialization::new().map(|com| ShellWorkerApartment { _com: com })
+    }
+
     pub fn shell_icon_rgba(path: &Path) -> io::Result<ShellIconRgba> {
-        let _com = ComInitialization::new()?;
         let icon = ShellIcon::for_path(path)?;
         icon.to_rgba()
     }
 
     pub fn shell_large_icon_rgba(path: &Path, size: u32) -> io::Result<ShellIconRgba> {
         use windows::Win32::Foundation::SIZE;
-        let _com = ComInitialization::new()?;
         let wide = wide_null(path.as_os_str());
         let factory: IShellItemImageFactory = unsafe {
             SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).map_err(windows_error)?
@@ -102,7 +108,7 @@ mod windows_impl {
                 )
                 .map_err(windows_error)?
         };
-        bitmap_to_rgba(bitmap)
+        owned_bitmap_to_rgba(bitmap)
     }
 
     pub fn shell_thumbnail_rgba(
@@ -110,52 +116,40 @@ mod windows_impl {
         size: u32,
         cache_only: bool,
     ) -> io::Result<ShellThumbnailRgba> {
-        use windows::Win32::{
-            System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
-            UI::Shell::{
-                ISharedBitmap, IThumbnailCache, LocalThumbnailCache, WTS_CACHED, WTS_CACHEFLAGS,
-                WTS_FORCEEXTRACTION, WTS_INCACHEONLY, WTS_SCALETOREQUESTEDSIZE, WTS_SCALEUP,
-            },
-        };
-        let _com = ComInitialization::new()?;
+        use windows::Win32::Foundation::SIZE;
         let wide = wide_null(path.as_os_str());
-        let item: IShellItem = unsafe {
+        let factory: IShellItemImageFactory = unsafe {
             SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).map_err(windows_error)?
         };
-        let cache: IThumbnailCache = unsafe {
-            CoCreateInstance(&LocalThumbnailCache, None, CLSCTX_INPROC_SERVER)
-                .map_err(windows_error)?
-        };
-        let mut shared: Option<ISharedBitmap> = None;
-        let mut cache_flags = WTS_CACHEFLAGS::default();
         let flags = if cache_only {
-            WTS_INCACHEONLY
+            SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK | SIIGBF_INCACHEONLY
         } else {
-            WTS_FORCEEXTRACTION | WTS_SCALETOREQUESTEDSIZE | WTS_SCALEUP
+            SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK | SIIGBF_SCALEUP
         };
-        unsafe {
-            cache
-                .GetThumbnail(
-                    &item,
-                    size,
+        let bitmap = unsafe {
+            factory
+                .GetImage(
+                    SIZE {
+                        cx: size as i32,
+                        cy: size as i32,
+                    },
                     flags,
-                    Some(&mut shared),
-                    Some(&mut cache_flags),
-                    None,
                 )
                 .map_err(windows_error)?
         };
-        let shared =
-            shared.ok_or_else(|| io::Error::other("thumbnail cache returned no bitmap"))?;
-        let bitmap = unsafe { shared.GetSharedBitmap().map_err(windows_error)? };
-        bitmap_to_rgba(bitmap).map(|image| ShellThumbnailRgba {
+        owned_bitmap_to_rgba(bitmap).map(|image| ShellThumbnailRgba {
             image,
-            source: if cache_flags.0 & WTS_CACHED.0 != 0 {
+            source: if cache_only {
                 ThumbnailSource::Cache
             } else {
                 ThumbnailSource::Provider
             },
         })
+    }
+
+    fn owned_bitmap_to_rgba(bitmap: HBITMAP) -> io::Result<ShellIconRgba> {
+        let bitmap = Bitmap(bitmap);
+        bitmap_to_rgba(bitmap.0)
     }
 
     fn bitmap_to_rgba(bitmap: HBITMAP) -> io::Result<ShellIconRgba> {
@@ -216,16 +210,19 @@ mod windows_impl {
 
     impl ComInitialization {
         fn new() -> io::Result<Self> {
-            let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+            let result = unsafe { OleInitialize(None) };
             if result.is_ok() {
                 Ok(Self { uninitialize: true })
-            } else if result == RPC_E_CHANGED_MODE {
+            } else if result
+                .as_ref()
+                .is_err_and(|error| error.code() == RPC_E_CHANGED_MODE)
+            {
                 Ok(Self {
                     uninitialize: false,
                 })
             } else {
                 Err(io::Error::other(format!(
-                    "CoInitializeEx failed: {result:?}"
+                    "OleInitialize failed: {result:?}"
                 )))
             }
         }
@@ -234,7 +231,7 @@ mod windows_impl {
     impl Drop for ComInitialization {
         fn drop(&mut self) {
             if self.uninitialize {
-                unsafe { CoUninitialize() };
+                unsafe { OleUninitialize() };
             }
         }
     }
@@ -411,7 +408,17 @@ mod windows_impl {
 }
 
 #[cfg(windows)]
-pub use windows_impl::{shell_icon_rgba, shell_large_icon_rgba, shell_thumbnail_rgba};
+pub use windows_impl::{
+    initialize_shell_worker, shell_icon_rgba, shell_large_icon_rgba, shell_thumbnail_rgba,
+};
+
+#[cfg(not(windows))]
+pub struct ShellWorkerApartment;
+
+#[cfg(not(windows))]
+pub fn initialize_shell_worker() -> io::Result<ShellWorkerApartment> {
+    Ok(ShellWorkerApartment)
+}
 
 #[cfg(not(windows))]
 pub fn shell_icon_rgba(_path: &Path) -> io::Result<ShellIconRgba> {
