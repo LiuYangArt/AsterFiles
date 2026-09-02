@@ -1921,7 +1921,7 @@ accessible-label: entry.name;
             max(12px, parent.height - self.height - 12px)
         );
         width: 320px;
-        height: min(parent.height - 24px, 42px + root.context-menu-content-height + (root.context-shell-loading ? 24px : 0px));
+        height: min(parent.height - 24px, 42px + root.context-menu-content-height);
         background: VisualStyle.cffffff; border-color: VisualStyle.ce0e2e7; border-width: 1px; border-radius: 8px;
         VerticalLayout {
             padding: 4px; spacing: 1px;
@@ -1992,11 +1992,6 @@ accessible-label: entry.name;
                         accessible-role: button; accessible-label: command.label; accessible-enabled: command.enabled;
                     }
                 }
-            }
-            Text {
-                visible: root.context-shell-loading; height: root.context-shell-loading ? 24px : 0px;
-                text: root.text-context-loading + (root.context-shell-elapsed-ms >= 100 ? " " + root.context-shell-elapsed-ms + " ms" : "");
-                color: VisualStyle.c72747d; font-size: 11px; horizontal-alignment: center; vertical-alignment: center;
             }
         }
         init => { context-search-editor.focus(); }
