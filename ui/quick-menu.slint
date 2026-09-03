@@ -1,0 +1,172 @@
+import { IconMap } from "icons/icon-map.slint";
+
+export struct PopupCommandRow { label: string, hint: string, enabled: bool, separator: bool, checked: bool, default: bool, submenu: bool, loading: bool, placeholder: bool, icon-kind: int }
+
+component PopupCommandList inherits Rectangle {
+    in property <[PopupCommandRow]> rows;
+    in property <bool> dark-theme: false;
+    in property <bool> loading: false;
+    in property <int> active-index: -1;
+    in property <string> loading-text: "";
+    in property <length> content-height: 0px;
+    callback move(int);
+    callback activate(int);
+    callback open-submenu(int, length);
+    callback hover(int, length);
+    callback cancel-hover();
+    background: root.dark-theme ? #252525 : #ffffff;
+    private property <color> foreground: root.dark-theme ? #f2f2f2 : #30333a;
+    private property <color> muted-foreground: root.dark-theme ? #8a8a8a : #9a9da3;
+    private property <color> secondary-foreground: root.dark-theme ? #a9a9a9 : #72747d;
+    private property <color> accent-foreground: root.dark-theme ? #7fa0ff : #4f6bed;
+    private property <color> hover-background: root.dark-theme ? #424242 : #edf1f6;
+    private property <color> divider: root.dark-theme ? #4b4b4b : #e0e2e7;
+    private property <int> hover-index: -1;
+    list-scroll := Flickable {
+        width: parent.width;
+        height: parent.height - (root.loading ? 20px : 0px);
+        viewport-height: max(self.height, max(root.content-height, command-list.preferred-height));
+        command-list := VerticalLayout {
+            width: list-scroll.width;
+            for command[index] in root.rows: command-row := Rectangle {
+                property <bool> command-loading: command.loading || command.placeholder;
+                property <bool> command-hovered: !command-loading && root.hover-index == index;
+                property <bool> command-active: !command-loading && root.hover-index < 0 && root.active-index == index;
+                property <bool> touch-hovered: command-touch.has-hover;
+                height: command.separator ? 9px : 28px;
+                border-radius: 4px;
+                background: command.enabled && !command-loading && !command.separator && (command-active || command-hovered) ? root.hover-background : transparent;
+                Rectangle { visible: command.separator; x: 4px; width: parent.width - 8px; height: 1px; y: 4px; background: root.divider; }
+                Rectangle { visible: command.placeholder && !command.separator; x: 26px; width: Math.mod(index, 3) == 0 ? min(178px, parent.width - 38px) : Math.mod(index, 3) == 1 ? min(132px, parent.width - 38px) : min(204px, parent.width - 38px); height: 8px; y: 10px; border-radius: 4px; background: root.muted-foreground; }
+                Image { visible: !command.separator && command.checked && !command-loading; x: 7px; y: 7px; width: 14px; height: 14px; source: IconMap.action-check; colorize: root.accent-foreground; }
+                Image { visible: !command.separator && !command.checked && !command-loading && command.icon-kind > 0; x: 7px; y: 6px; width: 16px; height: 16px; source: command.icon-kind == 1 ? IconMap.action-view : command.icon-kind == 2 ? IconMap.action-sort : command.icon-kind == 3 ? IconMap.action-group : command.icon-kind == 4 ? IconMap.action-refresh : command.icon-kind == 5 ? IconMap.file-folder : IconMap.action-columns; colorize: root.foreground; }
+                Text { visible: !command.separator; x: 26px; width: parent.width - 76px; text: command.placeholder ? " " : command.label; color: command-loading ? root.muted-foreground : command.enabled ? root.foreground : root.muted-foreground; font-size: command.default && !command-loading ? 13px : 12px; font-weight: command.default && !command-loading ? 600 : 400; vertical-alignment: center; overflow: elide; }
+                Text { visible: !command.separator && !command-loading; x: parent.width - 48px; width: 38px; text: command.submenu ? "›" : command.hint; color: root.secondary-foreground; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+                command-touch := TouchArea {
+                    enabled: command.enabled && !command-loading && !command.separator;
+                    mouse-cursor: pointer;
+                    moved => { root.move(index); }
+                    clicked => { if command.submenu { root.open-submenu(index, command-row.absolute-position.y); } else { root.activate(index); } }
+                }
+                changed touch-hovered => {
+                    if touch-hovered {
+                        root.hover-index = index;
+                        root.move(index);
+                        root.hover(command.submenu ? index : -2147483647, command-row.absolute-position.y);
+                    } else {
+                        if (root.hover-index == index) {
+                            root.hover-index = -1;
+                        }
+                        if (command.submenu) {
+                            root.cancel-hover();
+                        }
+                    }
+                }
+                accessible-role: button;
+                accessible-label: command.label;
+                accessible-enabled: command.enabled && !command-loading;
+            }
+        }
+    }
+    Text { visible: root.loading; y: parent.height - 20px; height: root.loading ? 20px : 0px; width: parent.width; text: root.loading-text; color: root.secondary-foreground; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+}
+
+export component QuickMenuWindow inherits Window {
+    title: "AsterFiles Quick Menu";
+    no-frame: true;
+    width: 320px;
+    height: root.window-height;
+    background: root.dark-theme ? #252525 : #ffffff;
+    default-font-family: "Segoe UI";
+    in property <[PopupCommandRow]> rows;
+    in property <length> content-height: 0px;
+    in property <bool> loading: false;
+    in-out property <string> search: "";
+    in property <int> active-index: -1;
+    in property <length> window-height: max(42px, 42px + root.content-height + (root.loading ? 20px : 0px));
+    in property <bool> dark-theme: false;
+    in property <string> search-text: "";
+    in property <string> loading-text: "";
+    in property <string> empty-text: "";
+    callback filter(string);
+    callback move(int);
+    callback activate(int);
+    callback open-submenu(int, length);
+    callback hover(int, length);
+    callback cancel-hover();
+    callback dismiss();
+    panel := Rectangle {
+        width: parent.width; height: parent.height;
+        background: root.dark-theme ? #252525 : #ffffff; border-color: root.dark-theme ? #4b4b4b : #e0e2e7; border-width: 1px; border-radius: 8px;
+        VerticalLayout {
+            padding: 4px; spacing: 1px;
+            search-box := Rectangle {
+                height: 32px; border-radius: 5px; background: root.dark-theme ? #202020 : #f5f6f8; border-color: root.dark-theme ? #4b4b4b : #e0e2e7; border-width: 1px;
+                Text { x: 8px; width: parent.width - 16px; text: root.search == "" ? root.search-text : ""; color: root.dark-theme ? #8a8a8a : #9a9da3; font-size: 12px; vertical-alignment: center; }
+                search-editor := TextInput {
+                    x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.search; single-line: true; color: root.dark-theme ? #f2f2f2 : #30333a; font-size: 12px; vertical-alignment: center;
+                    accessible-role: text-input; accessible-label: root.search-text;
+                    edited => { root.filter(root.search); }
+                    accepted => { root.activate(root.active-index); }
+                    key-pressed(event) => {
+                        if event.text == Key.UpArrow { root.move(-1); return accept; }
+                        if event.text == Key.DownArrow { root.move(1); return accept; }
+                        if event.text == Key.RightArrow { root.open-submenu(root.active-index, 0px); return accept; }
+                        if event.text == Key.Escape { if root.search != "" { root.search = ""; root.filter(""); } else { root.dismiss(); } return accept; }
+                        return reject;
+                    }
+                }
+            }
+            if root.rows.length == 0 && !root.loading: Text { height: max(28px, root.content-height); text: root.empty-text; color: root.dark-theme ? #a9a9a9 : #72747d; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+            if root.rows.length > 0 || root.loading: PopupCommandList {
+                vertical-stretch: 1; rows: root.rows; content-height: root.content-height; loading: root.loading; loading-text: root.loading-text; active-index: root.active-index; dark-theme: root.dark-theme;
+                move(index) => { root.move(index); } activate(index) => { root.activate(index); } open-submenu(index, anchor-y) => { root.open-submenu(index, anchor-y); } hover(index, anchor-y) => { root.hover(index, anchor-y); } cancel-hover => { root.cancel-hover(); }
+            }
+        }
+    }
+    init => { search-editor.focus(); }
+}
+
+export component QuickSubmenuWindow inherits Window {
+    title: "AsterFiles Quick Submenu";
+    no-frame: true;
+    width: 280px;
+    height: root.window-height;
+    background: root.dark-theme ? #252525 : #ffffff;
+    default-font-family: "Segoe UI";
+    in property <[PopupCommandRow]> rows;
+    in property <length> content-height: 0px;
+    in property <bool> loading: false;
+    in property <int> active-index: -1;
+    in property <length> window-height: max(28px, 8px + root.content-height + (root.loading ? 20px : 0px));
+    in property <bool> dark-theme: false;
+    in property <string> loading-text: "";
+    in property <string> empty-text: "";
+    callback move(int);
+    callback activate(int);
+    callback open-submenu(int, length);
+    callback hover(int, length);
+    callback cancel-hover();
+    callback dismiss();
+    panel := Rectangle {
+        width: parent.width; height: parent.height;
+        background: root.dark-theme ? #252525 : #ffffff; border-color: root.dark-theme ? #4b4b4b : #e0e2e7; border-width: 1px; border-radius: 6px;
+        menu-focus := FocusScope {
+            width: parent.width; height: parent.height;
+            key-pressed(event) => {
+                if event.text == Key.UpArrow { root.move(-1); return accept; }
+                if event.text == Key.DownArrow { root.move(1); return accept; }
+                if event.text == Key.Return { root.activate(root.active-index); return accept; }
+                if event.text == Key.RightArrow { root.open-submenu(root.active-index, 0px); return accept; }
+                if event.text == Key.LeftArrow || event.text == Key.Escape { root.dismiss(); return accept; }
+                return reject;
+            }
+            if root.rows.length == 0 && !root.loading: Text { x: 4px; y: 4px; width: parent.width - 8px; height: parent.height - 8px; text: root.empty-text; color: root.dark-theme ? #a9a9a9 : #72747d; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+            if root.rows.length > 0 || root.loading: PopupCommandList {
+                x: 4px; y: 4px; width: parent.width - 8px; height: parent.height - 8px; rows: root.rows; content-height: root.content-height; loading: root.loading; loading-text: root.loading-text; active-index: root.active-index; dark-theme: root.dark-theme;
+                move(index) => { root.move(index); } activate(index) => { root.activate(index); } open-submenu(index, anchor-y) => { root.open-submenu(index, anchor-y); } hover(index, anchor-y) => { root.hover(index, anchor-y); } cancel-hover => { root.cancel-hover(); }
+            }
+        }
+    }
+    init => { menu-focus.focus(); }
+}

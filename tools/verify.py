@@ -121,6 +121,10 @@ def main() -> int:
             "cargo", "run", "--", "--agent-scenario", "quick-menu-search",
             "--no-ui", "--agent-state-out", str(STATE_DIR / "context-menu" / "search.json"),
         ]),
+        ("agent-quick-menu-popup", [
+            "cargo", "run", "--", "--agent-scenario", "quick-menu-popup",
+            "--no-ui", "--agent-state-out", str(STATE_DIR / "context-menu" / "popup.json"),
+        ]),
         ("agent-folder-size-scheduler", [
             "cargo", "run", "--", "--agent-scenario", "folder-size-scheduler",
             "--no-ui", "--agent-state-out", str(STATE_DIR / "folder-size" / "scheduler.json"),

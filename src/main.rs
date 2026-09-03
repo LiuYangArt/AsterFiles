@@ -7,6 +7,7 @@ mod fs;
 mod group_projection;
 mod i18n;
 mod platform;
+mod quick_menu_popup;
 mod session_store;
 
 use std::path::PathBuf;
@@ -134,6 +135,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
         }
+        if scenario == agent_debug::AgentScenario::QuickMenuPopup {
+            let output = agent_options
+                .state_output()
+                .expect("scenario has a default state output");
+            quick_menu_popup::export_state(&output)?;
+            println!(
+                "{{\"event\":\"agent_state_exported\",\"scenario\":\"{}\",\"artifact\":{:?}}}",
+                scenario.name(),
+                output.to_string_lossy().as_ref()
+            );
+            if agent_options.no_ui {
+                return Ok(());
+            }
+        }
         if scenario == agent_debug::AgentScenario::FolderSizeScheduler {
             let output = agent_options
                 .state_output()
@@ -188,6 +203,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         slint::BackendSelector::new()
             .backend_name("winit".into())
             .with_winit_window_attributes_hook(|attributes| {
+                if let Some(owner) =
+                    platform::windows::quick_menu_window::take_pending_window_owner()
+                {
+                    return attributes
+                        .with_owner_window(owner as _)
+                        .with_decorations(false)
+                        .with_transparent(false)
+                        .with_window_level(WindowLevel::Normal)
+                        .with_visible(false)
+                        .with_drag_and_drop(false)
+                        .with_skip_taskbar(true)
+                        .with_undecorated_shadow(false)
+                        .with_corner_preference(CornerPreference::Round);
+                }
                 if attributes.title == "AsterFiles Tab Drag Preview" {
                     return attributes
                         .with_decorations(false)

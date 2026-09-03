@@ -6,6 +6,7 @@ pub mod directory_watch;
 pub mod drag_drop;
 pub mod everything;
 pub mod file_operation;
+pub mod quick_menu_window;
 pub mod shortcut;
 pub mod tab_insertion_indicator;
 pub mod window_trace;
