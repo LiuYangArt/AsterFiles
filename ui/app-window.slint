@@ -620,6 +620,11 @@ export component AppWindow inherits Window {
     in property <string> error-page-description: "";
     in property <string> text-request-access: "使用 Windows 请求访问权限";
     in property <bool> show-request-access: false;
+    in property <bool> show-everything-help: false;
+    in property <bool> show-start-everything: false;
+    in property <string> text-download-everything: "下载 Everything";
+    in property <string> text-everything-settings: "Everything 设置";
+    in property <string> text-discover-everything: "自动发现";
 
 
     in property <[FileRow]> files;
@@ -904,6 +909,8 @@ export component AppWindow inherits Window {
     callback update-everything-config(string, string);
     callback test-everything-connection();
     callback start-everything();
+    callback discover-everything();
+    callback download-everything();
     callback drag-window();
     callback drag-window-after-menu-dismiss();
     callback show-entry-menu(int, float, float);
@@ -1841,9 +1848,9 @@ accessible-label: entry.name;
                     }
                     if root.page-state >= 5: VerticalLayout {
                         alignment: center; spacing: 12px;
-                        HorizontalLayout { alignment: center; Image { width: 48px; height: 48px; source: IconMap.status-locked; } }
+                        if !root.show-everything-help: HorizontalLayout { alignment: center; Image { width: 48px; height: 48px; source: IconMap.status-locked; } }
                         Text { text: root.error-page-title; color: VisualStyle.c30333a; font-size: 20px; font-weight: 600; horizontal-alignment: center; }
-                        Text { text: root.error-page-description; color: VisualStyle.c62656f; font-size: 13px; horizontal-alignment: center; }
+                        HorizontalLayout { alignment: center; Text { width: min(root.width - 40px, 900px); text: root.error-page-description; color: VisualStyle.c62656f; font-size: 13px; horizontal-alignment: center; wrap: word-wrap; } }
                         Rectangle { height: 4px; }
                         error-page-actions := Rectangle {
                             height: 32px;
@@ -1852,6 +1859,9 @@ accessible-label: entry.name;
                             HorizontalLayout {
                                 alignment: center; spacing: 8px;
                                 if root.show-request-access: StandaloneActionButton { width: 260px; center-content: false; icon-source: IconMap.status-locked; label: root.text-request-access; clicked => { root.request-folder-access(); } }
+                                if root.show-everything-help: StandaloneActionButton { width: 180px; label: root.text-download-everything; clicked => { root.download-everything(); } }
+                                if root.show-start-everything: StandaloneActionButton { width: 180px; label: root.text-start-everything; clicked => { root.start-everything(); } }
+                                if root.show-everything-help: StandaloneActionButton { width: 180px; label: root.text-everything-settings; clicked => { root.settings-section = 2; root.open-settings(); } }
                             }
                         }
                     }
@@ -1967,7 +1977,7 @@ accessible-label: entry.name;
                                 }
                             }
                             if root.settings-section == 2: Rectangle {
-                                height: 262px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                height: 304px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
                                 VerticalLayout {
                                     padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 10px;
                                     Text { text: root.text-everything-path; color: VisualStyle.c30333a; font-size: 13px; }
@@ -1976,6 +1986,7 @@ accessible-label: entry.name;
                                     Rectangle { height: 34px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cffffff; TextInput { x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.everything-instance; single-line: true; edited => { root.update-everything-config(root.everything-path, root.everything-instance); } } }
                                     Text { text: root.everything-status; color: VisualStyle.c62656f; font-size: 12px; wrap: word-wrap; }
                                     HorizontalLayout { height: 34px; spacing: 8px; StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-test-connection; clicked => { root.test-everything-connection(); } } StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-start-everything; clicked => { root.start-everything(); } } }
+                                    HorizontalLayout { height: 34px; spacing: 8px; StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-discover-everything; clicked => { root.discover-everything(); } } StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-download-everything; clicked => { root.download-everything(); } } }
                                 }
                             }                            if root.settings-section == 3 && root.debug-tools-enabled: VerticalLayout {
                                 spacing: 12px;

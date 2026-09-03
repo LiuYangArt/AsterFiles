@@ -82,6 +82,8 @@ pub enum SearchState {
     NotConfigured,
     Disconnected,
     NotIndexed,
+    UnsupportedVersion,
+    UnsupportedArchitecture,
     SyntaxError,
     TimedOut,
     Cancelled,

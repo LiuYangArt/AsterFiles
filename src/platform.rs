@@ -283,6 +283,9 @@ mod windows_impl {
     pub fn open_path(path: &Path) -> std::io::Result<()> {
         shell_execute(path, None)
     }
+    pub fn open_url(url: &str) -> std::io::Result<()> {
+        shell_execute(Path::new(url), None)
+    }
     pub fn resolve_shortcut_target(path: &Path) -> std::io::Result<Option<ShortcutTarget>> {
         if !path
             .extension()
@@ -387,7 +390,7 @@ mod windows_impl {
 
 #[cfg(windows)]
 pub use windows_impl::{
-    double_click_interval, explorer_pinned_locations, known_locations, open_path,
+    double_click_interval, explorer_pinned_locations, known_locations, open_path, open_url,
     request_folder_access, resolve_shortcut_target,
 };
 
@@ -417,6 +420,13 @@ pub fn resolve_shortcut_target(_path: &Path) -> std::io::Result<Option<ShortcutT
 pub fn open_path(path: &Path) -> std::io::Result<()> {
     std::process::Command::new("xdg-open")
         .arg(path)
+        .spawn()
+        .map(|_| ())
+}
+#[cfg(not(windows))]
+pub fn open_url(url: &str) -> std::io::Result<()> {
+    std::process::Command::new("xdg-open")
+        .arg(url)
         .spawn()
         .map(|_| ())
 }

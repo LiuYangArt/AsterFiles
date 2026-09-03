@@ -1,10 +1,12 @@
 # AsterFiles
 
-AsterFiles 是一个面向 Windows 的高性能现代文件管理器原型。视觉体验参考 Files，底层使用 Rust，界面使用 Slint。
+AsterFiles 是一个面向 Windows 的高性能现代文件管理器原型。
 
 当前软件版本由 `Cargo.toml` 统一管理，采用 GNU General Public License v3.0（仅此版本）。
 
 当前版本已完成本地浏览闭环、Everything 搜索与文件夹大小、基础文件操作、剪贴板和经典右键菜单。网络协议、缩略图和拖放暂不包含。
+
+项目仍在开发中，后续内容以 GitHub Issues 为准。搜索及文件夹大小依赖用户自行安装并运行 Everything 1.5 x64，同时需要在 AsterFiles 设置中完成配置。
 
 ## 启动
 
