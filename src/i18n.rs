@@ -61,6 +61,13 @@ impl Texts {
                 "此位置未被 Everything 索引",
                 "This location is not indexed by Everything",
             ),
+            SearchState::UnsupportedVersion => self.choose(
+                "Everything 版本不受支持",
+                "Everything version is not supported",
+            ),
+            SearchState::UnsupportedArchitecture => {
+                self.choose("需要 Everything x64", "Everything x64 is required")
+            }
             SearchState::SyntaxError => self.choose("搜索语法有误", "Invalid search syntax"),
             SearchState::TimedOut => self.choose("搜索超时", "Search timed out"),
             SearchState::Cancelled => self.choose("搜索已取消", "Search cancelled"),
@@ -203,6 +210,8 @@ mod tests {
                 SearchState::NotConfigured,
                 SearchState::Disconnected,
                 SearchState::NotIndexed,
+                SearchState::UnsupportedVersion,
+                SearchState::UnsupportedArchitecture,
                 SearchState::SyntaxError,
                 SearchState::TimedOut,
                 SearchState::Cancelled,

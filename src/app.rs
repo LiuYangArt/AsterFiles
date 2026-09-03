@@ -1064,6 +1064,7 @@ struct AppState {
     search_column_order: [u8; 4],
     search_column_widths: session_store::SearchColumnWidths,
     everything_config: crate::domain::EverythingConfig,
+    everything_generation: u64,
     everything_status: String,
     everything_folder_sizes_indexed: Option<bool>,
     pending_right_drop: Option<platform::windows::drag_drop::DropIntent>,
@@ -1196,6 +1197,7 @@ impl AppState {
             search_column_order,
             search_column_widths,
             everything_config,
+            everything_generation: 0,
             everything_status: String::new(),
             everything_folder_sizes_indexed: None,
             pending_right_drop: None,
@@ -1930,8 +1932,9 @@ enum EverythingRequest {
         path: PathBuf,
     },
     Configure(crate::domain::EverythingConfig),
-    TestConnection,
-    Start,
+    Discover(u64),
+    TestConnection(u64),
+    Start(u64),
 }
 
 #[derive(Debug)]
@@ -1963,12 +1966,18 @@ enum EverythingEvent {
         path: PathBuf,
         state: FolderSizeState,
     },
-    Status(
-        Result<
+    Status {
+        generation: u64,
+        result: Result<
             platform::windows::everything::EverythingStatus,
             platform::windows::everything::EverythingError,
         >,
-    ),
+    },
+    Discovered {
+        generation: u64,
+        config: crate::domain::EverythingConfig,
+        status: platform::windows::everything::EverythingStatus,
+    },
 }
 
 enum FolderSizeWork {
@@ -2177,31 +2186,12 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     }
     let (request_sender, event_receiver) = spawn_directory_workers(WORKER_COUNT);
     let event_receiver = Arc::new(Mutex::new(event_receiver));
-    {
-        let mut app = state.lock().expect("app state mutex is not poisoned");
-        if app.everything_config.executable_path.is_none()
-            && let Some(installation) = platform::windows::everything::EverythingClient::discover()
-                .into_iter()
-                .find(|item| item.instance_name == "1.5a")
-                .or_else(|| {
-                    platform::windows::everything::EverythingClient::discover()
-                        .into_iter()
-                        .next()
-                })
-        {
-            if !installation.executable_path.as_os_str().is_empty() {
-                app.everything_config.executable_path = Some(installation.executable_path);
-            }
-            if !installation.instance_name.is_empty() {
-                app.everything_config.instance_name = installation.instance_name;
-            }
-        }
-    }
     let everything_config = state
         .lock()
         .expect("app state mutex is not poisoned")
         .everything_config
         .clone();
+    let should_discover_everything = everything_config.executable_path.is_none();
     let (everything_sender, everything_receiver) = spawn_everything_worker(everything_config);
     let (icon_sender, icon_receiver) = spawn_icon_workers(ICON_WORKER_COUNT, state.clone());
     let (operation_sender, operation_receiver) = spawn_file_operation_worker();
@@ -2279,7 +2269,11 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         everything_sender.clone(),
         state.clone(),
     );
-    let _ = everything_sender.send(EverythingRequest::TestConnection);
+    let _ = everything_sender.send(if should_discover_everything {
+        EverythingRequest::Discover(0)
+    } else {
+        EverythingRequest::TestConnection(0)
+    });
     start_icon_event_pump(&ui, icon_receiver, state.clone());
     start_file_operation_event_pump(
         &ui,
@@ -5214,17 +5208,50 @@ fn wire_callbacks(
             (!path.is_empty()).then(|| PathBuf::from(path.as_str()));
         app.everything_config.instance_name = instance.to_string();
         app.everything_config.verified_version = None;
+        app.everything_generation = app.everything_generation.saturating_add(1);
         let config = app.everything_config.clone();
         drop(app);
         let _ = everything_for_config.send(EverythingRequest::Configure(config));
     });
     let everything_for_test = everything_sender.clone();
+    let state_for_test = state.clone();
     ui.on_test_everything_connection(move || {
-        let _ = everything_for_test.send(EverythingRequest::TestConnection);
+        let generation = state_for_test
+            .lock()
+            .expect("app state mutex is not poisoned")
+            .everything_generation;
+        let _ = everything_for_test.send(EverythingRequest::TestConnection(generation));
     });
     let everything_for_start = everything_sender.clone();
+    let state_for_start = state.clone();
     ui.on_start_everything(move || {
-        let _ = everything_for_start.send(EverythingRequest::Start);
+        let generation = state_for_start
+            .lock()
+            .expect("app state mutex is not poisoned")
+            .everything_generation;
+        let _ = everything_for_start.send(EverythingRequest::Start(generation));
+    });
+    let everything_for_discover = everything_sender.clone();
+    let state_for_discover = state.clone();
+    ui.on_discover_everything(move || {
+        let generation = state_for_discover
+            .lock()
+            .expect("app state mutex is not poisoned")
+            .everything_generation;
+        let _ = everything_for_discover.send(EverythingRequest::Discover(generation));
+    });
+    let weak = ui.as_weak();
+    let state_for_download = state.clone();
+    ui.on_download_everything(move || {
+        if let Err(error) = platform::open_url("https://www.voidtools.com/downloads/") {
+            state_for_download
+                .lock()
+                .expect("app state mutex is not poisoned")
+                .everything_status = error.to_string();
+            if let Some(ui) = weak.upgrade() {
+                refresh_ui(&ui, &state_for_download);
+            }
+        }
     });
     let weak = ui.as_weak();
     let state_for_settings = state.clone();
@@ -8568,6 +8595,19 @@ fn search_grouped_page(
         response_offsets_valid: file_offset_valid && folder_offset_valid,
     })
 }
+
+fn everything_status(
+    client: Option<&platform::windows::everything::EverythingClient>,
+    timeout: Duration,
+) -> Result<
+    platform::windows::everything::EverythingStatus,
+    platform::windows::everything::EverythingError,
+> {
+    client
+        .ok_or(platform::windows::everything::EverythingError::NotConfigured)?
+        .status(timeout)
+}
+
 fn spawn_everything_worker(
     config: crate::domain::EverythingConfig,
 ) -> (
@@ -8751,20 +8791,71 @@ fn spawn_everything_worker(
                         platform::windows::everything::EverythingClient::new(value).ok()
                     });
                 }
-                EverythingRequest::TestConnection => {
-                    let result = client
-                        .as_ref()
-                        .ok_or(platform::windows::everything::EverythingError::NotConfigured)
-                        .and_then(|client| client.status(Duration::from_secs(2)));
-                    let _ = event_sender.send(EverythingEvent::Status(result));
+                EverythingRequest::Discover(generation) => {
+                    let installations = platform::windows::everything::EverythingClient::discover();
+                    let usable = |item: &&platform::windows::everything::EverythingInstallation| {
+                        item.executable_path.is_file()
+                    };
+                    let installation = installations
+                        .iter()
+                        .filter(usable)
+                        .find(|item| item.running && item.instance_name == "1.5a")
+                        .or_else(|| {
+                            installations
+                                .iter()
+                                .filter(usable)
+                                .find(|item| item.running)
+                        })
+                        .or_else(|| installations.iter().find(|item| usable(item)))
+                        .cloned();
+                    let Some(installation) = installation else {
+                        let _ = event_sender.send(EverythingEvent::Status {
+                            generation,
+                            result: Err(
+                                platform::windows::everything::EverythingError::NotConfigured,
+                            ),
+                        });
+                        continue;
+                    };
+                    let configured = crate::domain::EverythingConfig {
+                        executable_path: (!installation.executable_path.as_os_str().is_empty())
+                            .then_some(installation.executable_path),
+                        instance_name: installation.instance_name,
+                        verified_version: None,
+                        allow_launch: true,
+                    };
+                    client = platform_everything_config(&configured).and_then(|value| {
+                        platform::windows::everything::EverythingClient::new(value).ok()
+                    });
+                    match everything_status(client.as_ref(), Duration::from_secs(2)) {
+                        Ok(status) => {
+                            let _ =
+                                folder_sender.send(FolderSizeWork::Configure(configured.clone()));
+                            let _ = event_sender.send(EverythingEvent::Discovered {
+                                generation,
+                                config: configured,
+                                status,
+                            });
+                        }
+                        Err(error) => {
+                            let _ = event_sender.send(EverythingEvent::Status {
+                                generation,
+                                result: Err(error),
+                            });
+                        }
+                    }
                 }
-                EverythingRequest::Start => {
+                EverythingRequest::TestConnection(generation) => {
+                    let result = everything_status(client.as_ref(), Duration::from_secs(2));
+                    let _ = event_sender.send(EverythingEvent::Status { generation, result });
+                }
+                EverythingRequest::Start(generation) => {
                     let result = client
                         .as_ref()
                         .ok_or(platform::windows::everything::EverythingError::NotConfigured)
                         .and_then(|client| client.start())
-                        .and_then(|_| client.as_ref().unwrap().status(Duration::from_secs(3)));
-                    let _ = event_sender.send(EverythingEvent::Status(result));
+                        .and_then(|_| everything_status(client.as_ref(), Duration::from_secs(3)));
+                    let _ = event_sender.send(EverythingEvent::Status { generation, result });
                 }
             }
         }
@@ -8870,7 +8961,9 @@ fn start_everything_event_pump(
                 EverythingEvent::SearchPage { tab_id, .. }
                 | EverythingEvent::SearchFailed { tab_id, .. }
                 | EverythingEvent::SearchSkipped { tab_id, .. } => Some(*tab_id),
-                EverythingEvent::FolderSize { .. } | EverythingEvent::Status(_) => None,
+                EverythingEvent::FolderSize { .. }
+                | EverythingEvent::Status { .. }
+                | EverythingEvent::Discovered { .. } => None,
             };
             let mut folder_size_update = None;
             let mut app = state.lock().expect("app state mutex is not poisoned");
@@ -8980,7 +9073,17 @@ fn start_everything_event_pump(
                         })
                     });
                     tab.discard_pending();
-                    tab.search_state = match error { platform::windows::everything::EverythingError::NotConfigured => SearchState::NotConfigured, platform::windows::everything::EverythingError::NotRunning(_) => SearchState::Disconnected, platform::windows::everything::EverythingError::Timeout => SearchState::TimedOut, _ => SearchState::Failed };
+                    tab.search_state = match error {
+                        platform::windows::everything::EverythingError::NotConfigured
+                        | platform::windows::everything::EverythingError::InvalidExecutable(_) => SearchState::NotConfigured,
+                        platform::windows::everything::EverythingError::NotRunning(_) => SearchState::Disconnected,
+                        platform::windows::everything::EverythingError::UnsupportedVersion(_) => SearchState::UnsupportedVersion,
+                        platform::windows::everything::EverythingError::UnsupportedArchitecture => SearchState::UnsupportedArchitecture,
+                        platform::windows::everything::EverythingError::DatabaseNotLoaded => SearchState::NotIndexed,
+                        platform::windows::everything::EverythingError::QueryRejected => SearchState::SyntaxError,
+                        platform::windows::everything::EverythingError::Timeout => SearchState::TimedOut,
+                        _ => SearchState::Failed,
+                    };
                     tab.error = Some(error.to_string());
                     if let Some(request) = pending_request {
                         let _ = sender_for_search_consistency.send(request);
@@ -9027,10 +9130,33 @@ fn start_everything_event_pump(
                         folder_size_update = Some((tab_id, changed));
                     }
                 }
-                EverythingEvent::Status(result) => match result {
-                    Ok(status) => { app.everything_status = format!("Everything {} · {}", status.version, if status.folder_size_indexed { "文件夹大小已索引" } else { "文件夹大小未索引" }); app.everything_folder_sizes_indexed = Some(status.folder_size_indexed); app.everything_config.verified_version = Some(status.version.to_string()); }
-                    Err(error) => { app.everything_status = error.to_string(); app.everything_folder_sizes_indexed = None; }
-                },
+                EverythingEvent::Status { generation, result }
+                    if generation == app.everything_generation =>
+                {
+                    match result {
+                        Ok(status) => {
+                            app.everything_status =
+                                everything_connected_status(app.language, &status);
+                            app.everything_folder_sizes_indexed = Some(status.folder_size_indexed);
+                            app.everything_config.verified_version =
+                                Some(status.version.to_string());
+                        }
+                        Err(error) => {
+                            app.everything_status = match (app.language, &error) {
+                                (Language::Chinese, platform::windows::everything::EverythingError::NotConfigured) =>
+                                    "尚未发现 Everything，请先安装或检查配置。".to_owned(),
+                                (Language::Chinese, platform::windows::everything::EverythingError::NotRunning(_)) =>
+                                    "Everything 未运行，请启动后重试。".to_owned(),
+                                _ => error.to_string(),
+                            };
+                            app.everything_folder_sizes_indexed = None;
+                        }
+                    }
+                }
+                EverythingEvent::Discovered { generation, config, status } => {
+                    apply_everything_discovery(&mut app, generation, config, &status);
+                }
+                EverythingEvent::Status { .. } => {}
             }
             drop(app);
             if let Some((tab_id, changed)) = folder_size_update {
@@ -10004,7 +10130,11 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
     ui.set_search_recursive(tab.search_depth == SearchDepth::Recursive);
 
     ui.set_status_text(status_text(tab, texts).into());
-    let (error_page_title, error_page_description) = error_page_text(tab.load_state, texts);
+    let (error_page_title, error_page_description) = if tab.page_source == PageSource::Search {
+        search_error_page_text(tab.search_state, texts)
+    } else {
+        error_page_text(tab.load_state, texts)
+    };
     ui.set_error_page_title(error_page_title.into());
     ui.set_error_page_description(error_page_description.into());
     ui.set_active_tab_index(
@@ -10152,6 +10282,8 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
             SearchState::NotConfigured
             | SearchState::Disconnected
             | SearchState::NotIndexed
+            | SearchState::UnsupportedVersion
+            | SearchState::UnsupportedArchitecture
             | SearchState::SyntaxError
             | SearchState::TimedOut
             | SearchState::Failed => 9,
@@ -10164,6 +10296,21 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
         page_projection
             .visible_page_operations
             .contains(&agent_debug::PageOperation::RequestWindowsAccess),
+    );
+    ui.set_show_everything_help(
+        tab.page_source == PageSource::Search
+            && matches!(
+                tab.search_state,
+                SearchState::NotConfigured
+                    | SearchState::Disconnected
+                    | SearchState::NotIndexed
+                    | SearchState::UnsupportedVersion
+                    | SearchState::UnsupportedArchitecture
+                    | SearchState::Failed
+            ),
+    );
+    ui.set_show_start_everything(
+        tab.page_source == PageSource::Search && tab.search_state == SearchState::Disconnected,
     );
     ui.set_can_navigate_back(
         !active_is_settings && (tab.has_failed_location() || !tab.back_history.is_empty()),
@@ -10366,6 +10513,96 @@ fn error_page_text(state: LoadState, texts: Texts) -> (&'static str, &'static st
             "Unable to open location",
             "An error occurred while reading this location. Try again or go back.",
         ),
+    }
+}
+
+fn everything_connected_status(
+    language: Language,
+    status: &platform::windows::everything::EverythingStatus,
+) -> String {
+    let folder_size_status = match (language, status.folder_size_indexed) {
+        (Language::Chinese, true) => "文件夹大小已索引",
+        (Language::Chinese, false) => "文件夹大小未索引",
+        (Language::English, true) => "Folder sizes indexed",
+        (Language::English, false) => "Folder sizes not indexed",
+    };
+    format!("Everything {} · {folder_size_status}", status.version)
+}
+
+fn apply_everything_discovery(
+    app: &mut AppState,
+    generation: u64,
+    mut config: crate::domain::EverythingConfig,
+    status: &platform::windows::everything::EverythingStatus,
+) -> bool {
+    if generation != app.everything_generation {
+        return false;
+    }
+    config.verified_version = Some(status.version.to_string());
+    app.everything_config = config;
+    app.everything_status = everything_connected_status(app.language, status);
+    app.everything_folder_sizes_indexed = Some(status.folder_size_indexed);
+    true
+}
+
+fn search_error_page_text(state: SearchState, texts: Texts) -> (&'static str, &'static str) {
+    match (texts.language, state) {
+        (Language::Chinese, SearchState::NotConfigured) => (
+            "需要安装并配置 Everything",
+            "AsterFiles 搜索依赖 Everything 1.5 x64。请先安装 Everything，再到设置中确认程序路径和实例。",
+        ),
+        (Language::English, SearchState::NotConfigured) => (
+            "Install and configure Everything",
+            "AsterFiles search requires Everything 1.5 x64. Install Everything, then confirm its program path and instance in Settings.",
+        ),
+        (Language::Chinese, SearchState::Disconnected) => (
+            "无法连接 Everything",
+            "Everything 可能尚未运行，或程序路径与实例配置不正确。请启动 Everything，或前往设置检查配置。",
+        ),
+        (Language::English, SearchState::Disconnected) => (
+            "Can't connect to Everything",
+            "Everything may not be running, or its program path and instance may be incorrect. Start Everything or check its settings.",
+        ),
+        (Language::Chinese, SearchState::NotIndexed) => (
+            "Everything 索引尚未就绪",
+            "请等待 Everything 完成索引，并在 Everything 设置中确认索引功能已启用。",
+        ),
+        (Language::English, SearchState::NotIndexed) => (
+            "Everything index isn't ready",
+            "Wait for Everything to finish indexing and confirm indexing is enabled in Everything settings.",
+        ),
+        (Language::Chinese, SearchState::UnsupportedVersion) => (
+            "Everything 版本不受支持",
+            "AsterFiles 需要 Everything 1.5。请安装兼容版本，并前往设置重新发现或检查配置。",
+        ),
+        (Language::English, SearchState::UnsupportedVersion) => (
+            "Everything version isn't supported",
+            "AsterFiles requires Everything 1.5. Install a compatible version, then auto-detect it or check the configuration in Settings.",
+        ),
+        (Language::Chinese, SearchState::UnsupportedArchitecture) => (
+            "需要 Everything x64",
+            "当前 Everything 位数不兼容。请安装 Everything 1.5 x64，并前往设置重新配置。",
+        ),
+        (Language::English, SearchState::UnsupportedArchitecture) => (
+            "Everything x64 is required",
+            "The installed Everything architecture is incompatible. Install Everything 1.5 x64, then update the configuration in Settings.",
+        ),
+        (Language::Chinese, SearchState::SyntaxError) => {
+            ("搜索表达式有误", "请检查搜索内容后重试。")
+        }
+        (Language::English, SearchState::SyntaxError) => (
+            "Invalid search expression",
+            "Check the search text and try again.",
+        ),
+        (Language::Chinese, SearchState::TimedOut) => {
+            ("搜索超时", "Everything 未及时响应，请稍后重试。")
+        }
+        (Language::English, SearchState::TimedOut) => (
+            "Search timed out",
+            "Everything did not respond in time. Try again.",
+        ),
+        (Language::Chinese, _) => ("搜索失败", "Everything 搜索发生错误，请重试。"),
+        (Language::English, _) => ("Search failed", "Everything search failed. Try again."),
     }
 }
 fn apply_ui_texts(ui: &AppWindow, language: Language) {
@@ -10599,6 +10836,41 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_settings_general(settings_general.into());
     ui.set_text_settings_appearance(settings_appearance.into());
     ui.set_text_settings_developer(settings_developer.into());
+    let (
+        everything_path,
+        everything_instance,
+        test_connection,
+        start_everything,
+        discover_everything,
+        download_everything,
+        everything_settings,
+    ) = match language {
+        Language::Chinese => (
+            "程序路径",
+            "实例",
+            "测试连接",
+            "启动 Everything",
+            "自动发现",
+            "下载 Everything",
+            "前往 Everything 设置",
+        ),
+        Language::English => (
+            "Program path",
+            "Instance",
+            "Test connection",
+            "Start Everything",
+            "Auto-detect",
+            "Download Everything",
+            "Open Everything settings",
+        ),
+    };
+    ui.set_text_everything_path(everything_path.into());
+    ui.set_text_everything_instance(everything_instance.into());
+    ui.set_text_test_connection(test_connection.into());
+    ui.set_text_start_everything(start_everything.into());
+    ui.set_text_discover_everything(discover_everything.into());
+    ui.set_text_download_everything(download_everything.into());
+    ui.set_text_everything_settings(everything_settings.into());
     ui.set_text_ui_showcase(ui_showcase.into());
     ui.set_text_ui_showcase_detail(ui_showcase_detail.into());
     ui.set_text_show_delete_confirmation(show_delete_confirmation.into());
@@ -12240,6 +12512,58 @@ mod tests {
             assert!(!description.is_empty());
             assert!(description.contains("Windows"));
         }
+    }
+    #[test]
+    fn everything_search_errors_explain_installation_and_configuration() {
+        let (title, description) =
+            search_error_page_text(SearchState::NotConfigured, Texts::new(Language::Chinese));
+        assert!(title.contains("安装"));
+        assert!(description.contains("Everything 1.5 x64"));
+        assert!(description.contains("设置"));
+
+        let (title, description) =
+            search_error_page_text(SearchState::Disconnected, Texts::new(Language::English));
+        assert!(title.contains("Everything"));
+        assert!(description.contains("running"));
+        assert!(description.contains("settings"));
+
+        let (title, description) = search_error_page_text(
+            SearchState::UnsupportedArchitecture,
+            Texts::new(Language::Chinese),
+        );
+        assert!(title.contains("x64"));
+        assert!(description.contains("重新配置"));
+    }
+    #[test]
+    fn late_everything_discovery_does_not_overwrite_newer_configuration() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("same")], 0, [0, 1, 2, 3]);
+        app.everything_generation = 2;
+        app.everything_config.executable_path = Some(PathBuf::from("new.exe"));
+        let discovered = crate::domain::EverythingConfig {
+            executable_path: Some(PathBuf::from("old.exe")),
+            instance_name: "old".into(),
+            verified_version: None,
+            allow_launch: true,
+        };
+        let status = platform::windows::everything::EverythingStatus {
+            version: platform::windows::everything::EverythingVersion {
+                major: 1,
+                minor: 5,
+                revision: 0,
+                build: 1,
+            },
+            instance_name: "old".into(),
+            database_loaded: true,
+            folder_size_indexed: true,
+        };
+
+        assert!(!apply_everything_discovery(
+            &mut app, 1, discovered, &status
+        ));
+        assert_eq!(
+            app.everything_config.executable_path,
+            Some(PathBuf::from("new.exe"))
+        );
     }
     #[test]
     fn context_menu_closes_on_window_deactivation() {

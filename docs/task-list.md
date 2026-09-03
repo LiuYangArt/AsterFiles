@@ -94,6 +94,17 @@
 - [ ] E3 人工故障验收：本地 junction/符号链接、未索引位置、Everything 停止/重启、快速导航与多标签；当前自动边界与真实普通/空目录已通过，未执行项不得视为已验收。
 
 验收：官方 Query2 IPC 负责状态与分页搜索；Everything3 命名管道命令 18 已在本机 1.5.0.1396a x64、实例 1.5a 对已索引非空目录强断言返回非零值。UNC 导航继续走目录链路，搜索与大小仅接受索引结果。Issue #3 证据见 `docs/validation/2026-08-30-everything-folder-size-validation-result.md` 与 `artifacts/`。
+## GitHub Issue #22：Everything 外部依赖（已完成）
+
+- [x] 产品决策改为外部依赖：用户自行安装 Everything 1.5 x64；AsterFiles 不随包提供 `Everything.exe`，不安装或管理 Service，不触发 UAC。
+- [x] 删除随包资产、构建复制、自管 Service、专用实例、所有权记录和卸载清理链路，不保留兼容层。
+- [x] 设置 → Everything 提供官方下载、自动发现、程序路径、实例、测试连接和启动入口；下载仅打开 voidtools 官方页面。
+- [x] 搜索不可用时区分未安装、未运行、配置不匹配、版本不支持和连接失败；未安装时明确说明需安装并配置 Everything。
+- [x] 搜索错误页提供“前往设置”，直接打开单例设置标签并定位 Everything 分类；普通浏览继续可用，不做递归搜索或文件夹大小回退。
+- [x] 自动验证覆盖外部配置持久化、发现/启动/连接状态、错误到操作入口的映射和迟到状态拒绝。
+- [x] 用户已在真实 Windows 验收未安装引导、错误页提示与设置入口，并确认收尾；连接可用及文件夹大小索引链路沿用既有真实 IPC 验证。
+
+安装、配置与故障处理见 [Everything 外部依赖使用说明](everything-external-dependency.md)。
 ## GitHub Issue #9：Everything 超大结果列表深度滚动
 - [x] 搜索滚动条改为总结果数驱动的逻辑位置，Slint 列表只投影目标页及相邻页，避免十万透明槽位形成数百万像素内容高度。
 - [x] 详情、紧凑列表和网格按各自真实行高及网格列数统一换算绝对结果位置。
