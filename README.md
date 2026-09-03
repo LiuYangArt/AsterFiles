@@ -1,6 +1,6 @@
 # AsterFiles
 
-AsterFiles 是一个面向 Windows 的高性能现代文件管理器原型。视觉体验参考 Files，底层使用 Rust，界面使用 Slint。
+AsterFiles 是一个面向 Windows 的高性能现代文件管理器原型。
 
 项目开发中。 待进行内容见  issues. 
 
