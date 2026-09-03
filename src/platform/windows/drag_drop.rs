@@ -1493,21 +1493,28 @@ pub fn client_screen_rect(hwnd: isize) -> io::Result<(i32, i32, i32, i32)> {
 struct ThreadApartment {
     apartment: Option<OleApartment>,
     registrations: std::collections::HashMap<isize, DragDropRegistration>,
+    shutdown: bool,
 }
 
 impl ThreadApartment {
     fn ensure(&mut self) -> io::Result<()> {
+        if self.shutdown {
+            return Err(io::Error::other("drag-drop apartment is shutting down"));
+        }
         if self.apartment.is_none() {
             self.apartment = Some(OleApartment::initialize()?);
         }
         Ok(())
     }
-}
 
-impl Drop for ThreadApartment {
-    fn drop(&mut self) {
+    fn shutdown(&mut self) {
+        self.shutdown = true;
         self.registrations.clear();
         self.apartment.take();
+    }
+
+    fn revoke_all(&mut self) {
+        self.registrations.clear();
     }
 }
 
@@ -1558,10 +1565,14 @@ pub fn revoke(hwnd: isize) {
     });
 }
 
-pub fn revoke_current() {
-    THREAD_APARTMENT.with(|apartment| {
-        apartment.borrow_mut().registrations.clear();
-    });
+pub fn shutdown_current() {
+    TAB_TARGET_HANDLERS.with_borrow_mut(|handlers| handlers.clear());
+    THREAD_APARTMENT.with(|apartment| apartment.borrow_mut().shutdown());
+}
+
+pub fn revoke_all_current() {
+    TAB_TARGET_HANDLERS.with_borrow_mut(|handlers| handlers.clear());
+    THREAD_APARTMENT.with(|apartment| apartment.borrow_mut().revoke_all());
 }
 
 pub struct DragDropRegistration {

@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsString,
     io,
     path::Path,
     path::PathBuf,
@@ -306,6 +307,23 @@ pub fn is_unc_server_root(path: &Path) -> bool {
     })
 }
 
+pub fn unc_leaf_name(path: &Path) -> Option<OsString> {
+    use std::os::windows::ffi::OsStringExt;
+
+    let mut units = unc_body_units(path)?;
+    while units
+        .last()
+        .is_some_and(|unit| matches!(*unit, 0x005c | 0x002f))
+    {
+        units.pop();
+    }
+    let start = units
+        .iter()
+        .rposition(|unit| matches!(*unit, 0x005c | 0x002f))
+        .map_or(0, |index| index + 1);
+    (start < units.len()).then(|| OsString::from_wide(&units[start..]))
+}
+
 fn unc_body_units(path: &Path) -> Option<Vec<u16>> {
     use std::os::windows::ffi::OsStrExt;
 
@@ -334,6 +352,7 @@ pub struct DiscoveryCoordinator {
     cancel: Option<Arc<AtomicBool>>,
     state: DiscoveryState,
     devices: Vec<NetworkDeviceTarget>,
+    pending_devices: Vec<NetworkDeviceTarget>,
     error: Option<NetworkErrorKind>,
 }
 
@@ -350,6 +369,21 @@ impl DiscoveryCoordinator {
             cancel: None,
             state: DiscoveryState::Idle,
             devices: Vec::new(),
+            pending_devices: Vec::new(),
+            error: None,
+        }
+    }
+    pub fn with_devices(devices: Vec<NetworkDeviceTarget>) -> Self {
+        Self {
+            generation: DiscoveryRequestId(0),
+            cancel: None,
+            state: if devices.is_empty() {
+                DiscoveryState::Idle
+            } else {
+                DiscoveryState::Complete
+            },
+            devices,
+            pending_devices: Vec::new(),
             error: None,
         }
     }
@@ -359,7 +393,7 @@ impl DiscoveryCoordinator {
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
         self.state = DiscoveryState::Discovering;
-        self.devices.clear();
+        self.pending_devices.clear();
         self.error = None;
         (self.generation, cancel)
     }
@@ -367,6 +401,7 @@ impl DiscoveryCoordinator {
         if let Some(cancel) = self.cancel.take() {
             cancel.store(true, Ordering::Release);
             self.state = DiscoveryState::Cancelled;
+            self.pending_devices.clear();
         }
     }
     pub fn accepts(&self, request_id: DiscoveryRequestId) -> bool {
@@ -385,13 +420,14 @@ impl DiscoveryCoordinator {
         if !self.accepts(request_id) {
             return false;
         }
-        self.devices.extend(devices);
+        self.pending_devices.extend(devices);
         true
     }
     pub fn finish(&mut self, request_id: DiscoveryRequestId) -> bool {
         if !self.accepts(request_id) {
             return false;
         }
+        self.devices = std::mem::take(&mut self.pending_devices);
         self.state = if self.devices.is_empty() {
             DiscoveryState::Empty
         } else {
@@ -411,6 +447,7 @@ impl DiscoveryCoordinator {
         };
         self.error = Some(error);
         self.cancel = None;
+        self.pending_devices.clear();
         true
     }
     #[allow(dead_code)]
@@ -425,6 +462,13 @@ impl DiscoveryCoordinator {
         self.error
     }
     pub fn devices(&self) -> &[NetworkDeviceTarget] {
+        if self.state == DiscoveryState::Discovering && !self.pending_devices.is_empty() {
+            &self.pending_devices
+        } else {
+            &self.devices
+        }
+    }
+    pub fn successful_devices(&self) -> &[NetworkDeviceTarget] {
         &self.devices
     }
 }
@@ -530,6 +574,21 @@ mod tests {
         assert_eq!(c.devices()[0].display_name, "current");
     }
     #[test]
+    fn restored_devices_are_immediately_available_until_explicit_refresh() {
+        let mut c = DiscoveryCoordinator::with_devices(vec![device("LiuYanghomeNAS")]);
+        assert_eq!(c.state(), DiscoveryState::Complete);
+        assert_eq!(c.devices()[0].display_name, "LiuYanghomeNAS");
+        c.begin();
+        assert_eq!(c.devices()[0].display_name, "LiuYanghomeNAS");
+    }
+    #[test]
+    fn failed_refresh_keeps_the_last_successful_devices() {
+        let mut c = DiscoveryCoordinator::with_devices(vec![device("LiuYanghomeNAS")]);
+        let (request, _) = c.begin();
+        assert!(c.fail(request, NetworkErrorKind::TimedOut));
+        assert_eq!(c.devices()[0].display_name, "LiuYanghomeNAS");
+    }
+    #[test]
     fn cancellation_rejects_late_batches() {
         let mut c = DiscoveryCoordinator::new();
         let (request, cancel) = c.begin();
@@ -607,6 +666,20 @@ mod tests {
         assert!(is_unc_server_root(Path::new(r"\\server\")));
         assert!(!is_unc_server_root(Path::new(r"\\server\share")));
         assert!(!is_unc_server_root(Path::new(r"C:\server")));
+    }
+
+    #[test]
+    fn unc_leaf_name_does_not_depend_on_windows_path_file_name() {
+        assert_eq!(
+            unc_leaf_name(Path::new(r"\\server\share")),
+            Some("share".into())
+        );
+        assert_eq!(
+            unc_leaf_name(Path::new(r"\\server\share\")),
+            Some("share".into())
+        );
+        assert_eq!(unc_leaf_name(Path::new(r"\\server")), Some("server".into()));
+        assert_eq!(unc_leaf_name(Path::new(r"C:\share")), None);
     }
     #[test]
     fn network_errors_are_classified() {

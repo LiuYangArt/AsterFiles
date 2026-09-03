@@ -13,7 +13,7 @@ use std::{
 use windows::{
     Win32::{
         Foundation::RPC_E_CHANGED_MODE,
-        System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize},
+        System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize},
         UI::Shell::{
             BHID_EnumItems, IEnumShellItems, IShellItem, SHCreateItemFromParsingName,
             SHGetKnownFolderPath, SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_FILESYSPATH,
@@ -25,6 +25,38 @@ use windows::{
 
 #[cfg(windows)]
 use crate::domain::{EntryId, EntryKind, FileEntry, FileVisibility, FolderSizeState};
+
+pub fn record_runtime_event(event: &str) {
+    record_runtime_detail(event);
+}
+
+fn record_runtime_detail(event: &str) {
+    use std::{fs::OpenOptions, io::Write};
+
+    let Some(local_data) = std::env::var_os("LOCALAPPDATA") else {
+        return;
+    };
+    let directory = PathBuf::from(local_data).join("AsterFiles").join("logs");
+    if std::fs::create_dir_all(&directory).is_err() {
+        return;
+    }
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(directory.join("network-runtime.jsonl"))
+    else {
+        return;
+    };
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let _ = writeln!(
+        file,
+        "{{\"timestamp_ms\":{timestamp},\"pid\":{},\"event\":\"{event}\"}}",
+        std::process::id(),
+    );
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkLocation {
     pub label: String,
@@ -81,14 +113,14 @@ impl std::fmt::Display for NetworkAuthError {
 impl std::error::Error for NetworkAuthError {}
 
 const FOLDERID_NETHOOD: GUID = GUID::from_u128(0xc5abbf53_e17f_4121_8900_86626fc2c973);
-const NETWORK_NAMESPACE: &str = "shell:::{f02c1a0d-be21-4350-88b0-7367fc96ef3c}";
+const NETWORK_NAMESPACE: &str = "::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}";
 
 struct ComGuard {
     initialized: bool,
 }
 impl ComGuard {
     fn new() -> io::Result<Self> {
-        let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let result = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
         if result.is_ok() {
             Ok(Self { initialized: true })
         } else if result == RPC_E_CHANGED_MODE {
@@ -118,17 +150,19 @@ pub fn enumerate_network_locations() -> io::Result<Vec<NetworkLocation>> {
                 .file_system_path
                 .clone()
                 .or_else(|| item.parsing_path.clone())?;
-            let target = crate::platform::resolve_shortcut_target(&shell_path)
+            let target_link = if shell_path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"))
+            {
+                shell_path.clone()
+            } else {
+                shell_path.join("target.lnk")
+            };
+            let target = crate::platform::resolve_shortcut_target(&target_link)
                 .ok()
                 .flatten()
                 .map(|resolved| resolved.path)
-                .or_else(|| {
-                    (!shell_path
-                        .extension()
-                        .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk")))
-                    .then(|| item.file_system_path.clone())
-                    .flatten()
-                });
+                .or_else(|| crate::network::is_unc_path(&shell_path).then(|| shell_path.clone()));
             let label = item.label.unwrap_or_else(|| {
                 shell_path
                     .file_stem()
@@ -187,6 +221,63 @@ pub fn enumerate_network_devices() -> io::Result<Vec<NetworkDevice>> {
             })
         })
         .collect())
+}
+
+pub fn network_devices_from_imported_locations() -> io::Result<Vec<NetworkDevice>> {
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::new();
+    let mut devices = Vec::new();
+    for location in enumerate_network_locations()? {
+        let Some(target) = location.target else {
+            continue;
+        };
+        let Some(host) = unc_host_display_name(&target) else {
+            continue;
+        };
+        let root = PathBuf::from(format!(r"\\{host}"));
+        let identity = root.as_os_str().encode_wide().collect::<Vec<_>>();
+        if !seen.insert(identity) {
+            continue;
+        }
+        devices.push(NetworkDevice {
+            label: host,
+            target: root,
+            is_directory: true,
+        });
+    }
+    Ok(devices)
+}
+
+fn unc_host_display_name(path: &Path) -> Option<String> {
+    use std::ffi::OsString;
+
+    let units = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let start = if units.starts_with(&[
+        b'\\' as u16,
+        b'\\' as u16,
+        b'?' as u16,
+        b'\\' as u16,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        b'\\' as u16,
+    ]) {
+        8
+    } else if crate::network::is_unc_path(path) {
+        2
+    } else {
+        return None;
+    };
+    let end = units[start..]
+        .iter()
+        .position(|unit| matches!(*unit, 0x005c | 0x002f))
+        .map_or(units.len(), |offset| start + offset);
+    (end > start).then(|| {
+        OsString::from_wide(&units[start..end])
+            .to_string_lossy()
+            .into_owned()
+    })
 }
 
 pub fn network_drive_to_unc(path: &Path) -> io::Result<PathBuf> {
@@ -609,6 +700,12 @@ mod tests {
             items
                 .iter()
                 .all(|item| crate::network::is_unc_path(&item.target))
+        );
+        assert!(
+            items
+                .iter()
+                .all(|item| crate::network::unc_leaf_name(&item.target).is_some()),
+            "network root entries must have a stable final component: {items:#?}"
         );
     }
     #[test]
@@ -1940,5 +2037,37 @@ mod isolated_codec_tests {
         assert_eq!(decoded[0].modified, Some(modified));
         assert_eq!(decoded[0].created, None);
         let _ = std::fs::remove_file(file);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod live_import_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires the current user's Windows Explorer Network Shortcuts"]
+    fn explorer_network_shortcuts_resolve_target_links_when_present() {
+        let locations = enumerate_network_locations().expect("NetHood can be enumerated");
+        for location in locations {
+            if location.shell_path.join("target.lnk").is_file() {
+                let target = location
+                    .target
+                    .expect("target.lnk resolves to its remote target");
+                assert_ne!(target, location.shell_path);
+            }
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod host_display_tests {
+    use super::*;
+
+    #[test]
+    fn imported_device_host_preserves_windows_casing() {
+        assert_eq!(
+            unc_host_display_name(Path::new(r"\\LiuYanghomeNAS\Multimedia")),
+            Some("LiuYanghomeNAS".to_owned())
+        );
     }
 }

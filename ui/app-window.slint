@@ -1,4 +1,4 @@
-import { CheckBox, LineEdit, ListView } from "std-widgets.slint";
+import { CheckBox, LineEdit, ListView, ScrollView } from "std-widgets.slint";
 import { IconMap } from "icons/icon-map.slint";
 export { PopupCommandRow, QuickMenuWindow, QuickSubmenuWindow } from "quick-menu.slint";
 
@@ -783,6 +783,7 @@ export component AppWindow inherits Window {
     private property <int> active-geometry-revision: root.view-mode * 1000003 + root.projected-content-revision;
     in-out property <length> search-scroll-y: 0px;
     in property <int> search-total-items: 0;
+    out property <length> sidebar-viewport-y: 0px;
     out property <length> file-list-left: 0px;
     out property <length> file-list-top: 0px;
     out property <length> rectangle-viewport-top: 0px;
@@ -1422,8 +1423,27 @@ export component AppWindow inherits Window {
         if !root.active-is-settings: HorizontalLayout {
             spacing: 0px;
             if !root.minimal: Rectangle {
-                width: root.compact ? 184px : 218px; background: VisualStyle.c323437; border-width: 0px;
-                VerticalLayout {
+                width: root.compact ? 184px : 218px; background: VisualStyle.c323437; border-width: 0px; clip: true;
+                sidebar-scroll := ScrollView {
+                    width: parent.width; height: parent.height;
+                    viewport-width: self.width;
+                    viewport-height: max(self.height, sidebar-content.preferred-height);
+                    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+                    viewport-y <=> root.sidebar-viewport-y;
+                    sidebar-wheel := TouchArea {
+                        width: sidebar-scroll.visible-width;
+                        height: sidebar-scroll.visible-height;
+                        scroll-event(event) => {
+                            let maximum = max(0px, sidebar-content.preferred-height - sidebar-scroll.visible-height);
+                            if maximum > 0px && event.delta-y != 0px {
+                                sidebar-scroll.viewport-y = max(-maximum, min(0px, sidebar-scroll.viewport-y + event.delta-y));
+                                return accept;
+                            }
+                            return reject;
+                        }
+                    }
+                sidebar-content := VerticalLayout {
+                    width: sidebar-scroll.width;
                     padding-top: 4px; padding-bottom: 12px; padding-left: 10px; padding-right: 10px; spacing: 0px;
                     SidebarGroupHeader { label: root.text-quick-access; expanded: root.quick-access-expanded; toggled => { root.quick-access-expanded = !root.quick-access-expanded; } }
                     for location in root.sidebar-items: Rectangle {
@@ -1474,6 +1494,7 @@ export component AppWindow inherits Window {
                         accessible-role: button; accessible-label: location.label;
                     }
                     Rectangle { vertical-stretch: 1; }
+                }
                 }
             }
 
@@ -2028,7 +2049,7 @@ accessible-label: entry.name;
 
                 }
 
-                Rectangle {
+                status-bar := Rectangle {
                     height: 30px; background: VisualStyle.cfafbfc;
                     Text { x: 14px; text: root.operation-error != "" && root.rename-editing ? root.operation-error : root.status-text; color: root.operation-error != "" && root.rename-editing ? VisualStyle.cc42b1c : VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; }
                     Rectangle {

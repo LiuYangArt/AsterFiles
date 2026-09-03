@@ -79,6 +79,7 @@ mod windows_impl {
     use super::{KnownLocation, KnownLocationKind, Path, PathBuf, ShortcutTarget};
     use windows::{
         Win32::{
+            Foundation::RPC_E_CHANGED_MODE,
             Storage::FileSystem::{
                 FILE_ATTRIBUTE_DIRECTORY, GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
                 WIN32_FIND_DATAW,
@@ -319,7 +320,8 @@ mod windows_impl {
             .chain(Some(0))
             .collect::<Vec<_>>();
         let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        if initialized.is_err() {
+        let should_uninitialize = initialized.is_ok();
+        if initialized.is_err() && initialized != RPC_E_CHANGED_MODE {
             return Err(std::io::Error::other(format!(
                 "CoInitializeEx failed: {initialized:?}"
             )));
@@ -361,7 +363,9 @@ mod windows_impl {
                 is_directory,
             }))
         })();
-        unsafe { CoUninitialize() };
+        if should_uninitialize {
+            unsafe { CoUninitialize() };
+        }
         result
     }
 

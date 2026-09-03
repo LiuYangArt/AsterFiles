@@ -12,16 +12,19 @@ use crate::{
         ViewMode,
     },
     i18n::Language,
-    network::{NetworkLocation, NetworkLocationSource, NetworkTarget},
+    network::{
+        NetworkDeviceId, NetworkDeviceTarget, NetworkLocation, NetworkLocationSource, NetworkTarget,
+    },
 };
 
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-const MAGIC: &[u8; 6] = b"ASTF10";
+const MAGIC: &[u8; 6] = b"ASTF11";
 const MAX_TABS: usize = 1_024;
 const MAX_WINDOWS: usize = 128;
 const MAX_NETWORK_LOCATIONS: usize = 1_024;
+const MAX_NETWORK_DEVICES: usize = 1_024;
 const MAX_PATH_UNITS: usize = 32_767;
 const MIN_WINDOW_WIDTH: u32 = 820;
 const MIN_WINDOW_HEIGHT: u32 = 520;
@@ -74,6 +77,7 @@ pub struct SessionState {
     pub everything: EverythingConfig,
     pub file_visibility: FileVisibility,
     pub network_locations: Vec<NetworkLocation>,
+    pub network_devices: Vec<NetworkDeviceTarget>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,6 +108,7 @@ impl SessionState {
             EverythingConfig::default(),
             FileVisibility::default(),
             Vec::new(),
+            Vec::new(),
         )
     }
 
@@ -118,6 +123,7 @@ impl SessionState {
         everything: EverythingConfig,
         file_visibility: FileVisibility,
         network_locations: Vec<NetworkLocation>,
+        network_devices: Vec<NetworkDeviceTarget>,
     ) -> io::Result<Self> {
         if windows.is_empty() || windows.len() > MAX_WINDOWS {
             return Err(invalid_data("invalid session window count"));
@@ -141,6 +147,7 @@ impl SessionState {
         validate_directory_views(&directory_views)?;
         validate_everything_config(&everything)?;
         validate_network_locations(&network_locations)?;
+        validate_network_devices(&network_devices)?;
         Ok(Self {
             windows,
             default_directory_view,
@@ -151,6 +158,7 @@ impl SessionState {
             everything,
             file_visibility,
             network_locations,
+            network_devices,
         })
     }
 }
@@ -184,6 +192,7 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
         state.everything.clone(),
         state.file_visibility,
         state.network_locations.clone(),
+        state.network_devices.clone(),
     )?;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(MAGIC);
@@ -211,6 +220,15 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
         let NetworkTarget::WindowsPath(path) = &location.target else {
             return Err(invalid_data("network location target cannot be persisted"));
         };
+        write_os(&mut bytes, path.as_os_str())?;
+    }
+    bytes.extend_from_slice(&(state.network_devices.len() as u32).to_le_bytes());
+    for device in &state.network_devices {
+        write_string(&mut bytes, &device.display_name)?;
+        let path = device
+            .unc_path
+            .as_deref()
+            .ok_or_else(|| invalid_data("network device target cannot be persisted"))?;
         write_os(&mut bytes, path.as_os_str())?;
     }
 
@@ -278,6 +296,21 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
             target: NetworkTarget::WindowsPath(PathBuf::from(read_os(bytes, &mut offset)?)),
         });
     }
+    let network_device_count = read_u32(bytes, &mut offset)? as usize;
+    if network_device_count > MAX_NETWORK_DEVICES {
+        return Err(invalid_data("too many network devices"));
+    }
+    let mut network_devices = Vec::with_capacity(network_device_count);
+    for _ in 0..network_device_count {
+        let display_name = read_string(bytes, &mut offset)?;
+        let path = PathBuf::from(read_os(bytes, &mut offset)?);
+        network_devices.push(NetworkDeviceTarget {
+            id: network_device_id(&path),
+            display_name,
+            shell_identity: None,
+            unc_path: Some(path),
+        });
+    }
 
     let mut windows = Vec::with_capacity(window_count);
     for _ in 0..window_count {
@@ -315,7 +348,41 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
         everything,
         file_visibility,
         network_locations,
+        network_devices,
     )
+}
+
+fn network_device_id(path: &Path) -> NetworkDeviceId {
+    NetworkDeviceId(encode_os(path.as_os_str()))
+}
+
+fn validate_network_devices(values: &[NetworkDeviceTarget]) -> io::Result<()> {
+    if values.len() > MAX_NETWORK_DEVICES {
+        return Err(invalid_data("too many network devices"));
+    }
+    let mut identities = HashSet::with_capacity(values.len());
+    for device in values {
+        if device.display_name.trim().is_empty() || device.shell_identity.is_some() {
+            return Err(invalid_data("invalid persisted network device"));
+        }
+        let Some(path) = device.unc_path.as_deref() else {
+            return Err(invalid_data("network device target cannot be persisted"));
+        };
+        let identity = encode_os(path.as_os_str())
+            .into_iter()
+            .map(|unit| {
+                if (b'A' as u16..=b'Z' as u16).contains(&unit) {
+                    unit + (b'a' - b'A') as u16
+                } else {
+                    unit
+                }
+            })
+            .collect::<Vec<_>>();
+        if !crate::network::is_unc_server_root(path) || !identities.insert(identity) {
+            return Err(invalid_data("invalid persisted network device target"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_network_locations(values: &[NetworkLocation]) -> io::Result<()> {
@@ -704,19 +771,25 @@ mod tests {
                 sort_order: 0,
                 target: NetworkTarget::WindowsPath(PathBuf::from(r"\\NAS\媒体")),
             }],
+            vec![NetworkDeviceTarget {
+                id: network_device_id(Path::new(r"\\LiuYanghomeNAS")),
+                display_name: "LiuYanghomeNAS".to_owned(),
+                shell_identity: None,
+                unc_path: Some(PathBuf::from(r"\\LiuYanghomeNAS")),
+            }],
         )
         .unwrap()
     }
 
     #[test]
-    fn astf10_round_trip_preserves_network_locations_and_raw_paths() {
+    fn astf11_round_trip_preserves_network_locations_devices_and_raw_paths() {
         let state = sample_state();
         assert_eq!(decode(&encode(&state).unwrap()).unwrap(), state);
     }
 
     #[test]
     fn rejects_old_formats() {
-        for version in 1..=9 {
+        for version in 1..=10 {
             let bytes = format!("ASTF{version}\0\0\0\0");
             assert_eq!(
                 decode(bytes.as_bytes()).unwrap_err().kind(),
@@ -739,6 +812,16 @@ mod tests {
             NetworkTarget::ShellItemId(PathBuf::from("shell:::{network-location}"));
         assert_eq!(
             encode(&shell_item).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_persisted_network_device() {
+        let mut state = sample_state();
+        state.network_devices[0].unc_path = Some(PathBuf::from(r"\\NAS\share"));
+        assert_eq!(
+            encode(&state).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
     }

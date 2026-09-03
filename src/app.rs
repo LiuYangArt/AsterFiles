@@ -109,7 +109,7 @@ pub fn export_network_foundation_state(path: &Path) -> io::Result<()> {
             "  \"stale_result_rejected\": {},\n",
             "  \"previous_request_cancelled\": {},\n",
             "  \"current_result_accepted\": {},\n",
-            "  \"device_results_persisted\": false,\n",
+            "  \"device_results_persisted\": true,\n",
             "  \"local_and_network_directory_queues_separate\": true,\n",
             "  \"network_directory_queue_bounded\": true,\n",
             "  \"network_refresh_routed_separately\": true,\n",
@@ -2745,6 +2745,17 @@ fn logical_scroll_delta(delta: &MouseScrollDelta, view_mode: ViewMode, scale_fac
         }
     }
 }
+
+fn pointer_targets_file_area(
+    pointer_x: f32,
+    pointer_y: f32,
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+) -> bool {
+    pointer_x >= left && pointer_x <= left + width && pointer_y >= top && pointer_y <= top + height
+}
 fn search_logical_maximum(
     total: u32,
     view_mode: ViewMode,
@@ -3090,6 +3101,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         language,
         file_visibility,
         network_locations,
+        network_devices,
     ) = restored
         .filter(|session| {
             session
@@ -3116,6 +3128,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 session.language,
                 session.file_visibility,
                 session.network_locations,
+                session.network_devices,
             )
         })
         .unwrap_or_else(|| {
@@ -3131,6 +3144,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 session_store::ThemeMode::System,
                 Language::Chinese,
                 crate::domain::FileVisibility::default(),
+                Vec::new(),
                 Vec::new(),
             )
         });
@@ -3170,14 +3184,27 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     if let Ok(mut app) = state.lock() {
         app.file_visibility = file_visibility;
         app.network_locations = network_locations;
+        if !network_devices.is_empty() {
+            let active_window = app.active_window;
+            app.network_discovery.insert(
+                active_window,
+                DiscoveryCoordinator::with_devices(network_devices.clone()),
+            );
+        }
         app.active_window_state_mut().placement = window;
         for restored in &additional_windows {
             if !restored.tab_paths.is_empty() {
-                app.register_window(
+                let window_id = app.register_window(
                     restored.tab_paths.clone(),
                     restored.active_tab,
                     restored.placement,
                 );
+                if !network_devices.is_empty() {
+                    app.network_discovery.insert(
+                        window_id,
+                        DiscoveryCoordinator::with_devices(network_devices.clone()),
+                    );
+                }
             }
         }
         let _ = app.window(app.active_window);
@@ -3429,12 +3456,14 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         )?;
     }
     ui.show()?;
+    platform::windows::network::record_runtime_event("event_loop_started");
     let result = slint::run_event_loop();
+    platform::windows::network::record_runtime_event("event_loop_returned");
     if let Ok(mut coordinator) = network_login.lock() {
         coordinator.cancel();
     }
     drop(directory_watch_timer);
-    platform::windows::drag_drop::revoke_current();
+    platform::windows::drag_drop::revoke_all_current();
     for weak in [delete_weak, conflict_weak, exit_weak] {
         if let Some(window) = weak.upgrade() {
             let _ = window.hide();
@@ -3471,6 +3500,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         language,
         file_visibility,
         network_locations,
+        network_devices,
     ) = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         for (id, placement) in &live_placements {
@@ -3513,6 +3543,19 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             app.language,
             app.file_visibility,
             app.network_locations.clone(),
+            app.network_discovery
+                .values()
+                .flat_map(|discovery| discovery.successful_devices().iter())
+                .filter(|device| device.unc_path.is_some())
+                .fold(Vec::new(), |mut devices, device| {
+                    if !devices
+                        .iter()
+                        .any(|known: &NetworkDeviceTarget| known.id == device.id)
+                    {
+                        devices.push(device.clone());
+                    }
+                    devices
+                }),
         )
     };
     if scenario.is_none()
@@ -3527,15 +3570,17 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             everything_config,
             file_visibility,
             network_locations,
+            network_devices,
         )
     {
         let _ = session_store::save(&path, &session);
     }
+    clear_window_runtimes();
+    platform::windows::drag_drop::shutdown_current();
     let _ = state.lock().ok().and_then(|mut app| {
         let active_window = app.active_window;
         app.close_window(active_window)
     });
-    clear_window_runtimes();
     result
 }
 
@@ -3643,6 +3688,37 @@ fn submit_path_navigation(
     } else {
         submit_navigation(local_sender, state, tab_id, path, kind)
     }
+}
+
+fn sidebar_navigation_target(app: &AppState, index: usize) -> Option<PathBuf> {
+    if let Some(location) = app.sidebar.get(index) {
+        return Some(location.path.clone());
+    }
+    let mut location_targets = app
+        .imported_network_locations
+        .iter()
+        .chain(app.network_locations.iter())
+        .map(|location| match &location.target {
+            NetworkTarget::WindowsPath(path) => (location.sort_order, Some(path.clone())),
+            NetworkTarget::ShellItemId(_) => (location.sort_order, None),
+        })
+        .collect::<Vec<_>>();
+    location_targets.sort_by_key(|(order, _)| *order);
+    let offset = index.saturating_sub(app.sidebar.len());
+    if offset < location_targets.len() {
+        return location_targets
+            .get(offset)
+            .and_then(|(_, path)| path.clone());
+    }
+    app.network_discovery
+        .get(&app.active_window)
+        .and_then(|discovery| {
+            discovery
+                .devices()
+                .iter()
+                .filter_map(crate::network::device_root_target)
+                .nth(offset - location_targets.len())
+        })
 }
 fn restart_detached_tab(
     outcome: &DetachedTabOutcome,
@@ -6797,7 +6873,7 @@ fn wire_internal_drag_drop(
         );
         eprintln!("drag-drop: DoDragDrop returned result={outbound_result:?}");
         match outbound_result {
-            Ok(result) if result.dropped => {
+            Ok(result) if should_refresh_outbound_drag_source(result) => {
                 // External targets own the operation; refresh only the source views and never infer item removal.
                 refresh_affected_tabs(
                     &directory_for_update,
@@ -7586,6 +7662,12 @@ fn update_network_discovery(
     }
     refresh_all_windows(state);
 }
+
+fn network_discovery_needed(app: &AppState, window_id: WindowId) -> bool {
+    app.network_discovery
+        .get(&window_id)
+        .is_none_or(|discovery| discovery.devices().is_empty())
+}
 #[allow(clippy::too_many_arguments)]
 fn wire_callbacks(
     ui: &AppWindow,
@@ -7613,7 +7695,13 @@ fn wire_callbacks(
         let expanded = weak_for_network
             .upgrade()
             .is_some_and(|ui| ui.get_network_expanded());
-        update_network_discovery(&discovery_state_for_ui, &discovery_sender_for_ui, expanded);
+        let should_discover = expanded
+            && discovery_state_for_ui
+                .lock()
+                .is_ok_and(|app| network_discovery_needed(&app, discovery_state_for_ui.window_id));
+        if !expanded || should_discover {
+            update_network_discovery(&discovery_state_for_ui, &discovery_sender_for_ui, expanded);
+        }
     });
     let discovery_sender_for_refresh = network_discovery_sender.clone();
     let discovery_state_for_refresh = state.clone();
@@ -7924,6 +8012,11 @@ fn wire_callbacks(
                 .map(|(_, path)| (app.active_window_state().active_tab, path))
         };
         if let Some((tab_id, path)) = target {
+            if crate::network::is_unc_server_root(&path) {
+                platform::windows::network::record_runtime_event(
+                    "network_device_navigation_submitted",
+                );
+            }
             submit_path_navigation(
                 &sender_for_breadcrumb,
                 &network_sender_for_breadcrumb,
@@ -7947,38 +8040,8 @@ fn wire_callbacks(
                 .lock()
                 .expect("app state mutex is not poisoned");
             usize::try_from(index).ok().and_then(|index| {
-                let path = if let Some(location) = app.sidebar.get(index) {
-                    Some(location.path.clone())
-                } else {
-                    let mut targets = app
-                        .imported_network_locations
-                        .iter()
-                        .chain(app.network_locations.iter())
-                        .filter_map(|location| match &location.target {
-                            NetworkTarget::WindowsPath(path) => {
-                                Some((location.sort_order, path.clone()))
-                            }
-                            NetworkTarget::ShellItemId(_) => None,
-                        })
-                        .collect::<Vec<_>>();
-                    targets.sort_by_key(|(order, _)| *order);
-                    let mut targets = targets
-                        .into_iter()
-                        .map(|(_, path)| path)
-                        .collect::<Vec<_>>();
-                    if let Some(discovery) = app.network_discovery.get(&app.active_window) {
-                        targets.extend(
-                            discovery
-                                .devices()
-                                .iter()
-                                .filter_map(crate::network::device_root_target),
-                        );
-                    }
-                    targets
-                        .get(index.saturating_sub(app.sidebar.len()))
-                        .cloned()
-                };
-                path.map(|path| (app.active_window_state().active_tab, path))
+                sidebar_navigation_target(&app, index)
+                    .map(|path| (app.active_window_state().active_tab, path))
             })
         };
         if let Some((tab_id, path)) = target {
@@ -10131,6 +10194,8 @@ fn wire_callbacks(
                 remove_window_runtime(state_for_close.window_id);
             }
             WindowCloseAction::ExitApplication => {
+                platform::windows::network::record_runtime_event("event_loop_exit_requested");
+                platform::windows::drag_drop::revoke_all_current();
                 if let Some(ui) = weak.upgrade() {
                     let _ = ui.hide();
                 }
@@ -10228,6 +10293,8 @@ fn wire_mouse_navigation(
                 }
                 WindowCloseAction::ExitApplication => {
                     dismiss_quick_menu_session(window_id, false);
+                    platform::windows::network::record_runtime_event("event_loop_exit_requested");
+                    platform::windows::drag_drop::revoke_all_current();
                     return EventResult::Propagate;
                 }
                 WindowCloseAction::Ignore => return EventResult::PreventDefault,
@@ -10376,16 +10443,20 @@ fn wire_mouse_navigation(
                 let logical = cursor_position
                     .get()
                     .to_logical::<f32>(f64::from(ui.window().scale_factor()));
-                if logical.y < ui.get_file_list_top() {
+                if !pointer_targets_file_area(
+                    logical.x,
+                    logical.y,
+                    ui.get_file_list_left(),
+                    ui.get_file_list_top(),
+                    ui.get_file_viewport_width(),
+                    ui.get_file_viewport_height(),
+                ) {
+                    ctrl_wheel_accumulator.set(0.0);
                     return EventResult::Propagate;
                 }
                 let view_mode = view_mode_from_ui(ui.get_view_mode());
                 let control = modifiers.get().control_key();
                 if control {
-                    if logical.y >= ui.get_file_list_top() + ui.get_file_viewport_height() {
-                        ctrl_wheel_accumulator.set(0.0);
-                        return EventResult::Propagate;
-                    }
                     if ui.get_context_menu_open()
                         || ui.get_rename_editing()
                         || ui.get_rectangle_selection_pointer_active()
@@ -10426,9 +10497,6 @@ fn wire_mouse_navigation(
                 }
                 ctrl_wheel_accumulator.set(0.0);
                 let delta = logical_scroll_delta(delta, view_mode, ui.window().scale_factor());
-                if logical.y >= ui.get_file_list_top() + ui.get_file_viewport_height() {
-                    return EventResult::Propagate;
-                }
                 if ui.get_search_results_mode() {
                     ui.invoke_request_search_position(ui.get_search_scroll_y() + delta);
                 } else {
@@ -10687,6 +10755,12 @@ fn should_release_internal_pointer_grab(distance: f32, outbound_started: bool) -
 fn should_start_native_tab_drag(became_dragging: bool, native_started: bool) -> bool {
     became_dragging && !native_started
 }
+fn should_refresh_outbound_drag_source(
+    result: platform::windows::drag_drop::OutboundDropResult,
+) -> bool {
+    result.dropped && result.effect == platform::windows::drag_drop::DropEffect::Move
+}
+
 fn drop_requires_choice(intent: &platform::windows::drag_drop::DropIntent) -> bool {
     intent.right_button
 }
@@ -13975,10 +14049,7 @@ fn read_network_root_batches(
                     .min(u32::MAX as usize) as u32;
                 FileEntry {
                     id: EntryId(id),
-                    original_name: item
-                        .target
-                        .file_name()
-                        .map(ToOwned::to_owned)
+                    original_name: crate::network::unc_leaf_name(&item.target)
                         .unwrap_or_else(|| item.label.clone().into()),
                     display_name: item.label.clone(),
                     name_highlights: Vec::new(),
@@ -14040,6 +14111,9 @@ fn read_network_directory_batches(
     Ok(ReadOutcome::Complete { skipped })
 }
 fn run_directory_request(request: DirectoryRequest, events: &mpsc::Sender<DirectoryEvent>) {
+    if crate::network::is_unc_server_root(&request.path) {
+        platform::windows::network::record_runtime_event("network_root_request_started");
+    }
     let result = if crate::network::is_unc_server_root(&request.path) {
         read_network_root_batches(&request, events)
     } else if crate::network::is_unc_path(&request.path) {
@@ -14058,6 +14132,13 @@ fn run_directory_request(request: DirectoryRequest, events: &mpsc::Sender<Direct
             },
         )
     };
+    if crate::network::is_unc_server_root(&request.path) {
+        platform::windows::network::record_runtime_event(match &result {
+            Ok(ReadOutcome::Complete { .. }) => "network_root_request_completed",
+            Ok(ReadOutcome::Cancelled) => "network_root_request_cancelled",
+            Err(_) => "network_root_request_failed",
+        });
+    }
     let event = match result {
         Ok(ReadOutcome::Complete { skipped }) => DirectoryEvent::Finished {
             tab_id: request.tab_id,
@@ -14121,7 +14202,28 @@ fn start_event_pump(
                                 .is_some_and(crate::network::is_unc_path)
                         })
                     });
+                    let network_root_finished = finished.is_some_and(|(tab_id, request_id)| {
+                        state.lock().ok().is_some_and(|app| {
+                            app.tab(tab_id).is_some_and(|tab| {
+                                tab.latest_request == request_id
+                                    && tab
+                                        .requested_path
+                                        .as_deref()
+                                        .is_some_and(crate::network::is_unc_server_root)
+                            })
+                        })
+                    });
+                    if network_root_finished {
+                        platform::windows::network::record_runtime_event(
+                            "network_root_event_apply_started",
+                        );
+                    }
                     let icon_requests = apply_event(&state, event);
+                    if network_root_finished {
+                        platform::windows::network::record_runtime_event(
+                            "network_root_event_apply_completed",
+                        );
+                    }
                     if !network_tab {
                         for request in icon_requests {
                             let _ = icon_sender.send(request);
@@ -14169,6 +14271,11 @@ fn start_event_pump(
                         }
                         if let Some((tab_id, request_id)) = finished {
                             reveal_focused_entry(&ui, &state, tab_id, request_id);
+                        }
+                        if network_root_finished {
+                            platform::windows::network::record_runtime_event(
+                                "network_root_ui_refresh_completed",
+                            );
                         }
                     }
                 })
@@ -14225,13 +14332,15 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
         } => {
             let accepted = app.tab(tab_id).is_some_and(|tab| tab.accepts(request_id));
             if accepted {
+                let local_entries = entries
+                    .iter()
+                    .filter(|entry| !crate::network::is_unc_path(&entry.path));
                 if !app
                     .view_mode_for_tab(tab_id)
                     .is_some_and(ViewMode::uses_grid_layout)
                 {
                     icon_requests.extend(
-                        entries
-                            .iter()
+                        local_entries
                             .filter(|entry| !app.icon_cache.contains_key(&entry.path))
                             .map(|entry| IconRequest {
                                 tab_id,
@@ -14294,14 +14403,16 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                 if consumed_focus {
                     app.focus_after_refresh.remove(&tab_id);
                 }
-                icon_requests.push(IconRequest {
-                    tab_id,
-                    request_id,
-                    target: IconTarget::Location,
-                    path: location_path,
-                    thumbnail: false,
-                    requested_px: 0,
-                });
+                if !crate::network::is_unc_path(&location_path) {
+                    icon_requests.push(IconRequest {
+                        tab_id,
+                        request_id,
+                        target: IconTarget::Location,
+                        path: location_path,
+                        thumbnail: false,
+                        requested_px: 0,
+                    });
+                }
             }
         }
         DirectoryEvent::Cancelled { tab_id, request_id } => {
@@ -15535,6 +15646,31 @@ fn run_network_discovery(
             });
         }
         Err(error) => {
+            if error.kind() == io::ErrorKind::TimedOut
+                && let Ok(devices) =
+                    platform::windows::network::network_devices_from_imported_locations()
+                && !devices.is_empty()
+            {
+                let devices = devices
+                    .into_iter()
+                    .map(|device| NetworkDeviceTarget {
+                        id: crate::network::network_device_id(&device.target),
+                        display_name: device.label,
+                        shell_identity: None,
+                        unc_path: Some(device.target),
+                    })
+                    .collect();
+                let _ = event_sender.send(NetworkDiscoveryEvent::Batch {
+                    window_id,
+                    request_id,
+                    devices,
+                });
+                let _ = event_sender.send(NetworkDiscoveryEvent::Finished {
+                    window_id,
+                    request_id,
+                });
+                return;
+            }
             let _ = event_sender.send(NetworkDiscoveryEvent::Failed {
                 window_id,
                 request_id,
@@ -15601,6 +15737,23 @@ fn start_network_discovery_event_pump(
                                 .is_some_and(|coordinator| coordinator.finish(request_id));
                             if accepted {
                                 app.network_discovery_errors.remove(&window_id);
+                                if let Some(devices) = app
+                                    .network_discovery
+                                    .get(&window_id)
+                                    .filter(|discovery| !discovery.devices().is_empty())
+                                    .map(|discovery| discovery.devices().to_vec())
+                                {
+                                    for other_window in
+                                        app.windows.keys().copied().collect::<Vec<_>>()
+                                    {
+                                        if other_window != window_id {
+                                            app.network_discovery.insert(
+                                                other_window,
+                                                DiscoveryCoordinator::with_devices(devices.clone()),
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                         NetworkDiscoveryEvent::Failed {
@@ -16851,7 +17004,12 @@ fn file_row(
     grid_requested_px: Option<u32>,
 ) -> FileRow {
     debug_assert_eq!(
-        entry.path.file_name(),
+        if crate::network::is_unc_path(&entry.path) {
+            crate::network::unc_leaf_name(&entry.path)
+        } else {
+            entry.path.file_name().map(ToOwned::to_owned)
+        }
+        .as_deref(),
         Some(entry.original_name.as_os_str()),
         "entry identity must retain its original file name"
     );
@@ -18228,6 +18386,37 @@ mod tests {
     }
 
     #[test]
+    fn network_directory_events_never_request_shell_icons() {
+        let path = PathBuf::from(r"\\server\share");
+        let mut app = AppState::new_for_test(vec![path.clone()], 0, [0, 1, 2, 3]);
+        let tab = app.tab_mut(TabId(1)).unwrap();
+        tab.latest_request = RequestId(4);
+        tab.load_state = LoadState::Loading;
+        let state = Arc::new(Mutex::new(app));
+
+        let batch = apply_event(
+            &state,
+            DirectoryEvent::Batch {
+                tab_id: TabId(1),
+                request_id: RequestId(4),
+                entries: vec![focus_entry(1, r"\\server\share\folder")],
+            },
+        );
+        let finished = apply_event(
+            &state,
+            DirectoryEvent::Finished {
+                tab_id: TabId(1),
+                request_id: RequestId(4),
+                path,
+                skipped: 0,
+            },
+        );
+
+        assert!(batch.is_empty());
+        assert!(finished.is_empty());
+    }
+
+    #[test]
     fn operation_window_waits_until_conflict_is_resolved_and_runtime_reaches_threshold() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
         let id = app.operations.submit(
@@ -18708,6 +18897,91 @@ mod tests {
             network_location_default_name(Path::new(r"\\server")),
             "server"
         );
+    }
+    #[test]
+    fn network_sidebar_index_skips_shell_only_location_without_shifting_device() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\local")], 0, [0, 1, 2, 3]);
+        app.imported_network_locations = vec![
+            NetworkLocation {
+                id: 1,
+                source: NetworkLocationSource::WindowsImported,
+                display_name: "Path location".into(),
+                sort_order: 0,
+                target: NetworkTarget::WindowsPath(PathBuf::from(r"\\server\share")),
+            },
+            NetworkLocation {
+                id: 2,
+                source: NetworkLocationSource::WindowsImported,
+                display_name: "Shell only".into(),
+                sort_order: 1,
+                target: NetworkTarget::ShellItemId(PathBuf::from("shell:::virtual")),
+            },
+        ];
+        let (request_id, _) = app
+            .network_discovery
+            .entry(app.active_window)
+            .or_default()
+            .begin();
+        app.network_discovery
+            .get_mut(&app.active_window)
+            .unwrap()
+            .append(
+                request_id,
+                [NetworkDeviceTarget {
+                    id: crate::network::network_device_id(Path::new(r"\\LiuYanghomeNAS")),
+                    display_name: "LiuYanghomeNAS".into(),
+                    shell_identity: None,
+                    unc_path: Some(PathBuf::from(r"\\LiuYanghomeNAS")),
+                }],
+            );
+
+        assert_eq!(
+            sidebar_navigation_target(&app, app.sidebar.len() + 2),
+            Some(PathBuf::from(r"\\LiuYanghomeNAS"))
+        );
+    }
+    #[test]
+    fn cached_network_devices_skip_automatic_rediscovery() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\local")], 0, [0, 1, 2, 3]);
+        let window_id = app.active_window;
+        assert!(network_discovery_needed(&app, window_id));
+        app.network_discovery.insert(
+            window_id,
+            DiscoveryCoordinator::with_devices(vec![NetworkDeviceTarget {
+                id: crate::network::network_device_id(Path::new(r"\\LiuYanghomeNAS")),
+                display_name: "LiuYanghomeNAS".into(),
+                shell_identity: None,
+                unc_path: Some(PathBuf::from(r"\\LiuYanghomeNAS")),
+            }]),
+        );
+        assert!(!network_discovery_needed(&app, window_id));
+    }
+
+    #[test]
+    fn outbound_copy_does_not_refresh_source_but_move_does() {
+        use platform::windows::drag_drop::{DropEffect, OutboundDropResult};
+
+        let result = |effect, dropped| OutboundDropResult {
+            effect,
+            dropped,
+            performed_effect_reported: true,
+        };
+        assert!(!should_refresh_outbound_drag_source(result(
+            DropEffect::Copy,
+            true
+        )));
+        assert!(!should_refresh_outbound_drag_source(result(
+            DropEffect::Link,
+            true
+        )));
+        assert!(!should_refresh_outbound_drag_source(result(
+            DropEffect::Move,
+            false
+        )));
+        assert!(should_refresh_outbound_drag_source(result(
+            DropEffect::Move,
+            true
+        )));
     }
     #[test]
     fn directory_events_route_to_non_active_windows_by_global_tab_id() {
@@ -20838,6 +21112,153 @@ mod tests {
         ui.set_view_mode(0);
         update_test_layout(&ui);
         assert_eq!(ui.get_file_viewport_y(), 0.0);
+    }
+
+    #[test]
+    fn short_window_keeps_file_status_bar_above_the_bottom_edge() {
+        use i_slint_backend_testing::ElementRoot;
+
+        let ui = headless_file_view();
+        ui.window()
+            .set_size(slint::LogicalSize::new(1_180.0, 520.0));
+        ui.set_quick_access_expanded(true);
+        ui.set_drives_expanded(true);
+        ui.set_network_locations_expanded(true);
+        ui.set_network_expanded(true);
+        ui.set_sidebar_items(ModelRc::new(VecModel::from(
+            (0..48)
+                .map(|index| SidebarRow {
+                    index,
+                    stable_id: index.to_string().into(),
+                    label: format!("Sidebar {index}").into(),
+                    icon_kind: 0,
+                    group_kind: index % 4,
+                    source_kind: 0,
+                    is_drive: false,
+                    icon: Image::default(),
+                })
+                .collect::<Vec<_>>(),
+        )));
+        update_test_layout(&ui);
+
+        let status = ui
+            .root_element()
+            .query_descendants()
+            .match_id("AppWindow::status-bar")
+            .find_all()
+            .into_iter()
+            .next()
+            .expect("file status bar exists");
+        let position = status.absolute_position();
+        let size = status.size();
+        assert_eq!(size.height, 30.0);
+        assert!(position.y + size.height <= 520.0);
+    }
+
+    #[test]
+    fn overflowing_sidebar_uses_its_own_scroll_view() {
+        use i_slint_backend_testing::ElementRoot;
+
+        let ui = headless_file_view();
+        ui.window()
+            .set_size(slint::LogicalSize::new(1_180.0, 520.0));
+        ui.set_quick_access_expanded(true);
+        ui.set_drives_expanded(true);
+        ui.set_network_locations_expanded(true);
+        ui.set_network_expanded(true);
+        ui.set_sidebar_items(ModelRc::new(VecModel::from(
+            (0..48)
+                .map(|index| SidebarRow {
+                    index,
+                    stable_id: index.to_string().into(),
+                    label: format!("Sidebar {index}").into(),
+                    icon_kind: 0,
+                    group_kind: index % 4,
+                    source_kind: 0,
+                    is_drive: false,
+                    icon: Image::default(),
+                })
+                .collect::<Vec<_>>(),
+        )));
+        update_test_layout(&ui);
+
+        let scroll = ui
+            .root_element()
+            .query_descendants()
+            .match_id("AppWindow::sidebar-scroll")
+            .find_all()
+            .into_iter()
+            .next()
+            .expect("sidebar scroll view exists");
+        let content = ui
+            .root_element()
+            .query_descendants()
+            .match_id("AppWindow::sidebar-content")
+            .find_all()
+            .into_iter()
+            .next()
+            .expect("sidebar content exists");
+        assert!(content.size().height > scroll.size().height);
+    }
+
+    #[test]
+    fn sidebar_wheel_scrolls_sidebar_without_moving_file_list() {
+        use i_slint_backend_testing::ElementRoot;
+
+        let ui = headless_file_view();
+        ui.window()
+            .set_size(slint::LogicalSize::new(1_180.0, 520.0));
+        ui.set_quick_access_expanded(true);
+        ui.set_drives_expanded(true);
+        ui.set_network_locations_expanded(true);
+        ui.set_network_expanded(true);
+        ui.set_sidebar_items(ModelRc::new(VecModel::from(
+            (0..48)
+                .map(|index| SidebarRow {
+                    index,
+                    stable_id: index.to_string().into(),
+                    label: format!("Sidebar {index}").into(),
+                    icon_kind: 0,
+                    group_kind: index % 4,
+                    source_kind: 0,
+                    is_drive: false,
+                    icon: Image::default(),
+                })
+                .collect::<Vec<_>>(),
+        )));
+        ui.set_file_viewport_y(-200.0);
+        update_test_layout(&ui);
+
+        let scroll = ui
+            .root_element()
+            .query_descendants()
+            .match_id("AppWindow::sidebar-scroll")
+            .find_all()
+            .into_iter()
+            .next()
+            .expect("sidebar scroll view exists");
+        scroll.scroll(0.0, -120.0);
+        update_test_layout(&ui);
+
+        assert!(ui.get_sidebar_viewport_y() < 0.0);
+        assert_eq!(ui.get_file_viewport_y(), -200.0);
+    }
+
+    #[test]
+    fn native_wheel_routing_uses_the_complete_file_rectangle() {
+        let bounds = (218.0, 154.0, 934.0, 516.0);
+        assert!(!pointer_targets_file_area(
+            120.0, 300.0, bounds.0, bounds.1, bounds.2, bounds.3
+        ));
+        assert!(!pointer_targets_file_area(
+            500.0, 120.0, bounds.0, bounds.1, bounds.2, bounds.3
+        ));
+        assert!(!pointer_targets_file_area(
+            500.0, 700.0, bounds.0, bounds.1, bounds.2, bounds.3
+        ));
+        assert!(pointer_targets_file_area(
+            500.0, 300.0, bounds.0, bounds.1, bounds.2, bounds.3
+        ));
     }
 
     #[test]
