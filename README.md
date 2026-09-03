@@ -27,13 +27,23 @@ python tools/verify.py
 
 ## 发布
 
-推送与 `Cargo.toml` 版本一致的标签（例如 `v0.0.1`）会自动生成 Windows x64 portable ZIP 和 SHA-256 校验文件。已有标签也可以在本地补发：
+在 `main` 分支且工作区干净时，从本地选择版本级别发布：
+
+```powershell
+./tools/publish.ps1 major    # X.Y.Z -> X+1.0.0
+./tools/publish.ps1 feature  # X.Y.Z -> X.Y+1.0
+./tools/publish.ps1 bugfix   # X.Y.Z -> X.Y.Z+1
+```
+
+加 `-DryRun` 只预览版本号，不修改文件，例如 `./tools/publish.ps1 bugfix -DryRun`。正式运行会验证项目、更新 `Cargo.toml` 与 `Cargo.lock`、创建发布提交和 `v<版本>` 标签，再把 `main` 与标签原子推送到 GitHub。标签推送会自动生成 Windows x64 portable ZIP 和 SHA-256 校验文件。若推送失败，本地提交和标签会保留；不要再次运行发布命令，按脚本输出的 `git push --atomic ...` 命令重试。
+
+已有标签也可以在本地补发：
 
 ```powershell
 gh workflow run release.yml --ref main -f tag=v0.0.1
 ```
 
-本地检查发布包可运行 `./tools/release.ps1 -Tag v0.0.1`，产物写入 `artifacts/release/`。Everything 是可选的外部依赖，不包含在发布包中。
+只需在本地检查发布包时，运行 `./tools/release.ps1 -Tag v0.0.1`，产物写入 `artifacts/release/`。Everything 是可选的外部依赖，不包含在发布包中。
 
 ## 设计原则
 
