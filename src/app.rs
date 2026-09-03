@@ -14596,6 +14596,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
     );
     ui.set_everything_instance(app.everything_config.instance_name.clone().into());
     ui.set_everything_status(app.everything_status.clone().into());
+    ui.set_app_version(env!("CARGO_PKG_VERSION").into());
     ui.set_theme_mode(match app.theme_mode {
         session_store::ThemeMode::System => 0,
         session_store::ThemeMode::Light => 1,
@@ -14823,6 +14824,8 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
         settings_general,
         settings_appearance,
         settings_developer,
+        settings_about,
+        version,
         ui_showcase,
         ui_showcase_detail,
         show_delete_confirmation,
@@ -14888,6 +14891,8 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "常规",
             "外观",
             "开发工具",
+            "关于",
+            "版本",
             "UI 陈列室",
             "直接打开难以触发的窗口和状态；演示操作不会修改文件或任务。",
             "永久删除确认",
@@ -14953,6 +14958,8 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "General",
             "Appearance",
             "Developer tools",
+            "About",
+            "Version",
             "UI showcase",
             "Open hard-to-reach windows and states directly. Demo actions do not change files or tasks.",
             "Delete confirmation",
@@ -15019,6 +15026,8 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_settings_general(settings_general.into());
     ui.set_text_settings_appearance(settings_appearance.into());
     ui.set_text_settings_developer(settings_developer.into());
+    ui.set_text_settings_about(settings_about.into());
+    ui.set_text_version(version.into());
     ui.set_text_ui_showcase(ui_showcase.into());
     ui.set_text_ui_showcase_detail(ui_showcase_detail.into());
     ui.set_text_show_delete_confirmation(show_delete_confirmation.into());

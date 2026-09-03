@@ -1,1 +1,30 @@
-IDI_APP_ICON ICON "asterfiles.ico"
+IDI_APP_ICON ICON ASTERFILES_ICON_PATH
+
+1 VERSIONINFO
+FILEVERSION ASTERFILES_VERSION_COMMAS
+PRODUCTVERSION ASTERFILES_VERSION_COMMAS
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "AsterFiles contributors\0"
+            VALUE "FileDescription", "AsterFiles\0"
+            VALUE "FileVersion", ASTERFILES_VERSION_STRING
+            VALUE "InternalName", "asterfiles\0"
+            VALUE "LegalCopyright", "Copyright (C) AsterFiles contributors\0"
+            VALUE "OriginalFilename", "asterfiles.exe\0"
+            VALUE "ProductName", "AsterFiles\0"
+            VALUE "ProductVersion", ASTERFILES_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

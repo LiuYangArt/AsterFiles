@@ -2,6 +2,8 @@
 
 AsterFiles 是一个面向 Windows 的高性能现代文件管理器原型。视觉体验参考 Files，底层使用 Rust，界面使用 Slint。
 
+当前软件版本由 `Cargo.toml` 统一管理，采用 GNU General Public License v3.0（仅此版本）。
+
 当前版本已完成本地浏览闭环、Everything 搜索与文件夹大小、基础文件操作、剪贴板和经典右键菜单。网络协议、缩略图和拖放暂不包含。
 
 ## 启动
@@ -20,6 +22,16 @@ python tools/verify.py
 ```
 
 日常验证生成 `target/debug/asterfiles.exe`。只有需要正式 Release 时运行 `python tools/verify.py --release`。
+
+## 发布
+
+推送与 `Cargo.toml` 版本一致的标签（例如 `v0.0.1`）会自动生成 Windows x64 portable ZIP 和 SHA-256 校验文件。已有标签也可以在本地补发：
+
+```powershell
+gh workflow run release.yml --ref main -f tag=v0.0.1
+```
+
+本地检查发布包可运行 `./tools/release.ps1 -Tag v0.0.1`，产物写入 `artifacts/release/`。Everything 是可选的外部依赖，不包含在发布包中。
 
 ## 设计原则
 

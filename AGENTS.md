@@ -11,6 +11,8 @@ python tools/verify.py
 
 日常启动使用 `cargo run`，统一验证覆盖格式、静态检查、测试、无界面 Agent 场景和 Debug 构建。机器可读汇总位于 `artifacts/verify/summary.json`；详细规则和确定性 UI 场景见 `docs/agent/debug-validation.md`。Debug 构建产物位于 `target/debug/`；只有用户明确要求正式构建时才运行 `python tools/verify.py --release` 或 `cargo build --release`。UI 截图写入 `artifacts/ui/`，日志写入 `artifacts/logs/`，状态导出写入 `artifacts/state/`，性能 artifacts 写入 `artifacts/perf/`。
 
+发布包使用 `./tools/release.ps1 -Tag v<版本>` 在本地生成，输出位于 `artifacts/release/`；GitHub Release 由 `.github/workflows/release.yml` 在推送版本标签或手动触发时创建。版本唯一来源是 `Cargo.toml`。
+
 ## UI 操作与验证
 
 - 禁止 Codex 操作、自动化或尝试控制 AsterFiles 的 UI，包括通过内置浏览器、Chrome、Computer Use、Playwright、agent-browser、截图点击或键鼠模拟等方式。
@@ -39,6 +41,7 @@ python tools/verify.py
 - 提交、方案文档和验证证据使用 `#编号` 关联 Issue；验证结果、artifact 路径和剩余风险回写 Issue。范围外问题另建 Issue，不扩大当前任务。
 - 设计文档只维护仍有效的架构与产品边界；任务完成后更新受影响的设计文档，不维护第二份勾选状态。
 - 涉及路径、后台加载、多标签页、本地化或网络边界时，同时遵守并更新 `docs/foundation-plan.md`。
+- 除非用户显式要求，否则不新建 worktree/分支。在主线完成工作。
 
 ## 架构红线
 

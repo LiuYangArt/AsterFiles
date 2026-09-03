@@ -1,8 +1,8 @@
 [package]
 name = "asterfiles"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
-license = "MIT"
+license = "GPL-3.0-only"
 description = "A fast, modern Windows file manager built with Rust and Slint"
 build = "build.rs"
 

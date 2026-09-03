@@ -762,6 +762,9 @@ export component AppWindow inherits Window {
     in property <string> text-settings-general: "常规";
     in property <string> text-settings-appearance: "外观";
     in property <string> text-settings-developer: "开发工具";
+    in property <string> text-settings-about: "关于";
+    in property <string> text-version: "版本";
+    in property <string> app-version: "";
     in property <string> text-everything: "Everything";
     in property <string> text-everything-path: "程序路径";
     in property <string> text-everything-instance: "实例";
@@ -1053,6 +1056,13 @@ export component AppWindow inherits Window {
             : root.columns[2].kind == kind ? root.columns[2].label
             : root.columns[3].kind == kind ? root.columns[3].label
             : root.columns[4].label;
+    }
+    function settings-title(section: int) -> string {
+        if section == 0 { return root.text-settings-general; }
+        if section == 1 { return root.text-settings-appearance; }
+        if section == 2 { return root.text-everything; }
+        if section == 3 { return root.text-settings-developer; }
+        return root.text-settings-about;
     }
     function column-slot-x(slot: int) -> length {
         return slot <= 0 ? 0px
@@ -1890,8 +1900,8 @@ accessible-label: entry.name;
                     VerticalLayout {
                         padding-left: 12px; padding-right: 12px; padding-top: 18px; padding-bottom: 18px; spacing: 6px;
                         Text { text: root.text-settings-title; color: VisualStyle.c30333a; font-size: 22px; font-weight: 600; height: 42px; }
-                        for section[index] in [root.text-settings-general, root.text-settings-appearance, root.text-everything, root.text-settings-developer]: Rectangle {
-                            visible: index < 3 || root.debug-tools-enabled;
+                        for section[index] in [root.text-settings-general, root.text-settings-appearance, root.text-everything, root.text-settings-developer, root.text-settings-about]: Rectangle {
+                            visible: index != 3 || root.debug-tools-enabled;
                             height: 42px; border-radius: 6px;
                             background: root.settings-section == index ? VisualStyle.cdce6ff : (settings-nav-touch.has-hover ? VisualStyle.cedf1f6 : transparent);
                             Rectangle { visible: root.settings-section == index; x: 0px; y: 9px; width: 3px; height: 24px; border-radius: 2px; background: VisualStyle.c4f6bed; }
@@ -1917,7 +1927,7 @@ accessible-label: entry.name;
                             width: settings-scroll.width;
                             height: settings-scroll.viewport-height;
                             spacing: 16px;
-                            Text { text: root.settings-section == 0 ? root.text-settings-general : root.settings-section == 1 ? root.text-settings-appearance : root.text-settings-developer; color: VisualStyle.c30333a; font-size: 22px; font-weight: 600; height: 44px; }
+                            Text { text: root.settings-title(root.settings-section); color: VisualStyle.c30333a; font-size: 22px; font-weight: 600; height: 44px; }
                             if root.settings-section == 0: Rectangle {
                                 height: 202px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
                                 VerticalLayout {
@@ -1999,6 +2009,15 @@ accessible-label: entry.name;
                                             Text { text: root.window-trace-status; color: root.window-trace-active ? VisualStyle.c4f6bed : VisualStyle.c62656f; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
                                         }
                                     }
+                                }
+                            }
+                            if root.settings-section == 4: Rectangle {
+                                height: 144px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                VerticalLayout {
+                                    padding-left: 20px; padding-right: 20px; padding-top: 20px; padding-bottom: 20px; spacing: 10px;
+                                    Text { text: "AsterFiles"; color: VisualStyle.c30333a; font-size: 20px; font-weight: 600; }
+                                    Text { text: root.text-version + " " + root.app-version; color: VisualStyle.c62656f; font-size: 14px; }
+                                    Text { text: "GNU General Public License v3.0"; color: VisualStyle.c62656f; font-size: 12px; }
                                 }
                             }
                             Rectangle { height: 16px; }
