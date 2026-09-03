@@ -129,6 +129,10 @@ def main() -> int:
             "cargo", "run", "--", "--agent-scenario", "folder-size-scheduler",
             "--no-ui", "--agent-state-out", str(STATE_DIR / "folder-size" / "scheduler.json"),
         ]),
+        ("agent-network-foundation", [
+            "cargo", "run", "--", "--agent-scenario", "network-foundation",
+            "--no-ui", "--agent-state-out", str(STATE_DIR / "network" / "foundation.json"),
+        ]),
         ("release", ["cargo", "build", "--release"])
         if release_requested
         else ("debug", ["cargo", "build"]),

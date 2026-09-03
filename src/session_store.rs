@@ -12,14 +12,16 @@ use crate::{
         ViewMode,
     },
     i18n::Language,
+    network::{NetworkLocation, NetworkLocationSource, NetworkTarget},
 };
 
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-const MAGIC: &[u8; 5] = b"ASTF9";
+const MAGIC: &[u8; 6] = b"ASTF10";
 const MAX_TABS: usize = 1_024;
 const MAX_WINDOWS: usize = 128;
+const MAX_NETWORK_LOCATIONS: usize = 1_024;
 const MAX_PATH_UNITS: usize = 32_767;
 const MIN_WINDOW_WIDTH: u32 = 820;
 const MIN_WINDOW_HEIGHT: u32 = 520;
@@ -71,6 +73,7 @@ pub struct SessionState {
     pub language: Language,
     pub everything: EverythingConfig,
     pub file_visibility: FileVisibility,
+    pub network_locations: Vec<NetworkLocation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,6 +103,7 @@ impl SessionState {
             Language::Chinese,
             EverythingConfig::default(),
             FileVisibility::default(),
+            Vec::new(),
         )
     }
 
@@ -113,6 +117,7 @@ impl SessionState {
         language: Language,
         everything: EverythingConfig,
         file_visibility: FileVisibility,
+        network_locations: Vec<NetworkLocation>,
     ) -> io::Result<Self> {
         if windows.is_empty() || windows.len() > MAX_WINDOWS {
             return Err(invalid_data("invalid session window count"));
@@ -135,6 +140,7 @@ impl SessionState {
         validate_search_preference(search_view)?;
         validate_directory_views(&directory_views)?;
         validate_everything_config(&everything)?;
+        validate_network_locations(&network_locations)?;
         Ok(Self {
             windows,
             default_directory_view,
@@ -144,6 +150,7 @@ impl SessionState {
             language,
             everything,
             file_visibility,
+            network_locations,
         })
     }
 }
@@ -176,6 +183,7 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
         state.language,
         state.everything.clone(),
         state.file_visibility,
+        state.network_locations.clone(),
     )?;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(MAGIC);
@@ -195,6 +203,16 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
     bytes.push(u8::from(state.everything.allow_launch));
     bytes.push(u8::from(state.file_visibility.show_hidden));
     bytes.push(u8::from(state.file_visibility.show_system));
+    bytes.extend_from_slice(&(state.network_locations.len() as u32).to_le_bytes());
+    for location in &state.network_locations {
+        bytes.extend_from_slice(&location.id.to_le_bytes());
+        write_string(&mut bytes, &location.display_name)?;
+        bytes.extend_from_slice(&location.sort_order.to_le_bytes());
+        let NetworkTarget::WindowsPath(path) = &location.target else {
+            return Err(invalid_data("network location target cannot be persisted"));
+        };
+        write_os(&mut bytes, path.as_os_str())?;
+    }
 
     for window in &state.windows {
         bytes.extend_from_slice(&window.placement.x.to_le_bytes());
@@ -246,6 +264,20 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
         show_hidden: read_bool(bytes, &mut offset, "invalid hidden-file setting")?,
         show_system: read_bool(bytes, &mut offset, "invalid system-file setting")?,
     };
+    let network_location_count = read_u32(bytes, &mut offset)? as usize;
+    if network_location_count > MAX_NETWORK_LOCATIONS {
+        return Err(invalid_data("too many network locations"));
+    }
+    let mut network_locations = Vec::with_capacity(network_location_count);
+    for _ in 0..network_location_count {
+        network_locations.push(NetworkLocation {
+            id: read_u64(bytes, &mut offset)?,
+            source: NetworkLocationSource::AsterOwned,
+            display_name: read_string(bytes, &mut offset)?,
+            sort_order: read_u32(bytes, &mut offset)?,
+            target: NetworkTarget::WindowsPath(PathBuf::from(read_os(bytes, &mut offset)?)),
+        });
+    }
 
     let mut windows = Vec::with_capacity(window_count);
     for _ in 0..window_count {
@@ -282,7 +314,37 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
         language,
         everything,
         file_visibility,
+        network_locations,
     )
+}
+
+fn validate_network_locations(values: &[NetworkLocation]) -> io::Result<()> {
+    if values.len() > MAX_NETWORK_LOCATIONS {
+        return Err(invalid_data("too many network locations"));
+    }
+    let mut ids = HashSet::with_capacity(values.len());
+    for location in values {
+        if location.source != NetworkLocationSource::AsterOwned {
+            return Err(invalid_data(
+                "imported network location cannot be persisted",
+            ));
+        }
+        let NetworkTarget::WindowsPath(path) = &location.target else {
+            return Err(invalid_data("network location target cannot be persisted"));
+        };
+        if !ids.insert(location.id) {
+            return Err(invalid_data("duplicate network location id"));
+        }
+
+        if location.display_name.trim().is_empty() {
+            return Err(invalid_data("network location name cannot be empty"));
+        }
+        if location.display_name.encode_utf16().count() > MAX_PATH_UNITS {
+            return Err(invalid_data("network location name is too long"));
+        }
+        validate_path(path)?;
+    }
+    Ok(())
 }
 
 fn validate_directory_views(values: &[(PathBuf, DirectoryViewPreference)]) -> io::Result<()> {
@@ -550,6 +612,9 @@ fn read_u32(bytes: &[u8], offset: &mut usize) -> io::Result<u32> {
     read_array::<4>(bytes, offset).map(u32::from_le_bytes)
 }
 
+fn read_u64(bytes: &[u8], offset: &mut usize) -> io::Result<u64> {
+    read_array::<8>(bytes, offset).map(u64::from_le_bytes)
+}
 fn read_array<const N: usize>(bytes: &[u8], offset: &mut usize) -> io::Result<[u8; N]> {
     let end = offset
         .checked_add(N)
@@ -632,25 +697,71 @@ mod tests {
                 show_hidden: true,
                 show_system: false,
             },
+            vec![NetworkLocation {
+                id: 7,
+                source: NetworkLocationSource::AsterOwned,
+                display_name: "家庭 NAS".to_owned(),
+                sort_order: 0,
+                target: NetworkTarget::WindowsPath(PathBuf::from(r"\\NAS\媒体")),
+            }],
         )
         .unwrap()
     }
 
     #[test]
-    fn astf9_round_trip_preserves_view_preferences_and_raw_paths() {
+    fn astf10_round_trip_preserves_network_locations_and_raw_paths() {
         let state = sample_state();
         assert_eq!(decode(&encode(&state).unwrap()).unwrap(), state);
     }
 
     #[test]
     fn rejects_old_formats() {
-        for version in 1..=8 {
+        for version in 1..=9 {
             let bytes = format!("ASTF{version}\0\0\0\0");
             assert_eq!(
                 decode(bytes.as_bytes()).unwrap_err().kind(),
                 io::ErrorKind::InvalidData
             );
         }
+    }
+
+    #[test]
+    fn rejects_non_owned_and_non_path_network_locations() {
+        let mut imported = sample_state();
+        imported.network_locations[0].source = NetworkLocationSource::WindowsImported;
+        assert_eq!(
+            encode(&imported).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut shell_item = sample_state();
+        shell_item.network_locations[0].target =
+            NetworkTarget::ShellItemId(PathBuf::from("shell:::{network-location}"));
+        assert_eq!(
+            encode(&shell_item).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn rejects_empty_network_location_name() {
+        let mut state = sample_state();
+        state.network_locations[0].display_name = "  ".to_owned();
+        assert_eq!(
+            encode(&state).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+    #[test]
+    fn rejects_duplicate_network_location_identity() {
+        let mut state = sample_state();
+        let mut second = state.network_locations[0].clone();
+        second.sort_order = 1;
+        state.network_locations.push(second);
+        assert_eq!(
+            encode(&state).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]

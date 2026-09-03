@@ -1,7 +1,7 @@
 # 网络位置、Windows 设备列表与 SMB 实施方案
 
 > 日期：2026-09-01
-> 状态：方案已确认，等待实施
+> 状态：实施中；目录浏览与认证底座已落地，完整验收尚未完成
 > 对应 Issue：[GitHub Issue #10](https://github.com/LiuYangArt/AsterFiles/issues/10)
 
 ## 1. 目标

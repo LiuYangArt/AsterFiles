@@ -33,6 +33,7 @@ use windows::{
 use windows_sys::Win32::Foundation::GlobalFree;
 
 const CF_HDROP: u16 = 15;
+const CF_UNICODETEXT: u16 = 13;
 const DROPEFFECT_COPY: u32 = 1;
 const DROPEFFECT_MOVE: u32 = 2;
 const CLIPBOARD_RETRIES: usize = 8;
@@ -76,6 +77,26 @@ pub fn write_file_list(paths: &[PathBuf], operation: ClipboardOperation) -> io::
         OleSetClipboard(&data_object)?;
         OleFlushClipboard()
     })
+}
+
+pub fn write_text(value: &std::ffi::OsStr) -> io::Result<()> {
+    let _ole = OleApartment::initialize()?;
+    let bytes = encode_unicode_text(value);
+    let data_object = IDataObject::from(ClipboardDataObject {
+        formats: vec![(CF_UNICODETEXT, bytes)],
+    });
+    retry_clipboard(|| unsafe {
+        OleSetClipboard(&data_object)?;
+        OleFlushClipboard()
+    })
+}
+
+fn encode_unicode_text(value: &std::ffi::OsStr) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for unit in value.encode_wide().chain(std::iter::once(0)) {
+        bytes.extend_from_slice(&unit.to_ne_bytes());
+    }
+    bytes
 }
 
 pub fn read_file_list() -> io::Result<Option<ClipboardFileList>> {
@@ -401,5 +422,13 @@ mod tests {
         assert!(supports_format(&format_etc(CF_HDROP), CF_HDROP));
         assert!(supports_format(&format_etc(effect_format), effect_format));
         assert!(!supports_format(&format_etc(99), CF_HDROP));
+    }
+
+    #[test]
+    fn unicode_text_uses_utf16_and_terminal_nul() {
+        let bytes = encode_unicode_text(std::ffi::OsStr::new(r"\\服务器\共享"));
+        assert!(bytes.ends_with(&[0, 0]));
+        assert_eq!(bytes.len() % 2, 0);
+        assert!(supports_format(&format_etc(CF_UNICODETEXT), CF_UNICODETEXT));
     }
 }

@@ -66,8 +66,8 @@ mod windows_impl {
 
     use windows_sys::{
         Win32::{
-            Storage::FileSystem::{GetLogicalDrives, GetVolumeInformationW},
-            System::Com::CoTaskMemFree,
+            Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW},
+            System::{Com::CoTaskMemFree, WindowsProgramming::DRIVE_REMOTE},
             UI::{
                 Shell::{FOLDERID_Profile, SHGetKnownFolderPath, ShellExecuteW},
                 WindowsAndMessaging::SW_SHOWNORMAL,
@@ -243,6 +243,11 @@ mod windows_impl {
                 } else {
                     format!("{volume} ({letter}:)")
                 };
+                let path = if drive_is_remote(&path) {
+                    super::windows::network::network_drive_to_unc(&path).unwrap_or(path)
+                } else {
+                    path
+                };
                 KnownLocation {
                     kind: KnownLocationKind::Drive,
                     label,
@@ -251,6 +256,14 @@ mod windows_impl {
             })
     }
 
+    fn drive_is_remote(path: &Path) -> bool {
+        let root = path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_REMOTE }
+    }
     fn volume_label(path: &Path) -> String {
         let root = path
             .as_os_str()
@@ -282,6 +295,12 @@ mod windows_impl {
 
     pub fn open_path(path: &Path) -> std::io::Result<()> {
         shell_execute(path, None)
+    }
+    pub fn open_windows_credentials() -> std::io::Result<()> {
+        shell_execute(
+            Path::new("control.exe"),
+            Some(std::ffi::OsStr::new("/name Microsoft.CredentialManager")),
+        )
     }
     pub fn open_url(url: &str) -> std::io::Result<()> {
         shell_execute(Path::new(url), None)
@@ -391,7 +410,7 @@ mod windows_impl {
 #[cfg(windows)]
 pub use windows_impl::{
     double_click_interval, explorer_pinned_locations, known_locations, open_path, open_url,
-    request_folder_access, resolve_shortcut_target,
+    open_windows_credentials, request_folder_access, resolve_shortcut_target,
 };
 
 #[cfg(not(windows))]
@@ -422,6 +441,13 @@ pub fn open_path(path: &Path) -> std::io::Result<()> {
         .arg(path)
         .spawn()
         .map(|_| ())
+}
+#[cfg(not(windows))]
+pub fn open_windows_credentials() -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Windows Credential Manager is unavailable",
+    ))
 }
 #[cfg(not(windows))]
 pub fn open_url(url: &str) -> std::io::Result<()> {

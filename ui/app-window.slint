@@ -1,4 +1,4 @@
-import { CheckBox, ListView } from "std-widgets.slint";
+import { CheckBox, LineEdit, ListView } from "std-widgets.slint";
 import { IconMap } from "icons/icon-map.slint";
 export { PopupCommandRow, QuickMenuWindow, QuickSubmenuWindow } from "quick-menu.slint";
 
@@ -8,7 +8,7 @@ export struct GridRow { group-header: bool, group-label: string, group-count: in
 export struct HistoryRow { index: int, label: string }
 export struct BreadcrumbRow { index: int, label: string, current: bool }
 export struct TabRow { id: int, title: string, active: bool, loading: bool, icon: image, is-drive: bool, is-settings: bool }
-export struct SidebarRow { index: int, label: string, icon-kind: int, is-drive: bool, icon: image }
+export struct SidebarRow { index: int, stable-id: string, label: string, icon-kind: int, group-kind: int, source-kind: int, is-drive: bool, icon: image }
 export struct ColumnRow { kind: int, label: string, visible: bool, min-width: length, content-left: length, content-right: length, icon-slot: length }
 export struct ContextCommandRow { id: int, node-id: int, label: string, search-text: string, hint: string, enabled: bool, separator: bool, shell: bool, checked: bool, default: bool, submenu: bool, loading: bool, placeholder: bool, icon-kind: int }
 export struct OperationRow { id: int, title: string, percent: string, file-progress: string, transferred: string, speed: string, eta: string, current-item: string, source: string, destination: string, progress: float, state: int, paused: bool, can-pause: bool, can-cancel: bool, can-retry: bool }
@@ -264,6 +264,120 @@ export component ConfirmationWindow inherits Window {
                     if root.kind == 1: StandaloneActionButton { width: 96px; label: root.secondary-text; clicked => { root.secondary-action(); } }
                     if root.kind == 2: StandaloneActionButton { width: 120px; label: root.secondary-text; clicked => { root.secondary-action(); } }
                     StandaloneActionButton { width: root.kind == 2 ? 150px : 96px; label: root.primary-text; dangerous: root.kind == 0; clicked => { root.primary-action(); } }
+                }
+            }
+        }
+    }
+}
+
+export component NetworkLoginWindow inherits Window {
+    title: root.title-text;
+    icon: @image-url("../assets/app-icon.png");
+    no-frame: true;
+    resize-border-width: 0px;
+    preferred-width: 520px;
+    preferred-height: root.conflict ? 390px : 340px;
+    min-width: 520px;
+    max-width: 520px;
+    min-height: root.conflict ? 390px : 340px;
+    max-height: root.conflict ? 390px : 340px;
+    background: VisualStyle.cffffff;
+    default-font-family: "Segoe UI";
+
+    in property <bool> dark-theme: false;
+    in property <bool> busy: false;
+    in property <bool> conflict: false;
+    in property <string> title-text: "登录网络位置";
+    in property <string> detail-text: "输入此网络位置使用的 Windows 凭据。";
+    in property <string> target-text: "";
+    in property <string> user-label: "用户名";
+    in property <string> password-label: "密码";
+    in property <string> remember-label: "记住凭据（由 Windows 管理）";
+    in property <string> conflict-text: "Windows 已使用另一账号连接此服务器。断开会影响 Explorer 和其他软件。";
+    in property <string> cancel-text: "取消";
+    in property <string> login-text: "登录";
+    in property <string> reconnect-text: "断开并重新登录";
+    in property <string> close-text: "关闭";
+    in-out property <string> username: "";
+    in-out property <string> password: "";
+    in-out property <bool> remember: false;
+    callback login(string, string, bool, bool);
+    callback safe-cancel();
+    callback drag-window();
+
+    changed dark-theme => { VisualStyle.dark-theme = root.dark-theme; }
+
+    VerticalLayout {
+        StandaloneTitleBar { title: root.title-text; close-label: root.close-text; close-requested => { root.safe-cancel(); } drag-window => { root.drag-window(); } }
+        Rectangle {
+            vertical-stretch: 1;
+            background: VisualStyle.cffffff;
+            VerticalLayout {
+                padding-left: 20px; padding-right: 20px; padding-top: 12px; padding-bottom: 20px; spacing: 8px;
+                Text { text: root.detail-text; color: VisualStyle.c62656f; font-size: 13px; wrap: word-wrap; }
+                Text { text: root.target-text; color: VisualStyle.c30333a; font-size: 12px; overflow: elide; }
+                Text { text: root.user-label; color: VisualStyle.c62656f; font-size: 12px; }
+                LineEdit { text <=> root.username; enabled: !root.busy; }
+                Text { text: root.password-label; color: VisualStyle.c62656f; font-size: 12px; }
+                Rectangle {
+                    height: 34px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cffffff;
+                    TextInput { x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.password; single-line: true; input-type: InputType.password; enabled: !root.busy; accepted => { if (root.username != "" && root.password != "") { root.login(root.username, root.password, root.remember, root.conflict); } } }
+                }
+                CheckBox { text: root.remember-label; checked <=> root.remember; enabled: !root.busy; }
+                if root.conflict: Text { text: root.conflict-text; color: VisualStyle.cc42b1c; font-size: 12px; wrap: word-wrap; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    alignment: end; spacing: 8px;
+                    StandaloneActionButton { width: 96px; label: root.cancel-text; enabled: !root.busy; clicked => { root.safe-cancel(); } }
+                    StandaloneActionButton { width: root.conflict ? 170px : 96px; label: root.conflict ? root.reconnect-text : root.login-text; enabled: !root.busy && root.username != "" && root.password != ""; dangerous: root.conflict; clicked => { root.login(root.username, root.password, root.remember, root.conflict); } }
+                }
+            }
+        }
+    }
+}
+
+export component NetworkLocationRenameWindow inherits Window {
+    title: root.title-text;
+    icon: @image-url("../assets/app-icon.png");
+    no-frame: true;
+    resize-border-width: 0px;
+    preferred-width: 460px;
+    preferred-height: 210px;
+    min-width: 460px;
+    max-width: 460px;
+    min-height: 210px;
+    max-height: 210px;
+    background: VisualStyle.cffffff;
+    default-font-family: "Segoe UI";
+
+    in property <bool> dark-theme: false;
+    in property <string> location-id: "";
+    in property <string> title-text: "重命名网络位置";
+    in property <string> detail-text: "输入新的显示名称。";
+    in property <string> cancel-text: "取消";
+    in property <string> save-text: "保存";
+    in property <string> close-text: "关闭";
+    in-out property <string> name: "";
+    callback save(string);
+    callback safe-cancel();
+    callback drag-window();
+
+    changed dark-theme => { VisualStyle.dark-theme = root.dark-theme; }
+
+    VerticalLayout {
+        StandaloneTitleBar { title: root.title-text; close-label: root.close-text; close-requested => { root.safe-cancel(); } drag-window => { root.drag-window(); } }
+        Rectangle {
+            vertical-stretch: 1;
+            background: VisualStyle.cffffff;
+            VerticalLayout {
+                padding-left: 20px; padding-right: 20px; padding-top: 12px; padding-bottom: 20px; spacing: 10px;
+                Text { text: root.detail-text; color: VisualStyle.c62656f; font-size: 13px; }
+                LineEdit { text <=> root.name; accepted => { if (root.name != "") { root.save(root.name); } } }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    alignment: end; spacing: 8px;
+                    StandaloneActionButton { width: 96px; label: root.cancel-text; clicked => { root.safe-cancel(); } }
+                    StandaloneActionButton { width: 96px; label: root.save-text; enabled: root.name != ""; clicked => { root.save(root.name); } }
                 }
             }
         }
@@ -734,6 +848,11 @@ export component AppWindow inherits Window {
     in property <bool> context-menu-has-entry: false;
     in-out property <bool> quick-access-expanded: true;
     in-out property <bool> drives-expanded: true;
+    in-out property <bool> network-locations-expanded: true;
+    in-out property <bool> network-expanded: false;
+    in property <bool> network-discovery-loading: false;
+    in property <bool> network-discovery-empty: false;
+    in property <string> network-discovery-error: "";
     in property <bool> can-navigate-back: false;
     in property <bool> can-navigate-forward: false;
     in property <bool> can-navigate-up: false;
@@ -820,6 +939,11 @@ export component AppWindow inherits Window {
     in property <string> text-videos: "视频";
     in property <string> text-quick-access: "快速访问";
     in property <string> text-drives: "磁盘";
+    in property <string> text-network-locations: "网络位置";
+    in property <string> text-network: "网络";
+    in property <string> text-network-discovery-loading: "正在发现网络设备…";
+    in property <string> text-network-discovery-empty: "未发现网络设备";
+    in property <string> text-network-discovery-error: "网络设备发现失败";
     in property <string> text-name: "名称";
     in property <string> text-type: "类型";
     in property <string> text-parent-path: "父目录";
@@ -846,6 +970,10 @@ export component AppWindow inherits Window {
     callback request-folder-access();
 
     callback navigate-sidebar(int);
+    callback navigate-network-location(string);
+    callback show-network-location-menu(string, float, float);
+    callback toggle-network();
+    callback refresh-network();
     callback navigate-breadcrumb(int);
     callback select-entry(int, bool, bool);
     callback clear-selection();
@@ -1299,7 +1427,7 @@ export component AppWindow inherits Window {
                     padding-top: 4px; padding-bottom: 12px; padding-left: 10px; padding-right: 10px; spacing: 0px;
                     SidebarGroupHeader { label: root.text-quick-access; expanded: root.quick-access-expanded; toggled => { root.quick-access-expanded = !root.quick-access-expanded; } }
                     for location in root.sidebar-items: Rectangle {
-                        visible: !location.is-drive && root.quick-access-expanded;
+                        visible: location.group-kind == 0 && root.quick-access-expanded;
                         height: self.visible ? 34px : 0px; border-radius: 5px; background: side-touch.pressed ? VisualStyle.cdde3ed : side-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
                         HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : (location.icon-kind == 0 ? IconMap.location-home : location.icon-kind == 1 ? IconMap.location-desktop : location.icon-kind == 2 ? IconMap.location-downloads : location.icon-kind == 3 ? IconMap.location-documents : location.icon-kind == 4 ? IconMap.location-pictures : location.icon-kind == 5 ? IconMap.location-music : IconMap.location-videos); } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         side-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-sidebar(location.index); } }
@@ -1307,10 +1435,42 @@ export component AppWindow inherits Window {
                     }
                     SidebarGroupHeader { label: root.text-drives; expanded: root.drives-expanded; toggled => { root.drives-expanded = !root.drives-expanded; } }
                     for location in root.sidebar-items: Rectangle {
-                        visible: location.is-drive && root.drives-expanded;
+                        visible: location.group-kind == 1 && root.drives-expanded;
                         height: self.visible ? 34px : 0px; border-radius: 5px; background: drive-touch.pressed ? VisualStyle.cdde3ed : drive-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
                         HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.location-drive; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         drive-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-sidebar(location.index); } }
+                        accessible-role: button; accessible-label: location.label;
+                    }
+                    SidebarGroupHeader { label: root.text-network-locations; expanded: root.network-locations-expanded; toggled => { root.network-locations-expanded = !root.network-locations-expanded; } }
+                    for location in root.sidebar-items: Rectangle {
+                        visible: location.group-kind == 2 && root.network-locations-expanded;
+                        height: self.visible ? 34px : 0px; border-radius: 5px; background: network-location-touch.pressed ? VisualStyle.cdde3ed : network-location-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
+                        HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.location-drive; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
+                        network-location-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.navigate-network-location(location.stable-id); }
+                            pointer-event(event) => {
+                                if event.button == PointerEventButton.right && event.kind == PointerEventKind.up {
+                                    root.show-network-location-menu(location.stable-id, self.mouse-x / 1px, self.mouse-y / 1px);
+                                }
+                            }
+                        }
+                        accessible-role: button; accessible-label: location.label;
+                    }
+                    SidebarGroupHeader { label: root.text-network; expanded: root.network-expanded; toggled => { root.network-expanded = !root.network-expanded; root.toggle-network(); } }
+                    if root.network-expanded: Rectangle {
+                        height: root.network-discovery-loading || root.network-discovery-empty || root.network-discovery-error != "" ? 28px : 0px;
+                        status-text := Text { x: 8px; width: parent.width - 16px; text: root.network-discovery-error != "" ? root.network-discovery-error : root.network-discovery-loading ? root.text-network-discovery-loading : root.network-discovery-empty ? root.text-network-discovery-empty : ""; color: VisualStyle.c777a84; font-size: 11px; vertical-alignment: center; overflow: elide; }
+                        status-touch := TouchArea { enabled: !root.network-discovery-loading; mouse-cursor: self.enabled ? pointer : default; clicked => { root.refresh-network(); } }
+                        accessible-role: button;
+                        accessible-label: root.text-refresh + " " + root.text-network + ": " + status-text.text;
+                        accessible-enabled: !root.network-discovery-loading;
+                    }
+                    for location in root.sidebar-items: Rectangle {
+                        visible: location.group-kind == 3 && root.network-expanded;
+                        height: self.visible ? 34px : 0px; border-radius: 5px; background: network-touch.pressed ? VisualStyle.cdde3ed : network-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
+                        HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.location-drive; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
+                        network-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-sidebar(location.index); } }
                         accessible-role: button; accessible-label: location.label;
                     }
                     Rectangle { vertical-stretch: 1; }

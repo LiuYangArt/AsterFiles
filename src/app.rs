@@ -26,7 +26,7 @@ use crate::{
         TabId, TabKind, TabSession, ViewMode,
         file_operations::{
             FileOperationKind, ItemState, OperationId, OperationItem, OperationManager,
-            OperationResult, OperationState,
+            OperationResource, OperationResult, OperationState,
         },
         folder_size_scheduler::{FOLDER_SIZE_QUEUE_CAPACITY, FolderSizeCommit, FolderSizeQuery},
     },
@@ -35,6 +35,11 @@ use crate::{
         self, GroupProjectionContext, IconProjection, IconVisualRow, ListProjection, ListVisualRow,
     },
     i18n::{Language, Texts},
+    network::{
+        DiscoveryCoordinator, DiscoveryRequestId, DiscoveryState, NetworkDeviceTarget,
+        NetworkExecutionKey, NetworkLocation, NetworkLocationCatalog, NetworkLocationSource,
+        NetworkTarget,
+    },
     platform::{self, KnownLocation, KnownLocationKind},
     session_store,
 };
@@ -42,12 +47,98 @@ use crate::{
 slint::include_modules!();
 
 const WORKER_COUNT: usize = 4;
+const NETWORK_WORKER_COUNT: usize = 2;
 const ICON_WORKER_COUNT: usize = 2;
 const DIRECTORY_EVENT_INTERVAL: Duration = Duration::from_millis(16);
 const REBUILT_PROJECTION_BATCH_SIZE: usize = 256;
 const THUMBNAIL_CACHE_CAPACITY: usize = 128;
 const LARGE_ICON_CACHE_CAPACITY: usize = 128;
 
+pub fn export_network_foundation_state(path: &Path) -> io::Result<()> {
+    use crate::network::{
+        DiscoveryCoordinator, NetworkDeviceTarget, NetworkLocation, NetworkLocationSource,
+        NetworkTarget,
+    };
+    use std::sync::atomic::Ordering;
+
+    let imported = NetworkLocation {
+        id: 10,
+        source: NetworkLocationSource::WindowsImported,
+        display_name: "Windows Share".to_owned(),
+        sort_order: 0,
+        target: NetworkTarget::WindowsPath(PathBuf::from(r"\\服务器\导入")),
+    };
+    let mut catalog = NetworkLocationCatalog::new(Vec::new());
+    let owned_id = catalog
+        .add_unc(PathBuf::from(r"\\服务器\自有"), "Aster Share")
+        .expect("fixture UNC is valid");
+    catalog
+        .rename(owned_id, "Aster Share Renamed")
+        .expect("owned location can be renamed");
+    catalog
+        .move_to(owned_id, 0)
+        .expect("owned location can be moved");
+    let owned = catalog.locations()[0].clone();
+    let mut removable = catalog.clone();
+    let owned_location_removable = removable.remove(owned_id).is_ok();
+    let mut coordinator = DiscoveryCoordinator::new();
+    let (stale, stale_cancel) = coordinator.begin();
+    let (current, _) = coordinator.begin();
+    let stale_rejected = !coordinator.append(stale, Vec::<NetworkDeviceTarget>::new());
+    let current_accepted = coordinator.append(
+        current,
+        [NetworkDeviceTarget {
+            id: crate::network::network_device_id(Path::new(r"\\服务器")),
+            display_name: "服务器".to_owned(),
+            shell_identity: None,
+            unc_path: Some(PathBuf::from(r"\\服务器")),
+        }],
+    ) && coordinator.finish(current);
+    let state = format!(
+        concat!(
+            "{{\n",
+            "  \"schema_version\": 3,\n",
+            "  \"scenario\": \"network-foundation\",\n",
+            "  \"scope\": \"pure_model_no_network_io_no_ui\",\n",
+            "  \"location_sources_separate\": {},\n",
+            "  \"windows_import_not_owned\": {},\n",
+            "  \"owned_location_persistable\": {},\n",
+            "  \"owned_location_crud\": {},\n",
+            "  \"unc_identity_preserved\": {},\n",
+            "  \"discovery_is_window_scoped\": true,\n",
+            "  \"stale_result_rejected\": {},\n",
+            "  \"previous_request_cancelled\": {},\n",
+            "  \"current_result_accepted\": {},\n",
+            "  \"device_results_persisted\": false,\n",
+            "  \"local_and_network_directory_queues_separate\": true,\n",
+            "  \"network_directory_queue_bounded\": true,\n",
+            "  \"network_refresh_routed_separately\": true,\n",
+            "  \"mapped_drive_normalization_scope\": \"sidebar_address_session_restore_clipboard_and_drag_preflight\",\n",
+            "  \"killable_helper_scope\": \"discovery_root_directory_authentication_create_folder_and_rename\",\n",
+            "  \"network_directory_per_host_limit\": 1,\n",
+            "  \"slow_connection_notice_after_ms\": 2000,\n",
+            "  \"authentication_temp_storage\": \"windows_dpapi_encrypted\",\n",
+            "  \"credential_conflict_requires_confirmation\": true,\n",
+            "  \"network_file_operation_resource_separate\": true,\n",
+            "  \"all_network_file_operations_physically_isolated\": false,\n",
+            "  \"runtime_performance_verified_by_this_scenario\": false,\n",
+            "  \"network_auxiliary_work_disabled\": true\n",
+            "}}\n"
+        ),
+        imported.source != owned.source,
+        imported.source == NetworkLocationSource::WindowsImported,
+        owned.source == NetworkLocationSource::AsterOwned,
+        owned_location_removable,
+        matches!(owned.target, NetworkTarget::WindowsPath(ref target) if target == Path::new(r"\\服务器\自有")),
+        stale_rejected,
+        stale_cancel.load(Ordering::Acquire),
+        current_accepted,
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, state)
+}
 pub fn export_folder_size_scheduler_state(path: &Path) -> io::Result<()> {
     use crate::domain::{
         EntryKind,
@@ -226,6 +317,7 @@ pub fn export_multi_window_state_layering(path: &Path) -> io::Result<()> {
             NavigationKind::Normal,
         );
     let operation = app.operations.submit(
+        OperationResource::Local,
         FileOperationKind::Copy,
         Some(first_tab),
         vec![OperationItem::pending(
@@ -491,11 +583,16 @@ type SharedSessions = Arc<Mutex<AppState>>;
 #[derive(Clone)]
 struct WorkerSenders {
     directory: mpsc::Sender<DirectoryRequest>,
+    network_directory: mpsc::SyncSender<DirectoryRequest>,
+    network_discovery: mpsc::SyncSender<NetworkDiscoveryRequest>,
     operation: mpsc::Sender<FileOperationRequest>,
     clipboard: mpsc::Sender<ClipboardRequest>,
     shell_menu: platform::windows::context_menu::ShellMenuWorker,
     everything: mpsc::Sender<EverythingRequest>,
     icon: mpsc::Sender<IconRequest>,
+    network_login: slint::Weak<NetworkLoginWindow>,
+    network_login_state: Arc<Mutex<NetworkLoginCoordinator>>,
+    network_location_rename: slint::Weak<NetworkLocationRenameWindow>,
 }
 
 #[derive(Clone)]
@@ -1308,6 +1405,10 @@ struct AppState {
     large_icon_cache_order: VecDeque<(PathBuf, u32)>,
     thumbnail_requests: std::collections::HashSet<(TabId, RequestId, PathBuf, u32)>,
     sidebar: Vec<KnownLocation>,
+    network_locations: Vec<NetworkLocation>,
+    imported_network_locations: Vec<NetworkLocation>,
+    network_discovery: HashMap<WindowId, DiscoveryCoordinator>,
+    network_discovery_errors: HashMap<WindowId, String>,
     default_directory_view: DirectoryViewPreference,
     directory_views: HashMap<PathBuf, DirectoryViewPreference>,
     directory_view_lru: VecDeque<PathBuf>,
@@ -1522,6 +1623,10 @@ impl AppState {
             large_icon_cache_order: VecDeque::new(),
             thumbnail_requests: std::collections::HashSet::new(),
             sidebar: Vec::new(),
+            network_locations: Vec::new(),
+            imported_network_locations: Vec::new(),
+            network_discovery: HashMap::new(),
+            network_discovery_errors: HashMap::new(),
             default_directory_view,
             directory_view_lru: directory_views.keys().cloned().collect(),
             directory_views,
@@ -1773,6 +1878,10 @@ impl AppState {
             cancel_folder_sizes(tab);
             tab.cancel_pending();
         }
+        if let Some(mut discovery) = self.network_discovery.remove(&id) {
+            discovery.cancel_current();
+        }
+        self.network_discovery_errors.remove(&id);
         self.icons
             .retain(|(tab_id, _, _), _| !window.tabs.contains_key(tab_id));
         self.focus_after_refresh
@@ -2295,6 +2404,67 @@ struct DirectoryRequest {
     cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
+struct NetworkDirectoryCompletion {
+    key: NetworkExecutionKey,
+}
+
+#[derive(Default)]
+struct NetworkDirectoryScheduler {
+    pending: VecDeque<(NetworkExecutionKey, DirectoryRequest)>,
+    active: HashSet<NetworkExecutionKey>,
+}
+
+impl NetworkDirectoryScheduler {
+    fn push(&mut self, key: NetworkExecutionKey, request: DirectoryRequest) {
+        self.pending.push_back((key, request));
+    }
+
+    fn complete(&mut self, key: &NetworkExecutionKey) {
+        self.active.remove(key);
+    }
+
+    fn next_ready(&mut self) -> Option<(NetworkExecutionKey, DirectoryRequest)> {
+        let index = self
+            .pending
+            .iter()
+            .position(|(key, request)| !self.active.contains(key) && !request.cancelled())?;
+        let (key, request) = self.pending.remove(index)?;
+        self.active.insert(key.clone());
+        Some((key, request))
+    }
+
+    fn take_cancelled(&mut self) -> Vec<DirectoryRequest> {
+        let mut kept = VecDeque::with_capacity(self.pending.len());
+        let mut cancelled = Vec::new();
+        while let Some((key, request)) = self.pending.pop_front() {
+            if request.cancelled() {
+                cancelled.push(request);
+            } else {
+                kept.push_back((key, request));
+            }
+        }
+        self.pending = kept;
+        cancelled
+    }
+}
+
+impl DirectoryRequest {
+    fn cancelled(&self) -> bool {
+        self.cancel.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+fn network_directory_request(path: &str) -> DirectoryRequest {
+    DirectoryRequest {
+        tab_id: TabId(1),
+        request_id: RequestId(1),
+        path: PathBuf::from(path),
+        visibility: crate::domain::FileVisibility::default(),
+        cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    }
+}
+
 #[derive(Debug)]
 enum DirectoryEvent {
     Batch {
@@ -2317,6 +2487,54 @@ enum DirectoryEvent {
         request_id: RequestId,
         kind: io::ErrorKind,
         message: String,
+    },
+    Slow {
+        tab_id: TabId,
+        request_id: RequestId,
+    },
+}
+
+impl DirectoryEvent {
+    fn request_identity(&self) -> (TabId, RequestId) {
+        match self {
+            Self::Batch {
+                tab_id, request_id, ..
+            }
+            | Self::Finished {
+                tab_id, request_id, ..
+            }
+            | Self::Cancelled { tab_id, request_id }
+            | Self::Failed {
+                tab_id, request_id, ..
+            }
+            | Self::Slow { tab_id, request_id } => (*tab_id, *request_id),
+        }
+    }
+}
+#[derive(Debug)]
+enum NetworkDiscoveryRequest {
+    Discover {
+        window_id: WindowId,
+        request_id: DiscoveryRequestId,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    },
+}
+
+#[derive(Debug)]
+enum NetworkDiscoveryEvent {
+    Batch {
+        window_id: WindowId,
+        request_id: DiscoveryRequestId,
+        devices: Vec<NetworkDeviceTarget>,
+    },
+    Finished {
+        window_id: WindowId,
+        request_id: DiscoveryRequestId,
+    },
+    Failed {
+        window_id: WindowId,
+        request_id: DiscoveryRequestId,
+        error: crate::network::NetworkErrorKind,
     },
 }
 
@@ -2711,6 +2929,7 @@ enum IconTarget {
 struct FileOperationRequest {
     id: OperationId,
     kind: FileOperationKind,
+    resource: OperationResource,
     items: Vec<OperationItem>,
     cancellation: crate::domain::file_operations::CancellationToken,
 }
@@ -2761,6 +2980,72 @@ enum ClipboardEvent {
     Paste(Result<Option<(FileOperationKind, Vec<OperationItem>)>, String>),
     Availability(Result<bool, String>),
 }
+
+#[derive(Clone)]
+struct NetworkLoginSession {
+    generation: u64,
+    window_id: WindowId,
+    tab_id: TabId,
+    failed_request_id: RequestId,
+    target: PathBuf,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Default)]
+struct NetworkLoginCoordinator {
+    next_generation: u64,
+    current: Option<NetworkLoginSession>,
+}
+
+impl NetworkLoginCoordinator {
+    fn begin(
+        &mut self,
+        window_id: WindowId,
+        tab_id: TabId,
+        failed_request_id: RequestId,
+        target: PathBuf,
+    ) -> NetworkLoginSession {
+        self.cancel();
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        let session = NetworkLoginSession {
+            generation: self.next_generation,
+            window_id,
+            tab_id,
+            failed_request_id,
+            target,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        self.current = Some(session.clone());
+        session
+    }
+
+    fn cancel(&mut self) {
+        if let Some(current) = self.current.take() {
+            current
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|current| current.generation == generation)
+    }
+
+    fn finish(&mut self, generation: u64) {
+        if self.is_current(generation) {
+            self.current = None;
+        }
+    }
+
+    fn cancel_generation(&mut self, generation: u64) {
+        if self.is_current(generation) {
+            self.cancel();
+        }
+    }
+}
+
 struct IconEvent {
     tab_id: TabId,
     request_id: RequestId,
@@ -2773,6 +3058,8 @@ struct IconEvent {
 
 pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
+    let network_login_ui = NetworkLoginWindow::new()?;
+    let network_location_rename_ui = NetworkLocationRenameWindow::new()?;
     let operation_ui = OperationWindow::new()?;
     let delete_ui = ConfirmationWindow::new()?;
     let conflict_ui = ConfirmationWindow::new()?;
@@ -2802,6 +3089,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         theme_mode,
         language,
         file_visibility,
+        network_locations,
     ) = restored
         .filter(|session| {
             session
@@ -2827,6 +3115,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 session.theme_mode,
                 session.language,
                 session.file_visibility,
+                session.network_locations,
             )
         })
         .unwrap_or_else(|| {
@@ -2842,6 +3131,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 session_store::ThemeMode::System,
                 Language::Chinese,
                 crate::domain::FileVisibility::default(),
+                Vec::new(),
             )
         });
     ui.window()
@@ -2850,6 +3140,21 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         window.width as f32,
         window.height as f32,
     ));
+    let restored_paths = restored_paths
+        .into_iter()
+        .map(|path| platform::windows::network::network_drive_to_unc(&path).unwrap_or(path))
+        .collect();
+    let additional_windows = additional_windows
+        .into_iter()
+        .map(|mut window| {
+            window.tab_paths = window
+                .tab_paths
+                .into_iter()
+                .map(|path| platform::windows::network::network_drive_to_unc(&path).unwrap_or(path))
+                .collect();
+            window
+        })
+        .collect::<Vec<_>>();
     let state = Arc::new(Mutex::new(AppState::new(
         restored_paths,
         active_index,
@@ -2861,8 +3166,10 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         language,
         platform::system_uses_dark_theme(),
     )));
+    let network_login = Arc::new(Mutex::new(NetworkLoginCoordinator::default()));
     if let Ok(mut app) = state.lock() {
         app.file_visibility = file_visibility;
+        app.network_locations = network_locations;
         app.active_window_state_mut().placement = window;
         for restored in &additional_windows {
             if !restored.tab_paths.is_empty() {
@@ -2886,7 +3193,9 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             scenario,
         );
     }
-    let (request_sender, event_receiver) = spawn_directory_workers(WORKER_COUNT);
+    let (request_sender, network_request_sender, event_receiver) =
+        spawn_directory_workers(WORKER_COUNT, NETWORK_WORKER_COUNT);
+    let (network_discovery_sender, network_discovery_receiver) = spawn_network_discovery_worker();
     let event_receiver = Arc::new(Mutex::new(event_receiver));
     let everything_config = state
         .lock()
@@ -2905,11 +3214,16 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
 
     let senders = WorkerSenders {
         directory: request_sender.clone(),
+        network_directory: network_request_sender.clone(),
+        network_discovery: network_discovery_sender.clone(),
         operation: operation_sender.clone(),
         clipboard: clipboard_sender.clone(),
         shell_menu: shell_menu_worker.clone(),
         everything: everything_sender.clone(),
         icon: icon_sender.clone(),
+        network_login: network_login_ui.as_weak(),
+        network_login_state: network_login.clone(),
+        network_location_rename: network_location_rename_ui.as_weak(),
     };
     let initial_window_id = state
         .lock()
@@ -2922,10 +3236,15 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
 
     wire_callbacks(
         &ui,
+        network_login_ui.as_weak(),
+        network_login.clone(),
+        network_location_rename_ui.as_weak(),
         &delete_ui,
         &conflict_ui,
         &exit_ui,
         request_sender.clone(),
+        network_request_sender.clone(),
+        network_discovery_sender.clone(),
         operation_sender.clone(),
         clipboard_sender,
         everything_sender.clone(),
@@ -2945,6 +3264,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         &ui,
         operation_sender.clone(),
         request_sender.clone(),
+        network_request_sender.clone(),
         scoped_state.clone(),
     );
     let rectangle_selection_timer = wire_rectangle_selection(&ui, scoped_state.clone());
@@ -2966,6 +3286,15 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         operation_sender.clone(),
         state.clone(),
     );
+    wire_network_login_window(
+        &ui,
+        &network_login_ui,
+        request_sender.clone(),
+        network_request_sender.clone(),
+        state.clone(),
+        network_login.clone(),
+    );
+    wire_network_location_rename_window(&network_location_rename_ui, state.clone());
     wire_debug_showcase(
         &ui,
         &operation_ui,
@@ -3004,6 +3333,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         operation_receiver,
         operation_sender.clone(),
         request_sender.clone(),
+        network_request_sender.clone(),
         state.clone(),
     );
     start_shell_menu_event_pump(
@@ -3011,6 +3341,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         shell_menu_receiver,
         shell_menu_worker.clone(),
         request_sender.clone(),
+        network_request_sender.clone(),
         quick_menu.clone(),
         state.clone(),
     );
@@ -3019,13 +3350,18 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         clipboard_receiver,
         operation_sender.clone(),
         request_sender.clone(),
+        network_request_sender.clone(),
         state.clone(),
     );
     scan_cleanup_diagnostics(&ui, state.clone());
     start_sidebar_loader(&ui, state.clone());
+    start_network_location_loader(&ui, state.clone());
+    start_network_discovery_event_pump(&ui, network_discovery_receiver, state.clone());
+
     refresh_window_ui(&ui, &state, initial_window_id);
     refresh_operation_window(&operation_ui, &state);
     refresh_confirmation_windows(&delete_ui, &conflict_ui, &exit_ui, &state);
+    network_login_ui.set_dark_theme(state.lock().map(|app| app.dark_theme()).unwrap_or_default());
     let initial_tabs = {
         let app = state.lock().expect("app state mutex is not poisoned");
         app.active_window_state()
@@ -3042,8 +3378,9 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     };
     if scenario.is_none() {
         for (tab_id, path) in initial_tabs {
-            submit_navigation(
+            submit_path_navigation(
                 &request_sender,
+                &network_request_sender,
                 &state,
                 tab_id,
                 path,
@@ -3093,6 +3430,9 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     }
     ui.show()?;
     let result = slint::run_event_loop();
+    if let Ok(mut coordinator) = network_login.lock() {
+        coordinator.cancel();
+    }
     drop(directory_watch_timer);
     platform::windows::drag_drop::revoke_current();
     for weak in [delete_weak, conflict_weak, exit_weak] {
@@ -3100,6 +3440,8 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             let _ = window.hide();
         }
     }
+    let _ = network_login_ui.hide();
+    let _ = network_location_rename_ui.hide();
     let live_placements = WINDOW_RUNTIMES.with_borrow(|runtimes| {
         runtimes
             .iter()
@@ -3128,6 +3470,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         theme_mode,
         language,
         file_visibility,
+        network_locations,
     ) = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         for (id, placement) in &live_placements {
@@ -3169,6 +3512,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             app.theme_mode,
             app.language,
             app.file_visibility,
+            app.network_locations.clone(),
         )
     };
     if scenario.is_none()
@@ -3182,6 +3526,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             language,
             everything_config,
             file_visibility,
+            network_locations,
         )
     {
         let _ = session_store::save(&path, &session);
@@ -3233,6 +3578,72 @@ fn submit_navigation(
     sender.send(request).is_ok()
 }
 
+fn submit_network_navigation(
+    sender: &mpsc::SyncSender<DirectoryRequest>,
+    state: &SharedSessions,
+    tab_id: TabId,
+    path: PathBuf,
+    kind: NavigationKind,
+) -> bool {
+    let request = {
+        let mut app = state.lock().expect("app state mutex is not poisoned");
+        app.cancel_column_drag();
+        if let Some(tab) = app.tab_mut(tab_id) {
+            cancel_folder_sizes(tab);
+        }
+        app.icons.retain(|(icon_tab, _, _), _| *icon_tab != tab_id);
+        app.thumbnail_requests
+            .retain(|(request_tab, _, _, _)| *request_tab != tab_id);
+        app.focus_after_refresh.remove(&tab_id);
+        let Some(tab) = app.tab_mut(tab_id) else {
+            return false;
+        };
+        if tab.kind != TabKind::Files {
+            return false;
+        }
+        if kind == NavigationKind::Normal && tab.current_path.as_ref() == Some(&path) {
+            tab.cancel_address_edit();
+            return false;
+        }
+        let (request_id, cancel) = tab.begin_navigation(path.clone(), kind);
+        DirectoryRequest {
+            tab_id,
+            request_id,
+            path,
+            visibility: app.file_visibility,
+            cancel,
+        }
+    };
+    match sender.try_send(request) {
+        Ok(()) => true,
+        Err(mpsc::TrySendError::Full(request)) => {
+            if let Ok(mut app) = state.lock()
+                && let Some(tab) = app.tab_mut(request.tab_id)
+                && tab.latest_request == request.request_id
+            {
+                tab.load_state = LoadState::Failed;
+                tab.error = Some("network directory queue is busy".to_owned());
+            }
+            false
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => false,
+    }
+}
+
+fn submit_path_navigation(
+    local_sender: &mpsc::Sender<DirectoryRequest>,
+    network_sender: &mpsc::SyncSender<DirectoryRequest>,
+    state: &SharedSessions,
+    tab_id: TabId,
+    path: PathBuf,
+    kind: NavigationKind,
+) -> bool {
+    if crate::network::is_unc_path(&path) {
+        submit_network_navigation(network_sender, state, tab_id, path, kind)
+    } else {
+        submit_navigation(local_sender, state, tab_id, path, kind)
+    }
+}
 fn restart_detached_tab(
     outcome: &DetachedTabOutcome,
     senders: &WorkerSenders,
@@ -3240,8 +3651,9 @@ fn restart_detached_tab(
 ) {
     match &outcome.restart {
         Some(DetachedTabRestart::Directory(path)) => {
-            submit_navigation(
+            submit_path_navigation(
                 &senders.directory,
+                &senders.network_directory,
                 state,
                 outcome.tab_id,
                 path.clone(),
@@ -3323,10 +3735,15 @@ fn install_app_window_at(
     ));
     wire_callbacks(
         &ui,
+        senders.network_login.clone(),
+        senders.network_login_state.clone(),
+        senders.network_location_rename.clone(),
         delete_ui,
         conflict_ui,
         exit_ui,
         senders.directory.clone(),
+        senders.network_directory.clone(),
+        senders.network_discovery.clone(),
         senders.operation.clone(),
         senders.clipboard.clone(),
         senders.everything.clone(),
@@ -3346,6 +3763,7 @@ fn install_app_window_at(
         &ui,
         senders.operation.clone(),
         senders.directory.clone(),
+        senders.network_directory.clone(),
         scoped.clone(),
     );
     let rectangle_selection_timer = wire_rectangle_selection(&ui, scoped.clone());
@@ -3801,30 +4219,64 @@ fn enqueue_operation(
     state: &SharedSessions,
     sender: &mpsc::Sender<FileOperationRequest>,
     kind: FileOperationKind,
-    items: Vec<OperationItem>,
+    mut items: Vec<OperationItem>,
 ) {
     if items.is_empty() {
         return;
     }
+    for item in &mut items {
+        if let Some(source) = item.source.take() {
+            item.source =
+                Some(platform::windows::network::network_drive_to_unc(&source).unwrap_or(source));
+        }
+        if let Some(destination) = item.destination.take() {
+            item.destination = Some(
+                platform::windows::network::network_drive_to_unc(&destination)
+                    .unwrap_or(destination),
+            );
+        }
+    }
+    let resource = operation_resource(&items);
     let request = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         let tab = app.active_window_state().active_tab;
-        app.operations.submit(kind, Some(tab), items);
-        if app.operations.active_id().is_some() {
+        app.operations.submit(resource, kind, Some(tab), items);
+        if app.operations.active_id(resource).is_some() {
             return;
         }
-        app.operations.start_next().ok().flatten().and_then(|id| {
-            let _ = app.operations.mark_running(id);
-            app.operations.task(id).map(|task| FileOperationRequest {
-                id,
-                kind: task.kind,
-                items: task.items.clone(),
-                cancellation: task.cancellation.clone(),
+        app.operations
+            .start_next(resource)
+            .ok()
+            .flatten()
+            .and_then(|id| {
+                let _ = app.operations.mark_running(id);
+                app.operations.task(id).map(|task| FileOperationRequest {
+                    id,
+                    kind: task.kind,
+                    resource: task.resource,
+                    items: task.items.clone(),
+                    cancellation: task.cancellation.clone(),
+                })
             })
-        })
     };
     if let Some(request) = request {
         let _ = sender.send(request);
+    }
+}
+
+fn operation_resource(items: &[OperationItem]) -> OperationResource {
+    if items.iter().any(|item| {
+        item.source
+            .as_deref()
+            .is_some_and(crate::network::is_unc_path)
+            || item
+                .destination
+                .as_deref()
+                .is_some_and(crate::network::is_unc_path)
+    }) {
+        OperationResource::Network
+    } else {
+        OperationResource::Local
     }
 }
 
@@ -4134,6 +4586,9 @@ fn submit_rename(
 }
 
 fn should_fast_remove(path: &Path) -> bool {
+    if crate::network::is_unc_path(path) {
+        return false;
+    }
     let protected = path.parent().is_none()
         || std::env::var_os("USERPROFILE").is_some_and(|home| Path::new(&home) == path)
         || std::env::current_dir().is_ok_and(|workspace| workspace == path);
@@ -4190,6 +4645,15 @@ const CMD_GROUP_DESC: i32 = 151;
 const CMD_COLUMN_FIT: i32 = 160;
 const CMD_COLUMNS_FIT: i32 = 161;
 const CMD_COLUMN_TOGGLE_BASE: i32 = 170;
+const CMD_ADD_NETWORK_LOCATION: i32 = 190;
+const CMD_NETWORK_LOCATION_OPEN: i32 = 191;
+const CMD_NETWORK_LOCATION_COPY_ADDRESS: i32 = 192;
+const CMD_NETWORK_LOCATION_REMOVE: i32 = 193;
+const CMD_NETWORK_LOCATION_MOVE_UP: i32 = 194;
+const CMD_NETWORK_LOCATION_MOVE_DOWN: i32 = 195;
+const CMD_NETWORK_LOCATION_OPEN_NEW_TAB: i32 = 196;
+const CMD_NETWORK_LOCATION_MANAGE_CREDENTIALS: i32 = 197;
+const CMD_NETWORK_LOCATION_RENAME: i32 = 198;
 const NODE_VIEW: i32 = 10_001;
 const NODE_SORT: i32 = 10_002;
 const NODE_GROUP: i32 = 10_003;
@@ -4234,12 +4698,42 @@ struct QuickMenuState {
     loaded_submenu_rows: HashMap<u64, Vec<ContextCommandRow>>,
     built_in_submenu_rows: HashMap<i32, Vec<ContextCommandRow>>,
     active_column: Option<ColumnKind>,
+    active_network_location: Option<u64>,
     next_submenu_node: i32,
     active_submenu_token: Option<u64>,
     active_submenu_request: u64,
 }
 
 type SharedQuickMenu = Arc<Mutex<QuickMenuState>>;
+
+fn selected_network_location_path(
+    state: &WindowSessions,
+    menu: &SharedQuickMenu,
+) -> Option<PathBuf> {
+    let id = menu.lock().ok()?.active_network_location?;
+    let app = state.lock().ok()?;
+    app.imported_network_locations
+        .iter()
+        .chain(app.network_locations.iter())
+        .find(|location| location.id == id)
+        .and_then(|location| match &location.target {
+            NetworkTarget::WindowsPath(path) => Some(path.clone()),
+            NetworkTarget::ShellItemId(_) => None,
+        })
+}
+
+fn selected_network_location_target(
+    state: &WindowSessions,
+    menu: &SharedQuickMenu,
+) -> Option<NetworkTarget> {
+    let id = menu.lock().ok()?.active_network_location?;
+    let app = state.lock().ok()?;
+    app.imported_network_locations
+        .iter()
+        .chain(app.network_locations.iter())
+        .find(|location| location.id == id)
+        .map(|location| location.target.clone())
+}
 
 fn quick_menu_separator() -> ContextCommandRow {
     ContextCommandRow {
@@ -4921,6 +5415,20 @@ fn built_in_context_rows(
             false,
             false,
         ));
+        if app
+            .active()
+            .visible_path()
+            .is_some_and(crate::network::is_unc_path)
+        {
+            rows.push(quick_menu_row(
+                CMD_ADD_NETWORK_LOCATION,
+                0,
+                zh("添加到网络位置", "Add to network locations"),
+                true,
+                false,
+                false,
+            ));
+        }
     } else {
         rows.push(quick_menu_row(
             2,
@@ -6213,6 +6721,7 @@ fn wire_internal_drag_drop(
     ui: &AppWindow,
     operation_sender: mpsc::Sender<FileOperationRequest>,
     directory_sender: mpsc::Sender<DirectoryRequest>,
+    network_directory_sender: mpsc::SyncSender<DirectoryRequest>,
     state: WindowSessions,
 ) {
     #[derive(Debug)]
@@ -6257,6 +6766,7 @@ fn wire_internal_drag_drop(
     let state_for_update = state.clone();
     let drag_for_update = drag.clone();
     let directory_for_update = directory_sender.clone();
+    let network_directory_for_update = network_directory_sender.clone();
     ui.on_update_internal_drag(move |x, y| {
         let Some(ui) = weak_for_update.upgrade() else {
             return;
@@ -6291,6 +6801,7 @@ fn wire_internal_drag_drop(
                 // External targets own the operation; refresh only the source views and never infer item removal.
                 refresh_affected_tabs(
                     &directory_for_update,
+                    &network_directory_for_update,
                     &state_for_update,
                     &source_directories,
                 );
@@ -7042,13 +7553,51 @@ fn wire_rectangle_selection(ui: &AppWindow, state: WindowSessions) -> Rc<slint::
     timer
 }
 
+fn update_network_discovery(
+    state: &WindowSessions,
+    sender: &mpsc::SyncSender<NetworkDiscoveryRequest>,
+    expanded: bool,
+) {
+    let window_id = state.window_id;
+    let request = {
+        let mut app = state.lock().expect("app state mutex is not poisoned");
+        let coordinator = app.network_discovery.entry(window_id).or_default();
+        if expanded {
+            let (request_id, cancel) = coordinator.begin();
+            Some(NetworkDiscoveryRequest::Discover {
+                window_id,
+                request_id,
+                cancel,
+            })
+        } else {
+            coordinator.cancel_current();
+            None
+        }
+    };
+    if let Some(request) = request
+        && sender.try_send(request).is_err()
+        && let Ok(mut app) = state.lock()
+    {
+        if let Some(coordinator) = app.network_discovery.get_mut(&window_id) {
+            coordinator.cancel_current();
+        }
+        app.network_discovery_errors
+            .insert(window_id, "Windows 网络发现正忙，请稍后重试".to_owned());
+    }
+    refresh_all_windows(state);
+}
 #[allow(clippy::too_many_arguments)]
 fn wire_callbacks(
     ui: &AppWindow,
+    network_login_ui: slint::Weak<NetworkLoginWindow>,
+    network_login_state: Arc<Mutex<NetworkLoginCoordinator>>,
+    network_location_rename_ui: slint::Weak<NetworkLocationRenameWindow>,
     delete_ui: &ConfirmationWindow,
     conflict_ui: &ConfirmationWindow,
     exit_ui: &ConfirmationWindow,
     sender: mpsc::Sender<DirectoryRequest>,
+    network_sender: mpsc::SyncSender<DirectoryRequest>,
+    network_discovery_sender: mpsc::SyncSender<NetworkDiscoveryRequest>,
     operation_sender: mpsc::Sender<FileOperationRequest>,
     clipboard_sender: mpsc::Sender<ClipboardRequest>,
     everything_sender: mpsc::Sender<EverythingRequest>,
@@ -7057,8 +7606,27 @@ fn wire_callbacks(
     quick_menu: SharedQuickMenu,
     state: WindowSessions,
 ) {
+    let weak_for_network = ui.as_weak();
+    let discovery_sender_for_ui = network_discovery_sender.clone();
+    let discovery_state_for_ui = state.clone();
+    ui.on_toggle_network(move || {
+        let expanded = weak_for_network
+            .upgrade()
+            .is_some_and(|ui| ui.get_network_expanded());
+        update_network_discovery(&discovery_state_for_ui, &discovery_sender_for_ui, expanded);
+    });
+    let discovery_sender_for_refresh = network_discovery_sender.clone();
+    let discovery_state_for_refresh = state.clone();
+    ui.on_refresh_network(move || {
+        update_network_discovery(
+            &discovery_state_for_refresh,
+            &discovery_sender_for_refresh,
+            true,
+        );
+    });
     let weak = ui.as_weak();
     let sender_for_path = sender.clone();
+    let network_sender_for_path = network_sender.clone();
     let state_for_path = state.clone();
     let everything_for_accept = everything_sender.clone();
     ui.on_navigate_path(move |path| {
@@ -7090,12 +7658,16 @@ fn wire_callbacks(
         let target = platform::windows::address_path::normalize_address_path(path.as_str());
         let state_for_validation = state_for_path.clone();
         let sender_for_validation = sender_for_path.clone();
+        let network_sender_for_validation = network_sender_for_path.clone();
         let everything_for_validation = everything_for_accept.clone();
         thread::spawn(move || {
-            if target.is_dir() {
+            let target =
+                platform::windows::network::network_drive_to_unc(&target).unwrap_or(target);
+            if crate::network::is_unc_path(&target) || target.is_dir() {
                 let _ = slint::invoke_from_event_loop(move || {
-                    submit_navigation(
+                    submit_path_navigation(
                         &sender_for_validation,
+                        &network_sender_for_validation,
                         &state_for_validation,
                         tab_id,
                         target,
@@ -7289,6 +7861,7 @@ fn wire_callbacks(
     });
     let weak = ui.as_weak();
     let sender_for_entry = sender.clone();
+    let network_sender_for_entry = network_sender.clone();
     let state_for_entry = state.clone();
     ui.on_open_entry(move |entry_id| {
         let target = {
@@ -7315,8 +7888,9 @@ fn wire_callbacks(
         };
         if let Some((tab_id, target, is_directory)) = target {
             if is_directory {
-                submit_navigation(
+                submit_path_navigation(
                     &sender_for_entry,
+                    &network_sender_for_entry,
                     &state_for_entry,
                     tab_id,
                     target,
@@ -7337,6 +7911,7 @@ fn wire_callbacks(
 
     let weak = ui.as_weak();
     let sender_for_breadcrumb = sender.clone();
+    let network_sender_for_breadcrumb = network_sender.clone();
     let state_for_breadcrumb = state.clone();
     ui.on_navigate_breadcrumb(move |index| {
         let target = {
@@ -7349,8 +7924,9 @@ fn wire_callbacks(
                 .map(|(_, path)| (app.active_window_state().active_tab, path))
         };
         if let Some((tab_id, path)) = target {
-            submit_navigation(
+            submit_path_navigation(
                 &sender_for_breadcrumb,
+                &network_sender_for_breadcrumb,
                 &state_for_breadcrumb,
                 tab_id,
                 path,
@@ -7363,20 +7939,52 @@ fn wire_callbacks(
     });
     let weak = ui.as_weak();
     let sender_for_sidebar = sender.clone();
+    let network_sender_for_sidebar = network_sender.clone();
     let state_for_sidebar = state.clone();
     ui.on_navigate_sidebar(move |index| {
         let target = {
             let app = state_for_sidebar
                 .lock()
                 .expect("app state mutex is not poisoned");
-            usize::try_from(index)
-                .ok()
-                .and_then(|index| app.sidebar.get(index))
-                .map(|location| (app.active_window_state().active_tab, location.path.clone()))
+            usize::try_from(index).ok().and_then(|index| {
+                let path = if let Some(location) = app.sidebar.get(index) {
+                    Some(location.path.clone())
+                } else {
+                    let mut targets = app
+                        .imported_network_locations
+                        .iter()
+                        .chain(app.network_locations.iter())
+                        .filter_map(|location| match &location.target {
+                            NetworkTarget::WindowsPath(path) => {
+                                Some((location.sort_order, path.clone()))
+                            }
+                            NetworkTarget::ShellItemId(_) => None,
+                        })
+                        .collect::<Vec<_>>();
+                    targets.sort_by_key(|(order, _)| *order);
+                    let mut targets = targets
+                        .into_iter()
+                        .map(|(_, path)| path)
+                        .collect::<Vec<_>>();
+                    if let Some(discovery) = app.network_discovery.get(&app.active_window) {
+                        targets.extend(
+                            discovery
+                                .devices()
+                                .iter()
+                                .filter_map(crate::network::device_root_target),
+                        );
+                    }
+                    targets
+                        .get(index.saturating_sub(app.sidebar.len()))
+                        .cloned()
+                };
+                path.map(|path| (app.active_window_state().active_tab, path))
+            })
         };
         if let Some((tab_id, path)) = target {
-            submit_navigation(
+            submit_path_navigation(
                 &sender_for_sidebar,
+                &network_sender_for_sidebar,
                 &state_for_sidebar,
                 tab_id,
                 path,
@@ -7389,7 +7997,53 @@ fn wire_callbacks(
     });
 
     let weak = ui.as_weak();
+    let sender_for_network_location = sender.clone();
+    let network_sender_for_network_location = network_sender.clone();
+    let state_for_network_location = state.clone();
+    ui.on_navigate_network_location(move |stable_id| {
+        let Some(id) = stable_id.as_str().parse::<u64>().ok() else {
+            return;
+        };
+        let target = state_for_network_location.lock().ok().and_then(|app| {
+            app.imported_network_locations
+                .iter()
+                .chain(app.network_locations.iter())
+                .find(|location| location.id == id)
+                .map(|location| {
+                    (
+                        app.active_window_state().active_tab,
+                        location.target.clone(),
+                    )
+                })
+        });
+        match target {
+            Some((tab_id, NetworkTarget::WindowsPath(path))) => {
+                submit_path_navigation(
+                    &sender_for_network_location,
+                    &network_sender_for_network_location,
+                    &state_for_network_location,
+                    tab_id,
+                    path,
+                    NavigationKind::Normal,
+                );
+                if let Some(ui) = weak.upgrade() {
+                    refresh_ui(&ui, &state_for_network_location);
+                }
+            }
+            Some((_, NetworkTarget::ShellItemId(identity))) => {
+                thread::spawn(move || {
+                    if let Err(error) = platform::open_path(&identity) {
+                        eprintln!("unable to open Windows network location: {error}");
+                    }
+                });
+            }
+            None => {}
+        }
+    });
+
+    let weak = ui.as_weak();
     let sender_for_activate_entry = sender.clone();
+    let network_sender_for_activate_entry = network_sender.clone();
     let state_for_activate_entry = state.clone();
     let last_click = std::rc::Rc::new(Cell::new(None::<(TabId, RequestId, EntryId, Instant)>));
     ui.on_activate_entry(move |entry_id, toggle, extend| {
@@ -7433,8 +8087,9 @@ fn wire_callbacks(
             };
             if let Some((tab_id, target, is_directory)) = target {
                 if is_directory {
-                    submit_navigation(
+                    submit_path_navigation(
                         &sender_for_activate_entry,
+                        &network_sender_for_activate_entry,
                         &state_for_activate_entry,
                         tab_id,
                         target,
@@ -7729,6 +8384,7 @@ fn wire_callbacks(
 
     let weak = ui.as_weak();
     let sender_for_new = sender.clone();
+    let network_sender_for_new = network_sender.clone();
     let state_for_new = state.clone();
     ui.on_new_tab(move || {
         let reload = {
@@ -7751,8 +8407,9 @@ fn wire_callbacks(
             refresh_ui(&ui, &state_for_new);
         }
         if let Some((tab_id, path)) = reload {
-            submit_navigation(
+            submit_path_navigation(
                 &sender_for_new,
+                &network_sender_for_new,
                 &state_for_new,
                 tab_id,
                 path,
@@ -7786,6 +8443,7 @@ fn wire_callbacks(
 
     let weak = ui.as_weak();
     let sender_for_restore = sender.clone();
+    let network_sender_for_restore = network_sender.clone();
     let state_for_restore = state.clone();
     ui.on_restore_tab(move || {
         let restored = state_for_restore
@@ -7793,8 +8451,9 @@ fn wire_callbacks(
             .expect("app state mutex is not poisoned")
             .restore_closed();
         if let Some((tab_id, path)) = restored {
-            submit_navigation(
+            submit_path_navigation(
                 &sender_for_restore,
+                &network_sender_for_restore,
                 &state_for_restore,
                 tab_id,
                 path,
@@ -7845,11 +8504,16 @@ fn wire_callbacks(
     let state_for_tab_drag = state.clone();
     let senders_for_tab_drag = WorkerSenders {
         directory: sender.clone(),
+        network_directory: network_sender.clone(),
+        network_discovery: network_discovery_sender.clone(),
         operation: operation_sender.clone(),
         clipboard: clipboard_sender.clone(),
         shell_menu: shell_menu_worker.clone(),
         everything: everything_sender.clone(),
         icon: icon_sender.clone(),
+        network_login: network_login_ui.clone(),
+        network_login_state: network_login_state.clone(),
+        network_location_rename: network_location_rename_ui.clone(),
     };
     let confirmations_for_tab_drag = ConfirmationWindows::new(delete_ui, conflict_ui, exit_ui);
     ui.on_update_tab_drag(move |x, y, strip_x, strip_width, viewport_x, tab_width| {
@@ -7929,6 +8593,7 @@ fn wire_callbacks(
 
     let weak = ui.as_weak();
     let sender_for_back = sender.clone();
+    let network_sender_for_back = network_sender.clone();
     let state_for_back = state.clone();
     ui.on_navigate_back(move || {
         let (restored, target) = {
@@ -7949,8 +8614,9 @@ fn wire_callbacks(
         };
         let navigated = target.is_some();
         if let Some((tab_id, path)) = target {
-            submit_navigation(
+            submit_path_navigation(
                 &sender_for_back,
+                &network_sender_for_back,
                 &state_for_back,
                 tab_id,
                 path,
@@ -7966,6 +8632,7 @@ fn wire_callbacks(
 
     let weak = ui.as_weak();
     let sender_for_forward = sender.clone();
+    let network_sender_for_forward = network_sender.clone();
     let state_for_forward = state.clone();
     ui.on_navigate_forward(move || {
         let target = {
@@ -7977,8 +8644,9 @@ fn wire_callbacks(
                 .map(|path| (app.active_window_state().active_tab, path))
         };
         if let Some((tab_id, path)) = target {
-            submit_navigation(
+            submit_path_navigation(
                 &sender_for_forward,
+                &network_sender_for_forward,
                 &state_for_forward,
                 tab_id,
                 path,
@@ -7992,6 +8660,7 @@ fn wire_callbacks(
 
     let weak = ui.as_weak();
     let sender_for_history = sender.clone();
+    let network_sender_for_history = network_sender.clone();
     let state_for_history = state.clone();
     ui.on_navigate_history(move |is_back, index| {
         let target = {
@@ -8011,8 +8680,9 @@ fn wire_callbacks(
                 .map(|path| (app.active_window_state().active_tab, path))
         };
         if let Some((tab_id, path)) = target {
-            submit_navigation(
+            submit_path_navigation(
                 &sender_for_history,
+                &network_sender_for_history,
                 &state_for_history,
                 tab_id,
                 path,
@@ -8030,6 +8700,7 @@ fn wire_callbacks(
 
     let weak = ui.as_weak();
     let sender_for_up = sender.clone();
+    let network_sender_for_up = network_sender.clone();
     let state_for_up = state.clone();
     ui.on_navigate_up(move || {
         let target = {
@@ -8043,8 +8714,9 @@ fn wire_callbacks(
                 .map(|path| (app.active_window_state().active_tab, path))
         };
         if let Some((tab_id, path)) = target {
-            submit_navigation(
+            submit_path_navigation(
                 &sender_for_up,
+                &network_sender_for_up,
                 &state_for_up,
                 tab_id,
                 path,
@@ -8058,6 +8730,7 @@ fn wire_callbacks(
 
     let weak = ui.as_weak();
     let sender_for_refresh = sender.clone();
+    let network_sender_for_refresh = network_sender.clone();
     let state_for_refresh = state.clone();
     ui.on_refresh(move || {
         let target = {
@@ -8078,8 +8751,9 @@ fn wire_callbacks(
             }
         };
         if let Some((tab_id, path)) = target {
-            submit_navigation(
+            submit_path_navigation(
                 &sender_for_refresh,
+                &network_sender_for_refresh,
                 &state_for_refresh,
                 tab_id,
                 path,
@@ -8092,18 +8766,63 @@ fn wire_callbacks(
     });
     let weak = ui.as_weak();
     let state_for_access = state.clone();
+    let sender_for_access = sender.clone();
+    let network_sender_for_access = network_sender.clone();
+    let network_login_for_access = network_login_ui.clone();
+    let network_login_state_for_access = network_login_state.clone();
     ui.on_request_folder_access(move || {
         let target = {
             let app = state_for_access
                 .lock()
                 .expect("app state mutex is not poisoned");
             (app.active().load_state == LoadState::PermissionDenied)
-                .then(|| app.active().requested_path.clone())
+                .then(|| {
+                    app.active().requested_path.clone().map(|path| {
+                        (
+                            app.active_window,
+                            app.active_window_state().active_tab,
+                            app.active().latest_request,
+                            path,
+                        )
+                    })
+                })
                 .flatten()
         };
-        if let Some(target) = target {
+        if let Some((window_id, tab_id, failed_request_id, target)) = target {
+            if crate::network::is_unc_path(&target) {
+                network_login_state_for_access
+                    .lock()
+                    .expect("network login coordinator mutex is not poisoned")
+                    .begin(window_id, tab_id, failed_request_id, target.clone());
+                if let Some(login) = network_login_for_access.upgrade() {
+                    configure_network_login_window(&login, &state_for_access, &target);
+                    login.set_username("".into());
+                    login.set_password("".into());
+                    login.set_remember(false);
+                    login.set_conflict(false);
+                    login.set_busy(false);
+                    show_network_login_window(&login);
+                }
+                return;
+            }
+            let state = state_for_access.clone();
+            let sender = sender_for_access.clone();
+            let network_sender = network_sender_for_access.clone();
             thread::spawn(move || {
-                if let Err(error) = platform::request_folder_access(&target) {
+                let result =
+                    platform::request_folder_access(&target).map_err(|error| error.to_string());
+                if result.is_ok() {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        submit_path_navigation(
+                            &sender,
+                            &network_sender,
+                            &state,
+                            tab_id,
+                            target,
+                            NavigationKind::Refresh,
+                        );
+                    });
+                } else if let Err(error) = result {
                     eprintln!("unable to request folder access through Windows: {error}");
                 }
             });
@@ -8117,6 +8836,7 @@ fn wire_callbacks(
     let delete_weak_for_language = delete_ui.as_weak();
     let conflict_weak_for_language = conflict_ui.as_weak();
     let exit_weak_for_language = exit_ui.as_weak();
+    let network_login_for_language = network_login_ui.clone();
     let state_for_language = state.clone();
     ui.on_change_language(move |language| {
         let mut app = state_for_language
@@ -8138,11 +8858,28 @@ fn wire_callbacks(
         ) {
             refresh_confirmation_windows(&delete_ui, &conflict_ui, &exit_ui, &state_for_language);
         }
+        if let Some(login) = network_login_for_language.upgrade() {
+            login.set_dark_theme(
+                state_for_language
+                    .lock()
+                    .map(|app| app.dark_theme())
+                    .unwrap_or_default(),
+            );
+            if let Some(target) = network_login_state.lock().ok().and_then(|coordinator| {
+                coordinator
+                    .current
+                    .as_ref()
+                    .map(|value| value.target.clone())
+            }) {
+                configure_network_login_window(&login, &state_for_language, &target);
+            }
+        }
     });
 
     let weak_for_visibility = ui.as_weak();
     let state_for_visibility = state.clone();
     let sender_for_visibility = sender.clone();
+    let network_sender_for_visibility = network_sender.clone();
     ui.on_change_file_visibility(move |show_hidden, show_system| {
         let targets = {
             let mut app = state_for_visibility
@@ -8159,8 +8896,9 @@ fn wire_callbacks(
                 .collect::<Vec<_>>()
         };
         for (tab_id, path) in targets {
-            submit_navigation(
+            submit_path_navigation(
                 &sender_for_visibility,
+                &network_sender_for_visibility,
                 &state_for_visibility,
                 tab_id,
                 path,
@@ -8175,6 +8913,7 @@ fn wire_callbacks(
     let delete_weak_for_theme = delete_ui.as_weak();
     let conflict_weak_for_theme = conflict_ui.as_weak();
     let exit_weak_for_theme = exit_ui.as_weak();
+    let network_login_for_theme = network_login_ui.clone();
     let state_for_theme = state.clone();
     ui.on_change_theme(move |theme| {
         let mut app = state_for_theme
@@ -8195,6 +8934,14 @@ fn wire_callbacks(
             exit_weak_for_theme.upgrade(),
         ) {
             refresh_confirmation_windows(&delete_ui, &conflict_ui, &exit_ui, &state_for_theme);
+        }
+        if let Some(login) = network_login_for_theme.upgrade() {
+            login.set_dark_theme(
+                state_for_theme
+                    .lock()
+                    .map(|app| app.dark_theme())
+                    .unwrap_or_default(),
+            );
         }
     });
 
@@ -8300,6 +9047,127 @@ fn wire_callbacks(
                 &shell_menu_for_entry,
                 false,
             );
+        }
+    });
+
+    let weak = ui.as_weak();
+    let state_for_network_location_menu = state.clone();
+    let quick_menu_for_network_location = quick_menu.clone();
+    ui.on_show_network_location_menu(move |stable_id, x, y| {
+        let Some(ui) = weak.upgrade() else { return };
+        let Some(location_id) = stable_id.as_str().parse::<u64>().ok() else {
+            return;
+        };
+        let selected = state_for_network_location_menu.lock().ok().and_then(|app| {
+            app.imported_network_locations
+                .iter()
+                .chain(app.network_locations.iter())
+                .find(|location| location.id == location_id)
+                .map(|location| {
+                    (
+                        location.id,
+                        location.source == NetworkLocationSource::AsterOwned,
+                        matches!(location.target, NetworkTarget::WindowsPath(_)),
+                        app.language,
+                    )
+                })
+        });
+        let Some((location_id, owned, navigable, language)) = selected else {
+            return;
+        };
+        let zh = |chinese: &'static str, english: &'static str| {
+            if language == Language::Chinese {
+                chinese
+            } else {
+                english
+            }
+        };
+        let mut rows = vec![
+            quick_menu_row(
+                CMD_NETWORK_LOCATION_OPEN,
+                0,
+                zh("打开", "Open"),
+                true,
+                false,
+                false,
+            ),
+            quick_menu_row(
+                CMD_NETWORK_LOCATION_OPEN_NEW_TAB,
+                0,
+                zh("在新标签页中打开", "Open in new tab"),
+                navigable,
+                false,
+                false,
+            ),
+            quick_menu_row(
+                CMD_NETWORK_LOCATION_COPY_ADDRESS,
+                0,
+                zh("复制地址", "Copy address"),
+                navigable,
+                false,
+                false,
+            ),
+            quick_menu_row(
+                CMD_NETWORK_LOCATION_MANAGE_CREDENTIALS,
+                0,
+                zh("管理 Windows 凭据", "Manage Windows credentials"),
+                true,
+                false,
+                false,
+            ),
+        ];
+        if owned {
+            rows.push(quick_menu_separator());
+            rows.push(quick_menu_row(
+                CMD_NETWORK_LOCATION_RENAME,
+                0,
+                zh("重命名", "Rename"),
+                true,
+                false,
+                false,
+            ));
+            rows.push(quick_menu_row(
+                CMD_NETWORK_LOCATION_MOVE_UP,
+                0,
+                zh("上移", "Move up"),
+                true,
+                false,
+                false,
+            ));
+            rows.push(quick_menu_row(
+                CMD_NETWORK_LOCATION_MOVE_DOWN,
+                0,
+                zh("下移", "Move down"),
+                true,
+                false,
+                false,
+            ));
+            rows.push(quick_menu_row(
+                CMD_NETWORK_LOCATION_REMOVE,
+                0,
+                zh("从网络位置移除", "Remove from network locations"),
+                true,
+                false,
+                false,
+            ));
+        }
+        if let Ok(mut menu) = quick_menu_for_network_location.lock() {
+            menu.identity = None;
+            menu.active_network_location = Some(location_id);
+            menu.built_in_rows = rows.clone();
+            menu.all_rows = rows;
+            menu.submenu_rows.clear();
+            menu.submenu_history.clear();
+        }
+        ui.set_context_menu_anchor_x(x);
+        ui.set_context_menu_anchor_y(y);
+        ui.set_context_search("".into());
+        ui.set_context_shell_loading(false);
+        ui.set_context_submenu_open(false);
+        project_filtered_context_menu(&ui, &quick_menu_for_network_location, "");
+        ui.set_context_menu_open(true);
+        if let Some(window_id) = window_id_for_ui(&ui) {
+            open_quick_menu_popup(window_id, x, y);
         }
     });
 
@@ -8777,6 +9645,170 @@ fn wire_callbacks(
                 if let Some(ui) = weak.upgrade() {
                     ui.invoke_refresh();
                 }
+            }
+            CMD_ADD_NETWORK_LOCATION => {
+                if let Ok(mut app) = state_for_context_command.lock()
+                    && let Some(path) = app.active().visible_path().map(Path::to_path_buf)
+                {
+                    let name = network_location_default_name(&path);
+                    let mut catalog = NetworkLocationCatalog::new(app.network_locations.clone());
+                    match catalog.add_unc(path, name) {
+                        Ok(_) => app.network_locations = catalog.locations().to_vec(),
+                        Err(crate::network::NetworkLocationCatalogError::DuplicateTarget) => {}
+                        Err(error) => app
+                            .operation_errors
+                            .push(format!("Failed to add network location: {error:?}")),
+                    }
+                }
+            }
+            CMD_NETWORK_LOCATION_OPEN => {
+                let target = selected_network_location_target(
+                    &state_for_context_command,
+                    &quick_menu_for_command,
+                );
+                match target {
+                    Some(NetworkTarget::WindowsPath(path)) => {
+                        let tab_id = state_for_context_command
+                            .lock()
+                            .ok()
+                            .map(|app| app.active_window_state().active_tab);
+                        if let Some(tab_id) = tab_id {
+                            submit_path_navigation(
+                                &sender,
+                                &network_sender,
+                                &state_for_context_command,
+                                tab_id,
+                                path,
+                                NavigationKind::Normal,
+                            );
+                        }
+                    }
+                    Some(NetworkTarget::ShellItemId(identity)) => {
+                        thread::spawn(move || {
+                            if let Err(error) = platform::open_path(&identity) {
+                                eprintln!("unable to open Windows network location: {error}");
+                            }
+                        });
+                    }
+                    None => {}
+                }
+            }
+            CMD_NETWORK_LOCATION_OPEN_NEW_TAB => {
+                let path = selected_network_location_path(
+                    &state_for_context_command,
+                    &quick_menu_for_command,
+                );
+                if let Some(path) = path {
+                    let tab_id = state_for_context_command
+                        .lock()
+                        .ok()
+                        .map(|mut app| app.create_tab(path.clone()));
+                    if let Some(tab_id) = tab_id {
+                        submit_path_navigation(
+                            &sender,
+                            &network_sender,
+                            &state_for_context_command,
+                            tab_id,
+                            path,
+                            NavigationKind::Refresh,
+                        );
+                    }
+                }
+            }
+            CMD_NETWORK_LOCATION_MANAGE_CREDENTIALS => {
+                if let Err(error) = platform::open_windows_credentials()
+                    && let Ok(mut app) = state_for_context_command.lock()
+                {
+                    app.operation_errors
+                        .push(format!("Failed to open Windows credentials: {error}"));
+                }
+            }
+            CMD_NETWORK_LOCATION_RENAME => {
+                let selected = quick_menu_for_command
+                    .lock()
+                    .ok()
+                    .and_then(|menu| menu.active_network_location)
+                    .and_then(|id| {
+                        state_for_context_command.lock().ok().and_then(|app| {
+                            app.network_locations
+                                .iter()
+                                .find(|location| location.id == id)
+                                .map(|location| {
+                                    (
+                                        id,
+                                        location.display_name.clone(),
+                                        app.language,
+                                        app.dark_theme(),
+                                    )
+                                })
+                        })
+                    });
+                if let (Some((id, name, language, dark_theme)), Some(window)) =
+                    (selected, network_location_rename_ui.upgrade())
+                {
+                    configure_network_location_rename_window(
+                        &window, id, &name, language, dark_theme,
+                    );
+                    show_network_location_rename_window(&window);
+                }
+            }
+            CMD_NETWORK_LOCATION_COPY_ADDRESS => {
+                if let Some(path) = selected_network_location_path(
+                    &state_for_context_command,
+                    &quick_menu_for_command,
+                ) {
+                    let result = platform::windows::clipboard::write_text(path.as_os_str());
+                    if let Err(error) = result
+                        && let Ok(mut app) = state_for_context_command.lock()
+                    {
+                        app.operation_errors
+                            .push(format!("Failed to copy network address: {error}"));
+                    }
+                }
+            }
+            CMD_NETWORK_LOCATION_REMOVE
+            | CMD_NETWORK_LOCATION_MOVE_UP
+            | CMD_NETWORK_LOCATION_MOVE_DOWN => {
+                let id = quick_menu_for_command
+                    .lock()
+                    .ok()
+                    .and_then(|menu| menu.active_network_location);
+                if let Some(id) = id
+                    && let Ok(mut app) = state_for_context_command.lock()
+                {
+                    let mut catalog = NetworkLocationCatalog::new(app.network_locations.clone());
+                    let result = match command {
+                        CMD_NETWORK_LOCATION_REMOVE => catalog.remove(id).map(|_| ()),
+                        CMD_NETWORK_LOCATION_MOVE_UP | CMD_NETWORK_LOCATION_MOVE_DOWN => {
+                            let positions = catalog
+                                .locations()
+                                .iter()
+                                .position(|location| location.id == id);
+                            positions
+                                .map(|position| {
+                                    let next = if command == CMD_NETWORK_LOCATION_MOVE_UP {
+                                        position.saturating_sub(1)
+                                    } else {
+                                        position
+                                            .saturating_add(1)
+                                            .min(catalog.locations().len().saturating_sub(1))
+                                    };
+                                    catalog.move_to(id, next)
+                                })
+                                .unwrap_or(Err(
+                                    crate::network::NetworkLocationCatalogError::NotFound,
+                                ))
+                        }
+                        _ => unreachable!(),
+                    };
+                    match result {
+                        Ok(_) => app.network_locations = catalog.locations().to_vec(),
+                        Err(error) => app
+                            .operation_errors
+                            .push(format!("Failed to manage network location: {error:?}")),
+                    }
+                }
+                refresh_all_windows(&state_for_context_command.shared);
             }
             command if (CMD_VIEW_BASE..CMD_VIEW_BASE + 8).contains(&command) => {
                 if let Some(mode) = ViewMode::from_storage_code((command - CMD_VIEW_BASE) as u8) {
@@ -10098,8 +11130,10 @@ enum PreparedDrop {
 fn prepare_drop_operation(
     intent: platform::windows::drag_drop::DropIntent,
 ) -> Result<PreparedDrop, String> {
+    let target =
+        platform::windows::network::network_drive_to_unc(&intent.target).unwrap_or(intent.target);
     let target_metadata =
-        std::fs::metadata(&intent.target).map_err(|error| format!("拖放目标不可用：{error}"))?;
+        std::fs::metadata(&target).map_err(|error| format!("拖放目标不可用：{error}"))?;
     if !target_metadata.is_dir() {
         return Err("拖放目标不是文件夹".to_owned());
     }
@@ -10113,14 +11147,15 @@ fn prepare_drop_operation(
     };
     let mut items = Vec::with_capacity(intent.paths.len());
     for source in intent.paths {
+        let source = platform::windows::network::network_drive_to_unc(&source).unwrap_or(source);
         let metadata = std::fs::symlink_metadata(&source)
             .map_err(|error| format!("拖放来源不可用：{error}"))?;
         let _ = metadata.file_type();
         let name = source
             .file_name()
             .ok_or_else(|| "拖放来源没有可用名称".to_owned())?;
-        let destination = intent.target.join(name);
-        if intent.target.starts_with(&source)
+        let destination = target.join(name);
+        if target.starts_with(&source)
             || (source == destination
                 && intent.effect == platform::windows::drag_drop::DropEffect::Move)
         {
@@ -10138,7 +11173,7 @@ fn prepare_drop_operation(
         let mut shortcuts = Vec::with_capacity(items.len());
         for source in items.into_iter().filter_map(|item| item.source) {
             let mut destination =
-                platform::windows::shortcut::shortcut_destination(&intent.target, &source)
+                platform::windows::shortcut::shortcut_destination(&target, &source)
                     .map_err(|error| error.to_string())?;
             if reserved.contains(&destination) {
                 let stem = source
@@ -10148,7 +11183,7 @@ fn prepare_drop_operation(
                 for index in 2_u64.. {
                     let mut name = stem.to_os_string();
                     name.push(format!(" ({index})"));
-                    let mut candidate = intent.target.join(name);
+                    let mut candidate = target.join(name);
                     candidate.set_extension("lnk");
                     if !reserved.contains(&candidate) && !candidate.exists() {
                         destination = candidate;
@@ -10552,6 +11587,347 @@ fn show_confirmation_window(
     confirmation_ui
         .window()
         .with_winit_window(|window| window.focus_window());
+}
+
+fn show_network_login_window(ui: &NetworkLoginWindow) {
+    if ui.window().is_visible() {
+        ui.window()
+            .with_winit_window(|window| window.focus_window());
+        return;
+    }
+    let _ = ui.show();
+    ui.window()
+        .with_winit_window(|window| window.focus_window());
+}
+
+fn show_network_location_rename_window(ui: &NetworkLocationRenameWindow) {
+    if ui.window().is_visible() {
+        ui.window()
+            .with_winit_window(|window| window.focus_window());
+        return;
+    }
+    let _ = ui.show();
+    ui.window()
+        .with_winit_window(|window| window.focus_window());
+}
+
+fn configure_network_location_rename_window(
+    ui: &NetworkLocationRenameWindow,
+    id: u64,
+    name: &str,
+    language: Language,
+    dark_theme: bool,
+) {
+    ui.set_location_id(id.to_string().into());
+    ui.set_name(name.into());
+    ui.set_dark_theme(dark_theme);
+    match language {
+        Language::Chinese => {
+            ui.set_title_text("重命名网络位置".into());
+            ui.set_detail_text("输入新的显示名称。".into());
+            ui.set_cancel_text("取消".into());
+            ui.set_save_text("保存".into());
+            ui.set_close_text("关闭".into());
+        }
+        Language::English => {
+            ui.set_title_text("Rename network location".into());
+            ui.set_detail_text("Enter a new display name.".into());
+            ui.set_cancel_text("Cancel".into());
+            ui.set_save_text("Save".into());
+            ui.set_close_text("Close".into());
+        }
+    }
+}
+
+fn wire_network_location_rename_window(ui: &NetworkLocationRenameWindow, state: SharedSessions) {
+    ui.window().on_close_requested({
+        let weak = ui.as_weak();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.invoke_safe_cancel();
+            }
+            slint::CloseRequestResponse::KeepWindowShown
+        }
+    });
+    let weak = ui.as_weak();
+    ui.on_safe_cancel(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_location_id("".into());
+            let _ = ui.hide();
+        }
+    });
+    let weak = ui.as_weak();
+    ui.on_drag_window(move || {
+        if let Some(ui) = weak.upgrade() {
+            let _ = ui.window().with_winit_window(|window| window.drag_window());
+        }
+    });
+    let weak = ui.as_weak();
+    ui.on_save(move |name| {
+        let id = weak
+            .upgrade()
+            .and_then(|ui| ui.get_location_id().as_str().parse::<u64>().ok());
+        let Some(id) = id else { return };
+        if let Ok(mut app) = state.lock() {
+            let mut catalog = NetworkLocationCatalog::new(app.network_locations.clone());
+            match catalog.rename(id, name.as_str()) {
+                Ok(()) => app.network_locations = catalog.locations().to_vec(),
+                Err(error) => app
+                    .operation_errors
+                    .push(format!("Failed to rename network location: {error:?}")),
+            }
+        }
+        if let Some(ui) = weak.upgrade() {
+            ui.set_location_id("".into());
+            let _ = ui.hide();
+        }
+        refresh_all_windows(&state);
+    });
+}
+
+fn configure_network_login_window(ui: &NetworkLoginWindow, state: &SharedSessions, target: &Path) {
+    let language = state
+        .lock()
+        .map(|app| app.language)
+        .unwrap_or(Language::Chinese);
+    ui.set_target_text(display_path(target).into());
+    match language {
+        Language::Chinese => {
+            ui.set_title_text("登录网络位置".into());
+            ui.set_detail_text("输入此网络位置使用的 Windows 凭据。".into());
+            ui.set_user_label("用户名".into());
+            ui.set_password_label("密码".into());
+            ui.set_remember_label("记住凭据（由 Windows 管理）".into());
+            ui.set_conflict_text(
+                "Windows 已使用另一账号连接此服务器。断开会影响 Explorer 和其他软件。".into(),
+            );
+            ui.set_cancel_text("取消".into());
+            ui.set_login_text("登录".into());
+            ui.set_reconnect_text("断开并重新登录".into());
+            ui.set_close_text("关闭".into());
+        }
+        Language::English => {
+            ui.set_title_text("Sign in to network location".into());
+            ui.set_detail_text("Enter the Windows credentials for this network location.".into());
+            ui.set_user_label("Username".into());
+            ui.set_password_label("Password".into());
+            ui.set_remember_label("Remember credentials (managed by Windows)".into());
+            ui.set_conflict_text(
+                "Windows is already connected to this server with another account. Disconnecting can affect Explorer and other apps."
+                    .into(),
+            );
+            ui.set_cancel_text("Cancel".into());
+            ui.set_login_text("Sign in".into());
+            ui.set_reconnect_text("Disconnect and sign in".into());
+            ui.set_close_text("Close".into());
+        }
+    }
+}
+
+fn network_auth_error_text(
+    error: platform::windows::network::NetworkAuthError,
+    language: Language,
+) -> String {
+    use platform::windows::network::NetworkAuthErrorKind;
+
+    let message = match (language, error.kind) {
+        (Language::Chinese, NetworkAuthErrorKind::AccessDenied) => "Windows 拒绝了访问",
+        (Language::Chinese, NetworkAuthErrorKind::LogonFailure) => "用户名或密码不正确",
+        (Language::Chinese, NetworkAuthErrorKind::CredentialConflict) => {
+            "Windows 已使用另一账号连接此服务器"
+        }
+        (Language::Chinese, NetworkAuthErrorKind::BadPath) => "网络路径不存在",
+        (Language::Chinese, NetworkAuthErrorKind::Unavailable) => "网络位置暂时不可用",
+        (Language::Chinese, NetworkAuthErrorKind::Other) => "无法登录网络位置",
+        (Language::English, NetworkAuthErrorKind::AccessDenied) => "Windows denied access",
+        (Language::English, NetworkAuthErrorKind::LogonFailure) => {
+            "The username or password is incorrect"
+        }
+        (Language::English, NetworkAuthErrorKind::CredentialConflict) => {
+            "Windows is connected to this server with another account"
+        }
+        (Language::English, NetworkAuthErrorKind::BadPath) => "The network path does not exist",
+        (Language::English, NetworkAuthErrorKind::Unavailable) => {
+            "The network location is unavailable"
+        }
+        (Language::English, NetworkAuthErrorKind::Other) => {
+            "Unable to sign in to the network location"
+        }
+    };
+    format!("{message}（Windows {}）", error.code)
+}
+
+fn wire_network_login_window(
+    owner: &AppWindow,
+    login: &NetworkLoginWindow,
+    local_sender: mpsc::Sender<DirectoryRequest>,
+    network_sender: mpsc::SyncSender<DirectoryRequest>,
+    state: SharedSessions,
+    login_state: Arc<Mutex<NetworkLoginCoordinator>>,
+) {
+    let login_weak = login.as_weak();
+    let login_state_for_cancel = login_state.clone();
+    login.on_safe_cancel(move || {
+        if let Ok(mut coordinator) = login_state_for_cancel.lock() {
+            coordinator.cancel();
+        }
+        if let Some(login) = login_weak.upgrade() {
+            login.set_password("".into());
+            login.set_conflict(false);
+            login.set_busy(false);
+            let _ = login.hide();
+        }
+    });
+    let owner_weak = owner.as_weak();
+    let login_weak = login.as_weak();
+    login.on_drag_window(move || {
+        if let Some(login) = login_weak.upgrade() {
+            let _ = login
+                .window()
+                .with_winit_window(|window| window.drag_window());
+        }
+    });
+    let login_weak = login.as_weak();
+    login.on_login(move |username, password, remember, disconnect_first| {
+        let session = login_state
+            .lock()
+            .ok()
+            .and_then(|coordinator| coordinator.current.clone());
+        let Some(session) = session else {
+            return;
+        };
+        if let Some(login) = login_weak.upgrade() {
+            login.set_busy(true);
+        }
+        let state = state.clone();
+        let local_sender = local_sender.clone();
+        let network_sender = network_sender.clone();
+        let login_weak = login_weak.clone();
+        let owner_weak = owner_weak.clone();
+        let login_state = login_state.clone();
+        let username = username.to_string();
+        let mut password = password.to_string();
+        let auth_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let auth_done_for_monitor = auth_done.clone();
+        let state_for_monitor = state.clone();
+        let login_state_for_monitor = login_state.clone();
+        let session_for_monitor = session.clone();
+        thread::spawn(move || {
+            while !auth_done_for_monitor.load(std::sync::atomic::Ordering::Acquire) {
+                let valid = state_for_monitor.lock().ok().is_some_and(|app| {
+                    app.window_for_tab(session_for_monitor.tab_id)
+                        == Some(session_for_monitor.window_id)
+                        && app.tab(session_for_monitor.tab_id).is_some_and(|tab| {
+                            tab.latest_request == session_for_monitor.failed_request_id
+                                && tab.requested_path.as_deref()
+                                    == Some(session_for_monitor.target.as_path())
+                        })
+                });
+                if !valid {
+                    if let Ok(mut coordinator) = login_state_for_monitor.lock() {
+                        coordinator.cancel_generation(session_for_monitor.generation);
+                    }
+                    return;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        thread::spawn(move || {
+            let result = (|| {
+                if disconnect_first {
+                    platform::windows::network::isolated_force_disconnect_network_share(
+                        &session.target,
+                        &session.cancel,
+                    )?;
+                }
+                platform::windows::network::isolated_connect_network_share(
+                    &session.target,
+                    Some(&username),
+                    Some(&password),
+                    remember,
+                    &session.cancel,
+                )
+            })();
+            auth_done.store(true, std::sync::atomic::Ordering::Release);
+            unsafe { password.as_bytes_mut() }.fill(0);
+            let _ = slint::invoke_from_event_loop(move || {
+                let still_current = login_state
+                    .lock()
+                    .ok()
+                    .is_some_and(|coordinator| coordinator.is_current(session.generation))
+                    && state.lock().ok().is_some_and(|app| {
+                        app.window_for_tab(session.tab_id) == Some(session.window_id)
+                            && app.tab(session.tab_id).is_some_and(|tab| {
+                                tab.latest_request == session.failed_request_id
+                                    && tab.requested_path.as_deref()
+                                        == Some(session.target.as_path())
+                            })
+                    });
+                if !still_current {
+                    let superseded = login_state.lock().ok().is_some_and(|coordinator| {
+                        coordinator
+                            .current
+                            .as_ref()
+                            .is_some_and(|current| current.generation != session.generation)
+                    });
+                    if !superseded && let Some(login) = login_weak.upgrade() {
+                        login.set_password("".into());
+                        login.set_busy(false);
+                        let _ = login.hide();
+                    }
+                    return;
+                }
+                match result {
+                    Ok(_) => {
+                        if let Ok(mut coordinator) = login_state.lock() {
+                            coordinator.finish(session.generation);
+                        }
+                        if let Some(login) = login_weak.upgrade() {
+                            login.set_password("".into());
+                            login.set_busy(false);
+                            login.set_conflict(false);
+                            let _ = login.hide();
+                        }
+                        submit_path_navigation(
+                            &local_sender,
+                            &network_sender,
+                            &state,
+                            session.tab_id,
+                            session.target,
+                            NavigationKind::Refresh,
+                        );
+                        if let Some(target_ui) =
+                            window_ui(session.window_id).or_else(|| owner_weak.upgrade())
+                        {
+                            refresh_ui(
+                                &target_ui,
+                                &WindowSessions::new(state.clone(), session.window_id),
+                            );
+                        }
+                    }
+                    Err(error)
+                        if error.kind
+                            == platform::windows::network::NetworkAuthErrorKind::CredentialConflict =>
+                    {
+                        if let Some(login) = login_weak.upgrade() {
+                            login.set_busy(false);
+                            login.set_conflict(true);
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(login) = login_weak.upgrade() {
+                            login.set_busy(false);
+                            let language = state
+                                .lock()
+                                .map(|app| app.language)
+                                .unwrap_or(Language::Chinese);
+                            login.set_detail_text(network_auth_error_text(error, language).into());
+                        }
+                    }
+                }
+            });
+        });
+    });
 }
 
 fn position_window_centered(
@@ -10990,6 +12366,9 @@ fn spawn_clipboard_worker() -> (
                     platform::windows::clipboard::read_file_list()
                         .map(|clipboard| {
                             clipboard.map(|clipboard| {
+                                let target =
+                                    platform::windows::network::network_drive_to_unc(&target)
+                                        .unwrap_or(target);
                                 let kind = match clipboard.operation {
                                     platform::windows::clipboard::ClipboardOperation::Copy => {
                                         FileOperationKind::Copy
@@ -11002,6 +12381,11 @@ fn spawn_clipboard_worker() -> (
                                     .paths
                                     .into_iter()
                                     .filter_map(|source| {
+                                        let source =
+                                            platform::windows::network::network_drive_to_unc(
+                                                &source,
+                                            )
+                                            .unwrap_or(source);
                                         source.file_name().map(|name| {
                                             OperationItem::pending(
                                                 Some(source.clone()),
@@ -11043,6 +12427,7 @@ fn start_shell_menu_event_pump(
     receiver: mpsc::Receiver<platform::windows::context_menu::ShellMenuEvent>,
     worker: platform::windows::context_menu::ShellMenuWorker,
     directory_sender: mpsc::Sender<DirectoryRequest>,
+    network_directory_sender: mpsc::SyncSender<DirectoryRequest>,
     _quick_menu: SharedQuickMenu,
     state: SharedSessions,
 ) {
@@ -11052,6 +12437,7 @@ fn start_shell_menu_event_pump(
             let weak = weak.clone();
             let worker = worker.clone();
             let directory_sender = directory_sender.clone();
+            let network_directory_sender = network_directory_sender.clone();
             let state = state.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 let (session_id, request_id) = match &event {
@@ -11251,7 +12637,12 @@ fn start_shell_menu_event_pump(
                         } else if let Some(folder) =
                             identity.and_then(|identity| identity.key.folder)
                         {
-                            refresh_affected_tabs(&directory_sender, &state, &[folder]);
+                            refresh_affected_tabs(
+                                &directory_sender,
+                                &network_directory_sender,
+                                &state,
+                                &[folder],
+                            );
                         }
                         let _ =
                             worker.send(platform::windows::context_menu::ShellMenuCommand::Close {
@@ -11315,6 +12706,7 @@ fn start_clipboard_event_pump(
     receiver: mpsc::Receiver<ClipboardEvent>,
     operation_sender: mpsc::Sender<FileOperationRequest>,
     directory_sender: mpsc::Sender<DirectoryRequest>,
+    network_directory_sender: mpsc::SyncSender<DirectoryRequest>,
     state: SharedSessions,
 ) {
     let weak = ui.as_weak();
@@ -11324,6 +12716,7 @@ fn start_clipboard_event_pump(
             let state = state.clone();
             let operation_sender = operation_sender.clone();
             let directory_sender = directory_sender.clone();
+            let network_directory_sender = network_directory_sender.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 match event {
                     ClipboardEvent::Written {
@@ -11355,6 +12748,7 @@ fn start_clipboard_event_pump(
                                 paths,
                                 generation,
                                 directory_sender.clone(),
+                                network_directory_sender.clone(),
                                 state.clone(),
                             );
                         }
@@ -11378,6 +12772,7 @@ fn monitor_external_cut(
     mut paths: Vec<PathBuf>,
     generation: u64,
     directory_sender: mpsc::Sender<DirectoryRequest>,
+    network_directory_sender: mpsc::SyncSender<DirectoryRequest>,
     state: SharedSessions,
 ) {
     thread::spawn(move || {
@@ -11400,6 +12795,7 @@ fn monitor_external_cut(
             let remaining_for_ui = remaining.clone();
             let parents_for_ui = parents.clone();
             let directory_sender_for_ui = directory_sender.clone();
+            let network_directory_sender_for_ui = network_directory_sender.clone();
             let state_for_ui = state.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 let current = state_for_ui.lock().is_ok_and(|mut app| {
@@ -11410,7 +12806,12 @@ fn monitor_external_cut(
                     true
                 });
                 if current {
-                    refresh_affected_tabs(&directory_sender_for_ui, &state_for_ui, &parents_for_ui);
+                    refresh_affected_tabs(
+                        &directory_sender_for_ui,
+                        &network_directory_sender_for_ui,
+                        &state_for_ui,
+                        &parents_for_ui,
+                    );
                 }
             });
             if remaining.is_empty() {
@@ -11482,17 +12883,54 @@ fn spawn_file_operation_worker() -> (
     mpsc::Receiver<FileOperationEvent>,
 ) {
     let (request_sender, request_receiver) = mpsc::channel::<FileOperationRequest>();
+    let (local_sender, local_receiver) = mpsc::channel::<FileOperationRequest>();
+    let (network_sender, network_receiver) = mpsc::channel::<FileOperationRequest>();
     let (event_sender, event_receiver) = mpsc::channel::<FileOperationEvent>();
+    let conflict_gate = Arc::new(Mutex::new(()));
+    let dispatcher_event_sender = event_sender.clone();
     thread::spawn(move || {
         while let Ok(request) = request_receiver.recv() {
-            let mut succeeded = Vec::new();
-            let mut skipped = Vec::new();
-            let mut failed = Vec::new();
-            let mut affected = Vec::new();
-            let mut indexed_states = Vec::new();
-            let mut completed_targets = Vec::new();
-            let started = Instant::now();
-            let totals = request
+            let sender = match request.resource {
+                OperationResource::Local => &local_sender,
+                OperationResource::Network => &network_sender,
+            };
+            if sender.send(request).is_err() {
+                break;
+            }
+        }
+    });
+    run_file_operation_worker(local_receiver, event_sender.clone(), conflict_gate.clone());
+    run_file_operation_worker(network_receiver, dispatcher_event_sender, conflict_gate);
+    (request_sender, event_receiver)
+}
+
+fn run_file_operation_worker(
+    receiver: mpsc::Receiver<FileOperationRequest>,
+    event_sender: mpsc::Sender<FileOperationEvent>,
+    conflict_gate: Arc<Mutex<()>>,
+) {
+    thread::spawn(move || {
+        while let Ok(request) = receiver.recv() {
+            execute_file_operation_request(request, &event_sender, &conflict_gate);
+        }
+    });
+}
+
+fn execute_file_operation_request(
+    request: FileOperationRequest,
+    event_sender: &mpsc::Sender<FileOperationEvent>,
+    conflict_gate: &Arc<Mutex<()>>,
+) {
+    let mut succeeded = Vec::new();
+    let mut skipped = Vec::new();
+    let mut failed = Vec::new();
+    let mut affected = Vec::new();
+    let mut indexed_states = Vec::new();
+    let mut completed_targets = Vec::new();
+    let started = Instant::now();
+    let totals = (request.resource == OperationResource::Local)
+        .then(|| {
+            request
                 .items
                 .iter()
                 .filter(|item| item.state == ItemState::Pending)
@@ -11504,138 +12942,138 @@ fn spawn_file_operation_worker() -> (
                             files.saturating_add(next_files),
                         )
                     })
-                });
-            let (total_bytes, total_files) = totals
-                .map(|(bytes, files)| (Some(bytes), Some(files)))
-                .unwrap_or((None, None));
-            let _ = event_sender.send(FileOperationEvent::Progress {
-                id: request.id,
-                completed_items: 0,
-                completed_files: 0,
-                total_files,
-                processed_bytes: 0,
-                total_bytes,
-                current_item: request
-                    .items
-                    .first()
-                    .and_then(|item| item.source.clone().or_else(|| item.destination.clone()))
-                    .unwrap_or_default(),
-                started,
-            });
-            let mut processed_bytes = 0_u64;
-            let mut processed_files = 0_usize;
-            let mut conflict_defaults = HashMap::new();
-            for (item_index, item) in request.items.iter().enumerate() {
-                if item.state != ItemState::Pending {
-                    continue;
+                })
+        })
+        .flatten();
+    let (total_bytes, total_files) = totals
+        .map(|(bytes, files)| (Some(bytes), Some(files)))
+        .unwrap_or((None, None));
+    let _ = event_sender.send(FileOperationEvent::Progress {
+        id: request.id,
+        completed_items: 0,
+        completed_files: 0,
+        total_files,
+        processed_bytes: 0,
+        total_bytes,
+        current_item: request
+            .items
+            .first()
+            .and_then(|item| item.source.clone().or_else(|| item.destination.clone()))
+            .unwrap_or_default(),
+        started,
+    });
+    let mut processed_bytes = 0_u64;
+    let mut processed_files = 0_usize;
+    let mut conflict_defaults = HashMap::new();
+    for (item_index, item) in request.items.iter().enumerate() {
+        if item.state != ItemState::Pending {
+            continue;
+        }
+        if request.cancellation.is_cancelled() {
+            indexed_states.push((item_index, ItemState::Cancelled, None));
+            continue;
+        }
+        let destination_was_existing_directory = request.resource == OperationResource::Local
+            && item.source != item.destination
+            && item
+                .source
+                .as_deref()
+                .and_then(|path| std::fs::symlink_metadata(path).ok())
+                .is_some_and(|metadata| metadata.file_type().is_dir())
+            && item
+                .destination
+                .as_deref()
+                .and_then(|path| std::fs::symlink_metadata(path).ok())
+                .is_some_and(|metadata| metadata.file_type().is_dir());
+        let outcome = execute_file_operation_item(
+            request.id,
+            request.kind,
+            item,
+            &request.cancellation,
+            event_sender,
+            item_index,
+            processed_bytes,
+            processed_files,
+            total_bytes,
+            total_files,
+            started,
+            &mut conflict_defaults,
+            conflict_gate,
+        );
+        match outcome {
+            Ok(report) => {
+                processed_bytes = processed_bytes.saturating_add(report.bytes);
+                processed_files = processed_files.saturating_add(report.files);
+                if report.skipped.is_empty()
+                    && let Some(target) = completed_target_for_item(
+                        item,
+                        &report.completed_paths,
+                        destination_was_existing_directory,
+                    )
+                    && !completed_targets.contains(&target)
+                {
+                    completed_targets.push(target);
                 }
-                if request.cancellation.is_cancelled() {
-                    indexed_states.push((item_index, ItemState::Cancelled, None));
-                    continue;
-                }
-                let destination_was_existing_directory = item.source != item.destination
-                    && item
-                        .source
-                        .as_deref()
-                        .and_then(|path| std::fs::symlink_metadata(path).ok())
-                        .is_some_and(|metadata| metadata.file_type().is_dir())
-                    && item
-                        .destination
-                        .as_deref()
-                        .and_then(|path| std::fs::symlink_metadata(path).ok())
-                        .is_some_and(|metadata| metadata.file_type().is_dir());
-                let outcome = execute_file_operation_item(
-                    request.id,
-                    request.kind,
-                    item,
-                    &request.cancellation,
-                    &event_sender,
-                    item_index,
-                    processed_bytes,
-                    processed_files,
-                    total_bytes,
+                let current_item = item
+                    .source
+                    .clone()
+                    .or_else(|| item.destination.clone())
+                    .unwrap_or_default();
+                let _ = event_sender.send(FileOperationEvent::Progress {
+                    id: request.id,
+                    completed_items: item_index + 1,
+                    completed_files: processed_files,
                     total_files,
+                    processed_bytes,
+                    total_bytes,
+                    current_item,
                     started,
-                    &mut conflict_defaults,
-                );
-                match outcome {
-                    Ok(report) => {
-                        processed_bytes = processed_bytes.saturating_add(report.bytes);
-                        processed_files = processed_files.saturating_add(report.files);
-                        if report.skipped.is_empty()
-                            && let Some(target) = completed_target_for_item(
-                                item,
-                                &report.completed_paths,
-                                destination_was_existing_directory,
-                            )
-                            && !completed_targets.contains(&target)
-                        {
-                            completed_targets.push(target);
-                        }
-                        let current_item = item
-                            .source
-                            .clone()
-                            .or_else(|| item.destination.clone())
-                            .unwrap_or_default();
-                        let _ = event_sender.send(FileOperationEvent::Progress {
-                            id: request.id,
-                            completed_items: item_index + 1,
-                            completed_files: processed_files,
-                            total_files,
-                            processed_bytes,
-                            total_bytes,
-                            current_item,
-                            started,
-                        });
-                        let identity = item
-                            .destination
-                            .clone()
-                            .or_else(|| item.source.clone())
-                            .unwrap_or_default();
-                        if report.skipped.is_empty() {
-                            succeeded.push(identity);
-                            indexed_states.push((item_index, ItemState::Succeeded, None));
-                        } else {
-                            skipped.extend(report.skipped);
-                            indexed_states.push((item_index, ItemState::Skipped, None));
-                        }
-                        for directory in report.affected_directories {
-                            if !affected.contains(&directory) {
-                                affected.push(directory);
-                            }
-                        }
-                    }
-                    Err(message) => {
-                        let identity = item
-                            .source
-                            .clone()
-                            .or_else(|| item.destination.clone())
-                            .unwrap_or_default();
-                        if request.cancellation.is_cancelled() {
-                            indexed_states.push((item_index, ItemState::Cancelled, None));
-                        } else {
-                            failed.push((identity, message.clone()));
-                            indexed_states.push((item_index, ItemState::Failed, Some(message)));
-                        }
+                });
+                let identity = item
+                    .destination
+                    .clone()
+                    .or_else(|| item.source.clone())
+                    .unwrap_or_default();
+                if report.skipped.is_empty() {
+                    succeeded.push(identity);
+                    indexed_states.push((item_index, ItemState::Succeeded, None));
+                } else {
+                    skipped.extend(report.skipped);
+                    indexed_states.push((item_index, ItemState::Skipped, None));
+                }
+                for directory in report.affected_directories {
+                    if !affected.contains(&directory) {
+                        affected.push(directory);
                     }
                 }
             }
-            let _ = event_sender.send(FileOperationEvent::Finished {
-                id: request.id,
-                result: OperationResult {
-                    succeeded,
-                    skipped,
-                    failed,
-                    affected_directories: affected,
-                },
-                item_states: indexed_states,
-                completed_targets,
-            });
+            Err(message) => {
+                let identity = item
+                    .source
+                    .clone()
+                    .or_else(|| item.destination.clone())
+                    .unwrap_or_default();
+                if request.cancellation.is_cancelled() {
+                    indexed_states.push((item_index, ItemState::Cancelled, None));
+                } else {
+                    failed.push((identity, message.clone()));
+                    indexed_states.push((item_index, ItemState::Failed, Some(message)));
+                }
+            }
         }
+    }
+    let _ = event_sender.send(FileOperationEvent::Finished {
+        id: request.id,
+        result: OperationResult {
+            succeeded,
+            skipped,
+            failed,
+            affected_directories: affected,
+        },
+        item_states: indexed_states,
+        completed_targets,
     });
-    (request_sender, event_receiver)
 }
-
 fn tree_totals(
     path: &Path,
     cancellation: &crate::domain::file_operations::CancellationToken,
@@ -11693,8 +13131,47 @@ fn execute_file_operation_item(
         crate::domain::file_operations::ConflictCategory,
         crate::domain::file_operations::ConflictAction,
     >,
+    conflict_gate: &Arc<Mutex<()>>,
 ) -> Result<crate::fs::file_operations::FileOperationReport, String> {
+    if [item.source.as_deref(), item.destination.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(crate::network::is_unc_path)
+        && matches!(
+            kind,
+            FileOperationKind::CreateFolder | FileOperationKind::Rename
+        )
+    {
+        let isolated_kind = match kind {
+            FileOperationKind::CreateFolder => {
+                platform::windows::network::IsolatedFileMutationKind::CreateFolder
+            }
+            FileOperationKind::Rename => {
+                platform::windows::network::IsolatedFileMutationKind::Rename
+            }
+            _ => unreachable!(),
+        };
+        let result = platform::windows::network::isolated_file_mutation(
+            isolated_kind,
+            item.source.as_deref(),
+            item.destination.as_deref(),
+            cancel.cancellation_flag(),
+        )
+        .map_err(|error| error.to_string())?;
+        return Ok(crate::fs::file_operations::FileOperationReport {
+            files: usize::from(kind != FileOperationKind::CreateFolder),
+            directories: usize::from(kind == FileOperationKind::CreateFolder),
+            bytes: 0,
+            skipped: Vec::new(),
+            affected_directories: result.affected_directories,
+            cleanup_pending: None,
+            completed_paths: result.completed_path.into_iter().collect(),
+        });
+    }
     let replace = &mut |category, source: &Path, destination: &Path| {
+        let _conflict_gate = conflict_gate
+            .lock()
+            .expect("conflict gate mutex is not poisoned");
         if let Some(action) = conflict_defaults.get(&category).copied() {
             return action;
         }
@@ -11902,6 +13379,7 @@ fn start_file_operation_event_pump(
     receiver: mpsc::Receiver<FileOperationEvent>,
     sender: mpsc::Sender<FileOperationRequest>,
     directory_sender: mpsc::Sender<DirectoryRequest>,
+    network_directory_sender: mpsc::SyncSender<DirectoryRequest>,
     state: SharedSessions,
 ) {
     let weak = ui.as_weak();
@@ -11918,6 +13396,7 @@ fn start_file_operation_event_pump(
             let exit_weak = exit_weak.clone();
             let sender = sender.clone();
             let directory_sender = directory_sender.clone();
+            let network_directory_sender = network_directory_sender.clone();
             let state = state.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 let event_operation_id = match &event {
@@ -11930,7 +13409,12 @@ fn start_file_operation_event_pump(
                     FileOperationEvent::DestinationCreated { path, .. } => {
                         let parent = path.parent().map(Path::to_path_buf);
                         if let Some(parent) = parent {
-                            refresh_affected_tabs(&directory_sender, &state, &[parent]);
+                            refresh_affected_tabs(
+                                &directory_sender,
+                                &network_directory_sender,
+                                &state,
+                                &[parent],
+                            );
                         }
                     }
                     FileOperationEvent::Progress {
@@ -11988,62 +13472,71 @@ fn start_file_operation_event_pump(
                         item_states,
                         completed_targets,
                     } => {
-                        let (affected, next) =
-                            {
-                                let mut app =
-                                    state.lock().expect("app state mutex is not poisoned");
-                                if let Some(task) = app.operations.task_mut(id) {
-                                    for (index, status, error) in item_states {
-                                        if let Some(item) = task.items.get_mut(index) {
-                                            item.state = status;
-                                            item.error = error;
-                                        }
+                        let (affected, next) = {
+                            let mut app = state.lock().expect("app state mutex is not poisoned");
+                            if let Some(task) = app.operations.task_mut(id) {
+                                for (index, status, error) in item_states {
+                                    if let Some(item) = task.items.get_mut(index) {
+                                        item.state = status;
+                                        item.error = error;
                                     }
                                 }
-                                let cancelled = app
-                                    .operations
-                                    .task(id)
-                                    .is_some_and(|task| task.cancellation.is_cancelled());
-                                let terminal = if cancelled
-                                    && result.succeeded.is_empty()
-                                    && result.failed.is_empty()
-                                {
-                                    OperationState::Cancelled
-                                } else if cancelled
-                                    || (!result.failed.is_empty() && !result.succeeded.is_empty())
-                                {
-                                    OperationState::PartiallyCompleted
-                                } else if result.failed.is_empty() {
-                                    OperationState::Completed
-                                } else {
-                                    OperationState::Failed
-                                };
-                                let affected = result.affected_directories.clone();
-                                app.conflict_responses.remove(&id);
-                                queue_completed_focus(&mut app, &completed_targets);
-                                let _ = app.operations.finish(id, terminal, result);
-                                if cancelled {
-                                    app.operations.remove_terminal(id);
-                                }
-                                let next = app.operations.start_next().ok().flatten().and_then(
-                                    |next_id| {
-                                        let _ = app.operations.mark_running(next_id);
-                                        app.operations.task(next_id).map(|task| {
-                                            FileOperationRequest {
-                                                id: next_id,
-                                                kind: task.kind,
-                                                items: task.items.clone(),
-                                                cancellation: task.cancellation.clone(),
-                                            }
-                                        })
-                                    },
-                                );
-                                (affected, next)
+                            }
+                            let cancelled = app
+                                .operations
+                                .task(id)
+                                .is_some_and(|task| task.cancellation.is_cancelled());
+                            let terminal = if cancelled
+                                && result.succeeded.is_empty()
+                                && result.failed.is_empty()
+                            {
+                                OperationState::Cancelled
+                            } else if cancelled
+                                || (!result.failed.is_empty() && !result.succeeded.is_empty())
+                            {
+                                OperationState::PartiallyCompleted
+                            } else if result.failed.is_empty() {
+                                OperationState::Completed
+                            } else {
+                                OperationState::Failed
                             };
+                            let affected = result.affected_directories.clone();
+                            let resource = app
+                                .operations
+                                .task(id)
+                                .map(|task| task.resource)
+                                .unwrap_or(OperationResource::Local);
+                            app.conflict_responses.remove(&id);
+                            queue_completed_focus(&mut app, &completed_targets);
+                            let _ = app.operations.finish(id, terminal, result);
+                            if cancelled {
+                                app.operations.remove_terminal(id);
+                            }
+                            let next = app.operations.start_next(resource).ok().flatten().and_then(
+                                |next_id| {
+                                    let _ = app.operations.mark_running(next_id);
+                                    app.operations
+                                        .task(next_id)
+                                        .map(|task| FileOperationRequest {
+                                            id: next_id,
+                                            kind: task.kind,
+                                            resource: task.resource,
+                                            items: task.items.clone(),
+                                            cancellation: task.cancellation.clone(),
+                                        })
+                                },
+                            );
+                            (affected, next)
+                        };
                         if let Some(request) = next {
                             let _ = sender.send(request);
                         }
-                        refresh_affected_tabs(&directory_sender, &state, &affected);
+                        refresh_affected_tabs(
+                            &directory_sender,
+                            &network_directory_sender,
+                            &state,
+                            &affected,
+                        );
                     }
                 }
                 if let Some(ui) = weak.upgrade() {
@@ -12190,7 +13683,31 @@ fn start_directory_watchers(
             let sender_for_ui = directory_sender.clone();
             let state_for_ui = state.clone();
             let _ = slint::invoke_from_event_loop(move || {
-                refresh_affected_tabs(&sender_for_ui, &state_for_ui, &roots);
+                // Network paths are excluded from watched_roots, so this refresh cannot reach SMB.
+                for root in &roots {
+                    let targets = {
+                        let app = state_for_ui
+                            .lock()
+                            .expect("app state mutex is not poisoned");
+                        app.windows
+                            .values()
+                            .flat_map(|window| window.tabs.values())
+                            .filter_map(|tab| {
+                                (tab.visible_path() == Some(root.as_path()))
+                                    .then_some((tab.id, root.clone()))
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    for (tab, path) in targets {
+                        submit_navigation(
+                            &sender_for_ui,
+                            &state_for_ui,
+                            tab,
+                            path,
+                            NavigationKind::Refresh,
+                        );
+                    }
+                }
             });
         }
     });
@@ -12200,7 +13717,11 @@ fn watched_roots(app: &AppState) -> std::collections::HashSet<PathBuf> {
     app.windows
         .values()
         .flat_map(|window| window.tabs.values())
-        .filter_map(|tab| tab.visible_path().map(Path::to_path_buf))
+        .filter_map(|tab| {
+            tab.visible_path()
+                .filter(|path| !crate::network::is_unc_path(path))
+                .map(Path::to_path_buf)
+        })
         .collect()
 }
 
@@ -12214,6 +13735,7 @@ fn watch_event_root(event: platform::windows::directory_watch::DirectoryWatchEve
 }
 fn refresh_affected_tabs(
     sender: &mpsc::Sender<DirectoryRequest>,
+    network_sender: &mpsc::SyncSender<DirectoryRequest>,
     state: &SharedSessions,
     directories: &[PathBuf],
 ) {
@@ -12235,8 +13757,14 @@ fn refresh_affected_tabs(
             .ok()
             .and_then(|mut app| app.focus_after_refresh.remove(&tab))
             .filter(|pending| pending.directory == path);
-        if submit_navigation(sender, state, tab, path.clone(), NavigationKind::Refresh)
-            && let Some(mut pending) = pending
+        if submit_path_navigation(
+            sender,
+            network_sender,
+            state,
+            tab,
+            path.clone(),
+            NavigationKind::Refresh,
+        ) && let Some(mut pending) = pending
             && let Ok(mut app) = state.lock()
         {
             pending.request_id = app.tab(tab).map(|session| session.latest_request);
@@ -12247,26 +13775,33 @@ fn refresh_affected_tabs(
 
 fn prepare_retry(state: &SharedSessions, id: OperationId) -> Option<FileOperationRequest> {
     let mut app = state.lock().ok()?;
+    let resource = app.operations.task(id)?.resource;
     if !app.operations.retry(id) {
         return None;
     }
-    let started = app.operations.start_next().ok().flatten()?;
+    let started = app.operations.start_next(resource).ok().flatten()?;
     app.operations.mark_running(started).ok()?;
     let task = app.operations.task(started)?;
     Some(FileOperationRequest {
         id: started,
         kind: task.kind,
+        resource: task.resource,
         items: task.items.clone(),
         cancellation: task.cancellation.clone(),
     })
 }
 fn spawn_directory_workers(
     worker_count: usize,
+    network_worker_count: usize,
 ) -> (
     mpsc::Sender<DirectoryRequest>,
+    mpsc::SyncSender<DirectoryRequest>,
     mpsc::Receiver<DirectoryEvent>,
 ) {
+    let network_worker_count = network_worker_count.max(1);
     let (request_sender, request_receiver) = mpsc::channel::<DirectoryRequest>();
+    let (network_request_sender, network_request_receiver) =
+        mpsc::sync_channel::<DirectoryRequest>(network_worker_count.saturating_mul(32));
     let request_receiver = Arc::new(Mutex::new(request_receiver));
     let (event_sender, event_receiver) = mpsc::channel::<DirectoryEvent>();
     for _ in 0..worker_count {
@@ -12285,22 +13820,244 @@ fn spawn_directory_workers(
             }
         });
     }
-    (request_sender, event_receiver)
+    spawn_network_directory_scheduler(
+        network_worker_count,
+        network_request_receiver,
+        event_sender.clone(),
+    );
+    (request_sender, network_request_sender, event_receiver)
 }
 
-fn run_directory_request(request: DirectoryRequest, events: &mpsc::Sender<DirectoryEvent>) {
-    let result = read_directory_batches_filtered(
+fn spawn_network_directory_scheduler(
+    worker_count: usize,
+    requests: mpsc::Receiver<DirectoryRequest>,
+    events: mpsc::Sender<DirectoryEvent>,
+) {
+    let (work_sender, work_receiver) = mpsc::channel::<(NetworkExecutionKey, DirectoryRequest)>();
+    let (completion_sender, completion_receiver) = mpsc::channel::<NetworkDirectoryCompletion>();
+    let work_receiver = Arc::new(Mutex::new(work_receiver));
+    for _ in 0..worker_count {
+        let work_receiver = work_receiver.clone();
+        let completion_sender = completion_sender.clone();
+        let events = events.clone();
+        thread::spawn(move || {
+            loop {
+                let work = work_receiver
+                    .lock()
+                    .expect("network directory work receiver mutex is not poisoned")
+                    .recv();
+                let Ok((key, request)) = work else {
+                    break;
+                };
+                let slow_cancel = request.cancel.clone();
+                let slow_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let slow_done_for_timer = slow_done.clone();
+                let slow_events = events.clone();
+                let slow_tab_id = request.tab_id;
+                let slow_request_id = request.request_id;
+                thread::spawn(move || {
+                    let started = Instant::now();
+                    while started.elapsed() < Duration::from_secs(2) {
+                        if slow_cancel.load(std::sync::atomic::Ordering::Acquire)
+                            || slow_done_for_timer.load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    let _ = slow_events.send(DirectoryEvent::Slow {
+                        tab_id: slow_tab_id,
+                        request_id: slow_request_id,
+                    });
+                });
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_directory_request(request, &events);
+                }));
+                slow_done.store(true, std::sync::atomic::Ordering::Release);
+                if outcome.is_err() {
+                    let _ = events.send(DirectoryEvent::Failed {
+                        tab_id: slow_tab_id,
+                        request_id: slow_request_id,
+                        kind: io::ErrorKind::Other,
+                        message: "network directory worker failed unexpectedly".to_owned(),
+                    });
+                }
+                let _ = completion_sender.send(NetworkDirectoryCompletion { key });
+            }
+        });
+    }
+    thread::spawn(move || {
+        let mut scheduler = NetworkDirectoryScheduler::default();
+        let mut input_open = true;
+        while input_open || !scheduler.pending.is_empty() || !scheduler.active.is_empty() {
+            while let Ok(completion) = completion_receiver.try_recv() {
+                scheduler.complete(&completion.key);
+            }
+            for request in scheduler.take_cancelled() {
+                let _ = events.send(DirectoryEvent::Cancelled {
+                    tab_id: request.tab_id,
+                    request_id: request.request_id,
+                });
+            }
+            while scheduler.active.len() < worker_count {
+                let Some(work) = scheduler.next_ready() else {
+                    break;
+                };
+                if work_sender.send(work).is_err() {
+                    return;
+                }
+            }
+            if scheduler.active.len() >= worker_count || !scheduler.pending.is_empty() {
+                match completion_receiver.recv_timeout(Duration::from_millis(20)) {
+                    Ok(completion) => scheduler.complete(&completion.key),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            } else if input_open {
+                match requests.recv_timeout(Duration::from_millis(20)) {
+                    Ok(request) => {
+                        if let Some(key) = NetworkExecutionKey::from_unc(&request.path) {
+                            scheduler.push(key, request);
+                        } else {
+                            let _ = events.send(DirectoryEvent::Failed {
+                                tab_id: request.tab_id,
+                                request_id: request.request_id,
+                                kind: io::ErrorKind::InvalidInput,
+                                message: "network directory request requires a UNC path".to_owned(),
+                            });
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => input_open = false,
+                }
+            }
+            while let Ok(request) = requests.try_recv() {
+                if let Some(key) = NetworkExecutionKey::from_unc(&request.path) {
+                    scheduler.push(key, request);
+                } else {
+                    let _ = events.send(DirectoryEvent::Failed {
+                        tab_id: request.tab_id,
+                        request_id: request.request_id,
+                        kind: io::ErrorKind::InvalidInput,
+                        message: "network directory request requires a UNC path".to_owned(),
+                    });
+                }
+            }
+        }
+    });
+}
+
+fn read_network_root_batches(
+    request: &DirectoryRequest,
+    events: &mpsc::Sender<DirectoryEvent>,
+) -> io::Result<ReadOutcome> {
+    use std::sync::atomic::Ordering;
+
+    if request.cancel.load(Ordering::Acquire) {
+        return Ok(ReadOutcome::Cancelled);
+    }
+    let items = platform::windows::network::isolated_network_root(&request.path, &request.cancel)?;
+    if request.cancel.load(Ordering::Acquire) {
+        return Ok(ReadOutcome::Cancelled);
+    }
+    for (batch_index, items) in items.chunks(32).enumerate() {
+        if request.cancel.load(Ordering::Acquire) {
+            return Ok(ReadOutcome::Cancelled);
+        }
+        let entries = items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let id = batch_index
+                    .saturating_mul(32)
+                    .saturating_add(index)
+                    .saturating_add(1)
+                    .min(u32::MAX as usize) as u32;
+                FileEntry {
+                    id: EntryId(id),
+                    original_name: item
+                        .target
+                        .file_name()
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| item.label.clone().into()),
+                    display_name: item.label.clone(),
+                    name_highlights: Vec::new(),
+                    path: item.target.clone(),
+                    kind: crate::domain::EntryKind::Directory,
+                    open_target: None,
+                    parent_display: display_path(&request.path),
+                    size_bytes: None,
+                    folder_size: FolderSizeState::NotIndexed,
+                    modified: None,
+                    created: None,
+                }
+            })
+            .collect();
+        let _ = events.send(DirectoryEvent::Batch {
+            tab_id: request.tab_id,
+            request_id: request.request_id,
+            entries,
+        });
+    }
+    Ok(ReadOutcome::Complete { skipped: 0 })
+}
+
+fn read_network_directory_batches(
+    request: &DirectoryRequest,
+    events: &mpsc::Sender<DirectoryEvent>,
+) -> io::Result<ReadOutcome> {
+    use std::sync::atomic::Ordering;
+
+    if request.cancel.load(Ordering::Acquire) {
+        return Ok(ReadOutcome::Cancelled);
+    }
+    let (entries, skipped) = platform::windows::network::isolated_directory(
         &request.path,
-        &request.cancel,
         request.visibility,
-        |entries| {
-            let _ = events.send(DirectoryEvent::Batch {
-                tab_id: request.tab_id,
-                request_id: request.request_id,
-                entries,
-            });
-        },
-    );
+        &request.cancel,
+    )?;
+    if request.cancel.load(Ordering::Acquire) {
+        return Ok(ReadOutcome::Cancelled);
+    }
+    let first = entries.len().min(32);
+    if first > 0 {
+        let _ = events.send(DirectoryEvent::Batch {
+            tab_id: request.tab_id,
+            request_id: request.request_id,
+            entries: entries[..first].to_vec(),
+        });
+    }
+    for batch in entries[first..].chunks(256) {
+        if request.cancel.load(Ordering::Acquire) {
+            return Ok(ReadOutcome::Cancelled);
+        }
+        let _ = events.send(DirectoryEvent::Batch {
+            tab_id: request.tab_id,
+            request_id: request.request_id,
+            entries: batch.to_vec(),
+        });
+    }
+    Ok(ReadOutcome::Complete { skipped })
+}
+fn run_directory_request(request: DirectoryRequest, events: &mpsc::Sender<DirectoryEvent>) {
+    let result = if crate::network::is_unc_server_root(&request.path) {
+        read_network_root_batches(&request, events)
+    } else if crate::network::is_unc_path(&request.path) {
+        read_network_directory_batches(&request, events)
+    } else {
+        read_directory_batches_filtered(
+            &request.path,
+            &request.cancel,
+            request.visibility,
+            |entries| {
+                let _ = events.send(DirectoryEvent::Batch {
+                    tab_id: request.tab_id,
+                    request_id: request.request_id,
+                    entries,
+                });
+            },
+        )
+    };
     let event = match result {
         Ok(ReadOutcome::Complete { skipped }) => DirectoryEvent::Finished {
             tab_id: request.tab_id,
@@ -12344,12 +14101,7 @@ fn start_event_pump(
             let everything_sender = everything_sender.clone();
             if weak
                 .upgrade_in_event_loop(move |ui| {
-                    let routed_tab = match &event {
-                        DirectoryEvent::Batch { tab_id, .. }
-                        | DirectoryEvent::Finished { tab_id, .. }
-                        | DirectoryEvent::Failed { tab_id, .. }
-                        | DirectoryEvent::Cancelled { tab_id, .. } => Some(*tab_id),
-                    };
+                    let routed_tab = Some(event.request_identity().0);
                     let batch = match &event {
                         DirectoryEvent::Batch {
                             tab_id, request_id, ..
@@ -12362,9 +14114,18 @@ fn start_event_pump(
                         } => Some((*tab_id, *request_id)),
                         _ => None,
                     };
+                    let network_tab = routed_tab.is_some_and(|tab_id| {
+                        state.lock().ok().is_some_and(|app| {
+                            app.tab(tab_id)
+                                .and_then(TabSession::visible_path)
+                                .is_some_and(crate::network::is_unc_path)
+                        })
+                    });
                     let icon_requests = apply_event(&state, event);
-                    for request in icon_requests {
-                        let _ = icon_sender.send(request);
+                    if !network_tab {
+                        for request in icon_requests {
+                            let _ = icon_sender.send(request);
+                        }
                     }
                     if let Some((tab_id, request_id)) = batch {
                         if let Some(window_id) =
@@ -12380,9 +14141,11 @@ fn start_event_pump(
                         } else {
                             append_active_file_rows(&ui, &state, tab_id, request_id);
                         }
-                        defer_grid_thumbnails(state.clone(), tab_id, icon_sender.clone());
+                        if !network_tab {
+                            defer_grid_thumbnails(state.clone(), tab_id, icon_sender.clone());
+                        }
                     } else {
-                        if let Some((tab_id, request_id)) = finished {
+                        if let Some((tab_id, request_id)) = finished.filter(|_| !network_tab) {
                             let viewport = state
                                 .lock()
                                 .ok()
@@ -12561,6 +14324,14 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                 tab.discard_pending();
                 tab.load_state = classify_error(kind);
                 tab.error = Some(message);
+            }
+        }
+        DirectoryEvent::Slow { tab_id, request_id } => {
+            if let Some(tab) = app.tab_mut(tab_id)
+                && tab.accepts(request_id)
+                && tab.load_state == LoadState::Loading
+            {
+                tab.error = Some("network_slow".to_owned());
             }
         }
     }
@@ -13622,6 +15393,9 @@ fn start_sidebar_icon_loader(ui: &AppWindow, state: SharedSessions) {
     thread::spawn(move || {
         let _shell_apartment = platform::windows_shell_icons::initialize_shell_worker().ok();
         for path in locations {
+            if crate::network::is_unc_path(&path) {
+                continue;
+            }
             let Ok(icon) = platform::windows_shell_icons::shell_icon_rgba(&path) else {
                 continue;
             };
@@ -13663,6 +15437,198 @@ fn start_sidebar_loader(ui: &AppWindow, state: SharedSessions) {
     });
 }
 
+fn start_network_location_loader(ui: &AppWindow, state: SharedSessions) {
+    let weak = ui.as_weak();
+    thread::spawn(move || {
+        let imported = platform::windows::network::enumerate_network_locations()
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(index, location)| NetworkLocation {
+                id: stable_network_location_id(&location.shell_path),
+                source: NetworkLocationSource::WindowsImported,
+                display_name: location.label,
+                sort_order: index as u32,
+                target: location
+                    .target
+                    .map(NetworkTarget::WindowsPath)
+                    .or_else(|| location.shell_identity.map(NetworkTarget::ShellItemId))
+                    .expect("Windows network location retains an executable identity"),
+            })
+            .collect::<Vec<_>>();
+        let state_for_ui = state.clone();
+        let _ = weak.upgrade_in_event_loop(move |_ui| {
+            if let Ok(mut app) = state_for_ui.lock() {
+                app.imported_network_locations = imported;
+            }
+            refresh_all_windows(&state_for_ui);
+        });
+    });
+}
+
+fn stable_network_location_id(path: &Path) -> u64 {
+    use std::os::windows::ffi::OsStrExt;
+
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        })
+}
+
+fn spawn_network_discovery_worker() -> (
+    mpsc::SyncSender<NetworkDiscoveryRequest>,
+    mpsc::Receiver<NetworkDiscoveryEvent>,
+) {
+    let (request_sender, request_receiver) = mpsc::sync_channel(1);
+    let (event_sender, event_receiver) = mpsc::channel();
+    thread::spawn(move || {
+        while let Ok(request) = request_receiver.recv() {
+            run_network_discovery(request, &event_sender);
+        }
+    });
+    (request_sender, event_receiver)
+}
+
+fn run_network_discovery(
+    request: NetworkDiscoveryRequest,
+    event_sender: &mpsc::Sender<NetworkDiscoveryEvent>,
+) {
+    let NetworkDiscoveryRequest::Discover {
+        window_id,
+        request_id,
+        cancel,
+    } = request;
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let result = platform::windows::network::isolated_network_devices(&cancel);
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    match result {
+        Ok(devices) => {
+            for batch in devices.chunks(16) {
+                if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                let devices = batch
+                    .iter()
+                    .map(|device| NetworkDeviceTarget {
+                        id: crate::network::network_device_id(&device.target),
+                        display_name: device.label.clone(),
+                        shell_identity: None,
+                        unc_path: crate::network::is_unc_path(&device.target)
+                            .then(|| device.target.clone()),
+                    })
+                    .collect();
+                let _ = event_sender.send(NetworkDiscoveryEvent::Batch {
+                    window_id,
+                    request_id,
+                    devices,
+                });
+            }
+            let _ = event_sender.send(NetworkDiscoveryEvent::Finished {
+                window_id,
+                request_id,
+            });
+        }
+        Err(error) => {
+            let _ = event_sender.send(NetworkDiscoveryEvent::Failed {
+                window_id,
+                request_id,
+                error: crate::network::classify_network_error(&error),
+            });
+        }
+    }
+}
+
+fn network_error_text(error: crate::network::NetworkErrorKind, language: Language) -> &'static str {
+    use crate::network::NetworkErrorKind;
+    match (language, error) {
+        (Language::Chinese, NetworkErrorKind::PermissionDenied) => {
+            "无权访问 Windows 网络设备，点击重试"
+        }
+        (Language::Chinese, NetworkErrorKind::TimedOut) => "获取网络设备超时，点击重试",
+        (Language::Chinese, NetworkErrorKind::Disconnected) => "网络不可用，点击重试",
+        (Language::Chinese, _) => "无法获取 Windows 网络设备，点击重试",
+        (Language::English, NetworkErrorKind::PermissionDenied) => {
+            "Windows network access was denied. Click to retry"
+        }
+        (Language::English, NetworkErrorKind::TimedOut) => {
+            "Network discovery timed out. Click to retry"
+        }
+        (Language::English, NetworkErrorKind::Disconnected) => {
+            "The network is unavailable. Click to retry"
+        }
+        (Language::English, _) => "Unable to discover Windows network devices. Click to retry",
+    }
+}
+fn start_network_discovery_event_pump(
+    ui: &AppWindow,
+    receiver: mpsc::Receiver<NetworkDiscoveryEvent>,
+    state: SharedSessions,
+) {
+    let weak = ui.as_weak();
+    thread::spawn(move || {
+        while let Ok(event) = receiver.recv() {
+            let state = state.clone();
+            let _ = weak.upgrade_in_event_loop(move |_ui| {
+                let mut error_message = None;
+                if let Ok(mut app) = state.lock() {
+                    match event {
+                        NetworkDiscoveryEvent::Batch {
+                            window_id,
+                            request_id,
+                            devices,
+                        } => {
+                            let accepted = app
+                                .network_discovery
+                                .get_mut(&window_id)
+                                .is_some_and(|coordinator| coordinator.append(request_id, devices));
+                            if accepted {
+                                app.network_discovery_errors.remove(&window_id);
+                            }
+                        }
+                        NetworkDiscoveryEvent::Finished {
+                            window_id,
+                            request_id,
+                        } => {
+                            let accepted = app
+                                .network_discovery
+                                .get_mut(&window_id)
+                                .is_some_and(|coordinator| coordinator.finish(request_id));
+                            if accepted {
+                                app.network_discovery_errors.remove(&window_id);
+                            }
+                        }
+                        NetworkDiscoveryEvent::Failed {
+                            window_id,
+                            request_id,
+                            error,
+                        } => {
+                            if let Some(coordinator) = app.network_discovery.get_mut(&window_id)
+                                && coordinator.fail(request_id, error)
+                            {
+                                let message = network_error_text(error, app.language).to_owned();
+                                app.network_discovery_errors.insert(window_id, message);
+                                error_message = Some((window_id, error));
+                            }
+                        }
+                    }
+                }
+                if let Some((window_id, kind)) = error_message {
+                    eprintln!(
+                        "{{\"event\":\"network_discovery_failed\",\"window\":{},\"kind\":{:?}}}",
+                        window_id.0, kind
+                    );
+                }
+                refresh_all_windows(&state);
+            });
+        }
+    });
+}
 fn start_icon_event_pump(
     ui: &AppWindow,
     receiver: mpsc::Receiver<IconEvent>,
@@ -14432,6 +16398,7 @@ fn directory_display_entries(tab: &TabSession) -> &[FileEntry] {
 fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
     let app = state.lock().expect("app state mutex is not poisoned");
     let texts = Texts::new(app.language);
+    let window_id = app.active_window;
     let tab = app.active();
     if let Some(window_id) = window_id_for_ui(ui) {
         let request_id = tab.latest_request;
@@ -14556,7 +16523,23 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
     ui.set_search_recursive(tab.search_depth == SearchDepth::Recursive);
 
     ui.set_status_text(status_text(tab, texts).into());
-    let (error_page_title, error_page_description) = if tab.page_source == PageSource::Search {
+    let network_permission = tab.load_state == LoadState::PermissionDenied
+        && tab
+            .requested_path
+            .as_deref()
+            .is_some_and(crate::network::is_unc_path);
+    let (error_page_title, error_page_description) = if network_permission {
+        match app.language {
+            Language::Chinese => (
+                "需要登录此网络位置",
+                "Windows 当前凭据无法访问此位置。登录后会重新读取当前标签页。",
+            ),
+            Language::English => (
+                "Sign-in required",
+                "The current Windows credentials cannot access this location. The tab will retry after sign-in.",
+            ),
+        }
+    } else if tab.page_source == PageSource::Search {
         search_error_page_text(tab.search_state, texts)
     } else {
         error_page_text(tab.load_state, texts)
@@ -14635,33 +16618,105 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
             })
             .collect::<Vec<_>>(),
     )));
-    ui.set_sidebar_items(ModelRc::new(VecModel::from(
-        app.sidebar
-            .iter()
-            .enumerate()
-            .map(|(index, location)| SidebarRow {
-                index: index as i32,
-                label: match (app.language, location.kind) {
-                    (Language::Chinese, KnownLocationKind::Home) => "主页",
-                    (Language::English, KnownLocationKind::Home) => "Home",
-                    (_, KnownLocationKind::Pinned) => location.label.as_str(),
-                    (_, KnownLocationKind::Drive) => location.label.as_str(),
+    let mut sidebar_rows = app
+        .sidebar
+        .iter()
+        .enumerate()
+        .map(|(index, location)| SidebarRow {
+            index: index as i32,
+            stable_id: "".into(),
+            label: match (app.language, location.kind) {
+                (Language::Chinese, KnownLocationKind::Home) => "主页",
+                (Language::English, KnownLocationKind::Home) => "Home",
+                (_, KnownLocationKind::Pinned | KnownLocationKind::Drive) => {
+                    location.label.as_str()
                 }
-                .into(),
-                icon_kind: match location.kind {
-                    KnownLocationKind::Home => 0,
-                    KnownLocationKind::Drive => 7,
-                    KnownLocationKind::Pinned => 3,
-                },
-                is_drive: location.kind == KnownLocationKind::Drive,
-                icon: app
-                    .sidebar_icons
-                    .get(&location.path)
-                    .map(shell_icon_image)
-                    .unwrap_or_default(),
-            })
-            .collect::<Vec<_>>(),
-    )));
+            }
+            .into(),
+            icon_kind: match location.kind {
+                KnownLocationKind::Home => 0,
+                KnownLocationKind::Drive => 7,
+                KnownLocationKind::Pinned => 3,
+            },
+            is_drive: location.kind == KnownLocationKind::Drive,
+            group_kind: if location.kind == KnownLocationKind::Drive {
+                1
+            } else {
+                0
+            },
+            source_kind: 0,
+            icon: app
+                .sidebar_icons
+                .get(&location.path)
+                .map(shell_icon_image)
+                .unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
+    let mut network_row_index = app.sidebar.len();
+    let mut locations = app
+        .imported_network_locations
+        .iter()
+        .chain(app.network_locations.iter())
+        .collect::<Vec<_>>();
+    locations.sort_by_key(|location| location.sort_order);
+    for location in locations {
+        let index = network_row_index;
+        network_row_index += 1;
+        sidebar_rows.push(SidebarRow {
+            index: index as i32,
+            stable_id: location.id.to_string().into(),
+            label: location.display_name.clone().into(),
+            icon_kind: 7,
+            group_kind: 2,
+            source_kind: if location.source == NetworkLocationSource::WindowsImported {
+                1
+            } else {
+                2
+            },
+            is_drive: false,
+            icon: app
+                .sidebar_icons
+                .get(match &location.target {
+                    NetworkTarget::WindowsPath(path) | NetworkTarget::ShellItemId(path) => path,
+                })
+                .map(shell_icon_image)
+                .unwrap_or_default(),
+        });
+    }
+    if let Some(discovery) = app.network_discovery.get(&window_id) {
+        for device in discovery.devices() {
+            let Some(_path) = crate::network::device_root_target(device) else {
+                continue;
+            };
+            let index = network_row_index;
+            network_row_index += 1;
+            sidebar_rows.push(SidebarRow {
+                index: index as i32,
+                stable_id: "".into(),
+                label: device.display_name.clone().into(),
+                icon_kind: 7,
+                group_kind: 3,
+                source_kind: 0,
+                is_drive: false,
+                icon: Image::default(),
+            });
+        }
+    }
+    ui.set_sidebar_items(ModelRc::new(VecModel::from(sidebar_rows)));
+    let discovery_state = app
+        .network_discovery
+        .get(&window_id)
+        .map(DiscoveryCoordinator::state)
+        .unwrap_or(DiscoveryState::Idle);
+    ui.set_network_discovery_loading(discovery_state == DiscoveryState::Discovering);
+    ui.set_network_discovery_empty(discovery_state == DiscoveryState::Empty);
+    ui.set_network_discovery_error(
+        app.network_discovery_errors
+            .get(&window_id)
+            .cloned()
+            .unwrap_or_default()
+            .into(),
+    );
     ui.set_selected_count(tab.selected.len() as i32);
     project_column_layout(ui, tab, &app);
     let (sort_field, sort_direction) = if tab.page_source == PageSource::Search {
@@ -14695,11 +16750,24 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
     } else {
         page_projection.index
     });
-    ui.set_show_request_access(
-        page_projection
-            .visible_page_operations
-            .contains(&agent_debug::PageOperation::RequestWindowsAccess),
-    );
+    let show_request_access = page_projection
+        .visible_page_operations
+        .contains(&agent_debug::PageOperation::RequestWindowsAccess);
+    ui.set_show_request_access(show_request_access);
+    if show_request_access
+        && tab
+            .requested_path
+            .as_deref()
+            .is_some_and(crate::network::is_unc_path)
+    {
+        ui.set_text_request_access(
+            match app.language {
+                Language::Chinese => "登录网络位置",
+                Language::English => "Sign in to network location",
+            }
+            .into(),
+        );
+    }
     ui.set_show_everything_help(
         tab.page_source == PageSource::Search
             && matches!(
@@ -14858,6 +16926,14 @@ fn shell_icon_image(icon: &platform::windows_shell_icons::ShellIconRgba) -> Imag
 }
 
 fn status_text(tab: &TabSession, texts: Texts) -> String {
+    if tab.error.as_deref() == Some("network_slow")
+        && matches!(tab.load_state, LoadState::Loading | LoadState::Partial)
+    {
+        return match texts.language {
+            Language::Chinese => "网络连接较慢，仍在等待…".to_owned(),
+            Language::English => "The network connection is slow. Still waiting…".to_owned(),
+        };
+    }
     if let Some(progress) = tab.folder_sizes.progress()
         && progress.completed < progress.total
     {
@@ -15243,6 +17319,22 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_videos(videos.into());
     ui.set_text_quick_access(quick_access.into());
     ui.set_text_drives(drives.into());
+    match language {
+        Language::Chinese => {
+            ui.set_text_network_locations("网络位置".into());
+            ui.set_text_network("网络".into());
+            ui.set_text_network_discovery_loading("正在发现网络设备…".into());
+            ui.set_text_network_discovery_empty("未发现网络设备".into());
+            ui.set_text_network_discovery_error("网络设备发现失败".into());
+        }
+        Language::English => {
+            ui.set_text_network_locations("Network locations".into());
+            ui.set_text_network("Network".into());
+            ui.set_text_network_discovery_loading("Discovering network devices…".into());
+            ui.set_text_network_discovery_empty("No network devices found".into());
+            ui.set_text_network_discovery_error("Network discovery failed".into());
+        }
+    }
     ui.set_text_name(name.into());
     ui.set_text_type(kind.into());
     ui.set_text_modified(modified.into());
@@ -15355,6 +17447,14 @@ fn display_path(path: &Path) -> String {
     path.as_os_str().to_string_lossy().into_owned()
 }
 
+fn network_location_default_name(path: &Path) -> String {
+    path.file_name()
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string_lossy().into_owned())
+        .or_else(|| crate::network::unc_host_key(path))
+        .unwrap_or_else(|| display_path(path))
+}
+
 fn is_drive_root(path: &Path) -> bool {
     let value = path.as_os_str().to_string_lossy();
     value.len() == 3 && value.as_bytes()[1] == b':' && matches!(value.as_bytes()[2], b'\\' | b'/')
@@ -15369,6 +17469,66 @@ fn initial_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_directory_scheduler_serializes_one_host_and_allows_another() {
+        let mut scheduler = NetworkDirectoryScheduler::default();
+        let server = NetworkExecutionKey::from_unc(Path::new(r"\\server\one")).unwrap();
+        let other = NetworkExecutionKey::from_unc(Path::new(r"\\other\one")).unwrap();
+        scheduler.push(server.clone(), network_directory_request(r"\\server\one"));
+        scheduler.push(server.clone(), network_directory_request(r"\\server\two"));
+        scheduler.push(other.clone(), network_directory_request(r"\\other\one"));
+
+        let (first_key, _) = scheduler.next_ready().unwrap();
+        assert_eq!(first_key, server);
+        let (second_key, _) = scheduler.next_ready().unwrap();
+        assert_eq!(second_key, other);
+        assert!(scheduler.next_ready().is_none());
+
+        scheduler.complete(&first_key);
+        let (third_key, _) = scheduler.next_ready().unwrap();
+        assert_eq!(third_key, server);
+    }
+
+    #[test]
+    fn network_directory_scheduler_discards_cancelled_request() {
+        let mut scheduler = NetworkDirectoryScheduler::default();
+        let key = NetworkExecutionKey::from_unc(Path::new(r"\\server\one")).unwrap();
+        let request = network_directory_request(r"\\server\one");
+        request
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        scheduler.push(key, request);
+        let cancelled = scheduler.take_cancelled();
+        assert_eq!(cancelled.len(), 1);
+        assert!(scheduler.next_ready().is_none());
+    }
+
+    #[test]
+    fn network_login_coordinator_replaces_and_cancels_previous_request() {
+        let mut coordinator = NetworkLoginCoordinator::default();
+        let first = coordinator.begin(
+            WindowId(1),
+            TabId(1),
+            RequestId(1),
+            PathBuf::from(r"\\server\one"),
+        );
+        let second = coordinator.begin(
+            WindowId(2),
+            TabId(2),
+            RequestId(2),
+            PathBuf::from(r"\\server\two"),
+        );
+
+        assert!(first.cancel.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!coordinator.is_current(first.generation));
+        assert!(coordinator.is_current(second.generation));
+        coordinator.cancel_generation(first.generation);
+        assert!(!second.cancel.load(std::sync::atomic::Ordering::Acquire));
+        coordinator.cancel_generation(second.generation);
+        assert!(second.cancel.load(std::sync::atomic::Ordering::Acquire));
+        assert!(coordinator.current.is_none());
+    }
 
     fn test_image(size: u32) -> platform::windows_shell_icons::ShellIconRgba {
         platform::windows_shell_icons::ShellIconRgba {
@@ -16071,6 +18231,7 @@ mod tests {
     fn operation_window_waits_until_conflict_is_resolved_and_runtime_reaches_threshold() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
         let id = app.operations.submit(
+            OperationResource::Local,
             FileOperationKind::Copy,
             None,
             vec![OperationItem::pending(
@@ -16078,7 +18239,7 @@ mod tests {
                 Some(PathBuf::from("b")),
             )],
         );
-        app.operations.start_next().unwrap();
+        app.operations.start_next(OperationResource::Local).unwrap();
         app.operations.mark_running(id).unwrap();
         {
             let task = app.operations.task_mut(id).unwrap();
@@ -16470,6 +18631,7 @@ mod tests {
             .unwrap()
             .begin_navigation(PathBuf::from("two/new"), NavigationKind::Normal);
         let operation = app.operations.submit(
+            OperationResource::Local,
             FileOperationKind::Copy,
             Some(first_tab),
             vec![OperationItem::pending(
@@ -16492,6 +18654,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn closing_window_cancels_and_removes_network_discovery() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
+        let first = app.active_window;
+        let second = app.register_window(vec![PathBuf::from("two")], 0, test_window_placement(160));
+        let (request, cancel) = app.network_discovery.entry(first).or_default().begin();
+        assert_eq!(request, DiscoveryRequestId(1));
+        app.network_discovery_errors
+            .insert(first, "temporary".to_owned());
+
+        assert_eq!(
+            app.close_window(first),
+            Some(WindowCloseDecision::KeepRunning)
+        );
+        assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!app.network_discovery.contains_key(&first));
+        assert!(!app.network_discovery_errors.contains_key(&first));
+        assert!(app.window(second).is_some());
+    }
+    #[test]
+    fn file_operations_use_network_resource_when_either_endpoint_is_unc() {
+        let local = OperationItem::pending(
+            Some(PathBuf::from(r"C:\source.txt")),
+            Some(PathBuf::from(r"D:\target.txt")),
+        );
+        let to_network = OperationItem::pending(
+            Some(PathBuf::from(r"C:\source.txt")),
+            Some(PathBuf::from(r"\\server\share\target.txt")),
+        );
+        let from_network = OperationItem::pending(
+            Some(PathBuf::from(r"\\server\share\source.txt")),
+            Some(PathBuf::from(r"C:\target.txt")),
+        );
+
+        assert_eq!(operation_resource(&[local]), OperationResource::Local);
+        assert_eq!(
+            operation_resource(&[to_network]),
+            OperationResource::Network
+        );
+        assert_eq!(
+            operation_resource(&[from_network]),
+            OperationResource::Network
+        );
+    }
+    #[test]
+    fn network_location_name_prefers_share_or_host() {
+        assert_eq!(
+            network_location_default_name(Path::new(r"\\server\share\folder")),
+            "folder"
+        );
+        assert_eq!(
+            network_location_default_name(Path::new(r"\\server")),
+            "server"
+        );
+    }
     #[test]
     fn directory_events_route_to_non_active_windows_by_global_tab_id() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
@@ -16609,6 +18826,7 @@ mod tests {
         let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
         let first_window = app.active_window;
         let operation = app.operations.submit(
+            OperationResource::Local,
             FileOperationKind::Copy,
             None,
             vec![OperationItem::pending(
@@ -16616,7 +18834,7 @@ mod tests {
                 Some(PathBuf::from("target")),
             )],
         );
-        app.operations.start_next().unwrap();
+        app.operations.start_next(OperationResource::Local).unwrap();
         app.operations.mark_running(operation).unwrap();
         assert_eq!(
             app.request_window_close(first_window),

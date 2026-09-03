@@ -7,7 +7,7 @@ use crate::domain::{
     LoadState, TabId, TabSession,
     file_operations::{
         ConflictCategory, FileOperationKind, FileSnapshot, ItemState, OperationConflict,
-        OperationItem, OperationManager, OperationResult, OperationState,
+        OperationItem, OperationManager, OperationResource, OperationResult, OperationState,
     },
 };
 
@@ -42,6 +42,7 @@ pub enum AgentScenario {
     FolderSizeScheduler,
     QuickMenuSearch,
     QuickMenuPopup,
+    NetworkFoundation,
 }
 
 impl AgentScenario {
@@ -61,6 +62,7 @@ impl AgentScenario {
             Self::FolderSizeScheduler => "folder-size-scheduler",
             Self::QuickMenuSearch => "quick-menu-search",
             Self::QuickMenuPopup => "quick-menu-popup",
+            Self::NetworkFoundation => "network-foundation",
         }
     }
 
@@ -132,6 +134,7 @@ fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
         "folder-size-scheduler" => Ok(AgentScenario::FolderSizeScheduler),
         "quick-menu-search" => Ok(AgentScenario::QuickMenuSearch),
         "quick-menu-popup" => Ok(AgentScenario::QuickMenuPopup),
+        "network-foundation" => Ok(AgentScenario::NetworkFoundation),
         _ => Err(format!("unknown agent scenario: {value}")),
     }
 }
@@ -174,7 +177,8 @@ pub fn apply_scenario(session: &mut TabSession, scenario: AgentScenario) {
         }
         AgentScenario::FolderSizeScheduler
         | AgentScenario::QuickMenuSearch
-        | AgentScenario::QuickMenuPopup => {
+        | AgentScenario::QuickMenuPopup
+        | AgentScenario::NetworkFoundation => {
             session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\FolderSizes"));
             session.load_state = LoadState::Complete;
         }
@@ -208,6 +212,7 @@ struct AgentState {
     visible_page_operations: Vec<&'static str>,
     error_type: Option<&'static str>,
     drag_drop: Option<crate::platform::windows::drag_drop::DragDropState>,
+    network_foundation: Option<&'static str>,
 }
 
 impl AgentState {
@@ -230,6 +235,9 @@ impl AgentState {
             error_type: operation_state.or(projection.error_type),
             drag_drop: (scenario == AgentScenario::DragDropFoundation)
                 .then(|| crate::platform::windows::drag_drop::current_state(0)),
+            network_foundation: (scenario == AgentScenario::NetworkFoundation).then_some(
+                "separate_groups,raw_unc_identity,per_host_directory_limit,bounded_queue,isolated_helper,windows_credentials",
+            ),
         }
     }
 
@@ -273,14 +281,19 @@ impl AgentState {
                 )
             },
         );
+        let network_foundation = self
+            .network_foundation
+            .map(|value| format!("\"{}\"", escape_json(value)))
+            .unwrap_or_else(|| "null".to_owned());
         format!(
-            "{{\n  \"schema_version\": 1,\n  \"scenario\": \"{}\",\n  \"current_path\": \"{}\",\n  \"page_state\": \"{}\",\n  \"visible_page_operations\": [{}],\n  \"error_type\": {},\n  \"drag_drop\": {}\n}}\n",
+            "{{\n  \"schema_version\": 1,\n  \"scenario\": \"{}\",\n  \"current_path\": \"{}\",\n  \"page_state\": \"{}\",\n  \"visible_page_operations\": [{}],\n  \"error_type\": {},\n  \"drag_drop\": {},\n  \"network_foundation\": {}\n}}\n",
             escape_json(self.scenario),
             escape_json(&self.current_path),
             escape_json(self.page_state),
             operations,
             error_type,
             drag_drop,
+            network_foundation,
         )
     }
 }
@@ -299,11 +312,13 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
             | AgentScenario::FolderSizeScheduler
             | AgentScenario::QuickMenuSearch
             | AgentScenario::QuickMenuPopup
+            | AgentScenario::NetworkFoundation
     ) {
         return None;
     }
     let mut manager = OperationManager::new();
     let id = manager.submit(
+        OperationResource::Local,
         FileOperationKind::Copy,
         Some(TabId(1)),
         vec![OperationItem::pending(
@@ -311,7 +326,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
             Some(PathBuf::from(r"C:AgentScenarios	arget.txt")),
         )],
     );
-    let _ = manager.start_next();
+    let _ = manager.start_next(OperationResource::Local);
     let _ = manager.mark_running(id);
     match scenario {
         AgentScenario::FileOperationRunning => {}
@@ -359,6 +374,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
         AgentScenario::FolderSizeScheduler => unreachable!(),
         AgentScenario::QuickMenuSearch => unreachable!(),
         AgentScenario::QuickMenuPopup => unreachable!(),
+        AgentScenario::NetworkFoundation => unreachable!(),
         AgentScenario::PermissionDenied => unreachable!(),
     }
     manager.task(id).map(|task| match task.state {
@@ -490,6 +506,17 @@ mod tests {
         assert!(json.contains("\"lifecycle\":\"unregistered\""));
         assert!(json.contains("\"registered\":false"));
         assert!(json.contains("\"rejection_reason\":\"not_registered\""));
+    }
+
+    #[test]
+    fn exported_network_foundation_state_lists_safety_boundaries() {
+        let mut session = TabSession::new(TabId(1));
+        apply_scenario(&mut session, AgentScenario::NetworkFoundation);
+        let json = AgentState::from_session(&session, AgentScenario::NetworkFoundation).to_json();
+
+        assert!(json.contains("per_host_directory_limit"));
+        assert!(json.contains("isolated_helper"));
+        assert!(json.contains("windows_credentials"));
     }
 
     #[test]
