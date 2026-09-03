@@ -4,6 +4,8 @@ AsterFiles 是一个面向 Windows 的高性能现代文件管理器原型。视
 
 项目开发中。 待进行内容见  issues. 
 
+搜索以及文件夹大小功能依赖 everything，需要有安装everything并在后台运行。 并在本软件的设置中正确配置everything的路径。
+
 ## 启动
 
 ```powershell
