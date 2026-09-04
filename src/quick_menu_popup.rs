@@ -140,6 +140,47 @@ pub fn place_submenu_popup_with_margins(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmenuPlacementRequest {
+    pub anchor_y: i32,
+    pub desired_size: PhysicalSize,
+}
+
+pub fn place_submenu_chain(
+    root_rect: PhysicalRect,
+    requests: &[SubmenuPlacementRequest],
+    work_area: PhysicalRect,
+) -> Vec<PopupPlacement> {
+    let mut parent_rect = root_rect;
+    requests
+        .iter()
+        .map(|request| {
+            let anchored_parent = PhysicalRect::new(
+                parent_rect.x,
+                parent_rect.y.saturating_add(request.anchor_y),
+                parent_rect.width,
+                parent_rect.height,
+            );
+            let placement = place_submenu_popup(anchored_parent, request.desired_size, work_area);
+            parent_rect = placement.rect;
+            placement
+        })
+        .collect()
+}
+
+pub fn stable_root_size(
+    root_rect: PhysicalRect,
+    desired_height: i32,
+    work_area: PhysicalRect,
+) -> PhysicalRect {
+    let available_height = work_area.bottom().saturating_sub(root_rect.y).max(0);
+    PhysicalRect::new(
+        root_rect.x,
+        root_rect.y,
+        root_rect.width,
+        desired_height.clamp(0, available_height),
+    )
+}
 fn normalize_rect(rect: PhysicalRect) -> PhysicalRect {
     PhysicalRect::new(rect.x, rect.y, rect.width.max(0), rect.height.max(0))
 }
@@ -303,7 +344,28 @@ pub fn export_state(path: &Path) -> io::Result<()> {
         PhysicalSize::new(480, 720),
         work_area,
     );
-    let submenu = place_submenu_popup(root.rect, PhysicalSize::new(420, 1200), work_area);
+    let loading_submenu = place_submenu_chain(
+        root.rect,
+        &[SubmenuPlacementRequest {
+            anchor_y: 180,
+            desired_size: PhysicalSize::new(420, 48),
+        }],
+        work_area,
+    );
+    let loaded_submenus = place_submenu_chain(
+        root.rect,
+        &[
+            SubmenuPlacementRequest {
+                anchor_y: 180,
+                desired_size: PhysicalSize::new(420, 1200),
+            },
+            SubmenuPlacementRequest {
+                anchor_y: 120,
+                desired_size: PhysicalSize::new(360, 420),
+            },
+        ],
+        work_area,
+    );
     let identity = MenuSessionId {
         owner_window: WindowId(2),
         tab_id: TabId(7),
@@ -341,8 +403,11 @@ pub fn export_state(path: &Path) -> io::Result<()> {
                 "  \"root_inside_work_area\": {},\n",
                 "  \"root_flipped_horizontal\": {},\n",
                 "  \"root_flipped_vertical\": {},\n",
-                "  \"submenu_inside_work_area\": {},\n",
-                "  \"submenu_height_limited\": {},\n",
+                "  \"root_rect_stable_after_submenu_load\": {},\n",
+                "  \"loading_submenu_inside_work_area\": {},\n",
+                "  \"loaded_submenu_inside_work_area\": {},\n",
+                "  \"loaded_submenu_height_limited\": {},\n",
+                "  \"multilevel_submenu_inside_work_area\": {},\n",
                 "  \"multi_level_branch_added\": {},\n",
                 "  \"cross_window_event_rejected\": {},\n",
                 "  \"stale_request_closed_session\": {},\n",
@@ -356,8 +421,17 @@ pub fn export_state(path: &Path) -> io::Result<()> {
             contains(work_area, root.rect),
             root.horizontal_flipped,
             root.vertical_flipped,
-            contains(work_area, submenu.rect),
-            submenu.height_limited,
+            root.rect
+                == place_root_popup(
+                    PhysicalPoint::new(-80, 1040),
+                    PhysicalSize::new(480, 720),
+                    work_area,
+                )
+                .rect,
+            contains(work_area, loading_submenu[0].rect),
+            contains(work_area, loaded_submenus[0].rect),
+            loaded_submenus[0].height_limited,
+            contains(work_area, loaded_submenus[1].rect),
             branch_added,
             cross_window_rejected,
             stale_request_closed,
@@ -531,6 +605,88 @@ mod tests {
         assert!(placement.height_limited);
     }
 
+    #[test]
+    fn root_size_change_keeps_origin_until_work_area_requires_clamping() {
+        let work_area = PhysicalRect::new(-1920, 0, 1920, 1080);
+        let root = PhysicalRect::new(-800, 400, 320, 220);
+
+        assert_eq!(
+            stable_root_size(root, 500, work_area),
+            PhysicalRect::new(-800, 400, 320, 500)
+        );
+        assert_eq!(
+            stable_root_size(root, 900, work_area),
+            PhysicalRect::new(-800, 400, 320, 680)
+        );
+    }
+    #[test]
+    fn submenu_loading_update_keeps_the_root_rect_stable() {
+        let root = place_root_popup(
+            PhysicalPoint::new(700, 760),
+            PhysicalSize::new(260, 220),
+            WORK_AREA,
+        );
+        let loading = place_submenu_chain(
+            root.rect,
+            &[SubmenuPlacementRequest {
+                anchor_y: 150,
+                desired_size: PhysicalSize::new(260, 48),
+            }],
+            WORK_AREA,
+        );
+        let loaded = place_submenu_chain(
+            root.rect,
+            &[SubmenuPlacementRequest {
+                anchor_y: 150,
+                desired_size: PhysicalSize::new(260, 360),
+            }],
+            WORK_AREA,
+        );
+
+        assert_eq!(root.rect, PhysicalRect::new(700, 540, 260, 220));
+        assert_eq!(loading[0].rect, PhysicalRect::new(440, 690, 260, 48));
+        assert_eq!(loaded[0].rect, PhysicalRect::new(440, 440, 260, 360));
+    }
+
+    #[test]
+    fn sibling_and_multilevel_submenus_reposition_independently_of_the_root() {
+        let root = PhysicalRect::new(-800, 400, 300, 320);
+        let work_area = PhysicalRect::new(-1920, 0, 1920, 1080);
+        let first = place_submenu_chain(
+            root,
+            &[
+                SubmenuPlacementRequest {
+                    anchor_y: 180,
+                    desired_size: PhysicalSize::new(280, 420),
+                },
+                SubmenuPlacementRequest {
+                    anchor_y: 120,
+                    desired_size: PhysicalSize::new(260, 300),
+                },
+            ],
+            work_area,
+        );
+        let sibling = place_submenu_chain(
+            root,
+            &[
+                SubmenuPlacementRequest {
+                    anchor_y: 40,
+                    desired_size: PhysicalSize::new(280, 140),
+                },
+                SubmenuPlacementRequest {
+                    anchor_y: 70,
+                    desired_size: PhysicalSize::new(260, 500),
+                },
+            ],
+            work_area,
+        );
+
+        assert_eq!(first[0].rect, PhysicalRect::new(-500, 580, 280, 420));
+        assert_eq!(first[1].rect, PhysicalRect::new(-760, 700, 260, 300));
+        assert_eq!(sibling[0].rect, PhysicalRect::new(-500, 440, 280, 140));
+        assert_eq!(sibling[1].rect, PhysicalRect::new(-760, 510, 260, 500));
+        assert_eq!(root, PhysicalRect::new(-800, 400, 300, 320));
+    }
     #[test]
     fn same_depth_branch_replacement_invalidates_the_old_identity() {
         let mut session = QuickMenuPopupSession::default();

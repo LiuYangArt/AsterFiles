@@ -674,6 +674,7 @@ struct QuickMenuPopupRuntime {
     owner_hwnd: isize,
     client_anchor: crate::quick_menu_popup::PhysicalPoint,
     work_area: crate::quick_menu_popup::PhysicalRect,
+    root_rect: Option<crate::quick_menu_popup::PhysicalRect>,
     next_generation: u64,
     next_branch: u64,
     shown_once: bool,
@@ -5747,6 +5748,7 @@ fn create_quick_menu_popup(
         owner_hwnd,
         client_anchor: crate::quick_menu_popup::PhysicalPoint::new(0, 0),
         work_area: crate::quick_menu_popup::PhysicalRect::new(0, 0, 1, 1),
+        root_rect: None,
         next_generation: 0,
         next_branch: 0,
         shown_once: false,
@@ -5815,7 +5817,7 @@ fn update_root_popup_projection(window_id: WindowId) {
         popup.set_loading_text(ui.get_text_context_loading());
         popup.set_empty_text(ui.get_text_context_empty());
     });
-    reposition_quick_menu_popup(window_id);
+    resize_quick_menu_root_and_reposition_submenus(window_id);
 }
 
 fn submenu_slot_is_current(
@@ -5938,7 +5940,7 @@ fn update_open_submenu_projection(window_id: WindowId) {
         .ceil()
         .max(28.0) as i32;
     submenu.set_window_height(height.min(work_area_height.max(1)) as f32 / scale);
-    reposition_quick_menu_popup(window_id);
+    reposition_quick_submenu_popups(window_id);
     if present_after_update && let Some(event) = event {
         WINDOW_RUNTIMES.with_borrow_mut(|runtimes| {
             if let Some(runtime) = runtimes.get_mut(&window_id)
@@ -6022,6 +6024,7 @@ fn open_quick_menu_popup(window_id: WindowId, client_x: f32, client_y: f32) {
             ),
             work_area,
         );
+        popup.root_rect = Some(placement.rect);
         popup.root.set_window_height(placement.rect.height as f32 / scale);
         popup.root.window().set_position(slint::PhysicalPosition::new(placement.rect.x, placement.rect.y));
         let root_hwnd = component_window_handle(&popup.root);
@@ -6063,9 +6066,32 @@ fn open_quick_menu_popup(window_id: WindowId, client_x: f32, client_y: f32) {
     });
 }
 
-fn reposition_quick_menu_popup(window_id: WindowId) {
+fn resize_quick_menu_root_and_reposition_submenus(window_id: WindowId) {
+    WINDOW_RUNTIMES.with_borrow_mut(|runtimes| {
+        let Some(runtime) = runtimes.get_mut(&window_id) else {
+            return;
+        };
+        let popup = &mut runtime.quick_menu_popup;
+        let Some(root_rect) = popup.root_rect else {
+            return;
+        };
+        let scale = popup.root.window().scale_factor();
+        let stable_rect = crate::quick_menu_popup::stable_root_size(
+            root_rect,
+            root_popup_height(&runtime.ui, scale),
+            popup.work_area,
+        );
+        popup.root_rect = Some(stable_rect);
+        popup
+            .root
+            .set_window_height(stable_rect.height as f32 / scale);
+    });
+    reposition_quick_submenu_popups(window_id);
+}
+
+fn reposition_quick_menu_root_and_submenus(window_id: WindowId) {
     let started_at = Instant::now();
-    let placement = WINDOW_RUNTIMES.with_borrow(|runtimes| {
+    let root = WINDOW_RUNTIMES.with_borrow(|runtimes| {
         let runtime = runtimes.get(&window_id)?;
         let popup = &runtime.quick_menu_popup;
         if !popup.session.is_open() {
@@ -6078,87 +6104,95 @@ fn reposition_quick_menu_popup(window_id: WindowId) {
         )
         .ok()?;
         let work_area = platform::windows::quick_menu_window::work_area_for_point(anchor).ok()?;
-        Some((
-            crate::quick_menu_popup::place_root_popup(
-                anchor,
-                crate::quick_menu_popup::PhysicalSize::new(
-                    (320.0 * scale).ceil() as i32,
-                    root_popup_height(&runtime.ui, scale),
-                ),
-                work_area,
+        let placement = crate::quick_menu_popup::place_root_popup(
+            anchor,
+            crate::quick_menu_popup::PhysicalSize::new(
+                (320.0 * scale).ceil() as i32,
+                root_popup_height(&runtime.ui, scale),
             ),
-            scale,
             work_area,
-        ))
+        );
+        Some((placement, scale, work_area))
     });
-    let Some((placement, scale, work_area)) = placement else {
+    let Some((placement, scale, work_area)) = root else {
         return;
     };
     WINDOW_RUNTIMES.with_borrow_mut(|runtimes| {
-        if let Some(runtime) = runtimes.get_mut(&window_id) {
-            runtime.quick_menu_popup.work_area = work_area;
-            runtime
-                .quick_menu_popup
-                .root
-                .set_window_height(placement.rect.height as f32 / scale);
-            runtime
-                .quick_menu_popup
-                .root
-                .window()
-                .set_position(slint::PhysicalPosition::new(
-                    placement.rect.x,
-                    placement.rect.y,
-                ));
-            let root_size = runtime.quick_menu_popup.root.window().size();
-            let mut parent_rect = crate::quick_menu_popup::PhysicalRect::new(
+        let Some(runtime) = runtimes.get_mut(&window_id) else {
+            return;
+        };
+        let popup = &mut runtime.quick_menu_popup;
+        popup.work_area = work_area;
+        popup.root_rect = Some(placement.rect);
+        popup
+            .root
+            .set_window_height(placement.rect.height as f32 / scale);
+        popup
+            .root
+            .window()
+            .set_position(slint::PhysicalPosition::new(
                 placement.rect.x,
                 placement.rect.y,
-                root_size.width as i32,
-                root_size.height as i32,
-            );
-            let mut parent_scale = runtime.quick_menu_popup.root.window().scale_factor();
-            for branch in runtime
-                .quick_menu_popup
-                .branches
-                .iter()
-                .filter(|slot| slot.event.is_some())
-            {
+            ));
+    });
+    reposition_quick_submenu_popups(window_id);
+    eprintln!(
+        "{{\"event\":\"quick_menu_popup_repositioned\",\"window\":{},\"elapsed_us\":{},\"x\":{},\"y\":{}}}",
+        window_id.0,
+        started_at.elapsed().as_micros(),
+        placement.rect.x,
+        placement.rect.y,
+    );
+}
+fn reposition_quick_submenu_popups(window_id: WindowId) {
+    let started_at = Instant::now();
+    WINDOW_RUNTIMES.with_borrow_mut(|runtimes| {
+        let Some(runtime) = runtimes.get_mut(&window_id) else {
+            return;
+        };
+        let popup = &mut runtime.quick_menu_popup;
+        let Some(root_rect) = popup.root_rect else {
+            return;
+        };
+        let work_area = popup.work_area;
+        let mut parent_scale = popup.root.window().scale_factor();
+        let requests = popup
+            .branches
+            .iter()
+            .filter(|slot| slot.event.is_some())
+            .map(|branch| {
                 let branch_scale = branch.window.window().scale_factor();
-                let desired_height =
-                    (branch.window.get_window_height() * branch_scale).ceil() as i32;
-                let anchored_parent = crate::quick_menu_popup::PhysicalRect::new(
-                    parent_rect.x,
-                    parent_rect
-                        .y
-                        .saturating_add((branch.anchor_y * parent_scale).round() as i32),
-                    parent_rect.width,
-                    parent_rect.height,
-                );
-                let branch_placement = crate::quick_menu_popup::place_submenu_popup_with_margins(
-                    anchored_parent,
-                    crate::quick_menu_popup::PhysicalSize::new(
+                let request = crate::quick_menu_popup::SubmenuPlacementRequest {
+                    anchor_y: (branch.anchor_y * parent_scale).round() as i32,
+                    desired_size: crate::quick_menu_popup::PhysicalSize::new(
                         (280.0 * branch_scale).ceil() as i32,
-                        desired_height,
+                        (branch.window.get_window_height() * branch_scale).ceil() as i32,
                     ),
-                    work_area,
-                    0,
-                    0,
-                );
-                branch.window.window().set_position(slint::PhysicalPosition::new(
-                    branch_placement.rect.x,
-                    branch_placement.rect.y,
-                ));
-                parent_rect = branch_placement.rect;
+                };
                 parent_scale = branch_scale;
-            }
-            eprintln!(
-                "{{\"event\":\"quick_menu_popup_repositioned\",\"window\":{},\"elapsed_us\":{},\"x\":{},\"y\":{}}}",
-                window_id.0,
-                started_at.elapsed().as_micros(),
+                request
+            })
+            .collect::<Vec<_>>();
+        let placements =
+            crate::quick_menu_popup::place_submenu_chain(root_rect, &requests, work_area);
+        for (branch, placement) in popup
+            .branches
+            .iter()
+            .filter(|slot| slot.event.is_some())
+            .zip(placements)
+        {
+            branch.window.window().set_position(slint::PhysicalPosition::new(
                 placement.rect.x,
                 placement.rect.y,
-            );
+            ));
         }
+        eprintln!(
+            "{{\"event\":\"quick_menu_submenus_repositioned\",\"window\":{},\"elapsed_us\":{},\"root_x\":{},\"root_y\":{}}}",
+            window_id.0,
+            started_at.elapsed().as_micros(),
+            root_rect.x,
+            root_rect.y,
+        );
     });
 }
 
@@ -6206,6 +6240,7 @@ fn close_quick_menu_popup(window_id: WindowId, restore_focus: bool) {
         let _ = popup.root.hide();
         popup.presentation = PopupPresentation::Hidden;
         popup.cloak_generation = None;
+        popup.root_rect = None;
         let focus_restored = was_open && foreground_owned;
         if focus_restored {
             platform::windows::quick_menu_window::focus_window(popup.owner_hwnd);
@@ -6834,7 +6869,7 @@ fn wire_submenu_popup_callbacks(submenu: &QuickSubmenuWindow, window_id: WindowI
         if current_submenu_event(window_id, depth).is_some()
             && matches!(event, winit::event::WindowEvent::ScaleFactorChanged { .. })
         {
-            reposition_quick_menu_popup(window_id);
+            reposition_quick_submenu_popups(window_id);
         }
         if matches!(event, winit::event::WindowEvent::Destroyed)
             && let Some(event_identity) = current_submenu_event(window_id, depth)
@@ -6988,7 +7023,7 @@ fn wire_root_popup_callbacks(root: &QuickMenuWindow, window_id: WindowId) {
             });
         }
         if matches!(event, winit::event::WindowEvent::ScaleFactorChanged { .. }) {
-            reposition_quick_menu_popup(window_id);
+            reposition_quick_menu_root_and_submenus(window_id);
         }
         EventResult::Propagate
     });
@@ -10753,7 +10788,7 @@ fn wire_mouse_navigation(
             event,
             WindowEvent::ScaleFactorChanged { .. } | WindowEvent::Moved(_)
         ) {
-            reposition_quick_menu_popup(window_id);
+            reposition_quick_menu_root_and_submenus(window_id);
             return EventResult::Propagate;
         }
         if matches!(event, WindowEvent::Focused(false)) {
