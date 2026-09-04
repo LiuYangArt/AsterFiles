@@ -2090,7 +2090,7 @@ accessible-label: entry.name;
 
         if root.active-is-settings: Rectangle {
             vertical-stretch: 1;
-            background: VisualStyle.c323437;
+            background: VisualStyle.navigation-surface-background;
             HorizontalLayout {
                 padding-left: root.minimal ? 16px : 28px;
                 padding-right: root.minimal ? 16px : 28px;
@@ -2122,7 +2122,7 @@ accessible-label: entry.name;
                 }
                 settings-pane := Rectangle {
                     horizontal-stretch: 1;
-                    background: VisualStyle.c323437;
+                    background: VisualStyle.navigation-surface-background;
                     settings-scroll := Flickable {
                         width: parent.width - 16px; height: parent.height;
                         viewport-width: self.width;

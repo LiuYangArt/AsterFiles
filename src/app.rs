@@ -22812,7 +22812,7 @@ mod tests {
     }
 
     #[test]
-    fn light_theme_uses_navigation_background_for_tab_address_sidebar_and_corner() {
+    fn light_theme_uses_navigation_background_for_tab_address_sidebar_corner_and_settings() {
         let ui = headless_file_view();
         ui.set_dark_theme(false);
         let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
@@ -22820,7 +22820,7 @@ mod tests {
             source
                 .matches("VisualStyle.navigation-surface-background")
                 .count(),
-            4
+            6
         );
         assert!(source.contains("shape-color: VisualStyle.navigation-surface-background;"));
         assert!(source.contains("fill: VisualStyle.navigation-surface-background;"));
