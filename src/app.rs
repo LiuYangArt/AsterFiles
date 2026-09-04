@@ -1430,6 +1430,7 @@ struct AppState {
     everything_config: crate::domain::EverythingConfig,
     everything_generation: u64,
     everything_status: String,
+    everything_busy: bool,
     everything_folder_sizes_indexed: Option<bool>,
     pending_right_drops: HashMap<WindowId, (TabId, platform::windows::drag_drop::DropIntent)>,
     tab_drag: Option<TabDragSession>,
@@ -1646,6 +1647,7 @@ impl AppState {
             everything_config,
             everything_generation: 0,
             everything_status: String::new(),
+            everything_busy: false,
             everything_folder_sizes_indexed: None,
             pending_right_drops: HashMap::new(),
             tab_drag: None,
@@ -2869,6 +2871,10 @@ enum EverythingRequest {
     Discover(u64),
     TestConnection(u64),
     Start(u64),
+    PickExecutable {
+        generation: u64,
+        owner_window: isize,
+    },
 }
 
 #[derive(Debug)]
@@ -2909,6 +2915,10 @@ enum EverythingEvent {
         generation: u64,
         config: crate::domain::EverythingConfig,
         status: platform::windows::everything::EverythingStatus,
+    },
+    ExecutablePicked {
+        generation: u64,
+        result: std::io::Result<Option<PathBuf>>,
     },
 }
 
@@ -9286,6 +9296,7 @@ fn wire_callbacks(
         }
     });
 
+    let weak = ui.as_weak();
     let state_for_everything_config = state.clone();
     let everything_for_config = everything_sender.clone();
     ui.on_update_everything_config(move |path, instance| {
@@ -9297,36 +9308,75 @@ fn wire_callbacks(
         app.everything_config.instance_name = instance.to_string();
         app.everything_config.verified_version = None;
         app.everything_generation = app.everything_generation.saturating_add(1);
+        app.everything_status.clear();
+        app.everything_busy = false;
+        app.everything_folder_sizes_indexed = None;
         let config = app.everything_config.clone();
         drop(app);
         let _ = everything_for_config.send(EverythingRequest::Configure(config));
+        if let Some(ui) = weak.upgrade() {
+            refresh_ui(&ui, &state_for_everything_config);
+        }
     });
+    let weak = ui.as_weak();
     let everything_for_test = everything_sender.clone();
     let state_for_test = state.clone();
     ui.on_test_everything_connection(move || {
-        let generation = state_for_test
-            .lock()
-            .expect("app state mutex is not poisoned")
-            .everything_generation;
+        let Some(generation) =
+            begin_everything_operation(&state_for_test, EverythingOperation::Test)
+        else {
+            return;
+        };
+        if let Some(ui) = weak.upgrade() {
+            refresh_ui(&ui, &state_for_test);
+        }
         let _ = everything_for_test.send(EverythingRequest::TestConnection(generation));
     });
+    let weak = ui.as_weak();
     let everything_for_start = everything_sender.clone();
     let state_for_start = state.clone();
     ui.on_start_everything(move || {
-        let generation = state_for_start
-            .lock()
-            .expect("app state mutex is not poisoned")
-            .everything_generation;
+        let Some(generation) =
+            begin_everything_operation(&state_for_start, EverythingOperation::Start)
+        else {
+            return;
+        };
+        if let Some(ui) = weak.upgrade() {
+            refresh_ui(&ui, &state_for_start);
+        }
         let _ = everything_for_start.send(EverythingRequest::Start(generation));
     });
+    let weak = ui.as_weak();
     let everything_for_discover = everything_sender.clone();
     let state_for_discover = state.clone();
     ui.on_discover_everything(move || {
-        let generation = state_for_discover
-            .lock()
-            .expect("app state mutex is not poisoned")
-            .everything_generation;
+        let Some(generation) =
+            begin_everything_operation(&state_for_discover, EverythingOperation::Discover)
+        else {
+            return;
+        };
+        if let Some(ui) = weak.upgrade() {
+            refresh_ui(&ui, &state_for_discover);
+        }
         let _ = everything_for_discover.send(EverythingRequest::Discover(generation));
+    });
+    let weak = ui.as_weak();
+    let everything_for_picker = everything_sender.clone();
+    let state_for_picker = state.clone();
+    ui.on_select_everything_program(move || {
+        let Some(generation) =
+            begin_everything_operation(&state_for_picker, EverythingOperation::Pick)
+        else {
+            return;
+        };
+        let owner_window = weak.upgrade().map_or(0, |ui| {
+            refresh_ui(&ui, &state_for_picker);
+            native_window_handle(&ui)
+        });
+        let _ = everything_for_picker.send(EverythingRequest::PickExecutable {
+            generation,
+            owner_window,
+        });
     });
     let weak = ui.as_weak();
     let state_for_download = state.clone();
@@ -14891,11 +14941,42 @@ fn everything_status(
     platform::windows::everything::EverythingStatus,
     platform::windows::everything::EverythingError,
 > {
-    client
+    let status = client
         .ok_or(platform::windows::everything::EverythingError::NotConfigured)?
-        .status(timeout)
+        .status(timeout)?;
+    if status.database_loaded {
+        Ok(status)
+    } else {
+        Err(platform::windows::everything::EverythingError::DatabaseNotLoaded)
+    }
 }
 
+fn wait_for_everything_status(
+    client: &platform::windows::everything::EverythingClient,
+) -> Result<
+    platform::windows::everything::EverythingStatus,
+    platform::windows::everything::EverythingError,
+> {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        match client.status(Duration::from_millis(750)) {
+            Ok(status) if status.database_loaded => return Ok(status),
+            Ok(_) if Instant::now() >= deadline => {
+                return Err(platform::windows::everything::EverythingError::DatabaseNotLoaded);
+            }
+            Ok(_) => thread::sleep(Duration::from_millis(250)),
+            Err(error @ platform::windows::everything::EverythingError::UnsupportedVersion(_))
+            | Err(
+                error @ platform::windows::everything::EverythingError::UnsupportedArchitecture,
+            )
+            | Err(error @ platform::windows::everything::EverythingError::InvalidExecutable(_)) => {
+                return Err(error);
+            }
+            Err(error) if Instant::now() >= deadline => return Err(error),
+            Err(_) => thread::sleep(Duration::from_millis(250)),
+        }
+    }
+}
 fn spawn_everything_worker(
     config: crate::domain::EverythingConfig,
     state: SharedSessions,
@@ -15178,9 +15259,25 @@ fn spawn_everything_worker(
                     let result = client
                         .as_ref()
                         .ok_or(platform::windows::everything::EverythingError::NotConfigured)
-                        .and_then(|client| client.start())
-                        .and_then(|_| everything_status(client.as_ref(), Duration::from_secs(3)));
+                        .and_then(|client| {
+                            client.start()?;
+                            wait_for_everything_status(client)
+                        });
                     let _ = event_sender.send(EverythingEvent::Status { generation, result });
+                }
+                EverythingRequest::PickExecutable {
+                    generation,
+                    owner_window,
+                } => {
+                    let picker_events = event_sender.clone();
+                    thread::spawn(move || {
+                        let result =
+                            platform::windows::everything_file_picker::pick_everything_executable(
+                                owner_window,
+                            );
+                        let _ = picker_events
+                            .send(EverythingEvent::ExecutablePicked { generation, result });
+                    });
                 }
             }
         }
@@ -15308,7 +15405,8 @@ fn start_everything_event_pump(
                 | EverythingEvent::SearchSkipped { tab_id, .. } => Some(*tab_id),
                 EverythingEvent::FolderSize { .. }
                 | EverythingEvent::Status { .. }
-                | EverythingEvent::Discovered { .. } => None,
+                | EverythingEvent::Discovered { .. }
+                | EverythingEvent::ExecutablePicked { .. } => None,
             };
             let mut folder_size_update = None;
             let mut app = state.lock().expect("app state mutex is not poisoned");
@@ -15494,6 +15592,7 @@ fn start_everything_event_pump(
                 EverythingEvent::Status { generation, result }
                     if generation == app.everything_generation =>
                 {
+                    app.everything_busy = false;
                     match result {
                         Ok(status) => {
                             app.everything_status =
@@ -15503,21 +15602,41 @@ fn start_everything_event_pump(
                                 Some(status.version.to_string());
                         }
                         Err(error) => {
-                            app.everything_status = match (app.language, &error) {
-                                (Language::Chinese, platform::windows::everything::EverythingError::NotConfigured) =>
-                                    "尚未发现 Everything，请先安装或检查配置。".to_owned(),
-                                (Language::Chinese, platform::windows::everything::EverythingError::NotRunning(_)) =>
-                                    "Everything 未运行，请启动后重试。".to_owned(),
-                                _ => error.to_string(),
-                            };
+                            app.everything_status = everything_error_text(app.language, &error);
                             app.everything_folder_sizes_indexed = None;
                         }
                     }
                 }
-                EverythingEvent::Discovered { generation, config, status } => {
+                EverythingEvent::Discovered { generation, config, status }
+                    if generation == app.everything_generation =>
+                {
+                    app.everything_busy = false;
                     apply_everything_discovery(&mut app, generation, config, &status);
                 }
-                EverythingEvent::Status { .. } => {}
+                EverythingEvent::ExecutablePicked { generation, result }
+                    if generation == app.everything_generation =>
+                {
+                    app.everything_busy = false;
+                    match result {
+                        Ok(Some(path)) => {
+                            app.everything_config.executable_path = Some(path);
+                            app.everything_config.verified_version = None;
+                            app.everything_generation = app.everything_generation.saturating_add(1);
+                            app.everything_status.clear();
+                            app.everything_folder_sizes_indexed = None;
+                            let _ = sender_for_search_consistency.send(EverythingRequest::Configure(
+                                app.everything_config.clone(),
+                            ));
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            app.everything_status = everything_picker_error_text(app.language).to_owned();
+                        }
+                    }
+                }
+                EverythingEvent::Status { .. }
+                | EverythingEvent::Discovered { .. }
+                | EverythingEvent::ExecutablePicked { .. } => {}
             }
             drop(app);
             if let Some((tab_id, changed)) = folder_size_update {
@@ -17334,6 +17453,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     );
     ui.set_everything_instance(app.everything_config.instance_name.clone().into());
     ui.set_everything_status(app.everything_status.clone().into());
+    ui.set_everything_busy(app.everything_busy);
     ui.set_app_version(env!("CARGO_PKG_VERSION").into());
     ui.set_theme_mode(match app.theme_mode {
         session_store::ThemeMode::System => 0,
@@ -17541,17 +17661,158 @@ fn error_page_text(state: LoadState, texts: Texts) -> (&'static str, &'static st
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EverythingOperation {
+    Discover,
+    Pick,
+    Start,
+    Test,
+}
+
+fn begin_everything_operation(
+    state: &SharedSessions,
+    operation: EverythingOperation,
+) -> Option<u64> {
+    let mut app = state.lock().expect("app state mutex is not poisoned");
+    if app.everything_busy {
+        return None;
+    }
+    app.everything_busy = true;
+    app.everything_status = everything_progress_text(app.language, operation);
+    Some(app.everything_generation)
+}
+
+fn everything_progress_text(language: Language, operation: EverythingOperation) -> String {
+    match (language, operation) {
+        (Language::Chinese, EverythingOperation::Discover) => "正在自动发现 Everything…",
+        (Language::Chinese, EverythingOperation::Pick) => "正在选择 Everything 程序…",
+        (Language::Chinese, EverythingOperation::Start) => "正在启动 Everything…",
+        (Language::Chinese, EverythingOperation::Test) => "正在测试连接…",
+        (Language::English, EverythingOperation::Discover) => "Detecting Everything…",
+        (Language::English, EverythingOperation::Pick) => "Choosing the Everything program…",
+        (Language::English, EverythingOperation::Start) => "Starting Everything…",
+        (Language::English, EverythingOperation::Test) => "Testing connection…",
+    }
+    .to_owned()
+}
+
+fn everything_picker_error_text(language: Language) -> &'static str {
+    match language {
+        Language::Chinese => "无法打开程序选择器。请手动输入 Everything64.exe 的路径。",
+        Language::English => {
+            "Unable to open the program picker. Enter the path to Everything64.exe manually."
+        }
+    }
+}
+
+fn everything_error_text(
+    language: Language,
+    error: &platform::windows::everything::EverythingError,
+) -> String {
+    use platform::windows::everything::EverythingError;
+    match (language, error) {
+        (Language::Chinese, EverythingError::NotConfigured) => {
+            "尚未配置 Everything。请选择 Everything64.exe，或使用自动发现。"
+        }
+        (Language::Chinese, EverythingError::InvalidExecutable(_)) => {
+            "程序路径无效。请选择 Everything 1.5 x64 的 Everything64.exe。"
+        }
+        (Language::Chinese, EverythingError::NotRunning(_)) => {
+            "该 Everything 实例未运行。请启动后重试，并确认实例名一致。"
+        }
+        (Language::Chinese, EverythingError::Timeout) => {
+            "连接 Everything 超时。请确认程序已完成启动，且实例名一致。"
+        }
+        (Language::Chinese, EverythingError::UnsupportedVersion(_)) => {
+            "Everything 版本不受支持。请安装 Everything 1.5 x64。"
+        }
+        (Language::Chinese, EverythingError::UnsupportedArchitecture) => {
+            "Everything 架构不受支持。请使用 Everything 1.5 x64。"
+        }
+        (Language::Chinese, EverythingError::DatabaseNotLoaded) => {
+            "Everything 数据库尚未加载。请等待加载完成后重新测试。"
+        }
+        (Language::Chinese, EverythingError::StartFailed(_)) => {
+            "启动 Everything 失败。请检查程序路径，或手动启动后重试。"
+        }
+        (Language::Chinese, EverythingError::FolderSizePipeUnavailable(_)
+            | EverythingError::FolderSizeDisconnected
+            | EverythingError::FolderSizeRejected(_)) => {
+                "Everything 文件夹大小索引不可用。请在 Everything 中启用文件夹大小索引，并确认该目录已收录。"
+            }
+        (Language::Chinese, _) => {
+            "无法连接 Everything。请检查程序路径、实例名和运行状态后重试。"
+        }
+        (Language::English, EverythingError::NotConfigured) => {
+            "Everything is not configured. Choose Everything64.exe or use Auto-detect."
+        }
+        (Language::English, EverythingError::InvalidExecutable(_)) => {
+            "The program path is invalid. Choose Everything64.exe from Everything 1.5 x64."
+        }
+        (Language::English, EverythingError::NotRunning(_)) => {
+            "The configured Everything instance is not running. Start it and confirm the instance name matches."
+        }
+        (Language::English, EverythingError::Timeout) => {
+            "The Everything connection timed out. Wait for startup to finish and confirm the instance name."
+        }
+        (Language::English, EverythingError::UnsupportedVersion(_)) => {
+            "This Everything version is unsupported. Install Everything 1.5 x64."
+        }
+        (Language::English, EverythingError::UnsupportedArchitecture) => {
+            "This Everything architecture is unsupported. Use Everything 1.5 x64."
+        }
+        (Language::English, EverythingError::DatabaseNotLoaded) => {
+            "The Everything database is not loaded yet. Wait for it to finish, then test again."
+        }
+        (Language::English, EverythingError::StartFailed(_)) => {
+            "Everything could not be started. Check the program path or start it manually, then retry."
+        }
+        (Language::English, EverythingError::FolderSizePipeUnavailable(_)
+            | EverythingError::FolderSizeDisconnected
+            | EverythingError::FolderSizeRejected(_)) => {
+                "Everything folder-size indexing is unavailable. Enable folder-size indexing and include this folder."
+            }
+        (Language::English, _) => {
+            "Unable to connect to Everything. Check the program path, instance name, and running state."
+        }
+    }
+    .to_owned()
+}
 fn everything_connected_status(
     language: Language,
     status: &platform::windows::everything::EverythingStatus,
 ) -> String {
-    let folder_size_status = match (language, status.folder_size_indexed) {
-        (Language::Chinese, true) => "文件夹大小已索引",
-        (Language::Chinese, false) => "文件夹大小未索引",
-        (Language::English, true) => "Folder sizes indexed",
-        (Language::English, false) => "Folder sizes not indexed",
+    let database = match (language, status.database_loaded) {
+        (Language::Chinese, true) => "数据库已加载",
+        (Language::Chinese, false) => "数据库未加载",
+        (Language::English, true) => "Database loaded",
+        (Language::English, false) => "Database not loaded",
     };
-    format!("Everything {} · {folder_size_status}", status.version)
+    let folder_size_status = match (language, status.folder_size_indexed) {
+        (Language::Chinese, true) => "文件夹大小索引已启用",
+        (Language::Chinese, false) => "文件夹大小索引未启用",
+        (Language::English, true) => "Folder-size indexing enabled",
+        (Language::English, false) => "Folder-size indexing disabled",
+    };
+    let instance = if status.instance_name.is_empty() {
+        match language {
+            Language::Chinese => "默认实例",
+            Language::English => "Default instance",
+        }
+        .to_owned()
+    } else {
+        status.instance_name.clone()
+    };
+    match language {
+        Language::Chinese => format!(
+            "连接成功 · 版本 {} · 实例 {} · {database} · {folder_size_status}",
+            status.version, instance
+        ),
+        Language::English => format!(
+            "Connected · Version {} · Instance {} · {database} · {folder_size_status}",
+            status.version, instance
+        ),
+    }
 }
 
 fn apply_everything_discovery(
@@ -17886,37 +18147,77 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_settings_about(settings_about.into());
     ui.set_text_version(version.into());
     let (
+        everything_title,
+        everything_connection,
         everything_path,
+        select_everything_program,
         everything_instance,
+        everything_instance_help,
+        everything_actions,
         test_connection,
         start_everything,
+        everything_help,
+        everything_help_install,
+        everything_help_dependencies,
+        everything_help_independent,
+        everything_help_settings,
         discover_everything,
         download_everything,
         everything_settings,
     ) = match language {
         Language::Chinese => (
+            "Everything 集成配置",
+            "连接配置",
             "程序路径",
-            "实例",
+            "选择程序",
+            "Everything 实例名",
+            "“1.5a”是实例名，不是版本号。通常保持默认；仅在自定义或同时运行多个实例时修改，并与运行中的实例一致。",
+            "连接状态与操作",
             "测试连接",
             "启动 Everything",
+            "使用说明",
+            "• 需要安装 Everything 1.5 x64 并保持后台运行，数据库须完成加载。",
+            "• 地址栏快速搜索、搜索结果索引信息和普通目录文件夹大小依赖 Everything；文件夹大小索引需启用，目录也必须已收录。",
+            "• 普通目录浏览和 UNC 网络路径不依赖 Everything；未索引位置不会回退为递归扫描。",
+            "• 修改程序路径或实例名后请重新测试；AsterFiles 不会自动修改 Everything 的索引设置。",
             "自动发现",
             "下载 Everything",
             "前往 Everything 设置",
         ),
         Language::English => (
+            "Everything integration setup",
+            "Connection settings",
             "Program path",
-            "Instance",
+            "Choose program",
+            "Everything instance name",
+            "“1.5a” is an instance name, not a version. Keep the default unless you use a custom or multiple instance, and match the running instance.",
+            "Connection status and actions",
             "Test connection",
             "Start Everything",
+            "How it works",
+            "• Install Everything 1.5 x64, keep it running in the background, and wait for its database to finish loading.",
+            "• Address-bar search, indexed result details, and local folder sizes depend on Everything. Folder-size indexing must be enabled and the folder included.",
+            "• Normal folder browsing and UNC navigation do not depend on Everything. Unindexed locations never fall back to slow recursive scanning.",
+            "• Retest after changing the path or instance. AsterFiles never changes Everything index settings automatically.",
             "Auto-detect",
             "Download Everything",
             "Open Everything settings",
         ),
     };
+    ui.set_text_everything_title(everything_title.into());
+    ui.set_text_everything_connection(everything_connection.into());
     ui.set_text_everything_path(everything_path.into());
+    ui.set_text_select_everything_program(select_everything_program.into());
     ui.set_text_everything_instance(everything_instance.into());
+    ui.set_text_everything_instance_help(everything_instance_help.into());
+    ui.set_text_everything_actions(everything_actions.into());
     ui.set_text_test_connection(test_connection.into());
     ui.set_text_start_everything(start_everything.into());
+    ui.set_text_everything_help(everything_help.into());
+    ui.set_text_everything_help_install(everything_help_install.into());
+    ui.set_text_everything_help_dependencies(everything_help_dependencies.into());
+    ui.set_text_everything_help_independent(everything_help_independent.into());
+    ui.set_text_everything_help_settings(everything_help_settings.into());
     ui.set_text_discover_everything(discover_everything.into());
     ui.set_text_download_everything(download_everything.into());
     ui.set_text_everything_settings(everything_settings.into());
@@ -18025,6 +18326,68 @@ mod tests {
             .1;
         assert!(rename_editor.contains(semantic_font_size));
         assert!(!ui.contains("text: entry.name; color: VisualStyle.c24252a; font-size: 14px;"));
+    }
+    #[test]
+    fn issue_14_everything_status_text_covers_progress_success_and_failures() {
+        use platform::windows::everything::{EverythingError, EverythingStatus, EverythingVersion};
+
+        assert_eq!(
+            everything_progress_text(Language::Chinese, EverythingOperation::Test),
+            "正在测试连接…"
+        );
+        assert_eq!(
+            everything_progress_text(Language::English, EverythingOperation::Start),
+            "Starting Everything…"
+        );
+        let connected = everything_connected_status(
+            Language::Chinese,
+            &EverythingStatus {
+                version: EverythingVersion {
+                    major: 1,
+                    minor: 5,
+                    revision: 0,
+                    build: 1400,
+                },
+                instance_name: "1.5a".into(),
+                database_loaded: true,
+                folder_size_indexed: false,
+            },
+        );
+        assert!(connected.contains("版本 1.5.0.1400"));
+        assert!(connected.contains("实例 1.5a"));
+        assert!(connected.contains("数据库已加载"));
+        assert!(connected.contains("文件夹大小索引未启用"));
+        assert!(
+            everything_error_text(Language::Chinese, &EverythingError::Timeout).contains("超时")
+        );
+        assert!(
+            everything_error_text(
+                Language::English,
+                &EverythingError::InvalidExecutable(PathBuf::from("missing.exe"))
+            )
+            .contains("invalid")
+        );
+    }
+
+    #[test]
+    fn issue_14_everything_page_is_fully_localized_and_wired() {
+        let ui = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
+
+        for marker in [
+            "text-everything-title",
+            "text-select-everything-program",
+            "text-everything-instance-help",
+            "text-everything-help-dependencies",
+            "callback select-everything-program();",
+            "enabled: !root.everything-busy",
+            "maximum: max(0px, settings-content.preferred-height - settings-scroll.height);",
+            "settings-scroll.viewport-y = max(-maximum, min(0px, settings-scroll.viewport-y + event.delta-y));",
+        ] {
+            assert!(
+                ui.contains(marker),
+                "missing Everything page marker: {marker}"
+            );
+        }
     }
     #[test]
     fn network_directory_scheduler_serializes_one_host_and_allows_another() {

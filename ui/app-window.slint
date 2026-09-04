@@ -892,13 +892,24 @@ export component AppWindow inherits Window {
     in property <string> text-version: "版本";
     in property <string> app-version: "";
     in property <string> text-everything: "Everything";
+    in property <string> text-everything-title: "Everything 集成配置";
+    in property <string> text-everything-connection: "连接配置";
     in property <string> text-everything-path: "程序路径";
-    in property <string> text-everything-instance: "实例";
+    in property <string> text-select-everything-program: "选择程序";
+    in property <string> text-everything-instance: "Everything 实例名";
+    in property <string> text-everything-instance-help: "“1.5a”是实例名，不是版本号。通常保持默认；仅在自定义或同时运行多个实例时修改，并与运行中的实例一致。";
+    in property <string> text-everything-actions: "连接状态与操作";
     in property <string> text-test-connection: "测试连接";
     in property <string> text-start-everything: "启动 Everything";
+    in property <string> text-everything-help: "使用说明";
+    in property <string> text-everything-help-install: "• 需要安装 Everything 1.5 x64 并保持后台运行，数据库须完成加载。";
+    in property <string> text-everything-help-dependencies: "• 地址栏快速搜索、搜索结果索引信息和普通目录文件夹大小依赖 Everything；文件夹大小索引需启用，目录也必须已收录。";
+    in property <string> text-everything-help-independent: "• 普通目录浏览和 UNC 网络路径不依赖 Everything；未索引位置不会回退为递归扫描。";
+    in property <string> text-everything-help-settings: "• 修改程序路径或实例名后请重新测试；AsterFiles 不会自动修改 Everything 的索引设置。";
     in-out property <string> everything-path: "";
     in-out property <string> everything-instance: "1.5a";
     in property <string> everything-status: "";
+    in property <bool> everything-busy: false;
     in property <string> text-ui-showcase: "UI 陈列室";
     in property <string> text-ui-showcase-detail: "直接打开难以触发的窗口和状态；演示操作不会修改文件或任务。";
     in property <string> text-show-delete-confirmation: "永久删除确认";
@@ -1037,6 +1048,7 @@ export component AppWindow inherits Window {
     callback change-language(int);
     callback change-file-visibility(bool, bool);
     callback update-everything-config(string, string);
+    callback select-everything-program();
     callback test-everything-connection();
     callback start-everything();
     callback discover-everything();
@@ -1197,7 +1209,7 @@ export component AppWindow inherits Window {
     function settings-title(section: int) -> string {
         if section == 0 { return root.text-settings-general; }
         if section == 1 { return root.text-settings-appearance; }
-        if section == 2 { return root.text-everything; }
+        if section == 2 { return root.text-everything-title; }
         if section == 3 { return root.text-settings-developer; }
         return root.text-settings-about;
     }
@@ -2108,16 +2120,27 @@ accessible-label: entry.name;
                         Rectangle { vertical-stretch: 1; }
                     }
                 }
-                Rectangle {
+                settings-pane := Rectangle {
                     horizontal-stretch: 1;
                     background: VisualStyle.c323437;
                     settings-scroll := Flickable {
-                        width: parent.width; height: parent.height;
+                        width: parent.width - 16px; height: parent.height;
                         viewport-width: self.width;
-                        viewport-height: max(self.height, 188px);
-                        VerticalLayout {
+                        viewport-height: max(self.height, settings-content.preferred-height);
+                        settings-wheel := TouchArea {
                             width: settings-scroll.width;
-                            height: settings-scroll.viewport-height;
+                            height: settings-scroll.height;
+                            scroll-event(event) => {
+                                let maximum = max(0px, settings-content.preferred-height - settings-scroll.height);
+                                if maximum > 0px && event.delta-y != 0px {
+                                    settings-scroll.viewport-y = max(-maximum, min(0px, settings-scroll.viewport-y + event.delta-y));
+                                    return accept;
+                                }
+                                return reject;
+                            }
+                        }
+                        settings-content := VerticalLayout {
+                            width: settings-scroll.width;
                             spacing: 16px;
                             Text { text: root.settings-title(root.settings-section); color: VisualStyle.c30333a; font-size: 22px; font-weight: 600; height: 44px; }
                             if root.settings-section == 0: Rectangle {
@@ -2158,19 +2181,61 @@ accessible-label: entry.name;
                                     }
                                 }
                             }
-                            if root.settings-section == 2: Rectangle {
-                                height: 304px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
-                                VerticalLayout {
-                                    padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 10px;
-                                    Text { text: root.text-everything-path; color: VisualStyle.c30333a; font-size: 13px; }
-                                    Rectangle { height: 34px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cffffff; TextInput { x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.everything-path; single-line: true; edited => { root.update-everything-config(root.everything-path, root.everything-instance); } } }
-                                    Text { text: root.text-everything-instance; color: VisualStyle.c30333a; font-size: 13px; }
-                                    Rectangle { height: 34px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cffffff; TextInput { x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.everything-instance; single-line: true; edited => { root.update-everything-config(root.everything-path, root.everything-instance); } } }
-                                    Text { text: root.everything-status; color: VisualStyle.c62656f; font-size: 12px; wrap: word-wrap; }
-                                    HorizontalLayout { height: 34px; spacing: 8px; StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-test-connection; clicked => { root.test-everything-connection(); } } StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-start-everything; clicked => { root.start-everything(); } } }
-                                    HorizontalLayout { height: 34px; spacing: 8px; StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-discover-everything; clicked => { root.discover-everything(); } } StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-download-everything; clicked => { root.download-everything(); } } }
+                            if root.settings-section == 2: VerticalLayout {
+                                spacing: 12px;
+                                Rectangle {
+                                    height: 244px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                    VerticalLayout {
+                                        padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 8px;
+                                        Text { text: root.text-everything-connection; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
+                                        Text { text: root.text-everything-path; color: VisualStyle.c30333a; font-size: 12px; }
+                                        HorizontalLayout {
+                                            height: 32px; spacing: 8px;
+                                            Rectangle {
+                                                horizontal-stretch: 1; border-width: 1px; border-color: VisualStyle.ce0e2e7; border-radius: 4px; background: VisualStyle.cffffff;
+                                                TextInput { x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.everything-path; single-line: true; vertical-alignment: center; edited => { root.update-everything-config(root.everything-path, root.everything-instance); } }
+                                            }
+                                            StandaloneActionButton { width: 112px; height: 32px; label: root.text-select-everything-program; enabled: !root.everything-busy; clicked => { root.select-everything-program(); } }
+                                        }
+                                        Text { text: root.text-everything-instance; color: VisualStyle.c30333a; font-size: 12px; }
+                                        Rectangle {
+                                            height: 32px; border-width: 1px; border-color: VisualStyle.ce0e2e7; border-radius: 4px; background: VisualStyle.cffffff;
+                                            TextInput { x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.everything-instance; single-line: true; vertical-alignment: center; edited => { root.update-everything-config(root.everything-path, root.everything-instance); } }
+                                        }
+                                        Text { text: root.text-everything-instance-help; color: VisualStyle.c62656f; font-size: 11px; wrap: word-wrap; }
+                                    }
                                 }
-                            }                            if root.settings-section == 3 && root.debug-tools-enabled: VerticalLayout {
+                                Rectangle {
+                                    height: 142px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                    VerticalLayout {
+                                        padding-left: 20px; padding-right: 20px; padding-top: 14px; padding-bottom: 14px; spacing: 8px;
+                                        Text { text: root.text-everything-actions; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
+                                        Text { text: root.everything-status; color: VisualStyle.c62656f; font-size: 12px; wrap: word-wrap; }
+                                        HorizontalLayout {
+                                            height: 32px; spacing: 8px;
+                                            StandaloneActionButton { width: (parent.width - 8px) / 2; height: 32px; label: root.text-test-connection; enabled: !root.everything-busy; clicked => { root.test-everything-connection(); } }
+                                            StandaloneActionButton { width: (parent.width - 8px) / 2; height: 32px; label: root.text-start-everything; enabled: !root.everything-busy; clicked => { root.start-everything(); } }
+                                        }
+                                    }
+                                }
+                                Rectangle {
+                                    height: 174px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                    VerticalLayout {
+                                        padding-left: 20px; padding-right: 20px; padding-top: 14px; padding-bottom: 14px; spacing: 6px;
+                                        Text { text: root.text-everything-help; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
+                                        Text { text: root.text-everything-help-install; color: VisualStyle.c62656f; font-size: 11px; wrap: word-wrap; }
+                                        Text { text: root.text-everything-help-dependencies; color: VisualStyle.c62656f; font-size: 11px; wrap: word-wrap; }
+                                        Text { text: root.text-everything-help-independent; color: VisualStyle.c62656f; font-size: 11px; wrap: word-wrap; }
+                                        Text { text: root.text-everything-help-settings; color: VisualStyle.c62656f; font-size: 11px; wrap: word-wrap; }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    height: 32px; spacing: 8px;
+                                    StandaloneActionButton { width: (parent.width - 8px) / 2; height: 32px; label: root.text-discover-everything; enabled: !root.everything-busy; clicked => { root.discover-everything(); } }
+                                    StandaloneActionButton { width: (parent.width - 8px) / 2; height: 32px; label: root.text-download-everything; enabled: !root.everything-busy; clicked => { root.download-everything(); } }
+                                }
+                            }
+                            if root.settings-section == 3 && root.debug-tools-enabled: VerticalLayout {
                                 spacing: 12px;
                                 Rectangle {
                                     height: 244px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
@@ -2215,6 +2280,14 @@ accessible-label: entry.name;
                             }
                             Rectangle { height: 16px; }
                         }
+                    }
+                    LightScrollBar {
+                        x: parent.width - self.width;
+                        height: parent.height;
+                        value: settings-scroll.viewport-y;
+                        maximum: max(0px, settings-content.preferred-height - settings-scroll.height);
+                        page-size: settings-scroll.height;
+                        scrolled(viewport-y) => { settings-scroll.viewport-y = viewport-y; }
                     }
                 }
             }

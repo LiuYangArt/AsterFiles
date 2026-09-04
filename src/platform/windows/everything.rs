@@ -284,6 +284,11 @@ impl EverythingClient {
         found
     }
     pub fn status(&self, timeout: Duration) -> Result<EverythingStatus, EverythingError> {
+        if !self.config.executable_path.is_file() {
+            return Err(EverythingError::InvalidExecutable(
+                self.config.executable_path.clone(),
+            ));
+        }
         let w = self.window()?;
         let version = EverythingVersion {
             major: send(w, 0, 0, timeout)? as u32,
