@@ -397,40 +397,32 @@ component ActiveTabShape inherits Rectangle {
     in property <color> shape-color;
     background: transparent;
 
-    // Fixed shoulders keep the join stable while only the center follows tab width.
-    Rectangle {
-        x: VisualStyle.tab-shoulder-width;
-        width: parent.width - VisualStyle.tab-shoulder-span;
+    // One contour prevents independently rasterized pieces from opening seams at fractional positions.
+    Path {
+        width: parent.width;
         height: parent.height;
-        border-radius: VisualStyle.tab-shoulder-width;
-        background: root.shape-color;
-    }
-    Rectangle {
-        x: VisualStyle.tab-shoulder-width;
-        y: parent.height - 10px;
-        width: parent.width - VisualStyle.tab-shoulder-span;
-        height: 10px;
-        background: root.shape-color;
-    }
-    Path {
-        x: 0px;
-        y: parent.height - 10px;
-        width: VisualStyle.tab-shoulder-width;
-        height: 10px;
-        viewbox-width: 7;
-        viewbox-height: 10;
-        commands: "M 0 10 C 4 10 7 7 7 3 L 7 0 L 7 10 Z";
         fill: root.shape-color;
-    }
-    Path {
-        x: parent.width - VisualStyle.tab-shoulder-width;
-        y: parent.height - 10px;
-        width: VisualStyle.tab-shoulder-width;
-        height: 10px;
-        viewbox-width: 7;
-        viewbox-height: 10;
-        commands: "M 0 0 L 0 3 C 0 7 3 10 7 10 L 0 10 Z";
-        fill: root.shape-color;
+        MoveTo { x: 0; y: root.height / 1px; }
+        CubicTo {
+            control-1-x: 4; control-1-y: root.height / 1px;
+            control-2-x: 7; control-2-y: root.height / 1px - 3;
+            x: 7; y: root.height / 1px - 7;
+        }
+        LineTo { x: 7; y: 7; }
+        CubicTo { control-1-x: 7; control-1-y: 3; control-2-x: 10; control-2-y: 0; x: 14; y: 0; }
+        LineTo { x: root.width / 1px - 14; y: 0; }
+        CubicTo {
+            control-1-x: root.width / 1px - 10; control-1-y: 0;
+            control-2-x: root.width / 1px - 7; control-2-y: 3;
+            x: root.width / 1px - 7; y: 7;
+        }
+        LineTo { x: root.width / 1px - 7; y: root.height / 1px - 7; }
+        CubicTo {
+            control-1-x: root.width / 1px - 7; control-1-y: root.height / 1px - 3;
+            control-2-x: root.width / 1px - 4; control-2-y: root.height / 1px;
+            x: root.width / 1px; y: root.height / 1px;
+        }
+        Close { }
     }
 }
 

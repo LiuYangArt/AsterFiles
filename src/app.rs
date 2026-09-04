@@ -18984,6 +18984,24 @@ mod tests {
     }
 
     #[test]
+    fn issue_49_active_tab_uses_one_continuous_contour() {
+        let ui = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
+        let shape = ui
+            .split_once("component ActiveTabShape inherits Rectangle {")
+            .expect("active tab shape exists")
+            .1
+            .split_once("component IconButton inherits Rectangle {")
+            .expect("active tab shape has a component boundary")
+            .0;
+
+        assert_eq!(shape.matches("Path {").count(), 1);
+        assert_eq!(shape.matches("Rectangle {").count(), 0);
+        assert_eq!(shape.matches("MoveTo {").count(), 1);
+        assert_eq!(shape.matches("CubicTo {").count(), 4);
+        assert_eq!(shape.matches("Close { }").count(), 1);
+        assert!(shape.contains("x: root.width / 1px; y: root.height / 1px;"));
+    }
+    #[test]
     fn issue_43_file_name_font_size_has_one_semantic_source() {
         let ui = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
         let semantic_font_size = "font-size: VisualStyle.file-name-font-size;";
