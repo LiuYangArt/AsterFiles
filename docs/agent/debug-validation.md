@@ -42,7 +42,7 @@ cargo run -- --agent-scenario permission-denied --no-ui
 cargo run -- --agent-scenario drag-drop-foundation --no-ui
 ```
 
-统一验证写入 `artifacts/state/drag-drop/foundation.json`。`drag_drop` 对象包含生命周期、是否注册、源数量、目标、协商效果、拒绝原因、最后事件和事件序号。无界面场景固定为 `unregistered`；真实窗口创建后才在主 winit/STA 线程完成注册。P3.D0 尚不接受文件，进入窗口的拖放会返回禁止，P3.D1 再接入 `CF_HDROP` 和文件任务。
+统一验证写入 `artifacts/state/drag-drop/foundation.json`。`drag_drop` 对象包含生命周期、是否注册、源数量、目标、协商效果、拒绝原因、最后事件和事件序号。无界面场景固定为 `unregistered`；真实窗口创建后才在主 winit/STA 线程完成注册。生命周期测试直接验证多窗口逐个注销、重复注销、统一退出注销和线程本地清理，保证每个窗口最多成功注销一次，且析构阶段不再调用 Windows 拖放撤销接口。
 
 ## Issue #5 文件夹大小调度
 

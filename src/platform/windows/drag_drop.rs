@@ -1489,16 +1489,86 @@ pub fn client_screen_rect(hwnd: isize) -> io::Result<(i32, i32, i32, i32)> {
     ))
 }
 
+trait ExplicitRevoke {
+    fn revoke(&mut self) -> bool;
+}
+
+struct RegistrationStore<R> {
+    registrations: std::collections::HashMap<isize, R>,
+    shutdown: bool,
+}
+
+impl<R> Default for RegistrationStore<R> {
+    fn default() -> Self {
+        Self {
+            registrations: std::collections::HashMap::new(),
+            shutdown: false,
+        }
+    }
+}
+
+impl<R> Drop for RegistrationStore<R> {
+    fn drop(&mut self) {
+        if !self.registrations.is_empty() {
+            eprintln!(
+                "drag-drop: {} registrations reached thread cleanup without explicit revocation",
+                self.registrations.len()
+            );
+        }
+    }
+}
+impl<R: ExplicitRevoke> RegistrationStore<R> {
+    fn contains(&self, hwnd: isize) -> bool {
+        self.registrations.contains_key(&hwnd)
+    }
+
+    fn insert(&mut self, hwnd: isize, registration: R) {
+        assert!(!self.shutdown, "drag-drop registration after shutdown");
+        debug_assert!(!self.contains(hwnd));
+        self.registrations.insert(hwnd, registration);
+    }
+
+    fn revoke(&mut self, hwnd: isize) -> bool {
+        let Some(mut registration) = self.registrations.remove(&hwnd) else {
+            return false;
+        };
+        registration.revoke()
+    }
+
+    fn revoke_all(&mut self) {
+        let handles = self.registrations.keys().copied().collect::<Vec<_>>();
+        for hwnd in handles {
+            self.revoke(hwnd);
+        }
+    }
+
+    fn begin_shutdown(&mut self) {
+        self.shutdown = true;
+        self.revoke_all();
+    }
+
+    fn is_shutdown(&self) -> bool {
+        self.shutdown
+    }
+
+    fn is_empty(&self) -> bool {
+        self.registrations.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.registrations.len()
+    }
+}
+
 #[derive(Default)]
 struct ThreadApartment {
+    registrations: RegistrationStore<DragDropRegistration>,
     apartment: Option<OleApartment>,
-    registrations: std::collections::HashMap<isize, DragDropRegistration>,
-    shutdown: bool,
 }
 
 impl ThreadApartment {
     fn ensure(&mut self) -> io::Result<()> {
-        if self.shutdown {
+        if self.registrations.is_shutdown() {
             return Err(io::Error::other("drag-drop apartment is shutting down"));
         }
         if self.apartment.is_none() {
@@ -1507,19 +1577,29 @@ impl ThreadApartment {
         Ok(())
     }
 
-    fn shutdown(&mut self) {
-        self.shutdown = true;
-        self.registrations.clear();
-        self.apartment.take();
+    fn begin_shutdown(&mut self) {
+        self.registrations.begin_shutdown();
     }
 
-    fn revoke_all(&mut self) {
-        self.registrations.clear();
+    fn shutdown(&mut self) {
+        self.begin_shutdown();
+        if self.registrations.is_empty() {
+            self.apartment.take();
+        } else {
+            eprintln!(
+                "drag-drop: keeping OLE initialized for {} registrations that could not be revoked",
+                self.registrations.len()
+            );
+        }
     }
 }
 
 thread_local! {
     static THREAD_APARTMENT: std::cell::RefCell<ThreadApartment> = std::cell::RefCell::new(ThreadApartment::default());
+}
+pub fn begin_shutdown_current() {
+    TAB_TARGET_HANDLERS.with_borrow_mut(|handlers| handlers.clear());
+    THREAD_APARTMENT.with(|apartment| apartment.borrow_mut().begin_shutdown());
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1547,10 +1627,9 @@ pub fn register_current(
     THREAD_APARTMENT.with(|apartment| {
         let mut apartment = apartment.borrow_mut();
         apartment.ensure()?;
-        if let std::collections::hash_map::Entry::Vacant(entry) =
-            apartment.registrations.entry(hwnd)
-        {
-            entry.insert(DragDropRegistration::register(hwnd, target, intents)?);
+        if !apartment.registrations.contains(hwnd) {
+            let registration = DragDropRegistration::register(hwnd, target, intents)?;
+            apartment.registrations.insert(hwnd, registration);
         }
         Ok(())
     })
@@ -1561,18 +1640,13 @@ pub fn revoke(hwnd: isize) {
         handlers.remove(&hwnd);
     });
     THREAD_APARTMENT.with(|apartment| {
-        apartment.borrow_mut().registrations.remove(&hwnd);
+        apartment.borrow_mut().registrations.revoke(hwnd);
     });
 }
 
 pub fn shutdown_current() {
     TAB_TARGET_HANDLERS.with_borrow_mut(|handlers| handlers.clear());
     THREAD_APARTMENT.with(|apartment| apartment.borrow_mut().shutdown());
-}
-
-pub fn revoke_all_current() {
-    TAB_TARGET_HANDLERS.with_borrow_mut(|handlers| handlers.clear());
-    THREAD_APARTMENT.with(|apartment| apartment.borrow_mut().revoke_all());
 }
 
 pub struct DragDropRegistration {
@@ -1623,18 +1697,32 @@ impl DragDropRegistration {
     }
 }
 
-impl Drop for DragDropRegistration {
-    fn drop(&mut self) {
-        let _ = unsafe { RevokeDragDrop(self.hwnd) };
+impl ExplicitRevoke for DragDropRegistration {
+    fn revoke(&mut self) -> bool {
+        if self.target.is_none() {
+            return false;
+        }
+        let revoked = match unsafe { RevokeDragDrop(self.hwnd) } {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!(
+                    "failed to revoke native drag-drop target hwnd={}: {}",
+                    self.hwnd.0 as isize,
+                    windows_error(error)
+                );
+                false
+            }
+        };
+        drop(self.target.take());
         if let Ok(mut state) = self.state.lock() {
             state.record(DragDropEvent::Revoked);
         }
-        self.target.take();
         if let Some(live) = LIVE_STATES.get()
             && let Ok(mut live) = live.lock()
         {
             live.remove(&(self.hwnd.0 as isize));
         }
+        revoked
     }
 }
 
@@ -1999,5 +2087,99 @@ mod tests {
         assert_eq!(registration_action(0, 101), RegistrationAction::Replace);
         assert_eq!(registration_action(101, 101), RegistrationAction::Keep);
         assert_eq!(registration_action(101, 202), RegistrationAction::Replace);
+    }
+
+    #[derive(Clone)]
+    struct RevokeProbe {
+        hwnd: isize,
+        calls: Arc<Mutex<Vec<isize>>>,
+        succeeds: bool,
+    }
+
+    impl ExplicitRevoke for RevokeProbe {
+        fn revoke(&mut self) -> bool {
+            self.calls.lock().unwrap().push(self.hwnd);
+            self.succeeds
+        }
+    }
+
+    fn probe(hwnd: isize, calls: &Arc<Mutex<Vec<isize>>>) -> RevokeProbe {
+        RevokeProbe {
+            hwnd,
+            calls: calls.clone(),
+            succeeds: true,
+        }
+    }
+
+    #[test]
+    fn registration_store_revokes_each_window_at_most_once() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut registrations = RegistrationStore::default();
+        registrations.insert(101, probe(101, &calls));
+        registrations.insert(202, probe(202, &calls));
+
+        assert!(registrations.revoke(101));
+        assert!(!registrations.revoke(101));
+        assert_eq!(registrations.len(), 1);
+        registrations.revoke_all();
+        registrations.revoke_all();
+
+        let mut calls = calls.lock().unwrap().clone();
+        calls.sort_unstable();
+        assert_eq!(calls, [101, 202]);
+        assert_eq!(registrations.len(), 0);
+    }
+
+    #[test]
+    fn shutdown_revokes_all_windows_once_and_rejects_late_registration() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut registrations = RegistrationStore::default();
+        registrations.insert(101, probe(101, &calls));
+        registrations.insert(202, probe(202, &calls));
+
+        registrations.begin_shutdown();
+        registrations.begin_shutdown();
+
+        let mut observed = calls.lock().unwrap().clone();
+        observed.sort_unstable();
+        assert_eq!(observed, [101, 202]);
+        assert_eq!(registrations.len(), 0);
+        assert!(registrations.is_shutdown());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                registrations.insert(303, probe(303, &calls));
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_revoke_is_attempted_only_once() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut registrations = RegistrationStore::default();
+        registrations.insert(
+            101,
+            RevokeProbe {
+                hwnd: 101,
+                calls: calls.clone(),
+                succeeds: false,
+            },
+        );
+
+        assert!(!registrations.revoke(101));
+        registrations.begin_shutdown();
+
+        assert_eq!(calls.lock().unwrap().as_slice(), [101]);
+        assert!(registrations.is_empty());
+    }
+    #[test]
+    fn dropping_registration_store_never_revokes_windows() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        {
+            let mut registrations = RegistrationStore::default();
+            registrations.insert(101, probe(101, &calls));
+        }
+
+        assert!(calls.lock().unwrap().is_empty());
     }
 }

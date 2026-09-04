@@ -1116,6 +1116,7 @@ fn remove_window_runtime(window_id: WindowId) {
 }
 
 fn clear_window_runtimes() {
+    platform::windows::drag_drop::begin_shutdown_current();
     platform::windows::tab_insertion_indicator::destroy();
     let windows = WINDOW_RUNTIMES.with_borrow(|runtimes| {
         runtimes
@@ -1142,6 +1143,7 @@ fn clear_window_runtimes() {
 }
 
 fn hide_all_app_windows() {
+    platform::windows::drag_drop::begin_shutdown_current();
     let windows = WINDOW_RUNTIMES.with_borrow(|runtimes| {
         runtimes
             .values()
@@ -3463,7 +3465,6 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         coordinator.cancel();
     }
     drop(directory_watch_timer);
-    platform::windows::drag_drop::revoke_all_current();
     for weak in [delete_weak, conflict_weak, exit_weak] {
         if let Some(window) = weak.upgrade() {
             let _ = window.hide();
@@ -6282,12 +6283,10 @@ fn activate_submenu_slot_row(window_id: WindowId, depth: usize, index: i32) -> b
         if !can_open {
             return false;
         }
-        WINDOW_RUNTIMES.with_borrow(|runtimes| {
-            if let Some(runtime) = runtimes.get(&window_id) {
-                runtime.ui.set_context_submenu_active_index(index);
-                runtime.ui.invoke_open_context_submenu(-index - 1);
-            }
-        });
+        if let Some(ui) = window_ui(window_id) {
+            ui.set_context_submenu_active_index(index);
+            ui.invoke_open_context_submenu(-index - 1);
+        }
     } else {
         let is_deepest = WINDOW_RUNTIMES.with_borrow(|runtimes| {
             runtimes.get(&window_id).is_some_and(|runtime| {
@@ -6297,15 +6296,13 @@ fn activate_submenu_slot_row(window_id: WindowId, depth: usize, index: i32) -> b
         if !is_deepest {
             return false;
         }
-        WINDOW_RUNTIMES.with_borrow(|runtimes| {
-            if let Some(runtime) = runtimes.get(&window_id) {
-                runtime.ui.set_context_menu_open(false);
-                runtime.ui.invoke_invoke_context_command(row.id);
-                if !row.shell {
-                    runtime.ui.invoke_dismiss_context_menu();
-                }
+        if let Some(ui) = window_ui(window_id) {
+            ui.set_context_menu_open(false);
+            ui.invoke_invoke_context_command(row.id);
+            if !row.shell {
+                ui.invoke_dismiss_context_menu();
             }
-        });
+        }
         let menu_closed = WINDOW_RUNTIMES.with_borrow(|runtimes| {
             runtimes
                 .get(&window_id)
@@ -6647,12 +6644,10 @@ fn wire_root_popup_callbacks(root: &QuickMenuWindow, window_id: WindowId) {
         });
     });
     root.on_activate(move |index| {
-        WINDOW_RUNTIMES.with_borrow(|runtimes| {
-            if let Some(runtime) = runtimes.get(&window_id) {
-                runtime.ui.set_context_active_index(index);
-                runtime.ui.invoke_activate_context_selection();
-            }
-        });
+        if let Some(ui) = window_ui(window_id) {
+            ui.set_context_active_index(index);
+            ui.invoke_activate_context_selection();
+        }
         let menu_closed = WINDOW_RUNTIMES.with_borrow(|runtimes| {
             runtimes
                 .get(&window_id)
@@ -10195,7 +10190,7 @@ fn wire_callbacks(
             }
             WindowCloseAction::ExitApplication => {
                 platform::windows::network::record_runtime_event("event_loop_exit_requested");
-                platform::windows::drag_drop::revoke_all_current();
+                platform::windows::drag_drop::begin_shutdown_current();
                 if let Some(ui) = weak.upgrade() {
                     let _ = ui.hide();
                 }
@@ -10294,7 +10289,7 @@ fn wire_mouse_navigation(
                 WindowCloseAction::ExitApplication => {
                     dismiss_quick_menu_session(window_id, false);
                     platform::windows::network::record_runtime_event("event_loop_exit_requested");
-                    platform::windows::drag_drop::revoke_all_current();
+                    platform::windows::drag_drop::begin_shutdown_current();
                     return EventResult::Propagate;
                 }
                 WindowCloseAction::Ignore => return EventResult::PreventDefault,
