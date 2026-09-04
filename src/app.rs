@@ -5181,8 +5181,18 @@ fn wire_context_submenu_hover(ui: &AppWindow) -> Rc<slint::Timer> {
             Duration::from_millis(250),
             move || {
                 if let Some(ui) = weak.upgrade() {
+                    let window_id = window_id_for_ui(&ui);
+                    trace_quick_menu(
+                        "quick_menu_hover_timer_fired",
+                        format!(
+                            "window={:?} encoded_index={} menu_open={}",
+                            window_id.map(|window_id| window_id.0),
+                            encoded_index,
+                            ui.get_context_menu_open(),
+                        ),
+                    );
                     ui.invoke_open_context_submenu(encoded_index);
-                    if let Some(window_id) = window_id_for_ui(&ui) {
+                    if let Some(window_id) = window_id {
                         let parent_depth = (encoded_index < 0).then(|| {
                             WINDOW_RUNTIMES.with_borrow(|runtimes| {
                                 runtimes
@@ -5686,6 +5696,9 @@ fn window_id_for_ui(ui: &AppWindow) -> Option<WindowId> {
     })
 }
 
+fn trace_quick_menu(event: &str, detail: impl AsRef<str>) {
+    platform::windows::window_trace::log_diagnostic(event, detail.as_ref());
+}
 fn popup_rows(rows: &[ContextCommandRow]) -> Vec<PopupCommandRow> {
     rows.iter()
         .map(|row| PopupCommandRow {
@@ -5795,48 +5808,146 @@ fn update_root_popup_projection(window_id: WindowId) {
     reposition_quick_menu_popup(window_id);
 }
 
+fn submenu_slot_is_current(
+    session: &crate::quick_menu_popup::QuickMenuPopupSession,
+    depth: usize,
+    event: Option<crate::quick_menu_popup::MenuEventIdentity>,
+) -> bool {
+    event.is_some_and(|event| {
+        session.matches_event(event)
+            && session.branches().get(depth + 1).map(|branch| branch.id) == Some(event.branch)
+    })
+}
+
+fn replace_submenu_slot_rows_if_current(
+    session: &crate::quick_menu_popup::QuickMenuPopupSession,
+    depth: usize,
+    event: Option<crate::quick_menu_popup::MenuEventIdentity>,
+    slot_rows: &mut Vec<ContextCommandRow>,
+    projected_rows: &[ContextCommandRow],
+) -> bool {
+    let current = submenu_slot_is_current(session, depth, event);
+    if current {
+        *slot_rows = projected_rows.to_vec();
+    }
+    current
+}
+
+fn submenu_projection_needs_presentation(
+    presentation: PopupPresentation,
+    cloak_event_pending: bool,
+    loading: bool,
+) -> bool {
+    presentation == PopupPresentation::ShownCloaked && !cloak_event_pending && !loading
+}
+
+fn present_loaded_submenu_popup(
+    window_id: WindowId,
+    depth: usize,
+    event: crate::quick_menu_popup::MenuEventIdentity,
+) {
+    slint::Timer::single_shot(Duration::from_millis(16), move || {
+        finish_submenu_popup_presentation(window_id, depth, event);
+    });
+}
 fn update_open_submenu_projection(window_id: WindowId) {
-    WINDOW_RUNTIMES.with_borrow(|runtimes| {
-        let Some(runtime) = runtimes.get(&window_id) else {
-            return;
-        };
-        let popup = &runtime.quick_menu_popup;
-        let Some(depth) = popup.session.branches().len().checked_sub(2) else {
-            return;
-        };
-        let Some(submenu) = popup.branches.get(depth).filter(|slot| {
-            slot.event.is_some_and(|event| {
-                popup.session.matches_event(event)
-                    && popup
-                        .session
-                        .branches()
-                        .get(depth + 1)
-                        .map(|branch| branch.id)
-                        == Some(event.branch)
-            })
-        }) else {
-            return;
-        };
+    let projection = WINDOW_RUNTIMES.with_borrow_mut(|runtimes| {
+        let runtime = runtimes.get_mut(&window_id)?;
         let ui = &runtime.ui;
         let rows = (0..ui.get_context_submenu_commands().row_count())
             .filter_map(|index| ui.get_context_submenu_commands().row_data(index))
             .collect::<Vec<_>>();
-        submenu
-            .window
-            .set_rows(ModelRc::new(VecModel::from(popup_rows(&rows))));
-        submenu
-            .window
-            .set_content_height(ui.get_context_submenu_content_height());
-        submenu.window.set_loading(ui.get_context_submenu_loading());
-        submenu
-            .window
-            .set_active_index(ui.get_context_submenu_active_index());
-        let scale = submenu.window.window().scale_factor();
-        let height =
-            submenu_popup_height(ui, scale).min(runtime.quick_menu_popup.work_area.height.max(1));
-        submenu.window.set_window_height(height as f32 / scale);
+        let content_height = ui.get_context_submenu_content_height();
+        let loading = ui.get_context_submenu_loading();
+        let active_index = ui.get_context_submenu_active_index();
+        let popup = &mut runtime.quick_menu_popup;
+        let depth = popup.session.branches().len().checked_sub(2)?;
+        let submenu = popup.branches.get_mut(depth)?;
+        if !replace_submenu_slot_rows_if_current(
+            &popup.session,
+            depth,
+            submenu.event,
+            &mut submenu.rows,
+            &rows,
+        ) {
+            return None;
+        }
+        let present_after_update = submenu_projection_needs_presentation(
+            submenu.presentation,
+            submenu.cloak_event.is_some(),
+            loading,
+        );
+        Some((
+            submenu.window.clone_strong(),
+            submenu.event,
+            depth,
+            rows,
+            content_height,
+            loading,
+            active_index,
+            popup.work_area.height,
+            present_after_update,
+        ))
     });
+    let Some((
+        submenu,
+        event,
+        depth,
+        rows,
+        content_height,
+        loading,
+        active_index,
+        work_area_height,
+        present_after_update,
+    )) = projection
+    else {
+        trace_quick_menu(
+            "quick_menu_submenu_projection_skipped",
+            format!("window={}", window_id.0),
+        );
+        return;
+    };
+    trace_quick_menu(
+        "quick_menu_submenu_projected",
+        format!(
+            "window={} depth={} branch={:?} rows={} loading={} presentation_needed={}",
+            window_id.0,
+            depth,
+            event.map(|event| event.branch.0),
+            rows.len(),
+            loading,
+            present_after_update,
+        ),
+    );
+    submenu.set_rows(ModelRc::new(VecModel::from(popup_rows(&rows))));
+    submenu.set_content_height(content_height);
+    submenu.set_loading(loading);
+    submenu.set_active_index(active_index);
+    let scale = submenu.window().scale_factor();
+    let height = ((8.0 + content_height + if loading { 20.0 } else { 0.0 }) * scale)
+        .ceil()
+        .max(28.0) as i32;
+    submenu.set_window_height(height.min(work_area_height.max(1)) as f32 / scale);
     reposition_quick_menu_popup(window_id);
+    if present_after_update && let Some(event) = event {
+        WINDOW_RUNTIMES.with_borrow_mut(|runtimes| {
+            if let Some(runtime) = runtimes.get_mut(&window_id)
+                && current_slot_matches(&runtime.quick_menu_popup, depth, event)
+                && let Some(slot) = runtime.quick_menu_popup.branches.get_mut(depth)
+            {
+                slot.cloak_event = Some(event);
+            }
+        });
+        trace_quick_menu(
+            "quick_menu_submenu_presentation_scheduled",
+            format!(
+                "window={} depth={} branch={}",
+                window_id.0, depth, event.branch.0,
+            ),
+        );
+        submenu.window().request_redraw();
+        present_loaded_submenu_popup(window_id, depth, event);
+    }
 }
 
 fn open_quick_menu_popup(window_id: WindowId, client_x: f32, client_y: f32) {
@@ -6101,7 +6212,17 @@ fn close_quick_menu_popup(window_id: WindowId, restore_focus: bool) {
 }
 
 fn open_quick_submenu_popup(window_id: WindowId, anchor_y: f32, parent_depth: Option<usize>) {
+    open_quick_submenu_popup_attempt(window_id, anchor_y, parent_depth, 2);
+}
+
+fn open_quick_submenu_popup_attempt(
+    window_id: WindowId,
+    anchor_y: f32,
+    parent_depth: Option<usize>,
+    retries_remaining: u8,
+) {
     let started_at = Instant::now();
+    let mut retry_reason = None;
     let opened = WINDOW_RUNTIMES.with_borrow_mut(|runtimes| {
         let runtime = runtimes.get_mut(&window_id)?;
         let popup = &mut runtime.quick_menu_popup;
@@ -6190,8 +6311,9 @@ fn open_quick_submenu_popup(window_id: WindowId, anchor_y: f32, parent_depth: Op
             platform::windows::quick_menu_window::prepare_window(popup.owner_hwnd);
             let window = match QuickSubmenuWindow::new() {
                 Ok(window) => window,
-                Err(_) => {
+                Err(error) => {
                     platform::windows::quick_menu_window::cancel_prepared_window();
+                    retry_reason = Some(format!("create_window:{error}"));
                     return None;
                 }
             };
@@ -6232,13 +6354,21 @@ fn open_quick_submenu_popup(window_id: WindowId, anchor_y: f32, parent_depth: Op
             ));
 
         let hwnd = component_window_handle(&slot.window);
-        if platform::windows::quick_menu_window::attach_owner(hwnd, popup.owner_hwnd).is_err() {
+        if let Err(error) =
+            platform::windows::quick_menu_window::attach_owner(hwnd, popup.owner_hwnd)
+        {
+            retry_reason = Some(format!("attach_owner:{error}"));
             hide_quick_submenu_slots_from(popup, depth);
             let _ = popup.session.close_branch_and_descendants(event);
             return None;
         }
+        let loading = ui.get_context_submenu_loading();
         if already_visible {
             if slot.presentation == PopupPresentation::Presented {
+                slot.cloak_event = None;
+            } else if loading {
+                let _ = platform::windows::quick_menu_window::set_cloaked(hwnd, true);
+                slot.presentation = PopupPresentation::ShownCloaked;
                 slot.cloak_event = None;
             } else {
                 slot.presentation = PopupPresentation::ShownCloaked;
@@ -6246,20 +6376,22 @@ fn open_quick_submenu_popup(window_id: WindowId, anchor_y: f32, parent_depth: Op
             }
             slot.window.window().request_redraw();
         } else {
-            if platform::windows::quick_menu_window::set_cloaked(hwnd, true).is_err() {
+            if let Err(error) = platform::windows::quick_menu_window::set_cloaked(hwnd, true) {
+                retry_reason = Some(format!("cloak:{error}"));
                 hide_quick_submenu_slots_from(popup, depth);
                 let _ = popup.session.close_branch_and_descendants(event);
                 return None;
             }
             slot.presentation = PopupPresentation::Cloaked;
-            if slot.window.show().is_err() {
+            if let Err(error) = slot.window.show() {
+                retry_reason = Some(format!("show:{error}"));
                 let _ = platform::windows::quick_menu_window::set_cloaked(hwnd, false);
                 hide_quick_submenu_slots_from(popup, depth);
                 let _ = popup.session.close_branch_and_descendants(event);
                 return None;
             }
             slot.presentation = PopupPresentation::ShownCloaked;
-            slot.cloak_event = Some(event);
+            slot.cloak_event = (!loading).then_some(event);
             slot.window.window().request_redraw();
         }
         Some((
@@ -6272,6 +6404,33 @@ fn open_quick_submenu_popup(window_id: WindowId, anchor_y: f32, parent_depth: Op
     });
 
     let Some((depth, event, reused, horizontal_flipped, height_limited)) = opened else {
+        if let Some(reason) = retry_reason {
+            trace_quick_menu(
+                "quick_menu_submenu_open_retry",
+                format!(
+                    "window={} parent_depth={:?} anchor_y={} retries_remaining={} reason={}",
+                    window_id.0, parent_depth, anchor_y, retries_remaining, reason,
+                ),
+            );
+            if retries_remaining > 0 {
+                slint::Timer::single_shot(Duration::from_millis(16), move || {
+                    open_quick_submenu_popup_attempt(
+                        window_id,
+                        anchor_y,
+                        parent_depth,
+                        retries_remaining - 1,
+                    );
+                });
+                return;
+            }
+        }
+        trace_quick_menu(
+            "quick_menu_submenu_open_failed",
+            format!(
+                "window={} parent_depth={:?} anchor_y={}",
+                window_id.0, parent_depth, anchor_y,
+            ),
+        );
         WINDOW_RUNTIMES.with_borrow(|runtimes| {
             if let Some(runtime) = runtimes.get(&window_id) {
                 runtime.ui.invoke_close_context_submenu();
@@ -6279,6 +6438,19 @@ fn open_quick_submenu_popup(window_id: WindowId, anchor_y: f32, parent_depth: Op
         });
         return;
     };
+    trace_quick_menu(
+        "quick_menu_submenu_opened",
+        format!(
+            "window={} depth={} branch={} reused={} elapsed_us={} horizontal_flipped={} height_limited={}",
+            window_id.0,
+            depth,
+            event.branch.0,
+            reused,
+            started_at.elapsed().as_micros(),
+            horizontal_flipped,
+            height_limited,
+        ),
+    );
     eprintln!(
         "{{\"event\":\"quick_menu_submenu_opened\",\"window\":{},\"depth\":{},\"branch\":{},\"reused\":{},\"elapsed_us\":{},\"horizontal_flipped\":{},\"height_limited\":{}}}",
         window_id.0,
@@ -6335,18 +6507,25 @@ fn activate_submenu_slot_row(window_id: WindowId, depth: usize, index: i32) -> b
             return false;
         }
         if let Some(ui) = window_ui(window_id) {
+            ui.invoke_cancel_context_submenu_hover();
             ui.set_context_submenu_active_index(index);
             ui.invoke_open_context_submenu(-index - 1);
         }
     } else {
-        let is_deepest = WINDOW_RUNTIMES.with_borrow(|runtimes| {
-            runtimes.get(&window_id).is_some_and(|runtime| {
-                depth + 2 == runtime.quick_menu_popup.session.branches().len()
-            })
+        let event = WINDOW_RUNTIMES.with_borrow(|runtimes| {
+            let popup = &runtimes.get(&window_id)?.quick_menu_popup;
+            let event = popup.branches.get(depth)?.event?;
+            submenu_slot_is_current(&popup.session, depth, Some(event)).then_some(event)
         });
-        if !is_deepest {
+        let Some(event) = event else {
             return false;
-        }
+        };
+        WINDOW_RUNTIMES.with_borrow_mut(|runtimes| {
+            if let Some(runtime) = runtimes.get_mut(&window_id) {
+                hide_quick_submenu_slots_from(&mut runtime.quick_menu_popup, depth + 1);
+                let _ = runtime.quick_menu_popup.session.close_to_branch(event);
+            }
+        });
         if let Some(ui) = window_ui(window_id) {
             ui.set_context_menu_open(false);
             ui.invoke_invoke_context_command(row.id);
@@ -6386,31 +6565,25 @@ fn open_submenu_slot_row(window_id: WindowId, depth: usize, index: i32) -> bool 
     let Some((node_id, parent_rows, parent_anchor_y)) = prepared else {
         return false;
     };
-    WINDOW_RUNTIMES.with_borrow(|runtimes| {
-        let Some(runtime) = runtimes.get(&window_id) else {
-            return false;
-        };
+    let ui = WINDOW_RUNTIMES.with_borrow(|runtimes| {
+        let runtime = runtimes.get(&window_id)?;
         let known = runtime
             ._quick_menu
             .lock()
             .ok()
             .is_some_and(|menu| menu.submenu_tokens.contains_key(&node_id));
-        if known {
-            let parent_height = context_menu_content_height(&parent_rows);
-            runtime
-                .ui
-                .set_context_submenu_parent_commands(ModelRc::new(VecModel::from(parent_rows)));
-            runtime
-                .ui
-                .set_context_submenu_parent_content_height(parent_height);
-            runtime
-                .ui
-                .set_context_submenu_parent_anchor_y(parent_anchor_y);
-            runtime.ui.set_context_submenu_active_index(index);
-            runtime.ui.invoke_open_context_submenu(-index - 1);
-        }
-        known
-    })
+        known.then(|| runtime.ui.clone_strong())
+    });
+    let Some(ui) = ui else {
+        return false;
+    };
+    let parent_height = context_menu_content_height(&parent_rows);
+    ui.set_context_submenu_parent_commands(ModelRc::new(VecModel::from(parent_rows)));
+    ui.set_context_submenu_parent_content_height(parent_height);
+    ui.set_context_submenu_parent_anchor_y(parent_anchor_y);
+    ui.set_context_submenu_active_index(index);
+    ui.invoke_open_context_submenu(-index - 1);
+    true
 }
 
 fn close_submenu_slot_and_descendants(
@@ -6462,10 +6635,36 @@ fn finish_submenu_popup_presentation(
         .then(|| component_window_handle(&slot.window))
     });
     let Some(hwnd) = hwnd else {
+        trace_quick_menu(
+            "quick_menu_submenu_presentation_skipped",
+            format!(
+                "window={} depth={} branch={} reason=state_mismatch",
+                window_id.0, depth, event.branch.0,
+            ),
+        );
         return;
     };
-    let presented = platform::windows::quick_menu_window::flush_compositor().is_ok()
-        && platform::windows::quick_menu_window::set_cloaked(hwnd, false).is_ok();
+    let flush_result = platform::windows::quick_menu_window::flush_compositor();
+    let uncloak_result = flush_result
+        .as_ref()
+        .map_err(ToString::to_string)
+        .and_then(|_| {
+            platform::windows::quick_menu_window::set_cloaked(hwnd, false)
+                .map_err(|error| error.to_string())
+        });
+    let presented = uncloak_result.is_ok();
+    trace_quick_menu(
+        "quick_menu_submenu_presentation_finished",
+        format!(
+            "window={} depth={} branch={} hwnd={} presented={} error={:?}",
+            window_id.0,
+            depth,
+            event.branch.0,
+            hwnd,
+            presented,
+            uncloak_result.err(),
+        ),
+    );
     if presented {
         WINDOW_RUNTIMES.with_borrow_mut(|runtimes| {
             if let Some(runtime) = runtimes.get_mut(&window_id)
@@ -6524,6 +6723,9 @@ fn wire_submenu_popup_callbacks(submenu: &QuickSubmenuWindow, window_id: WindowI
     submenu.on_open_submenu(move |index, anchor_y| {
         if current_submenu_event(window_id, depth).is_none() {
             return;
+        }
+        if let Some(ui) = window_ui(window_id) {
+            ui.invoke_cancel_context_submenu_hover();
         }
         if open_submenu_slot_row(window_id, depth, index) {
             open_quick_submenu_popup(window_id, anchor_y, Some(depth));
@@ -6712,17 +6914,32 @@ fn wire_root_popup_callbacks(root: &QuickMenuWindow, window_id: WindowId) {
         }
     });
     root.on_open_submenu(move |index, anchor_y| {
-        WINDOW_RUNTIMES.with_borrow(|runtimes| {
-            if let Some(runtime) = runtimes.get(&window_id) {
-                runtime.ui.set_context_active_index(index);
-                runtime.ui.invoke_open_context_submenu(index);
-            }
-        });
+        if let Some(ui) = window_ui(window_id) {
+            ui.invoke_cancel_context_submenu_hover();
+            ui.set_context_active_index(index);
+            ui.invoke_open_context_submenu(index);
+        }
         open_quick_submenu_popup(window_id, anchor_y, None);
     });
     root.on_hover(move |index, anchor_y| {
         WINDOW_RUNTIMES.with_borrow(|runtimes| {
             if let Some(runtime) = runtimes.get(&window_id) {
+                let row = (index >= 0)
+                    .then(|| runtime.ui.get_context_commands().row_data(index as usize))
+                    .flatten();
+                trace_quick_menu(
+                    "quick_menu_root_hover",
+                    format!(
+                        "window={} index={} anchor_y={} label={:?} submenu={} node={} enabled={}",
+                        window_id.0,
+                        index,
+                        anchor_y,
+                        row.as_ref().map(|row| row.label.as_str()),
+                        row.as_ref().is_some_and(|row| row.submenu),
+                        row.as_ref().map_or(0, |row| row.node_id),
+                        row.as_ref().is_some_and(|row| row.enabled),
+                    ),
+                );
                 runtime.ui.set_context_active_index(index.max(0));
                 runtime.ui.set_context_submenu_anchor_y(anchor_y);
                 runtime.ui.invoke_hover_context_submenu(index);
@@ -9534,6 +9751,7 @@ fn wire_callbacks(
             && !row.separator
         {
             if row.submenu {
+                ui.invoke_cancel_context_submenu_hover();
                 ui.set_context_submenu_anchor_y(ui.get_context_active_anchor_y());
                 ui.invoke_open_context_submenu(index);
             } else {
@@ -9551,7 +9769,6 @@ fn wire_callbacks(
     let shell_menu_for_submenu = shell_menu_worker.clone();
     ui.on_open_context_submenu(move |encoded_index| {
         let Some(ui) = weak.upgrade() else { return };
-        ui.invoke_cancel_context_submenu_hover();
         let (model, index) = if encoded_index < 0 {
             (
                 ui.get_context_submenu_commands(),
@@ -9561,9 +9778,31 @@ fn wire_callbacks(
             (ui.get_context_commands(), encoded_index as usize)
         };
         let Some(row) = model.row_data(index) else {
+            trace_quick_menu(
+                "quick_menu_submenu_open_rejected",
+                format!("encoded_index={} reason=row_missing", encoded_index),
+            );
             return;
         };
+        trace_quick_menu(
+            "quick_menu_submenu_open_requested",
+            format!(
+                "encoded_index={} label={:?} node={} enabled={} submenu={}",
+                encoded_index,
+                row.label.as_str(),
+                row.node_id,
+                row.enabled,
+                row.submenu,
+            ),
+        );
         if !row.enabled || !row.submenu || row.node_id <= 0 {
+            trace_quick_menu(
+                "quick_menu_submenu_open_rejected",
+                format!(
+                    "encoded_index={} node={} reason=invalid_row",
+                    encoded_index, row.node_id,
+                ),
+            );
             return;
         }
         let built_in = quick_menu_for_submenu.lock().ok().and_then(|mut menu| {
@@ -9603,8 +9842,27 @@ fn wire_callbacks(
             Some((identity, menu.active_submenu_request, token, preloaded))
         });
         let Some((identity, submenu_request_id, token, preloaded)) = request else {
+            trace_quick_menu(
+                "quick_menu_submenu_request_skipped",
+                format!(
+                    "encoded_index={} node={} submenu_open={} reason=missing_identity_token_or_duplicate",
+                    encoded_index, row.node_id, submenu_is_open,
+                ),
+            );
             return;
         };
+        trace_quick_menu(
+            "quick_menu_submenu_request_started",
+            format!(
+                "session={} request={} submenu_request={} token={} encoded_index={} cached={}",
+                identity.session_id,
+                identity.request_id,
+                submenu_request_id,
+                token,
+                encoded_index,
+                preloaded.is_some(),
+            ),
+        );
         ui.set_context_submenu_open(true);
         if encoded_index < 0 {
             ui.set_context_submenu_parent_anchor_y(ui.get_context_submenu_anchor_y());
@@ -9717,6 +9975,7 @@ fn wire_callbacks(
             && !row.separator
         {
             if row.submenu {
+                ui.invoke_cancel_context_submenu_hover();
                 ui.invoke_open_context_submenu(-index - 1);
             } else {
                 ui.set_context_menu_open(false);
@@ -11354,7 +11613,15 @@ fn prepare_drop_operation(
 }
 
 fn wire_window_trace(ui: &AppWindow) {
-    let Some(path) = platform::windows::window_trace::requested_path() else {
+    let path = if let Some(path) = platform::windows::window_trace::requested_path() {
+        path
+    } else if cfg!(debug_assertions) {
+        let path = platform::windows::window_trace::default_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        path
+    } else {
         return;
     };
     let weak = ui.as_weak();
@@ -12712,6 +12979,7 @@ fn start_shell_menu_event_pump(
                         elapsed_ms,
                         ..
                     } => {
+                        let item_count = items.len();
                         let accepted = menu_state.lock().ok().is_some_and(|menu| {
                             submenu_result_matches(
                                 &menu,
@@ -12723,6 +12991,19 @@ fn start_shell_menu_event_pump(
                                 quick_menu_key_is_current(&state, &identity.key)
                             })
                         });
+                        trace_quick_menu(
+                            "quick_menu_submenu_result_received",
+                            format!(
+                                "session={} request={} submenu_request={} token={} items={} elapsed_ms={} accepted={}",
+                                session_id,
+                                request_id,
+                                submenu_request_id,
+                                token,
+                                item_count,
+                                elapsed_ms,
+                                accepted,
+                            ),
+                        );
                         if !accepted {
                             return;
                         }
@@ -18173,6 +18454,134 @@ mod tests {
         assert_eq!(context_menu_content_height(&rows), 65.0);
     }
 
+    #[test]
+    fn loaded_submenu_requests_presentation_after_hidden_loading_state() {
+        assert!(!submenu_projection_needs_presentation(
+            PopupPresentation::ShownCloaked,
+            false,
+            true,
+        ));
+        assert!(submenu_projection_needs_presentation(
+            PopupPresentation::ShownCloaked,
+            false,
+            false,
+        ));
+        assert!(!submenu_projection_needs_presentation(
+            PopupPresentation::ShownCloaked,
+            true,
+            false,
+        ));
+        assert!(!submenu_projection_needs_presentation(
+            PopupPresentation::Presented,
+            false,
+            false,
+        ));
+    }
+    #[test]
+    fn parent_submenu_branch_remains_current_while_a_descendant_is_open() {
+        let active = crate::quick_menu_popup::MenuSessionId {
+            owner_window: WindowId(1),
+            tab_id: TabId(2),
+            request_id: RequestId(3),
+            generation: 4,
+        };
+        let root = crate::quick_menu_popup::MenuBranchId(10);
+        let parent = crate::quick_menu_popup::MenuBranchId(11);
+        let descendant = crate::quick_menu_popup::MenuBranchId(12);
+        let mut session = crate::quick_menu_popup::QuickMenuPopupSession::default();
+        session.open_root(active, root);
+        assert!(session.push_branch(
+            crate::quick_menu_popup::MenuEventIdentity {
+                session: active,
+                branch: root,
+            },
+            parent,
+        ));
+        let parent_event = crate::quick_menu_popup::MenuEventIdentity {
+            session: active,
+            branch: parent,
+        };
+        assert!(session.push_branch(parent_event, descendant));
+
+        assert!(submenu_slot_is_current(&session, 0, Some(parent_event)));
+        assert!(session.close_to_branch(parent_event));
+        assert_eq!(session.branches().len(), 2);
+    }
+    #[test]
+    fn loaded_submenu_rows_replace_the_visible_slot_snapshot() {
+        let active = crate::quick_menu_popup::MenuSessionId {
+            owner_window: WindowId(1),
+            tab_id: TabId(2),
+            request_id: RequestId(3),
+            generation: 4,
+        };
+        let root = crate::quick_menu_popup::MenuBranchId(10);
+        let child = crate::quick_menu_popup::MenuBranchId(11);
+        let mut session = crate::quick_menu_popup::QuickMenuPopupSession::default();
+        session.open_root(active, root);
+        assert!(session.push_branch(
+            crate::quick_menu_popup::MenuEventIdentity {
+                session: active,
+                branch: root,
+            },
+            child,
+        ));
+        let event = crate::quick_menu_popup::MenuEventIdentity {
+            session: active,
+            branch: child,
+        };
+        let mut slot_rows = Vec::new();
+        let loaded = vec![context_test_row(
+            SHELL_CONTEXT_COMMAND_BASE + 42,
+            "Loaded child",
+            "loaded",
+            false,
+        )];
+
+        assert!(replace_submenu_slot_rows_if_current(
+            &session,
+            0,
+            Some(event),
+            &mut slot_rows,
+            &loaded,
+        ));
+        assert_eq!(slot_rows, loaded);
+    }
+
+    #[test]
+    fn stale_submenu_rows_do_not_replace_the_visible_slot_snapshot() {
+        let active = crate::quick_menu_popup::MenuSessionId {
+            owner_window: WindowId(1),
+            tab_id: TabId(2),
+            request_id: RequestId(3),
+            generation: 4,
+        };
+        let root = crate::quick_menu_popup::MenuBranchId(10);
+        let current_child = crate::quick_menu_popup::MenuBranchId(12);
+        let mut session = crate::quick_menu_popup::QuickMenuPopupSession::default();
+        session.open_root(active, root);
+        assert!(session.push_branch(
+            crate::quick_menu_popup::MenuEventIdentity {
+                session: active,
+                branch: root,
+            },
+            current_child,
+        ));
+        let mut slot_rows = vec![context_test_row(1, "Current", "current", false)];
+        let stale = vec![context_test_row(2, "Stale", "stale", false)];
+
+        assert!(!replace_submenu_slot_rows_if_current(
+            &session,
+            0,
+            Some(crate::quick_menu_popup::MenuEventIdentity {
+                session: active,
+                branch: crate::quick_menu_popup::MenuBranchId(11),
+            }),
+            &mut slot_rows,
+            &stale,
+        ));
+        assert_eq!(slot_rows[0].label.as_str(), "Current");
+    }
     #[test]
     fn quick_menu_ignores_duplicate_request_for_visible_submenu() {
         assert!(submenu_request_is_duplicate(true, Some(7), 7));

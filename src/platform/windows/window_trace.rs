@@ -60,11 +60,35 @@ pub fn active_path() -> Option<&'static Path> {
 }
 
 pub fn default_path() -> PathBuf {
-    PathBuf::from("artifacts/logs/window-interaction-diagnostic.jsonl")
+    let relative = PathBuf::from("artifacts/logs/window-interaction-diagnostic.jsonl");
+    if cfg!(debug_assertions) {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+    } else {
+        relative
+    }
 }
 pub fn log_request(hwnd: isize, kind: &str) {
     if TRACE_FILE.get().is_some() {
         write_record(hwnd as HWND, kind, 0, 0);
+    }
+}
+
+pub fn log_diagnostic(kind: &str, detail: &str) {
+    let Some(file) = TRACE_FILE.get() else {
+        return;
+    };
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    if let Ok(mut file) = file.try_lock() {
+        let _ = writeln!(
+            file,
+            "{{\"time_unix_ms\":{},\"event\":{:?},\"detail\":{:?}}}",
+            elapsed.as_millis(),
+            kind,
+            detail,
+        );
+        let _ = file.flush();
     }
 }
 
@@ -139,5 +163,10 @@ mod tests {
         assert_eq!(message_name(WM_ENTERSIZEMOVE), Some("WM_ENTERSIZEMOVE"));
         assert_eq!(message_name(WM_EXITSIZEMOVE), Some("WM_EXITSIZEMOVE"));
         assert_eq!(message_name(0x0200), None);
+    }
+
+    #[test]
+    fn diagnostic_logging_is_safe_before_trace_installation() {
+        log_diagnostic("quick-menu-test", "not installed");
     }
 }
