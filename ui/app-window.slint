@@ -18,6 +18,7 @@ export global VisualStyle {
     out property <color> c303138: dark-theme ? #f2f2f2 : #303138;
     out property <color> c30333a: dark-theme ? #f2f2f2 : #30333a;
     out property <color> c323437: #323437;
+    out property <color> navigation-surface-background: dark-theme ? #323437 : #e9e9e9;
     out property <color> c57595c: dark-theme ? #57595c : #75787c;
     out property <color> c3b4f83: dark-theme ? #9db5ff : #3b4f83;
     out property <color> c4f535d: dark-theme ? #d0d0d0 : #4f535d;
@@ -1337,7 +1338,7 @@ export component AppWindow inherits Window {
                                 visible: tab.active;
                                 width: parent.width;
                                 height: parent.height;
-                                shape-color: VisualStyle.c323437;
+                                shape-color: VisualStyle.navigation-surface-background;
                             }
                             tab-touch := TouchArea {
                                 mouse-cursor: pointer;
@@ -1423,7 +1424,7 @@ export component AppWindow inherits Window {
 
         Rectangle {
             visible: !root.active-is-settings;
-            height: self.visible ? 56px : 0px; background: VisualStyle.c323437; border-width: 0px;
+            height: self.visible ? 56px : 0px; background: VisualStyle.navigation-surface-background; border-width: 0px;
             HorizontalLayout {
                 padding-top: 9px; padding-bottom: 9px; padding-left: 14px; padding-right: 14px; spacing: 7px;
                 ContextMenuArea { width: 38px; height: 38px; IconButton { icon-source: IconMap.action-back; tip: root.text-back + " (Alt+Left)"; enabled: root.can-navigate-back; button-label: root.text-back; clicked => { root.navigate-back(); } } Menu { for history in root.back-history: MenuItem { title: history.label; activated => { root.navigate-history(true, history.index); } } } }
@@ -1443,7 +1444,7 @@ export component AppWindow inherits Window {
         if !root.active-is-settings: HorizontalLayout {
             spacing: 0px;
             if !root.minimal: Rectangle {
-                width: root.compact ? 184px : 218px; background: VisualStyle.c323437; border-width: 0px; clip: true;
+                width: root.compact ? 184px : 218px; background: VisualStyle.navigation-surface-background; border-width: 0px; clip: true;
                 sidebar-scroll := ScrollView {
                     width: parent.width; height: parent.height;
                     viewport-width: self.width;
@@ -1628,7 +1629,7 @@ export component AppWindow inherits Window {
                         x: 0px; y: 0px; width: 5px; height: 5px;
                         viewbox-width: 5; viewbox-height: 5; fit: fill;
                         commands: "M 0 0 L 5 0 C 2.2 0 0 2.2 0 5 Z";
-                        fill: VisualStyle.c323437;
+                        fill: VisualStyle.navigation-surface-background;
                     }
                 }
 

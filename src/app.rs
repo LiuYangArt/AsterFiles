@@ -18982,6 +18982,7 @@ mod tests {
             assert!(source.contains(marker), "missing keyboard guard: {marker}");
         }
     }
+
     #[test]
     fn issue_43_file_name_font_size_has_one_semantic_source() {
         let ui = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
@@ -22792,6 +22793,33 @@ mod tests {
         let _ = ui.root_element().query_descendants().find_all();
     }
 
+    #[test]
+    fn light_theme_uses_navigation_background_for_tab_address_sidebar_and_corner() {
+        let ui = headless_file_view();
+        ui.set_dark_theme(false);
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
+        assert_eq!(
+            source
+                .matches("VisualStyle.navigation-surface-background")
+                .count(),
+            4
+        );
+        assert!(source.contains("shape-color: VisualStyle.navigation-surface-background;"));
+        assert!(source.contains("fill: VisualStyle.navigation-surface-background;"));
+        update_test_layout(&ui);
+
+        assert_eq!(
+            VisualStyle::get(&ui).get_navigation_surface_background(),
+            Color::from_argb_u8(0xff, 0xe9, 0xe9, 0xe9)
+        );
+
+        VisualStyle::get(&ui).set_dark_theme(true);
+        update_test_layout(&ui);
+        assert_eq!(
+            VisualStyle::get(&ui).get_navigation_surface_background(),
+            Color::from_argb_u8(0xff, 0x32, 0x34, 0x37)
+        );
+    }
     #[test]
     fn inactive_grid_model_updates_do_not_rewind_the_details_viewport() {
         let ui = headless_file_view();
