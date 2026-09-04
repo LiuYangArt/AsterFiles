@@ -58,6 +58,7 @@ export global VisualStyle {
     out property <color> cffffff: dark-theme ? #252525 : #ffffff;
     out property <length> tab-shoulder-width: 7px;
     out property <length> tab-shoulder-span: 14px;
+    out property <length> file-name-font-size: 12px;
 }
 
 component StandaloneActionButton inherits Rectangle {
@@ -1706,7 +1707,7 @@ spacing: 0px;
 for segment in entry.name-segments: Text {
     text: segment.text;
     color: VisualStyle.c24252a;
-    font-size: 13px;
+    font-size: VisualStyle.file-name-font-size;
     font-weight: segment.highlighted ? 700 : 400;
     horizontal-alignment: left;
     vertical-alignment: center;
@@ -1719,7 +1720,7 @@ x: parent.width - parent.fade-width;
 width: parent.fade-width;
 height: parent.height;
 background: entry.id == root.drop-hover-entry-id ? VisualStyle.cc7d7ff : (entry.selected ? VisualStyle.cdce6ff : (mouse.has-hover ? VisualStyle.ceff4ff : VisualStyle.cffffff));
-Text { text: "…"; color: VisualStyle.c24252a; font-size: 13px; horizontal-alignment: right; vertical-alignment: center; }
+Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name-font-size; horizontal-alignment: right; vertical-alignment: center; }
                                             }
                                         }
                                         if root.rename-editing && root.rename-entry-id == entry.id: Rectangle {
@@ -1754,7 +1755,7 @@ text <=> root.rename-input;
 color: VisualStyle.c24252a;
 selection-background-color: VisualStyle.cc7d7ff;
 selection-foreground-color: VisualStyle.c24252a;
-font-size: 13px;
+font-size: VisualStyle.file-name-font-size;
 single-line: true;
 vertical-alignment: center;
 init => {
@@ -1802,7 +1803,7 @@ accessible-label: entry.name;
                                     x: 4px; y: 8px; width: 48px; height: 48px;
                                     icon-source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document);
                                 }
-                                Text { x: 64px; y: 8px; width: parent.width - 76px; height: 24px; text: entry.name; color: VisualStyle.c24252a; font-size: 14px; font-weight: 500; vertical-alignment: center; overflow: elide; }
+                                Text { x: 64px; y: 8px; width: parent.width - 76px; height: 24px; text: entry.name; color: VisualStyle.c24252a; font-size: VisualStyle.file-name-font-size; font-weight: 500; vertical-alignment: center; overflow: elide; }
                                 Text { x: 64px; y: 34px; width: parent.width - 250px; height: 20px; text: entry.kind; color: VisualStyle.c6f717a; font-size: 12px; vertical-alignment: center; overflow: elide; }
                                 Text { x: parent.width - 174px; y: 34px; width: 74px; height: 20px; text: entry.size; color: VisualStyle.c6f717a; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
                                 Text { x: parent.width - 92px; y: 34px; width: 88px; height: 20px; text: entry.modified; color: VisualStyle.c6f717a; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
@@ -1943,7 +1944,7 @@ accessible-label: entry.name;
                                     y: root.view-mode == 6 ? 8px : root.view-icon-size(root.view-mode) + 10px;
                                     width: root.view-mode == 6 ? parent.width - 72px : parent.width - 14px;
                                     height: root.view-mode == 6 ? 24px : parent.height - root.view-icon-size(root.view-mode) - 12px;
-                                    text: entry.name; color: VisualStyle.c24252a; font-size: 12px;
+                                    text: entry.name; color: VisualStyle.c24252a; font-size: VisualStyle.file-name-font-size;
                                     horizontal-alignment: root.view-mode == 6 ? left : center; vertical-alignment: center; overflow: elide;
                                 }
                                 if root.view-mode == 6: Text {

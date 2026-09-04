@@ -17999,6 +17999,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn issue_43_file_name_font_size_has_one_semantic_source() {
+        let ui = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
+        let semantic_font_size = "font-size: VisualStyle.file-name-font-size;";
+
+        assert_eq!(
+            ui.matches("out property <length> file-name-font-size: 12px;")
+                .count(),
+            1
+        );
+        assert_eq!(ui.matches(semantic_font_size).count(), 5);
+        let details_and_list_name = ui
+            .split_once("for segment in entry.name-segments: Text {")
+            .expect("details and list must render segmented file names")
+            .1;
+        assert!(details_and_list_name.contains(semantic_font_size));
+        assert_eq!(
+            ui.matches("text: entry.name; color: VisualStyle.c24252a; font-size: VisualStyle.file-name-font-size;")
+                .count(),
+            2
+        );
+        let rename_editor = ui
+            .split_once("rename-editor := TextInput {")
+            .expect("rename editor must exist")
+            .1;
+        assert!(rename_editor.contains(semantic_font_size));
+        assert!(!ui.contains("text: entry.name; color: VisualStyle.c24252a; font-size: 14px;"));
+    }
+    #[test]
     fn network_directory_scheduler_serializes_one_host_and_allows_another() {
         let mut scheduler = NetworkDirectoryScheduler::default();
         let server = NetworkExecutionKey::from_unc(Path::new(r"\\server\one")).unwrap();
