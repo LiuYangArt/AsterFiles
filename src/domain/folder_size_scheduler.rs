@@ -95,7 +95,7 @@ impl FolderSizeScheduler {
             self.cancel(request_id);
         }
         let prefetch = visible_rows.max(1);
-        let start = first_row.saturating_sub(prefetch);
+        let start = first_row.saturating_sub(prefetch).min(entries.len());
         let end = first_row
             .saturating_add(visible_rows)
             .saturating_add(prefetch)
@@ -332,6 +332,16 @@ mod tests {
         assert_eq!(first.first().unwrap().key.entry_id, EntryId(41));
         assert_eq!(first.last().unwrap().key.entry_id, EntryId(64));
         assert!(duplicate.is_empty());
+    }
+
+    #[test]
+    fn visible_range_past_the_last_entry_is_empty() {
+        let mut entries = vec![entry(1, "folder")];
+        let mut scheduler = FolderSizeScheduler::new();
+
+        let queries = scheduler.visible_queries(RequestId(7), &mut entries, 900, 10);
+
+        assert!(queries.is_empty());
     }
 
     #[test]
