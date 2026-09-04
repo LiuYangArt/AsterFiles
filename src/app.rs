@@ -1417,10 +1417,9 @@ struct AppState {
     search_view: SearchViewPreference,
     operations: OperationManager,
     operation_errors: Vec<String>,
-    rename_target: Option<(TabId, EntryId)>,
-    rename_extension: Option<std::ffi::OsString>,
+    rename_targets: HashMap<WindowId, (TabId, EntryId, Option<std::ffi::OsString>)>,
     focus_after_refresh: HashMap<TabId, PendingFocus>,
-    pending_permanent_delete: Vec<OperationItem>,
+    pending_permanent_delete: Option<(TabId, Vec<OperationItem>)>,
     exit_after_cancel: bool,
     clipboard_has_files: bool,
     cut_paths: Vec<PathBuf>,
@@ -1432,7 +1431,7 @@ struct AppState {
     everything_generation: u64,
     everything_status: String,
     everything_folder_sizes_indexed: Option<bool>,
-    pending_right_drop: Option<platform::windows::drag_drop::DropIntent>,
+    pending_right_drops: HashMap<WindowId, (TabId, platform::windows::drag_drop::DropIntent)>,
     tab_drag: Option<TabDragSession>,
     column_drag: Option<ColumnDragSession>,
 }
@@ -1635,10 +1634,9 @@ impl AppState {
             search_view,
             operations: OperationManager::new(),
             operation_errors: Vec::new(),
-            rename_target: None,
-            rename_extension: None,
+            rename_targets: HashMap::new(),
             focus_after_refresh: HashMap::new(),
-            pending_permanent_delete: Vec::new(),
+            pending_permanent_delete: None,
             exit_after_cancel: false,
             clipboard_has_files: false,
             cut_paths: Vec::new(),
@@ -1649,7 +1647,7 @@ impl AppState {
             everything_generation: 0,
             everything_status: String::new(),
             everything_folder_sizes_indexed: None,
-            pending_right_drop: None,
+            pending_right_drops: HashMap::new(),
             tab_drag: None,
             column_drag: None,
         }
@@ -1888,9 +1886,7 @@ impl AppState {
             .retain(|(tab_id, _, _), _| !window.tabs.contains_key(tab_id));
         self.focus_after_refresh
             .retain(|tab_id, _| !window.tabs.contains_key(tab_id));
-        self.rename_target = self
-            .rename_target
-            .filter(|(tab_id, _)| !window.tabs.contains_key(tab_id));
+        self.rename_targets.remove(&id);
         if self.windows.is_empty() {
             return Some(WindowCloseDecision::ExitApplication);
         }
@@ -2980,7 +2976,7 @@ enum FileOperationEvent {
 #[derive(Debug)]
 enum ClipboardRequest {
     Write { paths: Vec<PathBuf>, cut: bool },
-    ReadPaste { target: PathBuf },
+    ReadPaste { origin_tab: TabId, target: PathBuf },
     CheckAvailability,
 }
 #[derive(Debug)]
@@ -2990,7 +2986,10 @@ enum ClipboardEvent {
         paths: Vec<PathBuf>,
         cut: bool,
     },
-    Paste(Result<Option<(FileOperationKind, Vec<OperationItem>)>, String>),
+    Paste {
+        origin_tab: TabId,
+        result: Result<Option<(FileOperationKind, Vec<OperationItem>)>, String>,
+    },
     Availability(Result<bool, String>),
 }
 
@@ -3313,7 +3312,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         &conflict_ui,
         &exit_ui,
         operation_sender.clone(),
-        state.clone(),
+        scoped_state.clone(),
     );
     wire_network_login_window(
         &ui,
@@ -4162,6 +4161,12 @@ fn selected_paths(app: &AppState) -> Vec<PathBuf> {
         })
         .collect()
 }
+fn selected_paths_for_tab(tab: &TabSession) -> Vec<PathBuf> {
+    tab.selected
+        .iter()
+        .filter_map(|id| tab.visible_entry(*id).map(|entry| entry.path.clone()))
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 struct FileHitGeometry {
@@ -4295,6 +4300,7 @@ fn context_target_at(
 fn enqueue_operation(
     state: &SharedSessions,
     sender: &mpsc::Sender<FileOperationRequest>,
+    origin_tab: TabId,
     kind: FileOperationKind,
     mut items: Vec<OperationItem>,
 ) {
@@ -4316,8 +4322,11 @@ fn enqueue_operation(
     let resource = operation_resource(&items);
     let request = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
-        let tab = app.active_window_state().active_tab;
-        app.operations.submit(resource, kind, Some(tab), items);
+        if app.tab(origin_tab).is_none() {
+            return;
+        }
+        app.operations
+            .submit(resource, kind, Some(origin_tab), items);
         if app.operations.active_id(resource).is_some() {
             return;
         }
@@ -4357,47 +4366,58 @@ fn operation_resource(items: &[OperationItem]) -> OperationResource {
     }
 }
 
-fn create_default_folder(state: &SharedSessions, sender: &mpsc::Sender<FileOperationRequest>) {
-    let destination = state.lock().ok().and_then(|app| {
+fn create_default_folder(state: &WindowSessions, sender: &mpsc::Sender<FileOperationRequest>) {
+    let target = state.lock().ok().and_then(|app| {
+        let tab_id = app.window(state.window_id)?.active_tab;
         let name = match app.language {
             Language::Chinese => "新建文件夹",
             Language::English => "New folder",
         };
-        app.active().visible_path().map(|parent| parent.join(name))
+        app.tab(tab_id)
+            .and_then(TabSession::visible_path)
+            .map(|parent| (tab_id, parent.join(name)))
     });
-    if let Some(path) = destination {
+    if let Some((tab_id, path)) = target {
         enqueue_operation(
-            state,
+            &state.shared,
             sender,
+            tab_id,
             FileOperationKind::CreateFolder,
             vec![OperationItem::pending(None, Some(path))],
         );
     }
 }
 fn request_clipboard_write(
-    state: &SharedSessions,
+    state: &WindowSessions,
     sender: &mpsc::Sender<ClipboardRequest>,
     cut: bool,
 ) {
     let paths = state
         .lock()
-        .map(|app| selected_paths(&app))
+        .map(|app| {
+            app.window(state.window_id)
+                .and_then(|window| window.tabs.get(&window.active_tab))
+                .map(selected_paths_for_tab)
+                .unwrap_or_default()
+        })
         .unwrap_or_default();
     if !paths.is_empty() {
         let _ = sender.send(ClipboardRequest::Write { paths, cut });
     }
 }
 
-fn request_clipboard_paste(state: &SharedSessions, sender: &mpsc::Sender<ClipboardRequest>) {
-    let target = state
-        .lock()
-        .ok()
-        .and_then(|app| app.active().visible_path().map(Path::to_path_buf));
-    if let Some(target) = target {
-        let _ = sender.send(ClipboardRequest::ReadPaste { target });
+fn request_clipboard_paste(state: &WindowSessions, sender: &mpsc::Sender<ClipboardRequest>) {
+    let target = state.lock().ok().and_then(|app| {
+        let tab_id = app.window(state.window_id)?.active_tab;
+        app.tab(tab_id)
+            .and_then(TabSession::visible_path)
+            .map(|path| (tab_id, path.to_path_buf()))
+    });
+    if let Some((origin_tab, target)) = target {
+        let _ = sender.send(ClipboardRequest::ReadPaste { origin_tab, target });
     }
 }
-fn set_view_mode(state: &SharedSessions, mode: ViewMode) {
+fn set_view_mode(state: &WindowSessions, mode: ViewMode) {
     if let Ok(mut app) = state.lock() {
         let tab_id = app.active_window_state().active_tab;
         if app.active().page_source == PageSource::Search {
@@ -4410,7 +4430,7 @@ fn set_view_mode(state: &SharedSessions, mode: ViewMode) {
     }
 }
 
-fn set_sort_field(state: &SharedSessions, field: SortField) {
+fn set_sort_field(state: &WindowSessions, field: SortField) {
     if let Ok(mut app) = state.lock() {
         if app.active().page_source == PageSource::Search {
             let direction = app.search_view.sort_direction;
@@ -4444,7 +4464,7 @@ fn set_sort_field(state: &SharedSessions, field: SortField) {
     }
 }
 
-fn set_sort_direction(state: &SharedSessions, direction: SortDirection) {
+fn set_sort_direction(state: &WindowSessions, direction: SortDirection) {
     if let Ok(mut app) = state.lock() {
         if app.active().page_source == PageSource::Search {
             app.search_view.sort_direction = direction;
@@ -4561,7 +4581,7 @@ fn fitted_column_width(app: &AppState, kind: ColumnKind) -> u32 {
         crate::domain::MAX_COLUMN_WIDTH,
     )
 }
-fn begin_rename_ui(weak: &slint::Weak<AppWindow>, state: &SharedSessions) {
+fn begin_rename_ui(weak: &slint::Weak<AppWindow>, state: &WindowSessions) {
     let target = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         if app.active().selected.len() != 1 {
@@ -4581,10 +4601,12 @@ fn begin_rename_ui(weak: &slint::Weak<AppWindow>, state: &SharedSessions) {
                 entry.display_name.clone()
             }
         });
-        app.rename_extension = entry
+        let extension = entry
             .filter(|entry| entry.kind == crate::domain::EntryKind::File)
             .and_then(|entry| entry.path.extension().map(std::ffi::OsStr::to_os_string));
-        app.rename_target = Some((app.active_window_state().active_tab, id));
+        let tab_id = app.active_window_state().active_tab;
+        app.rename_targets
+            .insert(state.window_id, (tab_id, id, extension));
         name.map(|name| (id, name))
     };
     if let Some((id, name)) = target
@@ -4628,37 +4650,48 @@ fn rename_validation_message(
 }
 
 fn submit_rename(
-    state: &SharedSessions,
+    state: &WindowSessions,
     sender: &mpsc::Sender<FileOperationRequest>,
     name: &str,
 ) -> Result<(), String> {
-    let item = {
+    let target = {
         let app = state.lock().expect("app state mutex is not poisoned");
         crate::fs::file_operations::validate_name(std::ffi::OsStr::new(name))
             .map_err(|error| rename_validation_message(app.language, error))?;
-        let target = app.rename_target;
-        target
-            .and_then(|(tab_id, id)| {
-                app.active_window_state()
+        app.rename_targets
+            .get(&state.window_id)
+            .and_then(|(tab_id, id, extension)| {
+                app.window(state.window_id)?
                     .tabs
-                    .get(&tab_id)?
-                    .visible_entry(id)
-            })
-            .and_then(|entry| {
-                entry.path.parent().map(|parent| {
-                    let mut new_name = std::ffi::OsString::from(name);
-                    if let Some(extension) = app.rename_extension.as_ref() {
-                        new_name.push(".");
-                        new_name.push(extension);
-                    }
-                    OperationItem::pending(Some(entry.path.clone()), Some(parent.join(new_name)))
-                })
+                    .get(tab_id)?
+                    .visible_entry(*id)
+                    .and_then(|entry| {
+                        entry.path.parent().map(|parent| {
+                            let mut new_name = std::ffi::OsString::from(name);
+                            if let Some(extension) = extension.as_ref() {
+                                new_name.push(".");
+                                new_name.push(extension);
+                            }
+                            (
+                                *tab_id,
+                                OperationItem::pending(
+                                    Some(entry.path.clone()),
+                                    Some(parent.join(new_name)),
+                                ),
+                            )
+                        })
+                    })
             })
     };
-    let Some(item) = item else {
-        return Err("Rename target is no longer available.".to_owned());
-    };
-    enqueue_operation(state, sender, FileOperationKind::Rename, vec![item]);
+    let (tab_id, item) =
+        target.ok_or_else(|| "Rename target is no longer available.".to_owned())?;
+    enqueue_operation(
+        &state.shared,
+        sender,
+        tab_id,
+        FileOperationKind::Rename,
+        vec![item],
+    );
     Ok(())
 }
 
@@ -4677,37 +4710,40 @@ fn should_fast_remove(path: &Path) -> bool {
             .is_some()
 }
 
-fn selected_delete_items(state: &SharedSessions) -> Vec<OperationItem> {
-    state
-        .lock()
-        .map(|app| {
-            selected_paths(&app)
-                .into_iter()
-                .map(|path| OperationItem::pending(Some(path), None))
-                .collect()
-        })
-        .unwrap_or_default()
+fn pending_permanent_delete(state: &WindowSessions) -> Option<(TabId, Vec<OperationItem>)> {
+    state.lock().ok().and_then(|app| {
+        let window = app.window(state.window_id)?;
+        let tab = window.tabs.get(&window.active_tab)?;
+        let items = selected_paths_for_tab(tab)
+            .into_iter()
+            .map(|path| OperationItem::pending(Some(path), None))
+            .collect::<Vec<_>>();
+        (!items.is_empty()).then_some((tab.id, items))
+    })
 }
-
 fn submit_delete_items(
     state: &SharedSessions,
     sender: &mpsc::Sender<FileOperationRequest>,
+    origin_tab: TabId,
     permanent: bool,
     items: Vec<OperationItem>,
 ) {
-    if permanent {
-        enqueue_operation(state, sender, FileOperationKind::PermanentDelete, items);
+    let kind = if permanent {
+        FileOperationKind::PermanentDelete
     } else {
-        enqueue_operation(state, sender, FileOperationKind::RecycleDelete, items);
-    }
+        FileOperationKind::RecycleDelete
+    };
+    enqueue_operation(state, sender, origin_tab, kind, items);
 }
 
 fn submit_delete(
-    state: &SharedSessions,
+    state: &WindowSessions,
     sender: &mpsc::Sender<FileOperationRequest>,
     permanent: bool,
 ) {
-    submit_delete_items(state, sender, permanent, selected_delete_items(state));
+    if let Some((origin_tab, items)) = pending_permanent_delete(state) {
+        submit_delete_items(&state.shared, sender, origin_tab, permanent, items);
+    }
 }
 
 const SHELL_CONTEXT_COMMAND_BASE: i32 = 100_000;
@@ -6021,6 +6057,19 @@ fn close_quick_submenu_windows(popup: &mut QuickMenuPopupRuntime) {
     hide_quick_submenu_slots_from(popup, 0);
 }
 
+fn quick_menu_popup_owns_foreground(popup: &QuickMenuPopupRuntime) -> bool {
+    let handles = std::iter::once(component_window_handle(&popup.root))
+        .chain(
+            popup
+                .branches
+                .iter()
+                .filter(|slot| slot.event.is_some())
+                .map(|branch| component_window_handle(&branch.window)),
+        )
+        .collect::<Vec<_>>();
+    platform::windows::quick_menu_window::foreground_belongs_to(popup.owner_hwnd, &handles)
+}
+
 fn close_quick_menu_popup(window_id: WindowId, restore_focus: bool) {
     let started_at = Instant::now();
     WINDOW_RUNTIMES.with_borrow_mut(|runtimes| {
@@ -6028,6 +6077,7 @@ fn close_quick_menu_popup(window_id: WindowId, restore_focus: bool) {
             return;
         };
         let popup = &mut runtime.quick_menu_popup;
+        let foreground_owned = restore_focus && quick_menu_popup_owns_foreground(popup);
         let was_open = popup.session.close_all();
         close_quick_submenu_windows(popup);
         let root_hwnd = component_window_handle(&popup.root);
@@ -6035,7 +6085,8 @@ fn close_quick_menu_popup(window_id: WindowId, restore_focus: bool) {
         let _ = popup.root.hide();
         popup.presentation = PopupPresentation::Hidden;
         popup.cloak_generation = None;
-        if was_open && restore_focus {
+        let focus_restored = was_open && foreground_owned;
+        if focus_restored {
             platform::windows::quick_menu_window::focus_window(popup.owner_hwnd);
         }
         if was_open {
@@ -6043,7 +6094,7 @@ fn close_quick_menu_popup(window_id: WindowId, restore_focus: bool) {
                 "{{\"event\":\"quick_menu_popup_closed\",\"window\":{},\"elapsed_us\":{},\"focus_restored\":{}}}",
                 window_id.0,
                 started_at.elapsed().as_micros(),
-                restore_focus,
+                focus_restored,
             );
         }
     });
@@ -6309,7 +6360,7 @@ fn activate_submenu_slot_row(window_id: WindowId, depth: usize, index: i32) -> b
                 .is_none_or(|runtime| !runtime.ui.get_context_menu_open())
         });
         if menu_closed {
-            close_quick_menu_popup(window_id, false);
+            close_quick_menu_popup(window_id, true);
         }
     }
     row.submenu
@@ -6373,6 +6424,7 @@ fn close_submenu_slot_and_descendants(
         };
         let popup = &mut runtime.quick_menu_popup;
         if current_slot_matches(popup, depth, event) {
+            let foreground_owned = quick_menu_popup_owns_foreground(popup);
             hide_quick_submenu_slots_from(popup, depth);
             let _ = popup.session.close_branch_and_descendants(event);
             let focus_target = depth
@@ -6380,7 +6432,9 @@ fn close_submenu_slot_and_descendants(
                 .and_then(|parent_depth| popup.branches.get(parent_depth))
                 .and_then(|slot| slot.event.map(|_| component_window_handle(&slot.window)))
                 .unwrap_or_else(|| component_window_handle(&popup.root));
-            platform::windows::quick_menu_window::focus_window(focus_target);
+            if foreground_owned {
+                platform::windows::quick_menu_window::focus_window(focus_target);
+            }
         }
     });
 }
@@ -6654,7 +6708,7 @@ fn wire_root_popup_callbacks(root: &QuickMenuWindow, window_id: WindowId) {
                 .is_none_or(|runtime| !runtime.ui.get_context_menu_open())
         });
         if menu_closed {
-            close_quick_menu_popup(window_id, false);
+            close_quick_menu_popup(window_id, true);
         }
     });
     root.on_open_submenu(move |index, anchor_y| {
@@ -6798,6 +6852,7 @@ fn wire_internal_drag_drop(
     #[derive(Debug)]
     struct InternalDrag {
         entry_id: EntryId,
+        origin_tab: TabId,
         paths: Vec<PathBuf>,
         source_directories: Vec<PathBuf>,
         start_x: f32,
@@ -6815,6 +6870,7 @@ fn wire_internal_drag_drop(
             .lock()
             .expect("app state mutex is not poisoned");
         let id = EntryId(entry_id as u32);
+        let origin_tab = app.active_window_state().active_tab;
         let paths = drag_paths_for_pressed_entry(&app, id);
         let source_directories = paths
             .iter()
@@ -6823,6 +6879,7 @@ fn wire_internal_drag_drop(
         if let Ok(mut drag) = drag_for_begin.lock() {
             *drag = Some(InternalDrag {
                 entry_id: id,
+                origin_tab,
                 paths,
                 source_directories,
                 start_x: x,
@@ -6952,12 +7009,21 @@ fn wire_internal_drag_drop(
             ui.set_drop_can_move(true);
             ui.set_drop_can_link(true);
             if let Ok(mut app) = state_for_end.lock() {
-                app.pending_right_drop = Some(intent);
+                app.pending_right_drops
+                    .insert(state_for_end.window_id, (drag.origin_tab, intent));
             }
             ui.invoke_show_drop_menu(x, y);
         } else {
+            let origin_tab = state_for_end.lock().ok().and_then(|app| {
+                app.window(state_for_end.window_id)
+                    .map(|window| window.active_tab)
+            });
+            let Some(origin_tab) = origin_tab else {
+                return;
+            };
             dispatch_drop_operation(
                 intent,
+                origin_tab,
                 state_for_end.shared.clone(),
                 operation_sender.clone(),
             );
@@ -9992,11 +10058,9 @@ fn wire_callbacks(
                     }
                     return;
                 }
+                let pending = pending_permanent_delete(&state_for_context_command);
                 if let Ok(mut app) = state_for_context_command.lock() {
-                    app.pending_permanent_delete = selected_paths(&app)
-                        .into_iter()
-                        .map(|path| OperationItem::pending(Some(path), None))
-                        .collect();
+                    app.pending_permanent_delete = pending;
                 }
                 if let (Some(ui), Some(delete_ui)) =
                     (weak.upgrade(), delete_weak_for_context.upgrade())
@@ -10102,8 +10166,8 @@ fn wire_callbacks(
     let state_for_cancel_rename = state.clone();
     ui.on_cancel_rename(move || {
         if let Ok(mut app) = state_for_cancel_rename.lock() {
-            app.rename_target = None;
-            app.rename_extension = None;
+            app.rename_targets
+                .remove(&state_for_cancel_rename.window_id);
         }
         if let Some(ui) = weak.upgrade() {
             ui.set_rename_submitting(false);
@@ -10127,11 +10191,9 @@ fn wire_callbacks(
                 }
                 return;
             }
+            let pending = pending_permanent_delete(&state_for_delete);
             if let Ok(mut app) = state_for_delete.lock() {
-                app.pending_permanent_delete = selected_paths(&app)
-                    .into_iter()
-                    .map(|path| OperationItem::pending(Some(path), None))
-                    .collect();
+                app.pending_permanent_delete = pending;
             }
             if let (Some(ui), Some(delete_ui)) = (weak.upgrade(), delete_weak.upgrade()) {
                 show_confirmation_window(&ui, None, &delete_ui);
@@ -10351,7 +10413,7 @@ fn wire_mouse_navigation(
                 }
             }
             if let Ok(mut app) = state.lock() {
-                app.pending_right_drop = None;
+                app.pending_right_drops.remove(&window_id);
             }
             project_native_insertion_indicator(None, &state);
             return EventResult::Propagate;
@@ -10406,7 +10468,7 @@ fn wire_mouse_navigation(
             if ui.get_drop_menu_open() {
                 ui.set_drop_menu_open(false);
                 if let Ok(mut app) = state.lock() {
-                    app.pending_right_drop = None;
+                    app.pending_right_drops.remove(&window_id);
                 }
                 cancelled = true;
             }
@@ -10617,7 +10679,7 @@ fn wire_mouse_navigation(
                         if ui.get_drop_menu_open() {
                             ui.set_drop_menu_open(false);
                             if let Ok(mut app) = state.lock() {
-                                app.pending_right_drop = None;
+                                app.pending_right_drops.remove(&window_id);
                             }
                         } else {
                             ui.invoke_clear_selection();
@@ -10801,13 +10863,14 @@ fn selected_right_drop(
 
 fn dispatch_drop_operation(
     intent: platform::windows::drag_drop::DropIntent,
+    origin_tab: TabId,
     state: SharedSessions,
     operation_sender: mpsc::Sender<FileOperationRequest>,
 ) {
     thread::spawn(move || match prepare_drop_operation(intent) {
         Ok(PreparedDrop::Operation(kind, items)) => {
             let _ = slint::invoke_from_event_loop(move || {
-                enqueue_operation(&state, &operation_sender, kind, items);
+                enqueue_operation(&state, &operation_sender, origin_tab, kind, items);
             });
         }
         Ok(PreparedDrop::Shortcuts(shortcuts)) => {
@@ -10932,13 +10995,14 @@ fn wire_native_drag_drop(
         let pending = state_for_choice
             .lock()
             .ok()
-            .and_then(|mut app| app.pending_right_drop.take());
-        let Some(intent) = pending else {
+            .and_then(|mut app| app.pending_right_drops.remove(&state_for_choice.window_id));
+        let Some((origin_tab, intent)) = pending else {
             return;
         };
         match selected_right_drop(intent, choice) {
             Ok(Some(intent)) => dispatch_drop_operation(
                 intent,
+                origin_tab,
                 state_for_choice.shared.clone(),
                 operation_for_choice.clone(),
             ),
@@ -10982,14 +11046,36 @@ fn wire_native_drag_drop(
                     ui.set_drop_can_link(
                         intent.allowed_effects & platform::windows::drag_drop::ALLOW_LINK != 0,
                     );
-                    if let Ok(mut app) = state_for_ui.lock() {
-                        app.pending_right_drop = Some(intent);
+                    let pending_saved = state_for_ui.lock().is_ok_and(|mut app| {
+                        let Some(origin_tab) = app
+                            .window(state_for_ui.window_id)
+                            .map(|window| window.active_tab)
+                        else {
+                            return false;
+                        };
+                        app.pending_right_drops
+                            .insert(state_for_ui.window_id, (origin_tab, intent));
+                        true
+                    });
+                    if !pending_saved {
+                        return;
                     }
                     eprintln!("drag-drop: showing right-drop menu x={x} y={y}");
                     ui.invoke_show_drop_menu(x, y);
                 });
             } else {
-                dispatch_drop_operation(intent, state.shared.clone(), operation_sender.clone());
+                let origin_tab = state
+                    .lock()
+                    .ok()
+                    .and_then(|app| app.window(state.window_id).map(|window| window.active_tab));
+                if let Some(origin_tab) = origin_tab {
+                    dispatch_drop_operation(
+                        intent,
+                        origin_tab,
+                        state.shared.clone(),
+                        operation_sender.clone(),
+                    );
+                }
             }
         }
     });
@@ -11359,7 +11445,7 @@ fn wire_confirmation_windows(
     conflict_ui: &ConfirmationWindow,
     exit_ui: &ConfirmationWindow,
     operation_sender: mpsc::Sender<FileOperationRequest>,
-    state: SharedSessions,
+    state: WindowSessions,
 ) {
     for confirmation in [delete_ui, conflict_ui, exit_ui] {
         configure_confirmation_window(confirmation);
@@ -11370,7 +11456,7 @@ fn wire_confirmation_windows(
     delete_ui.on_safe_cancel(move || {
         let demo_mode = delete_weak.upgrade().is_some_and(|ui| ui.get_demo_mode());
         if !demo_mode && let Ok(mut app) = state_for_delete.lock() {
-            app.pending_permanent_delete.clear();
+            app.pending_permanent_delete = None;
         }
         if let Some(ui) = delete_weak.upgrade() {
             let _ = ui.hide();
@@ -11386,14 +11472,22 @@ fn wire_confirmation_windows(
             }
             return;
         }
-        let items = state_for_delete
+        let pending = state_for_delete
             .lock()
-            .map(|mut app| std::mem::take(&mut app.pending_permanent_delete))
-            .unwrap_or_default();
+            .ok()
+            .and_then(|mut app| app.pending_permanent_delete.take());
         if let Some(ui) = delete_weak.upgrade() {
             let _ = ui.hide();
         }
-        submit_delete_items(&state_for_delete, &sender_for_delete, true, items);
+        if let Some((origin_tab, items)) = pending {
+            submit_delete_items(
+                &state_for_delete,
+                &sender_for_delete,
+                origin_tab,
+                true,
+                items,
+            );
+        }
     });
 
     let resolve_conflict = |operation_id: &str, action, apply_to_all, state: &SharedSessions| {
@@ -12431,8 +12525,9 @@ fn spawn_clipboard_worker() -> (
                         .map(|clipboard| clipboard.is_some())
                         .map_err(|error| error.to_string()),
                 ),
-                ClipboardRequest::ReadPaste { target } => ClipboardEvent::Paste(
-                    platform::windows::clipboard::read_file_list()
+                ClipboardRequest::ReadPaste { origin_tab, target } => ClipboardEvent::Paste {
+                    origin_tab,
+                    result: platform::windows::clipboard::read_file_list()
                         .map(|clipboard| {
                             clipboard.map(|clipboard| {
                                 let target =
@@ -12467,7 +12562,7 @@ fn spawn_clipboard_worker() -> (
                             })
                         })
                         .map_err(|error| error.to_string()),
-                ),
+                },
             };
             let _ = event_sender.send(event);
         }
@@ -12791,15 +12886,18 @@ fn start_clipboard_event_pump(
                     ClipboardEvent::Written {
                         result: Err(error), ..
                     }
-                    | ClipboardEvent::Paste(Err(error))
+                    | ClipboardEvent::Paste {
+                        result: Err(error), ..
+                    }
                     | ClipboardEvent::Availability(Err(error)) => {
                         if let Ok(mut app) = state.lock() {
                             app.operation_errors.push(error);
                         }
                     }
-                    ClipboardEvent::Paste(Ok(Some((kind, items)))) => {
-                        enqueue_operation(&state, &operation_sender, kind, items)
-                    }
+                    ClipboardEvent::Paste {
+                        origin_tab,
+                        result: Ok(Some((kind, items))),
+                    } => enqueue_operation(&state, &operation_sender, origin_tab, kind, items),
                     ClipboardEvent::Written {
                         result: Ok(()),
                         paths,
@@ -12827,7 +12925,9 @@ fn start_clipboard_event_pump(
                             app.clipboard_has_files = available;
                         }
                     }
-                    ClipboardEvent::Paste(Ok(None)) => {}
+                    ClipboardEvent::Paste {
+                        result: Ok(None), ..
+                    } => {}
                 }
                 if weak.upgrade().is_some() {
                     refresh_all_windows(&state);
@@ -13608,58 +13708,54 @@ fn start_file_operation_event_pump(
                         );
                     }
                 }
-                if let Some(ui) = weak.upgrade() {
-                    let close_editor = state
-                        .lock()
-                        .ok()
-                        .and_then(|app| app.operations.task(event_operation_id).cloned())
-                        .is_some_and(|task| {
-                            matches!(
-                                task.kind,
-                                FileOperationKind::CreateFolder | FileOperationKind::Rename
-                            ) && task.state == OperationState::Completed
-                        });
-                    if close_editor {
+                let rename_update = state.lock().ok().and_then(|app| {
+                    let task = app.operations.task(event_operation_id)?;
+                    (task.kind == FileOperationKind::Rename
+                        && task.state != OperationState::Running)
+                        .then(|| {
+                            (
+                                task.origin_tab
+                                    .and_then(|tab_id| app.window_for_tab(tab_id)),
+                                task.state == OperationState::Completed,
+                                task.items.iter().find_map(|item| item.error.clone()),
+                            )
+                        })
+                });
+                if let Some((Some(window_id), completed, error)) = rename_update
+                    && let Some(ui) = window_ui(window_id)
+                {
+                    if completed {
                         if let Ok(mut app) = state.lock() {
-                            app.rename_target = None;
-                            app.rename_extension = None;
+                            app.rename_targets.remove(&window_id);
                         }
                         ui.set_rename_submitting(false);
                         ui.set_rename_editing(false);
-                    } else {
-                        let failed_rename = state
-                            .lock()
-                            .ok()
-                            .and_then(|app| app.operations.task(event_operation_id).cloned())
-                            .filter(|task| task.kind == FileOperationKind::Rename)
-                            .filter(|task| task.state != OperationState::Running)
-                            .and_then(|task| task.items.into_iter().find_map(|item| item.error));
-                        if let Some(message) = failed_rename {
-                            if let Ok(mut app) = state.lock() {
-                                app.operation_errors.push(message);
-                            }
-                            ui.set_rename_submitting(false);
-                            ui.set_rename_submit_generation(ui.get_rename_submit_generation() + 1);
+                    } else if let Some(message) = error {
+                        if let Ok(mut app) = state.lock() {
+                            app.operation_errors.push(message);
                         }
+                        ui.set_rename_submitting(false);
+                        ui.set_rename_submit_generation(ui.get_rename_submit_generation() + 1);
                     }
-                    refresh_all_windows(&state);
-                    if state.lock().is_ok_and(|app| {
-                        app.exit_after_cancel && !app.operations.has_active_tasks()
-                    }) {
-                        if let Some(operation_ui) = operation_weak.upgrade() {
-                            let _ = operation_ui.hide();
-                        }
-                        if let Some(delete_ui) = delete_weak.upgrade() {
-                            let _ = delete_ui.hide();
-                        }
-                        if let Some(conflict_ui) = conflict_weak.upgrade() {
-                            let _ = conflict_ui.hide();
-                        }
-                        if let Some(exit_ui) = exit_weak.upgrade() {
-                            let _ = exit_ui.hide();
-                        }
-                        hide_all_app_windows();
+                }
+                refresh_all_windows(&state);
+                if state
+                    .lock()
+                    .is_ok_and(|app| app.exit_after_cancel && !app.operations.has_active_tasks())
+                {
+                    if let Some(operation_ui) = operation_weak.upgrade() {
+                        let _ = operation_ui.hide();
                     }
+                    if let Some(delete_ui) = delete_weak.upgrade() {
+                        let _ = delete_ui.hide();
+                    }
+                    if let Some(conflict_ui) = conflict_weak.upgrade() {
+                        let _ = conflict_ui.hide();
+                    }
+                    if let Some(exit_ui) = exit_weak.upgrade() {
+                        let _ = exit_ui.hide();
+                    }
+                    hide_all_app_windows();
                 }
                 if let Some(operation_ui) = operation_weak.upgrade() {
                     refresh_operation_window(&operation_ui, &state);
@@ -16401,21 +16497,13 @@ fn format_remaining_time(language: Language, seconds: f64) -> String {
     }
 }
 fn refresh_window_ui(ui: &AppWindow, state: &SharedSessions, window_id: WindowId) {
-    let previous = {
-        let mut app = state.lock().expect("app state mutex is not poisoned");
-        if !app.windows.contains_key(&window_id) {
-            return;
-        }
-        let previous = app.active_window;
-        app.active_window = window_id;
-        previous
-    };
-    refresh_ui_inner(ui, state);
-    if let Ok(mut app) = state.lock()
-        && app.windows.contains_key(&previous)
+    if !state
+        .lock()
+        .is_ok_and(|app| app.windows.contains_key(&window_id))
     {
-        app.active_window = previous;
+        return;
     }
+    refresh_ui_inner(ui, state, window_id);
 }
 
 fn refresh_ui(ui: &AppWindow, state: &WindowSessions) {
@@ -16543,11 +16631,15 @@ fn directory_display_entries(tab: &TabSession) -> &[FileEntry] {
     }
 }
 
-fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
+fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId) {
     let app = state.lock().expect("app state mutex is not poisoned");
     let texts = Texts::new(app.language);
-    let window_id = app.active_window;
-    let tab = app.active();
+    let Some(window) = app.window(window_id) else {
+        return;
+    };
+    let Some(tab) = window.tabs.get(&window.active_tab) else {
+        return;
+    };
     if let Some(window_id) = window_id_for_ui(ui) {
         let request_id = tab.latest_request;
         let invalidated = WINDOW_RUNTIMES.with_borrow_mut(|runtimes| {
@@ -16567,7 +16659,9 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
     }
     let active_is_settings = tab.kind == TabKind::Settings;
     ui.set_active_is_settings(active_is_settings);
-    let view_mode = app.active_view_mode();
+    let view_mode = app
+        .view_mode_for_tab(tab.id)
+        .unwrap_or(app.default_directory_view.view_mode);
     ui.set_view_mode(view_mode_to_ui(view_mode));
     let projected_tab_id = tab.id.0 as i32;
     let projected_request_id = tab.latest_request.0 as i32;
@@ -16695,17 +16789,17 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
     ui.set_error_page_title(error_page_title.into());
     ui.set_error_page_description(error_page_description.into());
     ui.set_active_tab_index(
-        app.active_window_state()
+        window
             .tab_order
             .iter()
-            .position(|id| *id == app.active_window_state().active_tab)
+            .position(|id| *id == window.active_tab)
             .unwrap_or(0) as i32,
     );
     ui.set_tabs(ModelRc::new(VecModel::from(
-        app.active_window_state()
+        window
             .tab_order
             .iter()
-            .filter_map(|id| app.active_window_state().tabs.get(id))
+            .filter_map(|id| window.tabs.get(id))
             .map(|tab| TabRow {
                 id: tab.id.0 as i32,
                 title: if tab.kind == TabKind::Settings {
@@ -16720,7 +16814,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
                         })
                 }
                 .into(),
-                active: tab.id == app.active_window_state().active_tab,
+                active: tab.id == window.active_tab,
                 loading: matches!(tab.load_state, LoadState::Loading | LoadState::Partial),
                 icon: tab
                     .visible_path()
@@ -16941,8 +17035,8 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions) {
     ui.set_can_refresh(
         !active_is_settings && !matches!(tab.load_state, LoadState::Loading | LoadState::Partial),
     );
-    ui.set_can_close_tab(app.active_window_state().tab_order.len() > 1);
-    ui.set_can_restore_tab(!app.active_window_state().closed_tabs.is_empty());
+    ui.set_can_close_tab(window.tab_order.len() > 1);
+    ui.set_can_restore_tab(!window.closed_tabs.is_empty());
     ui.set_language_mode(match app.language {
         Language::Chinese => 0,
         Language::English => 1,
@@ -19571,6 +19665,146 @@ mod tests {
         assert!(app.window(destination).is_none());
     }
 
+    #[test]
+    fn file_commands_keep_the_triggering_window_and_tab() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\WindowA")], 0, [0, 1, 2, 3]);
+        let first_window = app.active_window;
+        let first_tab = app.window(first_window).unwrap().active_tab;
+        let second_window = app.register_window(
+            vec![PathBuf::from(r"C:\WindowB")],
+            0,
+            test_window_placement(160),
+        );
+        let second_tab = app.window(second_window).unwrap().active_tab;
+        {
+            let tab = app.tab_mut(first_tab).unwrap();
+            tab.replace_entries(vec![focus_entry(1, r"C:\WindowA\first.txt")]);
+            tab.selected = vec![EntryId(1)];
+        }
+        {
+            let tab = app.tab_mut(second_tab).unwrap();
+            tab.replace_entries(vec![focus_entry(2, r"C:\WindowB\second.txt")]);
+            tab.selected = vec![EntryId(2)];
+        }
+        app.active_window = second_window;
+        let shared = Arc::new(Mutex::new(app));
+        let first = WindowSessions::new(shared.clone(), first_window);
+        let (sender, _receiver) = mpsc::channel();
+
+        submit_delete(&first, &sender, false);
+        create_default_folder(&first, &sender);
+
+        let app = shared.lock().unwrap();
+        let tasks = app.operations.iter().collect::<Vec<_>>();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].origin_tab, Some(first_tab));
+        assert_eq!(
+            tasks[0].items[0].source.as_deref(),
+            Some(Path::new(r"C:\WindowA\first.txt"))
+        );
+        assert_eq!(tasks[1].origin_tab, Some(first_tab));
+        assert_eq!(
+            tasks[1].items[0].destination.as_deref(),
+            Some(Path::new(r"C:\WindowA\新建文件夹"))
+        );
+        assert_ne!(tasks[0].origin_tab, Some(second_tab));
+    }
+
+    #[test]
+    fn permanent_delete_snapshot_keeps_the_triggering_window_and_tab() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\WindowA")], 0, [0, 1, 2, 3]);
+        let first_window = app.active_window;
+        let first_tab = app.window(first_window).unwrap().active_tab;
+        app.tab_mut(first_tab)
+            .unwrap()
+            .replace_entries(vec![focus_entry(1, r"C:\WindowA\first.txt")]);
+        app.tab_mut(first_tab).unwrap().selected = vec![EntryId(1)];
+        let second_window = app.register_window(
+            vec![PathBuf::from(r"C:\WindowB")],
+            0,
+            test_window_placement(160),
+        );
+        app.active_window = first_window;
+        let shared = Arc::new(Mutex::new(app));
+        let second = WindowSessions::new(shared, second_window);
+
+        assert!(pending_permanent_delete(&second).is_none());
+
+        let mut app = second.lock().unwrap();
+        let second_tab = app.window(second_window).unwrap().active_tab;
+        app.tab_mut(second_tab)
+            .unwrap()
+            .replace_entries(vec![focus_entry(2, r"C:\WindowB\second.txt")]);
+        app.tab_mut(second_tab).unwrap().selected = vec![EntryId(2)];
+        drop(app);
+
+        let (origin_tab, items) = pending_permanent_delete(&second).unwrap();
+        assert_eq!(origin_tab, second_tab);
+        assert_eq!(
+            items[0].source.as_deref(),
+            Some(Path::new(r"C:\WindowB\second.txt"))
+        );
+    }
+    #[test]
+    fn delayed_paste_keeps_its_original_tab() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\WindowA")], 0, [0, 1, 2, 3]);
+        let first_window = app.active_window;
+        let first_tab = app.window(first_window).unwrap().active_tab;
+        let second_window = app.register_window(
+            vec![PathBuf::from(r"C:\WindowB")],
+            0,
+            test_window_placement(160),
+        );
+        app.active_window = second_window;
+        let shared = Arc::new(Mutex::new(app));
+        let (sender, _receiver) = mpsc::channel();
+        let event = ClipboardEvent::Paste {
+            origin_tab: first_tab,
+            result: Ok(Some((
+                FileOperationKind::Copy,
+                vec![OperationItem::pending(
+                    Some(PathBuf::from(r"C:\source.txt")),
+                    Some(PathBuf::from(r"C:\WindowA\source.txt")),
+                )],
+            ))),
+        };
+
+        if let ClipboardEvent::Paste {
+            origin_tab,
+            result: Ok(Some((kind, items))),
+        } = event
+        {
+            enqueue_operation(&shared, &sender, origin_tab, kind, items);
+        }
+
+        let app = shared.lock().unwrap();
+        let task = app.operations.iter().next().unwrap();
+        assert_eq!(task.origin_tab, Some(first_tab));
+        assert_eq!(app.window_for_tab(first_tab), Some(first_window));
+    }
+    #[test]
+    fn refreshing_each_window_does_not_change_the_active_window() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
+        let first = app.active_window;
+        let second = app.register_window(vec![PathBuf::from("b")], 0, test_window_placement(160));
+        let state = Arc::new(Mutex::new(app));
+        let first_ui = headless_file_view();
+        let second_ui = AppWindow::new().expect("second headless window should initialize");
+        second_ui
+            .window()
+            .set_size(slint::LogicalSize::new(1_180.0, 760.0));
+
+        refresh_window_ui(&first_ui, &state, first);
+        refresh_window_ui(&second_ui, &state, second);
+
+        assert_eq!(state.lock().unwrap().active_window, first);
+        assert_eq!(first_ui.get_tabs().row_count(), 1);
+        assert_eq!(second_ui.get_tabs().row_count(), 1);
+        assert_ne!(
+            first_ui.get_tabs().row_data(0).unwrap().title,
+            second_ui.get_tabs().row_data(0).unwrap().title
+        );
+    }
     #[test]
     fn background_window_projection_does_not_change_active_window() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
