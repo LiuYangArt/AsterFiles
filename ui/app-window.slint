@@ -830,6 +830,13 @@ export component AppWindow inherits Window {
     }
     changed file-viewport-y => { root.sync-active-file-viewport(); }
 
+    out property <bool> file-list-keyboard-target: !root.active-is-settings
+        && !root.address-editing
+        && !root.rename-editing
+        && !root.menu-open
+        && !root.tabs-menu-open
+        && !root.context-menu-open
+        && !root.drop-menu-open;
     in-out property <bool> context-menu-open: false;
     in-out property <bool> drop-menu-open: false;
     private property <bool> internal-drag-pointer-active: false;

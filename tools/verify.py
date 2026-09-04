@@ -133,6 +133,10 @@ def main() -> int:
             "cargo", "run", "--", "--agent-scenario", "network-foundation",
             "--no-ui", "--agent-state-out", str(STATE_DIR / "network" / "foundation.json"),
         ]),
+        ("agent-file-list-type-select", [
+            "cargo", "run", "--", "--agent-scenario", "file-list-type-select",
+            "--no-ui", "--agent-state-out", str(STATE_DIR / "file-list" / "type-select.json"),
+        ]),
         ("release", ["cargo", "build", "--release"])
         if release_requested
         else ("debug", ["cargo", "build"]),

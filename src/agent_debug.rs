@@ -43,6 +43,7 @@ pub enum AgentScenario {
     QuickMenuSearch,
     QuickMenuPopup,
     NetworkFoundation,
+    FileListTypeSelect,
 }
 
 impl AgentScenario {
@@ -63,6 +64,7 @@ impl AgentScenario {
             Self::QuickMenuSearch => "quick-menu-search",
             Self::QuickMenuPopup => "quick-menu-popup",
             Self::NetworkFoundation => "network-foundation",
+            Self::FileListTypeSelect => "file-list-type-select",
         }
     }
 
@@ -135,6 +137,7 @@ fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
         "quick-menu-search" => Ok(AgentScenario::QuickMenuSearch),
         "quick-menu-popup" => Ok(AgentScenario::QuickMenuPopup),
         "network-foundation" => Ok(AgentScenario::NetworkFoundation),
+        "file-list-type-select" => Ok(AgentScenario::FileListTypeSelect),
         _ => Err(format!("unknown agent scenario: {value}")),
     }
 }
@@ -178,7 +181,8 @@ pub fn apply_scenario(session: &mut TabSession, scenario: AgentScenario) {
         AgentScenario::FolderSizeScheduler
         | AgentScenario::QuickMenuSearch
         | AgentScenario::QuickMenuPopup
-        | AgentScenario::NetworkFoundation => {
+        | AgentScenario::NetworkFoundation
+        | AgentScenario::FileListTypeSelect => {
             session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\FolderSizes"));
             session.load_state = LoadState::Complete;
         }
@@ -313,6 +317,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
             | AgentScenario::QuickMenuSearch
             | AgentScenario::QuickMenuPopup
             | AgentScenario::NetworkFoundation
+            | AgentScenario::FileListTypeSelect
     ) {
         return None;
     }
@@ -375,6 +380,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
         AgentScenario::QuickMenuSearch => unreachable!(),
         AgentScenario::QuickMenuPopup => unreachable!(),
         AgentScenario::NetworkFoundation => unreachable!(),
+        AgentScenario::FileListTypeSelect => unreachable!(),
         AgentScenario::PermissionDenied => unreachable!(),
     }
     manager.task(id).map(|task| match task.state {

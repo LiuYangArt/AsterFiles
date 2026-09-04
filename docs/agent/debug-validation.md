@@ -86,6 +86,15 @@ cargo run -- --agent-scenario network-foundation --no-ui --agent-state-out artif
 ```
 
 该场景不打开窗口、不访问网络，验证网络位置来源分离、原始 UNC 身份、设备发现代次、取消与迟到结果拒收。实现层另由单元测试覆盖深层 UNC/认证辅助进程编解码，以及本地/网络文件任务双资源域；这些字段不是实际网络性能证明。真实 NAS、设备发现阻塞、错误凭据、凭据冲突、Explorer 互操作和文件操作只能由用户人工验证；耗时与取消指标写入 `artifacts/perf/network/`，运行日志写入 `artifacts/logs/network/`。未完成这些实证前，Issue #10 保持进行中。
+
+## Issue #20 文件列表直接键入定位
+
+```powershell
+cargo run -- --agent-scenario file-list-type-select --no-ui --agent-state-out artifacts/state/file-list/type-select.json
+cargo test issue_20 --quiet
+```
+
+场景只操作已加载的内存模型，不打开窗口、不访问文件系统、Shell/COM、网络或 Everything。产物记录单字符、连续前缀、同字符循环、稀疏结果身份和请求隔离；超时、上下文清理、分组投影、滚入可见区与输入分流由专项测试覆盖。真实键盘手感、中文输入法、各视图、分组和 DPI 只能由用户手动验证。
 ## P2 文件任务状态
 
 文件任务提供三个确定性无界面场景，不执行真实磁盘写入：

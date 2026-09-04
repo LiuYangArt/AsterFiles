@@ -53,6 +53,151 @@ const DIRECTORY_EVENT_INTERVAL: Duration = Duration::from_millis(16);
 const REBUILT_PROJECTION_BATCH_SIZE: usize = 256;
 const THUMBNAIL_CACHE_CAPACITY: usize = 128;
 const LARGE_ICON_CACHE_CAPACITY: usize = 128;
+const TYPE_SELECT_TIMEOUT: Duration = Duration::from_millis(1_000);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TypeSelectContext {
+    tab_id: TabId,
+    request_id: RequestId,
+    view_mode: ViewMode,
+    page_source: PageSource,
+    group_field: GroupField,
+    group_direction: SortDirection,
+    sort_field: SortField,
+    sort_direction: SortDirection,
+}
+
+#[derive(Debug, Default)]
+struct TypeSelectState {
+    buffer: String,
+    last_input: Option<Instant>,
+    context: Option<TypeSelectContext>,
+}
+
+impl TypeSelectState {
+    fn clear(&mut self) -> bool {
+        let changed =
+            !self.buffer.is_empty() || self.last_input.is_some() || self.context.is_some();
+        self.buffer.clear();
+        self.last_input = None;
+        self.context = None;
+        changed
+    }
+
+    fn select(
+        &mut self,
+        context: TypeSelectContext,
+        now: Instant,
+        typed: char,
+        entries: &[(EntryId, String)],
+        focused: Option<EntryId>,
+    ) -> Option<EntryId> {
+        if self.context != Some(context) {
+            self.clear();
+        }
+        self.context = Some(context);
+        if entries.is_empty() {
+            return None;
+        }
+
+        let typed = typed.to_lowercase().collect::<String>();
+        let expired = self
+            .last_input
+            .is_none_or(|last| now.saturating_duration_since(last) >= TYPE_SELECT_TIMEOUT);
+        let cycle = !expired && self.buffer == typed;
+        let start_after_focus = cycle || expired;
+        if expired || cycle || self.buffer.is_empty() {
+            self.buffer.clone_from(&typed);
+        } else {
+            self.buffer.push_str(&typed);
+        }
+        self.last_input = Some(now);
+
+        let focused_index =
+            focused.and_then(|id| entries.iter().position(|(entry_id, _)| *entry_id == id));
+        let start = match focused_index {
+            Some(index) if start_after_focus => (index + 1) % entries.len(),
+            Some(index) => index,
+            None => 0,
+        };
+        (0..entries.len())
+            .map(|offset| (start + offset) % entries.len())
+            .find_map(|index| {
+                entries[index]
+                    .1
+                    .to_lowercase()
+                    .starts_with(&self.buffer)
+                    .then_some(entries[index].0)
+            })
+    }
+
+    fn is_active(&self) -> bool {
+        !self.buffer.is_empty()
+    }
+}
+
+pub fn export_file_list_type_select_state(path: &Path) -> io::Result<()> {
+    let context = TypeSelectContext {
+        tab_id: TabId(1),
+        request_id: RequestId(9),
+        view_mode: ViewMode::Details,
+        page_source: PageSource::Search,
+        group_field: GroupField::None,
+        group_direction: SortDirection::Ascending,
+        sort_field: SortField::Name,
+        sort_direction: SortDirection::Descending,
+    };
+    let entries = vec![
+        (EntryId(1), "Alpha.txt".to_owned()),
+        (EntryId(257), "Alpine.txt".to_owned()),
+        (EntryId(1025), "7-Zip".to_owned()),
+    ];
+    let started = Instant::now();
+    let mut state = TypeSelectState::default();
+    let first = state.select(context, started, 'a', &entries, None);
+    let prefix = state.select(
+        context,
+        started + Duration::from_millis(100),
+        'l',
+        &entries,
+        first,
+    );
+    state.clear();
+    let cycle_first = state.select(context, started, 'a', &entries, None);
+    let cycle_second = state.select(
+        context,
+        started + Duration::from_millis(100),
+        'a',
+        &entries,
+        cycle_first,
+    );
+    let request_id_unchanged = context.request_id == RequestId(9);
+    let json = format!(
+        concat!(
+            "{{\n",
+            "  \"schema_version\": 1,\n",
+            "  \"scenario\": \"file-list-type-select\",\n",
+            "  \"scope\": \"pure_loaded_model_no_ui_no_io\",\n",
+            "  \"loaded_entry_ids\": [1, 257, 1025],\n",
+            "  \"sparse_placeholders_included\": false,\n",
+            "  \"first_match\": {},\n",
+            "  \"prefix_match\": {},\n",
+            "  \"cycle_match\": {},\n",
+            "  \"request_id_unchanged\": {},\n",
+            "  \"starts_search_or_directory_request\": false,\n",
+            "  \"reads_file_system_or_shell\": false\n",
+            "}}\n"
+        ),
+        first.map_or(0, |id| id.0),
+        prefix.map_or(0, |id| id.0),
+        cycle_second.map_or(0, |id| id.0),
+        request_id_unchanged,
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, json)
+}
 
 pub fn export_network_foundation_state(path: &Path) -> io::Result<()> {
     use crate::network::{
@@ -10659,6 +10804,8 @@ fn wire_mouse_navigation(
     let weak = ui.as_weak();
     let exit_weak = confirmations.exit.clone();
     let modifiers = Cell::new(ModifiersState::empty());
+    let ime_composing = Cell::new(false);
+    let type_select = Rc::new(RefCell::new(TypeSelectState::default()));
     let cursor_position = Cell::new(winit::dpi::PhysicalPosition::new(0.0, 0.0));
     let ctrl_wheel_accumulator = Cell::new(0.0_f32);
     ui.window().on_winit_window_event(move |_, event| {
@@ -10766,12 +10913,33 @@ fn wire_mouse_navigation(
             modifiers.set(changed.state());
             return EventResult::Propagate;
         }
+        if let WindowEvent::Ime(ime) = event {
+            match ime {
+                winit::event::Ime::Preedit(value, _) => {
+                    ime_composing.set(!value.is_empty());
+                }
+                winit::event::Ime::Commit(_) | winit::event::Ime::Disabled => {
+                    ime_composing.set(false);
+                }
+                winit::event::Ime::Enabled => {}
+            }
+            type_select.borrow_mut().clear();
+            return EventResult::Propagate;
+        }
         let Some(ui) = weak.upgrade() else {
             return EventResult::Propagate;
         };
         if matches!(event, WindowEvent::Focused(true)) && ui.get_context_menu_open() {
             dismiss_quick_menu_session(window_id, false);
+            type_select.borrow_mut().clear();
             return EventResult::Propagate;
+        }
+        if matches!(
+            event,
+            WindowEvent::Focused(false) | WindowEvent::Occluded(true)
+        ) {
+            ime_composing.set(false);
+            type_select.borrow_mut().clear();
         }
         if let WindowEvent::Resized(size) = event {
             platform::windows::window_trace::log_request(
@@ -10804,6 +10972,7 @@ fn wire_mouse_navigation(
                     && !event.repeat
                     && matches!(event.logical_key, Key::Named(NamedKey::Escape))
         ) {
+            let type_select_active = type_select.borrow_mut().clear();
             let mut cancelled = false;
             if ui.get_rectangle_selection_pointer_active() {
                 ui.invoke_cancel_rectangle_selection();
@@ -10824,7 +10993,7 @@ fn wire_mouse_navigation(
                 ui.invoke_cancel_column_drag_from_window();
                 cancelled = true;
             }
-            return if cancelled {
+            return if cancelled || type_select_active {
                 EventResult::PreventDefault
             } else {
                 EventResult::Propagate
@@ -10833,7 +11002,17 @@ fn wire_mouse_navigation(
         if matches!(event, WindowEvent::KeyboardInput { .. })
             && keyboard_shortcuts_suppressed(ui.get_rename_editing(), ui.get_context_menu_open())
         {
+            type_select.borrow_mut().clear();
             return EventResult::Propagate;
+        }
+        if matches!(
+            event,
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                ..
+            }
+        ) {
+            type_select.borrow_mut().clear();
         }
         match event {
             WindowEvent::CursorMoved { position, .. } => {
@@ -10918,12 +11097,17 @@ fn wire_mouse_navigation(
                 let control = modifiers.control_key();
                 let alt = modifiers.alt_key();
                 let shift = modifiers.shift_key();
+                let super_key = modifiers.super_key();
                 let editing_address = ui.get_address_editing();
                 let settings_active = ui.get_active_is_settings();
+                let type_select_active = type_select.borrow().is_active();
                 let character = match &event.logical_key {
                     Key::Character(value) => Some(value.as_str()),
                     _ => None,
                 };
+                if editing_address || settings_active {
+                    type_select.borrow_mut().clear();
+                }
                 let handled = match &event.logical_key {
                     Key::Named(NamedKey::ArrowLeft) if alt && !control && !shift => {
                         if ui.get_can_navigate_back() {
@@ -11025,7 +11209,7 @@ fn wire_mouse_navigation(
                             if let Ok(mut app) = state.lock() {
                                 app.pending_right_drops.remove(&window_id);
                             }
-                        } else {
+                        } else if !type_select_active {
                             ui.invoke_clear_selection();
                         }
                         true
@@ -11082,6 +11266,57 @@ fn wire_mouse_navigation(
                         if !control && !alt && !settings_active && !editing_address =>
                     {
                         ui.invoke_show_keyboard_context_menu();
+                        true
+                    }
+                    _ if ui.get_file_list_keyboard_target()
+                        && !ui.get_rectangle_selection_pointer_active()
+                        && !control
+                        && !alt
+                        && !shift
+                        && !super_key
+                        && !ime_composing.get()
+                        && event.text.as_ref().is_some_and(|value| {
+                            let mut chars = value.chars();
+                            chars
+                                .next()
+                                .is_some_and(|character| character.is_alphanumeric())
+                                && chars.next().is_none()
+                        }) =>
+                    {
+                        let typed = event.text.as_ref().and_then(|value| value.chars().next());
+                        let target = typed.and_then(|typed| {
+                            let app = state.shared.lock().ok()?;
+                            let window = app.window(window_id)?;
+                            let tab = window.tabs.get(&window.active_tab)?;
+                            (tab.kind == TabKind::Files).then_some(())?;
+                            let context = type_select_context(&app, tab);
+                            let projection = type_select_projection(&app, tab);
+                            let focused = tab.focused;
+                            drop(app);
+                            type_select.borrow_mut().select(
+                                context,
+                                Instant::now(),
+                                typed,
+                                &projection,
+                                focused,
+                            )
+                        });
+                        if let Some(entry_id) = target {
+                            let update = mutate_window_selection(&state, window_id, |tab| {
+                                tab.select_entry(entry_id, false, false);
+                            });
+                            if let Some((tab_id, changed)) = update {
+                                update_file_rows(&ui, &state, tab_id, &changed);
+                                update_selection_summary(&ui, &state);
+                                let request_id = state
+                                    .lock()
+                                    .ok()
+                                    .and_then(|app| app.tab(tab_id).map(|tab| tab.latest_request));
+                                if let Some(request_id) = request_id {
+                                    reveal_entry(&ui, &state.shared, tab_id, request_id, entry_id);
+                                }
+                            }
+                        }
                         true
                     }
                     _ if control
@@ -14744,6 +14979,98 @@ fn start_event_pump(
     });
 }
 
+fn reveal_scroll_target(
+    current: f32,
+    entry_top: f32,
+    entry_extent: f32,
+    visible_height: f32,
+    maximum: f32,
+) -> f32 {
+    let row_top = entry_top + current;
+    let row_bottom = row_top + entry_extent;
+    let viewport = if row_top < 0.0 {
+        -entry_top
+    } else if row_bottom > visible_height {
+        visible_height - entry_top - entry_extent
+    } else {
+        current
+    };
+    viewport.clamp(-maximum, 0.0)
+}
+fn reveal_entry(
+    ui: &AppWindow,
+    state: &SharedSessions,
+    tab_id: TabId,
+    request_id: RequestId,
+    entry_id: EntryId,
+) {
+    let snapshot = state.lock().ok().and_then(|app| {
+        let window_id = app.window_for_tab(tab_id)?;
+        let window = app.window(window_id)?;
+        let tab = window.tabs.get(&tab_id)?;
+        (window.active_tab == tab_id && tab.latest_request == request_id).then(|| {
+            let entries = directory_display_entries(tab);
+            (
+                app.view_mode_for_tab(tab_id)
+                    .unwrap_or(app.default_directory_view.view_mode),
+                tab.page_source,
+                tab.search_total,
+                entries.iter().position(|entry| entry.id == entry_id),
+                directory_group_projections(&app, tab, entries),
+            )
+        })
+    });
+    let Some((view_mode, page_source, search_total, entry_index, groups)) = snapshot else {
+        return;
+    };
+    let columns = ui.get_grid_column_count().max(1) as usize;
+    if page_source == PageSource::Search {
+        let index = entry_id.0.saturating_sub(1);
+        let maximum = search_logical_maximum(
+            search_total.unwrap_or(0),
+            view_mode,
+            columns,
+            ui.get_file_viewport_height(),
+        );
+        let logical_scroll =
+            search_scroll_for_index(index, view_mode, columns).clamp(-maximum, 0.0);
+        ui.set_search_scroll_y(logical_scroll);
+        let window = search_window_for_index(index, search_total.unwrap_or(0), columns);
+        ui.set_file_viewport_y(search_window_viewport_y(index, window, view_mode, columns));
+        refresh_tab_window(state, tab_id);
+        return;
+    }
+
+    let geometry = file_layout_geometry(view_mode);
+    let entry_top = if geometry.grid {
+        let projection =
+            IconProjection::from_groups(&groups, columns, 32, geometry.row_height as u64);
+        projection
+            .entry_position(entry_id)
+            .and_then(|position| projection.offsets.row_start(position.row_index))
+            .map(|value| value as f32)
+    } else {
+        let projection = ListProjection::from_groups(&groups, 32, geometry.row_height as u64);
+        projection
+            .entry_position(entry_id)
+            .and_then(|position| projection.offsets.row_start(position))
+            .map(|value| value as f32)
+    }
+    .or_else(|| entry_index.map(|index| index as f32 * geometry.row_height));
+    let Some(entry_top) = entry_top else {
+        return;
+    };
+    let visible_height = ui.get_file_viewport_height().max(geometry.row_height);
+    let maximum = projected_scroll_maximum(ui, view_mode, visible_height);
+    ui.set_file_viewport_y(reveal_scroll_target(
+        ui.get_file_viewport_y(),
+        entry_top,
+        geometry.row_height,
+        visible_height,
+        maximum,
+    ));
+}
+
 fn reveal_focused_entry(
     ui: &AppWindow,
     state: &SharedSessions,
@@ -16570,6 +16897,22 @@ fn mutate_active_selection(
     changed.extend(selection_projection_ids(tab));
     Some((tab_id, changed))
 }
+fn mutate_window_selection(
+    state: &SharedSessions,
+    window_id: WindowId,
+    mutate: impl FnOnce(&mut TabSession),
+) -> Option<(TabId, HashSet<EntryId>)> {
+    let mut app = state.lock().ok()?;
+    let window = app.windows.get_mut(&window_id)?;
+    let tab_id = window.active_tab;
+    let tab = window.tabs.get_mut(&tab_id)?;
+    let before = selection_projection_ids(tab);
+    mutate(tab);
+    let mut changed = before;
+    changed.extend(selection_projection_ids(tab));
+    Some((tab_id, changed))
+}
+
 fn update_tab_status(ui: &AppWindow, state: &SharedSessions, tab_id: TabId) {
     let app = state.lock().expect("app state mutex is not poisoned");
     let Some(window) = app
@@ -16960,6 +17303,52 @@ fn local_utc_offset_seconds() -> i32 {
         _ => 0,
     };
     -(information.Bias.saturating_add(seasonal_bias)).saturating_mul(60)
+}
+
+fn type_select_context(app: &AppState, tab: &TabSession) -> TypeSelectContext {
+    let (group_field, group_direction) = if tab.page_source == PageSource::Search {
+        (GroupField::None, SortDirection::Ascending)
+    } else {
+        tab.visible_path()
+            .map(|path| {
+                let preference = app.directory_preference(path);
+                (preference.group_field, preference.group_direction)
+            })
+            .unwrap_or((GroupField::None, SortDirection::Ascending))
+    };
+    TypeSelectContext {
+        tab_id: tab.id,
+        request_id: tab.latest_request,
+        view_mode: app
+            .view_mode_for_tab(tab.id)
+            .unwrap_or(app.default_directory_view.view_mode),
+        page_source: tab.page_source,
+        group_field,
+        group_direction,
+        sort_field: if tab.page_source == PageSource::Search {
+            tab.search_sort_field
+        } else {
+            tab.sort_field
+        },
+        sort_direction: if tab.page_source == PageSource::Search {
+            tab.search_sort_direction
+        } else {
+            tab.sort_direction
+        },
+    }
+}
+
+fn type_select_projection(app: &AppState, tab: &TabSession) -> Vec<(EntryId, String)> {
+    let entries = directory_display_entries(tab);
+    let by_id = entries
+        .iter()
+        .map(|entry| (entry.id, entry))
+        .collect::<HashMap<_, _>>();
+    directory_group_projections(app, tab, entries)
+        .into_iter()
+        .flat_map(|group| group.entries)
+        .filter_map(|id| by_id.get(&id).map(|entry| (id, entry.display_name.clone())))
+        .collect()
 }
 
 fn directory_group_projections(
@@ -18334,6 +18723,265 @@ fn initial_path() -> PathBuf {
 mod tests {
     use super::*;
 
+    fn type_select_test_context(window: u32, request: u64) -> TypeSelectContext {
+        TypeSelectContext {
+            tab_id: TabId(window),
+            request_id: RequestId(request),
+            view_mode: ViewMode::Details,
+            page_source: PageSource::Directory,
+            group_field: GroupField::None,
+            group_direction: SortDirection::Ascending,
+            sort_field: SortField::Name,
+            sort_direction: SortDirection::Ascending,
+        }
+    }
+
+    fn type_select_rows(names: &[&str]) -> Vec<(EntryId, String)> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (EntryId(index as u32 + 1), (*name).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn issue_20_type_select_handles_prefix_cycle_wrap_case_and_digits() {
+        let rows = type_select_rows(&["Alpha", "alpine", "Beta", "7-Zip", "apricot"]);
+        let context = type_select_test_context(1, 1);
+        let start = Instant::now();
+        let mut state = TypeSelectState::default();
+
+        assert_eq!(
+            state.select(context, start, 'a', &rows, None),
+            Some(EntryId(1))
+        );
+        assert_eq!(
+            state.select(
+                context,
+                start + Duration::from_millis(100),
+                'l',
+                &rows,
+                Some(EntryId(1))
+            ),
+            Some(EntryId(1))
+        );
+        assert_eq!(
+            state.select(
+                context,
+                start + Duration::from_millis(200),
+                'x',
+                &rows,
+                Some(EntryId(1))
+            ),
+            None
+        );
+
+        state.clear();
+        assert_eq!(
+            state.select(context, start, 'a', &rows, Some(EntryId(1))),
+            Some(EntryId(2))
+        );
+        assert_eq!(
+            state.select(
+                context,
+                start + Duration::from_millis(100),
+                'a',
+                &rows,
+                Some(EntryId(2))
+            ),
+            Some(EntryId(5))
+        );
+        assert_eq!(
+            state.select(
+                context,
+                start + Duration::from_millis(200),
+                'a',
+                &rows,
+                Some(EntryId(5))
+            ),
+            Some(EntryId(1))
+        );
+        state.clear();
+        assert_eq!(
+            state.select(context, start, '7', &rows, None),
+            Some(EntryId(4))
+        );
+    }
+
+    #[test]
+    fn issue_20_type_select_timeout_context_and_no_match_are_isolated() {
+        let rows = type_select_rows(&["alpha", "beta", "bravo"]);
+        let first = type_select_test_context(1, 7);
+        let second = type_select_test_context(2, 7);
+        let start = Instant::now();
+        let mut state = TypeSelectState::default();
+
+        assert_eq!(
+            state.select(first, start, 'b', &rows, None),
+            Some(EntryId(2))
+        );
+        assert_eq!(
+            state.select(
+                first,
+                start + Duration::from_millis(100),
+                'z',
+                &rows,
+                Some(EntryId(2))
+            ),
+            None
+        );
+        assert_eq!(state.buffer, "bz");
+        assert_eq!(
+            state.select(
+                first,
+                start + Duration::from_millis(1_100),
+                'b',
+                &rows,
+                Some(EntryId(2))
+            ),
+            Some(EntryId(3))
+        );
+        assert_eq!(state.buffer, "b");
+        assert_eq!(
+            state.select(
+                second,
+                start + TYPE_SELECT_TIMEOUT,
+                'a',
+                &rows,
+                Some(EntryId(3))
+            ),
+            Some(EntryId(1))
+        );
+        assert_eq!(state.context, Some(second));
+        assert!(state.clear());
+        assert!(!state.clear());
+    }
+
+    #[test]
+    fn issue_20_projection_uses_current_group_order_and_loaded_entries_only() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\group")], 0, [0, 1, 2, 3]);
+        let tab_id = app.active_window_state().active_tab;
+        {
+            let tab = app.tab_mut(tab_id).unwrap();
+            let mut alpha = focus_entry(1, r"C:\group\alpha.txt");
+            alpha.kind = crate::domain::EntryKind::File;
+            let mut folder = focus_entry(2, r"C:\group\folder");
+            folder.kind = crate::domain::EntryKind::Directory;
+            tab.replace_entries(vec![alpha, folder]);
+        }
+        app.update_directory_preference(PathBuf::from(r"C:\group"), |preference| {
+            preference.group_field = GroupField::Kind;
+            preference.group_direction = SortDirection::Descending;
+        });
+        let preference = app.directory_preference(Path::new(r"C:\group"));
+        assert_eq!(preference.group_field, GroupField::Kind);
+        assert_eq!(preference.group_direction, SortDirection::Descending);
+        let projection = type_select_projection(&app, app.tab(tab_id).unwrap());
+        let expected = directory_group_projections(
+            &app,
+            app.tab(tab_id).unwrap(),
+            app.tab(tab_id).unwrap().visible_entries(),
+        )
+        .into_iter()
+        .flat_map(|group| group.entries)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            projection.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            expected
+        );
+
+        let tab = app.tab_mut(tab_id).unwrap();
+        tab.page_source = PageSource::Search;
+        tab.load_state = LoadState::Complete;
+        tab.search_total = Some(4);
+        tab.replace_entries(vec![
+            focus_entry(1, r"C:\search\alpha.txt"),
+            focus_entry(4, r"C:\search\delta.txt"),
+        ]);
+        let projection = type_select_projection(&app, app.tab(tab_id).unwrap());
+        assert_eq!(
+            projection.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![EntryId(1), EntryId(4)]
+        );
+        assert_eq!(app.active().latest_request, RequestId(0));
+    }
+
+    #[test]
+    fn issue_20_selection_mutation_targets_the_owning_window() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\one")], 0, [0, 1, 2, 3]);
+        let first_window = app.active_window;
+        let second_window = app.register_window(
+            vec![PathBuf::from(r"C:\two")],
+            0,
+            session_store::WindowPlacement {
+                x: 100,
+                y: 100,
+                width: 800,
+                height: 600,
+            },
+        );
+        let first_tab = app.window(first_window).unwrap().active_tab;
+        let second_tab = app.window(second_window).unwrap().active_tab;
+        app.window_mut(first_window)
+            .unwrap()
+            .tabs
+            .get_mut(&first_tab)
+            .unwrap()
+            .replace_entries(vec![focus_entry(1, r"C:\one\alpha.txt")]);
+        app.window_mut(second_window)
+            .unwrap()
+            .tabs
+            .get_mut(&second_tab)
+            .unwrap()
+            .replace_entries(vec![focus_entry(2, r"C:\two\beta.txt")]);
+        let shared = Arc::new(Mutex::new(app));
+
+        let updated = mutate_window_selection(&shared, first_window, |tab| {
+            tab.select_entry(EntryId(1), false, false);
+        });
+        assert_eq!(updated.as_ref().map(|(id, _)| *id), Some(first_tab));
+        let app = shared.lock().unwrap();
+        assert_eq!(
+            app.window(first_window).unwrap().active().selected,
+            vec![EntryId(1)]
+        );
+        assert!(
+            app.window(second_window)
+                .unwrap()
+                .active()
+                .selected
+                .is_empty()
+        );
+    }
+    #[test]
+    fn issue_20_reveal_scrolls_only_when_the_match_is_outside_the_viewport() {
+        assert_eq!(
+            reveal_scroll_target(-80.0, 100.0, 40.0, 160.0, 400.0),
+            -80.0
+        );
+        assert_eq!(reveal_scroll_target(0.0, 240.0, 40.0, 160.0, 400.0), -120.0);
+        assert_eq!(
+            reveal_scroll_target(-200.0, 80.0, 40.0, 160.0, 400.0),
+            -80.0
+        );
+    }
+    #[test]
+    fn issue_20_window_keyboard_route_excludes_editors_ime_and_shortcuts() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/app.rs"));
+        for marker in [
+            "WindowEvent::Ime(ime)",
+            "ui.get_file_list_keyboard_target()",
+            "!editing_address",
+            "!settings_active",
+            "!control",
+            "!alt",
+            "!super_key",
+            "!ime_composing.get()",
+            "event.text.as_ref().is_some_and",
+        ] {
+            assert!(source.contains(marker), "missing keyboard guard: {marker}");
+        }
+    }
     #[test]
     fn issue_43_file_name_font_size_has_one_semantic_source() {
         let ui = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));

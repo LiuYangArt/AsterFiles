@@ -39,6 +39,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
 
     if let Some(scenario) = agent_options.scenario {
+        if scenario == agent_debug::AgentScenario::FileListTypeSelect {
+            let output = agent_options
+                .state_output()
+                .expect("scenario has a default state output");
+            app::export_file_list_type_select_state(&output)?;
+            println!(
+                "{{\"event\":\"agent_state_exported\",\"scenario\":\"{}\",\"artifact\":{:?}}}",
+                scenario.name(),
+                output.to_string_lossy().as_ref()
+            );
+            if agent_options.no_ui {
+                return Ok(());
+            }
+        }
         if scenario == agent_debug::AgentScenario::NetworkFoundation {
             let output = agent_options
                 .state_output()
