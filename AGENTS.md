@@ -30,7 +30,7 @@ python tools/verify.py
 - 不增加网络协议、插件或索引服务，除非当前里程碑明确需要。
 - 注释说明目的、性能约束或 Windows 平台决策，不复述代码。
 - 修改完成后至少运行与变更范围相符的最小验证，并保留可读取的错误输出。
-- 每个开发任务完成后必须运行 `cargo build`，确保 `target/debug/asterfiles.exe` 已更新，供用户直接测试。只有用户明确要求正式构建、发布验证，或用户确认某个 issue 已完成时，才运行 Release 构建。如果有正在运行的asterfiles进程阻挡打包，直接关闭进程。
+- 每个开发任务完成后必须运行 `cargo build`，确保 `target/debug/asterfiles.exe` 已更新，供用户直接测试。日常本地开发不计算或报告 SHA-256、文件时间等构建指纹。只有用户明确要求正式构建、发布验证，或用户确认某个 issue 已完成时，才运行 Release 构建。如果有正在运行的 AsterFiles 进程阻挡打包，直接关闭进程。
 - 每个 issue 经用户明确确认完成后，必须构建一版 Release；用户确认前不得因该规则提前构建 Release。
 
 ## Issue 与任务状态
