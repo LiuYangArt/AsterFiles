@@ -1842,7 +1842,14 @@ accessible-label: entry.name;
                                     if event.kind == PointerEventKind.down {
                                         self.click-control = event.modifiers.control;
                                         self.click-shift = event.modifiers.shift;
-                                        if event.button == PointerEventButton.left || event.button == PointerEventButton.right {
+                                        if event.button == PointerEventButton.right && event.kind == PointerEventKind.down {
+                                            root.show-entry-menu(
+                                                entry.id,
+                                                (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
+                                                (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px
+                                            );
+                                        }
+                                        if event.button == PointerEventButton.left {
                                             self.pressed-here = true;
                                             root.internal-drag-pointer-active = true;
                                             root.begin-internal-drag(
@@ -1851,7 +1858,7 @@ accessible-label: entry.name;
                                                 (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px,
                                                 event.modifiers.control,
                                                 event.modifiers.shift,
-                                                event.button == PointerEventButton.right
+                                                false
                                             );
                                         }
                                     }
@@ -1861,7 +1868,7 @@ accessible-label: entry.name;
                                             (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px
                                         );
                                     }
-                                    if event.kind == PointerEventKind.up && (event.button == PointerEventButton.left || event.button == PointerEventButton.right) && self.pressed-here && root.internal-drag-pointer-active {
+                                    if event.kind == PointerEventKind.up && event.button == PointerEventButton.left && self.pressed-here && root.internal-drag-pointer-active {
                                         self.pressed-here = false;
                                         root.internal-drag-pointer-active = false;
                                         root.end-internal-drag(
@@ -1869,7 +1876,7 @@ accessible-label: entry.name;
                                             (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px,
                                             event.modifiers.control,
                                             event.modifiers.shift,
-                                            event.button == PointerEventButton.right
+                                            false
                                         );
                                     }
                                 }
@@ -1986,7 +1993,14 @@ accessible-label: entry.name;
                                         if event.kind == PointerEventKind.down {
                                             self.click-control = event.modifiers.control;
                                             self.click-shift = event.modifiers.shift;
-                                            if event.button == PointerEventButton.left || event.button == PointerEventButton.right {
+                                            if event.button == PointerEventButton.right && event.kind == PointerEventKind.down {
+                                                root.show-entry-menu(
+                                                    entry.id,
+                                                    (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
+                                                    (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px
+                                                );
+                                            }
+                                            if event.button == PointerEventButton.left {
                                                 root.internal-drag-pointer-active = true;
                                                 root.begin-internal-drag(
                                                     entry.id,
@@ -1994,7 +2008,7 @@ accessible-label: entry.name;
                                                     (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px,
                                                     event.modifiers.control,
                                                     event.modifiers.shift,
-                                                    event.button == PointerEventButton.right
+                                                    false
                                                 );
                                             }
                                         }
@@ -2004,14 +2018,14 @@ accessible-label: entry.name;
                                                 (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px
                                             );
                                         }
-                                        if event.kind == PointerEventKind.up && (event.button == PointerEventButton.left || event.button == PointerEventButton.right) && root.internal-drag-pointer-active {
+                                        if event.kind == PointerEventKind.up && event.button == PointerEventButton.left && root.internal-drag-pointer-active {
                                             root.internal-drag-pointer-active = false;
                                             root.end-internal-drag(
                                                 (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
                                                 (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px,
                                                 event.modifiers.control,
                                                 event.modifiers.shift,
-                                                event.button == PointerEventButton.right
+                                                false
                                             );
                                         }
                                     }

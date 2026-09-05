@@ -11350,14 +11350,11 @@ fn wire_mouse_navigation(
         }
         if matches!(event, WindowEvent::Focused(true))
             && let Some(ui) = weak.upgrade()
+            && ui.get_context_menu_open()
         {
-            if ui.get_context_menu_open() {
-                // The owner receives activation before the underlying control's mouse event.
-                // Retire the popup here so the same click can reach that control.
-                dismiss_quick_menu_session(window_id, false);
-            } else {
-                reload_quick_access(ui.as_weak(), shared_state.clone());
-            }
+            // The owner receives activation before the underlying control's mouse event.
+            // Retire the popup here so the same click can reach that control.
+            dismiss_quick_menu_session(window_id, false);
         }
         if should_close_context_menu(event) {
             if weak
