@@ -10,9 +10,25 @@ python tools/verify.py
 
 Debug 程序的设置页包含仅开发构建可见的“开发工具 / UI 陈列室”，可直接打开永久删除、文件冲突、退出任务确认和文件进度窗口。陈列室复用正式窗口组件，演示按钮只关闭演示窗口，不修改真实文件或任务；Release 构建不显示该入口。
 
-命令依次检查格式、静态问题、测试、无界面 Agent 场景和 Debug 构建；某一步失败后仍继续执行其余独立检查，确保始终尝试生成 Debug 程序。用户明确要求正式构建时运行 `python tools/verify.py --release`。终端输出 JSON Lines；汇总写入 `artifacts/verify/summary.json`，完整命令日志写入 `artifacts/logs/`，状态导出写入 `artifacts/state/`。
+验证分为三档：
 
-验证失败后先读取汇总中的失败步骤，再打开对应日志，避免加载无关的大日志。成功汇总包含当前构建配置、对应程序的 UTC 文件时间和 SHA-256。
+```powershell
+python tools/verify.py --quick       # 小改动：格式、Clippy、测试、Debug 构建
+python tools/verify.py               # 完整 Debug：再运行全部无界面场景
+python tools/verify.py --release     # 收尾：复用未过期的完整验证并构建 Release
+```
+
+脚本启动时只关闭可执行路径属于本仓库 `target/debug` 或 `target/release` 的 AsterFiles，不影响其他目录的同名程序。默认首个失败即停止，后续步骤在汇总中标为 `skipped`；只有为了集中诊断多个独立失败时才使用 `--keep-going`。完整验证先构建一次 Debug，随后所有场景直接调用该程序，不重复 `cargo run`。成功完整验证记录当前工作树内容指纹；`--release` 在内容未变化时直接复用，若希望强制重跑则加 `--no-reuse`。
+
+终端输出 JSON Lines；汇总写入 `artifacts/verify/summary.json`，完整命令日志写入 `artifacts/logs/`，状态导出写入 `artifacts/state/`。验证失败后先读取汇总中的第一个失败步骤，再打开对应日志，避免加载无关的大日志。
+
+用户确认 Issue 完成后运行：
+
+```powershell
+./tools/finish-issue.ps1 <编号> -Message '<提交说明>' -Paths @('<文件1>', '<文件2>')
+```
+
+该入口只暂存 `-Paths` 明确列出的文件；存在其他未暂存或未跟踪内容时拒绝继续。随后按顺序执行 Release 收尾验证、差异检查、提交、证据回写、Project `Done` 和关闭 Issue；任一步失败都立即停止，不自动推送、打标签或发布。
 
 ## 确定性 UI 场景
 

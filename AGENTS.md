@@ -6,10 +6,12 @@
 
 ```powershell
 cargo run
-python tools/verify.py
+python tools/verify.py --quick # 小改动：格式、Clippy、测试、Debug 构建
+python tools/verify.py         # Issue 完整 Debug 验证
+python tools/verify.py --release # 用户确认后的 Release 收尾
 ```
 
-日常启动使用 `cargo run`，统一验证覆盖格式、静态检查、测试、无界面 Agent 场景和 Debug 构建。机器可读汇总位于 `artifacts/verify/summary.json`；详细规则和确定性 UI 场景见 `docs/agent/debug-validation.md`。Debug 构建产物位于 `target/debug/`；只有用户明确要求正式构建时才运行 `python tools/verify.py --release` 或 `cargo build --release`。UI 截图写入 `artifacts/ui/`，日志写入 `artifacts/logs/`，状态导出写入 `artifacts/state/`，性能 artifacts 写入 `artifacts/perf/`。
+验证默认首个失败即停止，并在开始前关闭由本仓库 Debug/Release 程序启动的 AsterFiles；诊断全部失败时显式加 `--keep-going`。完整验证只构建一次 Debug，随后直接复用程序运行全部无界面场景。`--release` 在工作树内容未变化时复用最近成功的完整验证，只补 Release 构建。Issue 收尾使用 `./tools/finish-issue.ps1 <编号> -Message '<提交说明>' -Paths <本 Issue 文件>`，依次验证、提交、回写 Issue、设为 Done 并关闭；任一步失败立即停止，且不会带入未明确列出的改动。机器可读汇总位于 `artifacts/verify/summary.json`；详细规则和确定性 UI 场景见 `docs/agent/debug-validation.md`。UI 截图写入 `artifacts/ui/`，日志写入 `artifacts/logs/`，状态导出写入 `artifacts/state/`，性能 artifacts 写入 `artifacts/perf/`。
 
 本地正式发布使用 `./tools/publish.ps1 major|feature|bugfix`，它会递增 `Cargo.toml` 版本、验证、提交、打标签并原子推送；`-DryRun` 仅预演。发布包可使用 `./tools/release.ps1 -Tag v<版本>` 在本地生成，输出位于 `artifacts/release/`；GitHub Release 由 `.github/workflows/release.yml` 在推送版本标签或手动触发时创建。版本唯一来源是 `Cargo.toml`。
 
