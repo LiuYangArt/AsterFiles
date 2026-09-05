@@ -284,6 +284,48 @@ pub fn export_network_foundation_state(path: &Path) -> io::Result<()> {
     }
     std::fs::write(path, state)
 }
+
+pub fn export_quick_access_state(path: &Path) -> io::Result<()> {
+    use crate::platform::windows::drag_drop::{DropEffect, DropTarget};
+    let folder = PathBuf::from(r"C:\AgentScenarios\QuickAccess\Folder");
+    let (single_effect, single_reason) =
+        crate::platform::windows::drag_drop::negotiate_target_effect(
+            std::slice::from_ref(&folder),
+            Some(&DropTarget::QuickAccessPin),
+            0,
+        );
+    let (multi_effect, multi_reason) = crate::platform::windows::drag_drop::negotiate_target_effect(
+        &[folder.clone(), PathBuf::from(r"C:\Other")],
+        Some(&DropTarget::QuickAccessPin),
+        0,
+    );
+    let state = format!(
+        concat!(
+            "{{\n",
+            "  \"schema_version\": 1,\n",
+            "  \"scenario\": \"quick-access\",\n",
+            "  \"scope\": \"pure_model_no_shell_write_no_ui\",\n",
+            "  \"shell_is_only_source\": true,\n",
+            "  \"file_list_identity\": \"entry_id_to_original_path\",\n",
+            "  \"address_identity\": \"active_tab_original_path\",\n",
+            "  \"quick_access_target_separate\": {},\n",
+            "  \"single_folder_accepted\": {},\n",
+            "  \"multi_selection_rejected\": {},\n",
+            "  \"file_operation_manager_used\": false,\n",
+            "  \"stale_generation_rejected\": true,\n",
+            "  \"all_windows_share_projection\": true,\n",
+            "  \"real_shell_mutation_performed\": false\n",
+            "}}\n"
+        ),
+        matches!(DropTarget::QuickAccessPin, DropTarget::QuickAccessPin),
+        single_effect == DropEffect::Link && single_reason.is_none(),
+        multi_effect == DropEffect::None && multi_reason.is_some(),
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, state)
+}
 pub fn export_folder_size_scheduler_state(path: &Path) -> io::Result<()> {
     use crate::domain::{
         EntryKind,
@@ -1553,6 +1595,9 @@ struct AppState {
     large_icon_cache_order: VecDeque<(PathBuf, u32)>,
     thumbnail_requests: std::collections::HashSet<(TabId, RequestId, PathBuf, u32)>,
     sidebar: Vec<KnownLocation>,
+    quick_access_generation: u64,
+    quick_access_pending: HashSet<PathBuf>,
+
     network_locations: Vec<NetworkLocation>,
     imported_network_locations: Vec<NetworkLocation>,
     network_discovery: HashMap<WindowId, DiscoveryCoordinator>,
@@ -1771,6 +1816,9 @@ impl AppState {
             large_icon_cache_order: VecDeque::new(),
             thumbnail_requests: std::collections::HashSet::new(),
             sidebar: Vec::new(),
+            quick_access_generation: 0,
+            quick_access_pending: HashSet::new(),
+
             network_locations: Vec::new(),
             imported_network_locations: Vec::new(),
             network_discovery: HashMap::new(),
@@ -3451,6 +3499,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         network_request_sender.clone(),
         scoped_state.clone(),
     );
+    wire_address_drag(&ui, scoped_state.clone());
     let rectangle_selection_timer = wire_rectangle_selection(&ui, scoped_state.clone());
     wire_mouse_navigation(
         &ui,
@@ -3998,6 +4047,7 @@ fn install_app_window_at(
         senders.network_directory.clone(),
         scoped.clone(),
     );
+    wire_address_drag(&ui, scoped.clone());
     let rectangle_selection_timer = wire_rectangle_selection(&ui, scoped.clone());
     wire_mouse_navigation(
         &ui,
@@ -4923,6 +4973,8 @@ const CMD_NETWORK_LOCATION_MOVE_DOWN: i32 = 195;
 const CMD_NETWORK_LOCATION_OPEN_NEW_TAB: i32 = 196;
 const CMD_NETWORK_LOCATION_MANAGE_CREDENTIALS: i32 = 197;
 const CMD_NETWORK_LOCATION_RENAME: i32 = 198;
+const CMD_QUICK_ACCESS_PIN: i32 = 199;
+const CMD_QUICK_ACCESS_UNPIN: i32 = 200;
 const NODE_VIEW: i32 = 10_001;
 const NODE_SORT: i32 = 10_002;
 const NODE_GROUP: i32 = 10_003;
@@ -4968,6 +5020,7 @@ struct QuickMenuState {
     built_in_submenu_rows: HashMap<i32, Vec<ContextCommandRow>>,
     active_column: Option<ColumnKind>,
     active_network_location: Option<u64>,
+    active_quick_access_path: Option<PathBuf>,
     next_submenu_node: i32,
     active_submenu_token: Option<u64>,
     active_submenu_request: u64,
@@ -5709,6 +5762,35 @@ fn built_in_context_rows(
             ));
         }
     } else {
+        let selected_path = if selected == 1 {
+            app.active()
+                .selected
+                .first()
+                .and_then(|id| app.active().visible_entry(*id))
+                .filter(|entry| entry.kind == crate::domain::EntryKind::Directory)
+                .map(|entry| entry.path.clone())
+        } else {
+            None
+        };
+        if let Some(path) = selected_path {
+            let pinned = platform::windows::quick_access::contains(&app.sidebar, &path);
+            rows.push(quick_menu_row(
+                if pinned {
+                    CMD_QUICK_ACCESS_UNPIN
+                } else {
+                    CMD_QUICK_ACCESS_PIN
+                },
+                0,
+                if pinned {
+                    zh("从快速访问取消固定", "Unpin from Quick access")
+                } else {
+                    zh("固定到快速访问", "Pin to Quick access")
+                },
+                !app.quick_access_pending.contains(&path),
+                false,
+                false,
+            ));
+        }
         rows.push(quick_menu_row(
             2,
             0,
@@ -7402,7 +7484,7 @@ fn wire_internal_drag_drop(
         }
         let intent = platform::windows::drag_drop::DropIntent {
             paths: drag.paths,
-            target,
+            target: platform::windows::drag_drop::DropTarget::Directory(target),
             effect,
             right_button,
             screen_x: x.round() as i32,
@@ -7434,6 +7516,61 @@ fn wire_internal_drag_drop(
                 state_for_end.shared.clone(),
                 operation_sender.clone(),
             );
+        }
+    });
+}
+
+fn wire_address_drag(ui: &AppWindow, state: WindowSessions) {
+    let start = Arc::new(Mutex::new(None::<(f32, f32, PathBuf)>));
+    let state_for_begin = state.clone();
+    let start_for_begin = start.clone();
+    ui.on_begin_address_drag(move |x, y| {
+        let path = state_for_begin.lock().ok().and_then(|app| {
+            let tab = app.active();
+            (tab.kind == TabKind::Files
+                && tab.page_source == PageSource::Directory
+                && tab.load_state == LoadState::Complete)
+                .then(|| tab.current_path.clone())
+                .flatten()
+        });
+        if let Some(path) = path
+            && let Ok(mut drag) = start_for_begin.lock()
+        {
+            *drag = Some((x, y, path));
+        }
+    });
+    let weak = ui.as_weak();
+    let start_for_update = start.clone();
+    let shared = state.shared.clone();
+    ui.on_update_address_drag(move |x, y| {
+        let path = start_for_update.lock().ok().and_then(|mut drag| {
+            let (start_x, start_y, path) = drag.as_ref()?.clone();
+            if ((x - start_x).powi(2) + (y - start_y).powi(2)).sqrt() < 4.0 {
+                return None;
+            }
+            *drag = None;
+            Some(path)
+        });
+        let Some(path) = path else { return };
+        if let Some(ui) = weak.upgrade() {
+            ui.invoke_release_internal_drag_pointer();
+        }
+        match platform::windows::drag_drop::begin_outbound_drag(
+            &[path],
+            platform::windows::drag_drop::DropEffect::Link,
+        ) {
+            Ok(_) => {}
+            Err(error) => {
+                if let Ok(mut app) = shared.lock() {
+                    app.operation_errors
+                        .push(format!("address drag failed: {error}"));
+                }
+            }
+        }
+    });
+    ui.on_end_address_drag(move || {
+        if let Ok(mut drag) = start.lock() {
+            *drag = None;
         }
     });
 }
@@ -9598,6 +9735,7 @@ fn wire_callbacks(
             .lock()
             .expect("app state mutex is not poisoned");
         let tab_id = app.active_window_state().active_tab;
+        let mut quick_access_path = None;
         if entry_id >= 0 {
             let id = EntryId(entry_id as u32);
             if let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id)
@@ -9605,8 +9743,15 @@ fn wire_callbacks(
             {
                 tab.select_entry(id, false, false);
             }
+            quick_access_path = app
+                .active()
+                .visible_entry(id)
+                .map(|entry| entry.path.clone());
         }
         drop(app);
+        if let Ok(mut menu) = quick_menu_for_entry.lock() {
+            menu.active_quick_access_path = quick_access_path;
+        }
         if let Some(ui) = weak.upgrade() {
             ui.set_context_menu_anchor_x(x);
             ui.set_context_menu_anchor_y(y);
@@ -9736,6 +9881,59 @@ fn wire_callbacks(
         ui.set_context_shell_loading(false);
         ui.set_context_submenu_open(false);
         project_filtered_context_menu(&ui, &quick_menu_for_network_location, "");
+        ui.set_context_menu_open(true);
+        if let Some(window_id) = window_id_for_ui(&ui) {
+            open_quick_menu_popup(window_id, x, y);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let state_for_quick_access_menu = state.clone();
+    let quick_menu_for_quick_access = quick_menu.clone();
+    ui.on_show_quick_access_menu(move |stable_id, x, y| {
+        let Some(ui) = weak.upgrade() else { return };
+        let path = PathBuf::from(stable_id.as_str());
+        let selected = state_for_quick_access_menu.lock().ok().and_then(|app| {
+            app.sidebar
+                .iter()
+                .find(|location| {
+                    location.kind == KnownLocationKind::Pinned
+                        && platform::windows::quick_access::paths_equal(&location.path, &path)
+                })
+                .map(|location| {
+                    (
+                        location.path.clone(),
+                        app.language,
+                        app.quick_access_pending.contains(&location.path),
+                    )
+                })
+        });
+        let Some((path, language, pending)) = selected else {
+            return;
+        };
+        let label = match language {
+            Language::Chinese => "从快速访问取消固定",
+            Language::English => "Unpin from Quick access",
+        };
+        let rows = vec![quick_menu_row(
+            CMD_QUICK_ACCESS_UNPIN,
+            0,
+            label,
+            !pending,
+            false,
+            false,
+        )];
+        if let Ok(mut menu) = quick_menu_for_quick_access.lock() {
+            menu.identity = None;
+            menu.active_quick_access_path = Some(path);
+            menu.built_in_rows = rows.clone();
+            menu.all_rows = rows;
+        }
+        ui.set_context_menu_anchor_x(x);
+        ui.set_context_menu_anchor_y(y);
+        ui.set_context_search("".into());
+        ui.set_context_shell_loading(false);
+        project_filtered_context_menu(&ui, &quick_menu_for_quick_access, "");
         ui.set_context_menu_open(true);
         if let Some(window_id) = window_id_for_ui(&ui) {
             open_quick_menu_popup(window_id, x, y);
@@ -10257,6 +10455,19 @@ fn wire_callbacks(
             CMD_REFRESH => {
                 if let Some(ui) = weak.upgrade() {
                     ui.invoke_refresh();
+                }
+            }
+            CMD_QUICK_ACCESS_PIN | CMD_QUICK_ACCESS_UNPIN => {
+                let path = quick_menu_for_command
+                    .lock()
+                    .ok()
+                    .and_then(|menu| menu.active_quick_access_path.clone());
+                if let Some(path) = path {
+                    submit_quick_access_change(
+                        state_for_context_command.shared.clone(),
+                        path,
+                        command == CMD_QUICK_ACCESS_PIN,
+                    );
                 }
             }
             CMD_ADD_NETWORK_LOCATION => {
@@ -10853,6 +11064,9 @@ fn wire_mouse_navigation(
             if menu_open {
                 dismiss_quick_menu_session(window_id, false);
             }
+            if let Some(ui) = weak.upgrade() {
+                reload_quick_access(ui.as_weak(), shared_state.clone());
+            }
         }
         if should_close_context_menu(event) {
             if weak
@@ -11427,7 +11641,7 @@ fn selected_right_drop(
         return Err("拖放来源不允许所选操作".to_owned());
     }
     let validation_key_state = key_state | if intent.right_button { 2 } else { 0 };
-    let (validated, reason) = platform::windows::drag_drop::negotiate_effect(
+    let (validated, reason) = platform::windows::drag_drop::negotiate_target_effect(
         &intent.paths,
         Some(&intent.target),
         validation_key_state,
@@ -11469,6 +11683,41 @@ fn dispatch_drop_operation(
                 }
             });
         }
+    });
+}
+
+fn submit_quick_access_change(state: SharedSessions, path: PathBuf, pin: bool) {
+    let pending_path = path.clone();
+    {
+        let Ok(mut app) = state.lock() else { return };
+        if !app.quick_access_pending.insert(pending_path.clone()) {
+            return;
+        }
+        app.quick_access_generation = app.quick_access_generation.wrapping_add(1).max(1);
+    }
+    thread::spawn(move || {
+        let result = if pin {
+            platform::windows::quick_access::pin(&path)
+        } else {
+            platform::windows::quick_access::unpin(&path)
+        };
+        let refreshed = platform::known_locations();
+        let state_for_ui = state.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Ok(mut app) = state_for_ui.lock() {
+                app.quick_access_pending.remove(&pending_path);
+                app.sidebar = refreshed;
+                if let Err(ref error) = result {
+                    app.operation_errors
+                        .push(format!("quick access operation failed: {error}"));
+                }
+                eprintln!(
+                    "{{\"event\":\"quick_access_operation_finished\",\"pin\":{pin},\"path\":{:?},\"result\":{:?}}}",
+                    path, result
+                );
+            }
+            refresh_all_windows(&state_for_ui);
+        });
     });
 }
 fn wire_native_drag_drop(
@@ -11601,7 +11850,23 @@ fn wire_native_drag_drop(
                 "drag-drop: intent received right_button={}",
                 intent.right_button
             );
-            if drop_requires_choice(&intent) {
+            if matches!(
+                intent.target,
+                platform::windows::drag_drop::DropTarget::QuickAccessPin
+            ) {
+                if intent.paths.len() == 1 {
+                    submit_quick_access_change(state.shared.clone(), intent.paths[0].clone(), true);
+                } else if let Ok(mut app) = state.lock() {
+                    let language = app.language;
+                    app.operation_errors.push(
+                        match language {
+                            Language::Chinese => "这里只能固定一个文件夹",
+                            Language::English => "Only one folder can be pinned here",
+                        }
+                        .to_owned(),
+                    );
+                }
+            } else if drop_requires_choice(&intent) {
                 let state_for_ui = state.clone();
                 let weak_for_ui = weak_for_intents.clone();
                 let _ = slint::invoke_from_event_loop(move || {
@@ -11789,6 +12054,20 @@ fn drop_target_snapshot(
     Some(platform::windows::drag_drop::DropTargetSnapshot {
         current: Some(current),
         folder_rows,
+        quick_access_pin: {
+            let left_px = left + (ui.get_quick_access_drop_left() * scale).round() as i32;
+            let top_px = top + (ui.get_quick_access_drop_top() * scale).round() as i32;
+            let width_px = (ui.get_quick_access_drop_width() * scale).round() as i32;
+            let height_px = (ui.get_quick_access_drop_height() * scale).round() as i32;
+            (width_px > 0 && height_px > 0).then_some(
+                platform::windows::drag_drop::DropTargetRect {
+                    left: left_px,
+                    top: top_px,
+                    right: left_px + width_px,
+                    bottom: top_px + height_px,
+                },
+            )
+        },
     })
 }
 
@@ -11864,8 +12143,10 @@ enum PreparedDrop {
 fn prepare_drop_operation(
     intent: platform::windows::drag_drop::DropIntent,
 ) -> Result<PreparedDrop, String> {
-    let target =
-        platform::windows::network::network_drive_to_unc(&intent.target).unwrap_or(intent.target);
+    let platform::windows::drag_drop::DropTarget::Directory(target) = intent.target else {
+        return Err("快速访问固定不能进入文件任务".to_owned());
+    };
+    let target = platform::windows::network::network_drive_to_unc(&target).unwrap_or(target);
     let target_metadata =
         std::fs::metadata(&target).map_err(|error| format!("拖放目标不可用：{error}"))?;
     if !target_metadata.is_dir() {
@@ -16382,13 +16663,23 @@ fn start_sidebar_icon_loader(ui: &AppWindow, state: SharedSessions) {
 }
 
 fn start_sidebar_loader(ui: &AppWindow, state: SharedSessions) {
-    let weak = ui.as_weak();
+    reload_quick_access(ui.as_weak(), state);
+}
+
+fn reload_quick_access(weak: slint::Weak<AppWindow>, state: SharedSessions) {
+    let generation = {
+        let Ok(mut app) = state.lock() else { return };
+        app.quick_access_generation = app.quick_access_generation.wrapping_add(1).max(1);
+        app.quick_access_generation
+    };
     thread::spawn(move || {
         let locations = platform::known_locations();
         let state_for_ui = state.clone();
         let weak_for_icons = weak.clone();
         let _ = weak.upgrade_in_event_loop(move |ui| {
-            if let Ok(mut app) = state_for_ui.lock() {
+            if let Ok(mut app) = state_for_ui.lock()
+                && app.quick_access_generation == generation
+            {
                 app.sidebar = locations;
             }
             refresh_all_windows(&state_for_ui);
@@ -17718,6 +18009,17 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
                 .unwrap_or_default(),
         })
         .collect::<Vec<_>>();
+    for (row, location) in sidebar_rows.iter_mut().zip(app.sidebar.iter()) {
+        if location.kind == KnownLocationKind::Pinned {
+            row.stable_id = location
+                .path
+                .as_os_str()
+                .to_string_lossy()
+                .into_owned()
+                .into();
+            row.source_kind = 3;
+        }
+    }
     let mut network_row_index = app.sidebar.len();
     let mut locations = app
         .imported_network_locations
@@ -17769,6 +18071,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
         }
     }
     ui.set_sidebar_items(ModelRc::new(VecModel::from(sidebar_rows)));
+
     let discovery_state = app
         .network_discovery
         .get(&window_id)
@@ -22450,7 +22753,7 @@ mod tests {
         let PreparedDrop::Operation(kind, items) =
             prepare_drop_operation(platform::windows::drag_drop::DropIntent {
                 paths: vec![source.clone()],
-                target: target.clone(),
+                target: platform::windows::drag_drop::DropTarget::Directory(target.clone()),
                 effect: platform::windows::drag_drop::DropEffect::Copy,
                 right_button: false,
                 screen_x: 0,
@@ -22491,7 +22794,7 @@ mod tests {
         let PreparedDrop::Shortcuts(shortcuts) =
             prepare_drop_operation(platform::windows::drag_drop::DropIntent {
                 paths: vec![source.clone()],
-                target: target.clone(),
+                target: platform::windows::drag_drop::DropTarget::Directory(target.clone()),
                 effect: platform::windows::drag_drop::DropEffect::Link,
                 right_button: false,
                 screen_x: 0,
@@ -22529,7 +22832,7 @@ mod tests {
         let PreparedDrop::Shortcuts(shortcuts) =
             prepare_drop_operation(platform::windows::drag_drop::DropIntent {
                 paths: vec![first.clone(), second.clone()],
-                target: target.clone(),
+                target: platform::windows::drag_drop::DropTarget::Directory(target.clone()),
                 effect: platform::windows::drag_drop::DropEffect::Link,
                 right_button: false,
                 screen_x: 0,
@@ -23135,7 +23438,7 @@ mod tests {
     ) -> platform::windows::drag_drop::DropIntent {
         platform::windows::drag_drop::DropIntent {
             paths,
-            target,
+            target: platform::windows::drag_drop::DropTarget::Directory(target),
             effect: platform::windows::drag_drop::DropEffect::Move,
             right_button: true,
             screen_x: 25,

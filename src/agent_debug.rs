@@ -38,6 +38,7 @@ pub enum AgentScenario {
     TabDetach,
     TabCrossWindow,
     ExplorerPins,
+    QuickAccess,
     ShellThumbnail,
     FolderSizeScheduler,
     QuickMenuSearch,
@@ -59,6 +60,7 @@ impl AgentScenario {
             Self::TabDetach => "tab-detach",
             Self::TabCrossWindow => "tab-cross-window",
             Self::ExplorerPins => "explorer-pins",
+            Self::QuickAccess => "quick-access",
             Self::ShellThumbnail => "shell-thumbnail",
             Self::FolderSizeScheduler => "folder-size-scheduler",
             Self::QuickMenuSearch => "quick-menu-search",
@@ -132,6 +134,7 @@ fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
         "tab-detach" => Ok(AgentScenario::TabDetach),
         "tab-cross-window" => Ok(AgentScenario::TabCrossWindow),
         "explorer-pins" => Ok(AgentScenario::ExplorerPins),
+        "quick-access" => Ok(AgentScenario::QuickAccess),
         "shell-thumbnail" => Ok(AgentScenario::ShellThumbnail),
         "folder-size-scheduler" => Ok(AgentScenario::FolderSizeScheduler),
         "quick-menu-search" => Ok(AgentScenario::QuickMenuSearch),
@@ -172,6 +175,10 @@ pub fn apply_scenario(session: &mut TabSession, scenario: AgentScenario) {
         }
         AgentScenario::ExplorerPins => {
             session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\ExplorerPins"));
+            session.load_state = LoadState::Complete;
+        }
+        AgentScenario::QuickAccess => {
+            session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\QuickAccess"));
             session.load_state = LoadState::Complete;
         }
         AgentScenario::ShellThumbnail => {
@@ -312,6 +319,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
             | AgentScenario::TabDetach
             | AgentScenario::TabCrossWindow
             | AgentScenario::ExplorerPins
+            | AgentScenario::QuickAccess
             | AgentScenario::ShellThumbnail
             | AgentScenario::FolderSizeScheduler
             | AgentScenario::QuickMenuSearch
@@ -375,6 +383,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
         AgentScenario::TabDetach => unreachable!(),
         AgentScenario::TabCrossWindow => unreachable!(),
         AgentScenario::ExplorerPins => unreachable!(),
+        AgentScenario::QuickAccess => unreachable!(),
         AgentScenario::ShellThumbnail => unreachable!(),
         AgentScenario::FolderSizeScheduler => unreachable!(),
         AgentScenario::QuickMenuSearch => unreachable!(),

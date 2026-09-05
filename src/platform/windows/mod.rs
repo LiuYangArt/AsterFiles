@@ -8,6 +8,7 @@ pub mod everything;
 pub mod everything_file_picker;
 pub mod file_operation;
 pub mod network;
+pub mod quick_access;
 pub mod quick_menu_window;
 pub mod shortcut;
 pub mod tab_insertion_indicator;

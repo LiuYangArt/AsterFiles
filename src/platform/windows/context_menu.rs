@@ -1036,6 +1036,93 @@ fn create_selection_context_menu(paths: &[PathBuf], owner: HWND) -> io::Result<I
     result
 }
 
+pub fn invoke_path_verb(path: &Path, verb: &str) -> io::Result<()> {
+    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if initialized == RPC_E_CHANGED_MODE {
+        return Err(io::Error::other("Shell verb requires an STA thread"));
+    }
+    initialized.ok().map_err(windows_error)?;
+    let result = (|| {
+        let context_menu = create_selection_context_menu(&[path.to_path_buf()], HWND::default())?;
+        let menu = unsafe { CreatePopupMenu() }.map_err(windows_error)?;
+        let result = (|| {
+            unsafe {
+                context_menu.QueryContextMenu(
+                    menu,
+                    0,
+                    FIRST_COMMAND_ID,
+                    LAST_COMMAND_ID,
+                    CMF_NORMAL,
+                )
+            }
+            .ok()
+            .map_err(windows_error)?;
+            let command_id = (FIRST_COMMAND_ID..=LAST_COMMAND_ID)
+                .find(|command_id| {
+                    command_verb(&context_menu, *command_id)
+                        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(verb))
+                })
+                .or_else(|| shell_home_command_by_title(menu, verb))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("Shell verb {verb} is unavailable"),
+                    )
+                })?;
+            let invocation = CMINVOKECOMMANDINFOEX {
+                cbSize: size_of::<CMINVOKECOMMANDINFOEX>() as u32,
+                fMask: 0,
+                hwnd: HWND::default(),
+                lpVerb: PCSTR((command_id - FIRST_COMMAND_ID) as usize as *const u8),
+                lpParameters: PCSTR::null(),
+                lpDirectory: PCSTR::null(),
+                nShow: SW_SHOWNORMAL.0,
+                ..Default::default()
+            };
+            let base = (&invocation as *const CMINVOKECOMMANDINFOEX).cast();
+            unsafe { context_menu.InvokeCommand(&*base) }.map_err(windows_error)
+        })();
+        unsafe { DestroyMenu(menu) }.ok();
+        result
+    })();
+    unsafe { CoUninitialize() };
+    result
+}
+
+fn shell_home_command_by_title(menu: HMENU, verb: &str) -> Option<u32> {
+    let count = unsafe { GetMenuItemCount(Some(menu)) };
+    if count <= 0 {
+        return None;
+    }
+    let normalized_verb = verb.to_ascii_lowercase();
+    let wants_unpin = normalized_verb.contains("unpin") || normalized_verb.contains("remove");
+    for position in 0..count as u32 {
+        let mut info = MENUITEMINFOW {
+            cbSize: size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_ID | MIIM_STRING,
+            ..Default::default()
+        };
+        unsafe { GetMenuItemInfoW(menu, position, true, &mut info) }.ok()?;
+        let mut title = vec![0_u16; info.cch as usize + 1];
+        info.dwTypeData = PWSTR(title.as_mut_ptr());
+        info.cch = title.len() as u32;
+        unsafe { GetMenuItemInfoW(menu, position, true, &mut info) }.ok()?;
+        let normalized = clean_menu_title(&String::from_utf16_lossy(&title[..info.cch as usize]))
+            .to_ascii_lowercase();
+        let matches = if wants_unpin {
+            (normalized.contains("unpin") || normalized.contains("remove"))
+                && (normalized.contains("quick access") || normalized.contains("home"))
+        } else {
+            normalized.contains("pin")
+                && (normalized.contains("quick access") || normalized.contains("home"))
+                && !normalized.contains("unpin")
+        };
+        if matches && (FIRST_COMMAND_ID..=LAST_COMMAND_ID).contains(&info.wID) {
+            return Some(info.wID);
+        }
+    }
+    None
+}
 fn create_background_context_menu(folder: &Path, owner: HWND) -> io::Result<IContextMenu> {
     let wide = wide_null(folder);
     let mut full_pidl = ptr::null_mut();

@@ -778,6 +778,10 @@ export component AppWindow inherits Window {
     in-out property <length> search-scroll-y: 0px;
     in property <int> search-total-items: 0;
     out property <length> sidebar-viewport-y: 0px;
+    out property <length> quick-access-drop-left: 0px;
+    out property <length> quick-access-drop-top: 0px;
+    out property <length> quick-access-drop-width: 0px;
+    out property <length> quick-access-drop-height: 0px;
     out property <length> file-list-left: 0px;
     out property <length> file-list-top: 0px;
     out property <length> rectangle-viewport-top: 0px;
@@ -855,6 +859,7 @@ export component AppWindow inherits Window {
     in property <bool> network-discovery-loading: false;
     in property <bool> network-discovery-empty: false;
     in property <string> network-discovery-error: "";
+
     in property <bool> can-navigate-back: false;
     in property <bool> can-navigate-forward: false;
     in property <bool> can-navigate-up: false;
@@ -1055,7 +1060,11 @@ export component AppWindow inherits Window {
     callback download-everything();
     callback drag-window();
     callback drag-window-after-menu-dismiss();
+    callback begin-address-drag(float, float);
+    callback update-address-drag(float, float);
+    callback end-address-drag();
     callback show-entry-menu(int, float, float);
+    callback show-quick-access-menu(string, float, float);
     callback show-background-menu(float, float);
     callback reopen-context-menu(float, float);
     callback invoke-context-command(int);
@@ -1425,7 +1434,7 @@ export component AppWindow inherits Window {
                 if !root.compact: IconButton { icon-source: IconMap.action-refresh; tip: root.text-refresh + " (F5)"; enabled: root.can-refresh; button-label: root.text-refresh; clicked => { root.refresh(); } }
                 Rectangle {
                     height: 38px; horizontal-stretch: 1; background: VisualStyle.cffffff; border-width: 0px; border-radius: 5px;
-                    if !root.address-editing: Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; HorizontalLayout { padding-left: 8px; padding-right: 8px; padding-top: 3px; padding-bottom: 3px; spacing: 2px; InlineIcon { icon-source: root.current-location-icon.width != 0 ? root.current-location-icon : (root.current-location-is-drive ? IconMap.location-drive : IconMap.file-folder); icon-size: 16px; } for crumb in root.breadcrumbs: BreadcrumbButton { label: crumb.label; current: crumb.current; clicked => { root.navigate-breadcrumb(crumb.index); } } Rectangle { horizontal-stretch: 1; TouchArea { mouse-cursor: text; clicked => { root.begin-search(); } } } } }
+                    if !root.address-editing: Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; HorizontalLayout { padding-left: 8px; padding-right: 8px; padding-top: 3px; padding-bottom: 3px; spacing: 2px; Rectangle { width: 18px; height: 100%; InlineIcon { y: (parent.height - self.height) / 2; icon-source: root.current-location-icon.width != 0 ? root.current-location-icon : (root.current-location-is-drive ? IconMap.location-drive : IconMap.file-folder); icon-size: 16px; } address-drag-touch := TouchArea { enabled: root.can-refresh && !root.search-results-mode; mouse-cursor: self.enabled ? grab : default; pointer-event(event) => { if event.button == PointerEventButton.left && event.kind == PointerEventKind.down { root.begin-address-drag((self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px, (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px); } if event.button == PointerEventButton.left && event.kind == PointerEventKind.up { root.end-address-drag(); } } moved => { if self.pressed { root.update-address-drag((self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px, (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px); } } } } for crumb in root.breadcrumbs: BreadcrumbButton { label: crumb.label; current: crumb.current; clicked => { root.navigate-breadcrumb(crumb.index); } } Rectangle { horizontal-stretch: 1; TouchArea { mouse-cursor: text; clicked => { root.begin-search(); } } } } }
                     address-editor := AddressEditor { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: parent.height - 4px; text <=> root.address-input; address-label: root.search-mode ? root.text-parent-path : root.text-address; cancel-label: root.text-cancel-edit; depth-enabled: root.search-mode && root.search-depth-enabled; recursive: root.search-recursive; depth-label: !root.search-depth-enabled ? root.text-search-global-disabled : (root.search-recursive ? root.text-search-recursive : root.text-search-current); changed(value) => { root.address-input-changed(value); } accepted(value) => { root.navigate-path(value); } cancelled => { root.cancel-address-edit(); } toggle-depth => { root.toggle-search-depth(); } }
 
                 }
@@ -1458,12 +1467,13 @@ export component AppWindow inherits Window {
                 sidebar-content := VerticalLayout {
                     width: sidebar-scroll.width;
                     padding-top: 4px; padding-bottom: 12px; padding-left: 10px; padding-right: 10px; spacing: 0px;
-                    SidebarGroupHeader { label: root.text-quick-access; expanded: root.quick-access-expanded; toggled => { root.quick-access-expanded = !root.quick-access-expanded; } }
+                    quick-access-header := SidebarGroupHeader { label: root.text-quick-access; expanded: root.quick-access-expanded; toggled => { root.quick-access-expanded = !root.quick-access-expanded; } changed absolute-position => { root.quick-access-drop-left = self.absolute-position.x - root.absolute-position.x; root.quick-access-drop-top = self.absolute-position.y - root.absolute-position.y; } changed width => { root.quick-access-drop-width = self.width; } changed height => { root.quick-access-drop-height = self.height; } init => { root.quick-access-drop-left = self.absolute-position.x - root.absolute-position.x; root.quick-access-drop-top = self.absolute-position.y - root.absolute-position.y; root.quick-access-drop-width = self.width; root.quick-access-drop-height = self.height; } }
+
                     for location in root.sidebar-items: Rectangle {
                         visible: location.group-kind == 0 && root.quick-access-expanded;
                         height: self.visible ? 34px : 0px; border-radius: 5px; background: side-touch.pressed ? VisualStyle.cdde3ed : side-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
                         HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : (location.icon-kind == 0 ? IconMap.location-home : location.icon-kind == 1 ? IconMap.location-desktop : location.icon-kind == 2 ? IconMap.location-downloads : location.icon-kind == 3 ? IconMap.location-documents : location.icon-kind == 4 ? IconMap.location-pictures : location.icon-kind == 5 ? IconMap.location-music : IconMap.location-videos); } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
-                        side-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-sidebar(location.index); } }
+                        side-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-sidebar(location.index); } pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.source-kind == 3 { root.show-quick-access-menu(location.stable-id, (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px, (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px); } } }
                         accessible-role: button; accessible-label: location.label;
                     }
                     SidebarGroupHeader { label: root.text-drives; expanded: root.drives-expanded; toggled => { root.drives-expanded = !root.drives-expanded; } }

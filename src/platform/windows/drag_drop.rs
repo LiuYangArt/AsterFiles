@@ -172,12 +172,18 @@ impl DropEffect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropIntent {
     pub paths: Vec<PathBuf>,
-    pub target: PathBuf,
+    pub target: DropTarget,
     pub effect: DropEffect,
     pub right_button: bool,
     pub screen_x: i32,
     pub screen_y: i32,
     pub allowed_effects: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DropTarget {
+    Directory(PathBuf),
+    QuickAccessPin,
 }
 
 pub const ALLOW_COPY: u32 = 1;
@@ -294,6 +300,15 @@ type SharedState = Arc<Mutex<DragDropState>>;
 pub struct DropTargetSnapshot {
     pub current: Option<PathBuf>,
     pub folder_rows: Vec<FolderDropTarget>,
+    pub quick_access_pin: Option<DropTargetRect>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropTargetRect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -306,7 +321,15 @@ pub struct FolderDropTarget {
 }
 
 impl DropTargetSnapshot {
-    fn target_at(&self, point: &POINTL) -> Option<PathBuf> {
+    fn target_at(&self, point: &POINTL) -> Option<DropTarget> {
+        if self.quick_access_pin.is_some_and(|rect| {
+            point.x >= rect.left
+                && point.x < rect.right
+                && point.y >= rect.top
+                && point.y < rect.bottom
+        }) {
+            return Some(DropTarget::QuickAccessPin);
+        }
         self.folder_rows
             .iter()
             .find(|row| {
@@ -315,8 +338,8 @@ impl DropTargetSnapshot {
                     && point.y >= row.top
                     && point.y < row.bottom
             })
-            .map(|row| row.path.clone())
-            .or_else(|| self.current.clone())
+            .map(|row| DropTarget::Directory(row.path.clone()))
+            .or_else(|| self.current.clone().map(DropTarget::Directory))
     }
 }
 
@@ -356,7 +379,7 @@ impl NativeDropTarget {
         &self,
         event: DragDropEvent,
         paths: &[PathBuf],
-        target: Option<&Path>,
+        target: Option<&DropTarget>,
         effect: DropEffect,
         reason: Option<&'static str>,
         point: Option<&POINTL>,
@@ -364,14 +387,17 @@ impl NativeDropTarget {
         if let Ok(mut state) = self.state.lock() {
             state.record(event);
             state.source_count = paths.len();
-            state.target = target.map(|path| path.as_os_str().to_string_lossy().into_owned());
+            state.target = target.map(|target| match target {
+                DropTarget::Directory(path) => path.as_os_str().to_string_lossy().into_owned(),
+                DropTarget::QuickAccessPin => "quick_access_pin".to_owned(),
+            });
             state.negotiated_effect = effect.name();
             state.rejection_reason = reason;
             state.cursor_y = point.map(|point| point.y);
         }
     }
 
-    fn target(&self, point: &POINTL) -> Option<PathBuf> {
+    fn target(&self, point: &POINTL) -> Option<DropTarget> {
         self.target
             .lock()
             .ok()
@@ -423,7 +449,7 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
         let offered = unsafe { native_effect.as_ref() }
             .copied()
             .unwrap_or(DROPEFFECT_NONE);
-        let (effect, reason) = negotiate_effect(&paths, target.as_deref(), key_state.0);
+        let (effect, reason) = negotiate_target_effect(&paths, target.as_ref(), key_state.0);
         set_native_effect(native_effect, effect);
         if let Ok(mut context) = self.context.lock() {
             context.paths = paths.clone();
@@ -434,7 +460,7 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
         self.update(
             DragDropEvent::Entered,
             &paths,
-            target.as_deref(),
+            target.as_ref(),
             effect,
             reason,
             Some(_point),
@@ -466,7 +492,7 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
             .lock()
             .map(|context| context.paths.clone())
             .unwrap_or_default();
-        let (effect, reason) = negotiate_effect(&paths, target.as_deref(), key_state.0);
+        let (effect, reason) = negotiate_target_effect(&paths, target.as_ref(), key_state.0);
         set_native_effect(native_effect, effect);
         if let Ok(mut context) = self.context.lock() {
             context.effect = effect;
@@ -475,7 +501,7 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
         self.update(
             DragDropEvent::Moved,
             &paths,
-            target.as_deref(),
+            target.as_ref(),
             effect,
             reason,
             Some(_point),
@@ -571,10 +597,16 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
             .unwrap_or_else(|_| (allowed_effects(offered), false));
         let right_button = tracked_right_button || key_state.0 & MK_RBUTTON.0 != 0;
         let effective_key_state = drop_key_state(key_state.0, right_button);
-        let (effect, reason) = negotiate_effect(&paths, target.as_deref(), effective_key_state);
+        let (effect, reason) =
+            negotiate_target_effect(&paths, target.as_ref(), effective_key_state);
         set_native_effect(native_effect, effect);
         if let (Some(target), None) = (target.clone(), reason) {
-            let allowed_effects = allowed_effects_for_target(&paths, &target, offered_effects);
+            let allowed_effects = match &target {
+                DropTarget::Directory(path) => {
+                    allowed_effects_for_target(&paths, path, offered_effects)
+                }
+                DropTarget::QuickAccessPin => ALLOW_LINK,
+            };
             eprintln!(
                 "drag-drop: native Drop right_button={right_button} allowed_effects={allowed_effects}"
             );
@@ -591,7 +623,7 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
         self.update(
             DragDropEvent::Dropped,
             &paths,
-            target.as_deref(),
+            target.as_ref(),
             effect,
             reason,
             Some(_point),
@@ -683,6 +715,21 @@ pub fn negotiate_effect(
         (DropEffect::Move, None)
     } else {
         (DropEffect::Copy, None)
+    }
+}
+
+pub fn negotiate_target_effect(
+    paths: &[PathBuf],
+    target: Option<&DropTarget>,
+    key_state: u32,
+) -> (DropEffect, Option<&'static str>) {
+    match target {
+        Some(DropTarget::QuickAccessPin) if paths.len() == 1 => (DropEffect::Link, None),
+        Some(DropTarget::QuickAccessPin) => {
+            (DropEffect::None, Some("quick_access_requires_one_folder"))
+        }
+        Some(DropTarget::Directory(path)) => negotiate_effect(paths, Some(path), key_state),
+        None => negotiate_effect(paths, None, key_state),
     }
 }
 
@@ -1992,15 +2039,51 @@ mod tests {
                 bottom: 60,
                 path: PathBuf::from(r"C:\Current\Child"),
             }],
+            quick_access_pin: None,
         };
 
         assert_eq!(
             snapshot.target_at(&POINTL { x: 50, y: 40 }),
-            Some(PathBuf::from(r"C:\Current\Child"))
+            Some(DropTarget::Directory(PathBuf::from(r"C:\Current\Child")))
         );
         assert_eq!(
             snapshot.target_at(&POINTL { x: 5, y: 5 }),
-            Some(PathBuf::from(r"C:\Current"))
+            Some(DropTarget::Directory(PathBuf::from(r"C:\Current")))
+        );
+    }
+
+    #[test]
+    fn quick_access_target_is_separate_and_accepts_one_source() {
+        let snapshot = DropTargetSnapshot {
+            current: Some(PathBuf::from(r"C:\Current")),
+            folder_rows: Vec::new(),
+            quick_access_pin: Some(DropTargetRect {
+                left: 0,
+                top: 0,
+                right: 100,
+                bottom: 32,
+            }),
+        };
+        assert_eq!(
+            snapshot.target_at(&POINTL { x: 50, y: 16 }),
+            Some(DropTarget::QuickAccessPin)
+        );
+        assert_eq!(
+            negotiate_target_effect(
+                &[PathBuf::from(r"C:\Folder")],
+                Some(&DropTarget::QuickAccessPin),
+                0,
+            ),
+            (DropEffect::Link, None)
+        );
+        assert!(
+            negotiate_target_effect(
+                &[PathBuf::from(r"C:\One"), PathBuf::from(r"C:\Two")],
+                Some(&DropTarget::QuickAccessPin),
+                0,
+            )
+            .1
+            .is_some()
         );
     }
 

@@ -89,6 +89,8 @@ P4 收敛为三个相互独立的纵向功能：
 
 AsterFiles 不维护独立收藏列表。侧栏固定目录以 Windows Shell 的 Explorer“主页/快速访问”固定项为唯一来源：
 
+当前实现把枚举、固定和取消固定集中在 Windows 平台适配器，固定后重新枚举并按应用级加载代次投影到所有窗口。窗口重新激活时受控刷新 Explorer 外部变更；文件列表和地址栏图标拖入都路由到独立 `QuickAccessPin`，不会创建文件任务。
+
 - 通过 Windows Shell 枚举固定文件夹，并读取固定属性；
 - 在 Explorer 中固定或取消固定后，AsterFiles 刷新并反映变化；
 - AsterFiles 的固定与取消固定操作调用 Windows Shell 能力；
