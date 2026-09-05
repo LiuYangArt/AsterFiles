@@ -47,7 +47,17 @@ jobs:
 
       - name: Verify
         shell: pwsh
-        run: python tools/verify.py --release
+        run: |
+          python tools/verify.py --release
+          $verifyExitCode = $LASTEXITCODE
+          if ($verifyExitCode -ne 0) {
+            Get-ChildItem artifacts/logs/*.log | ForEach-Object {
+              Write-Host "::group::$($_.Name)"
+              Get-Content $_.FullName
+              Write-Host "::endgroup::"
+            }
+            exit $verifyExitCode
+          }
 
       - name: Package portable release
         shell: pwsh
