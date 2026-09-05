@@ -476,6 +476,24 @@ mod tests {
     }
 
     #[test]
+    fn context_menu_release_cleanup_cannot_close_replacement_with_same_shell_generation() {
+        let active = identity(1, 10, 3);
+        let previous = MenuEventIdentity {
+            session: active,
+            branch: MenuBranchId(100),
+        };
+        let mut session = QuickMenuPopupSession::default();
+        session.open_root(active, previous.branch);
+        session.push_branch(previous, MenuBranchId(101));
+        assert!(session.matches_event(previous));
+
+        session.open_root(active, MenuBranchId(102));
+        assert!(!session.matches_event(previous));
+        assert_eq!(session.branches().len(), 1);
+        assert!(session.is_open());
+    }
+
+    #[test]
     fn root_flips_left_when_right_side_is_too_narrow() {
         let placement = place_root_popup(
             PhysicalPoint::new(950, 120),

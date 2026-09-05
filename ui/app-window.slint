@@ -1655,7 +1655,7 @@ export component AppWindow inherits Window {
                                 root.rectangle-selection-pointer-active = false;
                                 root.end-rectangle-selection();
                             }
-                            if event.kind == PointerEventKind.down && event.button == PointerEventButton.right {
+                            if event.kind == PointerEventKind.up && event.button == PointerEventButton.right {
                                 root.context-menu-anchor-x = self.absolute-position.x + self.mouse-x - root.absolute-position.x;
                                 root.context-menu-anchor-y = self.absolute-position.y + self.mouse-y - root.absolute-position.y;
                                 root.keyboard-menu-anchor-x = self.absolute-position.x + 24px - root.absolute-position.x;

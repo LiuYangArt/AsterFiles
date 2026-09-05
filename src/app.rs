@@ -5850,6 +5850,10 @@ fn project_context_menu(
     menu: &SharedQuickMenu,
     background: bool,
 ) {
+    // A new pointer target must never inherit executable Shell command identities.
+    if ui.get_context_menu_open() {
+        ui.invoke_dismiss_context_menu();
+    }
     let (built_in_rows, built_in_submenus) = {
         let app = state.lock().expect("app state mutex is not poisoned");
         built_in_context_rows(&app, app.clipboard_has_files, background)
@@ -6280,7 +6284,6 @@ fn open_quick_menu_popup(window_id: WindowId, client_x: f32, client_y: f32) {
         popup.cloak_generation = Some(popup.next_generation);
         popup.session.open_root(session, root_branch);
         popup.root.window().request_redraw();
-        popup.root.window().with_winit_window(|window| window.focus_window());
         let first_show = !popup.shown_once;
         popup.shown_once = true;
         eprintln!(
@@ -7244,6 +7247,7 @@ fn wire_root_popup_callbacks(root: &QuickMenuWindow, window_id: WindowId) {
             slint::Timer::single_shot(Duration::from_millis(1), move || {
                 if quick_menu_event_is_current(window_id, event_identity)
                     && !quick_menu_popup_has_focus(window_id)
+                    && !window_belongs_to_quick_menu_owner(window_id)
                 {
                     dismiss_quick_menu_session(window_id, false);
                 }
@@ -7254,6 +7258,18 @@ fn wire_root_popup_callbacks(root: &QuickMenuWindow, window_id: WindowId) {
         }
         EventResult::Propagate
     });
+}
+
+fn window_belongs_to_quick_menu_owner(window_id: WindowId) -> bool {
+    WINDOW_RUNTIMES.with_borrow(|runtimes| {
+        let Some(runtime) = runtimes.get(&window_id) else {
+            return false;
+        };
+        platform::windows::quick_menu_window::foreground_belongs_to(
+            runtime.quick_menu_popup.owner_hwnd,
+            &[native_window_handle(&runtime.ui)],
+        )
+    })
 }
 
 fn finish_root_popup_presentation(
@@ -11059,12 +11075,14 @@ fn wire_mouse_navigation(
                 WindowCloseAction::Ignore => return EventResult::PreventDefault,
             }
         }
-        if matches!(event, WindowEvent::Focused(true)) {
-            let menu_open = weak.upgrade().is_some_and(|ui| ui.get_context_menu_open());
-            if menu_open {
+        if matches!(event, WindowEvent::Focused(true))
+            && let Some(ui) = weak.upgrade()
+        {
+            if ui.get_context_menu_open() {
+                // The owner receives activation before the underlying control's mouse event.
+                // Retire the popup here so the same click can reach that control.
                 dismiss_quick_menu_session(window_id, false);
-            }
-            if let Some(ui) = weak.upgrade() {
+            } else {
                 reload_quick_access(ui.as_weak(), shared_state.clone());
             }
         }
@@ -11143,11 +11161,6 @@ fn wire_mouse_navigation(
         let Some(ui) = weak.upgrade() else {
             return EventResult::Propagate;
         };
-        if matches!(event, WindowEvent::Focused(true)) && ui.get_context_menu_open() {
-            dismiss_quick_menu_session(window_id, false);
-            type_select.borrow_mut().clear();
-            return EventResult::Propagate;
-        }
         if matches!(
             event,
             WindowEvent::Focused(false) | WindowEvent::Occluded(true)
