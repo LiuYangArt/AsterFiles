@@ -1486,6 +1486,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the current machine's PowerShell 7 Explorer registration"]
     fn powershell_background_registry_matches_supported_shape() {
         let folder = Path::new(r"C:\Users\Public\Folder & 100%!");
         let mut commands = HashMap::new();
