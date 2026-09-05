@@ -1296,8 +1296,8 @@ fn remove_window_runtime(window_id: WindowId) {
             runtime.quick_menu_popup.session.invalidate_owner(window_id);
             close_quick_submenu_windows(&mut runtime.quick_menu_popup);
             let root_hwnd = component_window_handle(&runtime.quick_menu_popup.root);
-            let _ = platform::windows::quick_menu_window::set_cloaked(root_hwnd, false);
             let _ = runtime.quick_menu_popup.root.hide();
+            let _ = platform::windows::quick_menu_window::set_cloaked(root_hwnd, false);
             platform::windows::drag_drop::revoke(native_window_handle(&runtime.ui));
         }
     });
@@ -1323,8 +1323,8 @@ fn clear_window_runtimes() {
                 .invalidate_owner(*window_id);
             close_quick_submenu_windows(&mut runtime.quick_menu_popup);
             let root_hwnd = component_window_handle(&runtime.quick_menu_popup.root);
-            let _ = platform::windows::quick_menu_window::set_cloaked(root_hwnd, false);
             let _ = runtime.quick_menu_popup.root.hide();
+            let _ = platform::windows::quick_menu_window::set_cloaked(root_hwnd, false);
         }
         runtimes.clear();
     });
@@ -6268,11 +6268,12 @@ fn open_quick_menu_popup(window_id: WindowId, client_x: f32, client_y: f32) {
             && platform::windows::quick_menu_window::set_cloaked(root_hwnd, true).is_ok();
         if cloaked {
             popup.presentation = PopupPresentation::Cloaked;
+            platform::windows::quick_menu_window::show_without_activation(root_hwnd);
         }
         let shown = cloaked && popup.root.show().is_ok();
         if !shown {
-            let _ = platform::windows::quick_menu_window::set_cloaked(root_hwnd, false);
             let _ = popup.root.hide();
+            let _ = platform::windows::quick_menu_window::set_cloaked(root_hwnd, false);
             popup.presentation = PopupPresentation::Hidden;
             popup.cloak_generation = None;
             ui.set_context_menu_open(false);
@@ -6429,8 +6430,8 @@ fn reposition_quick_submenu_popups(window_id: WindowId) {
 fn hide_quick_submenu_slots_from(popup: &mut QuickMenuPopupRuntime, depth: usize) {
     for slot in popup.branches.iter_mut().skip(depth) {
         let hwnd = component_window_handle(&slot.window);
-        let _ = platform::windows::quick_menu_window::set_cloaked(hwnd, false);
         let _ = slot.window.hide();
+        let _ = platform::windows::quick_menu_window::set_cloaked(hwnd, false);
         slot.event = None;
         slot.rows.clear();
         slot.cloak_event = None;
@@ -6466,8 +6467,8 @@ fn close_quick_menu_popup(window_id: WindowId, restore_focus: bool) {
         let was_open = popup.session.close_all();
         close_quick_submenu_windows(popup);
         let root_hwnd = component_window_handle(&popup.root);
-        let _ = platform::windows::quick_menu_window::set_cloaked(root_hwnd, false);
         let _ = popup.root.hide();
+        let _ = platform::windows::quick_menu_window::set_cloaked(root_hwnd, false);
         popup.presentation = PopupPresentation::Hidden;
         popup.cloak_generation = None;
         popup.root_rect = None;
@@ -6658,6 +6659,7 @@ fn open_quick_submenu_popup_attempt(
                 return None;
             }
             slot.presentation = PopupPresentation::Cloaked;
+            platform::windows::quick_menu_window::show_without_activation(hwnd);
             if let Err(error) = slot.window.show() {
                 retry_reason = Some(format!("show:{error}"));
                 let _ = platform::windows::quick_menu_window::set_cloaked(hwnd, false);
@@ -6872,17 +6874,8 @@ fn close_submenu_slot_and_descendants(
         };
         let popup = &mut runtime.quick_menu_popup;
         if current_slot_matches(popup, depth, event) {
-            let foreground_owned = quick_menu_popup_owns_foreground(popup);
             hide_quick_submenu_slots_from(popup, depth);
             let _ = popup.session.close_branch_and_descendants(event);
-            let focus_target = depth
-                .checked_sub(1)
-                .and_then(|parent_depth| popup.branches.get(parent_depth))
-                .and_then(|slot| slot.event.map(|_| component_window_handle(&slot.window)))
-                .unwrap_or_else(|| component_window_handle(&popup.root));
-            if foreground_owned {
-                platform::windows::quick_menu_window::focus_window(focus_target);
-            }
         }
     });
 }
@@ -7335,6 +7328,60 @@ fn quick_menu_popup_has_focus(window_id: WindowId) -> bool {
             &handles,
         )
     })
+}
+
+fn forward_quick_menu_key(window_id: WindowId, event: &winit::event::KeyEvent) {
+    use slint::platform::{Key as SlintKey, WindowEvent};
+    use winit::keyboard::{Key, NamedKey};
+    let text: slint::SharedString = match &event.logical_key {
+        Key::Character(text) => text.as_str().into(),
+        Key::Named(key) => match key {
+            NamedKey::ArrowUp => SlintKey::UpArrow.into(),
+            NamedKey::ArrowDown => SlintKey::DownArrow.into(),
+            NamedKey::ArrowLeft => SlintKey::LeftArrow.into(),
+            NamedKey::ArrowRight => SlintKey::RightArrow.into(),
+            NamedKey::Enter => SlintKey::Return.into(),
+            NamedKey::Escape => SlintKey::Escape.into(),
+            NamedKey::Backspace => SlintKey::Backspace.into(),
+            NamedKey::Delete => SlintKey::Delete.into(),
+            NamedKey::Home => SlintKey::Home.into(),
+            NamedKey::End => SlintKey::End.into(),
+            NamedKey::Tab => SlintKey::Tab.into(),
+            NamedKey::Space => " ".into(),
+            NamedKey::Shift => SlintKey::Shift.into(),
+            NamedKey::Control => SlintKey::Control.into(),
+            NamedKey::Alt => SlintKey::Alt.into(),
+            _ => return,
+        },
+        _ => return,
+    };
+    let event = if event.state == winit::event::ElementState::Released {
+        WindowEvent::KeyReleased { text }
+    } else if event.repeat {
+        WindowEvent::KeyPressRepeated { text }
+    } else {
+        WindowEvent::KeyPressed { text }
+    };
+    // Keep native focus on the owner while Slint edits the popup's focused control.
+    let target = WINDOW_RUNTIMES.with_borrow(|runtimes| {
+        let popup = &runtimes.get(&window_id)?.quick_menu_popup;
+        popup.session.is_open().then(|| {
+            popup
+                .branches
+                .iter()
+                .rev()
+                .find(|slot| slot.event.is_some())
+                .map(|slot| (None, Some(slot.window.clone_strong())))
+                .unwrap_or_else(|| (Some(popup.root.clone_strong()), None))
+        })
+    });
+    if let Some((root, submenu)) = target {
+        if let Some(root) = root {
+            root.window().dispatch_event(event);
+        } else if let Some(submenu) = submenu {
+            submenu.window().dispatch_event(event);
+        }
+    }
 }
 
 fn dismiss_quick_menu_session(window_id: WindowId, restore_focus: bool) {
@@ -10980,7 +11027,11 @@ fn wire_callbacks(
 fn should_close_context_menu(event: &winit::event::WindowEvent) -> bool {
     matches!(
         event,
-        winit::event::WindowEvent::Focused(false)
+        winit::event::WindowEvent::MouseInput {
+            state: winit::event::ElementState::Pressed,
+            button: winit::event::MouseButton::Left,
+            ..
+        } | winit::event::WindowEvent::Focused(false)
             | winit::event::WindowEvent::Occluded(true)
             | winit::event::WindowEvent::Destroyed
     )
@@ -11144,6 +11195,12 @@ fn wire_mouse_navigation(
         if let WindowEvent::ModifiersChanged(changed) = event {
             modifiers.set(changed.state());
             return EventResult::Propagate;
+        }
+        if let WindowEvent::KeyboardInput { event, .. } = event
+            && weak.upgrade().is_some_and(|ui| ui.get_context_menu_open())
+        {
+            forward_quick_menu_key(window_id, event);
+            return EventResult::PreventDefault;
         }
         if let WindowEvent::Ime(ime) = event {
             match ime {

@@ -260,6 +260,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     return attributes
                         .with_owner_window(owner as _)
+                        .with_active(false)
                         .with_decorations(false)
                         .with_transparent(false)
                         .with_window_level(WindowLevel::Normal)

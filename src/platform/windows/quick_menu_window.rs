@@ -4,7 +4,7 @@ use std::{
 };
 
 use windows_sys::Win32::{
-    Foundation::{HWND, POINT, RECT},
+    Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::{
         Dwm::{DWMWA_CLOAK, DwmFlush, DwmSetWindowAttribute},
         Gdi::{
@@ -14,15 +14,82 @@ use windows_sys::Win32::{
     },
     UI::WindowsAndMessaging::{
         GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GWLP_HWNDPARENT, GetForegroundWindow, GetWindow,
-        IsWindow, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-        SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WS_CAPTION, WS_EX_APPWINDOW,
-        WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+        IsWindow, MA_NOACTIVATE, STYLESTRUCT, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+        ShowWindow, WINDOWPOS, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_STYLECHANGING,
+        WM_WINDOWPOSCHANGING, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
     },
 };
 
 use crate::quick_menu_popup::{PhysicalPoint, PhysicalRect};
 
 static PENDING_WINDOW_OWNER: AtomicIsize = AtomicIsize::new(0);
+const POPUP_SUBCLASS_ID: usize = 0x4153_504f;
+
+unsafe extern "system" fn popup_window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    id: usize,
+    _: usize,
+) -> LRESULT {
+    use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    match message {
+        WM_MOUSEACTIVATE => return MA_NOACTIVATE as LRESULT,
+        WM_STYLECHANGING if lparam != 0 => {
+            // Winit rewrites styles on every visibility transition; keep popup invariants.
+            let style = unsafe { &mut *(lparam as *mut STYLESTRUCT) };
+            style.styleNew = popup_style(wparam as i32, style.styleNew);
+        }
+        WM_WINDOWPOSCHANGING if lparam != 0 => {
+            // Winit can use SW_SHOW again when a pooled popup changes visibility or style.
+            unsafe {
+                (*(lparam as *mut WINDOWPOS)).flags |= SWP_NOACTIVATE;
+            }
+        }
+        WM_NCDESTROY => unsafe {
+            RemoveWindowSubclass(hwnd, Some(popup_window_proc), id);
+        },
+        _ => {}
+    }
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+}
+
+fn popup_style(index: i32, style: u32) -> u32 {
+    match index {
+        GWL_STYLE => {
+            (style & !(WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)) | WS_POPUP
+        }
+        GWL_EXSTYLE => (style & !WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        _ => style,
+    }
+}
+
+pub fn show_without_activation(hwnd: isize) {
+    // Make the cloaked HWND visible before Slint calls SW_SHOW, which would activate a hidden HWND.
+    unsafe {
+        ShowWindow(hwnd as HWND, SW_SHOWNOACTIVATE);
+        SetWindowPos(
+            hwnd as HWND,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+    super::window_trace::log_diagnostic(
+        "quick_menu_native_show",
+        &format!(
+            "popup={} foreground={}",
+            hwnd,
+            unsafe { GetForegroundWindow() } as isize,
+        ),
+    );
+}
 
 pub fn prepare_window(owner: isize) {
     PENDING_WINDOW_OWNER.store(owner, Ordering::Release);
@@ -52,17 +119,24 @@ pub fn attach_owner(popup: isize, owner: isize) -> io::Result<()> {
         ));
     }
     unsafe {
+        if windows_sys::Win32::UI::Shell::SetWindowSubclass(
+            popup,
+            Some(popup_window_proc),
+            POPUP_SUBCLASS_ID,
+            0,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
         if GetWindow(popup, GW_OWNER) != owner as HWND {
             SetWindowLongPtrW(popup, GWLP_HWNDPARENT, owner);
         }
         let window_style =
             windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(popup, GWL_STYLE);
-        let frame_bits = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
-        let desired_window_style = (window_style & !(frame_bits as isize)) | WS_POPUP as isize;
+        let desired_window_style = popup_style(GWL_STYLE, window_style as u32) as isize;
         let extended_style =
             windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(popup, GWL_EXSTYLE);
-        let desired_extended_style =
-            (extended_style & !(WS_EX_APPWINDOW as isize)) | WS_EX_TOOLWINDOW as isize;
+        let desired_extended_style = popup_style(GWL_EXSTYLE, extended_style as u32) as isize;
         let frame_changed =
             window_style != desired_window_style || extended_style != desired_extended_style;
         if window_style != desired_window_style {
@@ -199,7 +273,46 @@ pub fn foreground_belongs_to(owner: isize, popups: &[isize]) -> bool {
 }
 
 pub fn focus_window(hwnd: isize) {
-    if hwnd != 0 && unsafe { IsWindow(hwnd as HWND) } != 0 {
+    if hwnd != 0
+        && unsafe { IsWindow(hwnd as HWND) } != 0
+        && unsafe { GetForegroundWindow() } != hwnd as HWND
+        && unsafe { GetWindow(GetForegroundWindow(), GW_OWNER) } == hwnd as HWND
+    {
         unsafe { SetForegroundWindow(hwnd as HWND) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quick_menu_popup_preserves_styles_across_backend_rewrites() {
+        let frame = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
+        let style = popup_style(GWL_STYLE, frame | WS_POPUP);
+        assert_eq!(style & frame, 0);
+        assert_ne!(style & WS_POPUP, 0);
+        let extended = popup_style(GWL_EXSTYLE, WS_EX_APPWINDOW);
+        assert_eq!(extended & WS_EX_APPWINDOW, 0);
+        assert_eq!(
+            extended & (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW),
+            WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+        );
+        assert_eq!(popup_style(GWL_EXSTYLE, extended), extended);
+    }
+
+    #[test]
+    fn quick_menu_popup_mouse_activation_keeps_click_delivery() {
+        let result = unsafe {
+            popup_window_proc(
+                std::ptr::null_mut(),
+                WM_MOUSEACTIVATE,
+                0,
+                0,
+                POPUP_SUBCLASS_ID,
+                0,
+            )
+        };
+        assert_eq!(result, MA_NOACTIVATE as LRESULT);
     }
 }
