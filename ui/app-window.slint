@@ -795,14 +795,14 @@ export component AppWindow inherits Window {
         return mode == 2 || mode == 3 || mode == 4 || mode == 5;
     }
     public pure function view-row-height(mode: int) -> length {
-        return mode == 1 ? 34px
-            : mode == 7 ? 76px
-            : mode == 3 ? 86px
-            : mode == 4 ? 196px
-            : mode == 5 ? 220px
-            : mode == 6 ? 86px
-            : mode == 2 ? 148px
-            : 40px;
+        return mode == 1 ? 30px
+            : mode == 7 ? 68px
+            : mode == 3 ? 78px
+            : mode == 4 ? 180px
+            : mode == 5 ? 204px
+            : mode == 6 ? 78px
+            : mode == 2 ? 132px
+            : 32px;
     }
     public pure function view-card-width(mode: int) -> length {
         return mode == 3 ? 88px
@@ -943,7 +943,6 @@ export component AppWindow inherits Window {
     in property <string> text-search-recursive: "搜索当前文件夹及子文件夹";
     in property <string> text-search-current: "仅搜索当前文件夹";
     in property <string> text-search-global-disabled: "全局搜索不支持切换范围";
-    in property <string> text-go: "前往";
     in property <string> text-back: "后退";
     in property <string> text-forward: "前进";
     in property <string> text-up: "向上";
@@ -1438,7 +1437,6 @@ export component AppWindow inherits Window {
                     address-editor := AddressEditor { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: parent.height - 4px; text <=> root.address-input; address-label: root.search-mode ? root.text-parent-path : root.text-address; cancel-label: root.text-cancel-edit; depth-enabled: root.search-mode && root.search-depth-enabled; recursive: root.search-recursive; depth-label: !root.search-depth-enabled ? root.text-search-global-disabled : (root.search-recursive ? root.text-search-recursive : root.text-search-current); changed(value) => { root.address-input-changed(value); } accepted(value) => { root.navigate-path(value); } cancelled => { root.cancel-address-edit(); } toggle-depth => { root.toggle-search-depth(); } }
 
                 }
-                IconButton { icon-source: IconMap.action-forward; tip: root.text-go; button-label: root.text-go; clicked => { root.address-editing ? root.navigate-path(root.address-input) : root.begin-search(); } }
             }
         }
 
@@ -1471,7 +1469,7 @@ export component AppWindow inherits Window {
 
                     for location in root.sidebar-items: Rectangle {
                         visible: location.group-kind == 0 && root.quick-access-expanded;
-                        height: self.visible ? 34px : 0px; border-radius: 5px; background: side-touch.pressed ? VisualStyle.cdde3ed : side-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
+                        height: self.visible ? 30px : 0px; border-radius: 5px; background: side-touch.pressed ? VisualStyle.cdde3ed : side-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
                         HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : (location.icon-kind == 0 ? IconMap.location-home : location.icon-kind == 1 ? IconMap.location-desktop : location.icon-kind == 2 ? IconMap.location-downloads : location.icon-kind == 3 ? IconMap.location-documents : location.icon-kind == 4 ? IconMap.location-pictures : location.icon-kind == 5 ? IconMap.location-music : IconMap.location-videos); } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         side-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-sidebar(location.index); } pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.source-kind == 3 { root.show-quick-access-menu(location.stable-id, (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px, (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px); } } }
                         accessible-role: button; accessible-label: location.label;
@@ -1479,7 +1477,7 @@ export component AppWindow inherits Window {
                     SidebarGroupHeader { label: root.text-drives; expanded: root.drives-expanded; toggled => { root.drives-expanded = !root.drives-expanded; } }
                     for location in root.sidebar-items: Rectangle {
                         visible: location.group-kind == 1 && root.drives-expanded;
-                        height: self.visible ? 34px : 0px; border-radius: 5px; background: drive-touch.pressed ? VisualStyle.cdde3ed : drive-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
+                        height: self.visible ? 30px : 0px; border-radius: 5px; background: drive-touch.pressed ? VisualStyle.cdde3ed : drive-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
                         HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.location-drive; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         drive-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-sidebar(location.index); } }
                         accessible-role: button; accessible-label: location.label;
@@ -1487,7 +1485,7 @@ export component AppWindow inherits Window {
                     SidebarGroupHeader { label: root.text-network-locations; expanded: root.network-locations-expanded; toggled => { root.network-locations-expanded = !root.network-locations-expanded; } }
                     for location in root.sidebar-items: Rectangle {
                         visible: location.group-kind == 2 && root.network-locations-expanded;
-                        height: self.visible ? 34px : 0px; border-radius: 5px; background: network-location-touch.pressed ? VisualStyle.cdde3ed : network-location-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
+                        height: self.visible ? 30px : 0px; border-radius: 5px; background: network-location-touch.pressed ? VisualStyle.cdde3ed : network-location-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
                         HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.location-drive; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         network-location-touch := TouchArea {
                             mouse-cursor: pointer;
@@ -1511,7 +1509,7 @@ export component AppWindow inherits Window {
                     }
                     for location in root.sidebar-items: Rectangle {
                         visible: location.group-kind == 3 && root.network-expanded;
-                        height: self.visible ? 34px : 0px; border-radius: 5px; background: network-touch.pressed ? VisualStyle.cdde3ed : network-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
+                        height: self.visible ? 30px : 0px; border-radius: 5px; background: network-touch.pressed ? VisualStyle.cdde3ed : network-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
                         HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.location-drive; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         network-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-sidebar(location.index); } }
                         accessible-role: button; accessible-label: location.label;
@@ -1686,7 +1684,7 @@ list := ListView {
                         for entry in root.files: Rectangle {
                             width: root.view-mode == 0 ? max(list.width, root.file-columns-width + 16px) : list.width;
                             x: 0px;
-                            height: entry.group-header ? 32px : root.view-row-height(root.view-mode);
+                            height: entry.group-header ? 28px : root.view-row-height(root.view-mode);
                             background: VisualStyle.cffffff;
                             opacity: entry.group-header ? 1 : (!entry.loaded ? 0 : (entry.cut ? 0.52 : 1));
                             if entry.group-header: Rectangle {
@@ -1948,7 +1946,7 @@ accessible-label: entry.name;
                         changed visible-height => { self.sync-file-geometry(); }
                         changed viewport-y => { if root.is-grid-view-mode(root.view-mode) { root.file-viewport-y = self.viewport-y; if !root.search-results-mode { root.request-folder-size-range(self.viewport-y / 1px, self.visible-height / 1px); } } }
                         for row in root.grid-rows: HorizontalLayout {
-                            height: row.group-header ? 32px : root.view-row-height(root.view-mode);
+                            height: row.group-header ? 28px : root.view-row-height(root.view-mode);
                             padding-left: 16px;
                             padding-right: 16px;
                             spacing: 8px;
@@ -2444,3 +2442,4 @@ if root.tabs-menu-open: TouchArea {
 
     }
 }
+

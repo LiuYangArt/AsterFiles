@@ -5525,7 +5525,7 @@ fn project_context_submenu(ui: &AppWindow, menu: &SharedQuickMenu) {
 
 fn context_menu_content_height(rows: &[ContextCommandRow]) -> f32 {
     rows.iter()
-        .map(|row| if row.separator { 9.0 } else { 28.0 })
+        .map(|row| if row.separator { 7.0 } else { 24.0 })
         .sum()
 }
 
@@ -6017,14 +6017,6 @@ fn built_in_context_rows(
             false,
             false,
         ));
-        rows.push(quick_menu_row(
-            7,
-            0,
-            zh("永久删除", "Delete permanently"),
-            selected > 0,
-            false,
-            false,
-        ));
     }
     (rows, submenus)
 }
@@ -6175,9 +6167,9 @@ fn create_quick_menu_popup(
 
 fn root_popup_height_for_content(content_height: f32, loading: bool, scale: f32) -> i32 {
     let loading_height = if loading { 20.0 } else { 0.0 };
-    ((42.0 + content_height + loading_height) * scale)
+    ((40.0 + content_height + loading_height) * scale)
         .ceil()
-        .max(42.0) as i32
+        .max(40.0) as i32
 }
 
 fn root_popup_height(ui: &AppWindow, scale: f32) -> i32 {
@@ -6209,7 +6201,7 @@ fn context_row_anchor(rows: &[ContextCommandRow], index: i32, header_height: f32
         + rows
             .iter()
             .take(index as usize)
-            .map(|row| if row.separator { 9.0 } else { 28.0 })
+            .map(|row| if row.separator { 7.0 } else { 24.0 })
             .sum::<f32>()
 }
 
@@ -19261,7 +19253,6 @@ fn search_error_page_text(state: SearchState, texts: Texts) -> (&'static str, &'
 }
 fn apply_ui_texts(ui: &AppWindow, language: Language) {
     let (
-        go,
         back,
         forward,
         up,
@@ -19328,7 +19319,6 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
         drop_cancel,
     ) = match language {
         Language::Chinese => (
-            "前往",
             "后退",
             "前进",
             "向上",
@@ -19395,7 +19385,6 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "取消",
         ),
         Language::English => (
-            "Go",
             "Back",
             "Forward",
             "Up",
@@ -19462,7 +19451,6 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "Cancel",
         ),
     };
-    ui.set_text_go(go.into());
     ui.set_text_back(back.into());
     ui.set_text_forward(forward.into());
     ui.set_text_up(up.into());

@@ -33,7 +33,7 @@ component PopupCommandList inherits Rectangle {
                 property <bool> command-hovered: !command-loading && root.hover-index == index;
                 property <bool> command-active: !command-loading && root.hover-index < 0 && root.active-index == index;
                 property <bool> touch-hovered: command-touch.has-hover;
-                height: command.separator ? 9px : 28px;
+                height: command.separator ? 7px : 24px;
                 border-radius: 4px;
                 background: command.enabled && !command-loading && !command.separator && (command-active || command-hovered) ? root.hover-background : transparent;
                 Rectangle { visible: command.separator; x: 4px; width: parent.width - 8px; height: 1px; y: 4px; background: root.divider; }
@@ -83,7 +83,7 @@ export component QuickMenuWindow inherits Window {
     in property <bool> loading: false;
     in-out property <string> search: "";
     in property <int> active-index: -1;
-    in property <length> window-height: max(42px, 42px + root.content-height + (root.loading ? 20px : 0px));
+    in property <length> window-height: max(40px, 40px + root.content-height + (root.loading ? 20px : 0px));
     in property <bool> dark-theme: false;
     in property <string> search-text: "";
     in property <string> loading-text: "";
@@ -170,3 +170,4 @@ export component QuickSubmenuWindow inherits Window {
     }
     init => { menu-focus.focus(); }
 }
+
