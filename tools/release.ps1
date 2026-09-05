@@ -56,13 +56,7 @@ if (Test-Path -LiteralPath $archive) {
 Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $archive -CompressionLevel Optimal
 Remove-Item -LiteralPath $staging -Recurse -Force
 
-$hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-$checksum = "$archive.sha256"
-Set-Content -LiteralPath $checksum -Value "$hash  $([System.IO.Path]::GetFileName($archive))" -Encoding ascii
-
 [PSCustomObject]@{
     version = $version
     archive = $archive
-    checksum = $checksum
-    sha256 = $hash
 } | ConvertTo-Json
