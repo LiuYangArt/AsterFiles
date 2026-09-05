@@ -20476,7 +20476,7 @@ mod tests {
             context_test_row(2, "PowerShell 7", "powershell", false),
         ];
 
-        assert_eq!(context_menu_content_height(&rows), 65.0);
+        assert_eq!(context_menu_content_height(&rows), 55.0);
     }
 
     #[test]
