@@ -1,7 +1,9 @@
 use std::{
+    collections::HashMap,
     io,
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
+    sync::Arc,
     thread,
 };
 
@@ -22,6 +24,7 @@ use windows::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileOperationItemResult {
+    pub index: usize,
     pub path: PathBuf,
     pub result: Result<(), String>,
 }
@@ -32,11 +35,15 @@ pub struct RecycleResult {
     pub aborted: bool,
 }
 
-pub fn recycle(paths: &[PathBuf]) -> RecycleResult {
+pub fn recycle(
+    paths: &[PathBuf],
+    is_cancelled: impl Fn() -> bool + Send + Sync + 'static,
+) -> RecycleResult {
     let owned_paths = paths.to_vec();
+    let is_cancelled: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(is_cancelled);
     match thread::Builder::new()
         .name("asterfiles-recycle".into())
-        .spawn(move || recycle_on_com_thread(owned_paths))
+        .spawn(move || recycle_on_com_thread(owned_paths, is_cancelled))
     {
         Ok(worker) => worker
             .join()
@@ -45,59 +52,87 @@ pub fn recycle(paths: &[PathBuf]) -> RecycleResult {
     }
 }
 
-fn recycle_on_com_thread(paths: Vec<PathBuf>) -> RecycleResult {
+fn recycle_on_com_thread(
+    paths: Vec<PathBuf>,
+    is_cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> RecycleResult {
     let com = match ComApartment::initialize() {
         Ok(com) => com,
         Err(error) => return failed_result(&paths, &error.to_string()),
     };
 
-    let mut items = Vec::with_capacity(paths.len());
-    let mut aborted = false;
-    for path in paths {
-        let result = recycle_one(&path);
-        aborted |= result
-            .as_ref()
-            .is_err_and(|error| error.kind() == io::ErrorKind::Interrupted);
-        items.push(FileOperationItemResult {
-            path,
-            result: result.map_err(|error| error.to_string()),
-        });
-    }
+    let result = recycle_batch(&paths, is_cancelled);
     drop(com);
-    RecycleResult { items, aborted }
+    result
 }
 
-fn recycle_one(path: &Path) -> io::Result<()> {
-    let wide_path = shell_path(path)?;
-    let item: IShellItem = unsafe { SHCreateItemFromParsingName(PCWSTR(wide_path.as_ptr()), None) }
-        .map_err(windows_error)?;
+fn recycle_batch(
+    paths: &[PathBuf],
+    is_cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> RecycleResult {
     let operation: IFileOperation =
-        unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_LOCAL_SERVER) }
-            .map_err(windows_error)?;
+        match unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_LOCAL_SERVER) } {
+            Ok(operation) => operation,
+            Err(error) => return failed_result(paths, &windows_error(error).to_string()),
+        };
+    let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = IFileOperationProgressSink::from(DeleteResultSink {
+        results: results.clone(),
+        is_cancelled: is_cancelled.clone(),
+    });
+    let mut queued = Vec::with_capacity(paths.len());
+    let mut initial = HashMap::new();
 
-    unsafe {
-        operation
-            .SetOperationFlags(recycle_flags())
-            .map_err(windows_error)?;
-        let sink_state = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let sink = IFileOperationProgressSink::from(DeleteResultSink {
-            result: sink_state.clone(),
-        });
-        operation.DeleteItem(&item, &sink).map_err(windows_error)?;
-        operation.PerformOperations().map_err(windows_error)?;
-        if operation
-            .GetAnyOperationsAborted()
-            .map_err(windows_error)?
-            .as_bool()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "recycle operation aborted",
-            ));
-        }
-        delete_result(&sink_state)?;
+    if let Err(error) = unsafe { operation.SetOperationFlags(recycle_flags()) } {
+        return failed_result(paths, &windows_error(error).to_string());
     }
-    Ok(())
+    for (index, path) in paths.iter().enumerate() {
+        if is_cancelled() {
+            break;
+        }
+        let item: io::Result<IShellItem> = shell_path(path).and_then(|wide_path| unsafe {
+            SHCreateItemFromParsingName(PCWSTR(wide_path.as_ptr()), None).map_err(windows_error)
+        });
+        match item {
+            Ok(item) => {
+                match unsafe { operation.DeleteItem(&item, &sink) }.map_err(windows_error) {
+                    Ok(()) => queued.push(path.clone()),
+                    Err(error) => {
+                        initial.insert(index, Err(error.to_string()));
+                    }
+                }
+            }
+            Err(error) => {
+                initial.insert(index, Err(error.to_string()));
+            }
+        }
+    }
+
+    let perform_error = if queued.is_empty() || is_cancelled() {
+        None
+    } else {
+        unsafe { operation.PerformOperations() }
+            .map_err(windows_error)
+            .err()
+            .map(|error| error.to_string())
+    };
+    let aborted = unsafe { operation.GetAnyOperationsAborted() }
+        .map(|value| value.as_bool())
+        .unwrap_or(false);
+    let reported = results.lock().expect("delete result sink poisoned").clone();
+    let cancelled = is_cancelled();
+    let items = merge_recycle_results(
+        paths,
+        initial,
+        &queued,
+        reported,
+        perform_error.as_deref(),
+        aborted || cancelled,
+    );
+    RecycleResult {
+        items,
+        aborted: aborted || cancelled,
+    }
 }
 
 fn recycle_flags() -> FILEOPERATION_FLAGS {
@@ -134,16 +169,49 @@ fn windows_error(error: WindowsError) -> io::Error {
 
 #[implement(IFileOperationProgressSink)]
 struct DeleteResultSink {
-    result: std::sync::Arc<std::sync::Mutex<Option<HRESULT>>>,
+    results: std::sync::Arc<std::sync::Mutex<Vec<HRESULT>>>,
+    is_cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
-fn delete_result(result_state: &std::sync::Mutex<Option<HRESULT>>) -> io::Result<()> {
-    match *result_state.lock().expect("delete result sink poisoned") {
-        Some(result) => result
-            .ok()
-            .map_err(|_| windows_error(WindowsError::from(result))),
-        None => Err(io::Error::other("shell did not report a recycle result")),
-    }
+fn merge_recycle_results(
+    paths: &[PathBuf],
+    mut initial: HashMap<usize, Result<(), String>>,
+    queued: &[PathBuf],
+    reported: Vec<HRESULT>,
+    perform_error: Option<&str>,
+    aborted: bool,
+) -> Vec<FileOperationItemResult> {
+    let mut reported = queued.iter().zip(reported);
+    paths
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, path)| {
+            let result = initial.remove(&index).unwrap_or_else(|| {
+                reported.next().map_or_else(
+                    || {
+                        Err(perform_error.map(str::to_owned).unwrap_or_else(|| {
+                            if aborted {
+                                "recycle operation aborted".to_owned()
+                            } else {
+                                "shell did not report a recycle result".to_owned()
+                            }
+                        }))
+                    },
+                    |(_, result)| {
+                        result
+                            .ok()
+                            .map_err(|_| windows_error(WindowsError::from(result)).to_string())
+                    },
+                )
+            });
+            FileOperationItemResult {
+                index,
+                path,
+                result,
+            }
+        })
+        .collect()
 }
 
 #[allow(non_snake_case)]
@@ -217,7 +285,11 @@ impl IFileOperationProgressSink_Impl for DeleteResultSink_Impl {
         _flags: u32,
         _item: windows::core::Ref<IShellItem>,
     ) -> windows::core::Result<()> {
-        Ok(())
+        if (self.is_cancelled)() {
+            Err(WindowsError::from_hresult(HRESULT(0x80004004_u32 as i32)))
+        } else {
+            Ok(())
+        }
     }
     fn PostDeleteItem(
         &self,
@@ -226,7 +298,10 @@ impl IFileOperationProgressSink_Impl for DeleteResultSink_Impl {
         result: HRESULT,
         _created: windows::core::Ref<IShellItem>,
     ) -> windows::core::Result<()> {
-        *self.result.lock().expect("delete result sink poisoned") = Some(result);
+        self.results
+            .lock()
+            .expect("delete result sink poisoned")
+            .push(result);
         Ok(())
     }
     fn PreNewItem(
@@ -267,7 +342,9 @@ fn failed_result(paths: &[PathBuf], message: &str) -> RecycleResult {
         items: paths
             .iter()
             .cloned()
-            .map(|path| FileOperationItemResult {
+            .enumerate()
+            .map(|(index, path)| FileOperationItemResult {
+                index,
                 path,
                 result: Err(message.to_owned()),
             })
@@ -299,7 +376,7 @@ mod tests {
 
     #[test]
     fn empty_path_is_rejected_without_shell_ui() {
-        let result = recycle(&[PathBuf::new()]);
+        let result = recycle(&[PathBuf::new()], || false);
         assert_eq!(result.items.len(), 1);
         assert!(result.items[0].result.is_err());
         assert!(!result.aborted);
@@ -320,9 +397,29 @@ mod tests {
     }
 
     #[test]
-    fn shell_item_failure_is_reported_as_item_failure() {
-        let state = std::sync::Mutex::new(Some(HRESULT(0x80004005_u32 as i32)));
-        assert!(delete_result(&state).is_err());
+    fn batch_results_preserve_input_order_and_item_failures() {
+        let paths = vec![PathBuf::from("first"), PathBuf::from("second")];
+        let reported = vec![HRESULT(0), HRESULT(0x80004005_u32 as i32)];
+        let results = merge_recycle_results(&paths, HashMap::new(), &paths, reported, None, false);
+        assert_eq!(
+            results.iter().map(|item| &item.path).collect::<Vec<_>>(),
+            [&paths[0], &paths[1]]
+        );
+        assert!(results[0].result.is_ok());
+        assert!(results[1].result.is_err());
+    }
+    #[test]
+    fn batch_results_keep_preparation_errors() {
+        let path = PathBuf::from("bad");
+        let results = merge_recycle_results(
+            std::slice::from_ref(&path),
+            HashMap::from([(0, Err("invalid path".to_owned()))]),
+            &[],
+            Vec::new(),
+            None,
+            false,
+        );
+        assert_eq!(results[0].result, Err("invalid path".to_owned()));
     }
     #[test]
     fn embedded_nul_is_rejected_before_shell_access() {

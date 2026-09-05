@@ -1361,11 +1361,42 @@ fn open_task_center_on_live_window(state: &SharedSessions) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct WindowId(pub(crate) u32);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingFocusAction {
+    Select,
+    Rename { window_id: WindowId },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingFocus {
     directory: PathBuf,
     request_id: Option<RequestId>,
     paths: Vec<PathBuf>,
+    action: PendingFocusAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingRenameUi {
+    tab_id: TabId,
+    request_id: RequestId,
+    entry_id: EntryId,
+    input: String,
+    extension: Option<std::ffi::OsString>,
+}
+
+#[derive(Debug, Clone)]
+struct RecentOperationChanges {
+    paths: HashSet<PathBuf>,
+    recorded_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PendingShellCreate {
+    window_id: WindowId,
+    tab_id: TabId,
+    directory: PathBuf,
+    baseline: HashSet<PathBuf>,
+    started_at: Instant,
 }
 
 #[derive(Debug)]
@@ -1610,6 +1641,11 @@ struct AppState {
     operation_errors: Vec<String>,
     rename_targets: HashMap<WindowId, (TabId, EntryId, Option<std::ffi::OsString>)>,
     focus_after_refresh: HashMap<TabId, PendingFocus>,
+    pending_rename_ui: HashMap<WindowId, PendingRenameUi>,
+    active_operation_directories: HashMap<PathBuf, usize>,
+    deferred_watch_directories: HashSet<PathBuf>,
+    recent_operation_changes: HashMap<PathBuf, RecentOperationChanges>,
+    pending_shell_creates: HashMap<WindowId, PendingShellCreate>,
     pending_permanent_delete: Option<(TabId, Vec<OperationItem>)>,
     exit_after_cancel: bool,
     clipboard_has_files: bool,
@@ -1831,6 +1867,11 @@ impl AppState {
             operation_errors: Vec::new(),
             rename_targets: HashMap::new(),
             focus_after_refresh: HashMap::new(),
+            pending_rename_ui: HashMap::new(),
+            active_operation_directories: HashMap::new(),
+            deferred_watch_directories: HashSet::new(),
+            recent_operation_changes: HashMap::new(),
+            pending_shell_creates: HashMap::new(),
             pending_permanent_delete: None,
             exit_after_cancel: false,
             clipboard_has_files: false,
@@ -2082,7 +2123,9 @@ impl AppState {
             .retain(|(tab_id, _, _), _| !window.tabs.contains_key(tab_id));
         self.focus_after_refresh
             .retain(|tab_id, _| !window.tabs.contains_key(tab_id));
+        self.pending_rename_ui.remove(&id);
         self.rename_targets.remove(&id);
+        self.pending_shell_creates.remove(&id);
         if self.windows.is_empty() {
             return Some(WindowCloseDecision::ExitApplication);
         }
@@ -2465,6 +2508,13 @@ impl AppState {
                 window.closed_tabs.truncate(10);
             }
         }
+        self.focus_after_refresh.remove(&closing);
+        self.pending_shell_creates
+            .retain(|_, pending| pending.tab_id != closing);
+        self.pending_rename_ui
+            .retain(|_, pending| pending.tab_id != closing);
+        self.rename_targets
+            .retain(|_, (tab_id, _, _)| *tab_id != closing);
         self.active_window_state_mut().tab_order.remove(index);
         if closing_was_active {
             let window = self.active_window_state_mut();
@@ -4542,13 +4592,16 @@ fn enqueue_operation(
             .flatten()
             .and_then(|id| {
                 let _ = app.operations.mark_running(id);
-                app.operations.task(id).map(|task| FileOperationRequest {
+                let task = app.operations.task(id)?;
+                let request = FileOperationRequest {
                     id,
                     kind: task.kind,
                     resource: task.resource,
                     items: task.items.clone(),
                     cancellation: task.cancellation.clone(),
-                })
+                };
+                register_operation_directories(&mut app, request.kind, &request.items);
+                Some(request)
             })
     };
     if let Some(request) = request {
@@ -4569,6 +4622,128 @@ fn operation_resource(items: &[OperationItem]) -> OperationResource {
         OperationResource::Network
     } else {
         OperationResource::Local
+    }
+}
+
+fn operation_directories(kind: FileOperationKind, items: &[OperationItem]) -> HashSet<PathBuf> {
+    items
+        .iter()
+        .flat_map(|item| match kind {
+            FileOperationKind::CreateFolder => item
+                .destination
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            FileOperationKind::Rename => [
+                item.source.as_deref().and_then(Path::parent),
+                item.destination.as_deref().and_then(Path::parent),
+            ]
+            .into_iter()
+            .flatten()
+            .map(Path::to_path_buf)
+            .collect(),
+            FileOperationKind::Copy | FileOperationKind::Move => item
+                .destination
+                .as_ref()
+                .into_iter()
+                .flat_map(|destination| {
+                    [
+                        Some(destination.clone()),
+                        destination.parent().map(Path::to_path_buf),
+                    ]
+                })
+                .flatten()
+                .chain(
+                    (kind == FileOperationKind::Move)
+                        .then(|| item.source.as_deref().and_then(Path::parent))
+                        .flatten()
+                        .map(Path::to_path_buf),
+                )
+                .collect(),
+            FileOperationKind::RecycleDelete
+            | FileOperationKind::PermanentDelete
+            | FileOperationKind::FastRemove => item
+                .source
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+                .into_iter()
+                .collect(),
+        })
+        .collect()
+}
+
+fn running_operation_directories(
+    kind: FileOperationKind,
+    items: &[OperationItem],
+) -> HashSet<PathBuf> {
+    operation_directories(kind, items)
+        .into_iter()
+        .filter(|path| !crate::network::is_unc_path(path))
+        .collect()
+}
+
+fn register_operation_directories(
+    app: &mut AppState,
+    kind: FileOperationKind,
+    items: &[OperationItem],
+) {
+    for directory in running_operation_directories(kind, items) {
+        *app.active_operation_directories
+            .entry(directory)
+            .or_insert(0) += 1;
+    }
+}
+
+fn release_operation_directories(
+    app: &mut AppState,
+    kind: FileOperationKind,
+    items: &[OperationItem],
+) -> HashSet<PathBuf> {
+    let directories = running_operation_directories(kind, items);
+    for directory in &directories {
+        let remove = app
+            .active_operation_directories
+            .get_mut(directory)
+            .is_some_and(|count| {
+                *count = count.saturating_sub(1);
+                *count == 0
+            });
+        if remove {
+            app.active_operation_directories.remove(directory);
+        }
+    }
+    directories
+}
+
+fn mark_recent_operation_changes(
+    app: &mut AppState,
+    directories: &HashSet<PathBuf>,
+    items: &[OperationItem],
+) {
+    let now = Instant::now();
+    for directory in directories {
+        let paths = items
+            .iter()
+            .filter(|item| item.state == ItemState::Succeeded)
+            .flat_map(|item| [item.source.as_ref(), item.destination.as_ref()])
+            .flatten()
+            .filter(|path| {
+                path.parent() == Some(directory.as_path())
+                    || path.as_path() == directory
+                    || path.starts_with(directory)
+            })
+            .cloned()
+            .collect();
+        app.recent_operation_changes.insert(
+            directory.clone(),
+            RecentOperationChanges {
+                paths,
+                recorded_at: now,
+            },
+        );
     }
 }
 
@@ -5015,6 +5190,7 @@ struct QuickMenuState {
     submenu_rows: Vec<ContextCommandRow>,
     submenu_history: Vec<(u64, Vec<ContextCommandRow>)>,
     submenu_tokens: HashMap<i32, u64>,
+    create_submenu_tokens: HashSet<u64>,
     preloaded_submenu_rows: HashMap<u64, Vec<ContextCommandRow>>,
     loaded_submenu_rows: HashMap<u64, Vec<ContextCommandRow>>,
     built_in_submenu_rows: HashMap<i32, Vec<ContextCommandRow>>,
@@ -5309,6 +5485,14 @@ fn project_shell_menu_items(
             let node_id = if let ClassicMenuItemKind::Submenu { token, items } = &item.kind {
                 menu.next_submenu_node = menu.next_submenu_node.saturating_add(1).max(1);
                 menu.submenu_tokens.insert(menu.next_submenu_node, *token);
+                if item
+                    .verb
+                    .as_deref()
+                    .is_some_and(|verb| verb.eq_ignore_ascii_case("new"))
+                    || matches!(item.title.trim(), "New" | "新建")
+                {
+                    menu.create_submenu_tokens.insert(*token);
+                }
                 if !items.is_empty() {
                     let rows = items
                         .iter()
@@ -5876,6 +6060,7 @@ fn project_context_menu(
             menu.submenu_history.clear();
             if !session_ready {
                 menu.submenu_tokens.clear();
+                menu.create_submenu_tokens.clear();
                 menu.preloaded_submenu_rows.clear();
                 menu.loaded_submenu_rows.clear();
                 menu.next_submenu_node = 0;
@@ -8776,29 +8961,34 @@ fn wire_callbacks(
     let sender_for_activate_entry = sender.clone();
     let network_sender_for_activate_entry = network_sender.clone();
     let state_for_activate_entry = state.clone();
-    let last_click = std::rc::Rc::new(Cell::new(None::<(TabId, RequestId, EntryId, Instant)>));
+    let last_click = std::rc::Rc::new(RefCell::new(None::<(TabId, PathBuf, Instant)>));
     ui.on_activate_entry(move |entry_id, toggle, extend| {
         let entry_id = EntryId(entry_id as u32);
         let now = Instant::now();
-        let (tab_id, request_id) = {
+        let (tab_id, path) = {
             let app = state_for_activate_entry
                 .lock()
                 .expect("app state mutex is not poisoned");
             (
                 app.active_window_state().active_tab,
-                app.active().latest_request,
+                app.active()
+                    .visible_entry(entry_id)
+                    .map(|entry| entry.path.clone()),
             )
         };
         let double_click_interval = platform::double_click_interval();
-        let should_open = last_click.get().is_some_and(
-            |(previous_tab, previous_request, previous_id, previous_time)| {
-                previous_tab == tab_id
-                    && previous_request == request_id
-                    && previous_id == entry_id
-                    && now.saturating_duration_since(previous_time) <= double_click_interval
+        let should_open = last_click.borrow().as_ref().is_some_and(
+            |(previous_tab, previous_path, previous_time)| {
+                *previous_tab == tab_id
+                    && path.as_ref() == Some(previous_path)
+                    && now.saturating_duration_since(*previous_time) <= double_click_interval
             },
-        );
-        last_click.set((!should_open).then_some((tab_id, request_id, entry_id, now)));
+        ) && path.is_some();
+        *last_click.borrow_mut() = if should_open {
+            None
+        } else {
+            path.map(|path| (tab_id, path, now))
+        };
 
         if should_open {
             let target = {
@@ -9209,6 +9399,12 @@ fn wire_callbacks(
             .lock()
             .expect("app state mutex is not poisoned");
         if app.active_window_state().tabs.contains_key(&id) {
+            let window_id = app.active_window;
+            app.pending_shell_creates.remove(&window_id);
+            app.pending_rename_ui.remove(&window_id);
+            app.focus_after_refresh.retain(|_, pending| {
+                !matches!(pending.action, PendingFocusAction::Rename { window_id: owner } if owner == window_id)
+            });
             app.active_window_state_mut().active_tab = id;
         }
         drop(app);
@@ -10841,11 +11037,15 @@ fn wire_callbacks(
                     return;
                 };
                 let command_id = (command - SHELL_CONTEXT_COMMAND_BASE) as u32;
+                let creates_item = quick_menu_for_command.lock().ok().is_some_and(|menu| {
+                    menu.active_submenu_token
+                        .is_some_and(|token| menu.create_submenu_tokens.contains(&token))
+                });
                 let current = state_for_context_command.lock().ok().and_then(|app| {
                     let tab = app.tab(identity.key.tab_id)?;
                     Some((
                         tab.latest_request,
-                        selected_paths(&app),
+                        selected_paths_for_tab(tab),
                         tab.visible_path().map(Path::to_path_buf),
                     ))
                 });
@@ -10873,16 +11073,38 @@ fn wire_callbacks(
                     ) else {
                         return;
                     };
-                    let _ = shell_menu_for_command.send(
-                        platform::windows::context_menu::ShellMenuCommand::Invoke {
+                    if creates_item
+                        && identity.key.paths.is_empty()
+                        && let Some(folder) = identity.key.folder.clone()
+                        && let Ok(mut app) = state_for_context_command.lock()
+                        && let Some(baseline) =
+                            app.tab(identity.key.tab_id).map(directory_path_snapshot)
+                    {
+                        app.pending_shell_creates.insert(
+                            identity.key.window_id,
+                            PendingShellCreate {
+                                window_id: identity.key.window_id,
+                                tab_id: identity.key.tab_id,
+                                directory: folder,
+                                baseline,
+                                started_at: Instant::now(),
+                            },
+                        );
+                    }
+                    if shell_menu_for_command
+                        .send(platform::windows::context_menu::ShellMenuCommand::Invoke {
                             session_id: identity.session_id,
                             request_id: identity.request_id,
                             command_id,
                             owner_window: native_window_handle(&ui),
                             screen_x: screen.x,
                             screen_y: screen.y,
-                        },
-                    );
+                        })
+                        .is_err()
+                        && let Ok(mut app) = state_for_context_command.lock()
+                    {
+                        app.pending_shell_creates.remove(&identity.key.window_id);
+                    }
                 }
             }
             _ => {}
@@ -13608,6 +13830,7 @@ fn start_shell_menu_event_pump(
                         }
                         if let Ok(mut menu) = menu_state.lock() {
                             menu.submenu_tokens.clear();
+                            menu.create_submenu_tokens.clear();
                             menu.preloaded_submenu_rows.clear();
                             menu.loaded_submenu_rows.clear();
                             menu.next_submenu_node = 0;
@@ -13986,9 +14209,90 @@ fn queue_completed_focus(app: &mut AppState, targets: &[PathBuf]) {
                     directory: directory.clone(),
                     request_id: None,
                     paths: paths.clone(),
+                    action: PendingFocusAction::Select,
                 },
             );
         }
+    }
+}
+
+fn pending_focus_is_valid(app: &AppState, tab_id: TabId, pending: &PendingFocus) -> bool {
+    let Some(tab) = app.tab(tab_id) else {
+        return false;
+    };
+    if tab.visible_path() != Some(pending.directory.as_path()) {
+        return false;
+    }
+    match pending.action {
+        PendingFocusAction::Select => true,
+        PendingFocusAction::Rename { window_id } => {
+            app.window_for_tab(tab_id) == Some(window_id)
+                && app
+                    .window(window_id)
+                    .is_some_and(|window| window.active_tab == tab_id)
+        }
+    }
+}
+
+fn queue_completed_rename(app: &mut AppState, origin_tab: TabId, target: PathBuf) {
+    let Some(directory) = target.parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let Some(window_id) = app.window_for_tab(origin_tab) else {
+        return;
+    };
+    if app
+        .window(window_id)
+        .is_none_or(|window| window.active_tab != origin_tab)
+    {
+        return;
+    }
+    if app.tab(origin_tab).and_then(TabSession::visible_path) != Some(directory.as_path()) {
+        return;
+    }
+    app.focus_after_refresh.insert(
+        origin_tab,
+        PendingFocus {
+            directory,
+            request_id: None,
+            paths: vec![target],
+            action: PendingFocusAction::Rename { window_id },
+        },
+    );
+}
+
+fn directory_path_snapshot(tab: &TabSession) -> HashSet<PathBuf> {
+    tab.visible_entries()
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect()
+}
+
+fn detect_unique_created_path(
+    baseline: &HashSet<PathBuf>,
+    entries: &[FileEntry],
+) -> Option<PathBuf> {
+    let mut added = entries
+        .iter()
+        .filter(|entry| !baseline.contains(&entry.path))
+        .map(|entry| entry.path.clone());
+    let path = added.next()?;
+    added.next().is_none().then_some(path)
+}
+
+fn rename_input_for_entry(entry: &FileEntry) -> (String, Option<std::ffi::OsString>) {
+    if entry.kind == crate::domain::EntryKind::File {
+        (
+            entry
+                .path
+                .file_stem()
+                .unwrap_or(&entry.original_name)
+                .to_string_lossy()
+                .into_owned(),
+            entry.path.extension().map(std::ffi::OsStr::to_os_string),
+        )
+    } else {
+        (entry.display_name.clone(), None)
     }
 }
 
@@ -14083,6 +14387,10 @@ fn execute_file_operation_request(
             .unwrap_or_default(),
         started,
     });
+    if request.kind == FileOperationKind::RecycleDelete {
+        execute_recycle_delete_request(request, event_sender, started);
+        return;
+    }
     let mut processed_bytes = 0_u64;
     let mut processed_files = 0_usize;
     let mut conflict_defaults = HashMap::new();
@@ -14193,6 +14501,90 @@ fn execute_file_operation_request(
         },
         item_states: indexed_states,
         completed_targets,
+    });
+}
+
+fn execute_recycle_delete_request(
+    request: FileOperationRequest,
+    event_sender: &mpsc::Sender<FileOperationEvent>,
+    started: Instant,
+) {
+    let pending = request
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.state == ItemState::Pending)
+        .filter_map(|(index, item)| item.source.clone().map(|path| (index, path)))
+        .collect::<Vec<_>>();
+    if request.cancellation.is_cancelled() {
+        let _ = event_sender.send(FileOperationEvent::Finished {
+            id: request.id,
+            result: OperationResult {
+                succeeded: Vec::new(),
+                skipped: Vec::new(),
+                failed: Vec::new(),
+                affected_directories: Vec::new(),
+            },
+            item_states: pending
+                .iter()
+                .map(|(index, _)| (*index, ItemState::Cancelled, None))
+                .collect(),
+            completed_targets: Vec::new(),
+        });
+        return;
+    }
+    let paths = pending
+        .iter()
+        .map(|(_, path)| path.clone())
+        .collect::<Vec<_>>();
+    let cancellation = request.cancellation.clone();
+    let recycle =
+        platform::windows::file_operation::recycle(&paths, move || cancellation.is_cancelled());
+    let mut succeeded = Vec::new();
+    let mut failed = Vec::new();
+    let mut affected = Vec::new();
+    let mut item_states = Vec::new();
+    for result in recycle.items {
+        let (index, path) = pending[result.index].clone();
+        if let Some(parent) = path.parent().map(Path::to_path_buf)
+            && !affected.contains(&parent)
+        {
+            affected.push(parent);
+        }
+        match result.result {
+            Ok(()) => {
+                succeeded.push(path.clone());
+                item_states.push((index, ItemState::Succeeded, None));
+            }
+            Err(message) if recycle.aborted || request.cancellation.is_cancelled() => {
+                item_states.push((index, ItemState::Cancelled, Some(message)));
+            }
+            Err(message) => {
+                failed.push((path.clone(), message.clone()));
+                item_states.push((index, ItemState::Failed, Some(message)));
+            }
+        }
+        let _ = event_sender.send(FileOperationEvent::Progress {
+            id: request.id,
+            completed_items: index + 1,
+            completed_files: succeeded.len(),
+            total_files: Some(paths.len()),
+            processed_bytes: 0,
+            total_bytes: Some(0),
+            current_item: path,
+            started,
+        });
+    }
+    let _ = event_sender.send(FileOperationEvent::Finished {
+        id: request.id,
+        result: OperationResult {
+            succeeded,
+            skipped: Vec::new(),
+            failed,
+            affected_directories: affected,
+        },
+        item_states,
+        completed_targets: Vec::new(),
     });
 }
 fn tree_totals(
@@ -14418,29 +14810,7 @@ fn execute_file_operation_item(
             result.map_err(|error| format!("{error:?}"))
         }
         FileOperationKind::RecycleDelete => {
-            let path = item.source.as_ref().ok_or("missing source")?.clone();
-            let result = platform::windows::file_operation::recycle(&[path]);
-            let first = result
-                .items
-                .into_iter()
-                .next()
-                .ok_or("missing recycle result")?;
-            first
-                .result
-                .map(|_| crate::fs::file_operations::FileOperationReport {
-                    files: 1,
-                    directories: 0,
-                    bytes: 0,
-                    skipped: vec![],
-                    affected_directories: first
-                        .path
-                        .parent()
-                        .map(Path::to_path_buf)
-                        .into_iter()
-                        .collect(),
-                    cleanup_pending: None,
-                    completed_paths: vec![],
-                })
+            unreachable!("recycle delete requests are executed as one Shell batch")
         }
         FileOperationKind::PermanentDelete => {
             let path = item.source.as_ref().ok_or("missing source")?;
@@ -14621,14 +14991,50 @@ fn start_file_operation_event_pump(
                             } else {
                                 OperationState::Failed
                             };
-                            let affected = result.affected_directories.clone();
-                            let resource = app
+                            let (resource, kind, origin_tab, task_items) = app
                                 .operations
                                 .task(id)
-                                .map(|task| task.resource)
-                                .unwrap_or(OperationResource::Local);
+                                .map(|task| {
+                                    (
+                                        task.resource,
+                                        task.kind,
+                                        task.origin_tab,
+                                        task.items.clone(),
+                                    )
+                                })
+                                .unwrap_or((
+                                    OperationResource::Local,
+                                    FileOperationKind::Copy,
+                                    None,
+                                    Vec::new(),
+                                ));
+                            let mut affected = result.affected_directories.clone();
+                            let registered =
+                                release_operation_directories(&mut app, kind, &task_items);
+                            affected.extend(registered.iter().cloned());
+                            let deferred = app
+                                .deferred_watch_directories
+                                .iter()
+                                .filter(|path| registered.contains(*path))
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            for path in deferred {
+                                app.deferred_watch_directories.remove(&path);
+                                affected.push(path);
+                            }
+                            affected.sort();
+                            affected.dedup();
+                            mark_recent_operation_changes(&mut app, &registered, &task_items);
                             app.conflict_responses.remove(&id);
-                            queue_completed_focus(&mut app, &completed_targets);
+                            if kind == FileOperationKind::CreateFolder {
+                                if let (Some(origin_tab), Some(target)) =
+                                    (origin_tab, completed_targets.first().cloned())
+                                {
+                                    queue_completed_rename(&mut app, origin_tab, target);
+                                }
+                            } else {
+                                queue_completed_focus(&mut app, &completed_targets);
+                            }
                             let _ = app.operations.finish(id, terminal, result);
                             if cancelled {
                                 app.operations.remove_terminal(id);
@@ -14636,15 +15042,21 @@ fn start_file_operation_event_pump(
                             let next = app.operations.start_next(resource).ok().flatten().and_then(
                                 |next_id| {
                                     let _ = app.operations.mark_running(next_id);
-                                    app.operations
-                                        .task(next_id)
-                                        .map(|task| FileOperationRequest {
+                                    app.operations.task(next_id).cloned().map(|task| {
+                                        let request = FileOperationRequest {
                                             id: next_id,
                                             kind: task.kind,
                                             resource: task.resource,
                                             items: task.items.clone(),
                                             cancellation: task.cancellation.clone(),
-                                        })
+                                        };
+                                        register_operation_directories(
+                                            &mut app,
+                                            request.kind,
+                                            &request.items,
+                                        );
+                                        request
+                                    })
                                 },
                             );
                             (affected, next)
@@ -14791,17 +15203,27 @@ fn start_directory_watchers(
                     failed.insert(root.clone());
                 }
             }
-            let mut roots = std::collections::HashSet::from([watch_event_root(first)]);
+            let mut events = vec![first];
             thread::sleep(Duration::from_millis(120));
             while let Ok(next) = event_receiver.try_recv() {
-                roots.insert(watch_event_root(next));
+                events.push(next);
             }
-            let roots = roots.into_iter().collect::<Vec<_>>();
             let sender_for_ui = directory_sender.clone();
             let state_for_ui = state.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 // Network paths are excluded from watched_roots, so this refresh cannot reach SMB.
-                for root in &roots {
+                for event in events {
+                    let changes = watch_event_changes(&event).to_vec();
+                    let root = watch_event_root(event);
+                    let should_refresh = {
+                        let mut app = state_for_ui
+                            .lock()
+                            .expect("app state mutex is not poisoned");
+                        classify_watch_refresh(&mut app, &root, &changes)
+                    };
+                    if !should_refresh {
+                        continue;
+                    }
                     let targets = {
                         let app = state_for_ui
                             .lock()
@@ -14850,6 +15272,60 @@ fn watch_event_root(event: platform::windows::directory_watch::DirectoryWatchEve
         | DirectoryWatchEvent::Error { root, .. } => root,
     }
 }
+
+fn watch_event_changes(
+    event: &platform::windows::directory_watch::DirectoryWatchEvent,
+) -> &[platform::windows::directory_watch::DirectoryChange] {
+    match event {
+        platform::windows::directory_watch::DirectoryWatchEvent::Changes { changes, .. } => changes,
+        _ => &[],
+    }
+}
+
+fn changed_paths(
+    changes: &[platform::windows::directory_watch::DirectoryChange],
+) -> HashSet<PathBuf> {
+    use platform::windows::directory_watch::DirectoryChange;
+    changes
+        .iter()
+        .flat_map(|change| match change {
+            DirectoryChange::Added(path)
+            | DirectoryChange::Removed(path)
+            | DirectoryChange::Modified(path) => vec![path.clone()],
+            DirectoryChange::Renamed { from, to } => vec![from.clone(), to.clone()],
+        })
+        .collect()
+}
+
+fn watch_event_is_recent_operation_echo(
+    recent: &RecentOperationChanges,
+    changes: &[platform::windows::directory_watch::DirectoryChange],
+) -> bool {
+    recent.recorded_at.elapsed() <= Duration::from_secs(2)
+        && !changes.is_empty()
+        && changed_paths(changes)
+            .iter()
+            .all(|changed| recent.paths.iter().any(|path| changed.starts_with(path)))
+}
+
+fn classify_watch_refresh(
+    app: &mut AppState,
+    root: &Path,
+    changes: &[platform::windows::directory_watch::DirectoryChange],
+) -> bool {
+    if app.active_operation_directories.contains_key(root) {
+        app.deferred_watch_directories.insert(root.to_path_buf());
+        return false;
+    }
+    let Some(recent) = app.recent_operation_changes.get(root) else {
+        return true;
+    };
+    if recent.recorded_at.elapsed() > Duration::from_secs(2) {
+        app.recent_operation_changes.remove(root);
+        return true;
+    }
+    !watch_event_is_recent_operation_echo(recent, changes)
+}
 fn refresh_affected_tabs(
     sender: &mpsc::Sender<DirectoryRequest>,
     network_sender: &mpsc::SyncSender<DirectoryRequest>,
@@ -14869,11 +15345,11 @@ fn refresh_affected_tabs(
             .collect::<Vec<_>>()
     };
     for (tab, path) in targets {
-        let pending = state
-            .lock()
-            .ok()
-            .and_then(|mut app| app.focus_after_refresh.remove(&tab))
-            .filter(|pending| pending.directory == path);
+        let pending = state.lock().ok().and_then(|mut app| {
+            let pending = app.focus_after_refresh.remove(&tab)?;
+            (pending.directory == path && pending_focus_is_valid(&app, tab, &pending))
+                .then_some(pending)
+        });
         if submit_path_navigation(
             sender,
             network_sender,
@@ -14899,13 +15375,15 @@ fn prepare_retry(state: &SharedSessions, id: OperationId) -> Option<FileOperatio
     let started = app.operations.start_next(resource).ok().flatten()?;
     app.operations.mark_running(started).ok()?;
     let task = app.operations.task(started)?;
-    Some(FileOperationRequest {
+    let request = FileOperationRequest {
         id: started,
         kind: task.kind,
         resource: task.resource,
         items: task.items.clone(),
         cancellation: task.cancellation.clone(),
-    })
+    };
+    register_operation_directories(&mut app, request.kind, &request.items);
+    Some(request)
 }
 fn spawn_directory_workers(
     worker_count: usize,
@@ -15503,12 +15981,27 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                 .then(|| app.focus_after_refresh.get(&tab_id).cloned())
                 .flatten()
                 .filter(|pending| {
-                    pending.request_id == Some(request_id) && pending.directory == path
+                    pending.request_id == Some(request_id)
+                        && pending.directory == path
+                        && pending_focus_is_valid(&app, tab_id, pending)
                 });
+            let shell_create = accepted
+                .then(|| app.window_for_tab(tab_id))
+                .flatten()
+                .and_then(|window_id| app.pending_shell_creates.get(&window_id).cloned())
+                .filter(|pending| pending.tab_id == tab_id && pending.directory == path);
+            let shell_create = shell_create.and_then(|pending| {
+                app.pending_shell_creates.remove(&pending.window_id);
+                (pending.started_at.elapsed() <= Duration::from_secs(5)
+                    && app
+                        .window(pending.window_id)
+                        .is_some_and(|window| window.active_tab == tab_id))
+                .then_some(pending)
+            });
             if accepted {
                 let consumed_focus = focus.is_some();
                 let preference = app.directory_preference(&path);
-                let location_path = {
+                let (location_path, shell_created) = {
                     let tab = app.tab_mut(tab_id).expect("accepted tab exists");
                     tab.sort_field = preference.sort_field;
                     tab.sort_direction = preference.sort_direction;
@@ -15532,11 +16025,63 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                             tab.selection_anchor = Some(focused);
                         }
                     }
+                    let shell_created = shell_create.as_ref().and_then(|pending| {
+                        detect_unique_created_path(&pending.baseline, &tab.entries)
+                    });
+                    if let Some(target) = shell_created.as_ref()
+                        && focus.is_none()
+                        && let Some(entry) = tab.entries.iter().find(|entry| entry.path == *target)
+                    {
+                        tab.selected = vec![entry.id];
+                        tab.focused = Some(entry.id);
+                        tab.selection_anchor = Some(entry.id);
+                    }
                     tab.error = (skipped > 0).then(|| skipped.to_string());
-                    tab.current_path.clone().expect("committed path exists")
+                    (
+                        tab.current_path.clone().expect("committed path exists"),
+                        shell_created,
+                    )
                 };
                 if consumed_focus {
                     app.focus_after_refresh.remove(&tab_id);
+                }
+                if let Some(focus) = focus
+                    && let PendingFocusAction::Rename { window_id } = focus.action
+                    && let Some(entry) = app
+                        .tab(tab_id)
+                        .and_then(|tab| tab.focused.and_then(|id| tab.visible_entry(id).cloned()))
+                {
+                    let (input, extension) = rename_input_for_entry(&entry);
+                    app.pending_rename_ui.insert(
+                        window_id,
+                        PendingRenameUi {
+                            tab_id,
+                            request_id,
+                            entry_id: entry.id,
+                            input,
+                            extension,
+                        },
+                    );
+                }
+                if let Some(pending) = shell_create
+                    && let Some(target) = shell_created
+                    && let Some(entry) = app
+                        .tab(tab_id)
+                        .and_then(|tab| tab.entries.iter().find(|entry| entry.path == target))
+                        .cloned()
+                {
+                    app.focus_after_refresh.remove(&tab_id);
+                    let (input, extension) = rename_input_for_entry(&entry);
+                    app.pending_rename_ui.insert(
+                        pending.window_id,
+                        PendingRenameUi {
+                            tab_id,
+                            request_id,
+                            entry_id: entry.id,
+                            input,
+                            extension,
+                        },
+                    );
                 }
                 if !crate::network::is_unc_path(&location_path) {
                     icon_requests.push(IconRequest {
@@ -17643,6 +18188,35 @@ fn refresh_window_ui(ui: &AppWindow, state: &SharedSessions, window_id: WindowId
         return;
     }
     refresh_ui_inner(ui, state, window_id);
+    apply_pending_rename_ui(ui, state, window_id);
+}
+
+fn apply_pending_rename_ui(ui: &AppWindow, state: &SharedSessions, window_id: WindowId) {
+    let pending = state.lock().ok().and_then(|mut app| {
+        let pending = app.pending_rename_ui.get(&window_id)?.clone();
+        let window = app.window(window_id)?;
+        let tab = window.tabs.get(&pending.tab_id)?;
+        if tab.latest_request != pending.request_id || tab.focused != Some(pending.entry_id) {
+            app.pending_rename_ui.remove(&window_id);
+            return None;
+        }
+        if window.active_tab != pending.tab_id {
+            return None;
+        }
+        app.pending_rename_ui.remove(&window_id)
+    });
+    if let Some(pending) = pending {
+        if let Ok(mut app) = state.lock() {
+            app.rename_targets.insert(
+                window_id,
+                (pending.tab_id, pending.entry_id, pending.extension.clone()),
+            );
+        }
+        ui.set_rename_entry_id(pending.entry_id.0 as i32);
+        ui.set_rename_input(pending.input.into());
+        ui.set_rename_submitting(false);
+        ui.set_rename_editing(true);
+    }
 }
 
 fn refresh_ui(ui: &AppWindow, state: &WindowSessions) {
@@ -22448,6 +23022,31 @@ mod tests {
     }
 
     #[test]
+    fn create_folder_focus_is_scoped_to_origin_tab_and_requests_rename() {
+        let mut app = AppState::new_for_test(
+            vec![PathBuf::from(r"C:\target"), PathBuf::from(r"C:\target")],
+            0,
+            [0, 1, 2, 3],
+        );
+        queue_completed_rename(&mut app, TabId(1), PathBuf::from(r"C:\target\New folder"));
+        assert_eq!(app.focus_after_refresh.len(), 1);
+        let pending = app.focus_after_refresh.get(&TabId(1)).unwrap();
+        assert_eq!(
+            pending.action,
+            PendingFocusAction::Rename {
+                window_id: app.active_window
+            }
+        );
+        assert!(!app.focus_after_refresh.contains_key(&TabId(2)));
+        app.active_window_state_mut().active_tab = TabId(2);
+        assert!(!pending_focus_is_valid(
+            &app,
+            TabId(1),
+            app.focus_after_refresh.get(&TabId(1)).unwrap()
+        ));
+    }
+
+    #[test]
     fn final_target_uses_keep_both_path_and_excludes_existing_merge_root() {
         let item = OperationItem::pending(
             Some(PathBuf::from(r"C:\source\name.txt")),
@@ -23655,6 +24254,72 @@ mod tests {
         std::fs::remove_file(&moved).unwrap();
         assert_eq!(existing_paths(&[moved, remaining.clone()]), vec![remaining]);
         std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn file_operation_directories_cover_delete_and_create_parents() {
+        let deleted = OperationItem::pending(Some(PathBuf::from(r"C:\source\old.txt")), None);
+        let created = OperationItem::pending(None, Some(PathBuf::from(r"C:\target\New folder")));
+        assert_eq!(
+            operation_directories(FileOperationKind::RecycleDelete, &[deleted]),
+            HashSet::from([PathBuf::from(r"C:\source")])
+        );
+        assert_eq!(
+            operation_directories(FileOperationKind::CreateFolder, &[created]),
+            HashSet::from([PathBuf::from(r"C:\target")])
+        );
+    }
+
+    #[test]
+    fn network_operations_do_not_wait_for_local_directory_watchers() {
+        let item = OperationItem::pending(Some(PathBuf::from(r"\\server\share\old.txt")), None);
+        assert!(
+            running_operation_directories(FileOperationKind::PermanentDelete, &[item]).is_empty()
+        );
+    }
+
+    #[test]
+    fn watcher_changes_are_deferred_during_an_operation_and_deduplicated_afterward() {
+        let root = PathBuf::from(r"C:\target");
+        let changed = root.join("item.txt");
+        let mut app = AppState::new_for_test(vec![root.clone()], 0, [0, 1, 2, 3]);
+        app.active_operation_directories.insert(root.clone(), 1);
+        let changes = vec![
+            platform::windows::directory_watch::DirectoryChange::Removed(changed.join("child.txt")),
+        ];
+        assert!(!classify_watch_refresh(&mut app, &root, &changes));
+        assert!(app.deferred_watch_directories.contains(&root));
+        app.active_operation_directories.clear();
+        app.recent_operation_changes.insert(
+            root.clone(),
+            RecentOperationChanges {
+                paths: HashSet::from([changed]),
+                recorded_at: Instant::now(),
+            },
+        );
+        assert!(!classify_watch_refresh(&mut app, &root, &changes));
+        assert!(app.recent_operation_changes.contains_key(&root));
+        let unrelated = vec![platform::windows::directory_watch::DirectoryChange::Added(
+            root.join("external.txt"),
+        )];
+        assert!(classify_watch_refresh(&mut app, &root, &unrelated));
+        assert!(app.recent_operation_changes.contains_key(&root));
+    }
+
+    #[test]
+    fn unique_shell_created_path_is_detected_without_guessing_multiple_changes() {
+        let baseline = HashSet::from([PathBuf::from(r"C:\target\existing.txt")]);
+        let one = vec![
+            focus_entry(1, r"C:\target\existing.txt"),
+            focus_entry(2, r"C:\target\created.txt"),
+        ];
+        assert_eq!(
+            detect_unique_created_path(&baseline, &one),
+            Some(PathBuf::from(r"C:\target\created.txt"))
+        );
+        let mut many = one;
+        many.push(focus_entry(3, r"C:\target\another.txt"));
+        assert_eq!(detect_unique_created_path(&baseline, &many), None);
     }
 
     #[test]
