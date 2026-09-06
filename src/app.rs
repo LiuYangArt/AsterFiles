@@ -493,15 +493,31 @@ pub fn export_quick_menu_search_state(path: &Path) -> io::Result<()> {
             icon_kind: 0,
         },
         ContextCommandRow {
+            id: 2,
+            node_id: 7,
+            label: "粘贴".into(),
+            search_text: "paste".into(),
+            hint: "Ctrl+V".into(),
+            enabled: true,
+            separator: false,
+            shell: false,
+            checked: false,
+            default: false,
+            submenu: false,
+            loading: false,
+            placeholder: false,
+            icon_kind: 0,
+        },
+        ContextCommandRow {
             id: SHELL_CONTEXT_COMMAND_BASE + 42,
-            node_id: 0,
+            node_id: 9,
             label: "在终端中打开".into(),
             search_text: "openinterminal".into(),
             hint: "".into(),
-            enabled: true,
+            enabled: false,
             separator: false,
             shell: true,
-            checked: false,
+            checked: true,
             default: false,
             submenu: false,
             loading: false,
@@ -511,15 +527,27 @@ pub fn export_quick_menu_search_state(path: &Path) -> io::Result<()> {
     ];
     let english = filtered_context_rows(&rows, "COPY");
     let chinese = filtered_context_rows(&rows, "终端");
+    let full_pinyin = filtered_context_rows(&rows, "zhongduan");
+    let initials = filtered_context_rows(&rows, "zt");
+    let uppercase_pinyin = filtered_context_rows(&rows, "ZHANTIE");
     let missing = filtered_context_rows(&rows, "missing");
     let json = format!(
-        "{{\n  \"schema_version\": 1,\n  \"scenario\": \"quick-menu-search\",\n  \"scope\": \"pure_model_no_shell_query_no_ui\",\n  \"case_insensitive_ids\": {:?},\n  \"chinese_ids\": {:?},\n  \"empty_result_count\": {},\n  \"shell_command_id_preserved\": {},\n  \"filter_performs_shell_query\": false\n}}\n",
+        "{{\n  \"schema_version\": 2,\n  \"scenario\": \"quick-menu-search\",\n  \"scope\": \"pure_model_no_shell_query_no_ui\",\n  \"case_insensitive_ids\": {:?},\n  \"chinese_ids\": {:?},\n  \"full_pinyin_ids\": {:?},\n  \"initials_ids\": {:?},\n  \"uppercase_pinyin_ids\": {:?},\n  \"empty_result_count\": {},\n  \"shell_command_id_preserved\": {},\n  \"row_identity_preserved\": {},\n  \"filter_performs_shell_query\": false\n}}\n",
         english.iter().map(|row| row.id).collect::<Vec<_>>(),
         chinese.iter().map(|row| row.id).collect::<Vec<_>>(),
+        full_pinyin.iter().map(|row| row.id).collect::<Vec<_>>(),
+        initials.iter().map(|row| row.id).collect::<Vec<_>>(),
+        uppercase_pinyin
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
         missing.len(),
-        chinese
+        full_pinyin
             .first()
             .is_some_and(|row| row.id == SHELL_CONTEXT_COMMAND_BASE + 42),
+        full_pinyin
+            .first()
+            .is_some_and(|row| { row.node_id == 9 && row.shell && !row.enabled && row.checked }),
     );
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -5943,17 +5971,21 @@ fn quick_menu_key_is_current(state: &SharedSessions, key: &QuickMenuKey) -> bool
         }
     })
 }
-fn context_row_matches(row: &ContextCommandRow, query: &str) -> bool {
-    if row.separator {
-        return false;
-    }
-    let query = query.trim().to_lowercase();
-    query.is_empty()
-        || row.label.to_lowercase().contains(&query)
-        || row.search_text.to_lowercase().contains(&query)
+fn context_row_matches(
+    row: &ContextCommandRow,
+    matcher: &ib_pinyin::matcher::PinyinMatcher<'_>,
+) -> bool {
+    !row.separator
+        && (matcher.is_match(row.label.as_str()) || matcher.is_match(row.search_text.as_str()))
 }
 
 fn filtered_context_rows(rows: &[ContextCommandRow], query: &str) -> Vec<ContextCommandRow> {
+    let query = query.trim();
+    let matcher = (!query.is_empty()).then(|| {
+        ib_pinyin::matcher::PinyinMatcher::builder(query)
+            .pinyin_case_insensitive(true)
+            .build()
+    });
     let mut result = Vec::new();
     let mut pending_separator = false;
     for row in rows {
@@ -5961,7 +5993,9 @@ fn filtered_context_rows(rows: &[ContextCommandRow], query: &str) -> Vec<Context
             pending_separator = !result.is_empty();
             continue;
         }
-        if !context_row_matches(row, query) {
+        if let Some(matcher) = &matcher
+            && !context_row_matches(row, matcher)
+        {
             continue;
         }
         if pending_separator && !result.is_empty() {
@@ -7935,7 +7969,6 @@ fn quick_menu_event_is_current(
 }
 
 fn wire_root_popup_callbacks(root: &QuickMenuWindow, window_id: WindowId) {
-    let weak = root.as_weak();
     root.on_filter(move |query| {
         WINDOW_RUNTIMES.with_borrow_mut(|runtimes| {
             if let Some(runtime) = runtimes.get_mut(&window_id) {
@@ -7958,20 +7991,14 @@ fn wire_root_popup_callbacks(root: &QuickMenuWindow, window_id: WindowId) {
                 }
             }
         });
-        WINDOW_RUNTIMES.with_borrow(|runtimes| {
-            if let Some(runtime) = runtimes.get(&window_id) {
-                runtime.ui.invoke_filter_context_menu(query.clone());
-                if let Some(root) = weak.upgrade() {
-                    root.set_rows(ModelRc::new(VecModel::from(popup_rows(
-                        &(0..runtime.ui.get_context_commands().row_count())
-                            .filter_map(|index| runtime.ui.get_context_commands().row_data(index))
-                            .collect::<Vec<_>>(),
-                    ))));
-                    root.set_content_height(runtime.ui.get_context_menu_content_height());
-                    root.set_active_index(runtime.ui.get_context_active_index());
-                }
-            }
+        let ui = WINDOW_RUNTIMES.with_borrow(|runtimes| {
+            runtimes
+                .get(&window_id)
+                .map(|runtime| runtime.ui.clone_strong())
         });
+        if let Some(ui) = ui {
+            ui.invoke_filter_context_menu(query);
+        }
     });
     let weak = root.as_weak();
     root.on_move(move |index| {
@@ -22191,41 +22218,84 @@ mod tests {
         assert!(!snapshots.contains_key(&second));
     }
     #[test]
-    fn quick_menu_filter_matches_case_chinese_and_command_verb_without_shell_work() {
+    fn quick_menu_filter_matches_text_pinyin_initials_and_verb_without_shell_work() {
+        let paste = ContextCommandRow {
+            id: 1,
+            node_id: 7,
+            label: "粘贴".into(),
+            search_text: "paste".into(),
+            hint: "Ctrl+V".into(),
+            enabled: true,
+            separator: false,
+            shell: false,
+            checked: false,
+            default: false,
+            submenu: false,
+            loading: false,
+            placeholder: false,
+            icon_kind: 5,
+        };
+        let terminal = ContextCommandRow {
+            id: SHELL_CONTEXT_COMMAND_BASE + 42,
+            node_id: 9,
+            label: "在终端中打开".into(),
+            search_text: "openinterminal".into(),
+            hint: "".into(),
+            enabled: false,
+            separator: false,
+            shell: true,
+            checked: true,
+            default: false,
+            submenu: false,
+            loading: false,
+            placeholder: false,
+            icon_kind: 0,
+        };
         let rows = vec![
-            context_test_row(1, "Copy", "copy", false),
+            context_test_row(3, "Copy", "copy", false),
             context_test_row(-1, "", "", true),
-            context_test_row(
-                SHELL_CONTEXT_COMMAND_BASE + 42,
-                "在终端中打开",
-                "openinterminal",
-                false,
-            ),
+            paste.clone(),
+            terminal.clone(),
+            context_test_row(4, "拼音 Search", "", false),
         ];
+
+        for query in ["粘贴", "zhantie", "zt", "ZHANTIE", "paste"] {
+            assert_eq!(
+                filtered_context_rows(&rows, query).as_slice(),
+                std::slice::from_ref(&paste)
+            );
+        }
+        for query in ["终端", "zhongduan", "zd", "openinterminal"] {
+            assert_eq!(
+                filtered_context_rows(&rows, query).as_slice(),
+                std::slice::from_ref(&terminal)
+            );
+        }
         assert_eq!(
             filtered_context_rows(&rows, "COPY")
                 .iter()
                 .map(|row| row.id)
                 .collect::<Vec<_>>(),
-            [1]
+            [3]
         );
         assert_eq!(
-            filtered_context_rows(&rows, "终端")
+            filtered_context_rows(&rows, "pinyin search")
                 .iter()
                 .map(|row| row.id)
                 .collect::<Vec<_>>(),
-            [SHELL_CONTEXT_COMMAND_BASE + 42]
+            [4]
         );
-        assert_eq!(
-            filtered_context_rows(&rows, "openinterminal")
-                .iter()
-                .map(|row| row.id)
-                .collect::<Vec<_>>(),
-            [SHELL_CONTEXT_COMMAND_BASE + 42]
-        );
+        assert!(filtered_context_rows(&rows, "zhantiex").is_empty());
         assert!(filtered_context_rows(&rows, "missing").is_empty());
     }
-
+    #[test]
+    fn quick_menu_filter_accepts_each_single_keyboard_character() {
+        let rows = [context_test_row(1, "粘贴 Copy [测试]", "paste", false)];
+        for character in ' '..='~' {
+            let query = character.to_string();
+            let _ = filtered_context_rows(&rows, &query);
+        }
+    }
     #[test]
     fn quick_menu_filter_removes_leading_trailing_and_duplicate_separators() {
         let rows = vec![

@@ -70,7 +70,7 @@ python tools/verify.py
 cargo build
 ```
 
-机器可读汇总保留在 `artifacts/verify/summary.json`。交付时报告 `target/debug/asterfiles.exe` 的修改时间与 SHA-256。用户确认 Issue 完成前不构建 Release。
+机器可读汇总保留在 `artifacts/verify/summary.json`。完成后确保 `target/debug/asterfiles.exe` 已更新，供用户直接测试；日常开发不计算或报告构建指纹。用户确认 Issue 完成前不构建 Release。
 
 ## 7. 人工验收
 
@@ -82,7 +82,7 @@ cargo build
 - 搜索期间菜单无明显卡顿，命令执行目标没有串项；
 - 未展开子菜单不会被搜索自动加载，展开后已加载项目可按既定当前层规则搜索。
 
-用户确认 Issue 完成后，再按项目规则构建 Release 并报告时间与 SHA-256。
+用户确认 Issue 完成后，再按项目规则执行本地 Release 构建。
 
 ## 8. 非目标
 

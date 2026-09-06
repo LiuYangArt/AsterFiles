@@ -1,5 +1,13 @@
 # 第三方许可
 
+## ib-pinyin
+
+MIT License
+
+Copyright (c) Chaoses-Ib
+
+`ib-pinyin` is distributed under the MIT License. The source and license details are available at <https://github.com/Chaoses-Ib/ib-matcher>.
+
 ## Microsoft Fluent UI System Icons
 
 MIT License

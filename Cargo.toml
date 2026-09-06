@@ -7,6 +7,7 @@ description = "A fast, modern Windows file manager built with Rust and Slint"
 build = "build.rs"
 
 [dependencies]
+ib-pinyin = "0.3.1"
 slint = { version = "1.17.1", default-features = false, features = ["std", "backend-winit", "renderer-skia", "accessibility", "compat-1-2", "unstable-winit-030"] }
 
 [target.'cfg(windows)'.dependencies]
