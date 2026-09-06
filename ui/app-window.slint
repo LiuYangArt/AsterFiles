@@ -1522,9 +1522,10 @@ export component AppWindow inherits Window {
                 }
             }
 
-            VerticalLayout {
-                spacing: 0px;
-                Rectangle {
+            Rectangle {
+                VerticalLayout {
+                    spacing: 0px;
+                    Rectangle {
                     height: root.view-mode == 0 ? 38px : 0px; visible: root.view-mode == 0; background: VisualStyle.cffffff; border-width: 0px; clip: true;
                     header-viewport := Rectangle {
                         width: parent.width - 28px; height: parent.height; clip: true;
@@ -1628,12 +1629,6 @@ export component AppWindow inherits Window {
                         }
 
                     }
-                    Path {
-                        x: 0px; y: 0px; width: 5px; height: 5px;
-                        viewbox-width: 5; viewbox-height: 5; fit: fill;
-                        commands: "M 0 0 L 5 0 C 2.2 0 0 2.2 0 5 Z";
-                        fill: VisualStyle.navigation-surface-background;
-                    }
                 }
 
                 content-area := Rectangle {
@@ -1707,7 +1702,7 @@ list := ListView {
                                 background: entry.id == root.drop-hover-entry-id ? VisualStyle.cc7d7ff : (entry.selected ? VisualStyle.cdce6ff : (mouse.has-hover ? VisualStyle.ceff4ff : transparent));
                                 Rectangle {
                                 visible: root.view-mode != 7;
-                                x: root.view-mode == 0 ? root.details-hit-left - parent.x : 10px; width: root.view-mode == 0 ? root.file-columns-width : parent.width - 20px;
+                                x: root.view-mode == 0 ? root.details-hit-left - parent.x : 0px; width: root.view-mode == 0 ? root.file-columns-width : parent.width;
                                 HorizontalLayout {
                                 spacing: 0px;
                                 for column in root.columns: Rectangle {
@@ -2109,6 +2104,13 @@ accessible-label: entry.name;
                         task-touch := TouchArea { clicked => { root.open-operation-window(); } mouse-cursor: pointer; }
                         accessible-role: button; accessible-label: "File operations";
                     }
+                }
+                }
+                Path {
+                    x: 0px; y: 0px; width: 5px; height: 5px; z: 100;
+                    viewbox-width: 5; viewbox-height: 5; fit: fill;
+                    commands: "M 0 0 L 5 0 C 2.2 0 0 2.2 0 5 Z";
+                    fill: VisualStyle.navigation-surface-background;
                 }
             }
         }
