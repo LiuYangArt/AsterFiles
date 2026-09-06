@@ -125,11 +125,6 @@ fn attributes_are_visible(attributes: u32, visibility: FileVisibility) -> bool {
         && (visibility.show_system || attributes & FILE_ATTRIBUTE_SYSTEM == 0)
 }
 
-#[cfg(not(windows))]
-fn metadata_is_visible(_: &fs::Metadata, _: FileVisibility) -> bool {
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

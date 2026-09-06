@@ -51,11 +51,6 @@ pub fn system_uses_dark_theme() -> bool {
     result == ERROR_SUCCESS && value == 0
 }
 
-#[cfg(not(windows))]
-pub fn system_uses_dark_theme() -> bool {
-    false
-}
-
 #[cfg(windows)]
 mod windows_impl {
     use std::{
@@ -416,51 +411,3 @@ pub use windows_impl::{
     double_click_interval, explorer_pinned_locations, known_locations, open_path, open_url,
     open_windows_credentials, request_folder_access, resolve_shortcut_target,
 };
-
-#[cfg(not(windows))]
-pub fn double_click_interval() -> std::time::Duration {
-    std::time::Duration::from_millis(500)
-}
-#[cfg(not(windows))]
-pub fn known_locations() -> Vec<KnownLocation> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|path| {
-            vec![KnownLocation {
-                kind: KnownLocationKind::Home,
-                label: "Home".to_owned(),
-                path,
-            }]
-        })
-        .unwrap_or_default()
-}
-
-#[cfg(not(windows))]
-pub fn resolve_shortcut_target(_path: &Path) -> std::io::Result<Option<ShortcutTarget>> {
-    Ok(None)
-}
-#[cfg(not(windows))]
-pub fn open_path(path: &Path) -> std::io::Result<()> {
-    std::process::Command::new("xdg-open")
-        .arg(path)
-        .spawn()
-        .map(|_| ())
-}
-#[cfg(not(windows))]
-pub fn open_windows_credentials() -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "Windows Credential Manager is unavailable",
-    ))
-}
-#[cfg(not(windows))]
-pub fn open_url(url: &str) -> std::io::Result<()> {
-    std::process::Command::new("xdg-open")
-        .arg(url)
-        .spawn()
-        .map(|_| ())
-}
-#[cfg(not(windows))]
-pub fn request_folder_access(path: &Path) -> std::io::Result<()> {
-    open_path(path)
-}

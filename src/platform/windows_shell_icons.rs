@@ -412,41 +412,6 @@ pub use windows_impl::{
     initialize_shell_worker, shell_icon_rgba, shell_large_icon_rgba, shell_thumbnail_rgba,
 };
 
-#[cfg(not(windows))]
-pub struct ShellWorkerApartment;
-
-#[cfg(not(windows))]
-pub fn initialize_shell_worker() -> io::Result<ShellWorkerApartment> {
-    Ok(ShellWorkerApartment)
-}
-
-#[cfg(not(windows))]
-pub fn shell_icon_rgba(_path: &Path) -> io::Result<ShellIconRgba> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "Windows Shell icons are only available on Windows",
-    ))
-}
-#[cfg(not(windows))]
-pub fn shell_large_icon_rgba(_path: &Path, _size: u32) -> io::Result<ShellIconRgba> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "Windows Shell icons are only available on Windows",
-    ))
-}
-
-#[cfg(not(windows))]
-pub fn shell_thumbnail_rgba(
-    _path: &Path,
-    _size: u32,
-    _cache_only: bool,
-) -> io::Result<ShellThumbnailRgba> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "Windows Shell thumbnails are only available on Windows",
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::ShellIconRgba;

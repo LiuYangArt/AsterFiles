@@ -708,16 +708,6 @@ fn decode_os(value: &[u16]) -> OsString {
     OsString::from_wide(value)
 }
 
-#[cfg(not(windows))]
-fn encode_os(value: &OsStr) -> Vec<u16> {
-    value.to_string_lossy().encode_utf16().collect()
-}
-
-#[cfg(not(windows))]
-fn decode_os(value: &[u16]) -> OsString {
-    OsString::from(String::from_utf16_lossy(value))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
