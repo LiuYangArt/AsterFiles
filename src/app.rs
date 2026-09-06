@@ -1616,6 +1616,7 @@ struct AppState {
     language: Language,
     theme_mode: session_store::ThemeMode,
     file_visibility: crate::domain::FileVisibility,
+    file_list_quick_search: bool,
     system_dark_theme: bool,
     icons: HashMap<(TabId, RequestId, EntryId), platform::windows_shell_icons::ShellIconRgba>,
     icon_cache: HashMap<PathBuf, platform::windows_shell_icons::ShellIconRgba>,
@@ -1842,6 +1843,7 @@ impl AppState {
             language,
             theme_mode,
             file_visibility: crate::domain::FileVisibility::default(),
+            file_list_quick_search: false,
             system_dark_theme,
             icons: HashMap::new(),
             icon_cache: HashMap::new(),
@@ -3355,6 +3357,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         theme_mode,
         language,
         file_visibility,
+        file_list_quick_search,
         network_locations,
         network_devices,
     ) = restored
@@ -3382,6 +3385,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 session.theme_mode,
                 session.language,
                 session.file_visibility,
+                session.file_list_quick_search,
                 session.network_locations,
                 session.network_devices,
             )
@@ -3399,6 +3403,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 session_store::ThemeMode::System,
                 Language::Chinese,
                 crate::domain::FileVisibility::default(),
+                false,
                 Vec::new(),
                 Vec::new(),
             )
@@ -3438,6 +3443,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     let network_login = Arc::new(Mutex::new(NetworkLoginCoordinator::default()));
     if let Ok(mut app) = state.lock() {
         app.file_visibility = file_visibility;
+        app.file_list_quick_search = file_list_quick_search;
         app.network_locations = network_locations;
         if !network_devices.is_empty() {
             let active_window = app.active_window;
@@ -3754,6 +3760,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         theme_mode,
         language,
         file_visibility,
+        file_list_quick_search,
         network_locations,
         network_devices,
     ) = {
@@ -3797,6 +3804,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             app.theme_mode,
             app.language,
             app.file_visibility,
+            app.file_list_quick_search,
             app.network_locations.clone(),
             app.network_discovery
                 .values()
@@ -3824,6 +3832,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             language,
             everything_config,
             file_visibility,
+            file_list_quick_search,
             network_locations,
             network_devices,
         )
@@ -8678,35 +8687,13 @@ fn wire_callbacks(
             (tab_id, tab.address_mode == AddressMode::Smart)
         };
         if is_search {
-            let state = state_for_changed.clone();
-            let sender = everything_for_changed.clone();
-            let weak = weak_for_changed.clone();
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(160));
-                let still_current = state.lock().ok().is_some_and(|app| {
-                    app.active_window_state()
-                        .tabs
-                        .get(&tab_id)
-                        .is_some_and(|tab| {
-                            tab.address_input == input && tab.address_mode == AddressMode::Smart
-                        })
-                });
-                if still_current {
-                    let query = state
-                        .lock()
-                        .ok()
-                        .and_then(|app| {
-                            app.active_window_state()
-                                .tabs
-                                .get(&tab_id)
-                                .map(|tab| tab.search_query.clone())
-                        })
-                        .unwrap_or(input);
-                    let _ = weak.upgrade_in_event_loop(move |ui| {
-                        submit_search(&sender, &state, Some(&ui), tab_id, query);
-                    });
-                }
-            });
+            schedule_search(
+                everything_for_changed.clone(),
+                state_for_changed.clone(),
+                weak_for_changed.clone(),
+                tab_id,
+                input,
+            );
         }
     });
 
@@ -9799,6 +9786,17 @@ fn wire_callbacks(
     let state_for_visibility = state.clone();
     let sender_for_visibility = sender.clone();
     let network_sender_for_visibility = network_sender.clone();
+    let weak_for_quick_search = ui.as_weak();
+    let state_for_quick_search = state.clone();
+    ui.on_change_file_list_quick_search(move |enabled| {
+        if let Ok(mut app) = state_for_quick_search.lock() {
+            app.file_list_quick_search = enabled;
+        }
+        if let Some(ui) = weak_for_quick_search.upgrade() {
+            refresh_ui(&ui, &state_for_quick_search);
+        }
+    });
+
     ui.on_change_file_visibility(move |show_hidden, show_system| {
         let targets = {
             let mut app = state_for_visibility
@@ -11779,40 +11777,61 @@ fn wire_mouse_navigation(
                         }) =>
                     {
                         let typed = event.text.as_ref().and_then(|value| value.chars().next());
-                        let target = typed.and_then(|typed| {
-                            let app = state.shared.lock().ok()?;
-                            let window = app.window(window_id)?;
-                            let tab = window.tabs.get(&window.active_tab)?;
-                            (tab.kind == TabKind::Files).then_some(())?;
-                            let context = type_select_context(&app, tab);
-                            let projection = type_select_projection(&app, tab);
-                            let focused = tab.focused;
-                            drop(app);
-                            type_select.borrow_mut().select(
-                                context,
-                                Instant::now(),
-                                typed,
-                                &projection,
-                                focused,
-                            )
-                        });
-                        if let Some(entry_id) = target {
-                            let update = mutate_window_selection(&state, window_id, |tab| {
-                                tab.select_entry(entry_id, false, false);
+                        if let Some((tab_id, input)) =
+                            typed.and_then(|typed| begin_file_list_quick_search(&state, typed))
+                        {
+                            type_select.borrow_mut().clear();
+                            refresh_ui(&ui, &state);
+                            ui.invoke_focus_address_editor();
+                            schedule_search(
+                                senders.everything.clone(),
+                                state.clone(),
+                                weak.clone(),
+                                tab_id,
+                                input,
+                            );
+                            true
+                        } else {
+                            let target = typed.and_then(|typed| {
+                                let app = state.shared.lock().ok()?;
+                                let window = app.window(window_id)?;
+                                let tab = window.tabs.get(&window.active_tab)?;
+                                (tab.kind == TabKind::Files).then_some(())?;
+                                let context = type_select_context(&app, tab);
+                                let projection = type_select_projection(&app, tab);
+                                let focused = tab.focused;
+                                drop(app);
+                                type_select.borrow_mut().select(
+                                    context,
+                                    Instant::now(),
+                                    typed,
+                                    &projection,
+                                    focused,
+                                )
                             });
-                            if let Some((tab_id, changed)) = update {
-                                update_file_rows(&ui, &state, tab_id, &changed);
-                                update_selection_summary(&ui, &state);
-                                let request_id = state
-                                    .lock()
-                                    .ok()
-                                    .and_then(|app| app.tab(tab_id).map(|tab| tab.latest_request));
-                                if let Some(request_id) = request_id {
-                                    reveal_entry(&ui, &state.shared, tab_id, request_id, entry_id);
+                            if let Some(entry_id) = target {
+                                let update = mutate_window_selection(&state, window_id, |tab| {
+                                    tab.select_entry(entry_id, false, false);
+                                });
+                                if let Some((tab_id, changed)) = update {
+                                    update_file_rows(&ui, &state, tab_id, &changed);
+                                    update_selection_summary(&ui, &state);
+                                    let request_id = state.lock().ok().and_then(|app| {
+                                        app.tab(tab_id).map(|tab| tab.latest_request)
+                                    });
+                                    if let Some(request_id) = request_id {
+                                        reveal_entry(
+                                            &ui,
+                                            &state.shared,
+                                            tab_id,
+                                            request_id,
+                                            entry_id,
+                                        );
+                                    }
                                 }
                             }
+                            true
                         }
-                        true
                     }
                     _ if control
                         && !alt
@@ -16979,6 +16998,46 @@ fn everything_sort(
         (SortField::Created, SortDirection::Descending) => EverythingSort::CreatedDescending,
     }
 }
+fn schedule_search(
+    sender: mpsc::Sender<EverythingRequest>,
+    state: WindowSessions,
+    weak: slint::Weak<AppWindow>,
+    tab_id: TabId,
+    input: String,
+) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(160));
+        let query = state.lock().ok().and_then(|app| {
+            let window = app.window(state.window_id)?;
+            (window.active_tab == tab_id).then_some(())?;
+            let tab = window.tabs.get(&tab_id)?;
+            (tab.address_input == input && tab.address_mode == AddressMode::Smart)
+                .then(|| tab.search_query.clone())
+        });
+        if let Some(query) = query {
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                submit_search(&sender, &state, Some(&ui), tab_id, query);
+            });
+        }
+    });
+}
+
+fn begin_file_list_quick_search(state: &WindowSessions, typed: char) -> Option<(TabId, String)> {
+    let mut app = state.lock().ok()?;
+    if !app.file_list_quick_search {
+        return None;
+    }
+    let tab_id = app.active_window_state().active_tab;
+    let tab = app.active_window_state_mut().tabs.get_mut(&tab_id)?;
+    if tab.kind != TabKind::Files {
+        return None;
+    }
+    tab.begin_smart_address_edit();
+    tab.search_depth = SearchDepth::CurrentFolder;
+    let input = format!("{}{}", tab.address_input, typed);
+    tab.update_address_input(input.clone());
+    Some((tab_id, input))
+}
 fn submit_search(
     sender: &mpsc::Sender<EverythingRequest>,
     state: &SharedSessions,
@@ -18803,6 +18862,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     });
     ui.set_show_hidden_files(app.file_visibility.show_hidden);
     ui.set_show_system_files(app.file_visibility.show_system);
+    ui.set_file_list_quick_search(app.file_list_quick_search);
     ui.set_everything_path(
         app.everything_config
             .executable_path
@@ -19282,6 +19342,7 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
         english,
         show_hidden_files,
         show_system_files,
+        file_list_quick_search,
         settings_general,
         settings_appearance,
         settings_developer,
@@ -19348,6 +19409,7 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "English",
             "显示隐藏文件",
             "显示系统文件",
+            "文件列表快速搜索",
             "常规",
             "外观",
             "开发工具",
@@ -19414,6 +19476,7 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "English",
             "Show hidden files",
             "Show system files",
+            "File list quick search",
             "General",
             "Appearance",
             "Developer tools",
@@ -19497,6 +19560,7 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_language_english(english.into());
     ui.set_text_show_hidden_files(show_hidden_files.into());
     ui.set_text_show_system_files(show_system_files.into());
+    ui.set_text_file_list_quick_search(file_list_quick_search.into());
     ui.set_text_settings_general(settings_general.into());
     ui.set_text_settings_appearance(settings_appearance.into());
     ui.set_text_settings_developer(settings_developer.into());
@@ -19674,6 +19738,60 @@ mod tests {
             .enumerate()
             .map(|(index, name)| (EntryId(index as u32 + 1), (*name).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn issue_28_quick_search_defaults_off_and_starts_in_current_directory() {
+        let app = AppState::new_for_test(vec![PathBuf::from(r"C:\work")], 0, [0, 1, 2, 3]);
+        let window_id = app.active_window;
+        let state = WindowSessions::new(Arc::new(Mutex::new(app)), window_id);
+
+        assert_eq!(begin_file_list_quick_search(&state, 'a'), None);
+        {
+            let mut app = state.lock().unwrap();
+            app.file_list_quick_search = true;
+            let tab = app.active();
+            assert_eq!(tab.page_source, PageSource::Directory);
+            assert!(!tab.address_editing);
+        }
+
+        let (tab_id, input) = begin_file_list_quick_search(&state, '7').unwrap();
+        let app = state.lock().unwrap();
+        let tab = app.tab(tab_id).unwrap();
+        assert_eq!(tab.search_depth, SearchDepth::CurrentFolder);
+        assert_eq!(
+            tab.search_scope,
+            SearchScope::Directory(PathBuf::from(r"C:\work"))
+        );
+        assert_eq!(tab.search_query, "7");
+        assert_eq!(tab.address_input, input);
+        assert!(tab.address_editing);
+        assert_eq!(tab.address_mode, AddressMode::Smart);
+    }
+
+    #[test]
+    fn issue_28_quick_search_preserves_directory_selection_when_cancelled() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\work")], 0, [0, 1, 2, 3]);
+        let window_id = app.active_window;
+        let tab_id = app.active_window_state().active_tab;
+        let entry = focus_entry(1, r"C:\work\alpha.txt");
+        {
+            let tab = app.tab_mut(tab_id).unwrap();
+            tab.replace_entries(vec![entry]);
+            tab.select_entry(EntryId(1), false, false);
+        }
+        app.file_list_quick_search = true;
+        let state = WindowSessions::new(Arc::new(Mutex::new(app)), window_id);
+        begin_file_list_quick_search(&state, 'a').unwrap();
+        {
+            let mut app = state.lock().unwrap();
+            let tab = app.tab_mut(tab_id).unwrap();
+            tab.begin_search(tab.search_scope.clone(), tab.search_query.clone());
+            tab.cancel_address_edit();
+            assert_eq!(tab.page_source, PageSource::Directory);
+            assert_eq!(tab.selected, vec![EntryId(1)]);
+            assert_eq!(tab.focused, Some(EntryId(1)));
+        }
     }
 
     #[test]

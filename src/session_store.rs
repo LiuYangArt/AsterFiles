@@ -20,7 +20,7 @@ use crate::{
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-const MAGIC: &[u8; 6] = b"ASTF11";
+const MAGIC: &[u8; 6] = b"ASTF12";
 const MAX_TABS: usize = 1_024;
 const MAX_WINDOWS: usize = 128;
 const MAX_NETWORK_LOCATIONS: usize = 1_024;
@@ -76,6 +76,7 @@ pub struct SessionState {
     pub language: Language,
     pub everything: EverythingConfig,
     pub file_visibility: FileVisibility,
+    pub file_list_quick_search: bool,
     pub network_locations: Vec<NetworkLocation>,
     pub network_devices: Vec<NetworkDeviceTarget>,
 }
@@ -107,6 +108,7 @@ impl SessionState {
             Language::Chinese,
             EverythingConfig::default(),
             FileVisibility::default(),
+            false,
             Vec::new(),
             Vec::new(),
         )
@@ -122,6 +124,7 @@ impl SessionState {
         language: Language,
         everything: EverythingConfig,
         file_visibility: FileVisibility,
+        file_list_quick_search: bool,
         network_locations: Vec<NetworkLocation>,
         network_devices: Vec<NetworkDeviceTarget>,
     ) -> io::Result<Self> {
@@ -157,6 +160,7 @@ impl SessionState {
             language,
             everything,
             file_visibility,
+            file_list_quick_search,
             network_locations,
             network_devices,
         })
@@ -191,6 +195,7 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
         state.language,
         state.everything.clone(),
         state.file_visibility,
+        state.file_list_quick_search,
         state.network_locations.clone(),
         state.network_devices.clone(),
     )?;
@@ -212,6 +217,7 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
     bytes.push(u8::from(state.everything.allow_launch));
     bytes.push(u8::from(state.file_visibility.show_hidden));
     bytes.push(u8::from(state.file_visibility.show_system));
+    bytes.push(u8::from(state.file_list_quick_search));
     bytes.extend_from_slice(&(state.network_locations.len() as u32).to_le_bytes());
     for location in &state.network_locations {
         bytes.extend_from_slice(&location.id.to_le_bytes());
@@ -282,6 +288,8 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
         show_hidden: read_bool(bytes, &mut offset, "invalid hidden-file setting")?,
         show_system: read_bool(bytes, &mut offset, "invalid system-file setting")?,
     };
+    let file_list_quick_search =
+        read_bool(bytes, &mut offset, "invalid file-list quick-search setting")?;
     let network_location_count = read_u32(bytes, &mut offset)? as usize;
     if network_location_count > MAX_NETWORK_LOCATIONS {
         return Err(invalid_data("too many network locations"));
@@ -347,6 +355,7 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
         language,
         everything,
         file_visibility,
+        file_list_quick_search,
         network_locations,
         network_devices,
     )
@@ -754,6 +763,7 @@ mod tests {
                 show_hidden: true,
                 show_system: false,
             },
+            true,
             vec![NetworkLocation {
                 id: 7,
                 source: NetworkLocationSource::AsterOwned,
@@ -772,14 +782,31 @@ mod tests {
     }
 
     #[test]
-    fn astf11_round_trip_preserves_network_locations_devices_and_raw_paths() {
+    fn astf12_round_trip_preserves_settings_network_locations_devices_and_raw_paths() {
         let state = sample_state();
+        assert!(state.file_list_quick_search);
         assert_eq!(decode(&encode(&state).unwrap()).unwrap(), state);
     }
 
     #[test]
+    fn quick_search_defaults_off() {
+        let state = SessionState::new(
+            WindowPlacement {
+                x: 0,
+                y: 0,
+                width: 1180,
+                height: 760,
+            },
+            0,
+            vec![PathBuf::from(r"C:\work")],
+        )
+        .unwrap();
+        assert!(!state.file_list_quick_search);
+    }
+
+    #[test]
     fn rejects_old_formats() {
-        for version in 1..=10 {
+        for version in 1..=11 {
             let bytes = format!("ASTF{version}\0\0\0\0");
             assert_eq!(
                 decode(bytes.as_bytes()).unwrap_err().kind(),

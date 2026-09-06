@@ -721,6 +721,7 @@ export component AppWindow inherits Window {
     in property <bool> search-results-mode: false;
     in property <bool> search-depth-enabled: false;
     in property <bool> search-recursive: true;
+    in property <bool> file-list-quick-search: false;
 
 
     in property <string> status-text: "";
@@ -890,6 +891,7 @@ export component AppWindow inherits Window {
     in property <string> text-language-english: "English";
     in property <string> text-show-hidden-files: "显示隐藏文件";
     in property <string> text-show-system-files: "显示系统文件";
+    in property <string> text-file-list-quick-search: "文件列表快速搜索";
     in property <string> text-settings-general: "常规";
     in property <string> text-settings-appearance: "外观";
     in property <string> text-settings-developer: "开发工具";
@@ -1051,6 +1053,7 @@ export component AppWindow inherits Window {
     callback change-theme(int);
     callback change-language(int);
     callback change-file-visibility(bool, bool);
+    callback change-file-list-quick-search(bool);
     callback update-everything-config(string, string);
     callback select-everything-program();
     callback test-everything-connection();
@@ -2206,7 +2209,7 @@ accessible-label: entry.name;
                             if root.settings-section == 2: VerticalLayout {
                                 spacing: 12px;
                                 Rectangle {
-                                    height: 244px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                    height: 274px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
                                     VerticalLayout {
                                         padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 8px;
                                         Text { text: root.text-everything-connection; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
@@ -2225,6 +2228,7 @@ accessible-label: entry.name;
                                             TextInput { x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.everything-instance; single-line: true; vertical-alignment: center; edited => { root.update-everything-config(root.everything-path, root.everything-instance); } }
                                         }
                                         Text { text: root.text-everything-instance-help; color: VisualStyle.c62656f; font-size: 11px; wrap: word-wrap; }
+                                        CheckBox { text: root.text-file-list-quick-search; checked: root.file-list-quick-search; toggled => { root.change-file-list-quick-search(self.checked); } }
                                     }
                                 }
                                 Rectangle {
