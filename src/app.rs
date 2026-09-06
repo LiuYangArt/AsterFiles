@@ -221,6 +221,7 @@ pub fn export_windows_libraries_state(path: &Path) -> io::Result<()> {
         path: PathBuf::from(r"C:\SourceA\first.txt"),
         kind: crate::domain::EntryKind::File,
         open_target: None,
+        library_source_index: None,
         parent_display: r"C:\SourceA".to_owned(),
         size_bytes: Some(1),
         folder_size: FolderSizeState::Unknown,
@@ -401,6 +402,7 @@ pub fn export_folder_size_scheduler_state(path: &Path) -> io::Result<()> {
         path: PathBuf::from(format!(r"C:\AgentScenarios\FolderSizes\folder-{id:03}")),
         kind: EntryKind::Directory,
         open_target: None,
+        library_source_index: None,
         parent_display: r"C:\AgentScenarios\FolderSizes".to_owned(),
         size_bytes: None,
         folder_size: FolderSizeState::Unknown,
@@ -1061,7 +1063,13 @@ fn grid_thumbnail_requests(
     let request_rows = grid_thumbnail_request_rows(
         &grid_rows
             .iter()
-            .map(|row| if row.group_header { 32.0 } else { row_height })
+            .map(|row| {
+                if row.group_header {
+                    group_header_height_for_detail(row.group_detail.as_str()) as f32
+                } else {
+                    row_height
+                }
+            })
             .collect::<Vec<_>>(),
         ui.get_file_viewport_y(),
         visible_height,
@@ -2969,6 +2977,26 @@ fn file_layout_geometry(view_mode: ViewMode) -> FileLayoutGeometry {
     }
 }
 
+const DEFAULT_GROUP_HEADER_HEIGHT: u64 = 32;
+const LIBRARY_GROUP_HEADER_HEIGHT: u64 = 48;
+
+fn group_header_height_for_detail(detail: &str) -> u64 {
+    if detail.is_empty() {
+        DEFAULT_GROUP_HEADER_HEIGHT
+    } else {
+        LIBRARY_GROUP_HEADER_HEIGHT
+    }
+}
+
+fn group_header_height(groups: &[group_projection::GroupProjection]) -> u64 {
+    groups
+        .iter()
+        .find(|group| group.header_visible)
+        .map_or(DEFAULT_GROUP_HEADER_HEIGHT, |group| {
+            group_header_height_for_detail(&group.detail)
+        })
+}
+
 fn file_row_height(view_mode: ViewMode) -> f32 {
     file_layout_geometry(view_mode).row_height
 }
@@ -2980,7 +3008,7 @@ fn projected_scroll_maximum(ui: &AppWindow, view_mode: ViewMode, visible_height:
             .iter()
             .map(|row| {
                 if row.group_header {
-                    32.0
+                    group_header_height_for_detail(row.group_detail.as_str()) as f32
                 } else {
                     file_row_height(view_mode)
                 }
@@ -2993,7 +3021,7 @@ fn projected_scroll_maximum(ui: &AppWindow, view_mode: ViewMode, visible_height:
             .iter()
             .map(|row| {
                 if row.group_header {
-                    32.0
+                    group_header_height_for_detail(row.group_detail.as_str()) as f32
                 } else {
                     file_row_height(view_mode)
                 }
@@ -4660,7 +4688,7 @@ fn directory_entry_at_visual_point(
         let projection = IconProjection::from_groups(
             &groups,
             grid_columns,
-            32,
+            group_header_height(&groups),
             file_row_height(view_mode) as u64,
         );
         let location = projection.offsets.locate(content_y as u64)?;
@@ -4672,8 +4700,11 @@ fn directory_entry_at_visual_point(
         let column = ((local_x - 16.0) / (geometry.card_width + 8.0).max(1.0)).floor() as usize;
         entries.get(column).copied()
     } else {
-        let projection =
-            ListProjection::from_groups(&groups, 32, file_row_height(view_mode) as u64);
+        let projection = ListProjection::from_groups(
+            &groups,
+            group_header_height(&groups),
+            file_row_height(view_mode) as u64,
+        );
         let location = projection.offsets.locate(content_y as u64)?;
         match projection.rows.get(location.row_index)? {
             ListVisualRow::Entry { entry_id } => Some(*entry_id),
@@ -5066,6 +5097,14 @@ fn set_sort_field(state: &WindowSessions, field: SortField) {
                     tab.resort_entries();
                 }
             }
+        } else if matches!(
+            app.active().visible_location(),
+            Some(NavigationLocation::Library(_))
+        ) {
+            let tab_id = app.active_window_state().active_tab;
+            let tab = app.tab_mut(tab_id).expect("active tab exists");
+            tab.sort_field = field;
+            tab.resort_entries();
         }
     }
 }
@@ -5096,6 +5135,14 @@ fn set_sort_direction(state: &WindowSessions, direction: SortDirection) {
                     tab.resort_entries();
                 }
             }
+        } else if matches!(
+            app.active().visible_location(),
+            Some(NavigationLocation::Library(_))
+        ) {
+            let tab_id = app.active_window_state().active_tab;
+            let tab = app.tab_mut(tab_id).expect("active tab exists");
+            tab.sort_direction = direction;
+            tab.resort_entries();
         }
     }
 }
@@ -6037,7 +6084,11 @@ fn built_in_context_rows(
                 -1,
                 NODE_GROUP,
                 zh("分组依据", "Group by"),
-                app.active().page_source != PageSource::Search,
+                app.active().page_source != PageSource::Search
+                    && !matches!(
+                        app.active().visible_location(),
+                        Some(NavigationLocation::Library(_))
+                    ),
                 false,
                 true,
             ),
@@ -8225,11 +8276,12 @@ fn rectangle_selection_hits_for_app(
     let Some(tab) = app.tab(tab_id) else {
         return HashSet::new();
     };
-    let group_field = tab
-        .visible_path()
-        .map(|path| app.directory_preference(path).group_field)
-        .unwrap_or(GroupField::None);
-    if tab.page_source == PageSource::Search || group_field == GroupField::None {
+    let grouped = matches!(tab.visible_location(), Some(NavigationLocation::Library(_)))
+        || tab
+            .visible_path()
+            .map(|path| app.directory_preference(path).group_field != GroupField::None)
+            .unwrap_or(false);
+    if tab.page_source == PageSource::Search || !grouped {
         return rectangle_selection_hits(
             tab,
             view_mode,
@@ -8244,8 +8296,12 @@ fn rectangle_selection_hits_for_app(
     let geometry = file_layout_geometry(view_mode);
     let mut hits = HashSet::new();
     if geometry.grid {
-        let projection =
-            IconProjection::from_groups(&groups, grid_columns, 32, geometry.row_height as u64);
+        let projection = IconProjection::from_groups(
+            &groups,
+            grid_columns,
+            group_header_height(&groups),
+            geometry.row_height as u64,
+        );
         for entry in tab.visible_entries() {
             let Some(position) = projection.entry_position(entry.id) else {
                 continue;
@@ -8278,7 +8334,11 @@ fn rectangle_selection_hits_for_app(
         if right <= left {
             return hits;
         }
-        let projection = ListProjection::from_groups(&groups, 32, geometry.row_height as u64);
+        let projection = ListProjection::from_groups(
+            &groups,
+            group_header_height(&groups),
+            geometry.row_height as u64,
+        );
         for entry in tab.visible_entries() {
             let Some(position) = projection.entry_position(entry.id) else {
                 continue;
@@ -12555,13 +12615,18 @@ fn drop_target_snapshot(
         )
     };
     let groups = directory_group_projections(app, tab, tab.visible_entries());
-    let list_projection = (!view_mode.uses_grid_layout())
-        .then(|| ListProjection::from_groups(&groups, 32, file_row_height(view_mode) as u64));
+    let list_projection = (!view_mode.uses_grid_layout()).then(|| {
+        ListProjection::from_groups(
+            &groups,
+            group_header_height(&groups),
+            file_row_height(view_mode) as u64,
+        )
+    });
     let icon_projection = view_mode.uses_grid_layout().then(|| {
         IconProjection::from_groups(
             &groups,
             ui.get_grid_column_count().max(1) as usize,
-            32,
+            group_header_height(&groups),
             file_row_height(view_mode) as u64,
         )
     });
@@ -15865,6 +15930,7 @@ fn read_network_root_batches(
                     path: item.target.clone(),
                     kind: crate::domain::EntryKind::Directory,
                     open_target: None,
+                    library_source_index: None,
                     parent_display: display_path(&request.path),
                     size_bytes: None,
                     folder_size: FolderSizeState::NotIndexed,
@@ -16239,14 +16305,22 @@ fn reveal_entry(
 
     let geometry = file_layout_geometry(view_mode);
     let entry_top = if geometry.grid {
-        let projection =
-            IconProjection::from_groups(&groups, columns, 32, geometry.row_height as u64);
+        let projection = IconProjection::from_groups(
+            &groups,
+            columns,
+            group_header_height(&groups),
+            geometry.row_height as u64,
+        );
         projection
             .entry_position(entry_id)
             .and_then(|position| projection.offsets.row_start(position.row_index))
             .map(|value| value as f32)
     } else {
-        let projection = ListProjection::from_groups(&groups, 32, geometry.row_height as u64);
+        let projection = ListProjection::from_groups(
+            &groups,
+            group_header_height(&groups),
+            geometry.row_height as u64,
+        );
         projection
             .entry_position(entry_id)
             .and_then(|position| projection.offsets.row_start(position))
@@ -16833,6 +16907,7 @@ fn spawn_everything_worker(
                                         crate::domain::EntryKind::File
                                     },
                                     open_target: None,
+                                    library_source_index: None,
                                     parent_display: item
                                         .parent
                                         .as_os_str()
@@ -17372,6 +17447,7 @@ fn empty_file_row() -> FileRow {
         loaded: false,
         group_header: false,
         group_label: "".into(),
+        group_detail: "".into(),
         group_count: 0,
         name: "".into(),
         name_segments: ModelRc::new(VecModel::default()),
@@ -17388,11 +17464,12 @@ fn empty_file_row() -> FileRow {
     }
 }
 
-fn group_header_file_row(label: &str, entry_count: usize) -> FileRow {
+fn group_header_file_row(label: &str, detail: &str, entry_count: usize) -> FileRow {
     let mut row = empty_file_row();
     row.loaded = true;
     row.group_header = true;
     row.group_label = label.into();
+    row.group_detail = detail.into();
     row.group_count = entry_count.min(i32::MAX as usize) as i32;
     row
 }
@@ -18356,10 +18433,11 @@ fn append_active_file_rows(
         return;
     }
     let texts = Texts::new(app.language);
-    let grouped = tab
-        .visible_path()
-        .map(|path| app.directory_preference(path).group_field != GroupField::None)
-        .unwrap_or(false);
+    let grouped = matches!(tab.visible_location(), Some(NavigationLocation::Library(_)))
+        || tab
+            .visible_path()
+            .map(|path| app.directory_preference(path).group_field != GroupField::None)
+            .unwrap_or(false);
     let grid_layout = app.active_view_mode().uses_grid_layout();
     if grouped || grid_layout {
         let projected_entries = if grid_layout {
@@ -18930,6 +19008,14 @@ fn directory_group_projections(
     tab: &TabSession,
     entries: &[FileEntry],
 ) -> Vec<group_projection::GroupProjection> {
+    if let Some(NavigationLocation::Library(location)) = tab.visible_location()
+        && let Some(library) = app
+            .libraries
+            .iter()
+            .find(|library| library.id.as_os_str() == location.identity.as_os_str())
+    {
+        return library_source_group_projections(library, entries);
+    }
     let preference = tab
         .visible_path()
         .map(|path| app.directory_preference(path))
@@ -18946,6 +19032,32 @@ fn directory_group_projections(
     )
 }
 
+fn library_source_group_projections(
+    library: &platform::windows::libraries::WindowsLibrary,
+    entries: &[FileEntry],
+) -> Vec<group_projection::GroupProjection> {
+    library
+        .sources
+        .iter()
+        .enumerate()
+        .filter_map(|(source_index, source)| {
+            let source_path = source.path.as_deref()?;
+            let group_entries = entries
+                .iter()
+                .filter(|entry| entry.library_source_index == Some(source_index))
+                .map(|entry| entry.id)
+                .collect();
+            Some(group_projection::GroupProjection {
+                key: library_stable_id(source.shell_identity.as_os_str()),
+                label: source.display_name.to_string_lossy().into_owned(),
+                detail: display_path(source_path),
+                entries: group_entries,
+                header_visible: true,
+            })
+        })
+        .collect()
+}
+
 fn projected_directory_rows(
     entries: &[FileEntry],
     tab: &TabSession,
@@ -18957,18 +19069,25 @@ fn projected_directory_rows(
         .iter()
         .map(|entry| (entry.id, entry))
         .collect::<HashMap<_, _>>();
-    ListProjection::from_groups(&groups, 32, file_row_height(app.active_view_mode()) as u64)
-        .rows
-        .into_iter()
-        .filter_map(|visual| match visual {
-            ListVisualRow::GroupHeader {
-                label, entry_count, ..
-            } => Some(group_header_file_row(&label, entry_count)),
-            ListVisualRow::Entry { entry_id } => by_id
-                .get(&entry_id)
-                .map(|entry| file_row(entry, tab, texts, app, None)),
-        })
-        .collect()
+    ListProjection::from_groups(
+        &groups,
+        group_header_height(&groups),
+        file_row_height(app.active_view_mode()) as u64,
+    )
+    .rows
+    .into_iter()
+    .filter_map(|visual| match visual {
+        ListVisualRow::GroupHeader {
+            label,
+            detail,
+            entry_count,
+            ..
+        } => Some(group_header_file_row(&label, &detail, entry_count)),
+        ListVisualRow::Entry { entry_id } => by_id
+            .get(&entry_id)
+            .map(|entry| file_row(entry, tab, texts, app, None)),
+    })
+    .collect()
 }
 
 fn projected_directory_grid_rows(
@@ -18987,23 +19106,28 @@ fn projected_directory_grid_rows(
     IconProjection::from_groups(
         &groups,
         columns,
-        32,
+        group_header_height(&groups),
         file_row_height(app.active_view_mode()) as u64,
     )
     .rows
     .into_iter()
     .map(|visual| match visual {
         IconVisualRow::GroupHeader {
-            label, entry_count, ..
+            label,
+            detail,
+            entry_count,
+            ..
         } => GridRow {
             group_header: true,
             group_label: label.into(),
+            group_detail: detail.into(),
             group_count: entry_count.min(i32::MAX as usize) as i32,
             entries: ModelRc::new(VecModel::default()),
         },
         IconVisualRow::Entries { entries, .. } => GridRow {
             group_header: false,
             group_label: "".into(),
+            group_detail: "".into(),
             group_count: 0,
             entries: ModelRc::new(VecModel::from(
                 entries
@@ -19100,6 +19224,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
                 .map(|entries| GridRow {
                     group_header: false,
                     group_label: "".into(),
+                    group_detail: "".into(),
                     group_count: 0,
                     entries: ModelRc::new(VecModel::from(entries.to_vec())),
                 })
@@ -19577,6 +19702,7 @@ fn file_row(
         loaded: true,
         group_header: false,
         group_label: "".into(),
+        group_detail: "".into(),
         group_count: 0,
         name: entry.display_name.clone().into(),
         name_segments: ModelRc::new(VecModel::from(name_segments)),
@@ -20368,6 +20494,7 @@ mod tests {
                 .map(
                     |(index, path)| platform::windows::libraries::LibrarySource {
                         shell_identity: format!("shell:source:{index}").into(),
+                        display_name: format!("Source {index}").into(),
                         path,
                     },
                 )
@@ -20394,6 +20521,118 @@ mod tests {
             .enumerate()
             .map(|(index, name)| (EntryId(index as u32 + 1), (*name).to_owned()))
             .collect()
+    }
+
+    fn library_projection_entry(id: u32, source_index: usize, path: &str) -> FileEntry {
+        let path = PathBuf::from(path);
+        let original_name = path.file_name().unwrap().to_owned();
+        FileEntry {
+            id: EntryId(id),
+            display_name: original_name.to_string_lossy().into_owned(),
+            name_highlights: Vec::new(),
+            original_name,
+            path: path.clone(),
+            kind: crate::domain::EntryKind::File,
+            open_target: None,
+            library_source_index: Some(source_index),
+            parent_display: path.parent().map(display_path).unwrap_or_default(),
+            size_bytes: Some(1),
+            folder_size: FolderSizeState::Unknown,
+            modified: None,
+            created: None,
+        }
+    }
+
+    #[test]
+    fn library_projection_preserves_shell_source_order_and_real_paths() {
+        let mut library = test_library(
+            "shell:library:grouped",
+            "Grouped",
+            vec![
+                Some(PathBuf::from(r"C:\First")),
+                Some(PathBuf::from(r"D:\Second")),
+            ],
+            None,
+        );
+        library.sources[0].display_name = "Same name".into();
+        library.sources[1].display_name = "Same name".into();
+        let entries = vec![
+            library_projection_entry(1, 0, r"C:\First\one.txt"),
+            library_projection_entry(2, 1, r"D:\Second\two.txt"),
+            library_projection_entry(3, 1, r"D:\Second\three.txt"),
+        ];
+
+        let groups = library_source_group_projections(&library, &entries);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].label, "Same name");
+        assert_eq!(groups[0].detail, r"C:\First");
+        assert_eq!(groups[0].entries, [EntryId(1)]);
+        assert_eq!(groups[1].detail, r"D:\Second");
+        assert_eq!(groups[1].entries, [EntryId(2), EntryId(3)]);
+        assert_ne!(groups[0].key, groups[1].key);
+        assert!(groups.iter().all(|group| group.header_visible));
+    }
+
+    #[test]
+    fn library_projection_keeps_empty_sources_during_incremental_loading() {
+        let library = test_library(
+            "shell:library:incremental",
+            "Incremental",
+            vec![
+                Some(PathBuf::from(r"C:\First")),
+                Some(PathBuf::from(r"D:\Second")),
+            ],
+            None,
+        );
+        let first_batch = vec![library_projection_entry(1, 1, r"D:\Second\one.txt")];
+        let mut second_batch = first_batch.clone();
+        second_batch.push(library_projection_entry(2, 1, r"D:\Second\two.txt"));
+
+        let first = library_source_group_projections(&library, &first_batch);
+        let second = library_source_group_projections(&library, &second_batch);
+
+        assert!(first[0].entries.is_empty());
+        assert_eq!(first[1].entries, [EntryId(1)]);
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[1].entries, [EntryId(1), EntryId(2)]);
+        assert_eq!(first[1].key, second[1].key);
+    }
+
+    #[test]
+    fn library_projection_uses_source_identity_instead_of_path_spelling() {
+        let library = test_library(
+            "shell:library:duplicate-path",
+            "Duplicate path",
+            vec![
+                Some(PathBuf::from(r"C:\Same")),
+                Some(PathBuf::from(r"C:\Same")),
+            ],
+            None,
+        );
+        let entries = vec![
+            library_projection_entry(1, 0, r"c:\same\first.txt"),
+            library_projection_entry(2, 1, r"C:\SAME\second.txt"),
+        ];
+
+        let groups = library_source_group_projections(&library, &entries);
+        let projected = groups
+            .iter()
+            .flat_map(|group| group.entries.iter().copied())
+            .collect::<Vec<_>>();
+
+        assert_eq!(groups[0].entries, [EntryId(1)]);
+        assert_eq!(groups[1].entries, [EntryId(2)]);
+        assert_eq!(projected, [EntryId(1), EntryId(2)]);
+    }
+
+    #[test]
+    fn grid_thumbnail_range_accounts_for_library_group_header_height() {
+        let extents = [48.0, 140.0, 48.0, 140.0];
+        assert_eq!(
+            grid_thumbnail_request_rows(&extents, -188.0, 140.0, 0.0),
+            vec![1, 2, 3]
+        );
     }
 
     #[test]
@@ -23324,6 +23563,7 @@ mod tests {
             path: PathBuf::from("same/file.txt"),
             kind: crate::domain::EntryKind::File,
             open_target: None,
+            library_source_index: None,
             parent_display: "same".into(),
             size_bytes: Some(1),
             folder_size: crate::domain::FolderSizeState::Unknown,
@@ -23632,6 +23872,7 @@ mod tests {
             path: PathBuf::from("same/file.txt"),
             kind: crate::domain::EntryKind::File,
             open_target: None,
+            library_source_index: None,
             parent_display: "same".into(),
             size_bytes: Some(1),
             folder_size: crate::domain::FolderSizeState::Unknown,
@@ -23730,6 +23971,7 @@ mod tests {
             name_highlights: Vec::new(),
             kind: crate::domain::EntryKind::Directory,
             open_target: None,
+            library_source_index: None,
             parent_display: r"C:\current".into(),
             size_bytes: None,
             folder_size: FolderSizeState::Querying,
@@ -23798,6 +24040,7 @@ mod tests {
             path: PathBuf::from(path),
             kind: crate::domain::EntryKind::File,
             open_target: None,
+            library_source_index: None,
             parent_display: String::new(),
             size_bytes: Some(1),
             folder_size: crate::domain::FolderSizeState::Unknown,
@@ -24128,6 +24371,7 @@ mod tests {
                 name_highlights: Vec::new(),
                 kind: crate::domain::EntryKind::File,
                 open_target: None,
+                library_source_index: None,
                 parent_display: "C:/test".into(),
                 size_bytes: Some(1),
                 folder_size: crate::domain::FolderSizeState::Unknown,
@@ -24205,6 +24449,7 @@ mod tests {
                             path: PathBuf::from(format!(r"C:\test\{id}.txt")),
                             kind: crate::domain::EntryKind::File,
                             open_target: None,
+                            library_source_index: None,
                             parent_display: "C:/test".into(),
                             size_bytes: Some(1),
                             folder_size: crate::domain::FolderSizeState::Unknown,
@@ -24276,6 +24521,7 @@ mod tests {
                     path: PathBuf::from(r"C:\test\file.txt"),
                     kind: crate::domain::EntryKind::File,
                     open_target: None,
+                    library_source_index: None,
                     parent_display: String::new(),
                     size_bytes: Some(1),
                     folder_size: crate::domain::FolderSizeState::Unknown,
@@ -24290,6 +24536,7 @@ mod tests {
                     path: PathBuf::from(r"C:\test\folder"),
                     kind: crate::domain::EntryKind::Directory,
                     open_target: None,
+                    library_source_index: None,
                     parent_display: String::new(),
                     size_bytes: None,
                     folder_size: crate::domain::FolderSizeState::Unknown,
@@ -24664,6 +24911,7 @@ mod tests {
                 .map(|_| GridRow {
                     group_header: false,
                     group_label: "".into(),
+                    group_detail: "".into(),
                     group_count: 0,
                     entries: ModelRc::new(VecModel::from(vec![empty_file_row(); 6])),
                 })

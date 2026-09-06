@@ -21,6 +21,7 @@ pub struct GroupProjectionContext {
 pub struct GroupProjection {
     pub key: String,
     pub label: String,
+    pub detail: String,
     pub entries: Vec<EntryId>,
     pub header_visible: bool,
 }
@@ -60,6 +61,7 @@ impl GroupProjectionBuilder {
                 .or_insert_with(|| GroupProjection {
                     key: bucket.key,
                     label: bucket.label,
+                    detail: String::new(),
                     entries: Vec::new(),
                     header_visible: self.field != GroupField::None,
                 })
@@ -93,6 +95,7 @@ pub enum ListVisualRow {
     GroupHeader {
         key: String,
         label: String,
+        detail: String,
         entry_count: usize,
     },
     Entry {
@@ -160,6 +163,7 @@ impl ListProjection {
                 rows.push(ListVisualRow::GroupHeader {
                     key: group.key.clone(),
                     label: group.label.clone(),
+                    detail: group.detail.clone(),
                     entry_count: group.entries.len(),
                 });
                 extents.push(header_extent);
@@ -191,6 +195,7 @@ pub enum IconVisualRow {
     GroupHeader {
         key: String,
         label: String,
+        detail: String,
         entry_count: usize,
     },
     Entries {
@@ -229,6 +234,7 @@ impl IconProjection {
                 rows.push(IconVisualRow::GroupHeader {
                     key: group.key.clone(),
                     label: group.label.clone(),
+                    detail: group.detail.clone(),
                     entry_count: group.entries.len(),
                 });
                 extents.push(header_extent);
@@ -516,6 +522,7 @@ mod tests {
             path: PathBuf::from(name),
             kind,
             open_target: None,
+            library_source_index: None,
             parent_display: String::new(),
             size_bytes: size,
             folder_size: FolderSizeState::Unknown,

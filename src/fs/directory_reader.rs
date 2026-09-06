@@ -117,7 +117,7 @@ pub fn read_aggregate_directory_batches_filtered(
     let mut batch = Vec::with_capacity(batch_limit);
     let mut next_id = 1_u32;
 
-    for source in sources {
+    for (source_index, source) in sources.iter().enumerate() {
         if cancel.load(AtomicOrdering::Acquire) {
             aggregate.cancelled = true;
             aggregate.sources.push(SourceReadOutcome {
@@ -165,12 +165,9 @@ pub fn read_aggregate_directory_batches_filtered(
                 source_cancelled = true;
                 break;
             }
-            batch.push(file_entry(
-                directory_entry.file_name(),
-                path,
-                metadata,
-                next_id,
-            ));
+            let mut entry = file_entry(directory_entry.file_name(), path, metadata, next_id);
+            entry.library_source_index = Some(source_index);
+            batch.push(entry);
             next_id = next_id.checked_add(1).expect("directory entry ID overflow");
 
             if batch.len() == batch_limit {
@@ -229,6 +226,7 @@ fn file_entry(
         path: path.clone(),
         kind,
         open_target,
+        library_source_index: None,
         parent_display: path
             .parent()
             .map(|value| value.as_os_str().to_string_lossy().into_owned())
@@ -380,6 +378,8 @@ mod tests {
                 .iter()
                 .any(|entry| entry.path == second.join("same.txt"))
         );
+        assert_eq!(entries[0].library_source_index, Some(0));
+        assert_eq!(entries[1].library_source_index, Some(1));
     }
 
     #[test]

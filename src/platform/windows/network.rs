@@ -1520,6 +1520,7 @@ fn enumerate_directory(
             path: entry_path.clone(),
             kind,
             open_target: None,
+            library_source_index: None,
             parent_display: entry_path
                 .parent()
                 .map(|value| value.as_os_str().to_string_lossy().into_owned())
@@ -1619,6 +1620,7 @@ fn read_directory_result(path: &Path) -> io::Result<(Vec<FileEntry>, usize, bool
             path: entry_path.clone(),
             kind,
             open_target: None,
+            library_source_index: None,
             parent_display: entry_path
                 .parent()
                 .map(|value| value.as_os_str().to_string_lossy().into_owned())
@@ -2014,6 +2016,7 @@ mod isolated_codec_tests {
             path: entry_path.clone(),
             kind: crate::domain::EntryKind::File,
             open_target: None,
+            library_source_index: None,
             parent_display: String::new(),
             size_bytes: Some(123),
             folder_size: crate::domain::FolderSizeState::Unknown,

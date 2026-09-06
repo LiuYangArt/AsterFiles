@@ -38,6 +38,7 @@ impl LibraryId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibrarySource {
     pub shell_identity: OsString,
+    pub display_name: OsString,
     pub path: Option<PathBuf>,
 }
 
@@ -173,8 +174,14 @@ fn library_sources(library: &IShellLibrary) -> io::Result<Vec<LibrarySource>> {
                 .map(|path| path.as_os_str().to_owned())
                 .ok_or_else(|| io::Error::other("library source has no stable Shell identity"))
         })?;
+        let display_name = shell_name(&item, SIGDN_NORMALDISPLAY).unwrap_or_else(|_| {
+            path.as_ref()
+                .and_then(|path| path.file_name().map(OsStr::to_owned))
+                .unwrap_or_else(|| shell_identity.clone())
+        });
         sources.push(LibrarySource {
             shell_identity,
+            display_name,
             path,
         });
     }
@@ -237,10 +244,12 @@ mod tests {
         let sources = [
             LibrarySource {
                 shell_identity: OsString::from(r"C:\first\same.txt"),
+                display_name: OsString::from("same"),
                 path: Some(PathBuf::from(r"C:\first\same.txt")),
             },
             LibrarySource {
                 shell_identity: OsString::from(r"D:\second\same.txt"),
+                display_name: OsString::from("same"),
                 path: Some(PathBuf::from(r"D:\second\same.txt")),
             },
         ];

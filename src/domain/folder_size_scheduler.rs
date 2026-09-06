@@ -310,6 +310,7 @@ mod tests {
             path: PathBuf::from(format!(r"C:\sizes\{name}")),
             kind: EntryKind::Directory,
             open_target: None,
+            library_source_index: None,
             parent_display: r"C:\sizes".to_owned(),
             size_bytes: None,
             folder_size: FolderSizeState::Unknown,

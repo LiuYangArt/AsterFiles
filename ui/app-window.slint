@@ -3,8 +3,8 @@ import { IconMap } from "icons/icon-map.slint";
 export { PopupCommandRow, QuickMenuWindow, QuickSubmenuWindow } from "quick-menu.slint";
 
 export struct HighlightSegment { text: string, highlighted: bool }
-export struct FileRow { id: int, loaded: bool, group-header: bool, group-label: string, group-count: int, name: string, name-segments: [HighlightSegment], kind: string, parent-path: string, size: string, modified: string, created: string, is-directory: bool, selected: bool, focused: bool, cut: bool, icon: image }
-export struct GridRow { group-header: bool, group-label: string, group-count: int, entries: [FileRow] }
+export struct FileRow { id: int, loaded: bool, group-header: bool, group-label: string, group-detail: string, group-count: int, name: string, name-segments: [HighlightSegment], kind: string, parent-path: string, size: string, modified: string, created: string, is-directory: bool, selected: bool, focused: bool, cut: bool, icon: image }
+export struct GridRow { group-header: bool, group-label: string, group-detail: string, group-count: int, entries: [FileRow] }
 export struct HistoryRow { index: int, label: string }
 export struct BreadcrumbRow { index: int, label: string, current: bool }
 export struct TabRow { id: int, title: string, active: bool, loading: bool, icon: image, is-drive: bool, is-settings: bool }
@@ -1693,13 +1693,14 @@ list := ListView {
                         for entry in root.files: Rectangle {
                             width: root.view-mode == 0 ? max(list.width, root.file-columns-width + 16px) : list.width;
                             x: 0px;
-                            height: entry.group-header ? 28px : root.view-row-height(root.view-mode);
+                            height: entry.group-header ? (entry.group-detail == "" ? 32px : 48px) : root.view-row-height(root.view-mode);
                             background: VisualStyle.cffffff;
                             opacity: entry.group-header ? 1 : (!entry.loaded ? 0 : (entry.cut ? 0.52 : 1));
                             if entry.group-header: Rectangle {
                                 x: 12px; width: parent.width - 24px; height: parent.height;
-                                Text { x: 4px; width: parent.width - 90px; text: entry.group-label; color: VisualStyle.c30333a; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: elide; }
-                                Text { x: parent.width - 82px; width: 78px; text: entry.group-count; color: VisualStyle.c72747d; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+                                Text { x: 4px; y: 5px; width: parent.width - 90px; height: 20px; text: entry.group-label; color: VisualStyle.c30333a; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: elide; }
+                                Text { x: 4px; y: 25px; width: parent.width - 8px; height: 18px; text: entry.group-detail; color: VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; overflow: elide; }
+                                Text { x: parent.width - 82px; y: 5px; width: 78px; height: 20px; text: entry.group-count; color: VisualStyle.c72747d; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
                             }
                             Rectangle {
                                 visible: !entry.group-header;
@@ -1955,14 +1956,15 @@ accessible-label: entry.name;
                         changed visible-height => { self.sync-file-geometry(); }
                         changed viewport-y => { if root.is-grid-view-mode(root.view-mode) { root.file-viewport-y = self.viewport-y; if !root.search-results-mode { root.request-folder-size-range(self.viewport-y / 1px, self.visible-height / 1px); } } }
                         for row in root.grid-rows: HorizontalLayout {
-                            height: row.group-header ? 28px : root.view-row-height(root.view-mode);
+                            height: row.group-header ? (row.group-detail == "" ? 32px : 48px) : root.view-row-height(root.view-mode);
                             padding-left: 16px;
                             padding-right: 16px;
                             spacing: 8px;
                             if row.group-header: Rectangle {
                                 width: max(0px, grid.width - 32px); height: parent.height;
-                                Text { x: 16px; width: parent.width - 110px; text: row.group-label; color: VisualStyle.c30333a; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: elide; }
-                                Text { x: parent.width - 92px; width: 76px; text: row.group-count; color: VisualStyle.c72747d; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+                                Text { x: 16px; y: 5px; width: parent.width - 110px; height: 20px; text: row.group-label; color: VisualStyle.c30333a; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: elide; }
+                                Text { x: 16px; y: 25px; width: parent.width - 32px; height: 18px; text: row.group-detail; color: VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; overflow: elide; }
+                                Text { x: parent.width - 92px; y: 5px; width: 76px; height: 20px; text: row.group-count; color: VisualStyle.c72747d; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
                             }
                             for entry in row.entries: Rectangle {
                                 width: root.view-card-width(root.view-mode); height: root.view-row-height(root.view-mode) - 8px;
