@@ -130,7 +130,7 @@ try {
     $versionCommitted = $true
     Invoke-Git tag --annotate $tag --message "AsterFiles $tag"
     $tagCreated = $true
-    Invoke-Git push --atomic origin 'HEAD:refs/heads/main' "refs/tags/$tag:refs/tags/$tag"
+    Invoke-Git push --atomic origin 'HEAD:refs/heads/main' ('refs/tags/{0}:refs/tags/{0}' -f $tag)
 
     [PSCustomObject]@{
         version = $nextVersion
@@ -145,7 +145,7 @@ catch {
     }
     elseif ($versionCommitted) {
         $recovery = if ($tagCreated) {
-            $retryCommand = "git push --atomic origin HEAD:refs/heads/main refs/tags/$tag:refs/tags/$tag"
+            $retryCommand = 'git push --atomic origin HEAD:refs/heads/main refs/tags/{0}:refs/tags/{0}' -f $tag
             "The local release commit and tag '$tag' were kept. Do not run publish.ps1 again. Resolve the error, then retry with: $retryCommand"
         }
         else {
