@@ -84,6 +84,8 @@ cargo run -- --agent-scenario folder-size-scheduler --no-ui --agent-state-out ar
 cargo run -- --agent-scenario quick-menu-search --no-ui --agent-state-out artifacts/state/context-menu/search.json
 ```
 
+该状态同时证明单一“新建”根项、自有“文件夹”首项、Shell 重复文件夹过滤，以及其余模板顺序和原始命令身份保留。
+
 产物记录大小写搜索、中文搜索、空结果、原始 Shell command ID 保留，以及过滤不会发起 Shell 查询。专项单元测试：
 
 ```powershell

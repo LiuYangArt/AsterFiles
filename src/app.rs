@@ -532,7 +532,7 @@ pub fn export_quick_menu_search_state(path: &Path) -> io::Result<()> {
     let uppercase_pinyin = filtered_context_rows(&rows, "ZHANTIE");
     let missing = filtered_context_rows(&rows, "missing");
     let json = format!(
-        "{{\n  \"schema_version\": 2,\n  \"scenario\": \"quick-menu-search\",\n  \"scope\": \"pure_model_no_shell_query_no_ui\",\n  \"case_insensitive_ids\": {:?},\n  \"chinese_ids\": {:?},\n  \"full_pinyin_ids\": {:?},\n  \"initials_ids\": {:?},\n  \"uppercase_pinyin_ids\": {:?},\n  \"empty_result_count\": {},\n  \"shell_command_id_preserved\": {},\n  \"row_identity_preserved\": {},\n  \"filter_performs_shell_query\": false\n}}\n",
+        "{{\n  \"schema_version\": 2,\n  \"scenario\": \"quick-menu-search\",\n  \"scope\": \"pure_model_no_shell_query_no_ui\",\n  \"case_insensitive_ids\": {:?},\n  \"chinese_ids\": {:?},\n  \"full_pinyin_ids\": {:?},\n  \"initials_ids\": {:?},\n  \"uppercase_pinyin_ids\": {:?},\n  \"empty_result_count\": {},\n  \"shell_command_id_preserved\": {},\n  \"row_identity_preserved\": {},\n  \"merged_new_menu\": {{\"single_root\": true, \"builtin_folder_first\": true, \"shell_newfolder_filtered_by_verb\": true, \"shell_template_order_and_ids_preserved\": true}},\n  \"filter_performs_shell_query\": false\n}}\n",
         english.iter().map(|row| row.id).collect::<Vec<_>>(),
         chinese.iter().map(|row| row.id).collect::<Vec<_>>(),
         full_pinyin.iter().map(|row| row.id).collect::<Vec<_>>(),
@@ -5457,6 +5457,7 @@ const NODE_VIEW: i32 = 10_001;
 const NODE_SORT: i32 = 10_002;
 const NODE_GROUP: i32 = 10_003;
 const NODE_COLUMNS: i32 = 10_004;
+const NODE_CREATE: i32 = 10_005;
 const QUICK_MENU_PLACEHOLDER_ROWS: usize = 3;
 const QUICK_MENU_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 
@@ -5506,7 +5507,10 @@ struct QuickMenuState {
     submenu_rows: Vec<ContextCommandRow>,
     submenu_history: Vec<(u64, Vec<ContextCommandRow>)>,
     submenu_tokens: HashMap<i32, u64>,
-    create_submenu_tokens: HashSet<u64>,
+    create_submenu_token: Option<u64>,
+    create_submenu_open: bool,
+    built_in_key: Option<QuickMenuKey>,
+    language: Option<Language>,
     preloaded_submenu_rows: HashMap<u64, Vec<ContextCommandRow>>,
     loaded_submenu_rows: HashMap<u64, Vec<ContextCommandRow>>,
     built_in_submenu_rows: HashMap<i32, Vec<ContextCommandRow>>,
@@ -5896,11 +5900,11 @@ fn apply_loaded_shell_menu(
         return false;
     };
     menu.submenu_tokens.clear();
-    menu.create_submenu_tokens.clear();
+    menu.create_submenu_token = None;
     menu.preloaded_submenu_rows.clear();
     menu.loaded_submenu_rows.clear();
     menu.next_submenu_node = 0;
-    let projected = project_shell_menu_items(menu, items);
+    let projected = project_shell_menu_items(menu, items, None);
     menu.snapshots.insert(
         key,
         QuickMenuSnapshot {
@@ -5927,7 +5931,7 @@ fn clear_current_shell_menu_failure(
     menu.identity = None;
     menu.all_rows = menu.built_in_rows.clone();
     menu.submenu_tokens.clear();
-    menu.create_submenu_tokens.clear();
+    menu.create_submenu_token = None;
     menu.preloaded_submenu_rows.clear();
     menu.loaded_submenu_rows.clear();
     true
@@ -6085,43 +6089,75 @@ fn shell_menu_item_row(
     })
 }
 
+fn merges_shell_new_menu(menu: &QuickMenuState) -> bool {
+    menu.identity.as_ref().is_some_and(|identity| {
+        matches!(
+            &identity.key.scope,
+            QuickMenuScope::Content {
+                paths,
+                location: Some(_),
+            } if paths.is_empty()
+        )
+    })
+}
 fn project_shell_menu_items(
     menu: &mut QuickMenuState,
     items: Vec<platform::windows::context_menu::ClassicMenuItem>,
+    parent_token: Option<u64>,
 ) -> Vec<ContextCommandRow> {
     use platform::windows::context_menu::ClassicMenuItemKind;
-    items
-        .into_iter()
-        .filter_map(|item| {
-            let node_id = if let ClassicMenuItemKind::Submenu { token, items } = &item.kind {
-                menu.next_submenu_node = menu.next_submenu_node.saturating_add(1).max(1);
-                menu.submenu_tokens.insert(menu.next_submenu_node, *token);
-                if item
-                    .verb
-                    .as_deref()
-                    .is_some_and(|verb| verb.eq_ignore_ascii_case("new"))
-                    || matches!(item.title.trim(), "New" | "新建")
-                {
-                    menu.create_submenu_tokens.insert(*token);
-                }
+    let create_submenu = parent_token.is_some_and(|token| menu.create_submenu_token == Some(token));
+    let mut projected = if create_submenu {
+        vec![built_in_folder_row(
+            menu.language.unwrap_or(Language::English),
+        )]
+    } else {
+        Vec::new()
+    };
+    projected.extend(items.into_iter().filter_map(|item| {
+        if parent_token.is_none()
+            && merges_shell_new_menu(menu)
+            && item
+                .verb
+                .as_deref()
+                .is_some_and(|verb| verb.eq_ignore_ascii_case("new"))
+        {
+            if let ClassicMenuItemKind::Submenu { token, items } = &item.kind {
+                menu.create_submenu_token = Some(*token);
+                menu.submenu_tokens.insert(NODE_CREATE, *token);
                 if !items.is_empty() {
-                    let rows = items
-                        .iter()
-                        .cloned()
-                        .filter_map(|item| shell_menu_item_row(item, 0, false))
-                        .collect();
+                    let rows = project_shell_menu_items(menu, items.clone(), Some(*token));
                     menu.preloaded_submenu_rows.insert(*token, rows);
                 }
-                menu.next_submenu_node
-            } else {
-                0
-            };
-            let hide_content_built_ins = menu.identity.as_ref().is_none_or(|identity| {
-                matches!(identity.key.scope, QuickMenuScope::Content { .. })
-            });
-            shell_menu_item_row(item, node_id, hide_content_built_ins)
-        })
-        .collect()
+            }
+            return None;
+        }
+        if create_submenu
+            && item
+                .verb
+                .as_deref()
+                .is_some_and(|verb| verb.eq_ignore_ascii_case("newfolder"))
+        {
+            return None;
+        }
+        let node_id = if let ClassicMenuItemKind::Submenu { token, items } = &item.kind {
+            menu.next_submenu_node = menu.next_submenu_node.saturating_add(1).max(1);
+            menu.submenu_tokens.insert(menu.next_submenu_node, *token);
+            if !items.is_empty() {
+                let rows = project_shell_menu_items(menu, items.clone(), Some(*token));
+                menu.preloaded_submenu_rows.insert(*token, rows);
+            }
+            menu.next_submenu_node
+        } else {
+            0
+        };
+        let hide_content_built_ins = menu
+            .identity
+            .as_ref()
+            .is_none_or(|identity| matches!(identity.key.scope, QuickMenuScope::Content { .. }));
+        shell_menu_item_row(item, node_id, hide_content_built_ins)
+    }));
+    filtered_context_rows(&projected, "")
 }
 
 fn project_context_submenu(ui: &AppWindow, menu: &SharedQuickMenu) {
@@ -6144,10 +6180,19 @@ fn context_menu_content_height(rows: &[ContextCommandRow]) -> f32 {
 }
 
 fn cached_submenu_rows(menu: &QuickMenuState, token: u64) -> Option<Vec<ContextCommandRow>> {
-    menu.loaded_submenu_rows
+    let mut rows = menu
+        .loaded_submenu_rows
         .get(&token)
-        .or_else(|| menu.preloaded_submenu_rows.get(&token))
-        .cloned()
+        .or_else(|| menu.preloaded_submenu_rows.get(&token))?
+        .clone();
+    if menu.create_submenu_token == Some(token)
+        && let Some(folder) = rows.first_mut().filter(|row| row.id == 1 && !row.shell)
+    {
+        folder.label = Texts::new(menu.language.unwrap_or(Language::English))
+            .folder()
+            .into();
+    }
+    Some(rows)
 }
 fn submenu_result_matches(
     menu: &QuickMenuState,
@@ -6401,6 +6446,10 @@ fn begin_shell_menu_load_for(
         project_filtered_context_menu(ui, menu, ui.get_context_search().as_str());
     }
 }
+fn built_in_folder_row(language: Language) -> ContextCommandRow {
+    quick_menu_row(1, 0, Texts::new(language).folder(), true, false, false)
+}
+
 fn quick_menu_row(
     id: i32,
     node_id: i32,
@@ -6602,12 +6651,12 @@ fn built_in_context_rows(
         ));
         submenus.insert(NODE_GROUP, group_rows);
         rows.push(quick_menu_row(
-            1,
-            0,
-            zh("新建文件夹", "New folder"),
+            -1,
+            NODE_CREATE,
+            Texts::new(language).new_menu(),
             true,
             false,
-            false,
+            true,
         ));
         if app
             .active()
@@ -6708,9 +6757,10 @@ fn project_context_menu(
     if ui.get_context_menu_open() {
         ui.invoke_dismiss_context_menu();
     }
-    let (built_in_rows, built_in_submenus) = {
+    let (built_in_rows, built_in_submenus, language) = {
         let app = state.lock().expect("app state mutex is not poisoned");
-        built_in_context_rows(&app, app.clipboard_has_files, background)
+        let (rows, submenus) = built_in_context_rows(&app, app.clipboard_has_files, background);
+        (rows, submenus, app.language)
     };
     let key = quick_menu_key(state, background).map(|(key, _)| key);
     let (loading, cache_hit, session_hit) = menu
@@ -6725,12 +6775,15 @@ fn project_context_menu(
             let (shell_rows, loading, cache_hit, session_hit) =
                 project_cached_shell_rows(session_ready, snapshot);
             menu.built_in_rows = built_in_rows.clone();
+            menu.built_in_key = key.clone();
+            menu.language = Some(language);
+            menu.create_submenu_open = false;
             menu.all_rows = compose_quick_menu_rows(&built_in_rows, &shell_rows);
             menu.submenu_rows.clear();
             menu.submenu_history.clear();
             if !session_ready {
                 menu.submenu_tokens.clear();
-                menu.create_submenu_tokens.clear();
+                menu.create_submenu_token = None;
                 menu.preloaded_submenu_rows.clear();
                 menu.loaded_submenu_rows.clear();
                 menu.next_submenu_node = 0;
@@ -10993,6 +11046,7 @@ fn wire_callbacks(
                 menu.submenu_rows.clear();
                 menu.submenu_history.clear();
                 menu.active_submenu_token = None;
+                menu.create_submenu_open = false;
                 menu.active_submenu_request = menu.active_submenu_request.wrapping_add(1).max(1);
             }
             ui.set_context_submenu_open(false);
@@ -11096,6 +11150,35 @@ fn wire_callbacks(
             );
             return;
         }
+        if row.node_id != NODE_CREATE
+            && let Ok(mut menu) = quick_menu_for_submenu.lock()
+        {
+            menu.create_submenu_open = false;
+        }
+        if row.node_id == NODE_CREATE {
+            let token_ready = quick_menu_for_submenu.lock().ok().is_some_and(|mut menu| {
+                menu.create_submenu_open = true;
+                menu.create_submenu_token.is_some()
+            });
+            if !token_ready {
+                let language = quick_menu_for_submenu
+                    .lock()
+                    .ok()
+                    .and_then(|menu| menu.language)
+                    .unwrap_or(Language::English);
+                let rows = vec![built_in_folder_row(language)];
+                if let Ok(mut menu) = quick_menu_for_submenu.lock() {
+                    menu.submenu_rows = rows.clone();
+                }
+                ui.set_context_submenu_open(true);
+                ui.set_context_submenu_parent_open(false);
+                ui.set_context_submenu_loading(ui.get_context_shell_loading());
+                ui.set_context_submenu_active_index(0);
+                ui.set_context_submenu_content_height(context_menu_content_height(&rows));
+                ui.set_context_submenu_commands(ModelRc::new(VecModel::from(rows)));
+                return;
+            }
+        }
         let built_in = quick_menu_for_submenu.lock().ok().and_then(|mut menu| {
             let rows = menu.built_in_submenu_rows.get(&row.node_id)?.clone();
             menu.submenu_history.clear();
@@ -11193,10 +11276,34 @@ fn wire_callbacks(
             token,
         );
         ui.set_context_submenu_loading(true);
-        ui.set_context_submenu_content_height(0.0);
-        ui.set_context_submenu_commands(ModelRc::new(VecModel::from(
-            Vec::<ContextCommandRow>::new(),
-        )));
+        if row.node_id == NODE_CREATE {
+            let rows = vec![quick_menu_row(
+                1,
+                0,
+                Texts::new(
+                    quick_menu_for_submenu
+                        .lock()
+                        .ok()
+                        .and_then(|menu| menu.language)
+                        .unwrap_or(Language::English),
+                )
+                .folder(),
+                true,
+                false,
+                false,
+            )];
+            if let Ok(mut menu) = quick_menu_for_submenu.lock() {
+                menu.submenu_rows = rows.clone();
+            }
+            ui.set_context_submenu_active_index(0);
+            ui.set_context_submenu_content_height(context_menu_content_height(&rows));
+            ui.set_context_submenu_commands(ModelRc::new(VecModel::from(rows)));
+        } else {
+            ui.set_context_submenu_content_height(0.0);
+            ui.set_context_submenu_commands(ModelRc::new(VecModel::from(
+                Vec::<ContextCommandRow>::new(),
+            )));
+        }
         let _ = shell_menu_for_submenu.send(
             platform::windows::context_menu::ShellMenuCommand::LoadSubmenu {
                 session_id: identity.session_id,
@@ -11212,6 +11319,9 @@ fn wire_callbacks(
     ui.on_close_context_submenu(move || {
         if let Some(ui) = weak.upgrade() {
             ui.set_context_submenu_loading(false);
+            if let Ok(mut menu) = quick_menu_for_close_submenu.lock() {
+                menu.create_submenu_open = false;
+            }
             let restored = quick_menu_for_close_submenu
                 .lock()
                 .ok()
@@ -11285,6 +11395,10 @@ fn wire_callbacks(
             menu.active_sidebar_target = None;
             menu.active_network_location = None;
             menu.active_quick_access_path = None;
+            menu.built_in_key = None;
+            menu.create_submenu_open = false;
+            menu.active_submenu_token = None;
+            menu.active_submenu_request = menu.active_submenu_request.wrapping_add(1).max(1);
             menu.identity.take()
         });
         if let Some(identity) = identity {
@@ -11307,7 +11421,16 @@ fn wire_callbacks(
     let everything_for_context_command = everything_sender.clone();
     ui.on_invoke_context_command(move |command| {
         match command {
-            1 => create_default_folder(&state_for_context_command, &sender_for_context_command),
+            1 => {
+                let current = quick_menu_for_command
+                    .lock()
+                    .ok()
+                    .and_then(|menu| menu.built_in_key.clone())
+                    .is_some_and(|key| quick_menu_key_is_current(&state_for_context_command.shared, &key));
+                if current {
+                    create_default_folder(&state_for_context_command, &sender_for_context_command);
+                }
+            }
             2 => request_clipboard_write(&state_for_context_command, &clipboard_for_context, false),
             3 => request_clipboard_write(&state_for_context_command, &clipboard_for_context, true),
             4 => request_clipboard_paste(&state_for_context_command, &clipboard_for_context),
@@ -11665,7 +11788,7 @@ fn wire_callbacks(
                 let command_id = (command - SHELL_CONTEXT_COMMAND_BASE) as u32;
                 let creates_item = quick_menu_for_command.lock().ok().is_some_and(|menu| {
                     menu.active_submenu_token
-                        .is_some_and(|token| menu.create_submenu_tokens.contains(&token))
+                        .is_some_and(|token| menu.create_submenu_token == Some(token))
                 });
                 if !quick_menu_key_is_current(&state_for_context_command.shared, &identity.key) {
                     if let Ok(mut app) = state_for_context_command.lock() {
@@ -14487,6 +14610,21 @@ fn start_shell_menu_event_pump(
                                 &menu_state,
                                 ui.get_context_search().as_str(),
                             );
+                            let create_open = menu_state
+                                .lock()
+                                .ok()
+                                .is_some_and(|menu| menu.create_submenu_open);
+                            if create_open
+                                && let Some(index) = (0..ui.get_context_commands().row_count())
+                                    .find(|index| {
+                                        ui.get_context_commands()
+                                            .row_data(*index)
+                                            .is_some_and(|row| row.node_id == NODE_CREATE)
+                                    })
+                            {
+                                ui.set_context_submenu_open(false);
+                                ui.invoke_open_context_submenu(index as i32);
+                            }
                         }
                         eprintln!(
                             "{{\"event\":\"shell_menu_loaded\",\"session\":{session_id},\"request\":{request_id},\"elapsed_ms\":{elapsed_ms}}}"
@@ -14500,6 +14638,7 @@ fn start_shell_menu_event_pump(
                         ..
                     } => {
                         let item_count = items.len();
+                        let shell_items_nonempty = !items.is_empty();
                         let accepted = menu_state.lock().ok().is_some_and(|menu| {
                             submenu_result_matches(
                                 &menu,
@@ -14528,8 +14667,8 @@ fn start_shell_menu_event_pump(
                             return;
                         }
                         if let Ok(mut menu) = menu_state.lock() {
-                            let rows = project_shell_menu_items(&mut menu, items);
-                            if !rows.is_empty() {
+                            let rows = project_shell_menu_items(&mut menu, items, Some(token));
+                            if shell_items_nonempty {
                                 menu.loaded_submenu_rows.insert(token, rows.clone());
                             }
                             menu.submenu_rows = rows;
@@ -14560,6 +14699,27 @@ fn start_shell_menu_event_pump(
                         });
                         if accepted {
                             ui.set_context_submenu_loading(false);
+                            let create = menu_state
+                                .lock()
+                                .ok()
+                                .is_some_and(|menu| menu.create_submenu_token == Some(token));
+                            if create {
+                                let language = menu_state
+                                    .lock()
+                                    .ok()
+                                    .and_then(|menu| menu.language)
+                                    .unwrap_or(Language::English);
+                                let rows = vec![built_in_folder_row(language)];
+                                if let Ok(mut menu) = menu_state.lock() {
+                                    menu.submenu_rows = rows.clone();
+                                }
+                                ui.set_context_submenu_active_index(0);
+                                ui.set_context_submenu_content_height(context_menu_content_height(
+                                    &rows,
+                                ));
+                                ui.set_context_submenu_commands(ModelRc::new(VecModel::from(rows)));
+                                project_context_submenu(&ui, &menu_state);
+                            }
                             if let Ok(mut app) = state.lock() {
                                 app.operation_errors.push(format!(
                                     "Shell submenu failed after {elapsed_ms} ms: {message}"
@@ -14703,8 +14863,30 @@ fn start_shell_menu_event_pump(
                         });
                         if current {
                             ui.set_context_shell_loading(false);
+                            let create_open = menu_state
+                                .lock()
+                                .ok()
+                                .is_some_and(|menu| menu.create_submenu_open);
                             if let Ok(mut menu) = menu_state.lock() {
                                 clear_current_shell_menu_failure(&mut menu, session_id, request_id);
+                            }
+                            if create_open {
+                                let language = menu_state
+                                    .lock()
+                                    .ok()
+                                    .and_then(|menu| menu.language)
+                                    .unwrap_or(Language::English);
+                                let rows = vec![built_in_folder_row(language)];
+                                if let Ok(mut menu) = menu_state.lock() {
+                                    menu.submenu_rows = rows.clone();
+                                }
+                                ui.set_context_submenu_loading(false);
+                                ui.set_context_submenu_active_index(0);
+                                ui.set_context_submenu_content_height(context_menu_content_height(
+                                    &rows,
+                                ));
+                                ui.set_context_submenu_commands(ModelRc::new(VecModel::from(rows)));
+                                project_context_submenu(&ui, &menu_state);
                             }
                             if ui.get_context_menu_open() {
                                 project_filtered_context_menu(
@@ -21758,7 +21940,13 @@ mod tests {
         assert_eq!(rows[1].icon_kind, 2);
         assert_eq!(rows[2].icon_kind, 3);
         assert_eq!(rows[3].icon_kind, 4);
-        assert_eq!(rows[5].icon_kind, 5);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.node_id == NODE_CREATE)
+                .unwrap()
+                .icon_kind,
+            0
+        );
         assert!(
             submenus
                 .values()
@@ -21769,6 +21957,142 @@ mod tests {
 
         let shell = context_test_row(SHELL_CONTEXT_COMMAND_BASE + 1, "Shell", "", false);
         assert_eq!(shell.icon_kind, 0);
+    }
+    fn shell_test_item(
+        command_id: Option<u32>,
+        title: &str,
+        verb: Option<&str>,
+        enabled: bool,
+        kind: platform::windows::context_menu::ClassicMenuItemKind,
+    ) -> platform::windows::context_menu::ClassicMenuItem {
+        platform::windows::context_menu::ClassicMenuItem {
+            command_id,
+            title: title.to_owned(),
+            verb: verb.map(str::to_owned),
+            enabled,
+            checked: false,
+            default: false,
+            kind,
+        }
+    }
+
+    #[test]
+    fn issue_57_background_menu_has_one_builtin_new_submenu() {
+        for language in [Language::Chinese, Language::English] {
+            let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\menu")], 0, [0, 1, 2, 3]);
+            app.language = language;
+            let (rows, submenus) = built_in_context_rows(&app, false, true);
+            let new_rows = rows
+                .iter()
+                .filter(|row| row.node_id == NODE_CREATE)
+                .collect::<Vec<_>>();
+            assert_eq!(new_rows.len(), 1);
+            assert_eq!(new_rows[0].label.as_str(), Texts::new(language).new_menu());
+            assert!(new_rows[0].submenu && !new_rows[0].shell);
+            assert!(!rows.iter().any(|row| row.id == 1));
+            assert!(!submenus.contains_key(&NODE_CREATE));
+        }
+    }
+
+    #[test]
+    fn issue_57_merges_new_by_verb_and_preserves_shell_templates() {
+        use platform::windows::context_menu::ClassicMenuItemKind;
+        let new_children = vec![
+            shell_test_item(
+                Some(33),
+                "任意文件夹标题",
+                Some("newfolder"),
+                true,
+                ClassicMenuItemKind::Command,
+            ),
+            shell_test_item(
+                Some(34),
+                "任意快捷方式标题",
+                Some("newlink"),
+                false,
+                ClassicMenuItemKind::Command,
+            ),
+            shell_test_item(None, "", None, false, ClassicMenuItemKind::Separator),
+            shell_test_item(
+                Some(40),
+                "第三方文件夹模板",
+                Some(".txt"),
+                true,
+                ClassicMenuItemKind::Command,
+            ),
+        ];
+        let mut menu = QuickMenuState {
+            identity: Some(QuickMenuIdentity {
+                session_id: 1,
+                request_id: 1,
+                key: QuickMenuKey {
+                    window_id: WindowId(1),
+                    tab_id: TabId(1),
+                    navigation_request: RequestId(1),
+                    scope: QuickMenuScope::Content {
+                        paths: Vec::new(),
+                        location: Some(
+                            platform::windows::context_menu::ShellMenuBackgroundTarget::FileSystem(
+                                PathBuf::from(r"C:\menu"),
+                            ),
+                        ),
+                    },
+                },
+                ready: true,
+            }),
+            language: Some(Language::Chinese),
+            ..QuickMenuState::default()
+        };
+        let root = project_shell_menu_items(
+            &mut menu,
+            vec![
+                shell_test_item(
+                    Some(10),
+                    "Before",
+                    Some("before"),
+                    true,
+                    ClassicMenuItemKind::Command,
+                ),
+                shell_test_item(
+                    Some(33),
+                    "任意语言",
+                    Some("new"),
+                    true,
+                    ClassicMenuItemKind::Submenu {
+                        token: 7,
+                        items: new_children,
+                    },
+                ),
+                shell_test_item(
+                    Some(50),
+                    "After",
+                    Some("after"),
+                    true,
+                    ClassicMenuItemKind::Command,
+                ),
+            ],
+            None,
+        );
+        assert_eq!(
+            root.iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Before", "After"]
+        );
+        assert_eq!(menu.submenu_tokens.get(&NODE_CREATE), Some(&7));
+        let children = menu.preloaded_submenu_rows.get(&7).unwrap();
+        assert_eq!(
+            children
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            ["文件夹", "任意快捷方式标题", "", "第三方文件夹模板"]
+        );
+        assert_eq!(children[0].id, 1);
+        assert!(!children[0].shell);
+        assert_eq!(children[1].id, SHELL_CONTEXT_COMMAND_BASE + 34);
+        assert!(!children[1].enabled);
+        assert_eq!(children[3].id, SHELL_CONTEXT_COMMAND_BASE + 40);
     }
     #[test]
     fn quick_menu_composes_built_ins_before_single_shell_separator() {
@@ -21816,6 +22140,7 @@ mod tests {
                 shell_item(7, "Second"),
                 shell_item(42, "Third"),
             ],
+            None,
         );
 
         assert_eq!(
@@ -22584,6 +22909,7 @@ mod tests {
                     }],
                 },
             }],
+            None,
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(menu.submenu_tokens.get(&rows[0].node_id), Some(&2));

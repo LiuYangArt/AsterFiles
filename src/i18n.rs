@@ -44,6 +44,14 @@ impl Texts {
         self.choose("设置", "Settings")
     }
 
+    pub fn new_menu(self) -> &'static str {
+        self.choose("新建", "New")
+    }
+
+    pub fn folder(self) -> &'static str {
+        self.choose("文件夹", "Folder")
+    }
+
     pub fn search_state(self, state: SearchState) -> &'static str {
         match state {
             SearchState::Waiting => self.choose("输入内容以搜索", "Type to search"),

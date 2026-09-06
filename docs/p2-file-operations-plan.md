@@ -23,7 +23,7 @@ P2 把 AsterFiles 从只读浏览器扩展为可可靠整理本地文件的日�
 
 ### 3.1 P2 必须完成
 
-- 空白处菜单：新建文件夹、粘贴，以及 Windows 提供的目录背景命令。
+- 空白处菜单：单一“新建”子菜单、粘贴，以及 Windows 提供的目录背景命令；“新建”首项文件夹由 AsterFiles 执行，其余模板保持 Windows Shell 原始身份与顺序。
 - 单项和多选菜单：打开、剪切、复制、重命名、删除、永久删除，以及 Windows 和第三方 Shell 扩展提供的命令。
 - `Ctrl+C`、`Ctrl+X`、`Ctrl+V`、`F2`、`Delete`、`Shift+Delete`、菜单键和 `Shift+F10`。
 - 本地磁盘、跨本地磁盘和 UNC/SMB 路径的文件与目录操作。
