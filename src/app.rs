@@ -10987,6 +10987,7 @@ fn wire_callbacks(
     let quick_menu_for_filter = quick_menu.clone();
     ui.on_filter_context_menu(move |query| {
         if let Some(ui) = weak.upgrade() {
+            ui.set_context_search(query.clone());
             ui.invoke_cancel_context_submenu_hover();
             if let Ok(mut menu) = quick_menu_for_filter.lock() {
                 menu.submenu_rows.clear();
@@ -20799,9 +20800,13 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_drop_link(drop_link.into());
     ui.set_text_drop_cancel(drop_cancel.into());
     let (context_search, context_loading, context_empty) = match language {
-        Language::Chinese => ("搜索命令", "正在加载 Windows 菜单…", "没有匹配的命令"),
+        Language::Chinese => (
+            "搜索命令（支持拼音）",
+            "正在加载 Windows 菜单…",
+            "没有匹配的命令",
+        ),
         Language::English => (
-            "Search commands",
+            "Search commands (supports Pinyin)",
             "Loading Windows menu…",
             "No matching commands",
         ),
@@ -22216,6 +22221,43 @@ mod tests {
         );
         assert!(snapshots.contains_key(&first));
         assert!(!snapshots.contains_key(&second));
+    }
+    #[test]
+    fn issue_72_filter_synchronizes_search_before_projection() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/app.rs"));
+        let filter = source
+            .split_once("ui.on_filter_context_menu(move |query| {")
+            .expect("context menu filter exists")
+            .1
+            .split_once("ui.on_move_context_selection")
+            .expect("context menu filter has a callback boundary")
+            .0;
+        let synchronize = filter
+            .find("ui.set_context_search(query.clone());")
+            .expect("filter stores the current search");
+        let project = filter
+            .find("project_filtered_context_menu(&ui, &quick_menu_for_filter, query.as_str());")
+            .expect("filter projects matching rows");
+
+        assert!(synchronize < project);
+    }
+
+    #[test]
+    fn issue_72_search_placeholder_explains_pinyin_support_in_chinese() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().expect("headless app window should initialize");
+
+        apply_ui_texts(&ui, Language::Chinese);
+        assert_eq!(
+            ui.get_text_context_search().as_str(),
+            "搜索命令（支持拼音）"
+        );
+
+        apply_ui_texts(&ui, Language::English);
+        assert_eq!(
+            ui.get_text_context_search().as_str(),
+            "Search commands (supports Pinyin)"
+        );
     }
     #[test]
     fn quick_menu_filter_matches_text_pinyin_initials_and_verb_without_shell_work() {
