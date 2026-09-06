@@ -21407,6 +21407,47 @@ mod tests {
         assert!(shape.contains("x: root.width / 1px; y: root.height / 1px;"));
     }
     #[test]
+    fn issue_67_active_and_hovered_tabs_share_one_corner_radius() {
+        let ui = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
+        let radius = "VisualStyle.tab-corner-radius";
+
+        assert_eq!(
+            ui.matches("out property <length> tab-corner-radius: 7px;")
+                .count(),
+            1
+        );
+        assert_eq!(
+            ui.matches("border-radius: VisualStyle.tab-corner-radius;")
+                .count(),
+            1
+        );
+        assert_eq!(
+            ui.matches("corner-radius: VisualStyle.tab-corner-radius;")
+                .count(),
+            1
+        );
+
+        let tab_visual = ui
+            .split_once("for tab[index] in root.tabs: Rectangle {")
+            .expect("tab visual exists")
+            .1
+            .split_once("tab-touch := TouchArea {")
+            .expect("tab visual has a touch boundary")
+            .0;
+        assert!(tab_visual.contains(&format!("border-radius: {radius};")));
+        assert!(tab_visual.contains(&format!("corner-radius: {radius};")));
+
+        let active_shape = ui
+            .split_once("component ActiveTabShape inherits Rectangle {")
+            .expect("active tab shape exists")
+            .1
+            .split_once("component IconButton inherits Rectangle {")
+            .expect("active tab shape has a component boundary")
+            .0;
+        assert!(active_shape.contains("in property <length> corner-radius;"));
+        assert!(active_shape.contains("root.corner-radius / 1px"));
+    }
+    #[test]
     fn issue_43_file_name_font_size_has_one_semantic_source() {
         let ui = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
         let semantic_font_size = "font-size: VisualStyle.file-name-font-size;";

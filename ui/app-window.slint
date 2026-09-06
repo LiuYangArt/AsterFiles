@@ -57,8 +57,9 @@ export global VisualStyle {
     out property <color> cf8f8f9: dark-theme ? #303030 : #f8f8f9;
     out property <color> cfafbfc: dark-theme ? #272727 : #fafbfc;
     out property <color> cffffff: dark-theme ? #252525 : #ffffff;
-    out property <length> tab-shoulder-width: 7px;
-    out property <length> tab-shoulder-span: 14px;
+    out property <length> tab-corner-radius: 7px;
+    out property <length> tab-shoulder-width: tab-corner-radius;
+    out property <length> tab-shoulder-span: 2 * tab-corner-radius;
     out property <length> file-name-font-size: 12px;
 }
 
@@ -395,6 +396,7 @@ component InlineIcon inherits Rectangle {
 
 component ActiveTabShape inherits Rectangle {
     in property <color> shape-color;
+    in property <length> corner-radius;
     background: transparent;
 
     // One contour prevents independently rasterized pieces from opening seams at fractional positions.
@@ -406,19 +408,19 @@ component ActiveTabShape inherits Rectangle {
         CubicTo {
             control-1-x: 4; control-1-y: root.height / 1px;
             control-2-x: 7; control-2-y: root.height / 1px - 3;
-            x: 7; y: root.height / 1px - 7;
+            x: root.corner-radius / 1px; y: root.height / 1px - root.corner-radius / 1px;
         }
-        LineTo { x: 7; y: 7; }
-        CubicTo { control-1-x: 7; control-1-y: 3; control-2-x: 10; control-2-y: 0; x: 14; y: 0; }
-        LineTo { x: root.width / 1px - 14; y: 0; }
+        LineTo { x: root.corner-radius / 1px; y: root.corner-radius / 1px; }
+        CubicTo { control-1-x: root.corner-radius / 1px; control-1-y: 3; control-2-x: 10; control-2-y: 0; x: 2 * root.corner-radius / 1px; y: 0; }
+        LineTo { x: root.width / 1px - 2 * root.corner-radius / 1px; y: 0; }
         CubicTo {
             control-1-x: root.width / 1px - 10; control-1-y: 0;
-            control-2-x: root.width / 1px - 7; control-2-y: 3;
-            x: root.width / 1px - 7; y: 7;
+            control-2-x: root.width / 1px - root.corner-radius / 1px; control-2-y: 3;
+            x: root.width / 1px - root.corner-radius / 1px; y: root.corner-radius / 1px;
         }
-        LineTo { x: root.width / 1px - 7; y: root.height / 1px - 7; }
+        LineTo { x: root.width / 1px - root.corner-radius / 1px; y: root.height / 1px - root.corner-radius / 1px; }
         CubicTo {
-            control-1-x: root.width / 1px - 7; control-1-y: root.height / 1px - 3;
+            control-1-x: root.width / 1px - root.corner-radius / 1px; control-1-y: root.height / 1px - 3;
             control-2-x: root.width / 1px - 4; control-2-y: root.height / 1px;
             x: root.width / 1px; y: root.height / 1px;
         }
@@ -1348,12 +1350,14 @@ export component AppWindow inherits Window {
                             width: root.tab-width; height: 34px;
                             visible: !root.tab-dragging || index != root.tab-drag-source-index;
                             background: tab.active ? transparent : (tab-touch.has-hover ? VisualStyle.ce8eaf0 : VisualStyle.cf1f2f5);
+                            border-radius: VisualStyle.tab-corner-radius;
                             border-width: 0px;
                             ActiveTabShape {
                                 visible: tab.active;
                                 width: parent.width;
                                 height: parent.height;
                                 shape-color: VisualStyle.navigation-surface-background;
+                                corner-radius: VisualStyle.tab-corner-radius;
                             }
                             tab-touch := TouchArea {
                                 mouse-cursor: pointer;
