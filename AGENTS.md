@@ -8,12 +8,12 @@
 cargo run
 python tools/verify.py --quick # 小改动：格式、Clippy、测试、Debug 构建
 python tools/verify.py         # Issue 完整 Debug 验证
-python tools/verify.py --release # 用户确认后的 Release 收尾
+python tools/verify.py --release # 用户确认 Issue 后的本地 Release 构建验证；不发布
 ```
 
-验证默认首个失败即停止，并在开始前关闭由本仓库 Debug/Release 程序启动的 AsterFiles；诊断全部失败时显式加 `--keep-going`。完整验证只构建一次 Debug，随后直接复用程序运行全部无界面场景。`--release` 在工作树内容未变化时复用最近成功的完整验证，只补 Release 构建。Issue 收尾使用 `./tools/finish-issue.ps1 <编号> -Message '<提交说明>' -Paths <本 Issue 文件>`，依次验证、提交、回写 Issue、设为 Done 并关闭；任一步失败立即停止，且不会带入未明确列出的改动。机器可读汇总位于 `artifacts/verify/summary.json`；详细规则和确定性 UI 场景见 `docs/agent/debug-validation.md`。UI 截图写入 `artifacts/ui/`，日志写入 `artifacts/logs/`，状态导出写入 `artifacts/state/`，性能 artifacts 写入 `artifacts/perf/`。
+验证默认首个失败即停止，并在开始前关闭由本仓库 Debug/Release 程序启动的 AsterFiles；诊断全部失败时显式加 `--keep-going`。完整验证只构建一次 Debug，随后直接复用程序运行全部无界面场景。`--release` 仅在本机生成并验证 `target/release/asterfiles.exe`，不会更新版本、提交、打标签、推送或创建 GitHub Release；工作树内容未变化时复用最近成功的完整验证，只补本地 Release 构建。Issue 收尾使用 `./tools/finish-issue.ps1 <编号> -Message '<提交说明>' -Paths <本 Issue 文件>`，依次验证、提交、回写 Issue、设为 Done 并关闭；任一步失败立即停止，且不会带入未明确列出的改动。机器可读汇总位于 `artifacts/verify/summary.json`；详细规则和确定性 UI 场景见 `docs/agent/debug-validation.md`。UI 截图写入 `artifacts/ui/`，日志写入 `artifacts/logs/`，状态导出写入 `artifacts/state/`，性能 artifacts 写入 `artifacts/perf/`。
 
-本地正式发布使用 `./tools/publish.ps1 major|feature|bugfix`，它会递增 `Cargo.toml` 版本、验证、提交、打标签并原子推送；`-DryRun` 仅预演。用户只要求“更新版本并让 GitHub Action 打 Release 包”时，运行该脚本并确认其成功触发 Action 后立即结束，不等待 Action 构建完成，也不重复执行脚本已覆盖的检查；只有用户明确要求确认云端发布结果时才等待。发布包可使用 `./tools/release.ps1 -Tag v<版本>` 在本地生成，输出位于 `artifacts/release/`；GitHub Release 由 `.github/workflows/release.yml` 在推送版本标签或手动触发时创建。版本唯一来源是 `Cargo.toml`。
+本地正式发布默认使用 `./tools/publish.ps1`：它读取上一个 GitHub Release 之后关闭且恰好带一个 `type: *` 标签的 Issue；只要包含 `type: feature` 就升级 feature 版本，否则升级 bugfix 版本，并把这些 Issue 按类型写入中文 Release Note。没有已完成 Issue 或 Issue 类型标签不合规时停止发布。确需人工覆盖时才使用 `./tools/publish.ps1 major|feature|bugfix`；`-DryRun` 仅预演。脚本负责递增 `Cargo.toml` 版本、验证、提交、将 Release Note 写入标签并原子推送。用户只要求“更新版本并让 GitHub Action 打 Release 包”时，运行脚本并确认其成功触发 Action 后立即结束，不等待 Action 构建完成，也不重复执行脚本已覆盖的检查；只有用户明确要求确认云端发布结果时才等待。发布包可使用 `./tools/release.ps1 -Tag v<版本>` 在本地生成，输出位于 `artifacts/release/`；GitHub Release 由 `.github/workflows/release.yml` 读取标签说明并发布。版本唯一来源是 `Cargo.toml`。
 
 ## UI 操作与验证
 
@@ -32,8 +32,8 @@ python tools/verify.py --release # 用户确认后的 Release 收尾
 - 不增加网络协议、插件或索引服务，除非当前里程碑明确需要。
 - 注释说明目的、性能约束或 Windows 平台决策，不复述代码。
 - 修改完成后至少运行与变更范围相符的最小验证，并保留可读取的错误输出。
-- 每个开发任务完成后必须运行 `cargo build`，确保 `target/debug/asterfiles.exe` 已更新，供用户直接测试。日常本地开发不计算或报告 SHA-256、文件时间等构建指纹。只有用户明确要求正式构建、发布验证，或用户确认某个 issue 已完成时，才运行 Release 构建。如果有正在运行的 AsterFiles 进程阻挡打包，直接关闭进程。
-- 每个 issue 经用户明确确认完成后，必须构建一版 Release；用户确认前不得因该规则提前构建 Release。
+- 每个开发任务完成后必须运行 `cargo build`，确保 `target/debug/asterfiles.exe` 已更新，供用户直接测试。日常本地开发不计算或报告 SHA-256、文件时间等构建指纹。只有用户明确要求正式构建、发布验证，或用户确认某个 issue 已完成时，才运行本地 Release 构建；本地 Release 构建不等于发布，回复中必须明确称为“本地 Release 构建”，不得简称“发布”。如果有正在运行的 AsterFiles 进程阻挡打包，直接关闭进程。
+- 每个 issue 经用户明确确认完成后，必须在本地执行一次 Release 构建，产物为 `target/release/asterfiles.exe`；该动作不包含版本更新、提交、标签、推送或 GitHub Release。用户确认前不得因该规则提前执行本地 Release 构建。
 
 ## Issue 与任务状态
 

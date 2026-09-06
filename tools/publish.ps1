@@ -2,9 +2,9 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet('major', 'feature', 'bugfix')]
-    [string]$Level,
+    [Parameter(Position = 0)]
+    [ValidateSet('auto', 'major', 'feature', 'bugfix')]
+    [string]$Level = 'auto',
     [switch]$DryRun
 )
 
@@ -24,6 +24,88 @@ function Get-GitOutput {
     return $output
 }
 
+function Invoke-GhJson {
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+    $output = & gh @Arguments
+    if ($LASTEXITCODE -ne 0) { throw "GitHub CLI command failed: gh $($Arguments -join ' ')" }
+    return ($output -join "`n") | ConvertFrom-Json
+}
+
+function Get-ReleaseIssues {
+    param(
+        [string]$Repository,
+        [datetime]$Since
+    )
+
+    $sinceText = $Since.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $pages = @(Invoke-GhJson api "repos/$Repository/issues?state=closed&since=$sinceText&per_page=100" --paginate --slurp)
+    $issues = foreach ($page in $pages) {
+        foreach ($item in @($page)) {
+            if ($item.PSObject.Properties.Name -notcontains 'pull_request' -and [datetime]$item.closed_at -gt $Since) {
+                $item
+            }
+        }
+    }
+    return @($issues | Sort-Object { [int]$_.number } -Unique)
+}
+
+function Get-IssueType {
+    param($Issue)
+
+    $typeLabels = @($Issue.labels | ForEach-Object { [string]$_.name } | Where-Object { $_ -like 'type: *' })
+    if ($typeLabels.Count -ne 1) {
+        throw "Issue #$($Issue.number) must have exactly one 'type: *' label before release."
+    }
+    return $typeLabels[0]
+}
+
+function Get-AutomaticLevel {
+    param([object[]]$Issues)
+
+    if ($Issues.Count -eq 0) {
+        throw 'No completed issues were found after the latest release. Nothing to publish.'
+    }
+    $types = @($Issues | ForEach-Object { Get-IssueType $_ })
+    $supportedTypes = @('type: feature', 'type: bug', 'type: maintenance', 'type: docs')
+    $unsupportedTypes = @($types | Where-Object { $_ -notin $supportedTypes } | Sort-Object -Unique)
+    if ($unsupportedTypes.Count -gt 0) {
+        throw "Unsupported release issue type(s): $($unsupportedTypes -join ', ')."
+    }
+    if ($types -contains 'type: feature') { return 'feature' }
+    return 'bugfix'
+}
+
+function Get-ReleaseNotes {
+    param(
+        [string]$PreviousTag,
+        [object[]]$Issues
+    )
+
+    $sections = [ordered]@{
+        'type: feature' = '## 新功能与改进'
+        'type: bug' = '## 问题修复'
+        'type: maintenance' = '## 工程维护'
+        'type: docs' = '## 文档'
+    }
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add("自 $PreviousTag 以来完成的事项：")
+    $lines.Add('')
+
+    foreach ($type in $sections.Keys) {
+        $matching = @($Issues | Where-Object { (Get-IssueType $_) -eq $type })
+        if ($matching.Count -eq 0) { continue }
+        $lines.Add($sections[$type])
+        $lines.Add('')
+        foreach ($issue in $matching) {
+            $lines.Add("- $($issue.title) ([#$($issue.number)]($($issue.html_url)))")
+        }
+        $lines.Add('')
+    }
+
+
+    return ($lines -join "`n").TrimEnd()
+}
+
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repositoryRoot
 
@@ -38,10 +120,19 @@ if ($currentVersion -notmatch '^(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)$') {
     throw "Cargo version '$currentVersion' is not a stable semantic version."
 }
 
-$major = [int]$Matches.major
-$minor = [int]$Matches.minor
-$patch = [int]$Matches.patch
-$nextVersion = switch ($Level) {
+$latestRelease = Invoke-GhJson release view --json 'tagName,createdAt'
+$previousTag = [string]$latestRelease.tagName
+$previousReleaseTime = [datetime]$latestRelease.createdAt
+$repository = [string](Invoke-GhJson repo view --json nameWithOwner).nameWithOwner
+$releaseIssues = @(Get-ReleaseIssues -Repository $repository -Since $previousReleaseTime)
+$selectedLevel = if ($Level -eq 'auto') { Get-AutomaticLevel $releaseIssues } else { $Level }
+$releaseNotes = Get-ReleaseNotes -PreviousTag $previousTag -Issues $releaseIssues
+
+$currentVersionParts = $currentVersion.Split('.')
+$major = [int]$currentVersionParts[0]
+$minor = [int]$currentVersionParts[1]
+$patch = [int]$currentVersionParts[2]
+$nextVersion = switch ($selectedLevel) {
     'major' { "$($major + 1).0.0" }
     'feature' { "$major.$($minor + 1).0" }
     'bugfix' { "$major.$minor.$($patch + 1)" }
@@ -50,12 +141,16 @@ $tag = "v$nextVersion"
 
 if ($DryRun) {
     [PSCustomObject]@{
-        level = $Level
+        requestedLevel = $Level
+        selectedLevel = $selectedLevel
         currentVersion = $currentVersion
         nextVersion = $nextVersion
         tag = $tag
+        previousTag = $previousTag
+        issues = @($releaseIssues | ForEach-Object { [PSCustomObject]@{ number = $_.number; title = $_.title; type = Get-IssueType $_ } })
+        releaseNotes = $releaseNotes
         dryRun = $true
-    } | ConvertTo-Json
+    } | ConvertTo-Json -Depth 5
     exit 0
 }
 
@@ -128,14 +223,16 @@ try {
     Invoke-Git diff --cached --check
     Invoke-Git commit -m "chore: release $tag"
     $versionCommitted = $true
-    Invoke-Git tag --annotate $tag --message "AsterFiles $tag"
+    Invoke-Git tag --annotate $tag --message $releaseNotes
     $tagCreated = $true
     Invoke-Git push --atomic origin 'HEAD:refs/heads/main' ('refs/tags/{0}:refs/tags/{0}' -f $tag)
 
     [PSCustomObject]@{
         version = $nextVersion
+        level = $selectedLevel
         tag = $tag
         commit = ([string](Get-GitOutput rev-parse HEAD)).Trim()
+        issues = @($releaseIssues | ForEach-Object { $_.number })
         release = 'GitHub Action has been triggered by the tag push.'
     } | ConvertTo-Json
 }
