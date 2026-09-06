@@ -1456,6 +1456,12 @@ export component AppWindow inherits Window {
                     viewport-height: max(self.height, sidebar-content.preferred-height);
                     horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
                     viewport-y <=> root.sidebar-viewport-y;
+                    function clamp-viewport() {
+                        let maximum = max(0px, sidebar-content.preferred-height - self.visible-height);
+                        self.viewport-y = max(-maximum, min(0px, self.viewport-y));
+                    }
+                    changed visible-height => { self.clamp-viewport(); }
+                    changed viewport-height => { self.clamp-viewport(); }
                     sidebar-wheel := TouchArea {
                         width: sidebar-scroll.visible-width;
                         height: sidebar-scroll.visible-height;
@@ -1471,7 +1477,7 @@ export component AppWindow inherits Window {
                 sidebar-content := VerticalLayout {
                     width: sidebar-scroll.width;
                     padding-top: 4px; padding-bottom: 12px; padding-left: 10px; padding-right: 10px; spacing: 0px;
-                    quick-access-header := SidebarGroupHeader { label: root.text-quick-access; expanded: root.quick-access-expanded; toggled => { root.quick-access-expanded = !root.quick-access-expanded; } changed absolute-position => { root.quick-access-drop-left = self.absolute-position.x - root.absolute-position.x; root.quick-access-drop-top = self.absolute-position.y - root.absolute-position.y; } changed width => { root.quick-access-drop-width = self.width; } changed height => { root.quick-access-drop-height = self.height; } init => { root.quick-access-drop-left = self.absolute-position.x - root.absolute-position.x; root.quick-access-drop-top = self.absolute-position.y - root.absolute-position.y; root.quick-access-drop-width = self.width; root.quick-access-drop-height = self.height; } }
+                    quick-access-header := SidebarGroupHeader { label: root.text-quick-access; expanded: root.quick-access-expanded; toggled => { root.quick-access-expanded = !root.quick-access-expanded; sidebar-scroll.clamp-viewport(); } changed absolute-position => { root.quick-access-drop-left = self.absolute-position.x - root.absolute-position.x; root.quick-access-drop-top = self.absolute-position.y - root.absolute-position.y; } changed width => { root.quick-access-drop-width = self.width; } changed height => { root.quick-access-drop-height = self.height; } init => { root.quick-access-drop-left = self.absolute-position.x - root.absolute-position.x; root.quick-access-drop-top = self.absolute-position.y - root.absolute-position.y; root.quick-access-drop-width = self.width; root.quick-access-drop-height = self.height; } }
 
                     for location in root.sidebar-items: Rectangle {
                         visible: location.group-kind == 0 && root.quick-access-expanded;
@@ -1480,7 +1486,7 @@ export component AppWindow inherits Window {
                         side-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-sidebar(location.index); } pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.source-kind == 3 { root.show-quick-access-menu(location.stable-id, (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px, (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px); } } }
                         accessible-role: button; accessible-label: location.label;
                     }
-                    SidebarGroupHeader { label: root.text-libraries; expanded: root.libraries-expanded; toggled => { root.libraries-expanded = !root.libraries-expanded; } }
+                    SidebarGroupHeader { label: root.text-libraries; expanded: root.libraries-expanded; toggled => { root.libraries-expanded = !root.libraries-expanded; sidebar-scroll.clamp-viewport(); } }
                     for location in root.sidebar-items: Rectangle {
                         visible: location.group-kind == 4 && root.libraries-expanded;
                         height: self.visible ? 30px : 0px; border-radius: 5px; background: library-touch.pressed ? VisualStyle.cdde3ed : library-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
@@ -1488,7 +1494,7 @@ export component AppWindow inherits Window {
                         library-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-library(location.stable-id); } }
                         accessible-role: button; accessible-label: location.label;
                     }
-                    SidebarGroupHeader { label: root.text-drives; expanded: root.drives-expanded; toggled => { root.drives-expanded = !root.drives-expanded; } }
+                    SidebarGroupHeader { label: root.text-drives; expanded: root.drives-expanded; toggled => { root.drives-expanded = !root.drives-expanded; sidebar-scroll.clamp-viewport(); } }
                     for location in root.sidebar-items: Rectangle {
                         visible: location.group-kind == 1 && root.drives-expanded;
                         height: self.visible ? 30px : 0px; border-radius: 5px; background: drive-touch.pressed ? VisualStyle.cdde3ed : drive-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
@@ -1496,7 +1502,7 @@ export component AppWindow inherits Window {
                         drive-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-sidebar(location.index); } }
                         accessible-role: button; accessible-label: location.label;
                     }
-                    SidebarGroupHeader { label: root.text-network-locations; expanded: root.network-locations-expanded; toggled => { root.network-locations-expanded = !root.network-locations-expanded; } }
+                    SidebarGroupHeader { label: root.text-network-locations; expanded: root.network-locations-expanded; toggled => { root.network-locations-expanded = !root.network-locations-expanded; sidebar-scroll.clamp-viewport(); } }
                     for location in root.sidebar-items: Rectangle {
                         visible: location.group-kind == 2 && root.network-locations-expanded;
                         height: self.visible ? 30px : 0px; border-radius: 5px; background: network-location-touch.pressed ? VisualStyle.cdde3ed : network-location-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
@@ -1512,7 +1518,7 @@ export component AppWindow inherits Window {
                         }
                         accessible-role: button; accessible-label: location.label;
                     }
-                    SidebarGroupHeader { label: root.text-network; expanded: root.network-expanded; toggled => { root.network-expanded = !root.network-expanded; root.toggle-network(); } }
+                    SidebarGroupHeader { label: root.text-network; expanded: root.network-expanded; toggled => { root.network-expanded = !root.network-expanded; root.toggle-network(); sidebar-scroll.clamp-viewport(); } }
                     if root.network-expanded: Rectangle {
                         height: root.network-discovery-loading || root.network-discovery-empty || root.network-discovery-error != "" ? 28px : 0px;
                         status-text := Text { x: 8px; width: parent.width - 16px; text: root.network-discovery-error != "" ? root.network-discovery-error : root.network-discovery-loading ? root.text-network-discovery-loading : root.network-discovery-empty ? root.text-network-discovery-empty : ""; color: VisualStyle.c777a84; font-size: 11px; vertical-alignment: center; overflow: elide; }

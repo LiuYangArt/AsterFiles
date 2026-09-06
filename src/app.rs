@@ -25088,6 +25088,60 @@ mod tests {
     }
 
     #[test]
+    fn issue_70_sidebar_collapse_clamps_stale_scroll_position() {
+        use i_slint_backend_testing::ElementRoot;
+
+        let ui = headless_file_view();
+        ui.window()
+            .set_size(slint::LogicalSize::new(1_180.0, 520.0));
+        ui.set_quick_access_expanded(true);
+        ui.set_libraries_expanded(true);
+        ui.set_drives_expanded(true);
+        ui.set_network_locations_expanded(true);
+        ui.set_network_expanded(true);
+        ui.set_sidebar_items(ModelRc::new(VecModel::from(
+            (0..48)
+                .map(|index| SidebarRow {
+                    index,
+                    stable_id: index.to_string().into(),
+                    label: format!("Sidebar {index}").into(),
+                    icon_kind: 0,
+                    group_kind: index % 5,
+                    source_kind: 0,
+                    is_drive: false,
+                    icon: Image::default(),
+                })
+                .collect::<Vec<_>>(),
+        )));
+        update_test_layout(&ui);
+
+        let scroll = ui
+            .root_element()
+            .query_descendants()
+            .match_id("AppWindow::sidebar-scroll")
+            .find_all()
+            .into_iter()
+            .next()
+            .expect("sidebar scroll view exists");
+        scroll.scroll(0.0, -5_000.0);
+        update_test_layout(&ui);
+        let scrolled_to_bottom = ui.get_sidebar_viewport_y();
+        assert!(scrolled_to_bottom < 0.0);
+
+        let bottom_group_header = ui
+            .root_element()
+            .query_descendants()
+            .match_type_name("SidebarGroupHeader")
+            .find_all()
+            .into_iter()
+            .last()
+            .expect("bottom sidebar group header exists");
+        bottom_group_header.mock_single_click(slint::platform::PointerEventButton::Left);
+        update_test_layout(&ui);
+
+        assert!(ui.get_sidebar_viewport_y() > scrolled_to_bottom);
+    }
+    #[test]
     fn sidebar_wheel_scrolls_sidebar_without_moving_file_list() {
         use i_slint_backend_testing::ElementRoot;
 
