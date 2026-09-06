@@ -993,7 +993,7 @@ export component AppWindow inherits Window {
     callback navigate-sidebar(int);
     callback navigate-library(string);
     callback navigate-network-location(string);
-    callback show-network-location-menu(string, float, float);
+    callback show-sidebar-menu(int, string, float, float);
     callback toggle-network();
     callback refresh-network();
     callback navigate-breadcrumb(int);
@@ -1069,7 +1069,7 @@ export component AppWindow inherits Window {
     callback update-address-drag(float, float);
     callback end-address-drag();
     callback show-entry-menu(int, float, float);
-    callback show-quick-access-menu(string, float, float);
+
     callback show-background-menu(float, float);
     callback reopen-context-menu(float, float);
     callback invoke-context-command(int);
@@ -1239,7 +1239,16 @@ export component AppWindow inherits Window {
     changed active-tab-index => { root.reveal-tab(root.active-tab-index); }
 
     public function focus-address-editor() { address-editor.focus-at-end(); }
+    in-out property <bool> sidebar-keyboard-active: false;
+    in-out property <int> sidebar-keyboard-group: -1;
+    in-out property <string> sidebar-keyboard-stable-id: "";
+    in-out property <float> sidebar-keyboard-anchor-x: 0;
+    in-out property <float> sidebar-keyboard-anchor-y: 0;
     public function show-keyboard-context-menu() {
+        if root.sidebar-keyboard-active && root.sidebar-keyboard-stable-id != "" {
+            root.show-sidebar-menu(root.sidebar-keyboard-group, root.sidebar-keyboard-stable-id, root.sidebar-keyboard-anchor-x, root.sidebar-keyboard-anchor-y);
+            return;
+        }
         root.context-menu-anchor-x = root.keyboard-menu-anchor-x;
         root.context-menu-anchor-y = root.keyboard-menu-anchor-y;
         if root.context-menu-has-entry {
@@ -1483,7 +1492,7 @@ export component AppWindow inherits Window {
                         visible: location.group-kind == 0 && root.quick-access-expanded;
                         height: self.visible ? 30px : 0px; border-radius: 5px; background: side-touch.pressed ? VisualStyle.cdde3ed : side-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
                         HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : (location.icon-kind == 0 ? IconMap.location-home : location.icon-kind == 1 ? IconMap.location-desktop : location.icon-kind == 2 ? IconMap.location-downloads : location.icon-kind == 3 ? IconMap.location-documents : location.icon-kind == 4 ? IconMap.location-pictures : location.icon-kind == 5 ? IconMap.location-music : IconMap.location-videos); } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
-                        side-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-sidebar(location.index); } pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.source-kind == 3 { root.show-quick-access-menu(location.stable-id, (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px, (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px); } } }
+                        side-touch := TouchArea { mouse-cursor: pointer; clicked => { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.width - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.height - root.absolute-position.y) / 1px; root.navigate-sidebar(location.index); } pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.stable-id != "" { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px; root.show-sidebar-menu(location.group-kind, location.stable-id, root.sidebar-keyboard-anchor-x, root.sidebar-keyboard-anchor-y); } } }
                         accessible-role: button; accessible-label: location.label;
                     }
                     SidebarGroupHeader { label: root.text-libraries; expanded: root.libraries-expanded; toggled => { root.libraries-expanded = !root.libraries-expanded; sidebar-scroll.clamp-viewport(); } }
@@ -1491,7 +1500,7 @@ export component AppWindow inherits Window {
                         visible: location.group-kind == 4 && root.libraries-expanded;
                         height: self.visible ? 30px : 0px; border-radius: 5px; background: library-touch.pressed ? VisualStyle.cdde3ed : library-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
                         HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.file-folder; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
-                        library-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-library(location.stable-id); } }
+                        library-touch := TouchArea { mouse-cursor: pointer; clicked => { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.width - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.height - root.absolute-position.y) / 1px; root.navigate-library(location.stable-id); } pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.stable-id != "" { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px; root.show-sidebar-menu(location.group-kind, location.stable-id, root.sidebar-keyboard-anchor-x, root.sidebar-keyboard-anchor-y); } } }
                         accessible-role: button; accessible-label: location.label;
                     }
                     SidebarGroupHeader { label: root.text-drives; expanded: root.drives-expanded; toggled => { root.drives-expanded = !root.drives-expanded; sidebar-scroll.clamp-viewport(); } }
@@ -1499,7 +1508,7 @@ export component AppWindow inherits Window {
                         visible: location.group-kind == 1 && root.drives-expanded;
                         height: self.visible ? 30px : 0px; border-radius: 5px; background: drive-touch.pressed ? VisualStyle.cdde3ed : drive-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
                         HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.location-drive; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
-                        drive-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-sidebar(location.index); } }
+                        drive-touch := TouchArea { mouse-cursor: pointer; clicked => { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.width - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.height - root.absolute-position.y) / 1px; root.navigate-sidebar(location.index); } pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.stable-id != "" { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px; root.show-sidebar-menu(location.group-kind, location.stable-id, root.sidebar-keyboard-anchor-x, root.sidebar-keyboard-anchor-y); } } }
                         accessible-role: button; accessible-label: location.label;
                     }
                     SidebarGroupHeader { label: root.text-network-locations; expanded: root.network-locations-expanded; toggled => { root.network-locations-expanded = !root.network-locations-expanded; sidebar-scroll.clamp-viewport(); } }
@@ -1509,10 +1518,11 @@ export component AppWindow inherits Window {
                         HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.location-drive; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         network-location-touch := TouchArea {
                             mouse-cursor: pointer;
-                            clicked => { root.navigate-network-location(location.stable-id); }
+                            clicked => { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.width - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.height - root.absolute-position.y) / 1px; root.navigate-network-location(location.stable-id); }
                             pointer-event(event) => {
-                                if event.button == PointerEventButton.right && event.kind == PointerEventKind.up {
-                                    root.show-network-location-menu(location.stable-id, self.mouse-x / 1px, self.mouse-y / 1px);
+                                if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.stable-id != "" {
+                                    root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px;
+                                    root.show-sidebar-menu(location.group-kind, location.stable-id, root.sidebar-keyboard-anchor-x, root.sidebar-keyboard-anchor-y);
                                 }
                             }
                         }
@@ -1531,7 +1541,7 @@ export component AppWindow inherits Window {
                         visible: location.group-kind == 3 && root.network-expanded;
                         height: self.visible ? 30px : 0px; border-radius: 5px; background: network-touch.pressed ? VisualStyle.cdde3ed : network-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
                         HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.location-drive; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
-                        network-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-sidebar(location.index); } }
+                        network-touch := TouchArea { mouse-cursor: pointer; clicked => { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.width - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.height - root.absolute-position.y) / 1px; root.navigate-sidebar(location.index); } pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.stable-id != "" { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px; root.show-sidebar-menu(location.group-kind, location.stable-id, root.sidebar-keyboard-anchor-x, root.sidebar-keyboard-anchor-y); } } }
                         accessible-role: button; accessible-label: location.label;
                     }
                     Rectangle { vertical-stretch: 1; }

@@ -1710,6 +1710,7 @@ struct AppState {
     library_failures: Vec<platform::windows::libraries::LibraryFailure>,
     library_icons: HashMap<std::ffi::OsString, platform::windows_shell_icons::ShellIconRgba>,
     library_generation: u64,
+    network_location_generation: u64,
     thumbnail_cache: HashMap<(PathBuf, u32), platform::windows_shell_icons::ShellIconRgba>,
     thumbnail_cache_order: VecDeque<(PathBuf, u32)>,
     large_icon_cache: HashMap<(PathBuf, u32), platform::windows_shell_icons::ShellIconRgba>,
@@ -1945,6 +1946,7 @@ impl AppState {
             library_failures: Vec::new(),
             library_icons: HashMap::new(),
             library_generation: 0,
+            network_location_generation: 0,
             thumbnail_cache: HashMap::new(),
             thumbnail_cache_order: VecDeque::new(),
             large_icon_cache: HashMap::new(),
@@ -3570,6 +3572,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         app.file_visibility = file_visibility;
         app.file_list_quick_search = file_list_quick_search;
         app.network_locations = network_locations;
+        app.network_location_generation = app.network_location_generation.wrapping_add(1).max(1);
         if !network_devices.is_empty() {
             let active_window = app.active_window;
             app.network_discovery.insert(
@@ -5430,12 +5433,25 @@ const QUICK_MENU_PLACEHOLDER_ROWS: usize = 3;
 const QUICK_MENU_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum QuickMenuScope {
+    Content {
+        paths: Vec<PathBuf>,
+        location: Option<platform::windows::context_menu::ShellMenuBackgroundTarget>,
+    },
+    Sidebar {
+        group: i32,
+        stable_id: String,
+        generation: u64,
+        target: platform::windows::context_menu::ShellMenuItemTarget,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct QuickMenuKey {
     window_id: WindowId,
     tab_id: TabId,
     navigation_request: RequestId,
-    paths: Vec<PathBuf>,
-    location: Option<platform::windows::context_menu::ShellMenuBackgroundTarget>,
+    scope: QuickMenuScope,
 }
 
 #[derive(Clone)]
@@ -5469,6 +5485,7 @@ struct QuickMenuState {
     active_column: Option<ColumnKind>,
     active_network_location: Option<u64>,
     active_quick_access_path: Option<PathBuf>,
+    active_sidebar_target: Option<SidebarMenuResolved>,
     next_submenu_node: i32,
     active_submenu_token: Option<u64>,
     active_submenu_request: u64,
@@ -5476,6 +5493,202 @@ struct QuickMenuState {
 
 type SharedQuickMenu = Arc<Mutex<QuickMenuState>>;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SidebarDestination {
+    Directory(PathBuf),
+    Library(LibraryLocationId),
+    External(PathBuf),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SidebarMenuResolved {
+    group: i32,
+    stable_id: String,
+    generation: u64,
+    target: platform::windows::context_menu::ShellMenuItemTarget,
+    destination: SidebarDestination,
+    quick_access_path: Option<PathBuf>,
+    network_location_id: Option<u64>,
+}
+
+fn sidebar_menu_target(
+    app: &AppState,
+    window_id: WindowId,
+    group: i32,
+    stable_id: &str,
+) -> Option<SidebarMenuResolved> {
+    use platform::windows::context_menu::ShellMenuItemTarget;
+    match group {
+        0 | 1 => {
+            let index = stable_id.strip_prefix("location:")?.parse::<usize>().ok()?;
+            let location = app.sidebar.get(index)?;
+            let expected_group = if location.kind == KnownLocationKind::Drive {
+                1
+            } else {
+                0
+            };
+            (group == expected_group).then(|| SidebarMenuResolved {
+                group,
+                stable_id: stable_id.to_owned(),
+                generation: app.quick_access_generation,
+                target: ShellMenuItemTarget::FileSystem(location.path.clone()),
+                destination: SidebarDestination::Directory(location.path.clone()),
+                quick_access_path: (location.kind == KnownLocationKind::Pinned)
+                    .then(|| location.path.clone()),
+                network_location_id: None,
+            })
+        }
+        2 => {
+            let id = stable_id
+                .strip_prefix("network-location:")?
+                .parse::<u64>()
+                .ok()?;
+            let location = app
+                .imported_network_locations
+                .iter()
+                .chain(app.network_locations.iter())
+                .find(|location| location.id == id)?;
+            let (target, destination) = match &location.target {
+                NetworkTarget::WindowsPath(path) => (
+                    ShellMenuItemTarget::FileSystem(path.clone()),
+                    SidebarDestination::Directory(path.clone()),
+                ),
+                NetworkTarget::ShellItemId(identity) => (
+                    ShellMenuItemTarget::Namespace {
+                        shell_identity: identity.as_os_str().to_owned(),
+                    },
+                    SidebarDestination::External(identity.clone()),
+                ),
+            };
+            Some(SidebarMenuResolved {
+                group,
+                stable_id: stable_id.to_owned(),
+                generation: app.network_location_generation,
+                target,
+                destination,
+                quick_access_path: None,
+                network_location_id: Some(id),
+            })
+        }
+        3 => {
+            let coordinator = app.network_discovery.get(&window_id)?;
+            let index = stable_id
+                .strip_prefix("network-device:")?
+                .parse::<usize>()
+                .ok()?;
+            let device = coordinator.devices().get(index)?;
+            let path = crate::network::device_root_target(device)?;
+            Some(SidebarMenuResolved {
+                group,
+                stable_id: stable_id.to_owned(),
+                generation: coordinator.generation().0,
+                target: ShellMenuItemTarget::FileSystem(path.clone()),
+                destination: SidebarDestination::Directory(path),
+                quick_access_path: None,
+                network_location_id: None,
+            })
+        }
+        4 => {
+            let library = app
+                .libraries
+                .iter()
+                .find(|library| library_stable_id(library.id.as_os_str()) == stable_id)?;
+            Some(SidebarMenuResolved {
+                group,
+                stable_id: stable_id.to_owned(),
+                generation: app.library_generation,
+                target: ShellMenuItemTarget::Namespace {
+                    shell_identity: library.id.as_os_str().to_owned(),
+                },
+                destination: SidebarDestination::Library(LibraryLocationId::new(
+                    library.id.as_os_str().to_owned(),
+                    library.display_name.to_string_lossy().into_owned(),
+                )),
+                quick_access_path: None,
+                network_location_id: None,
+            })
+        }
+        _ => None,
+    }
+}
+fn current_sidebar_menu_target(
+    state: &WindowSessions,
+    menu: &SharedQuickMenu,
+) -> Option<SidebarMenuResolved> {
+    let menu = menu.lock().ok()?;
+    let identity = menu.identity.as_ref()?;
+    matches!(identity.key.scope, QuickMenuScope::Sidebar { .. }).then_some(())?;
+    quick_menu_key_is_current(&state.shared, &identity.key).then_some(())?;
+    menu.active_sidebar_target.clone()
+}
+fn sidebar_context_rows(
+    target: &SidebarMenuResolved,
+    language: Language,
+    quick_access_pending: bool,
+) -> Vec<ContextCommandRow> {
+    let text = |chinese: &'static str, english: &'static str| {
+        if language == Language::Chinese {
+            chinese
+        } else {
+            english
+        }
+    };
+    let mut rows = vec![
+        quick_menu_row(
+            CMD_NETWORK_LOCATION_OPEN,
+            0,
+            text("打开", "Open"),
+            true,
+            false,
+            false,
+        ),
+        quick_menu_row(
+            CMD_NETWORK_LOCATION_OPEN_NEW_TAB,
+            0,
+            text("在新标签页中打开", "Open in new tab"),
+            !matches!(target.destination, SidebarDestination::External(_)),
+            false,
+            false,
+        ),
+    ];
+    if !matches!(target.destination, SidebarDestination::Library(_)) {
+        rows.push(quick_menu_row(
+            CMD_NETWORK_LOCATION_COPY_ADDRESS,
+            0,
+            text("复制路径", "Copy path"),
+            true,
+            false,
+            false,
+        ));
+    }
+    if target.quick_access_path.is_some() {
+        rows.extend([
+            quick_menu_separator(),
+            quick_menu_row(
+                CMD_QUICK_ACCESS_UNPIN,
+                0,
+                text("从快速访问取消固定", "Unpin from Quick access"),
+                !quick_access_pending,
+                false,
+                false,
+            ),
+        ]);
+    }
+    if target.network_location_id.is_some() {
+        rows.extend([
+            quick_menu_separator(),
+            quick_menu_row(
+                CMD_NETWORK_LOCATION_MANAGE_CREDENTIALS,
+                0,
+                text("管理 Windows 凭据", "Manage Windows credentials"),
+                true,
+                false,
+                false,
+            ),
+        ]);
+    }
+    rows
+}
 fn selected_network_location_path(
     state: &WindowSessions,
     menu: &SharedQuickMenu,
@@ -5629,8 +5842,10 @@ fn quick_menu_key(
         window_id: state.window_id,
         tab_id: tab.id,
         navigation_request: tab.latest_request,
-        paths: paths.clone(),
-        location: location.clone(),
+        scope: QuickMenuScope::Content {
+            paths: paths.clone(),
+            location: location.clone(),
+        },
     };
     let target = if background {
         platform::windows::context_menu::ShellMenuLoadTarget::Background(location?)
@@ -5691,23 +5906,41 @@ fn clear_current_shell_menu_failure(
 }
 fn quick_menu_key_is_current(state: &SharedSessions, key: &QuickMenuKey) -> bool {
     state.lock().ok().is_some_and(|app| {
-        app.window_for_tab(key.tab_id) == Some(key.window_id)
-            && app.tab(key.tab_id).is_some_and(|tab| {
-                tab.latest_request == key.navigation_request
-                    && quick_menu_location_target(&app, tab) == key.location
-                    && if key.paths.is_empty() {
+        if app.window_for_tab(key.tab_id) != Some(key.window_id) {
+            return false;
+        }
+        let Some(window) = app.window(key.window_id) else {
+            return false;
+        };
+        if window.active_tab != key.tab_id {
+            return false;
+        }
+        let Some(tab) = app.tab(key.tab_id) else {
+            return false;
+        };
+        if tab.latest_request != key.navigation_request {
+            return false;
+        }
+        match &key.scope {
+            QuickMenuScope::Content { paths, location } => {
+                quick_menu_location_target(&app, tab) == *location
+                    && if paths.is_empty() {
                         tab.selected.is_empty()
                     } else {
-                        key.paths
-                            == tab
-                                .selected
-                                .iter()
-                                .filter_map(|id| {
-                                    tab.visible_entry(*id).map(|entry| entry.path.clone())
-                                })
-                                .collect::<Vec<_>>()
+                        *paths == selected_paths_for_tab(tab)
                     }
-            })
+            }
+            QuickMenuScope::Sidebar {
+                group,
+                stable_id,
+                generation,
+                target,
+            } => {
+                sidebar_menu_target(&app, key.window_id, *group, stable_id).is_some_and(|current| {
+                    current.generation == *generation && current.target == *target
+                })
+            }
+        }
     })
 }
 fn context_row_matches(row: &ContextCommandRow, query: &str) -> bool {
@@ -5785,12 +6018,14 @@ fn next_enabled_context_index(rows: &[ContextCommandRow], current: i32, directio
 fn shell_menu_item_row(
     item: platform::windows::context_menu::ClassicMenuItem,
     node_id: i32,
+    hide_content_built_ins: bool,
 ) -> Option<ContextCommandRow> {
     use platform::windows::context_menu::ClassicMenuItemKind;
-    if item
-        .verb
-        .as_deref()
-        .is_some_and(|verb| matches!(verb, "cut" | "copy" | "paste" | "delete" | "rename"))
+    if hide_content_built_ins
+        && item
+            .verb
+            .as_deref()
+            .is_some_and(|verb| matches!(verb, "cut" | "copy" | "paste" | "delete" | "rename"))
     {
         return None;
     }
@@ -5839,7 +6074,7 @@ fn project_shell_menu_items(
                     let rows = items
                         .iter()
                         .cloned()
-                        .filter_map(|item| shell_menu_item_row(item, 0))
+                        .filter_map(|item| shell_menu_item_row(item, 0, false))
                         .collect();
                     menu.preloaded_submenu_rows.insert(*token, rows);
                 }
@@ -5847,7 +6082,10 @@ fn project_shell_menu_items(
             } else {
                 0
             };
-            shell_menu_item_row(item, node_id)
+            let hide_content_built_ins = menu.identity.as_ref().is_none_or(|identity| {
+                matches!(identity.key.scope, QuickMenuScope::Content { .. })
+            });
+            shell_menu_item_row(item, node_id, hide_content_built_ins)
         })
         .collect()
 }
@@ -6089,6 +6327,44 @@ fn begin_shell_menu_load(
             identity.key.tab_id.0,
             identity.key.navigation_request.0,
         );
+    }
+}
+fn begin_shell_menu_load_for(
+    ui: &AppWindow,
+    menu: &SharedQuickMenu,
+    worker: &platform::windows::context_menu::ShellMenuWorker,
+    key: QuickMenuKey,
+    target: platform::windows::context_menu::ShellMenuLoadTarget,
+) {
+    let identity = {
+        let mut menu = menu.lock().expect("quick menu mutex is not poisoned");
+        menu.next_request = menu.next_request.wrapping_add(1).max(1);
+        let request_id = menu.next_request;
+        let session_id = (u64::from(key.window_id.0) << 32) | request_id;
+        let identity = QuickMenuIdentity {
+            session_id,
+            request_id,
+            key,
+            ready: false,
+        };
+        menu.identity = Some(identity.clone());
+        identity
+    };
+    if worker
+        .send(platform::windows::context_menu::ShellMenuCommand::Load {
+            session_id: identity.session_id,
+            request_id: identity.request_id,
+            target,
+            include_extended_verbs: false,
+            owner_window: native_window_handle(ui),
+        })
+        .is_err()
+    {
+        if let Ok(mut menu) = menu.lock() {
+            clear_current_shell_menu_failure(&mut menu, identity.session_id, identity.request_id);
+        }
+        ui.set_context_shell_loading(false);
+        project_filtered_context_menu(ui, menu, ui.get_context_search().as_str());
     }
 }
 fn quick_menu_row(
@@ -10424,179 +10700,81 @@ fn wire_callbacks(
     });
 
     let weak = ui.as_weak();
-    let state_for_network_location_menu = state.clone();
-    let quick_menu_for_network_location = quick_menu.clone();
-    ui.on_show_network_location_menu(move |stable_id, x, y| {
+    let state_for_sidebar_menu = state.clone();
+    let quick_menu_for_sidebar = quick_menu.clone();
+    let shell_menu_for_sidebar = shell_menu_worker.clone();
+    ui.on_show_sidebar_menu(move |group, stable_id, x, y| {
         let Some(ui) = weak.upgrade() else { return };
-        let Some(location_id) = stable_id.as_str().parse::<u64>().ok() else {
-            return;
-        };
-        let selected = state_for_network_location_menu.lock().ok().and_then(|app| {
-            app.imported_network_locations
-                .iter()
-                .chain(app.network_locations.iter())
-                .find(|location| location.id == location_id)
-                .map(|location| {
-                    (
-                        location.id,
-                        location.source == NetworkLocationSource::AsterOwned,
-                        matches!(location.target, NetworkTarget::WindowsPath(_)),
-                        app.language,
-                    )
-                })
+        let resolved = state_for_sidebar_menu.lock().ok().and_then(|app| {
+            sidebar_menu_target(
+                &app,
+                state_for_sidebar_menu.window_id,
+                group,
+                stable_id.as_str(),
+            )
         });
-        let Some((location_id, owned, navigable, language)) = selected else {
-            return;
+        let Some(resolved) = resolved else { return };
+        let (language, tab_id, navigation_request, quick_access_pending) = state_for_sidebar_menu
+            .lock()
+            .ok()
+            .map(|app| {
+                let tab = app.active();
+                (
+                    app.language,
+                    tab.id,
+                    tab.latest_request,
+                    resolved
+                        .quick_access_path
+                        .as_ref()
+                        .is_some_and(|path| app.quick_access_pending.contains(path)),
+                )
+            })
+            .unwrap();
+        let rows = sidebar_context_rows(&resolved, language, quick_access_pending);
+        let key = QuickMenuKey {
+            window_id: state_for_sidebar_menu.window_id,
+            tab_id,
+            navigation_request,
+            scope: QuickMenuScope::Sidebar {
+                group,
+                stable_id: resolved.stable_id.clone(),
+                generation: resolved.generation,
+                target: resolved.target.clone(),
+            },
         };
-        let zh = |chinese: &'static str, english: &'static str| {
-            if language == Language::Chinese {
-                chinese
-            } else {
-                english
-            }
-        };
-        let mut rows = vec![
-            quick_menu_row(
-                CMD_NETWORK_LOCATION_OPEN,
-                0,
-                zh("打开", "Open"),
-                true,
-                false,
-                false,
-            ),
-            quick_menu_row(
-                CMD_NETWORK_LOCATION_OPEN_NEW_TAB,
-                0,
-                zh("在新标签页中打开", "Open in new tab"),
-                navigable,
-                false,
-                false,
-            ),
-            quick_menu_row(
-                CMD_NETWORK_LOCATION_COPY_ADDRESS,
-                0,
-                zh("复制地址", "Copy address"),
-                navigable,
-                false,
-                false,
-            ),
-            quick_menu_row(
-                CMD_NETWORK_LOCATION_MANAGE_CREDENTIALS,
-                0,
-                zh("管理 Windows 凭据", "Manage Windows credentials"),
-                true,
-                false,
-                false,
-            ),
-        ];
-        if owned {
-            rows.push(quick_menu_separator());
-            rows.push(quick_menu_row(
-                CMD_NETWORK_LOCATION_RENAME,
-                0,
-                zh("重命名", "Rename"),
-                true,
-                false,
-                false,
-            ));
-            rows.push(quick_menu_row(
-                CMD_NETWORK_LOCATION_MOVE_UP,
-                0,
-                zh("上移", "Move up"),
-                true,
-                false,
-                false,
-            ));
-            rows.push(quick_menu_row(
-                CMD_NETWORK_LOCATION_MOVE_DOWN,
-                0,
-                zh("下移", "Move down"),
-                true,
-                false,
-                false,
-            ));
-            rows.push(quick_menu_row(
-                CMD_NETWORK_LOCATION_REMOVE,
-                0,
-                zh("从网络位置移除", "Remove from network locations"),
-                true,
-                false,
-                false,
-            ));
-        }
-        if let Ok(mut menu) = quick_menu_for_network_location.lock() {
+        if let Ok(mut menu) = quick_menu_for_sidebar.lock() {
             menu.identity = None;
-            menu.active_network_location = Some(location_id);
+            menu.active_sidebar_target = Some(resolved.clone());
+            menu.active_network_location = resolved.network_location_id;
+            menu.active_quick_access_path = resolved.quick_access_path.clone();
             menu.built_in_rows = rows.clone();
-            menu.all_rows = rows;
+            menu.all_rows = compose_quick_menu_rows(
+                &rows,
+                &(0..QUICK_MENU_PLACEHOLDER_ROWS)
+                    .map(|_| quick_menu_placeholder())
+                    .collect::<Vec<_>>(),
+            );
             menu.submenu_rows.clear();
             menu.submenu_history.clear();
         }
         ui.set_context_menu_anchor_x(x);
         ui.set_context_menu_anchor_y(y);
         ui.set_context_search("".into());
-        ui.set_context_shell_loading(false);
+        ui.set_context_shell_loading(true);
         ui.set_context_submenu_open(false);
-        project_filtered_context_menu(&ui, &quick_menu_for_network_location, "");
+        project_filtered_context_menu(&ui, &quick_menu_for_sidebar, "");
         ui.set_context_menu_open(true);
         if let Some(window_id) = window_id_for_ui(&ui) {
             open_quick_menu_popup(window_id, x, y);
         }
+        begin_shell_menu_load_for(
+            &ui,
+            &quick_menu_for_sidebar,
+            &shell_menu_for_sidebar,
+            key,
+            platform::windows::context_menu::ShellMenuLoadTarget::Item(resolved.target),
+        );
     });
-
-    let weak = ui.as_weak();
-    let state_for_quick_access_menu = state.clone();
-    let quick_menu_for_quick_access = quick_menu.clone();
-    ui.on_show_quick_access_menu(move |stable_id, x, y| {
-        let Some(ui) = weak.upgrade() else { return };
-        let path = PathBuf::from(stable_id.as_str());
-        let selected = state_for_quick_access_menu.lock().ok().and_then(|app| {
-            app.sidebar
-                .iter()
-                .find(|location| {
-                    location.kind == KnownLocationKind::Pinned
-                        && platform::windows::quick_access::paths_equal(&location.path, &path)
-                })
-                .map(|location| {
-                    (
-                        location.path.clone(),
-                        app.language,
-                        app.quick_access_pending.contains(&location.path),
-                    )
-                })
-        });
-        let Some((path, language, pending)) = selected else {
-            return;
-        };
-        let label = match language {
-            Language::Chinese => "从快速访问取消固定",
-            Language::English => "Unpin from Quick access",
-        };
-        let rows = vec![quick_menu_row(
-            CMD_QUICK_ACCESS_UNPIN,
-            0,
-            label,
-            !pending,
-            false,
-            false,
-        )];
-        if let Ok(mut menu) = quick_menu_for_quick_access.lock() {
-            menu.identity = None;
-            menu.active_quick_access_path = Some(path);
-            menu.built_in_rows = rows.clone();
-            menu.all_rows = rows;
-        }
-        ui.set_context_menu_anchor_x(x);
-        ui.set_context_menu_anchor_y(y);
-        ui.set_context_search("".into());
-        ui.set_context_shell_loading(false);
-        project_filtered_context_menu(&ui, &quick_menu_for_quick_access, "");
-        ui.set_context_menu_open(true);
-        if let Some(window_id) = window_id_for_ui(&ui) {
-            open_quick_menu_popup(window_id, x, y);
-        }
-    });
-
     let weak = ui.as_weak();
     let state_for_column_menu = state.clone();
     let quick_menu_for_column = quick_menu.clone();
@@ -11075,10 +11253,12 @@ fn wire_callbacks(
     let quick_menu_for_dismiss = quick_menu.clone();
     let shell_menu_for_dismiss = shell_menu_worker.clone();
     ui.on_dismiss_context_menu(move || {
-        let identity = quick_menu_for_dismiss
-            .lock()
-            .ok()
-            .and_then(|mut menu| menu.identity.take());
+        let identity = quick_menu_for_dismiss.lock().ok().and_then(|mut menu| {
+            menu.active_sidebar_target = None;
+            menu.active_network_location = None;
+            menu.active_quick_access_path = None;
+            menu.identity.take()
+        });
         if let Some(identity) = identity {
             let _ = shell_menu_for_dismiss.send(
                 platform::windows::context_menu::ShellMenuCommand::Close {
@@ -11115,10 +11295,8 @@ fn wire_callbacks(
                 }
             }
             CMD_QUICK_ACCESS_PIN | CMD_QUICK_ACCESS_UNPIN => {
-                let path = quick_menu_for_command
-                    .lock()
-                    .ok()
-                    .and_then(|menu| menu.active_quick_access_path.clone());
+                let path = current_sidebar_menu_target(&state_for_context_command, &quick_menu_for_command)
+                    .and_then(|target| target.quick_access_path);
                 if let Some(path) = path {
                     submit_quick_access_change(
                         state_for_context_command.shared.clone(),
@@ -11134,7 +11312,7 @@ fn wire_callbacks(
                     let name = network_location_default_name(&path);
                     let mut catalog = NetworkLocationCatalog::new(app.network_locations.clone());
                     match catalog.add_unc(path, name) {
-                        Ok(_) => app.network_locations = catalog.locations().to_vec(),
+                        Ok(_) => { app.network_locations = catalog.locations().to_vec(); app.network_location_generation = app.network_location_generation.wrapping_add(1).max(1); },
                         Err(crate::network::NetworkLocationCatalogError::DuplicateTarget) => {}
                         Err(error) => app
                             .operation_errors
@@ -11143,10 +11321,22 @@ fn wire_callbacks(
                 }
             }
             CMD_NETWORK_LOCATION_OPEN => {
-                let target = selected_network_location_target(
-                    &state_for_context_command,
-                    &quick_menu_for_command,
-                );
+                let sidebar = current_sidebar_menu_target(&state_for_context_command, &quick_menu_for_command);
+                if let Some(sidebar) = sidebar {
+                    match sidebar.destination {
+                        SidebarDestination::Directory(path) => {
+                            let tab_id = state_for_context_command.lock().ok().map(|app| app.active_window_state().active_tab);
+                            if let Some(tab_id) = tab_id { submit_path_navigation(&sender, &network_sender, &state_for_context_command, tab_id, path, NavigationKind::Normal); }
+                        }
+                        SidebarDestination::Library(library) => {
+                            let tab_id = state_for_context_command.lock().ok().map(|app| app.active_window_state().active_tab);
+                            if let Some(tab_id) = tab_id { submit_library_navigation(&sender, &state_for_context_command, tab_id, library, NavigationKind::Normal); }
+                        }
+                        SidebarDestination::External(identity) => { thread::spawn(move || { let _ = platform::open_path(&identity); }); }
+                    }
+                    return;
+                }
+                let target = selected_network_location_target(&state_for_context_command, &quick_menu_for_command);
                 match target {
                     Some(NetworkTarget::WindowsPath(path)) => {
                         let tab_id = state_for_context_command
@@ -11175,10 +11365,22 @@ fn wire_callbacks(
                 }
             }
             CMD_NETWORK_LOCATION_OPEN_NEW_TAB => {
-                let path = selected_network_location_path(
-                    &state_for_context_command,
-                    &quick_menu_for_command,
-                );
+                let sidebar = current_sidebar_menu_target(&state_for_context_command, &quick_menu_for_command);
+                if let Some(sidebar) = sidebar {
+                    match sidebar.destination {
+                        SidebarDestination::Directory(path) => {
+                            let tab_id = state_for_context_command.lock().ok().map(|mut app| app.create_tab(NavigationLocation::Directory(path.clone())));
+                            if let Some(tab_id) = tab_id { submit_path_navigation(&sender, &network_sender, &state_for_context_command, tab_id, path, NavigationKind::Refresh); }
+                        }
+                        SidebarDestination::Library(library) => {
+                            let tab_id = state_for_context_command.lock().ok().map(|mut app| app.create_tab(NavigationLocation::Library(library.clone())));
+                            if let Some(tab_id) = tab_id { submit_library_navigation(&sender, &state_for_context_command, tab_id, library, NavigationKind::Refresh); }
+                        }
+                        SidebarDestination::External(_) => {}
+                    }
+                    return;
+                }
+                let path = selected_network_location_path(&state_for_context_command, &quick_menu_for_command);
                 if let Some(path) = path {
                     let tab_id = state_for_context_command
                         .lock()
@@ -11234,10 +11436,8 @@ fn wire_callbacks(
                 }
             }
             CMD_NETWORK_LOCATION_COPY_ADDRESS => {
-                if let Some(path) = selected_network_location_path(
-                    &state_for_context_command,
-                    &quick_menu_for_command,
-                ) {
+                let sidebar_path = current_sidebar_menu_target(&state_for_context_command, &quick_menu_for_command).and_then(|target| match target.destination { SidebarDestination::Directory(path) | SidebarDestination::External(path) => Some(path), SidebarDestination::Library(_) => None });
+                if let Some(path) = sidebar_path.or_else(|| selected_network_location_path(&state_for_context_command, &quick_menu_for_command)) {
                     let result = platform::windows::clipboard::write_text(path.as_os_str());
                     if let Err(error) = result
                         && let Ok(mut app) = state_for_context_command.lock()
@@ -11283,7 +11483,7 @@ fn wire_callbacks(
                         _ => unreachable!(),
                     };
                     match result {
-                        Ok(_) => app.network_locations = catalog.locations().to_vec(),
+                        Ok(_) => { app.network_locations = catalog.locations().to_vec(); app.network_location_generation = app.network_location_generation.wrapping_add(1).max(1); },
                         Err(error) => app
                             .operation_errors
                             .push(format!("Failed to manage network location: {error:?}")),
@@ -11439,19 +11639,7 @@ fn wire_callbacks(
                     menu.active_submenu_token
                         .is_some_and(|token| menu.create_submenu_tokens.contains(&token))
                 });
-                let current = state_for_context_command.lock().ok().and_then(|app| {
-                    let tab = app.tab(identity.key.tab_id)?;
-                    Some((
-                        tab.latest_request,
-                        selected_paths_for_tab(tab),
-                        quick_menu_location_target(&app, tab),
-                    ))
-                });
-                if current.is_none_or(|(request, paths, background)| {
-                    request != identity.key.navigation_request
-                        || paths != identity.key.paths
-                        || background != identity.key.location
-                }) {
+                if !quick_menu_key_is_current(&state_for_context_command.shared, &identity.key) {
                     if let Ok(mut app) = state_for_context_command.lock() {
                         app.operation_errors
                             .push("Discarded stale Shell menu invocation".to_owned());
@@ -11472,12 +11660,8 @@ fn wire_callbacks(
                         return;
                     };
                     if creates_item
-                        && identity.key.paths.is_empty()
-                        && let Some(
-                            platform::windows::context_menu::ShellMenuBackgroundTarget::FileSystem(
-                                folder,
-                            ),
-                        ) = identity.key.location.clone()
+                        && let QuickMenuScope::Content { paths, location: Some(platform::windows::context_menu::ShellMenuBackgroundTarget::FileSystem(folder)) } = identity.key.scope.clone()
+                        && paths.is_empty()
                         && let Ok(mut app) = state_for_context_command.lock()
                         && let Some(baseline) =
                             app.tab(identity.key.tab_id).map(directory_path_snapshot)
@@ -11918,6 +12102,12 @@ fn wire_mouse_navigation(
             }
         ) {
             type_select.borrow_mut().clear();
+            let logical = cursor_position
+                .get()
+                .to_logical::<f32>(f64::from(ui.window().scale_factor()));
+            if logical.x >= ui.get_file_list_left() || logical.y < ui.get_file_list_top() {
+                ui.set_sidebar_keyboard_active(false);
+            }
         }
         match event {
             WindowEvent::CursorMoved { position, .. } => {
@@ -13419,7 +13609,11 @@ fn wire_network_location_rename_window(ui: &NetworkLocationRenameWindow, state: 
         if let Ok(mut app) = state.lock() {
             let mut catalog = NetworkLocationCatalog::new(app.network_locations.clone());
             match catalog.rename(id, name.as_str()) {
-                Ok(()) => app.network_locations = catalog.locations().to_vec(),
+                Ok(()) => {
+                    app.network_locations = catalog.locations().to_vec();
+                    app.network_location_generation =
+                        app.network_location_generation.wrapping_add(1).max(1);
+                }
                 Err(error) => app
                     .operation_errors
                     .push(format!("Failed to rename network location: {error:?}")),
@@ -14369,29 +14563,93 @@ fn start_shell_menu_event_pump(
                             verb,
                         } = invocation
                         {
-                            match verb.as_str() {
-                                "copy" => ui.invoke_copy_selection(false),
-                                "cut" => ui.invoke_copy_selection(true),
-                                "paste" => ui.invoke_paste_files(),
-                                "delete" => ui.invoke_request_delete(false),
-                                "rename" => ui.invoke_begin_rename(),
-                                _ => {}
+                            if identity.as_ref().is_some_and(|identity| {
+                                matches!(identity.key.scope, QuickMenuScope::Content { .. })
+                            }) {
+                                match verb.as_str() {
+                                    "copy" => ui.invoke_copy_selection(false),
+                                    "cut" => ui.invoke_copy_selection(true),
+                                    "paste" => ui.invoke_paste_files(),
+                                    "delete" => ui.invoke_request_delete(false),
+                                    "rename" => ui.invoke_begin_rename(),
+                                    _ => {}
+                                }
+                            } else if let Ok(mut app) = state.lock() {
+                                app.operation_errors.push(format!(
+                                    "Ignored unsupported built-in sidebar Shell verb: {verb}"
+                                ));
                             }
-                        } else if let Some(identity) = identity
-                            && let Some(location) = shell_menu_invocation_refresh_target(
-                                &state,
-                                identity.key.tab_id,
-                                identity.key.location.as_ref(),
-                            )
-                        {
-                            let _ = submit_location_navigation(
-                                &directory_sender,
-                                &network_directory_sender,
-                                &state,
-                                identity.key.tab_id,
-                                location,
-                                NavigationKind::Refresh,
-                            );
+                        } else if let Some(identity) = identity {
+                            match &identity.key.scope {
+                                QuickMenuScope::Content { location, .. } => {
+                                    if let Some(location) = shell_menu_invocation_refresh_target(
+                                        &state,
+                                        identity.key.tab_id,
+                                        location.as_ref(),
+                                    ) {
+                                        let _ = submit_location_navigation(
+                                            &directory_sender,
+                                            &network_directory_sender,
+                                            &state,
+                                            identity.key.tab_id,
+                                            location,
+                                            NavigationKind::Refresh,
+                                        );
+                                    }
+                                }
+                                QuickMenuScope::Sidebar {
+                                    group, stable_id, ..
+                                } => {
+                                    let affected = state.lock().ok().and_then(|app| {
+                                        sidebar_menu_target(
+                                            &app,
+                                            identity.key.window_id,
+                                            *group,
+                                            stable_id,
+                                        )
+                                    });
+                                    if let Some(affected) = affected
+                                        && let Some(tab) = state.lock().ok().and_then(|app| {
+                                            app.tab(identity.key.tab_id)
+                                                .map(|tab| tab.visible_location().cloned())
+                                        })
+                                    {
+                                        let matches = match (&affected.destination, tab) {
+                                            (
+                                                SidebarDestination::Directory(path),
+                                                Some(NavigationLocation::Directory(current)),
+                                            ) => *path == current,
+                                            (
+                                                SidebarDestination::Library(library),
+                                                Some(NavigationLocation::Library(current)),
+                                            ) => *library == current,
+                                            _ => false,
+                                        };
+                                        if matches {
+                                            let location = match affected.destination {
+                                                SidebarDestination::Directory(path) => {
+                                                    NavigationLocation::Directory(path)
+                                                }
+                                                SidebarDestination::Library(library) => {
+                                                    NavigationLocation::Library(library)
+                                                }
+                                                SidebarDestination::External(_) => {
+                                                    unreachable!()
+                                                }
+                                            };
+                                            let _ = submit_location_navigation(
+                                                &directory_sender,
+                                                &network_directory_sender,
+                                                &state,
+                                                identity.key.tab_id,
+                                                location,
+                                                NavigationKind::Refresh,
+                                            );
+                                        }
+                                    }
+                                    refresh_all_windows(&state);
+                                }
+                            }
                         }
                         let _ =
                             worker.send(platform::windows::context_menu::ShellMenuCommand::Close {
@@ -18128,6 +18386,8 @@ fn start_network_location_loader(ui: &AppWindow, state: SharedSessions) {
         let _ = weak.upgrade_in_event_loop(move |_ui| {
             if let Ok(mut app) = state_for_ui.lock() {
                 app.imported_network_locations = imported;
+                app.network_location_generation =
+                    app.network_location_generation.wrapping_add(1).max(1);
             }
             refresh_all_windows(&state_for_ui);
         });
@@ -19493,7 +19753,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
         .enumerate()
         .map(|(index, location)| SidebarRow {
             index: index as i32,
-            stable_id: "".into(),
+            stable_id: format!("location:{index}").into(),
             label: match (app.language, location.kind) {
                 (Language::Chinese, KnownLocationKind::Home) => "主页",
                 (Language::English, KnownLocationKind::Home) => "Home",
@@ -19523,12 +19783,6 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
         .collect::<Vec<_>>();
     for (row, location) in sidebar_rows.iter_mut().zip(app.sidebar.iter()) {
         if location.kind == KnownLocationKind::Pinned {
-            row.stable_id = location
-                .path
-                .as_os_str()
-                .to_string_lossy()
-                .into_owned()
-                .into();
             row.source_kind = 3;
         }
     }
@@ -19560,7 +19814,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
         network_row_index += 1;
         sidebar_rows.push(SidebarRow {
             index: index as i32,
-            stable_id: location.id.to_string().into(),
+            stable_id: format!("network-location:{}", location.id).into(),
             label: location.display_name.clone().into(),
             icon_kind: 7,
             group_kind: 2,
@@ -19588,7 +19842,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
             network_row_index += 1;
             sidebar_rows.push(SidebarRow {
                 index: index as i32,
-                stable_id: "".into(),
+                stable_id: format!("network-device:{index}").into(),
                 label: device.display_name.clone().into(),
                 icon_kind: 7,
                 group_kind: 3,
@@ -21546,6 +21800,138 @@ mod tests {
     }
 
     #[test]
+    fn issue_50_sidebar_targets_use_model_identity_and_generation() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\current")], 0, [0, 1, 2, 3]);
+        app.quick_access_generation = 7;
+        app.sidebar = vec![KnownLocation {
+            kind: KnownLocationKind::Drive,
+            label: "Display only".to_owned(),
+            path: PathBuf::from(r"Z:\"),
+        }];
+        let target = sidebar_menu_target(&app, WindowId(1), 1, "location:0").expect("drive target");
+        assert_eq!(target.generation, 7);
+        assert_eq!(
+            target.target,
+            platform::windows::context_menu::ShellMenuItemTarget::FileSystem(PathBuf::from(r"Z:\"))
+        );
+        assert!(sidebar_menu_target(&app, WindowId(1), 1, "Display only").is_none());
+    }
+
+    #[test]
+    fn issue_50_sidebar_key_rejects_refresh_navigation_and_other_window() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\current")], 0, [0, 1, 2, 3]);
+        app.quick_access_generation = 4;
+        app.sidebar = vec![KnownLocation {
+            kind: KnownLocationKind::Pinned,
+            label: "Pinned".to_owned(),
+            path: PathBuf::from(r"C:\Pinned"),
+        }];
+        let shared = Arc::new(Mutex::new(app));
+        let resolved =
+            sidebar_menu_target(&shared.lock().unwrap(), WindowId(1), 0, "location:0").unwrap();
+        let key = QuickMenuKey {
+            window_id: WindowId(1),
+            tab_id: TabId(1),
+            navigation_request: shared.lock().unwrap().tab(TabId(1)).unwrap().latest_request,
+            scope: QuickMenuScope::Sidebar {
+                group: 0,
+                stable_id: resolved.stable_id,
+                generation: resolved.generation,
+                target: resolved.target,
+            },
+        };
+        assert!(quick_menu_key_is_current(&shared, &key));
+        shared.lock().unwrap().quick_access_generation += 1;
+        assert!(!quick_menu_key_is_current(&shared, &key));
+        shared.lock().unwrap().quick_access_generation = 4;
+        shared
+            .lock()
+            .unwrap()
+            .tab_mut(TabId(1))
+            .unwrap()
+            .latest_request
+            .0 += 1;
+        assert!(!quick_menu_key_is_current(&shared, &key));
+        let mut other = key.clone();
+        other.window_id = WindowId(2);
+        assert!(!quick_menu_key_is_current(&shared, &other));
+    }
+    #[test]
+    fn issue_50_library_and_shell_network_preserve_namespace_identity() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\current")], 0, [0, 1, 2, 3]);
+        let library_identity =
+            std::ffi::OsString::from(r"::{031E4825-7B94-4DC3-B131-E946B44C8DD5}\项目.library-ms");
+        app.library_generation = 9;
+        app.libraries.push(test_library(
+            library_identity.to_string_lossy().as_ref(),
+            "Display library",
+            vec![Some(PathBuf::from(r"D:\Data"))],
+            Some(PathBuf::from(r"D:\Data")),
+        ));
+        let library = sidebar_menu_target(
+            &app,
+            WindowId(1),
+            4,
+            &library_stable_id(library_identity.as_os_str()),
+        )
+        .unwrap();
+        assert!(
+            matches!(library.target, platform::windows::context_menu::ShellMenuItemTarget::Namespace { shell_identity } if shell_identity == library_identity)
+        );
+        let shell_identity = PathBuf::from(r"::{208D2C60-3AEA-1069-A2D7-08002B30309D}\服务器");
+        app.network_location_generation = 5;
+        app.imported_network_locations = vec![NetworkLocation {
+            id: 42,
+            source: NetworkLocationSource::WindowsImported,
+            display_name: "Display network".to_owned(),
+            sort_order: 0,
+            target: NetworkTarget::ShellItemId(shell_identity.clone()),
+        }];
+        let network = sidebar_menu_target(&app, WindowId(1), 2, "network-location:42").unwrap();
+        assert!(
+            matches!(network.target, platform::windows::context_menu::ShellMenuItemTarget::Namespace { shell_identity: identity } if identity == shell_identity.as_os_str())
+        );
+    }
+
+    #[test]
+    fn issue_50_current_sidebar_target_rejects_removed_node() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\current")], 0, [0, 1, 2, 3]);
+        app.quick_access_generation = 1;
+        app.sidebar = vec![KnownLocation {
+            kind: KnownLocationKind::Pinned,
+            label: "Pinned".to_owned(),
+            path: PathBuf::from(r"C:\Pinned"),
+        }];
+        let shared = Arc::new(Mutex::new(app));
+        let state = WindowSessions::new(shared.clone(), WindowId(1));
+        let resolved =
+            sidebar_menu_target(&shared.lock().unwrap(), WindowId(1), 0, "location:0").unwrap();
+        let key = QuickMenuKey {
+            window_id: WindowId(1),
+            tab_id: TabId(1),
+            navigation_request: shared.lock().unwrap().tab(TabId(1)).unwrap().latest_request,
+            scope: QuickMenuScope::Sidebar {
+                group: 0,
+                stable_id: resolved.stable_id.clone(),
+                generation: resolved.generation,
+                target: resolved.target.clone(),
+            },
+        };
+        let menu = Arc::new(Mutex::new(QuickMenuState {
+            identity: Some(QuickMenuIdentity {
+                session_id: 1,
+                request_id: 1,
+                key,
+                ready: true,
+            }),
+            active_sidebar_target: Some(resolved),
+            ..QuickMenuState::default()
+        }));
+        assert!(current_sidebar_menu_target(&state, &menu).is_some());
+        shared.lock().unwrap().sidebar.clear();
+        assert!(current_sidebar_menu_target(&state, &menu).is_none());
+    }
+    #[test]
     fn issue_69_library_background_uses_original_shell_identity() {
         let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\before")], 0, [0, 1, 2, 3]);
         let identity =
@@ -21569,13 +21955,14 @@ mod tests {
             shell_identity: identity,
             working_directory: Some(PathBuf::from(r"D:\Second")),
         };
-        assert_eq!(key.location, Some(expected.clone()));
+        assert!(
+            matches!(&key.scope, QuickMenuScope::Content { location: Some(candidate), paths } if candidate == &expected && paths.is_empty())
+        );
         assert!(matches!(
             target,
             platform::windows::context_menu::ShellMenuLoadTarget::Background(target)
                 if target == expected
         ));
-        assert!(key.paths.is_empty());
     }
 
     #[test]
@@ -21589,13 +21976,8 @@ mod tests {
         let state = WindowSessions::new(shared.clone(), WindowId(1));
 
         let (key, target) = quick_menu_key(&state, false).expect("selection target");
-        assert_eq!(
-            key.location,
-            Some(
-                platform::windows::context_menu::ShellMenuBackgroundTarget::FileSystem(
-                    PathBuf::from(r"C:\folder"),
-                )
-            )
+        assert!(
+            matches!(&key.scope, QuickMenuScope::Content { location: Some(platform::windows::context_menu::ShellMenuBackgroundTarget::FileSystem(path)), paths } if path == &PathBuf::from(r"C:\folder") && paths == &[PathBuf::from(r"C:\folder\selected.txt")])
         );
         assert!(matches!(
             target,
@@ -21667,13 +22049,15 @@ mod tests {
             window_id: WindowId(1),
             tab_id: TabId(2),
             navigation_request: RequestId(3),
-            paths: Vec::new(),
-            location: Some(
-                platform::windows::context_menu::ShellMenuBackgroundTarget::Namespace {
-                    shell_identity: "shell:library:one".into(),
-                    working_directory: None,
-                },
-            ),
+            scope: QuickMenuScope::Content {
+                paths: Vec::new(),
+                location: Some(
+                    platform::windows::context_menu::ShellMenuBackgroundTarget::Namespace {
+                        shell_identity: "shell:library:one".into(),
+                        working_directory: None,
+                    },
+                ),
+            },
         };
         let mut menu = QuickMenuState {
             identity: Some(QuickMenuIdentity {
@@ -21709,13 +22093,15 @@ mod tests {
             window_id: WindowId(1),
             tab_id: TabId(2),
             navigation_request: RequestId(3),
-            paths: Vec::new(),
-            location: Some(
-                platform::windows::context_menu::ShellMenuBackgroundTarget::Namespace {
-                    shell_identity: "shell:library:one".into(),
-                    working_directory: None,
-                },
-            ),
+            scope: QuickMenuScope::Content {
+                paths: Vec::new(),
+                location: Some(
+                    platform::windows::context_menu::ShellMenuBackgroundTarget::Namespace {
+                        shell_identity: "shell:library:one".into(),
+                        working_directory: None,
+                    },
+                ),
+            },
         };
         let mut menu = QuickMenuState {
             identity: Some(QuickMenuIdentity {
@@ -21775,17 +22161,19 @@ mod tests {
             window_id: WindowId(1),
             tab_id: TabId(2),
             navigation_request: RequestId(3),
-            paths: vec![PathBuf::from(r"C:\first.txt")],
-            location: Some(
-                platform::windows::context_menu::ShellMenuBackgroundTarget::FileSystem(
-                    PathBuf::from(r"C:\"),
+            scope: QuickMenuScope::Content {
+                paths: vec![PathBuf::from(r"C:\first.txt")],
+                location: Some(
+                    platform::windows::context_menu::ShellMenuBackgroundTarget::FileSystem(
+                        PathBuf::from(r"C:\"),
+                    ),
                 ),
-            ),
+            },
         };
-        let second = QuickMenuKey {
-            paths: vec![PathBuf::from(r"C:\second.txt")],
-            ..first.clone()
-        };
+        let mut second = first.clone();
+        if let QuickMenuScope::Content { paths, .. } = &mut second.scope {
+            *paths = vec![PathBuf::from(r"C:\second.txt")];
+        }
         let mut snapshots = HashMap::new();
         snapshots.insert(
             first.clone(),
@@ -22064,8 +22452,10 @@ mod tests {
                     window_id: WindowId(1),
                     tab_id: TabId(2),
                     navigation_request: RequestId(3),
-                    paths: vec![PathBuf::from(r"C:\selected.txt")],
-                    location: None,
+                    scope: QuickMenuScope::Content {
+                        paths: vec![PathBuf::from(r"C:\selected.txt")],
+                        location: None,
+                    },
                 },
                 ready: true,
             }),
@@ -22123,6 +22513,7 @@ mod tests {
                 },
             },
             9,
+            true,
         )
         .unwrap();
         assert!(submenu.enabled && submenu.submenu);
@@ -22140,6 +22531,7 @@ mod tests {
                 kind: ClassicMenuItemKind::Command,
             },
             0,
+            true,
         )
         .unwrap();
         assert_eq!(leaf.id, SHELL_CONTEXT_COMMAND_BASE + 42);

@@ -181,9 +181,25 @@ impl ShellMenuBackgroundTarget {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ShellMenuItemTarget {
+    FileSystem(PathBuf),
+    Namespace { shell_identity: OsString },
+}
+
+impl ShellMenuItemTarget {
+    fn shell_identity(&self) -> &OsStr {
+        match self {
+            Self::FileSystem(path) => path.as_os_str(),
+            Self::Namespace { shell_identity } => shell_identity,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ShellMenuLoadTarget {
     Paths(Vec<PathBuf>),
+    Item(ShellMenuItemTarget),
     Background(ShellMenuBackgroundTarget),
 }
 
@@ -305,6 +321,11 @@ fn shell_menu_worker_loop(
                 let result = match target {
                     ShellMenuLoadTarget::Paths(paths) => ClassicMenuSession::for_paths_with_owner(
                         &paths,
+                        include_extended_verbs,
+                        owner_window,
+                    ),
+                    ShellMenuLoadTarget::Item(target) => ClassicMenuSession::for_item_with_owner(
+                        &target,
                         include_extended_verbs,
                         owner_window,
                     ),
@@ -498,6 +519,17 @@ impl ClassicMenuSession {
         validate_selection(paths)?;
         Self::create(include_extended_verbs, false, None, || {
             create_selection_context_menu(paths, HWND(owner_window as *mut _))
+        })
+    }
+
+    pub fn for_item_with_owner(
+        target: &ShellMenuItemTarget,
+        include_extended_verbs: bool,
+        owner_window: isize,
+    ) -> io::Result<Self> {
+        validate_item(target.shell_identity())?;
+        Self::create(include_extended_verbs, false, None, || {
+            create_item_context_menu(target.shell_identity(), HWND(owner_window as *mut _))
         })
     }
 
@@ -1046,6 +1078,16 @@ fn validate_selection(paths: &[PathBuf]) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_item(identity: &OsStr) -> io::Result<()> {
+    if identity.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "classic menu item identity is empty",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_background(identity: &OsStr) -> io::Result<()> {
     if identity.is_empty() {
         return Err(io::Error::new(
@@ -1057,12 +1099,27 @@ fn validate_background(identity: &OsStr) -> io::Result<()> {
 }
 
 fn create_selection_context_menu(paths: &[PathBuf], owner: HWND) -> io::Result<IContextMenu> {
-    let mut full_pidls = Vec::with_capacity(paths.len());
-    let mut child_pidls = Vec::with_capacity(paths.len());
+    let identities = paths
+        .iter()
+        .map(|path| path.as_os_str())
+        .collect::<Vec<_>>();
+    create_item_context_menu_for_identities(&identities, owner)
+}
+
+fn create_item_context_menu(identity: &OsStr, owner: HWND) -> io::Result<IContextMenu> {
+    create_item_context_menu_for_identities(&[identity], owner)
+}
+
+fn create_item_context_menu_for_identities(
+    identities: &[&OsStr],
+    owner: HWND,
+) -> io::Result<IContextMenu> {
+    let mut full_pidls = Vec::with_capacity(identities.len());
+    let mut child_pidls = Vec::with_capacity(identities.len());
     let mut parent_folder = None;
     let result = (|| {
-        for path in paths {
-            let wide = wide_null(path);
+        for identity in identities {
+            let wide = wide_null_os(identity);
             let mut full_pidl = ptr::null_mut();
             unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut full_pidl, 0, None) }
                 .map_err(windows_error)?;
@@ -1078,7 +1135,7 @@ fn create_selection_context_menu(paths: &[PathBuf], owner: HWND) -> io::Result<I
         unsafe {
             parent_folder
                 .as_ref()
-                .expect("validated selection")
+                .expect("validated item identities")
                 .GetUIObjectOf(owner, &child_pidls, None)
         }
         .map_err(windows_error)
@@ -1436,6 +1493,53 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+    #[test]
+    fn issue_50_namespace_item_preserves_non_ascii_shell_identity() {
+        let identity = OsString::from(r"::{031E4825-7B94-4DC3-B131-E946B44C8DD5}\项目.library-ms");
+        let target = ShellMenuItemTarget::Namespace {
+            shell_identity: identity.clone(),
+        };
+
+        assert_eq!(target.shell_identity(), identity.as_os_str());
+        assert!(validate_item(target.shell_identity()).is_ok());
+        assert_eq!(
+            wide_null_os(target.shell_identity()),
+            identity.encode_wide().chain(Some(0)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn issue_50_item_rejects_empty_identity() {
+        let target = ShellMenuItemTarget::Namespace {
+            shell_identity: OsString::new(),
+        };
+
+        assert_eq!(
+            validate_item(target.shell_identity())
+                .expect_err("empty item identity must be rejected")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn issue_50_item_and_background_keep_distinct_menu_semantics() {
+        let path = PathBuf::from(r"C:\work");
+        let item = ShellMenuLoadTarget::Item(ShellMenuItemTarget::FileSystem(path.clone()));
+        let background =
+            ShellMenuLoadTarget::Background(ShellMenuBackgroundTarget::FileSystem(path.clone()));
+
+        assert!(matches!(
+            item,
+            ShellMenuLoadTarget::Item(ShellMenuItemTarget::FileSystem(candidate))
+                if candidate == path
+        ));
+        assert!(matches!(
+            background,
+            ShellMenuLoadTarget::Background(ShellMenuBackgroundTarget::FileSystem(candidate))
+                if candidate == path
+        ));
     }
     #[test]
     fn issue_69_namespace_background_preserves_identity_and_shell_working_directory() {
