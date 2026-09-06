@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    ffi::{OsStr, OsString},
     io,
     marker::PhantomData,
     mem::size_of,
@@ -153,10 +154,37 @@ impl<T> BoundedSessionStore<T> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ShellMenuBackgroundTarget {
+    FileSystem(PathBuf),
+    Namespace {
+        shell_identity: OsString,
+        working_directory: Option<PathBuf>,
+    },
+}
+
+impl ShellMenuBackgroundTarget {
+    fn shell_identity(&self) -> &OsStr {
+        match self {
+            Self::FileSystem(path) => path.as_os_str(),
+            Self::Namespace { shell_identity, .. } => shell_identity,
+        }
+    }
+
+    fn working_directory(&self) -> Option<&Path> {
+        match self {
+            Self::FileSystem(path) => Some(path),
+            Self::Namespace {
+                working_directory, ..
+            } => working_directory.as_deref(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ShellMenuLoadTarget {
     Paths(Vec<PathBuf>),
-    Background(PathBuf),
+    Background(ShellMenuBackgroundTarget),
 }
 
 #[derive(Debug)]
@@ -280,9 +308,9 @@ fn shell_menu_worker_loop(
                         include_extended_verbs,
                         owner_window,
                     ),
-                    ShellMenuLoadTarget::Background(folder) => {
-                        ClassicMenuSession::for_background_with_owner(
-                            &folder,
+                    ShellMenuLoadTarget::Background(target) => {
+                        ClassicMenuSession::for_background_target_with_owner(
+                            &target,
                             include_extended_verbs,
                             owner_window,
                         )
@@ -291,7 +319,7 @@ fn shell_menu_worker_loop(
                 .and_then(|mut menu| {
                     let mut items = menu.items_top_level()?;
                     menu.preload_powershell_background_submenu(&mut items);
-                    if menu.folder.is_some() {
+                    if menu.background {
                         items.retain(|item| item.verb.as_deref() != Some("windows.share"));
                     }
                     Ok((menu, items))
@@ -442,7 +470,8 @@ pub struct ClassicMenuSession {
     com_initialized: bool,
     submenus: Vec<SubmenuRegistration>,
     powershell_commands: HashMap<u32, PowerShellBackgroundCommand>,
-    folder: Option<PathBuf>,
+    background: bool,
+    working_directory: Option<PathBuf>,
     preloaded_submenus: std::collections::HashMap<ShellMenuSubmenuToken, Vec<ClassicMenuItem>>,
     _thread_affinity: PhantomData<Rc<()>>,
 }
@@ -467,7 +496,7 @@ impl ClassicMenuSession {
         owner_window: isize,
     ) -> io::Result<Self> {
         validate_selection(paths)?;
-        Self::create(include_extended_verbs, None, || {
+        Self::create(include_extended_verbs, false, None, || {
             create_selection_context_menu(paths, HWND(owner_window as *mut _))
         })
     }
@@ -477,15 +506,36 @@ impl ClassicMenuSession {
         include_extended_verbs: bool,
         owner_window: isize,
     ) -> io::Result<Self> {
-        validate_background(folder)?;
-        Self::create(include_extended_verbs, Some(folder.to_path_buf()), || {
-            create_background_context_menu(folder, HWND(owner_window as *mut _))
-        })
+        Self::for_background_target_with_owner(
+            &ShellMenuBackgroundTarget::FileSystem(folder.to_path_buf()),
+            include_extended_verbs,
+            owner_window,
+        )
+    }
+
+    pub fn for_background_target_with_owner(
+        target: &ShellMenuBackgroundTarget,
+        include_extended_verbs: bool,
+        owner_window: isize,
+    ) -> io::Result<Self> {
+        validate_background(target.shell_identity())?;
+        Self::create(
+            include_extended_verbs,
+            true,
+            target.working_directory().map(Path::to_path_buf),
+            || {
+                create_background_context_menu(
+                    target.shell_identity(),
+                    HWND(owner_window as *mut _),
+                )
+            },
+        )
     }
 
     fn create(
         include_extended_verbs: bool,
-        folder: Option<PathBuf>,
+        background: bool,
+        working_directory: Option<PathBuf>,
         create_context_menu: impl FnOnce() -> io::Result<IContextMenu>,
     ) -> io::Result<Self> {
         let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
@@ -543,7 +593,8 @@ impl ClassicMenuSession {
             com_initialized: true,
             submenus: Vec::new(),
             powershell_commands: HashMap::new(),
-            folder,
+            background,
+            working_directory,
             preloaded_submenus: std::collections::HashMap::new(),
             _thread_affinity: PhantomData,
         })
@@ -575,7 +626,7 @@ impl ClassicMenuSession {
     }
 
     fn preload_powershell_background_submenu(&mut self, items: &mut [ClassicMenuItem]) {
-        let Some(folder) = self.folder.clone() else {
+        let Some(folder) = self.working_directory.clone() else {
             return;
         };
         for item in items {
@@ -995,8 +1046,8 @@ fn validate_selection(paths: &[PathBuf]) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_background(folder: &Path) -> io::Result<()> {
-    if folder.as_os_str().is_empty() {
+fn validate_background(identity: &OsStr) -> io::Result<()> {
+    if identity.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "classic background menu folder is empty",
@@ -1123,8 +1174,8 @@ fn shell_home_command_by_title(menu: HMENU, verb: &str) -> Option<u32> {
     }
     None
 }
-fn create_background_context_menu(folder: &Path, owner: HWND) -> io::Result<IContextMenu> {
-    let wide = wide_null(folder);
+fn create_background_context_menu(identity: &OsStr, owner: HWND) -> io::Result<IContextMenu> {
+    let wide = wide_null_os(identity);
     let mut full_pidl = ptr::null_mut();
     unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut full_pidl, 0, None) }
         .map_err(windows_error)?;
@@ -1357,6 +1408,9 @@ fn clean_menu_title(title: &str) -> String {
 fn wide_null(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
+fn wide_null_os(value: &OsStr) -> Vec<u16> {
+    value.encode_wide().chain(Some(0)).collect()
+}
 fn windows_error(error: windows::core::Error) -> io::Error {
     io::Error::other(error.to_string())
 }
@@ -1382,6 +1436,35 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+    #[test]
+    fn issue_69_namespace_background_preserves_identity_and_shell_working_directory() {
+        let identity = OsString::from(r"::{031E4825-7B94-4DC3-B131-E946B44C8DD5}\项目.library-ms");
+        let working_directory = PathBuf::from(r"D:\Project");
+        let target = ShellMenuBackgroundTarget::Namespace {
+            shell_identity: identity.clone(),
+            working_directory: Some(working_directory.clone()),
+        };
+
+        assert_eq!(target.shell_identity(), identity.as_os_str());
+        assert_eq!(
+            target.working_directory(),
+            Some(working_directory.as_path())
+        );
+        assert!(validate_background(target.shell_identity()).is_ok());
+        assert_eq!(
+            wide_null_os(target.shell_identity()),
+            identity.encode_wide().chain(Some(0)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn issue_69_filesystem_background_retains_working_directory() {
+        let path = PathBuf::from(r"C:\work");
+        let target = ShellMenuBackgroundTarget::FileSystem(path.clone());
+
+        assert_eq!(target.shell_identity(), path.as_os_str());
+        assert_eq!(target.working_directory(), Some(path.as_path()));
     }
     #[test]
     fn bounded_session_store_routes_by_session_and_request() {
@@ -1432,8 +1515,8 @@ mod tests {
 
     #[test]
     fn background_requires_a_folder_identity() {
-        assert!(validate_background(Path::new("")).is_err());
-        assert!(validate_background(Path::new(r"C:\one")).is_ok());
+        assert!(validate_background(OsStr::new("")).is_err());
+        assert!(validate_background(OsStr::new(r"C:\one")).is_ok());
     }
     #[test]
     fn asterfiles_commands_are_not_sent_to_shell() {

@@ -163,7 +163,7 @@ Issue #6 在这条统一选择投影上增加窗口级框选手势，不保存�
 
 ## Issue #44 Windows Libraries 边界
 
-Windows Library 是 Shell 管理的虚拟容器，不能伪装为普通目录交给 `std::fs::read_dir`，也不解析 `.library-ms` XML 作为主实现。库枚举、固定状态、名称、顺序、图标、来源目录和默认保存目录均以 `FOLDERID_Libraries`、`IShellLibrary`、`IShellItem` 等 Windows Shell 接口为准，并集中在 `src/platform/windows` 的后台链路。库文件路径或 Shell parsing name 是稳定身份；展示名称不得反向用于打开、选择或文件操作。
+Windows Library 是 Shell 管理的虚拟容器，不能伪装为普通目录交给 `std::fs::read_dir`，也不解析 `.library-ms` XML 作为主实现。库枚举、固定状态、名称、顺序、图标、来源目录和默认保存目录均以 `FOLDERID_Libraries`、`IShellLibrary`、`IShellItem` 等 Windows Shell 接口为准，并集中在 `src/platform/windows` 的后台链路。库文件路径或 Shell parsing name 是稳定身份；展示名称不得反向用于打开、选择或文件操作。文件列表空白处的 Windows 背景菜单同样以该原始 Shell parsing name 创建，不能退化为默认保存目录、任一来源路径或 `.library-ms` 展示路径；Shell 返回的默认保存目录只可作为 PowerShell 等需要物理工作目录的命令参数。菜单请求继续按窗口、标签和导航代次拒绝迟到结果，失败必须清除加载占位并记录日志。
 
 侧栏的库列表属于应用级异步状态，使用独立加载代次同步投影到所有窗口；Explorer 创建、修改、删除、重命名和固定状态变化只触发受控重新枚举，迟到结果不得恢复旧列表。点击库后，当前标签保存库身份并继续使用 `TabId + RequestId` 加载；库的多个真实来源分批合并，并强制按 Shell 来源顺序分组。组头使用 Shell 来源显示名和真实路径，稳定 Shell 身份只用于内部区分；每个条目始终保留来源目录下的原始 `PathBuf` 和稳定 `EntryId`，同名来源与同名条目不得合并或覆盖。来源分组同时用于列表、网格、命中和选择，普通“分组依据”不在库页面叠加第二层。刷新、组内排序、选择、搜索、历史、标签关闭和退出沿用普通目录的请求取消与迟到结果拒收规则。
 

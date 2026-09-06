@@ -5435,7 +5435,7 @@ struct QuickMenuKey {
     tab_id: TabId,
     navigation_request: RequestId,
     paths: Vec<PathBuf>,
-    folder: Option<PathBuf>,
+    location: Option<platform::windows::context_menu::ShellMenuBackgroundTarget>,
 }
 
 #[derive(Clone)]
@@ -5586,6 +5586,27 @@ fn project_cached_shell_rows(
     (rows, !session_hit, cache_hit, session_hit)
 }
 
+fn quick_menu_location_target(
+    app: &AppState,
+    tab: &TabSession,
+) -> Option<platform::windows::context_menu::ShellMenuBackgroundTarget> {
+    match tab.visible_location()? {
+        NavigationLocation::Directory(path) => Some(
+            platform::windows::context_menu::ShellMenuBackgroundTarget::FileSystem(path.clone()),
+        ),
+        NavigationLocation::Library(library) => Some(
+            platform::windows::context_menu::ShellMenuBackgroundTarget::Namespace {
+                shell_identity: library.identity.clone(),
+                working_directory: app
+                    .libraries
+                    .iter()
+                    .find(|candidate| candidate.id.as_os_str() == library.identity.as_os_str())
+                    .and_then(|candidate| candidate.default_save_path.clone()),
+            },
+        ),
+    }
+}
+
 fn quick_menu_key(
     state: &WindowSessions,
     background: bool,
@@ -5600,8 +5621,8 @@ fn quick_menu_key(
     } else {
         selected_paths(&app)
     };
-    let folder = tab.visible_path().map(Path::to_path_buf);
-    if background && folder.is_none() || !background && paths.is_empty() {
+    let location = quick_menu_location_target(&app, tab);
+    if background && location.is_none() || !background && paths.is_empty() {
         return None;
     }
     let key = QuickMenuKey {
@@ -5609,22 +5630,71 @@ fn quick_menu_key(
         tab_id: tab.id,
         navigation_request: tab.latest_request,
         paths: paths.clone(),
-        folder: folder.clone(),
+        location: location.clone(),
     };
     let target = if background {
-        platform::windows::context_menu::ShellMenuLoadTarget::Background(folder?)
+        platform::windows::context_menu::ShellMenuLoadTarget::Background(location?)
     } else {
         platform::windows::context_menu::ShellMenuLoadTarget::Paths(paths)
     };
     Some((key, target))
 }
 
+fn apply_loaded_shell_menu(
+    menu: &mut QuickMenuState,
+    session_id: u64,
+    request_id: u64,
+    items: Vec<platform::windows::context_menu::ClassicMenuItem>,
+) -> bool {
+    let Some(key) = menu.identity.as_ref().and_then(|identity| {
+        (identity.session_id == session_id && identity.request_id == request_id)
+            .then(|| identity.key.clone())
+    }) else {
+        return false;
+    };
+    menu.submenu_tokens.clear();
+    menu.create_submenu_tokens.clear();
+    menu.preloaded_submenu_rows.clear();
+    menu.loaded_submenu_rows.clear();
+    menu.next_submenu_node = 0;
+    let projected = project_shell_menu_items(menu, items);
+    menu.snapshots.insert(
+        key,
+        QuickMenuSnapshot {
+            rows: projected.clone(),
+            captured_at: Instant::now(),
+        },
+    );
+    if let Some(current) = menu.identity.as_mut() {
+        current.ready = true;
+    }
+    menu.all_rows = compose_quick_menu_rows(&menu.built_in_rows, &projected);
+    true
+}
+fn clear_current_shell_menu_failure(
+    menu: &mut QuickMenuState,
+    session_id: u64,
+    request_id: u64,
+) -> bool {
+    if !menu.identity.as_ref().is_some_and(|identity| {
+        identity.session_id == session_id && identity.request_id == request_id
+    }) {
+        return false;
+    }
+    menu.identity = None;
+    menu.all_rows = menu.built_in_rows.clone();
+    menu.submenu_tokens.clear();
+    menu.create_submenu_tokens.clear();
+    menu.preloaded_submenu_rows.clear();
+    menu.loaded_submenu_rows.clear();
+    true
+}
 fn quick_menu_key_is_current(state: &SharedSessions, key: &QuickMenuKey) -> bool {
     state.lock().ok().is_some_and(|app| {
         app.window_for_tab(key.tab_id) == Some(key.window_id)
             && app.tab(key.tab_id).is_some_and(|tab| {
                 tab.latest_request == key.navigation_request
-                    && tab.visible_path().map(Path::to_path_buf) == key.folder
+                    && quick_menu_location_target(&app, tab) == key.location
                     && if key.paths.is_empty() {
                         tab.selected.is_empty()
                     } else {
@@ -5940,6 +6010,20 @@ fn project_filtered_context_menu(ui: &AppWindow, menu: &SharedQuickMenu, query: 
     }
 }
 
+fn shell_menu_invocation_refresh_target(
+    state: &SharedSessions,
+    tab_id: TabId,
+    target: Option<&platform::windows::context_menu::ShellMenuBackgroundTarget>,
+) -> Option<NavigationLocation> {
+    match target? {
+        platform::windows::context_menu::ShellMenuBackgroundTarget::FileSystem(path) => {
+            Some(NavigationLocation::Directory(path.clone()))
+        }
+        platform::windows::context_menu::ShellMenuBackgroundTarget::Namespace { .. } => {
+            state.lock().ok()?.tab(tab_id)?.visible_location().cloned()
+        }
+    }
+}
 fn begin_shell_menu_load(
     ui: &AppWindow,
     state: &WindowSessions,
@@ -5987,7 +6071,15 @@ fn begin_shell_menu_load(
         })
         .is_err()
     {
+        if let Ok(mut menu) = menu.lock() {
+            clear_current_shell_menu_failure(&mut menu, identity.session_id, identity.request_id);
+        }
         ui.set_context_shell_loading(false);
+        project_filtered_context_menu(ui, menu, ui.get_context_search().as_str());
+        eprintln!(
+            "{{\"event\":\"shell_menu_load_error\",\"session\":{},\"request\":{},\"operation\":\"dispatch\"}}",
+            identity.session_id, identity.request_id,
+        );
     } else {
         eprintln!(
             "{{\"event\":\"shell_menu_load_started\",\"session\":{},\"request\":{},\"window\":{},\"tab\":{},\"navigation_request\":{}}}",
@@ -11352,13 +11444,13 @@ fn wire_callbacks(
                     Some((
                         tab.latest_request,
                         selected_paths_for_tab(tab),
-                        tab.visible_path().map(Path::to_path_buf),
+                        quick_menu_location_target(&app, tab),
                     ))
                 });
-                if current.is_none_or(|(request, paths, folder)| {
+                if current.is_none_or(|(request, paths, background)| {
                     request != identity.key.navigation_request
                         || paths != identity.key.paths
-                        || folder != identity.key.folder
+                        || background != identity.key.location
                 }) {
                     if let Ok(mut app) = state_for_context_command.lock() {
                         app.operation_errors
@@ -11381,7 +11473,11 @@ fn wire_callbacks(
                     };
                     if creates_item
                         && identity.key.paths.is_empty()
-                        && let Some(folder) = identity.key.folder.clone()
+                        && let Some(
+                            platform::windows::context_menu::ShellMenuBackgroundTarget::FileSystem(
+                                folder,
+                            ),
+                        ) = identity.key.location.clone()
                         && let Ok(mut app) = state_for_context_command.lock()
                         && let Some(baseline) =
                             app.tab(identity.key.tab_id).map(directory_path_snapshot)
@@ -14159,29 +14255,7 @@ fn start_shell_menu_event_pump(
                             return;
                         }
                         if let Ok(mut menu) = menu_state.lock() {
-                            menu.submenu_tokens.clear();
-                            menu.create_submenu_tokens.clear();
-                            menu.preloaded_submenu_rows.clear();
-                            menu.loaded_submenu_rows.clear();
-                            menu.next_submenu_node = 0;
-                            let projected = project_shell_menu_items(&mut menu, items);
-                            if let Some(identity) = identity.as_ref() {
-                                menu.snapshots.insert(
-                                    identity.key.clone(),
-                                    QuickMenuSnapshot {
-                                        rows: projected.clone(),
-                                        captured_at: Instant::now(),
-                                    },
-                                );
-                                if let Some(current) = menu.identity.as_mut()
-                                    && current.session_id == session_id
-                                    && current.request_id == request_id
-                                {
-                                    current.ready = true;
-                                }
-                            }
-                            menu.all_rows =
-                                compose_quick_menu_rows(&menu.built_in_rows, &projected);
+                            apply_loaded_shell_menu(&mut menu, session_id, request_id, items);
                         }
                         if ui.get_context_menu_open() {
                             ui.set_context_shell_loading(false);
@@ -14303,14 +14377,20 @@ fn start_shell_menu_event_pump(
                                 "rename" => ui.invoke_begin_rename(),
                                 _ => {}
                             }
-                        } else if let Some(folder) =
-                            identity.and_then(|identity| identity.key.folder)
+                        } else if let Some(identity) = identity
+                            && let Some(location) = shell_menu_invocation_refresh_target(
+                                &state,
+                                identity.key.tab_id,
+                                identity.key.location.as_ref(),
+                            )
                         {
-                            refresh_affected_tabs(
+                            let _ = submit_location_navigation(
                                 &directory_sender,
                                 &network_directory_sender,
                                 &state,
-                                &[folder],
+                                identity.key.tab_id,
+                                location,
+                                NavigationKind::Refresh,
                             );
                         }
                         let _ =
@@ -14332,18 +14412,29 @@ fn start_shell_menu_event_pump(
                             menu.identity.as_ref().is_some_and(|identity| {
                                 identity.session_id == session_id
                                     && identity.request_id == request_id
+                                    && quick_menu_key_is_current(&state, &identity.key)
                             })
                         });
                         if current {
                             ui.set_context_shell_loading(false);
                             if let Ok(mut menu) = menu_state.lock() {
-                                menu.identity = None;
+                                clear_current_shell_menu_failure(&mut menu, session_id, request_id);
+                            }
+                            if ui.get_context_menu_open() {
+                                project_filtered_context_menu(
+                                    &ui,
+                                    &menu_state,
+                                    ui.get_context_search().as_str(),
+                                );
                             }
                             if let Ok(mut app) = state.lock() {
                                 app.operation_errors.push(format!(
                                     "Shell menu {operation} failed after {elapsed_ms} ms: {message}"
                                 ));
                             }
+                            eprintln!(
+                                "{{\"event\":\"shell_menu_error\",\"session\":{session_id},\"request\":{request_id},\"operation\":\"{operation}\",\"elapsed_ms\":{elapsed_ms},\"message\":{message:?}}}"
+                            );
                         } else {
                             eprintln!(
                                 "{{\"event\":\"shell_menu_stale_error\",\"session\":{session_id},\"request\":{request_id},\"operation\":\"{operation}\",\"elapsed_ms\":{elapsed_ms}}}"
@@ -21455,6 +21546,202 @@ mod tests {
     }
 
     #[test]
+    fn issue_69_library_background_uses_original_shell_identity() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\before")], 0, [0, 1, 2, 3]);
+        let identity =
+            std::ffi::OsString::from(r"::{031E4825-7B94-4DC3-B131-E946B44C8DD5}\项目.library-ms");
+        let library = LibraryLocationId::new(identity.clone(), "项目".to_owned());
+        app.tab_mut(TabId(1)).unwrap().current_location =
+            Some(NavigationLocation::Library(library));
+        app.libraries.push(test_library(
+            identity.to_string_lossy().as_ref(),
+            "项目",
+            vec![
+                Some(PathBuf::from(r"C:\First")),
+                Some(PathBuf::from(r"D:\Second")),
+            ],
+            Some(PathBuf::from(r"D:\Second")),
+        ));
+        let state = WindowSessions::new(Arc::new(Mutex::new(app)), WindowId(1));
+
+        let (key, target) = quick_menu_key(&state, true).expect("library background target");
+        let expected = platform::windows::context_menu::ShellMenuBackgroundTarget::Namespace {
+            shell_identity: identity,
+            working_directory: Some(PathBuf::from(r"D:\Second")),
+        };
+        assert_eq!(key.location, Some(expected.clone()));
+        assert!(matches!(
+            target,
+            platform::windows::context_menu::ShellMenuLoadTarget::Background(target)
+                if target == expected
+        ));
+        assert!(key.paths.is_empty());
+    }
+
+    #[test]
+    fn issue_69_selection_menu_keeps_its_visible_location_identity() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\folder")], 0, [0, 1, 2, 3]);
+        app.tab_mut(TabId(1))
+            .unwrap()
+            .replace_entries(vec![focus_entry(1, r"C:\folder\selected.txt")]);
+        app.tab_mut(TabId(1)).unwrap().selected = vec![EntryId(1)];
+        let shared = Arc::new(Mutex::new(app));
+        let state = WindowSessions::new(shared.clone(), WindowId(1));
+
+        let (key, target) = quick_menu_key(&state, false).expect("selection target");
+        assert_eq!(
+            key.location,
+            Some(
+                platform::windows::context_menu::ShellMenuBackgroundTarget::FileSystem(
+                    PathBuf::from(r"C:\folder"),
+                )
+            )
+        );
+        assert!(matches!(
+            target,
+            platform::windows::context_menu::ShellMenuLoadTarget::Paths(paths)
+                if paths == [PathBuf::from(r"C:\folder\selected.txt")]
+        ));
+        assert!(quick_menu_key_is_current(&shared, &key));
+    }
+    #[test]
+    fn issue_69_library_powershell_reuses_the_default_save_location() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\before")], 0, [0, 1, 2, 3]);
+        let identity = std::ffi::OsString::from("shell:library:multi-source");
+        app.tab_mut(TabId(1)).unwrap().current_location = Some(NavigationLocation::Library(
+            LibraryLocationId::new(identity.clone(), "Multi source".to_owned()),
+        ));
+        app.libraries.push(test_library(
+            identity.to_string_lossy().as_ref(),
+            "Multi source",
+            vec![
+                Some(PathBuf::from(r"C:\First")),
+                Some(PathBuf::from(r"D:\Second")),
+            ],
+            Some(PathBuf::from(r"D:\Second")),
+        ));
+
+        assert_eq!(
+            quick_menu_location_target(&app, app.active()),
+            Some(
+                platform::windows::context_menu::ShellMenuBackgroundTarget::Namespace {
+                    shell_identity: identity,
+                    working_directory: Some(PathBuf::from(r"D:\Second")),
+                }
+            )
+        );
+    }
+    #[test]
+    fn issue_69_library_background_key_rejects_refresh_and_location_changes() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\before")], 0, [0, 1, 2, 3]);
+        let library = LibraryLocationId::new("shell:library:one".into(), "One".to_owned());
+        app.tab_mut(TabId(1)).unwrap().current_location =
+            Some(NavigationLocation::Library(library.clone()));
+        let shared = Arc::new(Mutex::new(app));
+        let state = WindowSessions::new(shared.clone(), WindowId(1));
+        let (key, _) = quick_menu_key(&state, true).expect("library background target");
+        assert!(quick_menu_key_is_current(&shared, &key));
+
+        shared
+            .lock()
+            .unwrap()
+            .tab_mut(TabId(1))
+            .unwrap()
+            .latest_request = RequestId(1);
+        assert!(!quick_menu_key_is_current(&shared, &key));
+        {
+            let mut app = shared.lock().unwrap();
+            let tab = app.tab_mut(TabId(1)).unwrap();
+            tab.latest_request = key.navigation_request;
+            tab.current_location = Some(NavigationLocation::Library(LibraryLocationId::new(
+                "shell:library:two".into(),
+                "Two".to_owned(),
+            )));
+        }
+        assert!(!quick_menu_key_is_current(&shared, &key));
+    }
+
+    #[test]
+    fn issue_69_empty_shell_menu_load_is_a_successful_terminal_state() {
+        let key = QuickMenuKey {
+            window_id: WindowId(1),
+            tab_id: TabId(2),
+            navigation_request: RequestId(3),
+            paths: Vec::new(),
+            location: Some(
+                platform::windows::context_menu::ShellMenuBackgroundTarget::Namespace {
+                    shell_identity: "shell:library:one".into(),
+                    working_directory: None,
+                },
+            ),
+        };
+        let mut menu = QuickMenuState {
+            identity: Some(QuickMenuIdentity {
+                session_id: 41,
+                request_id: 7,
+                key,
+                ready: false,
+            }),
+            all_rows: (0..QUICK_MENU_PLACEHOLDER_ROWS)
+                .map(|_| quick_menu_placeholder())
+                .collect(),
+            built_in_rows: vec![context_test_row(1, "Refresh", "refresh", false)],
+            ..QuickMenuState::default()
+        };
+
+        assert!(apply_loaded_shell_menu(&mut menu, 41, 7, Vec::new()));
+        assert!(
+            menu.identity
+                .as_ref()
+                .is_some_and(|identity| identity.ready)
+        );
+        assert_eq!(menu.all_rows, menu.built_in_rows);
+        assert!(
+            menu.all_rows
+                .iter()
+                .all(|row| !row.placeholder && !row.loading)
+        );
+        assert!(!apply_loaded_shell_menu(&mut menu, 41, 8, Vec::new()));
+    }
+    #[test]
+    fn issue_69_shell_menu_failure_is_terminal_and_retryable() {
+        let key = QuickMenuKey {
+            window_id: WindowId(1),
+            tab_id: TabId(2),
+            navigation_request: RequestId(3),
+            paths: Vec::new(),
+            location: Some(
+                platform::windows::context_menu::ShellMenuBackgroundTarget::Namespace {
+                    shell_identity: "shell:library:one".into(),
+                    working_directory: None,
+                },
+            ),
+        };
+        let mut menu = QuickMenuState {
+            identity: Some(QuickMenuIdentity {
+                session_id: 41,
+                request_id: 7,
+                key,
+                ready: false,
+            }),
+            all_rows: (0..QUICK_MENU_PLACEHOLDER_ROWS)
+                .map(|_| quick_menu_placeholder())
+                .collect(),
+            built_in_rows: vec![context_test_row(1, "Refresh", "refresh", false)],
+            ..QuickMenuState::default()
+        };
+
+        assert!(clear_current_shell_menu_failure(&mut menu, 41, 7));
+        assert!(menu.identity.is_none());
+        assert_eq!(menu.all_rows, menu.built_in_rows);
+        assert!(
+            menu.all_rows
+                .iter()
+                .all(|row| !row.placeholder && !row.loading)
+        );
+        assert!(!clear_current_shell_menu_failure(&mut menu, 41, 7));
+    }
+    #[test]
     fn quick_menu_inflight_prewarm_projects_placeholders_until_snapshot_arrives() {
         let (rows, loading, cache_hit, session_hit) = project_cached_shell_rows(true, None);
         assert!(loading && !cache_hit && !session_hit);
@@ -21489,7 +21776,11 @@ mod tests {
             tab_id: TabId(2),
             navigation_request: RequestId(3),
             paths: vec![PathBuf::from(r"C:\first.txt")],
-            folder: Some(PathBuf::from(r"C:\")),
+            location: Some(
+                platform::windows::context_menu::ShellMenuBackgroundTarget::FileSystem(
+                    PathBuf::from(r"C:\"),
+                ),
+            ),
         };
         let second = QuickMenuKey {
             paths: vec![PathBuf::from(r"C:\second.txt")],
@@ -21774,7 +22065,7 @@ mod tests {
                     tab_id: TabId(2),
                     navigation_request: RequestId(3),
                     paths: vec![PathBuf::from(r"C:\selected.txt")],
-                    folder: None,
+                    location: None,
                 },
                 ready: true,
             }),
