@@ -1834,7 +1834,7 @@ accessible-label: entry.name;
                                 enabled: entry.loaded && !(root.rename-editing && root.rename-entry-id == entry.id);
                                 private property <bool> click-control: false;
                                 private property <bool> click-shift: false;
-                                private property <bool> pressed-here: false;
+
                                 mouse-cursor: pointer;
                                 pointer-event(event) => {
                                     if event.kind == PointerEventKind.down {
@@ -1848,7 +1848,7 @@ accessible-label: entry.name;
                                             );
                                         }
                                         if event.button == PointerEventButton.left {
-                                            self.pressed-here = true;
+
                                             root.internal-drag-pointer-active = true;
                                             root.begin-internal-drag(
                                                 entry.id,
@@ -1860,14 +1860,14 @@ accessible-label: entry.name;
                                             );
                                         }
                                     }
-                                    if event.kind == PointerEventKind.move && self.pressed-here && root.internal-drag-pointer-active {
+                                    if event.kind == PointerEventKind.move && self.pressed && root.internal-drag-pointer-active {
                                         root.update-internal-drag(
                                             (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
                                             (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px
                                         );
                                     }
-                                    if event.kind == PointerEventKind.up && event.button == PointerEventButton.left && self.pressed-here && root.internal-drag-pointer-active {
-                                        self.pressed-here = false;
+                                    if event.kind == PointerEventKind.up && event.button == PointerEventButton.left && self.pressed && root.internal-drag-pointer-active {
+
                                         root.internal-drag-pointer-active = false;
                                         root.end-internal-drag(
                                             (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
