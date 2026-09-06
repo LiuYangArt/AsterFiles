@@ -38,6 +38,7 @@ pub enum AgentScenario {
     TabDetach,
     TabCrossWindow,
     ExplorerPins,
+    WindowsLibraries,
     QuickAccess,
     ShellThumbnail,
     FolderSizeScheduler,
@@ -60,6 +61,7 @@ impl AgentScenario {
             Self::TabDetach => "tab-detach",
             Self::TabCrossWindow => "tab-cross-window",
             Self::ExplorerPins => "explorer-pins",
+            Self::WindowsLibraries => "windows-libraries",
             Self::QuickAccess => "quick-access",
             Self::ShellThumbnail => "shell-thumbnail",
             Self::FolderSizeScheduler => "folder-size-scheduler",
@@ -71,7 +73,12 @@ impl AgentScenario {
     }
 
     fn default_path(self) -> PathBuf {
-        Path::new(DEFAULT_STATE_DIR).join(format!("{}.json", self.name()))
+        match self {
+            Self::WindowsLibraries => Path::new(DEFAULT_STATE_DIR)
+                .join("windows-libraries")
+                .join("foundation.json"),
+            _ => Path::new(DEFAULT_STATE_DIR).join(format!("{}.json", self.name())),
+        }
     }
 }
 
@@ -134,6 +141,7 @@ fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
         "tab-detach" => Ok(AgentScenario::TabDetach),
         "tab-cross-window" => Ok(AgentScenario::TabCrossWindow),
         "explorer-pins" => Ok(AgentScenario::ExplorerPins),
+        "windows-libraries" => Ok(AgentScenario::WindowsLibraries),
         "quick-access" => Ok(AgentScenario::QuickAccess),
         "shell-thumbnail" => Ok(AgentScenario::ShellThumbnail),
         "folder-size-scheduler" => Ok(AgentScenario::FolderSizeScheduler),
@@ -148,41 +156,67 @@ fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
 pub fn apply_scenario(session: &mut TabSession, scenario: AgentScenario) {
     match scenario {
         AgentScenario::PermissionDenied => {
-            session.current_path = Some(PathBuf::from(r"C:\AgentScenarios"));
-            session.requested_path = Some(PathBuf::from(r"C:\AgentScenarios\PermissionDenied"));
+            session.current_location = Some(crate::domain::NavigationLocation::Directory(
+                PathBuf::from(r"C:\AgentScenarios"),
+            ));
+            session.requested_location = Some(crate::domain::NavigationLocation::Directory(
+                PathBuf::from(r"C:\AgentScenarios\PermissionDenied"),
+            ));
             session.load_state = LoadState::PermissionDenied;
             session.error = Some("permission denied".to_owned());
         }
         AgentScenario::DragDropFoundation => {
-            session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\DragDrop"));
+            session.current_location = Some(crate::domain::NavigationLocation::Directory(
+                PathBuf::from(r"C:\AgentScenarios\DragDrop"),
+            ));
             session.load_state = LoadState::Complete;
         }
         AgentScenario::MultiWindowStateLayering => {
-            session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\MultiWindow"));
+            session.current_location = Some(crate::domain::NavigationLocation::Directory(
+                PathBuf::from(r"C:\AgentScenarios\MultiWindow"),
+            ));
             session.load_state = LoadState::Complete;
         }
         AgentScenario::TabReorder => {
-            session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\TabReorder"));
+            session.current_location = Some(crate::domain::NavigationLocation::Directory(
+                PathBuf::from(r"C:\AgentScenarios\TabReorder"),
+            ));
             session.load_state = LoadState::Complete;
         }
         AgentScenario::TabDetach => {
-            session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\TabDetach"));
+            session.current_location = Some(crate::domain::NavigationLocation::Directory(
+                PathBuf::from(r"C:\AgentScenarios\TabDetach"),
+            ));
             session.load_state = LoadState::Complete;
         }
         AgentScenario::TabCrossWindow => {
-            session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\TabCrossWindow"));
+            session.current_location = Some(crate::domain::NavigationLocation::Directory(
+                PathBuf::from(r"C:\AgentScenarios\TabCrossWindow"),
+            ));
             session.load_state = LoadState::Complete;
         }
         AgentScenario::ExplorerPins => {
-            session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\ExplorerPins"));
+            session.current_location = Some(crate::domain::NavigationLocation::Directory(
+                PathBuf::from(r"C:\AgentScenarios\ExplorerPins"),
+            ));
+            session.load_state = LoadState::Complete;
+        }
+        AgentScenario::WindowsLibraries => {
+            session.current_location = Some(crate::domain::NavigationLocation::Directory(
+                PathBuf::from(r"C:\AgentScenarios\WindowsLibraries"),
+            ));
             session.load_state = LoadState::Complete;
         }
         AgentScenario::QuickAccess => {
-            session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\QuickAccess"));
+            session.current_location = Some(crate::domain::NavigationLocation::Directory(
+                PathBuf::from(r"C:\AgentScenarios\QuickAccess"),
+            ));
             session.load_state = LoadState::Complete;
         }
         AgentScenario::ShellThumbnail => {
-            session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\ShellThumbnail"));
+            session.current_location = Some(crate::domain::NavigationLocation::Directory(
+                PathBuf::from(r"C:\AgentScenarios\ShellThumbnail"),
+            ));
             session.load_state = LoadState::Complete;
         }
         AgentScenario::FolderSizeScheduler
@@ -190,13 +224,17 @@ pub fn apply_scenario(session: &mut TabSession, scenario: AgentScenario) {
         | AgentScenario::QuickMenuPopup
         | AgentScenario::NetworkFoundation
         | AgentScenario::FileListTypeSelect => {
-            session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\FolderSizes"));
+            session.current_location = Some(crate::domain::NavigationLocation::Directory(
+                PathBuf::from(r"C:\AgentScenarios\FolderSizes"),
+            ));
             session.load_state = LoadState::Complete;
         }
         AgentScenario::FileOperationRunning
         | AgentScenario::FileOperationConflict
         | AgentScenario::FileOperationPartial => {
-            session.current_path = Some(PathBuf::from(r"C:\AgentScenarios\FileOperations"));
+            session.current_location = Some(crate::domain::NavigationLocation::Directory(
+                PathBuf::from(r"C:\AgentScenarios\FileOperations"),
+            ));
             session.load_state = LoadState::Complete;
             session.error = Some(scenario.name().to_owned());
         }
@@ -319,6 +357,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
             | AgentScenario::TabDetach
             | AgentScenario::TabCrossWindow
             | AgentScenario::ExplorerPins
+            | AgentScenario::WindowsLibraries
             | AgentScenario::QuickAccess
             | AgentScenario::ShellThumbnail
             | AgentScenario::FolderSizeScheduler
@@ -383,6 +422,7 @@ fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str>
         AgentScenario::TabDetach => unreachable!(),
         AgentScenario::TabCrossWindow => unreachable!(),
         AgentScenario::ExplorerPins => unreachable!(),
+        AgentScenario::WindowsLibraries => unreachable!(),
         AgentScenario::QuickAccess => unreachable!(),
         AgentScenario::ShellThumbnail => unreachable!(),
         AgentScenario::FolderSizeScheduler => unreachable!(),
@@ -457,6 +497,17 @@ mod tests {
     use super::*;
     use crate::domain::{TabId, TabSession};
 
+    #[test]
+    fn windows_libraries_scenario_has_stable_name_and_nested_default_path() {
+        let scenario = parse_scenario("windows-libraries").expect("scenario is registered");
+
+        assert_eq!(scenario, AgentScenario::WindowsLibraries);
+        assert_eq!(scenario.name(), "windows-libraries");
+        assert_eq!(
+            scenario.default_path(),
+            PathBuf::from("artifacts/state/windows-libraries/foundation.json")
+        );
+    }
     #[test]
     fn permission_page_only_exposes_windows_access_inside_the_page() {
         let mut session = TabSession::new(TabId(1));

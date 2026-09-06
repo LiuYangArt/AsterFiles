@@ -4,6 +4,7 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
     ffi::OsString,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -53,10 +54,81 @@ pub enum AddressMode {
     Smart,
 }
 
+#[derive(Debug, Clone)]
+pub struct LibraryLocationId {
+    pub identity: OsString,
+    pub display_name: String,
+}
+
+impl LibraryLocationId {
+    pub fn new(identity: OsString, display_name: String) -> Self {
+        Self {
+            identity,
+            display_name,
+        }
+    }
+}
+impl PartialEq for LibraryLocationId {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+
+impl Eq for LibraryLocationId {}
+
+impl Hash for LibraryLocationId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.identity.hash(state);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum NavigationLocation {
+    Directory(PathBuf),
+    Library(LibraryLocationId),
+}
+
+impl NavigationLocation {
+    pub fn directory_path(&self) -> Option<&Path> {
+        match self {
+            Self::Directory(path) => Some(path),
+            Self::Library(_) => None,
+        }
+    }
+
+    pub fn display_name(&self) -> String {
+        match self {
+            Self::Directory(path) => display_path(path),
+            Self::Library(library) => library.display_name.clone(),
+        }
+    }
+}
+
+impl PartialEq<PathBuf> for NavigationLocation {
+    fn eq(&self, other: &PathBuf) -> bool {
+        self.directory_path() == Some(other.as_path())
+    }
+}
+
+impl PartialEq<NavigationLocation> for PathBuf {
+    fn eq(&self, other: &NavigationLocation) -> bool {
+        other == self
+    }
+}
+impl From<PathBuf> for NavigationLocation {
+    fn from(path: PathBuf) -> Self {
+        Self::Directory(path)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchScope {
     Global,
     Directory(PathBuf),
+    Library {
+        display_name: String,
+        sources: Vec<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -460,8 +532,8 @@ pub struct TabSession {
     pub id: TabId,
     pub kind: TabKind,
     pub latest_request: RequestId,
-    pub current_path: Option<PathBuf>,
-    pub requested_path: Option<PathBuf>,
+    pub current_location: Option<NavigationLocation>,
+    pub requested_location: Option<NavigationLocation>,
     pub address_editing: bool,
     pub address_input: String,
     pub address_mode: AddressMode,
@@ -478,8 +550,8 @@ pub struct TabSession {
     pub search_page_retries: HashMap<u32, u8>,
     directory_snapshot: Option<DirectorySnapshot>,
     pub navigation_kind: NavigationKind,
-    pub back_history: Vec<PathBuf>,
-    pub forward_history: Vec<PathBuf>,
+    pub back_history: Vec<NavigationLocation>,
+    pub forward_history: Vec<NavigationLocation>,
     pub entries: Arc<Vec<FileEntry>>,
     pub pending_entries: Vec<FileEntry>,
     pub entry_indices: HashMap<EntryId, usize>,
@@ -502,8 +574,8 @@ impl TabSession {
             id,
             kind: TabKind::Files,
             latest_request: RequestId(0),
-            current_path: None,
-            requested_path: None,
+            current_location: None,
+            requested_location: None,
             address_editing: false,
             address_input: String::new(),
             address_mode: AddressMode::Normal,
@@ -551,8 +623,8 @@ impl TabSession {
             id,
             kind: TabKind::Files,
             latest_request: source.latest_request,
-            current_path: source.current_path.clone(),
-            requested_path: None,
+            current_location: source.current_location.clone(),
+            requested_location: None,
             address_editing: false,
             address_input: String::new(),
             address_mode: AddressMode::Normal,
@@ -590,17 +662,21 @@ impl TabSession {
     pub fn begin_smart_address_edit(&mut self) {
         self.address_editing = true;
         self.address_mode = AddressMode::Smart;
-        self.search_scope = self
-            .visible_path()
-            .map(|path| SearchScope::Directory(path.to_path_buf()))
-            .unwrap_or(SearchScope::Global);
+        self.search_scope = match self.visible_location() {
+            Some(NavigationLocation::Directory(path)) => SearchScope::Directory(path.clone()),
+            Some(NavigationLocation::Library(library)) => SearchScope::Library {
+                display_name: library.display_name.clone(),
+                sources: Vec::new(),
+            },
+            None => SearchScope::Global,
+        };
         self.search_depth = SearchDepth::Recursive;
         self.search_query.clear();
         self.address_input = search_address_text(&self.search_scope, &self.search_query);
         self.search_state = SearchState::Waiting;
     }
 
-    pub fn visible_path(&self) -> Option<&Path> {
+    pub fn visible_location(&self) -> Option<&NavigationLocation> {
         if matches!(
             self.load_state,
             LoadState::Loading
@@ -611,16 +687,21 @@ impl TabSession {
                 | LoadState::Disconnected
                 | LoadState::Failed
         ) {
-            self.requested_path
-                .as_deref()
-                .or(self.current_path.as_deref())
+            self.requested_location
+                .as_ref()
+                .or(self.current_location.as_ref())
         } else {
-            self.current_path.as_deref()
+            self.current_location.as_ref()
         }
     }
 
+    pub fn visible_path(&self) -> Option<&Path> {
+        self.visible_location()
+            .and_then(NavigationLocation::directory_path)
+    }
+
     pub fn has_failed_location(&self) -> bool {
-        self.requested_path.is_some()
+        self.requested_location.is_some()
             && matches!(
                 self.load_state,
                 LoadState::Cancelled
@@ -632,10 +713,10 @@ impl TabSession {
     }
 
     pub fn restore_successful_location(&mut self) -> bool {
-        if !self.has_failed_location() || self.current_path.is_none() {
+        if !self.has_failed_location() || self.current_location.is_none() {
             return false;
         }
-        if let Some(failed_path) = self.requested_path.take()
+        if let Some(failed_path) = self.requested_location.take()
             && self.forward_history.last() != Some(&failed_path)
         {
             self.forward_history.push(failed_path);
@@ -650,9 +731,12 @@ impl TabSession {
         true
     }
 
-    pub fn breadcrumb_paths(&self) -> Vec<(String, PathBuf)> {
-        let Some(path) = self.visible_path() else {
+    pub fn breadcrumb_paths(&self) -> Vec<(String, NavigationLocation)> {
+        let Some(location) = self.visible_location() else {
             return Vec::new();
+        };
+        let NavigationLocation::Directory(path) = location else {
+            return vec![(location.display_name(), location.clone())];
         };
         let mut segments = Vec::new();
         let mut cursor = PathBuf::new();
@@ -663,16 +747,17 @@ impl TabSession {
                 std::path::Component::RootDir => display_path(&cursor),
                 _ => component.as_os_str().to_string_lossy().into_owned(),
             };
+            let location = NavigationLocation::Directory(cursor.clone());
             if !label.is_empty()
                 && segments
                     .last()
-                    .is_none_or(|(_, previous)| previous != &cursor)
+                    .is_none_or(|(_, previous)| previous != &location)
             {
-                segments.push((label, cursor.clone()));
+                segments.push((label, location));
             }
         }
         if segments.is_empty() && !path.as_os_str().is_empty() {
-            segments.push((display_path(path), path.to_path_buf()));
+            segments.push((display_path(path), location.clone()));
         }
         segments
     }
@@ -689,6 +774,15 @@ impl TabSession {
                         self.search_query = input.clone();
                     }
                 }
+                SearchScope::Library { display_name, .. } => {
+                    let prefix = library_search_scope_prefix(display_name);
+                    if let Some(query) = input.strip_prefix(&prefix) {
+                        self.search_query = query.to_owned();
+                    } else {
+                        self.search_scope = SearchScope::Global;
+                        self.search_query = input.clone();
+                    }
+                }
                 SearchScope::Global => self.search_query.clone_from(&input),
             }
         }
@@ -696,7 +790,7 @@ impl TabSession {
     }
 
     pub fn toggle_search_depth(&mut self) -> bool {
-        if !matches!(self.search_scope, SearchScope::Directory(_)) {
+        if matches!(self.search_scope, SearchScope::Global) {
             return false;
         }
         self.search_depth = match self.search_depth {
@@ -782,12 +876,12 @@ impl TabSession {
 
     pub fn begin_navigation(
         &mut self,
-        path: PathBuf,
+        location: NavigationLocation,
         kind: NavigationKind,
     ) -> (RequestId, Arc<AtomicBool>) {
         self.cancel_pending();
         self.latest_request.0 += 1;
-        self.requested_path = Some(path);
+        self.requested_location = Some(location);
         self.page_source = PageSource::Directory;
         self.directory_snapshot = None;
         self.search_total = None;
@@ -804,6 +898,14 @@ impl TabSession {
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
         (self.latest_request, cancel)
+    }
+
+    pub fn begin_directory_navigation(
+        &mut self,
+        path: PathBuf,
+        kind: NavigationKind,
+    ) -> (RequestId, Arc<AtomicBool>) {
+        self.begin_navigation(NavigationLocation::Directory(path), kind)
     }
 
     pub fn accepts(&self, request_id: RequestId) -> bool {
@@ -996,19 +1098,20 @@ impl TabSession {
         self.cancel = None;
     }
 
-    pub fn commit_path(&mut self, path: PathBuf) {
-        let previous = self.current_path.clone();
+    pub fn commit_location(&mut self, location: NavigationLocation) {
+        let previous = self.current_location.clone();
         match self.navigation_kind {
             NavigationKind::Normal => {
                 if let Some(previous) = previous.as_ref()
-                    && previous != &path
+                    && previous != &location
                 {
                     self.back_history.push(previous.clone());
                     self.forward_history.clear();
                 }
             }
             NavigationKind::Back => {
-                if let Some(position) = self.back_history.iter().rposition(|item| item == &path) {
+                if let Some(position) = self.back_history.iter().rposition(|item| item == &location)
+                {
                     let traversed = self.back_history.drain(position..).collect::<Vec<_>>();
                     if let Some(previous) = previous {
                         self.forward_history.push(previous);
@@ -1017,7 +1120,10 @@ impl TabSession {
                 }
             }
             NavigationKind::Forward => {
-                if let Some(position) = self.forward_history.iter().rposition(|item| item == &path)
+                if let Some(position) = self
+                    .forward_history
+                    .iter()
+                    .rposition(|item| item == &location)
                 {
                     let traversed = self.forward_history.drain(position..).collect::<Vec<_>>();
                     if let Some(previous) = previous {
@@ -1028,18 +1134,22 @@ impl TabSession {
             }
             NavigationKind::Refresh => {}
         }
-        self.current_path = Some(path);
-        self.requested_path = None;
+        self.current_location = Some(location);
+        self.requested_location = None;
         self.address_editing = false;
         self.address_input.clear();
         self.navigation_kind = NavigationKind::Normal;
         self.clear_selection();
     }
 
-    pub fn back_target(&self) -> Option<PathBuf> {
+    pub fn commit_path(&mut self, path: PathBuf) {
+        self.commit_location(NavigationLocation::Directory(path));
+    }
+
+    pub fn back_target(&self) -> Option<NavigationLocation> {
         self.back_history.last().cloned()
     }
-    pub fn forward_target(&self) -> Option<PathBuf> {
+    pub fn forward_target(&self) -> Option<NavigationLocation> {
         self.forward_history.last().cloned()
     }
 
@@ -1350,9 +1460,16 @@ fn search_scope_prefix(path: &Path) -> String {
     format!("{} ", display_path(path))
 }
 
+fn library_search_scope_prefix(display_name: &str) -> String {
+    format!("{display_name} ")
+}
+
 pub fn search_address_text(scope: &SearchScope, query: &str) -> String {
     match scope {
         SearchScope::Directory(path) => format!("{}{}", search_scope_prefix(path), query),
+        SearchScope::Library { display_name, .. } => {
+            format!("{}{}", library_search_scope_prefix(display_name), query)
+        }
         SearchScope::Global => query.to_owned(),
     }
 }
@@ -1486,6 +1603,84 @@ mod tests {
         session.set_sort(SortField::Created);
         assert_eq!(session.entries[0].id, EntryId(2));
     }
+    fn library(identity: &str, display_name: &str) -> NavigationLocation {
+        NavigationLocation::Library(LibraryLocationId::new(
+            OsString::from(identity),
+            display_name.to_owned(),
+        ))
+    }
+
+    #[test]
+    fn library_identity_is_lossless_and_independent_from_display_name() {
+        let first = LibraryLocationId::new(OsString::from("library::stable"), "Documents".into());
+        let renamed = LibraryLocationId::new(OsString::from("library::stable"), "文档".into());
+        let other = LibraryLocationId::new(OsString::from("library::other"), "Documents".into());
+
+        assert_eq!(first, renamed);
+        assert_ne!(first, other);
+    }
+
+    #[test]
+    fn library_navigation_cancels_old_request_and_rejects_late_results() {
+        let mut session = TabSession::new(TabId(7));
+        let library = library("library::documents", "文档");
+        let (first, first_cancel) = session.begin_navigation(library, NavigationKind::Normal);
+        let (second, _) = session
+            .begin_directory_navigation(PathBuf::from(r"C:\Users\DevUser"), NavigationKind::Normal);
+
+        assert!(first_cancel.load(AtomicOrdering::Acquire));
+        assert!(!session.accepts(first));
+        assert!(session.accepts(second));
+    }
+
+    #[test]
+    fn library_history_refresh_and_breadcrumb_keep_stable_identity() {
+        let mut session = TabSession::new(TabId(1));
+        let documents = library("library::documents", "文档");
+        let renamed = library("library::documents", "Documents");
+        session.current_location = Some(NavigationLocation::Directory(PathBuf::from(r"C:\Users")));
+
+        session.begin_navigation(documents.clone(), NavigationKind::Normal);
+        session.commit_location(renamed.clone());
+        assert_eq!(session.current_location, Some(documents.clone()));
+        assert_eq!(
+            session.back_target(),
+            Some(NavigationLocation::Directory(PathBuf::from(r"C:\Users")))
+        );
+        assert_eq!(
+            session.breadcrumb_paths(),
+            vec![("Documents".into(), renamed.clone())]
+        );
+        assert_eq!(session.visible_path(), None);
+
+        session.begin_navigation(renamed.clone(), NavigationKind::Refresh);
+        session.commit_location(renamed.clone());
+        assert_eq!(session.current_location, Some(documents));
+        assert_eq!(session.back_history.len(), 1);
+    }
+
+    #[test]
+    fn library_search_address_uses_display_name_and_preserves_sources() {
+        let sources = vec![PathBuf::from(r"C:\Docs"), PathBuf::from(r"D:\Archive")];
+        let scope = SearchScope::Library {
+            display_name: "文档".into(),
+            sources: sources.clone(),
+        };
+        let mut session = TabSession::new(TabId(1));
+        session.begin_search(scope.clone(), "*.pdf".into());
+
+        assert_eq!(session.address_input, "文档 *.pdf");
+        session.update_address_input("文档 report".into());
+        assert_eq!(session.search_query, "report");
+        assert_eq!(session.search_scope, scope);
+        assert_eq!(
+            session.search_scope,
+            SearchScope::Library {
+                display_name: "文档".into(),
+                sources
+            }
+        );
+    }
     #[test]
     fn search_requests_are_isolated_by_request_and_page_source() {
         let mut session = TabSession::new(TabId(7));
@@ -1507,7 +1702,7 @@ mod tests {
     #[test]
     fn search_address_keeps_directory_prefix_for_drive_path() {
         let mut session = TabSession::new(TabId(1));
-        session.current_path = Some(PathBuf::from(r"D:\Assets"));
+        session.current_location = Some(NavigationLocation::Directory(PathBuf::from(r"D:\Assets")));
         session.begin_smart_address_edit();
         assert_eq!(session.address_input, r"D:\Assets ");
         session.update_address_input(r"D:\Assets *.blend".to_owned());
@@ -1524,7 +1719,7 @@ mod tests {
     #[test]
     fn smart_address_search_depth_defaults_to_recursive_and_only_toggles_for_a_directory() {
         let mut session = TabSession::new(TabId(1));
-        session.current_path = Some(PathBuf::from(r"D:\Assets"));
+        session.current_location = Some(NavigationLocation::Directory(PathBuf::from(r"D:\Assets")));
         session.load_state = LoadState::Complete;
         session.begin_smart_address_edit();
         assert_eq!(session.search_depth, SearchDepth::Recursive);
@@ -1565,7 +1760,9 @@ mod tests {
     #[test]
     fn search_first_page_is_visible_bounded_and_cancel_restores_directory() {
         let mut session = TabSession::new(TabId(1));
-        session.current_path = Some(PathBuf::from(r"F:\CodeProjects\AsterFiles"));
+        session.current_location = Some(NavigationLocation::Directory(PathBuf::from(
+            r"F:\CodeProjects\AsterFiles",
+        )));
         session.replace_entries(vec![entry(90, "directory-row", EntryKind::File, Some(1))]);
         session.select_entry(EntryId(90), false, false);
         let (request, _) = session.begin_search(SearchScope::Global, ".md".to_owned());
@@ -1930,8 +2127,9 @@ mod tests {
     fn session_only_accepts_latest_request() {
         let mut session = TabSession::new(TabId(7));
         let (first, first_cancel) =
-            session.begin_navigation("first".into(), NavigationKind::Normal);
-        let (second, _) = session.begin_navigation("second".into(), NavigationKind::Normal);
+            session.begin_directory_navigation("first".into(), NavigationKind::Normal);
+        let (second, _) =
+            session.begin_directory_navigation("second".into(), NavigationKind::Normal);
         assert!(first_cancel.load(AtomicOrdering::Acquire));
         assert!(!session.accepts(first));
         assert!(session.accepts(second));
@@ -1940,11 +2138,11 @@ mod tests {
     #[test]
     fn normal_navigation_commit_clears_selection() {
         let mut session = TabSession::new(TabId(1));
-        session.current_path = Some(PathBuf::from(r"C:\source"));
+        session.current_location = Some(NavigationLocation::Directory(PathBuf::from(r"C:\source")));
         session.replace_entries(vec![entry(1, "old.txt", EntryKind::File, Some(1))]);
         session.select_entry(EntryId(1), false, false);
 
-        session.begin_navigation(PathBuf::from(r"C:\target"), NavigationKind::Normal);
+        session.begin_directory_navigation(PathBuf::from(r"C:\target"), NavigationKind::Normal);
         session.pending_entries = vec![entry(2, "new.txt", EntryKind::File, Some(1))];
         session.commit_pending();
         session.commit_path(PathBuf::from(r"C:\target"));
@@ -1956,9 +2154,10 @@ mod tests {
     #[test]
     fn failed_location_is_visible_and_can_return_to_successful_content() {
         let mut session = TabSession::new(TabId(1));
-        session.current_path = Some(PathBuf::from(r"C:\Users"));
+        session.current_location = Some(NavigationLocation::Directory(PathBuf::from(r"C:\Users")));
         session.replace_entries(vec![entry(1, "DevUser", EntryKind::Directory, None)]);
-        session.begin_navigation(PathBuf::from(r"C:\Users\DevUser"), NavigationKind::Normal);
+        session
+            .begin_directory_navigation(PathBuf::from(r"C:\Users\DevUser"), NavigationKind::Normal);
         session.load_state = LoadState::PermissionDenied;
 
         assert_eq!(session.visible_path(), Some(Path::new(r"C:\Users\DevUser")));
@@ -1968,75 +2167,103 @@ mod tests {
         assert_eq!(session.entries.len(), 1);
         assert_eq!(
             session.forward_target(),
-            Some(PathBuf::from(r"C:\Users\DevUser"))
+            Some(NavigationLocation::Directory(PathBuf::from(
+                r"C:\Users\DevUser"
+            )))
         );
     }
     #[test]
     fn retrying_failed_location_can_commit_it_normally() {
         let mut session = TabSession::new(TabId(1));
-        session.current_path = Some(PathBuf::from(r"C:\Users"));
-        session.begin_navigation(PathBuf::from(r"C:\Users\DevUser"), NavigationKind::Normal);
+        session.current_location = Some(NavigationLocation::Directory(PathBuf::from(r"C:\Users")));
+        session
+            .begin_directory_navigation(PathBuf::from(r"C:\Users\DevUser"), NavigationKind::Normal);
         session.load_state = LoadState::PermissionDenied;
 
         let requested = session
-            .requested_path
+            .requested_location
             .clone()
             .expect("failed target exists");
-        session.begin_navigation(requested.clone(), NavigationKind::Normal);
+        let requested_path = requested
+            .directory_path()
+            .expect("failed directory target exists")
+            .to_path_buf();
+        session.begin_directory_navigation(requested_path.clone(), NavigationKind::Normal);
         session.commit_pending();
-        session.commit_path(requested.clone());
+        session.commit_path(requested_path.clone());
 
-        assert_eq!(session.visible_path(), Some(requested.as_path()));
-        assert_eq!(session.back_target(), Some(PathBuf::from(r"C:\Users")));
-        assert!(session.requested_path.is_none());
+        assert_eq!(session.visible_path(), Some(requested_path.as_path()));
+        assert_eq!(
+            session.back_target(),
+            Some(NavigationLocation::Directory(PathBuf::from(r"C:\Users")))
+        );
+        assert!(session.requested_location.is_none());
         assert_eq!(session.load_state, LoadState::Complete);
     }
     #[test]
     fn failed_navigation_keeps_successful_page_and_history() {
         let mut session = TabSession::new(TabId(1));
-        session.current_path = Some("good".into());
-        session.back_history = vec!["older".into()];
-        session.begin_navigation("missing".into(), NavigationKind::Normal);
+        session.current_location = Some(NavigationLocation::Directory("good".into()));
+        session.back_history = vec![NavigationLocation::Directory("older".into())];
+        session.begin_directory_navigation("missing".into(), NavigationKind::Normal);
         session.load_state = LoadState::NotFound;
-        assert_eq!(session.current_path, Some("good".into()));
-        assert_eq!(session.back_history, vec![PathBuf::from("older")]);
+        assert_eq!(
+            session.current_location,
+            Some(NavigationLocation::Directory("good".into()))
+        );
+        assert_eq!(
+            session.back_history,
+            vec![NavigationLocation::Directory(PathBuf::from("older"))]
+        );
     }
 
     #[test]
     fn history_moves_only_after_success_and_supports_jumps() {
         let mut session = TabSession::new(TabId(1));
-        session.current_path = Some("three".into());
-        session.back_history = vec!["one".into(), "two".into()];
-        session.begin_navigation("one".into(), NavigationKind::Back);
+        session.current_location = Some(NavigationLocation::Directory("three".into()));
+        session.back_history = vec![
+            NavigationLocation::Directory("one".into()),
+            NavigationLocation::Directory("two".into()),
+        ];
+        session.begin_directory_navigation("one".into(), NavigationKind::Back);
         assert_eq!(session.back_history.len(), 2);
         session.commit_path("one".into());
         assert!(session.back_history.is_empty());
         assert_eq!(
             session.forward_history,
-            vec![PathBuf::from("three"), PathBuf::from("two")]
+            vec![
+                NavigationLocation::Directory(PathBuf::from("three")),
+                NavigationLocation::Directory(PathBuf::from("two"))
+            ]
         );
     }
 
     #[test]
     fn windows_root_breadcrumb_is_visible_without_duplicate_drive_prefix() {
         let mut session = TabSession::new(TabId(1));
-        session.current_path = Some(PathBuf::from(r"F:\"));
+        session.current_location = Some(NavigationLocation::Directory(PathBuf::from(r"F:\")));
         let breadcrumbs = session.breadcrumb_paths();
         assert_eq!(
             breadcrumbs,
-            vec![(r"F:\".to_owned(), PathBuf::from(r"F:\"))]
+            vec![(
+                r"F:\".to_owned(),
+                NavigationLocation::Directory(PathBuf::from(r"F:\"))
+            )]
         );
     }
     #[test]
     fn address_edit_cancel_restores_successful_path() {
         let mut session = TabSession::new(TabId(1));
-        session.current_path = Some(PathBuf::from("C:\\成功"));
+        session.current_location = Some(NavigationLocation::Directory(PathBuf::from("C:\\成功")));
         session.begin_smart_address_edit();
         session.update_address_input("C:\\不存在📁".to_owned());
         session.load_state = LoadState::NotFound;
         session.cancel_address_edit();
         assert!(!session.address_editing);
-        assert_eq!(session.current_path, Some(PathBuf::from("C:\\成功")));
+        assert_eq!(
+            session.current_location,
+            Some(NavigationLocation::Directory(PathBuf::from("C:\\成功")))
+        );
     }
 
     #[test]

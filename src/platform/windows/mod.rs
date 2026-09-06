@@ -7,6 +7,7 @@ pub mod drag_drop;
 pub mod everything;
 pub mod everything_file_picker;
 pub mod file_operation;
+pub mod libraries;
 pub mod network;
 pub mod quick_access;
 pub mod quick_menu_window;

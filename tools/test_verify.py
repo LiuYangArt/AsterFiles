@@ -37,6 +37,22 @@ class VerifyTests(unittest.TestCase):
         self.assertTrue(all(command[0] == str(verify.DEBUG) for command in scenario_commands))
         self.assertTrue(all("cargo" not in command for command in scenario_commands))
 
+    def test_windows_libraries_scenario_uses_debug_and_stable_artifact(self) -> None:
+        steps = dict(verify.scenario_steps())
+        command = steps["agent-windows-libraries"]
+
+        self.assertEqual(command[0], str(verify.DEBUG))
+        self.assertEqual(
+            command[1:],
+            [
+                "--agent-scenario",
+                "windows-libraries",
+                "--no-ui",
+                "--agent-state-out",
+                str(verify.STATE_DIR / "windows-libraries" / "foundation.json"),
+            ],
+        )
+
     def test_fail_fast_skips_following_steps(self) -> None:
         calls = []
 

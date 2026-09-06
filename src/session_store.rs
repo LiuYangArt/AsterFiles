@@ -8,8 +8,8 @@ use std::{
 use crate::{
     domain::{
         ColumnKind, ColumnLayout, DirectoryViewPreference, EverythingConfig, FileVisibility,
-        GroupField, MAX_DIRECTORY_VIEW_PREFERENCES, SearchViewPreference, SortDirection, SortField,
-        ViewMode,
+        GroupField, MAX_DIRECTORY_VIEW_PREFERENCES, NavigationLocation, SearchViewPreference,
+        SortDirection, SortField, ViewMode,
     },
     i18n::Language,
     network::{
@@ -20,7 +20,7 @@ use crate::{
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-const MAGIC: &[u8; 6] = b"ASTF12";
+const MAGIC: &[u8; 6] = b"ASTF13";
 const MAX_TABS: usize = 1_024;
 const MAX_WINDOWS: usize = 128;
 const MAX_NETWORK_LOCATIONS: usize = 1_024;
@@ -85,7 +85,7 @@ pub struct SessionState {
 pub struct WindowSessionState {
     pub placement: WindowPlacement,
     pub active_tab: usize,
-    pub tab_paths: Vec<PathBuf>,
+    pub tab_locations: Vec<NavigationLocation>,
 }
 
 impl SessionState {
@@ -93,13 +93,13 @@ impl SessionState {
     pub fn new(
         window: WindowPlacement,
         active_tab: usize,
-        tab_paths: Vec<PathBuf>,
+        tab_locations: Vec<NavigationLocation>,
     ) -> io::Result<Self> {
         Self::with_windows_and_settings(
             vec![WindowSessionState {
                 placement: window,
                 active_tab,
-                tab_paths,
+                tab_locations,
             }],
             DirectoryViewPreference::default(),
             SearchViewPreference::default(),
@@ -133,16 +133,16 @@ impl SessionState {
         }
         for window in &mut windows {
             validate_window(window.placement)?;
-            if window.tab_paths.len() > MAX_TABS {
+            if window.tab_locations.len() > MAX_TABS {
                 return Err(invalid_data("invalid session tab count"));
             }
-            for path in &window.tab_paths {
-                validate_path(path)?;
+            for location in &window.tab_locations {
+                validate_navigation_location(location)?;
             }
-            window.active_tab = if window.tab_paths.is_empty() {
+            window.active_tab = if window.tab_locations.is_empty() {
                 0
             } else {
-                window.active_tab.min(window.tab_paths.len() - 1)
+                window.active_tab.min(window.tab_locations.len() - 1)
             };
         }
         validate_directory_preference(default_directory_view)?;
@@ -244,9 +244,9 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
         bytes.extend_from_slice(&window.placement.width.to_le_bytes());
         bytes.extend_from_slice(&window.placement.height.to_le_bytes());
         bytes.extend_from_slice(&(window.active_tab as u32).to_le_bytes());
-        bytes.extend_from_slice(&(window.tab_paths.len() as u32).to_le_bytes());
-        for path in &window.tab_paths {
-            write_os(&mut bytes, path.as_os_str())?;
+        bytes.extend_from_slice(&(window.tab_locations.len() as u32).to_le_bytes());
+        for location in &window.tab_locations {
+            write_navigation_location(&mut bytes, location)?;
         }
     }
     Ok(bytes)
@@ -333,14 +333,14 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
         if count > MAX_TABS {
             return Err(invalid_data("too many session tabs"));
         }
-        let mut tab_paths = Vec::with_capacity(count);
+        let mut tab_locations = Vec::with_capacity(count);
         for _ in 0..count {
-            tab_paths.push(PathBuf::from(read_os(bytes, &mut offset)?));
+            tab_locations.push(read_navigation_location(bytes, &mut offset)?);
         }
         windows.push(WindowSessionState {
             placement,
             active_tab,
-            tab_paths,
+            tab_locations,
         });
     }
     if offset != bytes.len() {
@@ -454,6 +454,22 @@ fn validate_search_preference(value: SearchViewPreference) -> io::Result<()> {
     }
 }
 
+fn validate_navigation_location(location: &NavigationLocation) -> io::Result<()> {
+    match location {
+        NavigationLocation::Directory(path) => validate_path(path),
+        NavigationLocation::Library(library) => {
+            if library.identity.is_empty() || library.display_name.trim().is_empty() {
+                return Err(invalid_data("library display name cannot be empty"));
+            }
+            if encode_os(&library.identity).len() > MAX_PATH_UNITS
+                || library.display_name.encode_utf16().count() > MAX_PATH_UNITS
+            {
+                return Err(invalid_data("library location is too long"));
+            }
+            Ok(())
+        }
+    }
+}
 fn validate_path(path: &Path) -> io::Result<()> {
     if encode_os(path.as_os_str()).len() > MAX_PATH_UNITS {
         Err(invalid_data("stored path is too long"))
@@ -560,6 +576,34 @@ fn read_column_layout(bytes: &[u8], offset: &mut usize) -> io::Result<ColumnLayo
     })
 }
 
+fn write_navigation_location(bytes: &mut Vec<u8>, location: &NavigationLocation) -> io::Result<()> {
+    match location {
+        NavigationLocation::Directory(path) => {
+            bytes.push(0);
+            write_os(bytes, path.as_os_str())
+        }
+        NavigationLocation::Library(library) => {
+            bytes.push(1);
+            write_os(bytes, &library.identity)?;
+            write_string(bytes, &library.display_name)
+        }
+    }
+}
+
+fn read_navigation_location(bytes: &[u8], offset: &mut usize) -> io::Result<NavigationLocation> {
+    match read_u8(bytes, offset)? {
+        0 => Ok(NavigationLocation::Directory(PathBuf::from(read_os(
+            bytes, offset,
+        )?))),
+        1 => Ok(NavigationLocation::Library(
+            crate::domain::LibraryLocationId::new(
+                read_os(bytes, offset)?,
+                read_string(bytes, offset)?,
+            ),
+        )),
+        _ => Err(invalid_data("invalid navigation location kind")),
+    }
+}
 fn write_optional_os(bytes: &mut Vec<u8>, value: Option<&Path>) -> io::Result<()> {
     match value {
         Some(value) => {
@@ -741,7 +785,13 @@ mod tests {
                     height: 760,
                 },
                 active_tab: 0,
-                tab_paths: vec![PathBuf::from(r"C:\项目\📁")],
+                tab_locations: vec![
+                    NavigationLocation::Directory(PathBuf::from(r"C:\项目\📁")),
+                    NavigationLocation::Library(crate::domain::LibraryLocationId::new(
+                        OsString::from(r"C:\Libraries\媒体.library-ms"),
+                        "媒体".to_owned(),
+                    )),
+                ],
             }],
             DirectoryViewPreference::default(),
             SearchViewPreference {
@@ -782,12 +832,48 @@ mod tests {
     }
 
     #[test]
-    fn astf12_round_trip_preserves_settings_network_locations_devices_and_raw_paths() {
+    fn astf13_round_trip_preserves_settings_network_locations_devices_and_raw_paths() {
         let state = sample_state();
         assert!(state.file_list_quick_search);
-        assert_eq!(decode(&encode(&state).unwrap()).unwrap(), state);
+        let decoded = decode(&encode(&state).unwrap()).unwrap();
+        assert_eq!(decoded, state);
+        let NavigationLocation::Library(library) = &decoded.windows[0].tab_locations[1] else {
+            panic!("library location should survive the round trip");
+        };
+        assert_eq!(
+            library.identity,
+            OsString::from(r"C:\Libraries\媒体.library-ms")
+        );
+        assert_eq!(library.display_name, "媒体");
     }
 
+    #[test]
+    fn rejects_invalid_library_locations_and_unknown_location_kind() {
+        let mut state = sample_state();
+        state.windows[0].tab_locations[1] = NavigationLocation::Library(
+            crate::domain::LibraryLocationId::new(OsString::new(), "媒体".to_owned()),
+        );
+        assert_eq!(
+            encode(&state).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut state = sample_state();
+        state.windows[0].tab_locations[1] =
+            NavigationLocation::Library(crate::domain::LibraryLocationId::new(
+                OsString::from(r"C:\Libraries\媒体.library-ms"),
+                "  ".to_owned(),
+            ));
+        assert_eq!(
+            encode(&state).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        assert_eq!(
+            read_navigation_location(&[2], &mut 0).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
     #[test]
     fn quick_search_defaults_off() {
         let state = SessionState::new(
@@ -798,7 +884,7 @@ mod tests {
                 height: 760,
             },
             0,
-            vec![PathBuf::from(r"C:\work")],
+            vec![NavigationLocation::Directory(PathBuf::from(r"C:\work"))],
         )
         .unwrap();
         assert!(!state.file_list_quick_search);
@@ -806,7 +892,7 @@ mod tests {
 
     #[test]
     fn rejects_old_formats() {
-        for version in 1..=11 {
+        for version in 1..=12 {
             let bytes = format!("ASTF{version}\0\0\0\0");
             assert_eq!(
                 decode(bytes.as_bytes()).unwrap_err().kind(),
@@ -916,7 +1002,10 @@ mod tests {
                 height: 600,
             },
             99,
-            vec![PathBuf::from(r"C:\one"), PathBuf::from(r"C:\two")],
+            vec![
+                NavigationLocation::Directory(PathBuf::from(r"C:\one")),
+                NavigationLocation::Directory(PathBuf::from(r"C:\two")),
+            ],
         )
         .unwrap();
         assert_eq!(state.windows[0].active_tab, 1);

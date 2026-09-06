@@ -70,6 +70,11 @@ SCENARIOS = [
         STATE_DIR / "thumbnails" / "shell-png.json",
     ),
     (
+        "agent-windows-libraries",
+        "windows-libraries",
+        STATE_DIR / "windows-libraries" / "foundation.json",
+    ),
+    (
         "agent-quick-menu-search",
         "quick-menu-search",
         STATE_DIR / "context-menu" / "search.json",
@@ -300,6 +305,16 @@ def scenario_steps() -> list[tuple[str, list[str]]]:
 def validation_steps(quick: bool, include_release: bool) -> list[tuple[str, list[str]]]:
     steps = [
         ("verify-tests", [sys.executable, str(ROOT / "tools" / "test_verify.py")]),
+        (
+            "publish-tests",
+            [
+                "pwsh",
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "Invoke-Pester -Script '.\\tools\\test_publish.ps1' -EnableExit",
+            ],
+        ),
         ("format", ["cargo", "fmt", "--check"]),
         (
             "clippy",

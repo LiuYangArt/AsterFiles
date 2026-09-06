@@ -144,6 +144,36 @@ impl Texts {
             }
         }
     }
+
+    pub fn library_partial_sources_failed(self, failed: usize) -> String {
+        match self.language {
+            Language::Chinese => format!("{failed} 个库位置不可用，已显示其余内容"),
+            Language::English if failed == 1 => {
+                "1 library location is unavailable. Showing the remaining content.".to_owned()
+            }
+            Language::English => format!(
+                "{failed} library locations are unavailable. Showing the remaining content."
+            ),
+        }
+    }
+
+    pub fn library_no_default_save_location(self) -> &'static str {
+        self.choose(
+            "此库没有可用的默认保存位置",
+            "This library has no available default save location",
+        )
+    }
+
+    pub fn library_unavailable(self) -> &'static str {
+        self.choose("此库当前不可用", "This library is currently unavailable")
+    }
+
+    pub fn library_all_sources_failed(self) -> &'static str {
+        self.choose(
+            "无法读取此库的任何位置",
+            "None of this library's locations could be read",
+        )
+    }
     pub fn size(self, value: Option<u64>) -> String {
         let Some(bytes) = value else {
             return String::new();
@@ -184,6 +214,45 @@ mod tests {
         assert_eq!(Language::from_storage_code(u8::MAX), None);
     }
 
+    #[test]
+    fn library_messages_cover_failures_in_both_languages() {
+        let chinese = Texts::new(Language::Chinese);
+        assert_eq!(
+            chinese.library_partial_sources_failed(2),
+            "2 个库位置不可用，已显示其余内容"
+        );
+        assert_eq!(
+            chinese.library_no_default_save_location(),
+            "此库没有可用的默认保存位置"
+        );
+        assert_eq!(chinese.library_unavailable(), "此库当前不可用");
+        assert_eq!(
+            chinese.library_all_sources_failed(),
+            "无法读取此库的任何位置"
+        );
+
+        let english = Texts::new(Language::English);
+        assert_eq!(
+            english.library_partial_sources_failed(1),
+            "1 library location is unavailable. Showing the remaining content."
+        );
+        assert_eq!(
+            english.library_partial_sources_failed(2),
+            "2 library locations are unavailable. Showing the remaining content."
+        );
+        assert_eq!(
+            english.library_no_default_save_location(),
+            "This library has no available default save location"
+        );
+        assert_eq!(
+            english.library_unavailable(),
+            "This library is currently unavailable"
+        );
+        assert_eq!(
+            english.library_all_sources_failed(),
+            "None of this library's locations could be read"
+        );
+    }
     #[test]
     fn folder_size_distinguishes_zero_and_failures() {
         for language in [Language::Chinese, Language::English] {

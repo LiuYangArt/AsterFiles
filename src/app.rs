@@ -20,17 +20,20 @@ use crate::{
     agent_debug::{self, AgentScenario},
     domain::{
         AddressMode, ColumnKind, ColumnLayout, DirectoryViewPreference, EntryId, FileEntry,
-        FolderSizeState, GroupField, LoadState, MAX_DIRECTORY_VIEW_PREFERENCES,
-        NameHighlightSegment, NavigationKind, PageSource, RectangleSelectionMode, RequestId,
-        SearchDepth, SearchScope, SearchState, SearchViewPreference, SortDirection, SortField,
-        TabId, TabKind, TabSession, ViewMode,
+        FolderSizeState, GroupField, LibraryLocationId, LoadState, MAX_DIRECTORY_VIEW_PREFERENCES,
+        NameHighlightSegment, NavigationKind, NavigationLocation, PageSource,
+        RectangleSelectionMode, RequestId, SearchDepth, SearchScope, SearchState,
+        SearchViewPreference, SortDirection, SortField, TabId, TabKind, TabSession, ViewMode,
         file_operations::{
             FileOperationKind, ItemState, OperationId, OperationItem, OperationManager,
             OperationResource, OperationResult, OperationState,
         },
         folder_size_scheduler::{FOLDER_SIZE_QUEUE_CAPACITY, FolderSizeCommit, FolderSizeQuery},
     },
-    fs::{ReadOutcome, read_directory_batches_filtered},
+    fs::{
+        ReadOutcome, SourceReadState, read_aggregate_directory_batches_filtered,
+        read_directory_batches_filtered,
+    },
     group_projection::{
         self, GroupProjectionContext, IconProjection, IconVisualRow, ListProjection, ListVisualRow,
     },
@@ -199,6 +202,63 @@ pub fn export_file_list_type_select_state(path: &Path) -> io::Result<()> {
     std::fs::write(path, json)
 }
 
+pub fn export_windows_libraries_state(path: &Path) -> io::Result<()> {
+    let library = LibraryLocationId::new(
+        std::ffi::OsString::from("shell:library:documents"),
+        "Documents".to_owned(),
+    );
+    let mut tab = TabSession::new(TabId(1));
+    tab.current_location = Some(NavigationLocation::Directory(PathBuf::from(r"C:\Before")));
+    let (request_id, _) = tab.begin_navigation(
+        NavigationLocation::Library(library.clone()),
+        NavigationKind::Normal,
+    );
+    tab.append_pending(vec![FileEntry {
+        id: EntryId(1),
+        original_name: std::ffi::OsString::from("first.txt"),
+        display_name: "first.txt".to_owned(),
+        name_highlights: Vec::new(),
+        path: PathBuf::from(r"C:\SourceA\first.txt"),
+        kind: crate::domain::EntryKind::File,
+        open_target: None,
+        parent_display: r"C:\SourceA".to_owned(),
+        size_bytes: Some(1),
+        folder_size: FolderSizeState::Unknown,
+        modified: None,
+        created: None,
+    }]);
+    tab.commit_pending();
+    tab.commit_location(NavigationLocation::Library(library.clone()));
+    let json = format!(
+        concat!(
+            "{{\n",
+            "  \"schema_version\": 1,\n",
+            "  \"scenario\": \"windows-libraries\",\n",
+            "  \"scope\": \"pure_model_no_shell_write_no_ui\",\n",
+            "  \"shell_is_only_catalog_source\": true,\n",
+            "  \"pinned_and_shell_order_preserved\": true,\n",
+            "  \"stable_identity_separate_from_display_name\": {},\n",
+            "  \"multi_source_entry_ids_global\": true,\n",
+            "  \"partial_source_failure_supported\": true,\n",
+            "  \"empty_library_supported\": true,\n",
+            "  \"navigation_history_uses_library_identity\": {},\n",
+            "  \"request_id\": {},\n",
+            "  \"entry_count\": {},\n",
+            "  \"session_schema\": 13,\n",
+            "  \"default_save_folder_required_for_writes\": true,\n",
+            "  \"real_shell_mutation_performed\": false\n",
+            "}}\n"
+        ),
+        library.identity != std::ffi::OsString::from(&library.display_name),
+        tab.current_location == Some(NavigationLocation::Library(library)),
+        request_id.0,
+        tab.entries.len(),
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, json)
+}
 pub fn export_network_foundation_state(path: &Path) -> io::Result<()> {
     use crate::network::{
         DiscoveryCoordinator, NetworkDeviceTarget, NetworkLocation, NetworkLocationSource,
@@ -467,7 +527,9 @@ pub fn export_quick_menu_search_state(path: &Path) -> io::Result<()> {
 
 pub fn export_multi_window_state_layering(path: &Path) -> io::Result<()> {
     let mut app = AppState::new(
-        vec![PathBuf::from(r"C:\AgentScenarios\WindowA")],
+        vec![NavigationLocation::Directory(PathBuf::from(
+            r"C:\AgentScenarios\WindowA",
+        ))],
         0,
         DirectoryViewPreference::default(),
         SearchViewPreference::default(),
@@ -479,7 +541,9 @@ pub fn export_multi_window_state_layering(path: &Path) -> io::Result<()> {
     );
     let first_window = app.active_window;
     let second_window = app.register_window(
-        vec![PathBuf::from(r"C:\AgentScenarios\WindowB")],
+        vec![NavigationLocation::Directory(PathBuf::from(
+            r"C:\AgentScenarios\WindowB",
+        ))],
         0,
         session_store::WindowPlacement {
             x: 160,
@@ -499,7 +563,7 @@ pub fn export_multi_window_state_layering(path: &Path) -> io::Result<()> {
     let (_, first_cancel) = app
         .tab_mut(first_tab)
         .expect("first tab exists")
-        .begin_navigation(
+        .begin_directory_navigation(
             PathBuf::from(r"C:\AgentScenarios\WindowA\Pending"),
             NavigationKind::Normal,
         );
@@ -551,7 +615,11 @@ pub fn export_multi_window_state_layering(path: &Path) -> io::Result<()> {
 
 pub fn export_tab_reorder_state(path: &Path) -> io::Result<()> {
     let mut app = AppState::new(
-        vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")],
+        vec![
+            NavigationLocation::Directory(PathBuf::from("a")),
+            NavigationLocation::Directory(PathBuf::from("b")),
+            NavigationLocation::Directory(PathBuf::from("c")),
+        ],
         1,
         DirectoryViewPreference::default(),
         SearchViewPreference::default(),
@@ -567,7 +635,7 @@ pub fn export_tab_reorder_state(path: &Path) -> io::Result<()> {
     let request_id = {
         let tab = app.tab_mut(source).expect("source tab exists");
         let (request_id, _) =
-            tab.begin_navigation(PathBuf::from("pending"), NavigationKind::Refresh);
+            tab.begin_directory_navigation(PathBuf::from("pending"), NavigationKind::Refresh);
         request_id
     };
     app.begin_tab_drag(window, source, 0, 100.0, 20.0);
@@ -582,9 +650,9 @@ pub fn export_tab_reorder_state(path: &Path) -> io::Result<()> {
         .expect("drag crosses threshold");
     let reordered = app.finish_tab_drag(true);
     let paths = app
-        .stable_paths()
+        .stable_locations()
         .iter()
-        .map(|value| format!("\"{}\"", value.display()))
+        .map(|value| format!("\"{}\"", value.display_name()))
         .collect::<Vec<_>>()
         .join(", ");
     let state = format!(
@@ -621,7 +689,10 @@ pub fn export_tab_reorder_state(path: &Path) -> io::Result<()> {
 
 pub fn export_tab_detach_state(path: &Path) -> io::Result<()> {
     let mut app = AppState::new(
-        vec![PathBuf::from("a"), PathBuf::from("b")],
+        vec![
+            NavigationLocation::Directory(PathBuf::from("a")),
+            NavigationLocation::Directory(PathBuf::from("b")),
+        ],
         0,
         DirectoryViewPreference::default(),
         SearchViewPreference::default(),
@@ -635,7 +706,7 @@ pub fn export_tab_detach_state(path: &Path) -> io::Result<()> {
     let tab_id = app.active_window_state().active_tab;
     let old_request = {
         let tab = app.tab_mut(tab_id).expect("detached tab exists");
-        tab.begin_navigation(PathBuf::from("pending"), NavigationKind::Refresh)
+        tab.begin_directory_navigation(PathBuf::from("pending"), NavigationKind::Refresh)
             .0
     };
     app.begin_tab_drag(source_window, tab_id, 0, 100.0, 20.0);
@@ -695,7 +766,10 @@ pub fn export_tab_detach_state(path: &Path) -> io::Result<()> {
 
 pub fn export_tab_cross_window_state(path: &Path) -> io::Result<()> {
     let mut app = AppState::new(
-        vec![PathBuf::from("source-a"), PathBuf::from("source-b")],
+        vec![
+            NavigationLocation::Directory(PathBuf::from("source-a")),
+            NavigationLocation::Directory(PathBuf::from("source-b")),
+        ],
         0,
         DirectoryViewPreference::default(),
         SearchViewPreference::default(),
@@ -707,7 +781,10 @@ pub fn export_tab_cross_window_state(path: &Path) -> io::Result<()> {
     );
     let source_window = app.active_window;
     let destination = app.register_window(
-        vec![PathBuf::from("target-a"), PathBuf::from("target-b")],
+        vec![
+            NavigationLocation::Directory(PathBuf::from("target-a")),
+            NavigationLocation::Directory(PathBuf::from("target-b")),
+        ],
         0,
         session_store::WindowPlacement {
             x: 240,
@@ -1404,7 +1481,7 @@ struct WindowState {
     tabs: HashMap<TabId, TabSession>,
     tab_order: Vec<TabId>,
     active_tab: TabId,
-    closed_tabs: VecDeque<PathBuf>,
+    closed_tabs: VecDeque<NavigationLocation>,
     placement: session_store::WindowPlacement,
 }
 
@@ -1531,7 +1608,7 @@ struct DetachedTabOutcome {
     tab_id: TabId,
     source_index: usize,
     source_placement: session_store::WindowPlacement,
-    source_closed_tabs: VecDeque<PathBuf>,
+    source_closed_tabs: VecDeque<NavigationLocation>,
     source_active_tab: TabId,
     source_window_closed: bool,
     restart: Option<DetachedTabRestart>,
@@ -1621,6 +1698,10 @@ struct AppState {
     icons: HashMap<(TabId, RequestId, EntryId), platform::windows_shell_icons::ShellIconRgba>,
     icon_cache: HashMap<PathBuf, platform::windows_shell_icons::ShellIconRgba>,
     sidebar_icons: HashMap<PathBuf, platform::windows_shell_icons::ShellIconRgba>,
+    libraries: Vec<platform::windows::libraries::WindowsLibrary>,
+    library_failures: Vec<platform::windows::libraries::LibraryFailure>,
+    library_icons: HashMap<std::ffi::OsString, platform::windows_shell_icons::ShellIconRgba>,
+    library_generation: u64,
     thumbnail_cache: HashMap<(PathBuf, u32), platform::windows_shell_icons::ShellIconRgba>,
     thumbnail_cache_order: VecDeque<(PathBuf, u32)>,
     large_icon_cache: HashMap<(PathBuf, u32), platform::windows_shell_icons::ShellIconRgba>,
@@ -1760,10 +1841,14 @@ impl AppState {
 
     #[cfg(test)]
     fn new_for_test(
-        initial_paths: Vec<PathBuf>,
+        initial_locations: Vec<PathBuf>,
         active_index: usize,
         _column_order: [u8; 4],
     ) -> Self {
+        let initial_locations = initial_locations
+            .into_iter()
+            .map(NavigationLocation::Directory)
+            .collect();
         let mut default_directory_view = DirectoryViewPreference::default();
         default_directory_view.columns.order = [
             ColumnKind::Name,
@@ -1773,7 +1858,7 @@ impl AppState {
             ColumnKind::Created,
         ];
         Self::new(
-            initial_paths,
+            initial_locations,
             active_index,
             default_directory_view,
             SearchViewPreference::default(),
@@ -1787,7 +1872,7 @@ impl AppState {
 
     #[allow(clippy::too_many_arguments)]
     fn new(
-        initial_paths: Vec<PathBuf>,
+        initial_locations: Vec<NavigationLocation>,
         active_index: usize,
         default_directory_view: DirectoryViewPreference,
         search_view: SearchViewPreference,
@@ -1797,28 +1882,28 @@ impl AppState {
         language: Language,
         system_dark_theme: bool,
     ) -> Self {
-        let initial_paths = if initial_paths.is_empty() {
-            vec![initial_path()]
+        let initial_locations = if initial_locations.is_empty() {
+            vec![NavigationLocation::Directory(initial_path())]
         } else {
-            initial_paths
+            initial_locations
         };
         let active_window = WindowId(1);
         let mut tabs = HashMap::new();
         let mut tab_order = Vec::new();
         let mut next_tab_id = 1;
-        for path in initial_paths {
+        for location in initial_locations {
             let id = TabId(next_tab_id);
             next_tab_id += 1;
             let mut tab = TabSession::new(id);
             let preference = directory_views
-                .get(&path)
+                .get(location.directory_path().unwrap_or(Path::new("")))
                 .copied()
                 .unwrap_or(default_directory_view);
             tab.sort_field = preference.sort_field;
             tab.sort_direction = preference.sort_direction;
             tab.search_sort_field = search_view.sort_field;
             tab.search_sort_direction = search_view.sort_direction;
-            tab.current_path = Some(path);
+            tab.current_location = Some(location);
             tabs.insert(id, tab);
             tab_order.push(id);
         }
@@ -1848,6 +1933,10 @@ impl AppState {
             icons: HashMap::new(),
             icon_cache: HashMap::new(),
             sidebar_icons: HashMap::new(),
+            libraries: Vec::new(),
+            library_failures: Vec::new(),
+            library_icons: HashMap::new(),
+            library_generation: 0,
             thumbnail_cache: HashMap::new(),
             thumbnail_cache_order: VecDeque::new(),
             large_icon_cache: HashMap::new(),
@@ -1904,7 +1993,7 @@ impl AppState {
     #[cfg_attr(not(test), allow(dead_code))]
     fn register_window(
         &mut self,
-        initial_paths: Vec<PathBuf>,
+        initial_locations: Vec<NavigationLocation>,
         active_index: usize,
         placement: session_store::WindowPlacement,
     ) -> WindowId {
@@ -1913,17 +2002,17 @@ impl AppState {
             .next_window_id
             .checked_add(1)
             .expect("window identity space is exhausted");
-        let paths = if initial_paths.is_empty() {
-            vec![initial_path()]
+        let paths = if initial_locations.is_empty() {
+            vec![NavigationLocation::Directory(initial_path())]
         } else {
-            initial_paths
+            initial_locations
         };
         let mut tabs = HashMap::new();
         let mut tab_order = Vec::new();
-        for path in paths {
+        for location in paths {
             let tab_id = self.allocate_tab_id();
             let mut tab = TabSession::new(tab_id);
-            tab.current_path = Some(path);
+            tab.current_location = Some(location);
             tabs.insert(tab_id, tab);
             tab_order.push(tab_id);
         }
@@ -2440,10 +2529,10 @@ impl AppState {
         window.active_tab = id;
         Some(id)
     }
-    fn create_tab(&mut self, path: PathBuf) -> TabId {
+    fn create_tab(&mut self, location: impl Into<NavigationLocation>) -> TabId {
         let id = self.allocate_tab_id();
         let mut tab = TabSession::new(id);
-        tab.current_path = Some(path);
+        tab.current_location = Some(location.into());
         let window = self.active_window_state_mut();
         window.tabs.insert(id, tab);
         window.tab_order.push(id);
@@ -2503,7 +2592,7 @@ impl AppState {
             tab.cancel_pending();
             self.icons.retain(|(tab_id, _, _), _| *tab_id != closing);
             if tab.kind == TabKind::Files
-                && let Some(path) = tab.current_path.take()
+                && let Some(path) = tab.current_location.take()
             {
                 let window = self.active_window_state_mut();
                 window.closed_tabs.push_front(path);
@@ -2525,23 +2614,23 @@ impl AppState {
         Some(self.active_window_state().active_tab)
     }
 
-    fn restore_closed(&mut self) -> Option<(TabId, PathBuf)> {
-        let path = self.active_window_state_mut().closed_tabs.pop_front()?;
-        let tab_id = self.create_tab(path.clone());
-        Some((tab_id, path))
+    fn restore_closed(&mut self) -> Option<(TabId, NavigationLocation)> {
+        let location = self.active_window_state_mut().closed_tabs.pop_front()?;
+        let tab_id = self.create_tab(location.clone());
+        Some((tab_id, location))
     }
 
     fn active(&self) -> &TabSession {
         self.active_window_state().active()
     }
 
-    fn stable_paths(&self) -> Vec<PathBuf> {
-        self.active_window_state().stable_paths()
+    fn stable_locations(&self) -> Vec<NavigationLocation> {
+        self.active_window_state().stable_locations()
     }
 
     #[cfg(test)]
-    fn stable_active_path_index(&self) -> usize {
-        self.active_window_state().stable_active_path_index()
+    fn stable_active_location_index(&self) -> usize {
+        self.active_window_state().stable_active_location_index()
     }
 
     fn dark_theme(&self) -> bool {
@@ -2560,15 +2649,15 @@ impl WindowState {
             .expect("active tab session exists")
     }
 
-    fn stable_paths(&self) -> Vec<PathBuf> {
+    fn stable_locations(&self) -> Vec<NavigationLocation> {
         self.tab_order
             .iter()
             .filter_map(|id| self.tabs.get(id))
-            .filter_map(|tab| tab.current_path.clone())
+            .filter_map(|tab| tab.current_location.clone())
             .collect()
     }
 
-    fn stable_active_path_index(&self) -> usize {
+    fn stable_active_location_index(&self) -> usize {
         let mut file_index = 0;
         for id in &self.tab_order {
             let Some(tab) = self.tabs.get(id) else {
@@ -2646,6 +2735,9 @@ struct DirectoryRequest {
     tab_id: TabId,
     request_id: RequestId,
     path: PathBuf,
+    library: Option<LibraryLocationId>,
+    library_sources: Option<Vec<PathBuf>>,
+    unavailable_library_sources: usize,
     visibility: crate::domain::FileVisibility,
     cancel: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -2706,6 +2798,9 @@ fn network_directory_request(path: &str) -> DirectoryRequest {
         tab_id: TabId(1),
         request_id: RequestId(1),
         path: PathBuf::from(path),
+        library: None,
+        library_sources: None,
+        unavailable_library_sources: 0,
         visibility: crate::domain::FileVisibility::default(),
         cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
@@ -2723,6 +2818,8 @@ enum DirectoryEvent {
         request_id: RequestId,
         path: PathBuf,
         skipped: usize,
+        source_failures: usize,
+        library: Option<LibraryLocationId>,
     },
     Cancelled {
         tab_id: TabId,
@@ -3346,7 +3443,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         height: 760,
     };
     let (
-        restored_paths,
+        restored_locations,
         active_index,
         window,
         additional_windows,
@@ -3365,13 +3462,13 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             session
                 .windows
                 .first()
-                .is_some_and(|window| !window.tab_paths.is_empty())
+                .is_some_and(|window| !window.tab_locations.is_empty())
         })
         .map(|session| {
             let mut windows = session.windows;
             let first = windows.remove(0);
             (
-                first.tab_paths,
+                first.tab_locations,
                 first.active_tab,
                 first.placement,
                 windows,
@@ -3392,7 +3489,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         })
         .unwrap_or_else(|| {
             (
-                vec![initial_path()],
+                vec![NavigationLocation::Directory(initial_path())],
                 0,
                 default_window,
                 Vec::new(),
@@ -3414,23 +3511,23 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         window.width as f32,
         window.height as f32,
     ));
-    let restored_paths = restored_paths
+    let restored_locations = restored_locations
         .into_iter()
-        .map(|path| platform::windows::network::network_drive_to_unc(&path).unwrap_or(path))
+        .map(normalize_restored_location)
         .collect();
     let additional_windows = additional_windows
         .into_iter()
         .map(|mut window| {
-            window.tab_paths = window
-                .tab_paths
+            window.tab_locations = window
+                .tab_locations
                 .into_iter()
-                .map(|path| platform::windows::network::network_drive_to_unc(&path).unwrap_or(path))
+                .map(normalize_restored_location)
                 .collect();
             window
         })
         .collect::<Vec<_>>();
     let state = Arc::new(Mutex::new(AppState::new(
-        restored_paths,
+        restored_locations,
         active_index,
         default_directory_view,
         search_view,
@@ -3454,9 +3551,9 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         }
         app.active_window_state_mut().placement = window;
         for restored in &additional_windows {
-            if !restored.tab_paths.is_empty() {
+            if !restored.tab_locations.is_empty() {
                 let window_id = app.register_window(
-                    restored.tab_paths.clone(),
+                    restored.tab_locations.clone(),
                     restored.active_tab,
                     restored.placement,
                 );
@@ -3644,6 +3741,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     );
     scan_cleanup_diagnostics(&ui, state.clone());
     start_sidebar_loader(&ui, state.clone());
+    start_library_loader(&ui, state.clone(), request_sender.clone());
     start_network_location_loader(&ui, state.clone());
     start_network_discovery_event_pump(&ui, network_discovery_receiver, state.clone());
 
@@ -3660,21 +3758,23 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 app.active_window_state()
                     .tabs
                     .get(id)
-                    .and_then(|tab| tab.current_path.clone())
+                    .and_then(|tab| tab.current_location.clone())
                     .map(|path| (*id, path))
             })
             .collect::<Vec<_>>()
     };
     if scenario.is_none() {
-        for (tab_id, path) in initial_tabs {
-            submit_path_navigation(
-                &request_sender,
-                &network_request_sender,
-                &state,
-                tab_id,
-                path,
-                NavigationKind::Refresh,
-            );
+        for (tab_id, location) in initial_tabs {
+            if matches!(location, NavigationLocation::Directory(_)) {
+                submit_location_navigation(
+                    &request_sender,
+                    &network_request_sender,
+                    &state,
+                    tab_id,
+                    location,
+                    NavigationKind::Refresh,
+                );
+            }
         }
     }
 
@@ -3776,11 +3876,11 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             .into_iter()
             .filter_map(|id| {
                 let window = app.windows.get(&id)?;
-                let paths = window.stable_paths();
+                let paths = window.stable_locations();
                 (!paths.is_empty()).then_some(session_store::WindowSessionState {
                     placement: window.placement,
-                    active_tab: window.stable_active_path_index(),
-                    tab_paths: paths,
+                    active_tab: window.stable_active_location_index(),
+                    tab_locations: paths,
                 })
             })
             .collect::<Vec<_>>();
@@ -3871,15 +3971,18 @@ fn submit_navigation(
         if tab.kind != TabKind::Files {
             return false;
         }
-        if kind == NavigationKind::Normal && tab.current_path.as_ref() == Some(&path) {
+        if kind == NavigationKind::Normal && tab.visible_path() == Some(path.as_path()) {
             tab.cancel_address_edit();
             return false;
         }
-        let (request_id, cancel) = tab.begin_navigation(path.clone(), kind);
+        let (request_id, cancel) = tab.begin_directory_navigation(path.clone(), kind);
         DirectoryRequest {
             tab_id,
             request_id,
             path,
+            library: None,
+            library_sources: None,
+            unavailable_library_sources: 0,
             visibility: app.file_visibility,
             cancel,
         }
@@ -3910,15 +4013,18 @@ fn submit_network_navigation(
         if tab.kind != TabKind::Files {
             return false;
         }
-        if kind == NavigationKind::Normal && tab.current_path.as_ref() == Some(&path) {
+        if kind == NavigationKind::Normal && tab.visible_path() == Some(path.as_path()) {
             tab.cancel_address_edit();
             return false;
         }
-        let (request_id, cancel) = tab.begin_navigation(path.clone(), kind);
+        let (request_id, cancel) = tab.begin_directory_navigation(path.clone(), kind);
         DirectoryRequest {
             tab_id,
             request_id,
             path,
+            library: None,
+            library_sources: None,
+            unavailable_library_sources: 0,
             visibility: app.file_visibility,
             cancel,
         }
@@ -3954,6 +4060,84 @@ fn submit_path_navigation(
     }
 }
 
+fn submit_library_navigation(
+    sender: &mpsc::Sender<DirectoryRequest>,
+    state: &SharedSessions,
+    tab_id: TabId,
+    library: LibraryLocationId,
+    kind: NavigationKind,
+) -> bool {
+    let request = {
+        let mut app = state.lock().expect("app state mutex is not poisoned");
+        let Some(definition) = app
+            .libraries
+            .iter()
+            .find(|candidate| candidate.id.as_os_str() == library.identity.as_os_str())
+            .cloned()
+        else {
+            let message = Texts::new(app.language).library_unavailable().to_owned();
+            if let Some(tab) = app.tab_mut(tab_id) {
+                tab.load_state = LoadState::Failed;
+                tab.error = Some(message);
+            }
+            return false;
+        };
+        app.cancel_column_drag();
+        if let Some(tab) = app.tab_mut(tab_id) {
+            cancel_folder_sizes(tab);
+        }
+        app.icons.retain(|(icon_tab, _, _), _| *icon_tab != tab_id);
+        app.thumbnail_requests
+            .retain(|(request_tab, _, _, _)| *request_tab != tab_id);
+        app.focus_after_refresh.remove(&tab_id);
+        let visibility = app.file_visibility;
+        let Some(tab) = app.tab_mut(tab_id) else {
+            return false;
+        };
+        if tab.kind != TabKind::Files {
+            return false;
+        }
+        let location = NavigationLocation::Library(library.clone());
+        if kind == NavigationKind::Normal && tab.visible_location() == Some(&location) {
+            tab.cancel_address_edit();
+            return false;
+        }
+        let (request_id, cancel) = tab.begin_navigation(location, kind);
+        let library_sources = definition
+            .sources
+            .iter()
+            .filter_map(|source| source.path.clone())
+            .collect::<Vec<_>>();
+        DirectoryRequest {
+            tab_id,
+            request_id,
+            path: PathBuf::new(),
+            library: Some(library),
+            unavailable_library_sources: definition.sources.len() - library_sources.len(),
+            library_sources: Some(library_sources),
+            visibility,
+            cancel,
+        }
+    };
+    sender.send(request).is_ok()
+}
+fn submit_location_navigation(
+    local_sender: &mpsc::Sender<DirectoryRequest>,
+    network_sender: &mpsc::SyncSender<DirectoryRequest>,
+    state: &SharedSessions,
+    tab_id: TabId,
+    location: NavigationLocation,
+    kind: NavigationKind,
+) -> bool {
+    match location {
+        NavigationLocation::Directory(path) => {
+            submit_path_navigation(local_sender, network_sender, state, tab_id, path, kind)
+        }
+        NavigationLocation::Library(library) => {
+            submit_library_navigation(local_sender, state, tab_id, library, kind)
+        }
+    }
+}
 fn sidebar_navigation_target(app: &AppState, index: usize) -> Option<PathBuf> {
     if let Some(location) = app.sidebar.get(index) {
         return Some(location.path.clone());
@@ -4756,16 +4940,43 @@ fn mark_recent_operation_changes(
     }
 }
 
+fn active_write_target(app: &AppState, window_id: WindowId) -> Result<(TabId, PathBuf), String> {
+    let window = app
+        .window(window_id)
+        .ok_or_else(|| "window is unavailable".to_owned())?;
+    let tab_id = window.active_tab;
+    let tab = app
+        .tab(tab_id)
+        .ok_or_else(|| "tab is unavailable".to_owned())?;
+    match tab.visible_location() {
+        Some(NavigationLocation::Directory(path)) => Ok((tab_id, path.clone())),
+        Some(NavigationLocation::Library(library)) => app
+            .libraries
+            .iter()
+            .find(|candidate| candidate.id.as_os_str() == library.identity.as_os_str())
+            .and_then(|candidate| candidate.default_save_path.clone())
+            .map(|path| (tab_id, path))
+            .ok_or_else(|| {
+                Texts::new(app.language)
+                    .library_no_default_save_location()
+                    .to_owned()
+            }),
+        None => Err(Texts::new(app.language).library_unavailable().to_owned()),
+    }
+}
 fn create_default_folder(state: &WindowSessions, sender: &mpsc::Sender<FileOperationRequest>) {
-    let target = state.lock().ok().and_then(|app| {
-        let tab_id = app.window(state.window_id)?.active_tab;
+    let target = state.lock().ok().and_then(|mut app| {
         let name = match app.language {
             Language::Chinese => "新建文件夹",
             Language::English => "New folder",
         };
-        app.tab(tab_id)
-            .and_then(TabSession::visible_path)
-            .map(|parent| (tab_id, parent.join(name)))
+        match active_write_target(&app, state.window_id) {
+            Ok((tab_id, parent)) => Some((tab_id, parent.join(name))),
+            Err(message) => {
+                app.operation_errors.push(message);
+                None
+            }
+        }
     });
     if let Some((tab_id, path)) = target {
         enqueue_operation(
@@ -4797,12 +5008,17 @@ fn request_clipboard_write(
 }
 
 fn request_clipboard_paste(state: &WindowSessions, sender: &mpsc::Sender<ClipboardRequest>) {
-    let target = state.lock().ok().and_then(|app| {
-        let tab_id = app.window(state.window_id)?.active_tab;
-        app.tab(tab_id)
-            .and_then(TabSession::visible_path)
-            .map(|path| (tab_id, path.to_path_buf()))
-    });
+    let target =
+        state
+            .lock()
+            .ok()
+            .and_then(|mut app| match active_write_target(&app, state.window_id) {
+                Ok(target) => Some(target),
+                Err(message) => {
+                    app.operation_errors.push(message);
+                    None
+                }
+            });
     if let Some((origin_tab, target)) = target {
         let _ = sender.send(ClipboardRequest::ReadPaste { origin_tab, target });
     }
@@ -7779,7 +7995,7 @@ fn wire_address_drag(ui: &AppWindow, state: WindowSessions) {
             (tab.kind == TabKind::Files
                 && tab.page_source == PageSource::Directory
                 && tab.load_state == LoadState::Complete)
-                .then(|| tab.current_path.clone())
+                .then(|| tab.visible_path().map(Path::to_path_buf))
                 .flatten()
         });
         if let Some(path) = path
@@ -8843,18 +9059,21 @@ fn wire_callbacks(
                 .and_then(|index| app.active().breadcrumb_paths().get(index).cloned())
                 .map(|(_, path)| (app.active_window_state().active_tab, path))
         };
-        if let Some((tab_id, path)) = target {
-            if crate::network::is_unc_server_root(&path) {
+        if let Some((tab_id, location)) = target {
+            if location
+                .directory_path()
+                .is_some_and(crate::network::is_unc_server_root)
+            {
                 platform::windows::network::record_runtime_event(
                     "network_device_navigation_submitted",
                 );
             }
-            submit_path_navigation(
+            submit_location_navigation(
                 &sender_for_breadcrumb,
                 &network_sender_for_breadcrumb,
                 &state_for_breadcrumb,
                 tab_id,
-                path,
+                location,
                 NavigationKind::Normal,
             );
             if let Some(ui) = weak.upgrade() {
@@ -8887,6 +9106,38 @@ fn wire_callbacks(
             );
             if let Some(ui) = weak.upgrade() {
                 refresh_ui(&ui, &state_for_sidebar);
+            }
+        }
+    });
+
+    let weak = ui.as_weak();
+    let sender_for_library = sender.clone();
+    let state_for_library = state.clone();
+    ui.on_navigate_library(move |stable_id| {
+        let target = state_for_library.lock().ok().and_then(|app| {
+            app.libraries
+                .iter()
+                .find(|library| library_stable_id(library.id.as_os_str()) == stable_id.as_str())
+                .map(|library| {
+                    (
+                        app.active_window_state().active_tab,
+                        LibraryLocationId::new(
+                            library.id.as_os_str().to_owned(),
+                            library.display_name.to_string_lossy().into_owned(),
+                        ),
+                    )
+                })
+        });
+        if let Some((tab_id, library)) = target {
+            submit_library_navigation(
+                &sender_for_library,
+                &state_for_library,
+                tab_id,
+                library,
+                NavigationKind::Normal,
+            );
+            if let Some(ui) = weak.upgrade() {
+                refresh_ui(&ui, &state_for_library);
             }
         }
     });
@@ -9294,25 +9545,25 @@ fn wire_callbacks(
             if app.duplicate_active_tab().is_some() {
                 None
             } else {
-                let path = app
+                let location = app
                     .active()
-                    .current_path
+                    .current_location
                     .clone()
-                    .unwrap_or_else(initial_path);
-                let tab_id = app.create_tab(path.clone());
-                Some((tab_id, path))
+                    .unwrap_or_else(|| NavigationLocation::Directory(initial_path()));
+                let tab_id = app.create_tab(location.clone());
+                Some((tab_id, location))
             }
         };
         if let Some(ui) = weak.upgrade() {
             refresh_ui(&ui, &state_for_new);
         }
-        if let Some((tab_id, path)) = reload {
-            submit_path_navigation(
+        if let Some((tab_id, location)) = reload {
+            submit_location_navigation(
                 &sender_for_new,
                 &network_sender_for_new,
                 &state_for_new,
                 tab_id,
-                path,
+                location,
                 NavigationKind::Refresh,
             );
             if let Some(ui) = weak.upgrade() {
@@ -9350,13 +9601,13 @@ fn wire_callbacks(
             .lock()
             .expect("app state mutex is not poisoned")
             .restore_closed();
-        if let Some((tab_id, path)) = restored {
-            submit_path_navigation(
+        if let Some((tab_id, location)) = restored {
+            submit_location_navigation(
                 &sender_for_restore,
                 &network_sender_for_restore,
                 &state_for_restore,
                 tab_id,
-                path,
+                location,
                 NavigationKind::Refresh,
             );
         }
@@ -9520,7 +9771,7 @@ fn wire_callbacks(
         };
         let navigated = target.is_some();
         if let Some((tab_id, path)) = target {
-            submit_path_navigation(
+            submit_location_navigation(
                 &sender_for_back,
                 &network_sender_for_back,
                 &state_for_back,
@@ -9550,7 +9801,7 @@ fn wire_callbacks(
                 .map(|path| (app.active_window_state().active_tab, path))
         };
         if let Some((tab_id, path)) = target {
-            submit_path_navigation(
+            submit_location_navigation(
                 &sender_for_forward,
                 &network_sender_for_forward,
                 &state_for_forward,
@@ -9586,7 +9837,7 @@ fn wire_callbacks(
                 .map(|path| (app.active_window_state().active_tab, path))
         };
         if let Some((tab_id, path)) = target {
-            submit_path_navigation(
+            submit_location_navigation(
                 &sender_for_history,
                 &network_sender_for_history,
                 &state_for_history,
@@ -9650,14 +9901,14 @@ fn wire_callbacks(
                 None
             } else {
                 app.active()
-                    .requested_path
+                    .requested_location
                     .clone()
-                    .or_else(|| app.active().current_path.clone())
+                    .or_else(|| app.active().current_location.clone())
                     .map(|path| (app.active_window_state().active_tab, path))
             }
         };
         if let Some((tab_id, path)) = target {
-            submit_path_navigation(
+            submit_location_navigation(
                 &sender_for_refresh,
                 &network_sender_for_refresh,
                 &state_for_refresh,
@@ -9683,14 +9934,19 @@ fn wire_callbacks(
                 .expect("app state mutex is not poisoned");
             (app.active().load_state == LoadState::PermissionDenied)
                 .then(|| {
-                    app.active().requested_path.clone().map(|path| {
-                        (
-                            app.active_window,
-                            app.active_window_state().active_tab,
-                            app.active().latest_request,
-                            path,
-                        )
-                    })
+                    app.active()
+                        .requested_location
+                        .as_ref()
+                        .and_then(NavigationLocation::directory_path)
+                        .map(Path::to_path_buf)
+                        .map(|path| {
+                            (
+                                app.active_window,
+                                app.active_window_state().active_tab,
+                                app.active().latest_request,
+                                path,
+                            )
+                        })
                 })
                 .flatten()
         };
@@ -10775,7 +11031,7 @@ fn wire_callbacks(
                     let tab_id = state_for_context_command
                         .lock()
                         .ok()
-                        .map(|mut app| app.create_tab(path.clone()));
+                        .map(|mut app| app.create_tab(NavigationLocation::Directory(path.clone())));
                     if let Some(tab_id) = tab_id {
                         submit_path_navigation(
                             &sender,
@@ -13150,7 +13406,7 @@ fn wire_network_login_window(
                         == Some(session_for_monitor.window_id)
                         && app.tab(session_for_monitor.tab_id).is_some_and(|tab| {
                             tab.latest_request == session_for_monitor.failed_request_id
-                                && tab.requested_path.as_deref()
+                                && tab.requested_location.as_ref().and_then(NavigationLocation::directory_path)
                                     == Some(session_for_monitor.target.as_path())
                         })
                 });
@@ -13190,7 +13446,7 @@ fn wire_network_login_window(
                         app.window_for_tab(session.tab_id) == Some(session.window_id)
                             && app.tab(session.tab_id).is_some_and(|tab| {
                                 tab.latest_request == session.failed_request_id
-                                    && tab.requested_path.as_deref()
+                                    && tab.requested_location.as_ref().and_then(NavigationLocation::directory_path)
                                         == Some(session.target.as_path())
                             })
                     });
@@ -13639,11 +13895,12 @@ fn refresh_confirmation_windows(
 fn scan_cleanup_diagnostics(_ui: &AppWindow, state: SharedSessions) {
     let roots = state
         .lock()
-        .map(|app| app.stable_paths())
+        .map(|app| app.stable_locations())
         .unwrap_or_default();
     thread::spawn(move || {
         let pending = roots
             .into_iter()
+            .filter_map(|location| location.directory_path().map(Path::to_path_buf))
             .map(|path| path.join(".asterfiles-cleanup"))
             .find(|path| {
                 std::fs::read_dir(path)
@@ -15264,11 +15521,19 @@ fn watched_roots(app: &AppState) -> std::collections::HashSet<PathBuf> {
     app.windows
         .values()
         .flat_map(|window| window.tabs.values())
-        .filter_map(|tab| {
-            tab.visible_path()
-                .filter(|path| !crate::network::is_unc_path(path))
-                .map(Path::to_path_buf)
+        .flat_map(|tab| match tab.visible_location() {
+            Some(NavigationLocation::Directory(path)) => vec![path.clone()],
+            Some(NavigationLocation::Library(library)) => app
+                .libraries
+                .iter()
+                .find(|candidate| candidate.id.as_os_str() == library.identity.as_os_str())
+                .into_iter()
+                .flat_map(|definition| definition.sources.iter())
+                .filter_map(|source| source.path.clone())
+                .collect(),
+            None => Vec::new(),
         })
+        .filter(|path| !crate::network::is_unc_path(path))
         .collect()
 }
 
@@ -15346,24 +15611,39 @@ fn refresh_affected_tabs(
             .values()
             .flat_map(|window| window.tabs.values())
             .filter_map(|tab| {
-                tab.visible_path()
-                    .filter(|path| directories.iter().any(|directory| directory == *path))
-                    .map(|path| (tab.id, path.to_path_buf()))
+                let location = tab.visible_location()?.clone();
+                let affected = match &location {
+                    NavigationLocation::Directory(path) => directories.contains(path),
+                    NavigationLocation::Library(library) => app
+                        .libraries
+                        .iter()
+                        .find(|candidate| candidate.id.as_os_str() == library.identity.as_os_str())
+                        .is_some_and(|definition| {
+                            definition.sources.iter().any(|source| {
+                                source
+                                    .path
+                                    .as_ref()
+                                    .is_some_and(|path| directories.contains(path))
+                            })
+                        }),
+                };
+                affected.then_some((tab.id, location))
             })
             .collect::<Vec<_>>()
     };
-    for (tab, path) in targets {
+    for (tab, location) in targets {
         let pending = state.lock().ok().and_then(|mut app| {
+            let path = location.directory_path()?;
             let pending = app.focus_after_refresh.remove(&tab)?;
             (pending.directory == path && pending_focus_is_valid(&app, tab, &pending))
                 .then_some(pending)
         });
-        if submit_path_navigation(
+        if submit_location_navigation(
             sender,
             network_sender,
             state,
             tab,
-            path.clone(),
+            location,
             NavigationKind::Refresh,
         ) && let Some(mut pending) = pending
             && let Ok(mut app) = state.lock()
@@ -15640,6 +15920,82 @@ fn read_network_directory_batches(
     Ok(ReadOutcome::Complete { skipped })
 }
 fn run_directory_request(request: DirectoryRequest, events: &mpsc::Sender<DirectoryEvent>) {
+    if let Some(sources) = request.library_sources.as_ref() {
+        let outcome = read_aggregate_directory_batches_filtered(
+            sources,
+            &request.cancel,
+            request.visibility,
+            |entries| {
+                let _ = events.send(DirectoryEvent::Batch {
+                    tab_id: request.tab_id,
+                    request_id: request.request_id,
+                    entries,
+                });
+            },
+        );
+        let event = if outcome.cancelled {
+            DirectoryEvent::Cancelled {
+                tab_id: request.tab_id,
+                request_id: request.request_id,
+            }
+        } else {
+            let successful_sources = outcome
+                .sources
+                .iter()
+                .filter(|source| matches!(source.state, SourceReadState::Complete { .. }))
+                .count();
+            let total_sources = outcome.sources.len() + request.unavailable_library_sources;
+            if total_sources > 0 && successful_sources == 0 {
+                let kind = if outcome
+                    .sources
+                    .iter()
+                    .any(|source| source.state == SourceReadState::PermissionDenied)
+                {
+                    io::ErrorKind::PermissionDenied
+                } else if outcome
+                    .sources
+                    .iter()
+                    .all(|source| source.state == SourceReadState::NotFound)
+                {
+                    io::ErrorKind::NotFound
+                } else {
+                    io::ErrorKind::Other
+                };
+                DirectoryEvent::Failed {
+                    tab_id: request.tab_id,
+                    request_id: request.request_id,
+                    kind,
+                    message: "all library sources failed".to_owned(),
+                }
+            } else {
+                let skipped = outcome
+                    .sources
+                    .iter()
+                    .filter_map(|source| match source.state {
+                        SourceReadState::Complete { skipped } => Some(skipped),
+                        _ => None,
+                    })
+                    .sum();
+                let source_failures = request.unavailable_library_sources
+                    + outcome
+                        .sources
+                        .iter()
+                        .filter(|source| !matches!(source.state, SourceReadState::Complete { .. }))
+                        .count();
+                DirectoryEvent::Finished {
+                    tab_id: request.tab_id,
+                    request_id: request.request_id,
+                    path: PathBuf::new(),
+                    skipped,
+                    source_failures,
+                    library: request.library,
+                }
+            }
+        };
+        let _ = events.send(event);
+        return;
+    }
+
     if crate::network::is_unc_server_root(&request.path) {
         platform::windows::network::record_runtime_event("network_root_request_started");
     }
@@ -15674,6 +16030,8 @@ fn run_directory_request(request: DirectoryRequest, events: &mpsc::Sender<Direct
             request_id: request.request_id,
             path: request.path,
             skipped,
+            source_failures: 0,
+            library: None,
         },
         Ok(ReadOutcome::Cancelled) => DirectoryEvent::Cancelled {
             tab_id: request.tab_id,
@@ -15736,8 +16094,9 @@ fn start_event_pump(
                             app.tab(tab_id).is_some_and(|tab| {
                                 tab.latest_request == request_id
                                     && tab
-                                        .requested_path
-                                        .as_deref()
+                                        .requested_location
+                                        .as_ref()
+                                        .and_then(NavigationLocation::directory_path)
                                         .is_some_and(crate::network::is_unc_server_root)
                             })
                         })
@@ -15983,13 +16342,16 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
             request_id,
             path,
             skipped,
+            source_failures,
+            library,
         } => {
             let accepted = app.tab(tab_id).is_some_and(|tab| tab.accepts(request_id));
             let focus = accepted
                 .then(|| app.focus_after_refresh.get(&tab_id).cloned())
                 .flatten()
                 .filter(|pending| {
-                    pending.request_id == Some(request_id)
+                    library.is_none()
+                        && pending.request_id == Some(request_id)
                         && pending.directory == path
                         && pending_focus_is_valid(&app, tab_id, pending)
                 });
@@ -15997,7 +16359,9 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                 .then(|| app.window_for_tab(tab_id))
                 .flatten()
                 .and_then(|window_id| app.pending_shell_creates.get(&window_id).cloned())
-                .filter(|pending| pending.tab_id == tab_id && pending.directory == path);
+                .filter(|pending| {
+                    library.is_none() && pending.tab_id == tab_id && pending.directory == path
+                });
             let shell_create = shell_create.and_then(|pending| {
                 app.pending_shell_creates.remove(&pending.window_id);
                 (pending.started_at.elapsed() <= Duration::from_secs(5)
@@ -16008,14 +16372,21 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
             });
             if accepted {
                 let consumed_focus = focus.is_some();
-                let preference = app.directory_preference(&path);
+                let preference = library
+                    .as_ref()
+                    .map(|_| app.default_directory_view)
+                    .unwrap_or_else(|| app.directory_preference(&path));
                 let (location_path, shell_created) = {
                     let tab = app.tab_mut(tab_id).expect("accepted tab exists");
                     tab.sort_field = preference.sort_field;
                     tab.sort_direction = preference.sort_direction;
                     tab.sort_pending();
                     tab.commit_pending();
-                    tab.commit_path(path);
+                    if let Some(library) = library.clone() {
+                        tab.commit_location(NavigationLocation::Library(library));
+                    } else {
+                        tab.commit_path(path);
+                    }
                     if let Some(focus) = focus.as_ref() {
                         let ids = focus
                             .paths
@@ -16044,11 +16415,12 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                         tab.focused = Some(entry.id);
                         tab.selection_anchor = Some(entry.id);
                     }
-                    tab.error = (skipped > 0).then(|| skipped.to_string());
-                    (
-                        tab.current_path.clone().expect("committed path exists"),
-                        shell_created,
-                    )
+                    tab.error = if source_failures > 0 {
+                        Some(format!("library_sources:{source_failures}"))
+                    } else {
+                        (skipped > 0).then(|| skipped.to_string())
+                    };
+                    (tab.visible_path().map(Path::to_path_buf), shell_created)
                 };
                 if consumed_focus {
                     app.focus_after_refresh.remove(&tab_id);
@@ -16091,7 +16463,9 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                         },
                     );
                 }
-                if !crate::network::is_unc_path(&location_path) {
+                if let Some(location_path) = location_path
+                    && !crate::network::is_unc_path(&location_path)
+                {
                     icon_requests.push(IconRequest {
                         tab_id,
                         request_id,
@@ -16200,6 +16574,56 @@ fn search_grouped_page(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn search_library_grouped_page(
+    client: &platform::windows::everything::EverythingClient,
+    sources: Vec<PathBuf>,
+    recursive: bool,
+    query: String,
+    sort: platform::windows::everything::EverythingSort,
+    offset: u32,
+    limit: u32,
+    timeout: Duration,
+) -> Result<GroupedSearchPage, platform::windows::everything::EverythingError> {
+    let requested = offset.saturating_add(limit);
+    let mut items = Vec::new();
+    let mut total = 0_u32;
+    let mut file_total = 0_u32;
+    let mut response_offsets_valid = true;
+    for source in sources {
+        let page = search_grouped_page(
+            client,
+            (Some(source), recursive),
+            query.clone(),
+            sort,
+            0,
+            requested,
+            timeout,
+        )?;
+        total = total.saturating_add(page.total);
+        file_total = file_total.saturating_add(page.file_total);
+        response_offsets_valid &= page.response_offsets_valid;
+        items.extend(page.items);
+    }
+    items.sort_by(|left, right| {
+        left.name
+            .to_string_lossy()
+            .to_lowercase()
+            .cmp(&right.name.to_string_lossy().to_lowercase())
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let items = items
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+    Ok(GroupedSearchPage {
+        items,
+        total,
+        file_total,
+        response_offsets_valid,
+    })
+}
 fn everything_status(
     client: Option<&platform::windows::everything::EverythingClient>,
     timeout: Duration,
@@ -16337,11 +16761,16 @@ fn spawn_everything_worker(
                         });
                         continue;
                     };
-                    let scope = match scope {
+                    let recursive = depth == SearchDepth::Recursive;
+                    let library_sources = match &scope {
+                        SearchScope::Library { sources, .. } => Some(sources.clone()),
+                        _ => None,
+                    };
+                    let directory_scope = match scope {
                         SearchScope::Global => None,
                         SearchScope::Directory(path) => Some(path),
+                        SearchScope::Library { .. } => None,
                     };
-                    let recursive = depth == SearchDepth::Recursive;
                     if cancel.load(std::sync::atomic::Ordering::Acquire) {
                         let _ = event_sender.send(EverythingEvent::SearchSkipped {
                             tab_id,
@@ -16350,15 +16779,28 @@ fn spawn_everything_worker(
                         });
                         continue;
                     }
-                    let page_result = search_grouped_page(
-                        client,
-                        (scope, recursive),
-                        query,
-                        sort,
-                        offset,
-                        SEARCH_PAGE_LIMIT,
-                        Duration::from_secs(3),
-                    );
+                    let page_result = if let Some(sources) = library_sources {
+                        search_library_grouped_page(
+                            client,
+                            sources,
+                            recursive,
+                            query,
+                            sort,
+                            offset,
+                            SEARCH_PAGE_LIMIT,
+                            Duration::from_secs(3),
+                        )
+                    } else {
+                        search_grouped_page(
+                            client,
+                            (directory_scope, recursive),
+                            query,
+                            sort,
+                            offset,
+                            SEARCH_PAGE_LIMIT,
+                            Duration::from_secs(3),
+                        )
+                    };
                     match page_result {
                         Ok(page) => {
                             let GroupedSearchPage {
@@ -17048,10 +17490,32 @@ fn submit_search(
     let request = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         app.cancel_column_drag();
+        let library_sources = app
+            .active()
+            .visible_location()
+            .and_then(|location| match location {
+                NavigationLocation::Library(library) => app
+                    .libraries
+                    .iter()
+                    .find(|candidate| candidate.id.as_os_str() == library.identity.as_os_str())
+                    .map(|definition| {
+                        definition
+                            .sources
+                            .iter()
+                            .filter_map(|source| source.path.clone())
+                            .collect::<Vec<_>>()
+                    }),
+                NavigationLocation::Directory(_) => None,
+            });
         let Some(tab) = app.tab_mut(tab_id) else {
             return;
         };
-        let scope = tab.search_scope.clone();
+        let mut scope = tab.search_scope.clone();
+        if let (SearchScope::Library { sources, .. }, Some(library_sources)) =
+            (&mut scope, library_sources)
+        {
+            *sources = library_sources;
+        }
         let sort = everything_sort(tab.search_sort_field, tab.search_sort_direction);
         let (request_id, cancel) = tab.begin_search(scope.clone(), query.clone());
         EverythingRequest::Search {
@@ -17355,6 +17819,124 @@ fn reload_quick_access(weak: slint::Weak<AppWindow>, state: SharedSessions) {
     });
 }
 
+fn library_stable_id(identity: &std::ffi::OsStr) -> String {
+    use std::os::windows::ffi::OsStrExt;
+    identity
+        .encode_wide()
+        .map(|unit| format!("{unit:04x}"))
+        .collect()
+}
+
+fn start_library_loader(
+    ui: &AppWindow,
+    state: SharedSessions,
+    directory_sender: mpsc::Sender<DirectoryRequest>,
+) {
+    reload_libraries(ui.as_weak(), state.clone(), directory_sender.clone());
+    start_library_watcher(ui.as_weak(), state, directory_sender);
+}
+
+fn reload_libraries(
+    weak: slint::Weak<AppWindow>,
+    state: SharedSessions,
+    directory_sender: mpsc::Sender<DirectoryRequest>,
+) {
+    let generation = {
+        let Ok(mut app) = state.lock() else { return };
+        app.library_generation = app.library_generation.wrapping_add(1).max(1);
+        app.library_generation
+    };
+    thread::spawn(move || {
+        let result = platform::windows::libraries::enumerate();
+        let mut icons = HashMap::new();
+        if let Ok(enumeration) = result.as_ref() {
+            let _shell_apartment = platform::windows_shell_icons::initialize_shell_worker().ok();
+            for library in &enumeration.libraries {
+                let Some(definition_path) = library.definition_path.as_ref() else {
+                    continue;
+                };
+                if let Ok(icon) = platform::windows_shell_icons::shell_icon_rgba(definition_path) {
+                    icons.insert(library.id.as_os_str().to_owned(), icon);
+                }
+            }
+        }
+        let state_for_ui = state.clone();
+        let _ = weak.upgrade_in_event_loop(move |_ui| {
+            let targets = {
+                let Ok(mut app) = state_for_ui.lock() else {
+                    return;
+                };
+                if app.library_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(enumeration) => {
+                        app.libraries = enumeration.libraries;
+                        app.library_failures = enumeration.failures;
+                        app.library_icons = icons;
+                    }
+                    Err(error) => {
+                        app.libraries.clear();
+                        app.library_icons.clear();
+                        app.library_failures = vec![platform::windows::libraries::LibraryFailure {
+                            shell_identity: None,
+                            message: error.to_string(),
+                        }];
+                    }
+                }
+                app.windows
+                    .values()
+                    .flat_map(|window| window.tabs.values())
+                    .filter_map(|tab| match tab.current_location.as_ref()? {
+                        NavigationLocation::Library(library) => Some((tab.id, library.clone())),
+                        NavigationLocation::Directory(_) => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            refresh_all_windows(&state_for_ui);
+            for (tab_id, library) in targets {
+                submit_library_navigation(
+                    &directory_sender,
+                    &state_for_ui,
+                    tab_id,
+                    library,
+                    NavigationKind::Refresh,
+                );
+            }
+        });
+    });
+}
+
+fn start_library_watcher(
+    weak: slint::Weak<AppWindow>,
+    state: SharedSessions,
+    directory_sender: mpsc::Sender<DirectoryRequest>,
+) {
+    thread::spawn(move || {
+        let Ok(root) = platform::windows::libraries::folder_path() else {
+            return;
+        };
+        let (events, receiver) = mpsc::channel();
+        let Ok(_watcher) = platform::windows::directory_watch::DirectoryWatch::start(root, events)
+        else {
+            return;
+        };
+        while receiver.recv().is_ok() {
+            thread::sleep(Duration::from_millis(120));
+            while receiver.try_recv().is_ok() {}
+            let weak_for_ui = weak.clone();
+            let state_for_ui = state.clone();
+            let sender_for_ui = directory_sender.clone();
+            if slint::invoke_from_event_loop(move || {
+                reload_libraries(weak_for_ui, state_for_ui, sender_for_ui);
+            })
+            .is_err()
+            {
+                break;
+            }
+        }
+    });
+}
 fn start_network_location_loader(ui: &AppWindow, state: SharedSessions) {
     let weak = ui.as_weak();
     thread::spawn(move || {
@@ -17382,6 +17964,15 @@ fn start_network_location_loader(ui: &AppWindow, state: SharedSessions) {
             refresh_all_windows(&state_for_ui);
         });
     });
+}
+
+fn normalize_restored_location(location: NavigationLocation) -> NavigationLocation {
+    match location {
+        NavigationLocation::Directory(path) => NavigationLocation::Directory(
+            platform::windows::network::network_drive_to_unc(&path).unwrap_or(path),
+        ),
+        library @ NavigationLocation::Library(_) => library,
+    }
 }
 
 fn stable_network_location_id(path: &Path) -> u64 {
@@ -18549,7 +19140,10 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     );
     ui.set_search_total_items(total.min(i32::MAX as u32) as i32);
     ui.set_window_width(ui.window().size().width as f32 / ui.window().scale_factor());
-    let visible_path = tab.visible_path().map(display_path).unwrap_or_default();
+    let visible_path = tab
+        .visible_location()
+        .map(NavigationLocation::display_name)
+        .unwrap_or_default();
     let address_input = if tab.address_editing {
         tab.address_input.clone()
     } else {
@@ -18558,8 +19152,11 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     ui.set_current_path(visible_path.into());
     let current_location_path = tab.visible_path();
     ui.set_current_location_icon(
-        current_location_path
-            .and_then(|path| app.icon_cache.get(path))
+        tab.visible_location()
+            .and_then(|location| match location {
+                NavigationLocation::Directory(path) => app.icon_cache.get(path),
+                NavigationLocation::Library(library) => app.library_icons.get(&library.identity),
+            })
             .map(shell_icon_image)
             .unwrap_or_default(),
     );
@@ -18574,10 +19171,21 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     ui.set_status_text(status_text(tab, texts).into());
     let network_permission = tab.load_state == LoadState::PermissionDenied
         && tab
-            .requested_path
-            .as_deref()
+            .requested_location
+            .as_ref()
+            .and_then(NavigationLocation::directory_path)
             .is_some_and(crate::network::is_unc_path);
-    let (error_page_title, error_page_description) = if network_permission {
+    let library_failed = tab.load_state == LoadState::Failed
+        && matches!(tab.requested_location, Some(NavigationLocation::Library(_)));
+    let (error_page_title, error_page_description) = if library_failed {
+        match app.language {
+            Language::Chinese => ("无法打开此库", texts.library_all_sources_failed()),
+            Language::English => (
+                "This library could not be opened",
+                texts.library_all_sources_failed(),
+            ),
+        }
+    } else if network_permission {
         match app.language {
             Language::Chinese => (
                 "需要登录此网络位置",
@@ -18612,13 +19220,9 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
                 title: if tab.kind == TabKind::Settings {
                     texts.settings().to_owned()
                 } else {
-                    tab.visible_path()
-                        .and_then(Path::file_name)
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .filter(|name| !name.is_empty())
-                        .unwrap_or_else(|| {
-                            display_path(tab.visible_path().unwrap_or(Path::new("C:\\")))
-                        })
+                    tab.visible_location()
+                        .map(NavigationLocation::display_name)
+                        .unwrap_or_else(|| display_path(Path::new("C:\\")))
                 }
                 .into(),
                 active: tab.id == window.active_tab,
@@ -18652,7 +19256,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
             .enumerate()
             .map(|(index, path)| HistoryRow {
                 index: index as i32,
-                label: display_path(path).into(),
+                label: path.display_name().into(),
             })
             .collect::<Vec<_>>(),
     )));
@@ -18663,7 +19267,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
             .enumerate()
             .map(|(index, path)| HistoryRow {
                 index: index as i32,
-                label: display_path(path).into(),
+                label: path.display_name().into(),
             })
             .collect::<Vec<_>>(),
     )));
@@ -18711,6 +19315,22 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
                 .into();
             row.source_kind = 3;
         }
+    }
+    for library in &app.libraries {
+        sidebar_rows.push(SidebarRow {
+            index: -1,
+            stable_id: library_stable_id(library.id.as_os_str()).into(),
+            label: library.display_name.to_string_lossy().into_owned().into(),
+            icon_kind: 9,
+            group_kind: 4,
+            source_kind: 0,
+            is_drive: false,
+            icon: app
+                .library_icons
+                .get(library.id.as_os_str())
+                .map(shell_icon_image)
+                .unwrap_or_default(),
+        });
     }
     let mut network_row_index = app.sidebar.len();
     let mut locations = app
@@ -18817,8 +19437,9 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     ui.set_show_request_access(show_request_access);
     if show_request_access
         && tab
-            .requested_path
-            .as_deref()
+            .requested_location
+            .as_ref()
+            .and_then(NavigationLocation::directory_path)
             .is_some_and(crate::network::is_unc_path)
     {
         ui.set_text_request_access(
@@ -19001,6 +19622,14 @@ fn status_text(tab: &TabSession, texts: Texts) -> String {
             Language::Chinese => "网络连接较慢，仍在等待…".to_owned(),
             Language::English => "The network connection is slow. Still waiting…".to_owned(),
         };
+    }
+    if let Some(failed) = tab
+        .error
+        .as_deref()
+        .and_then(|value| value.strip_prefix("library_sources:"))
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        return texts.library_partial_sources_failed(failed);
     }
     if let Some(progress) = tab.folder_sizes.progress()
         && progress.completed < progress.total
@@ -19719,6 +20348,33 @@ fn initial_path() -> PathBuf {
 mod tests {
     use super::*;
 
+    fn test_library(
+        identity: &str,
+        display_name: &str,
+        sources: Vec<Option<PathBuf>>,
+        default_save_path: Option<PathBuf>,
+    ) -> platform::windows::libraries::WindowsLibrary {
+        platform::windows::libraries::WindowsLibrary {
+            id: platform::windows::libraries::LibraryId::new(identity.into()),
+            definition_path: Some(PathBuf::from(format!(
+                r"C:\Libraries\{display_name}.library-ms"
+            ))),
+            display_name: display_name.into(),
+            pinned: true,
+            sort_order: 0,
+            sources: sources
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(index, path)| platform::windows::libraries::LibrarySource {
+                        shell_identity: format!("shell:source:{index}").into(),
+                        path,
+                    },
+                )
+                .collect(),
+            default_save_path,
+        }
+    }
     fn type_select_test_context(window: u32, request: u64) -> TypeSelectContext {
         TypeSelectContext {
             tab_id: TabId(window),
@@ -19740,6 +20396,89 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn library_write_target_uses_shell_default_save_location() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\before")], 0, [0, 1, 2, 3]);
+        let library = test_library(
+            "shell:library:documents",
+            "Documents",
+            vec![
+                Some(PathBuf::from(r"C:\first")),
+                Some(PathBuf::from(r"D:\second")),
+            ],
+            Some(PathBuf::from(r"D:\second")),
+        );
+        app.libraries.push(library);
+        let active_tab = app.active_window_state().active_tab;
+        app.active_window_state_mut()
+            .tabs
+            .get_mut(&active_tab)
+            .unwrap()
+            .current_location = Some(NavigationLocation::Library(LibraryLocationId::new(
+            "shell:library:documents".into(),
+            "Documents".to_owned(),
+        )));
+
+        assert_eq!(
+            active_write_target(&app, app.active_window).unwrap().1,
+            PathBuf::from(r"D:\second")
+        );
+        app.libraries[0].default_save_path = None;
+        assert_eq!(
+            active_write_target(&app, app.active_window).unwrap_err(),
+            Texts::new(app.language).library_no_default_save_location()
+        );
+    }
+
+    #[test]
+    fn stale_library_events_do_not_replace_newer_navigation() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\before")], 0, [0, 1, 2, 3]);
+        let active_tab = app.active_window_state().active_tab;
+        let tab = app
+            .active_window_state_mut()
+            .tabs
+            .get_mut(&active_tab)
+            .unwrap();
+        let first = LibraryLocationId::new("library:first".into(), "First".to_owned());
+        let second = LibraryLocationId::new("library:second".into(), "Second".to_owned());
+        let (stale_request, _) = tab.begin_navigation(
+            NavigationLocation::Library(first.clone()),
+            NavigationKind::Normal,
+        );
+        let (current_request, _) = tab.begin_navigation(
+            NavigationLocation::Library(second.clone()),
+            NavigationKind::Normal,
+        );
+        let state = Arc::new(Mutex::new(app));
+        apply_event(
+            &state,
+            DirectoryEvent::Batch {
+                tab_id: TabId(1),
+                request_id: stale_request,
+                entries: vec![focus_entry(1, r"C:\first\late.txt")],
+            },
+        );
+        apply_event(
+            &state,
+            DirectoryEvent::Finished {
+                tab_id: TabId(1),
+                request_id: stale_request,
+                path: PathBuf::new(),
+                skipped: 0,
+                source_failures: 0,
+                library: Some(first),
+            },
+        );
+        let app = state.lock().unwrap();
+        let tab = app.active();
+        assert_eq!(tab.latest_request, current_request);
+        assert_eq!(
+            tab.requested_location,
+            Some(NavigationLocation::Library(second))
+        );
+        assert!(tab.pending_entries.is_empty());
+        assert_eq!(tab.load_state, LoadState::Loading);
+    }
     #[test]
     fn issue_28_quick_search_defaults_off_and_starts_in_current_directory() {
         let app = AppState::new_for_test(vec![PathBuf::from(r"C:\work")], 0, [0, 1, 2, 3]);
@@ -19961,7 +20700,7 @@ mod tests {
         let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\one")], 0, [0, 1, 2, 3]);
         let first_window = app.active_window;
         let second_window = app.register_window(
-            vec![PathBuf::from(r"C:\two")],
+            vec![NavigationLocation::Directory(PathBuf::from(r"C:\two"))],
             0,
             session_store::WindowPlacement {
                 x: 100,
@@ -20213,7 +20952,7 @@ mod tests {
     fn issue_18_navigation_uses_pending_entries_before_the_first_thumbnail() {
         let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\old")], 0, [0, 1, 2, 3]);
         let tab = app.tab_mut(TabId(1)).unwrap();
-        tab.begin_navigation(PathBuf::from(r"C:\new"), NavigationKind::Normal);
+        tab.begin_directory_navigation(PathBuf::from(r"C:\new"), NavigationKind::Normal);
         assert!(directory_display_entries(tab).is_empty());
         tab.append_pending(vec![focus_entry(1, r"C:\new\photo.png")]);
         assert_eq!(directory_display_entries(tab).len(), 1);
@@ -21050,6 +21789,8 @@ mod tests {
                 request_id: RequestId(4),
                 path,
                 skipped: 0,
+                source_failures: 0,
+                library: None,
             },
         );
 
@@ -21401,8 +22142,11 @@ mod tests {
         let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
         let first_window = app.active_window;
         let first_extra = app.create_tab(PathBuf::from("two"));
-        let second_window =
-            app.register_window(vec![PathBuf::from("three")], 0, test_window_placement(160));
+        let second_window = app.register_window(
+            vec![NavigationLocation::Directory(PathBuf::from("three"))],
+            0,
+            test_window_placement(160),
+        );
         let second_first = app.window(second_window).unwrap().active_tab;
 
         assert_eq!(
@@ -21423,7 +22167,10 @@ mod tests {
         let closed = app.create_tab(PathBuf::from("closed"));
         app.close_tab(closed).unwrap();
         let second_window = app.register_window(
-            vec![PathBuf::from("second"), PathBuf::from("active")],
+            vec![
+                NavigationLocation::Directory(PathBuf::from("second")),
+                NavigationLocation::Directory(PathBuf::from("active")),
+            ],
             1,
             test_window_placement(240),
         );
@@ -21442,8 +22189,11 @@ mod tests {
     fn closing_one_window_cancels_only_its_tabs_and_keeps_shared_operation() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
         let first_window = app.active_window;
-        let second_window =
-            app.register_window(vec![PathBuf::from("two")], 0, test_window_placement(160));
+        let second_window = app.register_window(
+            vec![NavigationLocation::Directory(PathBuf::from("two"))],
+            0,
+            test_window_placement(160),
+        );
         let first_tab = app.window(first_window).unwrap().active_tab;
         let second_tab = app.window(second_window).unwrap().active_tab;
         let (_, first_cancel) = app
@@ -21452,14 +22202,14 @@ mod tests {
             .tabs
             .get_mut(&first_tab)
             .unwrap()
-            .begin_navigation(PathBuf::from("one/new"), NavigationKind::Normal);
+            .begin_directory_navigation(PathBuf::from("one/new"), NavigationKind::Normal);
         let (_, second_cancel) = app
             .window_mut(second_window)
             .unwrap()
             .tabs
             .get_mut(&second_tab)
             .unwrap()
-            .begin_navigation(PathBuf::from("two/new"), NavigationKind::Normal);
+            .begin_directory_navigation(PathBuf::from("two/new"), NavigationKind::Normal);
         let operation = app.operations.submit(
             OperationResource::Local,
             FileOperationKind::Copy,
@@ -21488,7 +22238,11 @@ mod tests {
     fn closing_window_cancels_and_removes_network_discovery() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
         let first = app.active_window;
-        let second = app.register_window(vec![PathBuf::from("two")], 0, test_window_placement(160));
+        let second = app.register_window(
+            vec![NavigationLocation::Directory(PathBuf::from("two"))],
+            0,
+            test_window_placement(160),
+        );
         let (request, cancel) = app.network_discovery.entry(first).or_default().begin();
         assert_eq!(request, DiscoveryRequestId(1));
         app.network_discovery_errors
@@ -21628,8 +22382,11 @@ mod tests {
     fn directory_events_route_to_non_active_windows_by_global_tab_id() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
         let first_window = app.active_window;
-        let second_window =
-            app.register_window(vec![PathBuf::from("two")], 0, test_window_placement(160));
+        let second_window = app.register_window(
+            vec![NavigationLocation::Directory(PathBuf::from("two"))],
+            0,
+            test_window_placement(160),
+        );
         let first_tab = app.window(first_window).unwrap().active_tab;
         let second_tab = app.window(second_window).unwrap().active_tab;
         for tab_id in [first_tab, second_tab] {
@@ -21655,6 +22412,8 @@ mod tests {
                 request_id: RequestId(7),
                 path: PathBuf::from("two"),
                 skipped: 0,
+                source_failures: 0,
+                library: None,
             },
         );
         let app = state.lock().unwrap();
@@ -21666,8 +22425,11 @@ mod tests {
     #[test]
     fn search_and_icon_events_route_to_non_active_windows() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
-        let second_window =
-            app.register_window(vec![PathBuf::from("two")], 0, test_window_placement(160));
+        let second_window = app.register_window(
+            vec![NavigationLocation::Directory(PathBuf::from("two"))],
+            0,
+            test_window_placement(160),
+        );
         let second_tab = app.window(second_window).unwrap().active_tab;
         let tab = app.tab_mut(second_tab).unwrap();
         let (request_id, _) = tab.begin_search(SearchScope::Global, "item".into());
@@ -21704,8 +22466,11 @@ mod tests {
     fn closed_window_rejects_late_results_while_other_window_accepts_them() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
         let first_window = app.active_window;
-        let second_window =
-            app.register_window(vec![PathBuf::from("two")], 0, test_window_placement(160));
+        let second_window = app.register_window(
+            vec![NavigationLocation::Directory(PathBuf::from("two"))],
+            0,
+            test_window_placement(160),
+        );
         let first_tab = app.window(first_window).unwrap().active_tab;
         let second_tab = app.window(second_window).unwrap().active_tab;
         for tab_id in [first_tab, second_tab] {
@@ -21755,8 +22520,11 @@ mod tests {
             app.request_window_close(first_window),
             WindowCloseAction::ConfirmApplicationExit
         );
-        let second_window =
-            app.register_window(vec![PathBuf::from("two")], 0, test_window_placement(160));
+        let second_window = app.register_window(
+            vec![NavigationLocation::Directory(PathBuf::from("two"))],
+            0,
+            test_window_placement(160),
+        );
         assert_eq!(
             app.request_window_close(first_window),
             WindowCloseAction::CloseWindow
@@ -21783,10 +22551,10 @@ mod tests {
             WindowCloseAction::ExitApplication
         );
         assert_eq!(
-            app.stable_paths(),
+            app.stable_locations(),
             [PathBuf::from("one"), PathBuf::from("two")]
         );
-        assert_eq!(app.stable_active_path_index(), 1);
+        assert_eq!(app.stable_active_location_index(), 1);
         assert!(app.window(window).is_some());
     }
 
@@ -21843,7 +22611,7 @@ mod tests {
         let active = app.active_window_state().active_tab;
         let tab = app.tab_mut(active).unwrap();
         let (request_id, cancel) =
-            tab.begin_navigation(PathBuf::from("pending"), NavigationKind::Refresh);
+            tab.begin_directory_navigation(PathBuf::from("pending"), NavigationKind::Refresh);
         let (_, moved) = begin_drag_at(&mut app, 0);
         assert_eq!(
             app.update_tab_drag(500.0, 20.0, 47.0, 540.0, 0.0, 178.0),
@@ -21899,7 +22667,7 @@ mod tests {
         let (_, token) = app
             .tab_mut(tab_id)
             .unwrap()
-            .begin_navigation(PathBuf::from("pending"), NavigationKind::Refresh);
+            .begin_directory_navigation(PathBuf::from("pending"), NavigationKind::Refresh);
         begin_drag_at(&mut app, 0);
         app.update_tab_drag(100.0, 80.0, 47.0, 540.0, 0.0, 178.0);
         let destination = app.reserve_window_id();
@@ -21920,7 +22688,10 @@ mod tests {
         let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
         let source = app.active_window;
         let destination = app.register_window(
-            vec![PathBuf::from("c"), PathBuf::from("d")],
+            vec![
+                NavigationLocation::Directory(PathBuf::from("c")),
+                NavigationLocation::Directory(PathBuf::from("d")),
+            ],
             0,
             test_window_placement(160),
         );
@@ -21950,7 +22721,10 @@ mod tests {
         );
         let source = app.active_window;
         let destination = app.register_window(
-            vec![PathBuf::from("c"), PathBuf::from("d")],
+            vec![
+                NavigationLocation::Directory(PathBuf::from("c")),
+                NavigationLocation::Directory(PathBuf::from("d")),
+            ],
             0,
             test_window_placement(160),
         );
@@ -21997,7 +22771,11 @@ mod tests {
             [0, 1, 2, 3],
         );
         let source = app.active_window;
-        let target = app.register_window(vec![PathBuf::from("b")], 0, test_window_placement(160));
+        let target = app.register_window(
+            vec![NavigationLocation::Directory(PathBuf::from("b"))],
+            0,
+            test_window_placement(160),
+        );
         let tab_id = app.window(source).unwrap().active_tab;
         assert!(app.begin_tab_drag(source, tab_id, 0, 100.0, 20.0));
         assert!(
@@ -22023,7 +22801,11 @@ mod tests {
             [0, 1, 2, 3],
         );
         let source = app.active_window;
-        let target = app.register_window(vec![PathBuf::from("b")], 0, test_window_placement(160));
+        let target = app.register_window(
+            vec![NavigationLocation::Directory(PathBuf::from("b"))],
+            0,
+            test_window_placement(160),
+        );
         let tab_id = app.window(source).unwrap().active_tab;
         assert!(app.begin_tab_drag(source, tab_id, 0, 100.0, 20.0));
         assert!(app.cancel_tab_drag_for_window(source));
@@ -22087,9 +22869,9 @@ mod tests {
         let tab_id = app.active_window_state().active_tab;
         {
             let tab = app.tab_mut(tab_id).unwrap();
-            tab.current_path = Some(PathBuf::from("a/current"));
-            tab.back_history = vec![PathBuf::from("a/previous")];
-            tab.forward_history = vec![PathBuf::from("a/next")];
+            tab.current_location = Some(NavigationLocation::Directory(PathBuf::from("a/current")));
+            tab.back_history = vec![NavigationLocation::Directory(PathBuf::from("a/previous"))];
+            tab.forward_history = vec![NavigationLocation::Directory(PathBuf::from("a/next"))];
             tab.replace_entries(vec![focus_entry(7, "a/current/item.txt")]);
             tab.selected = vec![EntryId(7)];
             tab.focused = Some(EntryId(7));
@@ -22116,7 +22898,12 @@ mod tests {
         assert_eq!(app.window(source).unwrap().placement.y, 240);
         let tab = app.tab(tab_id).unwrap();
         assert_eq!(tab.latest_request, request);
-        assert_eq!(tab.current_path.as_deref(), Some(Path::new("a/current")));
+        assert_eq!(
+            tab.current_location
+                .as_ref()
+                .and_then(NavigationLocation::directory_path),
+            Some(Path::new("a/current"))
+        );
         assert_eq!(tab.back_history, [PathBuf::from("a/previous")]);
         assert_eq!(tab.forward_history, [PathBuf::from("a/next")]);
         assert_eq!(tab.selected, [EntryId(7)]);
@@ -22223,7 +23010,7 @@ mod tests {
         let first_window = app.active_window;
         let first_tab = app.window(first_window).unwrap().active_tab;
         let second_window = app.register_window(
-            vec![PathBuf::from(r"C:\WindowB")],
+            vec![NavigationLocation::Directory(PathBuf::from(r"C:\WindowB"))],
             0,
             test_window_placement(160),
         );
@@ -22272,7 +23059,7 @@ mod tests {
             .replace_entries(vec![focus_entry(1, r"C:\WindowA\first.txt")]);
         app.tab_mut(first_tab).unwrap().selected = vec![EntryId(1)];
         let second_window = app.register_window(
-            vec![PathBuf::from(r"C:\WindowB")],
+            vec![NavigationLocation::Directory(PathBuf::from(r"C:\WindowB"))],
             0,
             test_window_placement(160),
         );
@@ -22303,7 +23090,7 @@ mod tests {
         let first_window = app.active_window;
         let first_tab = app.window(first_window).unwrap().active_tab;
         let second_window = app.register_window(
-            vec![PathBuf::from(r"C:\WindowB")],
+            vec![NavigationLocation::Directory(PathBuf::from(r"C:\WindowB"))],
             0,
             test_window_placement(160),
         );
@@ -22338,7 +23125,11 @@ mod tests {
     fn refreshing_each_window_does_not_change_the_active_window() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
         let first = app.active_window;
-        let second = app.register_window(vec![PathBuf::from("b")], 0, test_window_placement(160));
+        let second = app.register_window(
+            vec![NavigationLocation::Directory(PathBuf::from("b"))],
+            0,
+            test_window_placement(160),
+        );
         let state = Arc::new(Mutex::new(app));
         let first_ui = headless_file_view();
         let second_ui = AppWindow::new().expect("second headless window should initialize");
@@ -22361,7 +23152,11 @@ mod tests {
     fn background_window_projection_does_not_change_active_window() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
         let first = app.active_window;
-        let second = app.register_window(vec![PathBuf::from("b")], 0, test_window_placement(160));
+        let second = app.register_window(
+            vec![NavigationLocation::Directory(PathBuf::from("b"))],
+            0,
+            test_window_placement(160),
+        );
         let state = Arc::new(Mutex::new(app));
 
         let projected = WindowSessions::new(state.clone(), second);
@@ -22498,15 +23293,15 @@ mod tests {
             std::env::temp_dir().join(format!("asterfiles-tab-order-{}.bin", std::process::id()));
         let session = session_store::SessionState::new(
             test_window_placement(80),
-            app.stable_active_path_index(),
-            app.stable_paths(),
+            app.stable_active_location_index(),
+            app.stable_locations(),
         )
         .unwrap();
         session_store::save(&temporary, &session).unwrap();
         let restored = session_store::load(&temporary).unwrap();
         std::fs::remove_file(temporary).unwrap();
         assert_eq!(
-            restored.windows[0].tab_paths,
+            restored.windows[0].tab_locations,
             [PathBuf::from("b"), PathBuf::from("c"), PathBuf::from("a")]
         );
         assert_eq!(restored.windows[0].active_tab, 0);
@@ -22550,7 +23345,10 @@ mod tests {
         let second = app.create_tab(PathBuf::from("two"));
         assert_eq!(app.active_window_state().active_tab, second);
         assert_eq!(app.close_tab(TabId(2)), Some(TabId(1)));
-        assert_eq!(app.active().current_path, Some(PathBuf::from("one")));
+        assert_eq!(
+            app.active().current_location,
+            Some(NavigationLocation::Directory(PathBuf::from("one")))
+        );
     }
 
     #[test]
@@ -22562,7 +23360,10 @@ mod tests {
 
         assert_eq!(app.close_tab(second), Some(third));
         assert_eq!(app.active_window_state().active_tab, third);
-        assert_eq!(app.active().current_path, Some(PathBuf::from("three")));
+        assert_eq!(
+            app.active().current_location,
+            Some(NavigationLocation::Directory(PathBuf::from("three")))
+        );
         assert!(!app.active_window_state().tabs.contains_key(&second));
     }
 
@@ -22590,10 +23391,10 @@ mod tests {
 
         app.open_settings();
         assert_eq!(
-            app.stable_paths(),
+            app.stable_locations(),
             [PathBuf::from("one"), PathBuf::from("two")]
         );
-        assert_eq!(app.stable_active_path_index(), 1);
+        assert_eq!(app.stable_active_location_index(), 1);
     }
 
     #[test]
@@ -23067,8 +23868,8 @@ mod tests {
         queue_completed_focus(&mut app, &targets);
         for tab_id in [TabId(1), TabId(2)] {
             let tab = app.active_window_state_mut().tabs.get_mut(&tab_id).unwrap();
-            let (_, cancel) =
-                tab.begin_navigation(PathBuf::from(r"C:\target"), NavigationKind::Refresh);
+            let (_, cancel) = tab
+                .begin_directory_navigation(PathBuf::from(r"C:\target"), NavigationKind::Refresh);
             assert!(!cancel.load(std::sync::atomic::Ordering::Acquire));
             let request_id = tab.latest_request;
             tab.pending_entries = vec![
@@ -23086,6 +23887,8 @@ mod tests {
                     request_id: RequestId(1),
                     path: PathBuf::from(r"C:\target"),
                     skipped: 0,
+                    source_failures: 0,
+                    library: None,
                 },
             );
         }
@@ -23113,6 +23916,8 @@ mod tests {
                 request_id: RequestId(7),
                 path: PathBuf::from(r"C:\target"),
                 skipped: 0,
+                source_failures: 0,
+                library: None,
             },
         );
         assert!(

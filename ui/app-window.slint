@@ -854,6 +854,7 @@ export component AppWindow inherits Window {
     in property <string> operation-error: "";
     in property <bool> context-menu-has-entry: false;
     in-out property <bool> quick-access-expanded: true;
+    in-out property <bool> libraries-expanded: true;
     in-out property <bool> drives-expanded: true;
     in-out property <bool> network-locations-expanded: true;
     in-out property <bool> network-expanded: false;
@@ -957,6 +958,7 @@ export component AppWindow inherits Window {
     in property <string> text-music: "音乐";
     in property <string> text-videos: "视频";
     in property <string> text-quick-access: "快速访问";
+    in property <string> text-libraries: "库";
     in property <string> text-drives: "磁盘";
     in property <string> text-network-locations: "网络位置";
     in property <string> text-network: "网络";
@@ -989,6 +991,7 @@ export component AppWindow inherits Window {
     callback request-folder-access();
 
     callback navigate-sidebar(int);
+    callback navigate-library(string);
     callback navigate-network-location(string);
     callback show-network-location-menu(string, float, float);
     callback toggle-network();
@@ -1475,6 +1478,14 @@ export component AppWindow inherits Window {
                         height: self.visible ? 30px : 0px; border-radius: 5px; background: side-touch.pressed ? VisualStyle.cdde3ed : side-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
                         HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : (location.icon-kind == 0 ? IconMap.location-home : location.icon-kind == 1 ? IconMap.location-desktop : location.icon-kind == 2 ? IconMap.location-downloads : location.icon-kind == 3 ? IconMap.location-documents : location.icon-kind == 4 ? IconMap.location-pictures : location.icon-kind == 5 ? IconMap.location-music : IconMap.location-videos); } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         side-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-sidebar(location.index); } pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.source-kind == 3 { root.show-quick-access-menu(location.stable-id, (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px, (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px); } } }
+                        accessible-role: button; accessible-label: location.label;
+                    }
+                    SidebarGroupHeader { label: root.text-libraries; expanded: root.libraries-expanded; toggled => { root.libraries-expanded = !root.libraries-expanded; } }
+                    for location in root.sidebar-items: Rectangle {
+                        visible: location.group-kind == 4 && root.libraries-expanded;
+                        height: self.visible ? 30px : 0px; border-radius: 5px; background: library-touch.pressed ? VisualStyle.cdde3ed : library-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
+                        HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.file-folder; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
+                        library-touch := TouchArea { mouse-cursor: pointer; clicked => { root.navigate-library(location.stable-id); } }
                         accessible-role: button; accessible-label: location.label;
                     }
                     SidebarGroupHeader { label: root.text-drives; expanded: root.drives-expanded; toggled => { root.drives-expanded = !root.drives-expanded; } }
