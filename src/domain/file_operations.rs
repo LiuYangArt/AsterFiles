@@ -148,8 +148,11 @@ pub struct OperationProgress {
     pub completed_items: usize,
     pub total_files: Option<usize>,
     pub completed_files: usize,
+    pub discovered_files: usize,
     pub processed_bytes: u64,
     pub total_bytes: Option<u64>,
+    pub discovered_bytes: u64,
+    pub scanning_complete: bool,
     pub current_item: Option<PathBuf>,
 }
 
@@ -299,6 +302,9 @@ impl OperationTask {
             execution_round: 1,
             progress: OperationProgress {
                 total_items: items.len(),
+                discovered_files: 0,
+                discovered_bytes: 0,
+                scanning_complete: false,
                 ..Default::default()
             },
             items,
@@ -397,6 +403,9 @@ impl OperationTask {
         self.state = OperationState::Queued;
         self.progress = OperationProgress {
             total_items: retry_count,
+            discovered_files: 0,
+            discovered_bytes: 0,
+            scanning_complete: false,
             ..Default::default()
         };
         self.conflict = None;
@@ -591,6 +600,22 @@ mod tests {
     use super::*;
     fn item(name: &str) -> OperationItem {
         OperationItem::pending(Some(PathBuf::from(name)), None)
+    }
+    #[test]
+    fn issue_61_new_task_starts_with_unknown_scan_totals() {
+        let task = OperationTask::new(
+            OperationId(1),
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![item("a")],
+        );
+
+        assert_eq!(task.progress.discovered_files, 0);
+        assert_eq!(task.progress.discovered_bytes, 0);
+        assert!(!task.progress.scanning_complete);
+        assert_eq!(task.progress.total_files, None);
+        assert_eq!(task.progress.total_bytes, None);
     }
     #[test]
     fn manager_runs_only_one_write_task() {
@@ -892,7 +917,7 @@ mod tests {
         assert!(manager.task(id).unwrap().cancellation.is_cancelled());
     }
     #[test]
-    fn retry_keeps_successes() {
+    fn issue_61_retry_resets_scan_discovery_and_keeps_successes() {
         let mut manager = OperationManager::new();
         let id = manager.submit(
             OperationResource::Local,
@@ -906,6 +931,9 @@ mod tests {
             let task = manager.task_mut(id).unwrap();
             task.items[0].state = ItemState::Succeeded;
             task.items[1].state = ItemState::Failed;
+            task.progress.discovered_files = 3;
+            task.progress.discovered_bytes = 4_096;
+            task.progress.scanning_complete = true;
         }
         manager
             .finish(
@@ -923,6 +951,9 @@ mod tests {
         let task = manager.task(id).unwrap();
         assert_eq!(task.execution_round, 2);
         assert_eq!(task.progress.total_items, 2);
+        assert_eq!(task.progress.discovered_files, 0);
+        assert_eq!(task.progress.discovered_bytes, 0);
+        assert!(!task.progress.scanning_complete);
         assert_eq!(task.items[0].state, ItemState::Succeeded);
         assert_eq!(task.items[1].state, ItemState::Pending);
     }

@@ -11,7 +11,7 @@ export struct TabRow { id: int, title: string, active: bool, loading: bool, icon
 export struct SidebarRow { index: int, stable-id: string, label: string, icon-kind: int, group-kind: int, source-kind: int, is-drive: bool, icon: image }
 export struct ColumnRow { kind: int, label: string, visible: bool, min-width: length, content-left: length, content-right: length, icon-slot: length }
 export struct ContextCommandRow { id: int, node-id: int, label: string, search-text: string, hint: string, enabled: bool, separator: bool, shell: bool, checked: bool, default: bool, submenu: bool, loading: bool, placeholder: bool, icon-kind: int }
-export struct OperationRow { id: int, title: string, percent: string, file-progress: string, transferred: string, speed: string, eta: string, current-item: string, source: string, destination: string, progress: float, state: int, paused: bool, can-pause: bool, can-cancel: bool, can-retry: bool }
+export struct OperationRow { id: int, title: string, percent: string, file-progress: string, transferred: string, speed: string, eta: string, current-item: string, source: string, destination: string, progress: float, progress-known: bool, state: int, paused: bool, can-pause: bool, can-cancel: bool, can-retry: bool }
 export global VisualStyle {
     in-out property <bool> dark-theme: false;
     out property <color> c24252a: dark-theme ? #f2f2f2 : #24252a;
@@ -175,7 +175,7 @@ export component OperationWindow inherits Window {
                             background: VisualStyle.ce0e2e7;
                             Rectangle {
                                 x: 0px;
-                                width: max(0px, min(parent.width, parent.width * operation.progress));
+                                width: operation.progress-known ? max(0px, min(parent.width, parent.width * operation.progress)) : 0px;
                                 height: parent.height;
                                 border-radius: 11px;
                                 background: operation.state == 8 || operation.state == 7 ? #b3261e : VisualStyle.cdce6ff;

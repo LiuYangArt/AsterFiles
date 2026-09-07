@@ -57,6 +57,9 @@ const REBUILT_PROJECTION_BATCH_SIZE: usize = 256;
 const THUMBNAIL_CACHE_CAPACITY: usize = 128;
 const LARGE_ICON_CACHE_CAPACITY: usize = 128;
 const TYPE_SELECT_TIMEOUT: Duration = Duration::from_millis(1_000);
+const OPERATION_PROGRESS_INTERVAL: Duration = Duration::from_millis(125);
+const OPERATION_PROGRESS_BYTES: u64 = 4 * 1024 * 1024;
+const OPERATION_PROGRESS_FILES: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TypeSelectContext {
@@ -1188,6 +1191,24 @@ fn refresh_all_windows(state: &SharedSessions) {
         {
             refresh_window_ui(&ui, state, window_id);
         }
+    }
+}
+
+fn refresh_operation_badges(state: &SharedSessions) {
+    let rows = {
+        let Ok(app) = state.lock() else {
+            return;
+        };
+        operation_rows(&app)
+    };
+    let windows = WINDOW_RUNTIMES.with_borrow(|runtimes| {
+        runtimes
+            .values()
+            .map(|runtime| runtime.ui.clone_strong())
+            .collect::<Vec<_>>()
+    });
+    for ui in windows {
+        ui.set_operations(ModelRc::new(VecModel::from(rows.clone())));
     }
 }
 
@@ -3380,10 +3401,12 @@ enum FileOperationEvent {
         completed_items: usize,
         completed_files: usize,
         total_files: Option<usize>,
+        discovered_files: usize,
         processed_bytes: u64,
         total_bytes: Option<u64>,
+        discovered_bytes: u64,
+        scanning_complete: bool,
         current_item: PathBuf,
-        started: Instant,
     },
     Conflict {
         id: OperationId,
@@ -3396,6 +3419,118 @@ enum FileOperationEvent {
         item_states: Vec<(usize, ItemState, Option<String>)>,
         completed_targets: Vec<PathBuf>,
     },
+}
+
+#[derive(Debug)]
+struct OperationProgressSnapshot {
+    id: OperationId,
+    completed_items: usize,
+    completed_files: usize,
+    total_files: Option<usize>,
+    discovered_files: usize,
+    processed_bytes: u64,
+    total_bytes: Option<u64>,
+    discovered_bytes: u64,
+    scanning_complete: bool,
+    current_item: PathBuf,
+}
+
+#[derive(Debug)]
+struct OperationProgressEmitter<'a> {
+    events: &'a mpsc::Sender<FileOperationEvent>,
+    snapshot: OperationProgressSnapshot,
+    last_sent_at: Instant,
+    last_sent_bytes: u64,
+    last_sent_files: usize,
+}
+
+impl<'a> OperationProgressEmitter<'a> {
+    fn new(
+        events: &'a mpsc::Sender<FileOperationEvent>,
+        snapshot: OperationProgressSnapshot,
+    ) -> Self {
+        let now = Instant::now();
+        let last_sent_at = now.checked_sub(OPERATION_PROGRESS_INTERVAL).unwrap_or(now);
+        Self {
+            events,
+            snapshot,
+            last_sent_at,
+            last_sent_bytes: 0,
+            last_sent_files: 0,
+        }
+    }
+
+    fn discovered(&mut self, bytes: u64, current: &Path) {
+        self.snapshot.discovered_files = self.snapshot.discovered_files.saturating_add(1);
+        self.snapshot.discovered_bytes = self.snapshot.discovered_bytes.saturating_add(bytes);
+        self.snapshot.current_item = current.to_path_buf();
+        self.send_if_due(false);
+    }
+
+    fn advanced(&mut self, bytes: u64, file_completed: bool, current: &Path) {
+        self.snapshot.processed_bytes = self.snapshot.processed_bytes.saturating_add(bytes);
+        if file_completed {
+            self.snapshot.completed_files = self.snapshot.completed_files.saturating_add(1);
+        }
+        self.snapshot.current_item = current.to_path_buf();
+        self.send_if_due(false);
+    }
+
+    fn finish_scan(&mut self) {
+        self.snapshot.scanning_complete = true;
+        self.snapshot.total_files = Some(self.snapshot.discovered_files);
+        self.snapshot.total_bytes = Some(self.snapshot.discovered_bytes);
+        self.send_if_due(true);
+    }
+
+    fn complete_item(&mut self, completed_items: usize, current: PathBuf) {
+        self.snapshot.completed_items = completed_items;
+        self.snapshot.current_item = current;
+        self.send_if_due(false);
+    }
+
+    fn flush(&mut self) {
+        self.send_if_due(true);
+    }
+
+    fn send_if_due(&mut self, force: bool) {
+        let now = Instant::now();
+        let byte_delta = self
+            .snapshot
+            .processed_bytes
+            .saturating_sub(self.last_sent_bytes);
+        let file_delta = self
+            .snapshot
+            .completed_files
+            .max(self.snapshot.discovered_files)
+            .saturating_sub(self.last_sent_files);
+        if !force {
+            let elapsed = now.saturating_duration_since(self.last_sent_at);
+            if elapsed < OPERATION_PROGRESS_INTERVAL
+                || (byte_delta < OPERATION_PROGRESS_BYTES && file_delta < OPERATION_PROGRESS_FILES)
+            {
+                return;
+            }
+        }
+        let _ = self.events.send(FileOperationEvent::Progress {
+            id: self.snapshot.id,
+            completed_items: self.snapshot.completed_items,
+            completed_files: self.snapshot.completed_files,
+            total_files: self.snapshot.total_files,
+            discovered_files: self.snapshot.discovered_files,
+            processed_bytes: self.snapshot.processed_bytes,
+            total_bytes: self.snapshot.total_bytes,
+            discovered_bytes: self.snapshot.discovered_bytes,
+            scanning_complete: self.snapshot.scanning_complete,
+            current_item: self.snapshot.current_item.clone(),
+        });
+        self.last_sent_at = now;
+        self.last_sent_bytes = self.snapshot.processed_bytes;
+        self.last_sent_files = self
+            .snapshot
+            .completed_files
+            .max(self.snapshot.discovered_files);
+    }
 }
 
 #[derive(Debug)]
@@ -4963,6 +5098,7 @@ fn enqueue_operation(
                 Some(request)
             })
     };
+    refresh_operation_badges(state);
     if let Some(request) = request {
         let _ = sender.send(request);
     }
@@ -14216,8 +14352,8 @@ fn wire_operation_window(
                 });
             }
         }
-        refresh_all_windows(&state_for_cancel);
         if let Some(operation_ui) = operation_weak.upgrade() {
+            refresh_operation_window(&operation_ui, &state_for_cancel);
             let _ = operation_ui.hide();
         }
     });
@@ -14234,7 +14370,6 @@ fn wire_operation_window(
                 ));
             }
         }
-        refresh_all_windows(&state_for_pause);
         if let Some(operation_ui) = operation_weak.upgrade() {
             refresh_operation_window(&operation_ui, &state_for_pause);
         }
@@ -14275,7 +14410,7 @@ fn wire_operation_window(
                 .map(|mut app| app.operations.prune_transient(Duration::ZERO))
                 .unwrap_or_default();
             if removed > 0 {
-                refresh_all_windows(&state_for_auto_open);
+                refresh_operation_badges(&state_for_auto_open);
                 refresh_operation_window(&operation_ui, &state_for_auto_open);
             }
             let should_open = state_for_auto_open
@@ -14330,10 +14465,9 @@ fn position_operation_window_next_to_main(ui: &AppWindow, operation_ui: &Operati
 }
 
 fn refresh_operation_window(ui: &OperationWindow, state: &SharedSessions) {
-    let Ok(mut app) = state.lock() else {
+    let Ok(app) = state.lock() else {
         return;
     };
-    app.operations.prune_transient(Duration::ZERO);
     ui.set_operations(ModelRc::new(VecModel::from(operation_rows(&app))));
     ui.set_dark_theme(app.dark_theme());
     let (title, cancel, retry, pause, resume, empty, minimize, close) = match app.language {
@@ -14400,6 +14534,7 @@ fn refresh_debug_operation_window(ui: &OperationWindow, state: &SharedSessions) 
         can_pause: false,
         can_cancel: false,
         can_retry: false,
+        progress_known: true,
     }])));
 }
 
@@ -15339,47 +15474,35 @@ fn execute_file_operation_request(
     let mut affected = Vec::new();
     let mut indexed_states = Vec::new();
     let mut completed_targets = Vec::new();
-    let started = Instant::now();
-    let totals = (request.resource == OperationResource::Local)
-        .then(|| {
-            request
-                .items
-                .iter()
-                .filter(|item| item.state == ItemState::Pending)
-                .filter_map(|item| item.source.as_deref())
-                .try_fold((0_u64, 0_usize), |(bytes, files), path| {
-                    tree_totals(path, &request.cancellation).map(|(next_bytes, next_files)| {
-                        (
-                            bytes.saturating_add(next_bytes),
-                            files.saturating_add(next_files),
-                        )
-                    })
-                })
-        })
-        .flatten();
-    let (total_bytes, total_files) = totals
-        .map(|(bytes, files)| (Some(bytes), Some(files)))
-        .unwrap_or((None, None));
-    let _ = event_sender.send(FileOperationEvent::Progress {
-        id: request.id,
-        completed_items: 0,
-        completed_files: 0,
-        total_files,
-        processed_bytes: 0,
-        total_bytes,
-        current_item: request
-            .items
-            .first()
-            .and_then(|item| item.source.clone().or_else(|| item.destination.clone()))
-            .unwrap_or_default(),
-        started,
-    });
+    let current_item = request
+        .items
+        .first()
+        .and_then(|item| item.source.clone().or_else(|| item.destination.clone()))
+        .unwrap_or_default();
+    let copy_or_move = matches!(
+        request.kind,
+        FileOperationKind::Copy | FileOperationKind::Move
+    );
+    let mut progress = OperationProgressEmitter::new(
+        event_sender,
+        OperationProgressSnapshot {
+            id: request.id,
+            completed_items: 0,
+            completed_files: 0,
+            total_files: (!copy_or_move).then_some(request.items.len()),
+            discovered_files: 0,
+            processed_bytes: 0,
+            total_bytes: (!copy_or_move).then_some(0),
+            discovered_bytes: 0,
+            scanning_complete: !copy_or_move,
+            current_item,
+        },
+    );
+    progress.flush();
     if request.kind == FileOperationKind::RecycleDelete {
-        execute_recycle_delete_request(request, event_sender, started);
+        execute_recycle_delete_request(request, event_sender);
         return;
     }
-    let mut processed_bytes = 0_u64;
-    let mut processed_files = 0_usize;
     let mut conflict_defaults = HashMap::new();
     for (item_index, item) in request.items.iter().enumerate() {
         if item.state != ItemState::Pending {
@@ -15407,19 +15530,12 @@ fn execute_file_operation_request(
             item,
             &request.cancellation,
             event_sender,
-            item_index,
-            processed_bytes,
-            processed_files,
-            total_bytes,
-            total_files,
-            started,
+            &mut progress,
             &mut conflict_defaults,
             conflict_gate,
         );
         match outcome {
             Ok(report) => {
-                processed_bytes = processed_bytes.saturating_add(report.bytes);
-                processed_files = processed_files.saturating_add(report.files);
                 if report.skipped.is_empty()
                     && let Some(target) = completed_target_for_item(
                         item,
@@ -15435,16 +15551,7 @@ fn execute_file_operation_request(
                     .clone()
                     .or_else(|| item.destination.clone())
                     .unwrap_or_default();
-                let _ = event_sender.send(FileOperationEvent::Progress {
-                    id: request.id,
-                    completed_items: item_index + 1,
-                    completed_files: processed_files,
-                    total_files,
-                    processed_bytes,
-                    total_bytes,
-                    current_item,
-                    started,
-                });
+                progress.complete_item(item_index + 1, current_item);
                 let identity = item
                     .destination
                     .clone()
@@ -15478,6 +15585,11 @@ fn execute_file_operation_request(
             }
         }
     }
+    if copy_or_move {
+        progress.finish_scan();
+    } else {
+        progress.flush();
+    }
     let _ = event_sender.send(FileOperationEvent::Finished {
         id: request.id,
         result: OperationResult {
@@ -15494,7 +15606,6 @@ fn execute_file_operation_request(
 fn execute_recycle_delete_request(
     request: FileOperationRequest,
     event_sender: &mpsc::Sender<FileOperationEvent>,
-    started: Instant,
 ) {
     let pending = request
         .items
@@ -15556,10 +15667,12 @@ fn execute_recycle_delete_request(
             completed_items: index + 1,
             completed_files: succeeded.len(),
             total_files: Some(paths.len()),
+            discovered_files: paths.len(),
             processed_bytes: 0,
             total_bytes: Some(0),
+            discovered_bytes: 0,
+            scanning_complete: true,
             current_item: path,
-            started,
         });
     }
     let _ = event_sender.send(FileOperationEvent::Finished {
@@ -15574,31 +15687,6 @@ fn execute_recycle_delete_request(
         completed_targets: Vec::new(),
     });
 }
-fn tree_totals(
-    path: &Path,
-    cancellation: &crate::domain::file_operations::CancellationToken,
-) -> Option<(u64, usize)> {
-    cancellation.wait_if_paused();
-    if cancellation.is_cancelled() {
-        return None;
-    }
-    let metadata = std::fs::symlink_metadata(path).ok()?;
-    if metadata.file_type().is_symlink() {
-        return Some((0, 1));
-    }
-    if metadata.is_file() {
-        return Some((metadata.len(), 1));
-    }
-    let mut total_bytes = 0_u64;
-    let mut total_files = 0_usize;
-    for entry in std::fs::read_dir(path).ok()? {
-        let (bytes, files) = tree_totals(&entry.ok()?.path(), cancellation)?;
-        total_bytes = total_bytes.saturating_add(bytes);
-        total_files = total_files.saturating_add(files);
-    }
-    Some((total_bytes, total_files))
-}
-
 fn file_snapshot(path: &Path) -> crate::domain::file_operations::FileSnapshot {
     let metadata = std::fs::symlink_metadata(path).ok();
     crate::domain::file_operations::FileSnapshot {
@@ -15621,12 +15709,7 @@ fn execute_file_operation_item(
     item: &OperationItem,
     cancel: &crate::domain::file_operations::CancellationToken,
     events: &mpsc::Sender<FileOperationEvent>,
-    completed_items: usize,
-    base_processed_bytes: u64,
-    base_processed_files: usize,
-    operation_total_bytes: Option<u64>,
-    operation_total_files: Option<usize>,
-    started: Instant,
+    progress_emitter: &mut OperationProgressEmitter<'_>,
     conflict_defaults: &mut HashMap<
         crate::domain::file_operations::ConflictCategory,
         crate::domain::file_operations::ConflictAction,
@@ -15749,23 +15832,14 @@ fn execute_file_operation_item(
         FileOperationKind::Copy | FileOperationKind::Move => {
             let source = item.source.as_ref().ok_or("missing source")?;
             let destination = item.destination.as_ref().ok_or("missing destination")?;
-            let mut processed = base_processed_bytes;
-            let mut completed_files = base_processed_files;
+            let progress_emitter = RefCell::new(progress_emitter);
             let mut progress = |bytes, file_completed, current: &Path| {
-                processed = processed.saturating_add(bytes);
-                if file_completed {
-                    completed_files = completed_files.saturating_add(1);
-                }
-                let _ = events.send(FileOperationEvent::Progress {
-                    id,
-                    completed_items,
-                    completed_files,
-                    total_files: operation_total_files,
-                    processed_bytes: processed,
-                    total_bytes: operation_total_bytes,
-                    current_item: current.to_path_buf(),
-                    started,
-                });
+                progress_emitter
+                    .borrow_mut()
+                    .advanced(bytes, file_completed, current);
+            };
+            let mut discovered = |bytes, current: &Path| {
+                progress_emitter.borrow_mut().discovered(bytes, current);
             };
             let mut root_destination_reported = false;
             let result = if kind == FileOperationKind::Copy {
@@ -15774,6 +15848,7 @@ fn execute_file_operation_item(
                     destination,
                     cancel,
                     replace,
+                    &mut discovered,
                     &mut progress,
                     &mut |path| {
                         if !root_destination_reported {
@@ -15791,6 +15866,7 @@ fn execute_file_operation_item(
                     destination,
                     cancel,
                     replace,
+                    &mut discovered,
                     &mut progress,
                 )
             };
@@ -15900,10 +15976,12 @@ fn start_file_operation_event_pump(
                         completed_items,
                         completed_files,
                         total_files,
+                        discovered_files,
                         processed_bytes,
                         total_bytes,
+                        discovered_bytes,
+                        scanning_complete,
                         current_item,
-                        started,
                     } => {
                         if let Ok(mut app) = state.lock()
                             && let Some(task) = app.operations.task_mut(id)
@@ -15911,10 +15989,12 @@ fn start_file_operation_event_pump(
                             task.progress.completed_items = completed_items;
                             task.progress.completed_files = completed_files;
                             task.progress.total_files = total_files;
+                            task.progress.discovered_files = discovered_files;
                             task.progress.processed_bytes = processed_bytes;
                             task.progress.total_bytes = total_bytes;
+                            task.progress.discovered_bytes = discovered_bytes;
+                            task.progress.scanning_complete = scanning_complete;
                             task.progress.current_item = Some(current_item);
-                            let _elapsed = started.elapsed();
                         }
                     }
                     FileOperationEvent::Conflict {
@@ -16051,6 +16131,7 @@ fn start_file_operation_event_pump(
                         if let Some(request) = next {
                             let _ = sender.send(request);
                         }
+                        refresh_operation_badges(&state);
                         refresh_affected_tabs(
                             &directory_sender,
                             &network_directory_sender,
@@ -16089,7 +16170,6 @@ fn start_file_operation_event_pump(
                         ui.set_rename_submit_generation(ui.get_rename_submit_generation() + 1);
                     }
                 }
-                refresh_all_windows(&state);
                 if state
                     .lock()
                     .is_ok_and(|app| app.exit_after_cancel && !app.operations.has_active_tasks())
@@ -19420,62 +19500,76 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
                 (Language::English, FileOperationKind::PermanentDelete) => "Deleting",
                 (Language::English, FileOperationKind::FastRemove) => "Deleting",
             };
-            let progress = task
-                .progress
-                .total_bytes
-                .filter(|total| *total > 0)
-                .map(|total| task.progress.processed_bytes as f32 / total as f32)
-                .unwrap_or_else(|| {
-                    if task.items.is_empty() {
-                        0.0
-                    } else {
-                        completed as f32 / task.items.len() as f32
-                    }
-                });
-            let (transferred, speed_text, eta_text) = task
-                .progress
-                .total_bytes
-                .filter(|total| *total > 0)
-                .map(|total| {
-                    let elapsed = task
-                        .cancellation
-                        .active_elapsed(task.started_at)
-                        .as_secs_f64()
-                        .max(0.001);
-                    let speed = task.progress.processed_bytes as f64 / elapsed;
-                    let remaining = total.saturating_sub(task.progress.processed_bytes);
-                    let eta = if speed > 0.0 {
-                        remaining as f64 / speed
-                    } else {
-                        0.0
-                    };
-                    (
-                        format!(
-                            "{:.1} / {:.1} MB",
-                            task.progress.processed_bytes as f64 / 1_048_576.0,
-                            total as f64 / 1_048_576.0
-                        ),
-                        if task.state == OperationState::Paused {
-                            match app.language {
-                                Language::Chinese => "已暂停".to_owned(),
-                                Language::English => "Paused".to_owned(),
-                            }
+            let progress_known = task.progress.scanning_complete;
+            let progress = if progress_known {
+                task.progress
+                    .total_bytes
+                    .filter(|total| *total > 0)
+                    .map(|total| task.progress.processed_bytes as f32 / total as f32)
+                    .unwrap_or_else(|| {
+                        if task.items.is_empty() {
+                            0.0
                         } else {
-                            format!("{:.1} MB/s", speed / 1_048_576.0)
-                        },
-                        match (app.language, task.state == OperationState::Paused) {
-                            (_, true) => "—".to_owned(),
-                            (language, false) => format_remaining_time(language, eta),
-                        },
-                    )
-                })
-                .unwrap_or_else(|| {
-                    (
-                        format!("{completed}/{}", task.items.len()),
-                        String::new(),
-                        String::new(),
-                    )
-                });
+                            completed as f32 / task.items.len() as f32
+                        }
+                    })
+            } else {
+                0.0
+            };
+            let (transferred, speed_text, eta_text) = if progress_known {
+                task.progress
+                    .total_bytes
+                    .filter(|total| *total > 0)
+                    .map(|total| {
+                        let elapsed = task
+                            .cancellation
+                            .active_elapsed(task.started_at)
+                            .as_secs_f64()
+                            .max(0.001);
+                        let speed = task.progress.processed_bytes as f64 / elapsed;
+                        let remaining = total.saturating_sub(task.progress.processed_bytes);
+                        let eta = if speed > 0.0 {
+                            remaining as f64 / speed
+                        } else {
+                            0.0
+                        };
+                        (
+                            format!(
+                                "{:.1} / {:.1} MB",
+                                task.progress.processed_bytes as f64 / 1_048_576.0,
+                                total as f64 / 1_048_576.0
+                            ),
+                            if task.state == OperationState::Paused {
+                                match app.language {
+                                    Language::Chinese => "已暂停".to_owned(),
+                                    Language::English => "Paused".to_owned(),
+                                }
+                            } else {
+                                format!("{:.1} MB/s", speed / 1_048_576.0)
+                            },
+                            match (app.language, task.state == OperationState::Paused) {
+                                (_, true) => "—".to_owned(),
+                                (language, false) => format_remaining_time(language, eta),
+                            },
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        (
+                            format!("{completed}/{}", task.items.len()),
+                            String::new(),
+                            String::new(),
+                        )
+                    })
+            } else {
+                (
+                    format!(
+                        "{:.1} MB",
+                        task.progress.processed_bytes as f64 / 1_048_576.0
+                    ),
+                    String::new(),
+                    String::new(),
+                )
+            };
             let source = task
                 .items
                 .first()
@@ -19492,14 +19586,23 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
             OperationRow {
                 id: task.id.0 as i32,
                 title: title.into(),
-                percent: format!("{:.0}%", (progress * 100.0).clamp(0.0, 100.0)).into(),
+                percent: if progress_known {
+                    format!("{:.0}%", (progress * 100.0).clamp(0.0, 100.0))
+                } else {
+                    String::new()
+                }
+                .into(),
                 file_progress: task
                     .progress
                     .total_files
                     .map(|total| format!("{} / {total}", task.progress.completed_files.min(total)))
                     .unwrap_or_else(|| match app.language {
-                        Language::Chinese => "正在准备…".to_owned(),
-                        Language::English => "Preparing…".to_owned(),
+                        Language::Chinese => {
+                            format!("正在扫描 · 已处理 {} 项", task.progress.completed_files)
+                        }
+                        Language::English => {
+                            format!("Scanning · {} processed", task.progress.completed_files)
+                        }
                     })
                     .into(),
                 transferred: transferred.into(),
@@ -19517,6 +19620,7 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
                     .unwrap_or_default()
                     .into(),
                 progress,
+                progress_known,
                 state: operation_state_index(task.state),
                 can_cancel: matches!(
                     task.state,
@@ -21126,6 +21230,202 @@ fn initial_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue_61_progress_emitter_coalesces_and_flushes_scan_completion() {
+        let (sender, receiver) = mpsc::channel();
+        let mut emitter = OperationProgressEmitter::new(
+            &sender,
+            OperationProgressSnapshot {
+                id: OperationId(61),
+                completed_items: 0,
+                completed_files: 0,
+                total_files: None,
+                discovered_files: 0,
+                processed_bytes: 0,
+                total_bytes: None,
+                discovered_bytes: 0,
+                scanning_complete: false,
+                current_item: PathBuf::new(),
+            },
+        );
+
+        emitter.flush();
+        for index in 0..32 {
+            let path = PathBuf::from(format!("file-{index}"));
+            emitter.discovered(1, &path);
+            emitter.advanced(1, true, &path);
+        }
+        assert_eq!(receiver.try_iter().count(), 1);
+
+        emitter.last_sent_at = Instant::now() - OPERATION_PROGRESS_INTERVAL;
+        emitter.advanced(OPERATION_PROGRESS_BYTES, false, Path::new("large.bin"));
+        assert_eq!(receiver.try_iter().count(), 1);
+
+        emitter.finish_scan();
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        let FileOperationEvent::Progress {
+            completed_files,
+            total_files,
+            discovered_files,
+            total_bytes,
+            scanning_complete,
+            ..
+        } = &events[0]
+        else {
+            panic!("scan completion must flush progress");
+        };
+        assert_eq!(*completed_files, 32);
+        assert_eq!(*discovered_files, 32);
+        assert_eq!(*total_files, Some(32));
+        assert_eq!(*total_bytes, Some(32));
+        assert!(*scanning_complete);
+    }
+
+    #[test]
+    #[ignore = "explicit 100k-file performance evidence"]
+    fn issue_61_100k_small_files_performance_evidence() {
+        use std::{cell::RefCell, fs};
+
+        let artifact_dir = PathBuf::from("artifacts/perf/file-operations");
+        fs::create_dir_all(&artifact_dir).unwrap();
+        let fixture =
+            std::env::temp_dir().join(format!("asterfiles-issue-61-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&fixture);
+        let _fixture_cleanup = FixtureCleanup(fixture.clone());
+        let source = fixture.join("source");
+        let destination = fixture.join("destination");
+        fs::create_dir_all(&source).unwrap();
+        for directory in 0..500_u32 {
+            let parent = source.join(format!("d-{directory:03}"));
+            fs::create_dir(&parent).unwrap();
+            for file in 0..200_u32 {
+                fs::File::create(parent.join(format!("f-{file:04}.txt"))).unwrap();
+            }
+        }
+
+        let started = Instant::now();
+        let first_copy_started = RefCell::new(None);
+        let raw_progress_events = RefCell::new(0_u64);
+        let discovered_files = RefCell::new(0_usize);
+        let discovered_bytes = RefCell::new(0_u64);
+        let (sender, receiver) = mpsc::channel();
+        let emitter = RefCell::new(OperationProgressEmitter::new(
+            &sender,
+            OperationProgressSnapshot {
+                id: OperationId(61),
+                completed_items: 0,
+                completed_files: 0,
+                total_files: None,
+                discovered_files: 0,
+                processed_bytes: 0,
+                total_bytes: None,
+                discovered_bytes: 0,
+                scanning_complete: false,
+                current_item: source.clone(),
+            },
+        ));
+        emitter.borrow_mut().flush();
+        let cpu_started = process_cpu_millis();
+        crate::fs::file_operations::copy_path_with_progress(
+            &source,
+            &destination,
+            &crate::domain::file_operations::CancellationToken::new(),
+            &mut |_, _, _| crate::domain::file_operations::ConflictAction::Replace,
+            &mut |bytes, path| {
+                *discovered_files.borrow_mut() += 1;
+                *discovered_bytes.borrow_mut() += bytes;
+                emitter.borrow_mut().discovered(bytes, path);
+            },
+            &mut |bytes, completed, path| {
+                *raw_progress_events.borrow_mut() += 1;
+                if completed && first_copy_started.borrow().is_none() {
+                    *first_copy_started.borrow_mut() = Some(started.elapsed());
+                }
+                emitter.borrow_mut().advanced(bytes, completed, path);
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+        let scan_finished = started.elapsed();
+        emitter.borrow_mut().finish_scan();
+        let total_elapsed = started.elapsed();
+        let committed_progress_events = receiver.try_iter().count();
+        let cpu_millis = process_cpu_millis().saturating_sub(cpu_started);
+        let first_copy_started = first_copy_started.borrow().unwrap();
+        assert_eq!(*discovered_files.borrow(), 100_000);
+        assert_eq!(*discovered_bytes.borrow(), 0);
+        assert!(first_copy_started < scan_finished);
+        assert_eq!(destination.read_dir().unwrap().count(), 500);
+
+        fs::write(
+            artifact_dir.join("100k-small-files.json"),
+            format!(
+                concat!(
+                    "{{\n",
+                    "  \"schema_version\": 1,\n",
+                    "  \"issue\": 61,\n",
+                    "  \"fixture_file_count\": 100000,\n",
+                    "  \"first_copy_started_ms\": {},\n",
+                    "  \"scan_finished_ms\": {},\n",
+                    "  \"total_elapsed_ms\": {},\n",
+                    "  \"raw_progress_events\": {},\n",
+                    "  \"committed_progress_events\": {},\n",
+                    "  \"task_center_model_refreshes\": {},\n",
+                    "  \"other_window_model_refreshes\": 0,\n",
+                    "  \"cpu_millis\": {}\n",
+                    "}}\n"
+                ),
+                first_copy_started.as_millis(),
+                scan_finished.as_millis(),
+                total_elapsed.as_millis(),
+                *raw_progress_events.borrow(),
+                committed_progress_events,
+                committed_progress_events,
+                cpu_millis,
+            ),
+        )
+        .unwrap();
+    }
+
+    struct FixtureCleanup(PathBuf);
+
+    impl Drop for FixtureCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(windows)]
+    fn process_cpu_millis() -> u64 {
+        use windows_sys::Win32::{
+            Foundation::FILETIME,
+            System::Threading::{GetCurrentProcess, GetProcessTimes},
+        };
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        unsafe {
+            GetProcessTimes(
+                GetCurrentProcess(),
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            );
+        }
+        let ticks = |value: FILETIME| {
+            (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime)
+        };
+        ticks(kernel).saturating_add(ticks(user)) / 10_000
+    }
+
+    #[cfg(not(windows))]
+    fn process_cpu_millis() -> u64 {
+        0
+    }
 
     fn test_library(
         identity: &str,

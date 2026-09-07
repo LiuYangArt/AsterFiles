@@ -142,3 +142,19 @@ cargo run -- --agent-scenario file-operation-partial --no-ui
 ```
 
 统一验证把结果写入 `artifacts/state/file-operations/`。稳定状态名分别为 `running`、`waiting_conflict` 和 `partially_completed`，用于任务中心、冲突等待与部分完成回归检查。
+
+## Issue #61 大目录复制流水线
+
+专项无界面测试运行：
+
+```powershell
+cargo test issue_61_
+```
+
+测试使用临时目录或内存事件，不启动 AsterFiles 窗口。验证内容包括：扫描未完成时总文件数与总字节数保持未知且不生成百分比；发现数量单调增长并只计一次；首个文件在扫描终态前开始复制；稳定进度按时间与累计字节或文件门槛合并到约 5–10 Hz；完成、失败、冲突、暂停、继续、取消和扫描终态立即提交；暂停与取消能在扫描、文件和块边界生效；普通进度只更新任务中心，不重建其他主窗口模型。
+
+10 万小文件场景属于显式人工性能测量，不进入日常测试和统一验证，也不由 Agent 操作应用界面。测量结果写入 `artifacts/perf/file-operations/`，至少记录首个复制开始时间、扫描完成时间、总耗时、原始进度事件数、任务中心模型提交数、主窗口目录模型刷新数和进程 CPU 时间；证据应能判断复制是否早于整树扫描完成、持续进度是否保持设计频率，以及普通进度是否造成无关窗口刷新。
+
+```powershell
+cargo test app::tests::issue_61_100k_small_files_performance_evidence -- --ignored --exact
+```

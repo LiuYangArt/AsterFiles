@@ -181,6 +181,7 @@ pub fn rename_path(source: &Path, new_name: &OsStr) -> Result<PathBuf, Operation
 }
 
 pub type FileProgressCallback<'a> = dyn FnMut(u64, bool, &Path) + 'a;
+pub type FileDiscoveredCallback<'a> = dyn FnMut(u64, &Path) + 'a;
 pub type DestinationCreatedCallback<'a> = dyn FnMut(&Path) + 'a;
 
 pub fn copy_path_with_progress(
@@ -188,6 +189,7 @@ pub fn copy_path_with_progress(
     destination: &Path,
     cancel: &CancellationToken,
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
+    discovered: &mut FileDiscoveredCallback<'_>,
     progress: &mut FileProgressCallback<'_>,
     destination_created: &mut DestinationCreatedCallback<'_>,
 ) -> Result<FileOperationReport, OperationError> {
@@ -201,6 +203,7 @@ pub fn copy_path_with_progress(
         destination,
         cancel,
         resolve_conflict,
+        discovered,
         progress,
         destination_created,
         &mut report,
@@ -213,7 +216,29 @@ pub fn move_path_with_progress(
     destination: &Path,
     cancel: &CancellationToken,
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
+    discovered: &mut FileDiscoveredCallback<'_>,
     progress: &mut FileProgressCallback<'_>,
+) -> Result<FileOperationReport, OperationError> {
+    move_path_with_progress_inner(
+        source,
+        destination,
+        cancel,
+        resolve_conflict,
+        discovered,
+        progress,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn move_path_with_progress_inner(
+    source: &Path,
+    destination: &Path,
+    cancel: &CancellationToken,
+    resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
+    discovered: &mut FileDiscoveredCallback<'_>,
+    progress: &mut FileProgressCallback<'_>,
+    discover_source: bool,
 ) -> Result<FileOperationReport, OperationError> {
     if source == destination {
         let mut report = FileOperationReport::new();
@@ -238,6 +263,9 @@ pub fn move_path_with_progress(
     }
     let source_metadata =
         fs::symlink_metadata(source).map_err(|error| OperationError::io(source, error))?;
+    if discover_source && !source_metadata.file_type().is_dir() {
+        discovered(discovered_size(&source_metadata), source);
+    }
     let destination_metadata = fs::symlink_metadata(destination).ok();
     if source_metadata.file_type().is_dir()
         && destination_metadata
@@ -250,6 +278,7 @@ pub fn move_path_with_progress(
             destination,
             cancel,
             resolve_conflict,
+            discovered,
             progress,
             &mut report,
         )?;
@@ -287,6 +316,7 @@ pub fn move_path_with_progress(
         &resolution,
         cancel,
         resolve_conflict,
+        discovered,
         progress,
         &mut |_| {},
         &mut report,
@@ -341,11 +371,13 @@ struct DestinationResolution {
     replace_existing: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn copy_entry(
     source: &Path,
     destination: &Path,
     cancel: &CancellationToken,
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
+    discovered: &mut FileDiscoveredCallback<'_>,
     progress: &mut FileProgressCallback<'_>,
     destination_created: &mut DestinationCreatedCallback<'_>,
     report: &mut FileOperationReport,
@@ -353,6 +385,9 @@ fn copy_entry(
     check_cancel(cancel)?;
     let source_metadata =
         fs::symlink_metadata(source).map_err(|error| OperationError::io(source, error))?;
+    if !source_metadata.file_type().is_dir() {
+        discovered(discovered_size(&source_metadata), source);
+    }
     let resolution =
         match resolve_destination(source, destination, &source_metadata, resolve_conflict) {
             Ok(resolution) => resolution,
@@ -367,17 +402,20 @@ fn copy_entry(
         &resolution,
         cancel,
         resolve_conflict,
+        discovered,
         progress,
         destination_created,
         report,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn copy_resolved_entry(
     source: &Path,
     resolution: &DestinationResolution,
     cancel: &CancellationToken,
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
+    discovered: &mut FileDiscoveredCallback<'_>,
     progress: &mut FileProgressCallback<'_>,
     destination_created: &mut DestinationCreatedCallback<'_>,
     report: &mut FileOperationReport,
@@ -405,6 +443,7 @@ fn copy_resolved_entry(
                 &resolution.path,
                 cancel,
                 resolve_conflict,
+                discovered,
                 progress,
                 destination_created,
                 report,
@@ -415,6 +454,7 @@ fn copy_resolved_entry(
             &resolution.path,
             cancel,
             resolve_conflict,
+            discovered,
             progress,
             destination_created,
             report,
@@ -432,11 +472,13 @@ fn copy_resolved_entry(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn copy_directory(
     source: &Path,
     destination: &Path,
     cancel: &CancellationToken,
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
+    discovered: &mut FileDiscoveredCallback<'_>,
     progress: &mut FileProgressCallback<'_>,
     destination_created: &mut DestinationCreatedCallback<'_>,
     report: &mut FileOperationReport,
@@ -455,6 +497,7 @@ fn copy_directory(
             &destination.join(entry.file_name()),
             cancel,
             resolve_conflict,
+            discovered,
             progress,
             destination_created,
             report,
@@ -463,11 +506,13 @@ fn copy_directory(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replace_directory_safely(
     source: &Path,
     destination: &Path,
     cancel: &CancellationToken,
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
+    discovered: &mut FileDiscoveredCallback<'_>,
     progress: &mut FileProgressCallback<'_>,
     destination_created: &mut DestinationCreatedCallback<'_>,
     report: &mut FileOperationReport,
@@ -478,6 +523,7 @@ fn replace_directory_safely(
         &temporary,
         cancel,
         resolve_conflict,
+        discovered,
         progress,
         destination_created,
         report,
@@ -498,6 +544,7 @@ fn move_directory_merged(
     destination: &Path,
     cancel: &CancellationToken,
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
+    discovered: &mut FileDiscoveredCallback<'_>,
     progress: &mut FileProgressCallback<'_>,
     report: &mut FileOperationReport,
 ) -> Result<(), OperationError> {
@@ -506,30 +553,34 @@ fn move_directory_merged(
         let entry = entry.map_err(|error| OperationError::io(source, error))?;
         let source_child = entry.path();
         let destination_child = destination.join(entry.file_name());
-        if path_exists(&destination_child) {
-            let metadata = fs::symlink_metadata(&source_child)
-                .map_err(|error| OperationError::io(&source_child, error))?;
-            if metadata.file_type().is_dir()
-                && fs::symlink_metadata(&destination_child)
-                    .is_ok_and(|item| item.file_type().is_dir())
-            {
-                move_directory_merged(
-                    &source_child,
-                    &destination_child,
-                    cancel,
-                    resolve_conflict,
-                    progress,
-                    report,
-                )?;
-                continue;
-            }
+        let source_metadata = fs::symlink_metadata(&source_child)
+            .map_err(|error| OperationError::io(&source_child, error))?;
+        if !source_metadata.file_type().is_dir() {
+            discovered(discovered_size(&source_metadata), &source_child);
         }
-        match move_path_with_progress(
+        if path_exists(&destination_child)
+            && source_metadata.file_type().is_dir()
+            && fs::symlink_metadata(&destination_child).is_ok_and(|item| item.file_type().is_dir())
+        {
+            move_directory_merged(
+                &source_child,
+                &destination_child,
+                cancel,
+                resolve_conflict,
+                discovered,
+                progress,
+                report,
+            )?;
+            continue;
+        }
+        match move_path_with_progress_inner(
             &source_child,
             &destination_child,
             cancel,
             resolve_conflict,
+            discovered,
             progress,
+            false,
         ) {
             Ok(child_report) => merge_report(report, child_report),
             Err(OperationError::ConflictSkipped(_)) => report.skipped.push(source_child),
@@ -545,6 +596,14 @@ fn move_directory_merged(
         report.directories += 1;
     }
     Ok(())
+}
+
+fn discovered_size(metadata: &fs::Metadata) -> u64 {
+    if metadata.file_type().is_file() {
+        metadata.len()
+    } else {
+        0
+    }
 }
 
 fn merge_report(report: &mut FileOperationReport, child: FileOperationReport) {
@@ -884,6 +943,7 @@ mod tests {
             destination,
             cancel,
             resolve_conflict,
+            &mut |_, _| {},
             &mut |_, _, _| {},
             &mut |_| {},
         )
@@ -899,6 +959,7 @@ mod tests {
             destination,
             cancel,
             resolve_conflict,
+            &mut |_, _| {},
             &mut |_, _, _| {},
         )
     }
@@ -1135,6 +1196,7 @@ mod tests {
             &destination,
             &cancel,
             &mut replace,
+            &mut |_, _| {},
             &mut move |_, _, _| cancel_after_first_chunk.cancel(),
             &mut |_| {},
         );
@@ -1158,6 +1220,7 @@ mod tests {
             &destination,
             &cancel,
             &mut replace,
+            &mut |_, _| {},
             &mut move |_, _, _| cancel_after_first_chunk.cancel(),
         );
         assert_eq!(result, Err(OperationError::Cancelled));
@@ -1179,6 +1242,7 @@ mod tests {
             &destination,
             &CancellationToken::new(),
             &mut replace,
+            &mut |_, _| {},
             &mut |bytes, completed, _| {
                 if bytes > 0 && !completed {
                     increments.push(bytes);
@@ -1191,6 +1255,171 @@ mod tests {
         assert_eq!(report.bytes, (COPY_BUFFER_SIZE + 17) as u64);
         assert_eq!(increments, vec![COPY_BUFFER_SIZE as u64, 17]);
         assert!(temporary_siblings(temp.path()).is_empty());
+    }
+
+    #[test]
+    fn issue_61_discovers_each_file_before_completion() {
+        use std::cell::RefCell;
+
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        write(&source.join("first.txt"), b"first");
+        write(&source.join("second.txt"), b"second");
+        let events = RefCell::new(Vec::new());
+
+        copy_path_with_progress(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut replace,
+            &mut |_, path| events.borrow_mut().push(("discovered", path.to_path_buf())),
+            &mut |_, completed, path| {
+                if completed {
+                    events.borrow_mut().push(("completed", path.to_path_buf()));
+                }
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+
+        let events = events.into_inner();
+        assert!(events.chunks_exact(2).all(|pair| {
+            pair[0].0 == "discovered" && pair[1].0 == "completed" && pair[0].1 == pair[1].1
+        }));
+        for path in [source.join("first.txt"), source.join("second.txt")] {
+            let discovered = events
+                .iter()
+                .position(|event| event == &("discovered", path.clone()))
+                .unwrap();
+            let completed = events
+                .iter()
+                .position(|event| event == &("completed", path.clone()))
+                .unwrap();
+            assert!(discovered < completed);
+        }
+    }
+
+    #[test]
+    fn issue_61_discovery_counts_files_and_bytes_once() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(source.join("nested")).unwrap();
+        write(&source.join("one.bin"), &[1; 3]);
+        write(&source.join("nested").join("two.bin"), &[2; 5]);
+        let mut discovered = Vec::new();
+
+        copy_path_with_progress(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut replace,
+            &mut |bytes, path| discovered.push((path.to_path_buf(), bytes)),
+            &mut |_, _, _| {},
+            &mut |_| {},
+        )
+        .unwrap();
+
+        discovered.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(discovered.len(), 2);
+        assert_eq!(discovered.iter().map(|item| item.1).sum::<u64>(), 8);
+        assert_eq!(
+            discovered.iter().map(|item| &item.0).collect::<Vec<_>>(),
+            vec![
+                &source.join("nested").join("two.bin"),
+                &source.join("one.bin")
+            ]
+        );
+    }
+
+    #[test]
+    fn issue_61_cancelled_copy_stops_before_discovery() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source.bin");
+        let destination = temp.path().join("destination.bin");
+        write(&source, b"content");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut discovered = Vec::new();
+
+        let result = copy_path_with_progress(
+            &source,
+            &destination,
+            &cancel,
+            &mut replace,
+            &mut |bytes, path| discovered.push((bytes, path.to_path_buf())),
+            &mut |_, _, _| {},
+            &mut |_| {},
+        );
+
+        assert_eq!(result, Err(OperationError::Cancelled));
+        assert!(discovered.is_empty());
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn issue_61_paused_copy_waits_before_discovery() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let temp = TempDir::new();
+        let source = temp.path().join("source.bin");
+        let destination = temp.path().join("destination.bin");
+        write(&source, b"content");
+        let cancel = CancellationToken::new();
+        cancel.pause();
+        let worker_cancel = cancel.clone();
+        let (discovered_sender, discovered_receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            copy_path_with_progress(
+                &source,
+                &destination,
+                &worker_cancel,
+                &mut replace,
+                &mut |bytes, path| discovered_sender.send((bytes, path.to_path_buf())).unwrap(),
+                &mut |_, _, _| {},
+                &mut |_| {},
+            )
+        });
+
+        let discovered_while_paused = discovered_receiver
+            .recv_timeout(Duration::from_millis(50))
+            .is_ok();
+        cancel.resume();
+        assert!(!discovered_while_paused);
+        assert_eq!(
+            discovered_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .0,
+            7
+        );
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn issue_61_same_volume_move_rename_does_not_scan() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source.bin");
+        let destination = temp.path().join("destination.bin");
+        write(&source, b"content");
+        let mut discovered = Vec::new();
+
+        move_path_with_progress(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut replace,
+            &mut |bytes, path| discovered.push((bytes, path.to_path_buf())),
+            &mut |_, _, _| {},
+        )
+        .unwrap();
+
+        assert!(discovered.is_empty());
+        assert!(!source.exists());
+        assert_eq!(fs::read(destination).unwrap(), b"content");
     }
 
     #[test]
@@ -1207,6 +1436,7 @@ mod tests {
             &destination,
             &CancellationToken::new(),
             &mut replace,
+            &mut |_, _| {},
             &mut |_, _, _| {},
             &mut |path| created.push(path.to_path_buf()),
         )
