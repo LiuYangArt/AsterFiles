@@ -1,4 +1,4 @@
-use std::{ffi::c_void, io, mem::size_of, os::windows::ffi::OsStrExt, path::Path, ptr};
+use std::{ffi::c_void, io, mem::size_of, os::windows::ffi::OsStrExt, path::Path};
 
 use windows::{
     Win32::{
@@ -76,7 +76,7 @@ pub fn copy_file(
         let parameters = COPYFILE2_EXTENDED_PARAMETERS {
             dwSize: size_of::<COPYFILE2_EXTENDED_PARAMETERS>() as u32,
             dwCopyFlags: flags,
-            pfCancel: ptr::null_mut(),
+            pfCancel: cancel.windows_cancellation_flag() as *const _ as *mut windows::core::BOOL,
             pProgressRoutine: Some(copy_progress),
             pvCallbackContext: (&mut context as *mut CopyContext<'_>).cast::<c_void>(),
         };
@@ -163,6 +163,7 @@ unsafe extern "system" fn copy_progress(
         }
     }
     if context.cancel.is_paused() {
+        context.cancel.acknowledge_pause();
         context.pause_requested = true;
         COPYFILE2_PROGRESS_PAUSE
     } else {
@@ -206,8 +207,9 @@ mod tests {
     impl TempDir {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
-                "asterfiles-copyfile2-{}-{}",
+                "asterfiles-copyfile2-{}-{}-{}",
                 std::process::id(),
+                UNIQUE_TEST_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -217,6 +219,9 @@ mod tests {
             Self(path)
         }
     }
+
+    static UNIQUE_TEST_DIRECTORY: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
 
     impl Drop for TempDir {
         fn drop(&mut self) {

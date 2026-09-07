@@ -28,19 +28,9 @@ VALIDATION_STAMP = VERIFY_DIR / "full-debug-success.json"
 SCENARIOS = [
     ("agent-state", "permission-denied", STATE_DIR / "permission-denied.json"),
     (
-        "agent-file-operation-running",
-        "file-operation-running",
-        STATE_DIR / "file-operations" / "running.json",
-    ),
-    (
-        "agent-file-operation-conflict",
-        "file-operation-conflict",
-        STATE_DIR / "file-operations" / "conflict.json",
-    ),
-    (
-        "agent-file-operation-partial",
-        "file-operation-partial",
-        STATE_DIR / "file-operations" / "partial.json",
+        "agent-file-operation-center",
+        "file-operation-center",
+        STATE_DIR / "file-operations" / "task-center.json",
     ),
     (
         "agent-drag-drop-foundation",

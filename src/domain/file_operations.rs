@@ -154,6 +154,57 @@ pub struct OperationProgress {
     pub discovered_bytes: u64,
     pub scanning_complete: bool,
     pub current_item: Option<PathBuf>,
+    pub recent_speed_bps: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+pub struct TransferRateEstimator {
+    samples: VecDeque<(Duration, u64)>,
+    epoch: u64,
+}
+
+impl TransferRateEstimator {
+    const WINDOW: Duration = Duration::from_secs(5);
+    const MIN_SPAN: Duration = Duration::from_millis(500);
+
+    pub fn record(&mut self, active_elapsed: Duration, processed_bytes: u64, epoch: u64) {
+        if self.epoch != epoch
+            || self
+                .samples
+                .back()
+                .is_some_and(|(_, previous)| processed_bytes < *previous)
+        {
+            self.samples.clear();
+            self.epoch = epoch;
+        }
+        if self
+            .samples
+            .back()
+            .is_some_and(|(_, previous)| processed_bytes <= *previous)
+        {
+            return;
+        }
+        self.samples.push_back((active_elapsed, processed_bytes));
+        let cutoff = active_elapsed.saturating_sub(Self::WINDOW);
+        while self.samples.len() > 2
+            && self
+                .samples
+                .get(1)
+                .is_some_and(|(elapsed, _)| *elapsed <= cutoff)
+        {
+            self.samples.pop_front();
+        }
+    }
+
+    pub fn bytes_per_second(&self) -> Option<u64> {
+        let (first_elapsed, first_bytes) = self.samples.front()?;
+        let (last_elapsed, last_bytes) = self.samples.back()?;
+        let elapsed = last_elapsed.saturating_sub(*first_elapsed);
+        if elapsed < Self::MIN_SPAN || last_bytes <= first_bytes {
+            return None;
+        }
+        Some((last_bytes - first_bytes).saturating_mul(1_000) / elapsed.as_millis() as u64)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +225,9 @@ struct PauseState {
 #[derive(Debug)]
 struct OperationControl {
     cancelled: AtomicBool,
+    windows_cancelled: std::sync::atomic::AtomicI32,
+    pause_acknowledged: AtomicBool,
+    rate_epoch: std::sync::atomic::AtomicU64,
     pause: Mutex<PauseState>,
     wake: Condvar,
 }
@@ -189,12 +243,16 @@ impl CancellationToken {
     pub fn new() -> Self {
         Self(Arc::new(OperationControl {
             cancelled: AtomicBool::new(false),
+            windows_cancelled: std::sync::atomic::AtomicI32::new(0),
+            pause_acknowledged: AtomicBool::new(false),
+            rate_epoch: std::sync::atomic::AtomicU64::new(0),
             pause: Mutex::new(PauseState::default()),
             wake: Condvar::new(),
         }))
     }
     pub fn cancel(&self) {
         self.0.cancelled.store(true, Ordering::Release);
+        self.0.windows_cancelled.store(1, Ordering::Release);
         self.0.wake.notify_all();
     }
     pub fn is_cancelled(&self) -> bool {
@@ -203,12 +261,17 @@ impl CancellationToken {
     pub fn cancellation_flag(&self) -> &AtomicBool {
         &self.0.cancelled
     }
+    pub fn windows_cancellation_flag(&self) -> &std::sync::atomic::AtomicI32 {
+        &self.0.windows_cancelled
+    }
     pub fn pause(&self) {
         if let Ok(mut state) = self.0.pause.lock()
             && !state.paused
         {
+            self.0.pause_acknowledged.store(false, Ordering::Release);
             state.paused = true;
             state.started = Some(Instant::now());
+            self.0.rate_epoch.fetch_add(1, Ordering::AcqRel);
         }
     }
     pub fn resume(&self) {
@@ -216,19 +279,30 @@ impl CancellationToken {
             && state.paused
         {
             state.paused = false;
+            self.0.pause_acknowledged.store(false, Ordering::Release);
             if let Some(started) = state.started.take() {
                 state.accumulated += started.elapsed();
             }
+            self.0.rate_epoch.fetch_add(1, Ordering::AcqRel);
             self.0.wake.notify_all();
         }
     }
     pub fn is_paused(&self) -> bool {
         self.0.pause.lock().is_ok_and(|state| state.paused)
     }
+    pub fn acknowledge_pause(&self) {
+        self.0.pause_acknowledged.store(true, Ordering::Release);
+    }
+    pub fn is_pause_acknowledged(&self) -> bool {
+        self.0.pause_acknowledged.load(Ordering::Acquire)
+    }
     pub fn wait_if_paused(&self) {
         let Ok(mut state) = self.0.pause.lock() else {
             return;
         };
+        if state.paused {
+            self.acknowledge_pause();
+        }
         while state.paused && !self.is_cancelled() {
             let Ok(next) = self.0.wake.wait(state) else {
                 return;
@@ -245,6 +319,9 @@ impl CancellationToken {
                     .map_or(Duration::ZERO, |value| value.elapsed())
         });
         elapsed.saturating_sub(paused)
+    }
+    pub fn rate_epoch(&self) -> u64 {
+        self.0.rate_epoch.load(Ordering::Acquire)
     }
 }
 
@@ -333,6 +410,7 @@ impl OperationTask {
     ) -> Result<(), StateTransitionError> {
         self.transition(OperationState::WaitingConflict)?;
         self.cancellation.pause();
+        self.progress.recent_speed_bps = None;
         self.conflict = Some(conflict);
         Ok(())
     }
@@ -351,6 +429,7 @@ impl OperationTask {
                 .insert(conflict.category, decision.action);
         }
         self.cancellation.resume();
+        self.progress.recent_speed_bps = None;
         self.transition(OperationState::Running)
     }
     pub fn request_cancel(&mut self) -> Result<(), StateTransitionError> {
@@ -368,19 +447,26 @@ impl OperationTask {
             }),
         }
     }
-    pub fn toggle_pause(&mut self) -> Result<(), StateTransitionError> {
-        match self.state {
-            OperationState::Running => {
+    pub fn set_paused(&mut self, paused: bool) -> Result<(), StateTransitionError> {
+        match (self.state, paused) {
+            (OperationState::Running, true) => {
                 self.cancellation.pause();
+                self.progress.recent_speed_bps = None;
                 self.transition(OperationState::Paused)
             }
-            OperationState::Paused => {
+            (OperationState::Paused, false) => {
                 self.cancellation.resume();
+                self.progress.recent_speed_bps = None;
                 self.transition(OperationState::Running)
             }
+            (OperationState::Paused, true) | (OperationState::Running, false) => Ok(()),
             _ => Err(StateTransitionError {
                 from: self.state,
-                to: OperationState::Paused,
+                to: if paused {
+                    OperationState::Paused
+                } else {
+                    OperationState::Running
+                },
             }),
         }
     }
@@ -469,6 +555,16 @@ impl OperationManager {
     pub fn active_id(&self, resource: OperationResource) -> Option<OperationId> {
         self.active[resource.index()]
     }
+    pub fn queue_position(&self, id: OperationId) -> Option<usize> {
+        let task = self.tasks.get(&id)?;
+        if task.state != OperationState::Queued {
+            return None;
+        }
+        self.queues[task.resource.index()]
+            .iter()
+            .position(|queued| *queued == id)
+            .map(|position| position + 1)
+    }
     pub fn has_active_tasks(&self) -> bool {
         self.tasks.values().any(|task| task.state.is_active())
     }
@@ -492,8 +588,10 @@ impl OperationManager {
         Ok(None)
     }
     pub fn mark_running(&mut self, id: OperationId) -> Result<(), StateTransitionError> {
-        self.require_active_mut(id)?
-            .transition(OperationState::Running)
+        let task = self.require_active_mut(id)?;
+        task.transition(OperationState::Running)?;
+        task.started_at = Instant::now();
+        Ok(())
     }
     pub fn finish(
         &mut self,
@@ -542,11 +640,15 @@ impl OperationManager {
         }
         Ok(())
     }
-    pub fn toggle_pause(&mut self, id: OperationId) -> Result<(), StateTransitionError> {
+    pub fn set_paused(
+        &mut self,
+        id: OperationId,
+        paused: bool,
+    ) -> Result<(), StateTransitionError> {
         self.tasks
             .get_mut(&id)
             .expect("operation must exist")
-            .toggle_pause()
+            .set_paused(paused)
     }
     pub fn remove_terminal(&mut self, id: OperationId) -> bool {
         let Some(resource) = self
@@ -616,6 +718,59 @@ mod tests {
         assert!(!task.progress.scanning_complete);
         assert_eq!(task.progress.total_files, None);
         assert_eq!(task.progress.total_bytes, None);
+    }
+    #[test]
+    fn issue_62_recent_rate_uses_a_bounded_window_and_requires_enough_time() {
+        let mut estimator = TransferRateEstimator::default();
+        estimator.record(Duration::from_millis(0), 1_000, 0);
+        estimator.record(Duration::from_millis(300), 4_000, 0);
+        assert_eq!(estimator.bytes_per_second(), None);
+        estimator.record(Duration::from_millis(1_000), 11_000, 0);
+        assert_eq!(estimator.bytes_per_second(), Some(10_000));
+        estimator.record(Duration::from_millis(7_000), 41_000, 0);
+        assert_eq!(estimator.bytes_per_second(), Some(5_000));
+    }
+
+    #[test]
+    fn issue_62_pause_epoch_discards_old_rate_samples() {
+        let token = CancellationToken::new();
+        let mut estimator = TransferRateEstimator::default();
+        estimator.record(Duration::ZERO, 1_000, token.rate_epoch());
+        estimator.record(Duration::from_secs(1), 11_000, token.rate_epoch());
+        assert_eq!(estimator.bytes_per_second(), Some(10_000));
+        token.pause();
+        token.resume();
+        estimator.record(Duration::from_secs(2), 12_000, token.rate_epoch());
+        assert_eq!(estimator.bytes_per_second(), None);
+    }
+
+    #[test]
+    fn issue_62_queue_position_is_scoped_to_each_resource() {
+        let mut manager = OperationManager::new();
+        let local_first = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![item("a")],
+        );
+        let local_second = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![item("b")],
+        );
+        let network_first = manager.submit(
+            OperationResource::Network,
+            FileOperationKind::Copy,
+            None,
+            vec![item("n")],
+        );
+        assert_eq!(manager.queue_position(local_first), Some(1));
+        assert_eq!(manager.queue_position(local_second), Some(2));
+        assert_eq!(manager.queue_position(network_first), Some(1));
+        manager.start_next(OperationResource::Local).unwrap();
+        assert_eq!(manager.queue_position(local_first), None);
+        assert_eq!(manager.queue_position(local_second), Some(1));
     }
     #[test]
     fn manager_runs_only_one_write_task() {
@@ -903,18 +1058,37 @@ mod tests {
         manager.start_next(OperationResource::Local).unwrap();
         manager.mark_running(id).unwrap();
 
-        manager.toggle_pause(id).unwrap();
+        manager.set_paused(id, true).unwrap();
         assert_eq!(manager.task(id).unwrap().state, OperationState::Paused);
         assert!(manager.task(id).unwrap().cancellation.is_paused());
 
-        manager.toggle_pause(id).unwrap();
+        manager.set_paused(id, false).unwrap();
         assert_eq!(manager.task(id).unwrap().state, OperationState::Running);
         assert!(!manager.task(id).unwrap().cancellation.is_paused());
 
-        manager.toggle_pause(id).unwrap();
+        manager.set_paused(id, true).unwrap();
         manager.cancel(id).unwrap();
         assert_eq!(manager.task(id).unwrap().state, OperationState::Cancelling);
         assert!(manager.task(id).unwrap().cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn issue_62_repeated_pause_request_is_idempotent() {
+        let mut manager = OperationManager::new();
+        let id = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![item("a")],
+        );
+        manager.start_next(OperationResource::Local).unwrap();
+        manager.mark_running(id).unwrap();
+
+        manager.set_paused(id, true).unwrap();
+        manager.set_paused(id, true).unwrap();
+
+        assert_eq!(manager.task(id).unwrap().state, OperationState::Paused);
+        assert!(manager.task(id).unwrap().cancellation.is_paused());
     }
     #[test]
     fn issue_61_retry_resets_scan_discovery_and_keeps_successes() {

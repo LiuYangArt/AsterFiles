@@ -549,14 +549,7 @@ fn replace_directory_safely(
         destination_created,
         report,
     );
-    if let Err(error) = result {
-        let _ = remove_entry(
-            &temporary,
-            &CancellationToken::new(),
-            &mut FileOperationReport::new(),
-        );
-        return Err(error);
-    }
+    result?;
     replace_with_temporary(&temporary, destination)
 }
 

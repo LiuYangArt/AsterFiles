@@ -3,13 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::domain::{
-    LoadState, TabId, TabSession,
-    file_operations::{
-        ConflictCategory, FileOperationKind, FileSnapshot, ItemState, OperationConflict,
-        OperationItem, OperationManager, OperationResource, OperationResult, OperationState,
-    },
-};
+use crate::domain::{LoadState, TabSession};
 
 const DEFAULT_STATE_DIR: &str = "artifacts/state";
 
@@ -29,9 +23,7 @@ impl PageOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentScenario {
     PermissionDenied,
-    FileOperationRunning,
-    FileOperationConflict,
-    FileOperationPartial,
+    FileOperationCenter,
     DragDropFoundation,
     MultiWindowStateLayering,
     TabReorder,
@@ -52,9 +44,7 @@ impl AgentScenario {
     pub fn name(self) -> &'static str {
         match self {
             Self::PermissionDenied => "permission-denied",
-            Self::FileOperationRunning => "file-operation-running",
-            Self::FileOperationConflict => "file-operation-conflict",
-            Self::FileOperationPartial => "file-operation-partial",
+            Self::FileOperationCenter => "file-operation-center",
             Self::DragDropFoundation => "drag-drop-foundation",
             Self::MultiWindowStateLayering => "multi-window-state-layering",
             Self::TabReorder => "tab-reorder",
@@ -132,9 +122,7 @@ impl AgentOptions {
 fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
     match value {
         "permission-denied" => Ok(AgentScenario::PermissionDenied),
-        "file-operation-running" => Ok(AgentScenario::FileOperationRunning),
-        "file-operation-conflict" => Ok(AgentScenario::FileOperationConflict),
-        "file-operation-partial" => Ok(AgentScenario::FileOperationPartial),
+        "file-operation-center" => Ok(AgentScenario::FileOperationCenter),
         "drag-drop-foundation" => Ok(AgentScenario::DragDropFoundation),
         "multi-window-state-layering" => Ok(AgentScenario::MultiWindowStateLayering),
         "tab-reorder" => Ok(AgentScenario::TabReorder),
@@ -229,9 +217,7 @@ pub fn apply_scenario(session: &mut TabSession, scenario: AgentScenario) {
             ));
             session.load_state = LoadState::Complete;
         }
-        AgentScenario::FileOperationRunning
-        | AgentScenario::FileOperationConflict
-        | AgentScenario::FileOperationPartial => {
+        AgentScenario::FileOperationCenter => {
             session.current_location = Some(crate::domain::NavigationLocation::Directory(
                 PathBuf::from(r"C:\AgentScenarios\FileOperations"),
             ));
@@ -348,96 +334,7 @@ impl AgentState {
 }
 
 fn operation_state_for_scenario(scenario: AgentScenario) -> Option<&'static str> {
-    if matches!(
-        scenario,
-        AgentScenario::PermissionDenied
-            | AgentScenario::DragDropFoundation
-            | AgentScenario::MultiWindowStateLayering
-            | AgentScenario::TabReorder
-            | AgentScenario::TabDetach
-            | AgentScenario::TabCrossWindow
-            | AgentScenario::ExplorerPins
-            | AgentScenario::WindowsLibraries
-            | AgentScenario::QuickAccess
-            | AgentScenario::ShellThumbnail
-            | AgentScenario::FolderSizeScheduler
-            | AgentScenario::QuickMenuSearch
-            | AgentScenario::QuickMenuPopup
-            | AgentScenario::NetworkFoundation
-            | AgentScenario::FileListTypeSelect
-    ) {
-        return None;
-    }
-    let mut manager = OperationManager::new();
-    let id = manager.submit(
-        OperationResource::Local,
-        FileOperationKind::Copy,
-        Some(TabId(1)),
-        vec![OperationItem::pending(
-            Some(PathBuf::from(r"C:AgentScenariossource.txt")),
-            Some(PathBuf::from(r"C:AgentScenarios	arget.txt")),
-        )],
-    );
-    let _ = manager.start_next(OperationResource::Local);
-    let _ = manager.mark_running(id);
-    match scenario {
-        AgentScenario::FileOperationRunning => {}
-        AgentScenario::FileOperationConflict => {
-            let task = manager.task_mut(id).expect("scenario task exists");
-            let _ = task.set_conflict(OperationConflict {
-                category: ConflictCategory::ExistingFile,
-                source: FileSnapshot {
-                    path: PathBuf::from(r"C:AgentScenariossource.txt"),
-                    is_directory: false,
-                    size_bytes: Some(64),
-                    modified: None,
-                },
-                destination: FileSnapshot {
-                    path: PathBuf::from(r"C:AgentScenarios	arget.txt"),
-                    is_directory: false,
-                    size_bytes: Some(32),
-                    modified: None,
-                },
-            });
-        }
-        AgentScenario::FileOperationPartial => {
-            manager.task_mut(id).expect("scenario task exists").items[0].state = ItemState::Failed;
-            let _ = manager.finish(
-                id,
-                OperationState::PartiallyCompleted,
-                OperationResult {
-                    succeeded: vec![PathBuf::from(r"C:AgentScenarioscopied.txt")],
-                    skipped: vec![],
-                    failed: vec![(
-                        PathBuf::from(r"C:AgentScenariossource.txt"),
-                        "locked".to_owned(),
-                    )],
-                    affected_directories: vec![PathBuf::from(r"C:AgentScenarios")],
-                },
-            );
-        }
-        AgentScenario::DragDropFoundation => unreachable!(),
-        AgentScenario::MultiWindowStateLayering => unreachable!(),
-        AgentScenario::TabReorder => unreachable!(),
-        AgentScenario::TabDetach => unreachable!(),
-        AgentScenario::TabCrossWindow => unreachable!(),
-        AgentScenario::ExplorerPins => unreachable!(),
-        AgentScenario::WindowsLibraries => unreachable!(),
-        AgentScenario::QuickAccess => unreachable!(),
-        AgentScenario::ShellThumbnail => unreachable!(),
-        AgentScenario::FolderSizeScheduler => unreachable!(),
-        AgentScenario::QuickMenuSearch => unreachable!(),
-        AgentScenario::QuickMenuPopup => unreachable!(),
-        AgentScenario::NetworkFoundation => unreachable!(),
-        AgentScenario::FileListTypeSelect => unreachable!(),
-        AgentScenario::PermissionDenied => unreachable!(),
-    }
-    manager.task(id).map(|task| match task.state {
-        OperationState::Running => "running",
-        OperationState::WaitingConflict => "waiting_conflict",
-        OperationState::PartiallyCompleted => "partially_completed",
-        _ => "unexpected",
-    })
+    (scenario == AgentScenario::FileOperationCenter).then_some("task_center")
 }
 pub struct PageProjection {
     pub index: i32,

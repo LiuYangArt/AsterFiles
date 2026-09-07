@@ -11,7 +11,7 @@ export struct TabRow { id: int, title: string, active: bool, loading: bool, icon
 export struct SidebarRow { index: int, stable-id: string, label: string, icon-kind: int, group-kind: int, source-kind: int, is-drive: bool, icon: image }
 export struct ColumnRow { kind: int, label: string, visible: bool, min-width: length, content-left: length, content-right: length, icon-slot: length }
 export struct ContextCommandRow { id: int, node-id: int, label: string, search-text: string, hint: string, enabled: bool, separator: bool, shell: bool, checked: bool, default: bool, submenu: bool, loading: bool, placeholder: bool, icon-kind: int }
-export struct OperationRow { id: int, title: string, percent: string, file-progress: string, transferred: string, speed: string, eta: string, current-item: string, source: string, destination: string, progress: float, progress-known: bool, state: int, paused: bool, can-pause: bool, can-cancel: bool, can-retry: bool }
+export struct OperationRow { id: int, title: string, status: string, queue: string, failure-summary: string, accessible-label: string, source-line: string, destination-line: string, current-item-line: string, percent: string, file-progress: string, transferred: string, speed: string, eta: string, progress: float, progress-known: bool, state: int, paused: bool, pause-pending: bool, cancel-pending: bool, can-pause: bool, can-cancel: bool, can-retry: bool }
 export global VisualStyle {
     in-out property <bool> dark-theme: false;
     out property <color> c24252a: dark-theme ? #f2f2f2 : #24252a;
@@ -95,6 +95,7 @@ component StandaloneActionButton inherits Rectangle {
 component StandaloneTitleBar inherits Rectangle {
     in property <string> title;
     in property <string> close-label: "关闭";
+    in property <string> minimize-label: "最小化";
     in property <bool> show-minimize: false;
     callback close-requested();
     callback minimize-requested();
@@ -104,7 +105,7 @@ component StandaloneTitleBar inherits Rectangle {
     HorizontalLayout {
         padding-left: 16px;
         Text { text: root.title; color: VisualStyle.c30333a; font-size: 16px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
-        Rectangle { visible: root.show-minimize; width: 46px; Text { text: "—"; color: VisualStyle.c303138; horizontal-alignment: center; vertical-alignment: center; } TouchArea { clicked => { root.minimize-requested(); } } }
+        Rectangle { visible: root.show-minimize; width: 46px; Text { text: "—"; color: VisualStyle.c303138; horizontal-alignment: center; vertical-alignment: center; } TouchArea { clicked => { root.minimize-requested(); } } accessible-role: button; accessible-label: root.minimize-label; }
         Rectangle { width: 46px; Text { text: "×"; color: VisualStyle.c303138; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; } TouchArea { clicked => { root.close-requested(); } } accessible-role: button; accessible-label: root.close-label; }
     }
     TouchArea { width: parent.width - 46px - (root.show-minimize ? 46px : 0px); pointer-event(event) => { if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) { root.drag-window(); } } }
@@ -116,15 +117,17 @@ export component OperationWindow inherits Window {
     no-frame: true;
     resize-border-width: 0px;
     preferred-width: 580px;
-    preferred-height: 255px;
+    preferred-height: max(278px, min(650px, 48px + root.operations.length * 230px));
     min-width: 580px;
     max-width: 580px;
-    min-height: 255px;
-    max-height: 255px;
+    min-height: 278px;
+    max-height: 760px;
     background: VisualStyle.cffffff;
     default-font-family: "Segoe UI";
 
     in property <[OperationRow]> operations;
+    in property <bool> demo-mode: false;
+    in property <string> demo-notice: "";
     in property <bool> dark-theme: false;
     in property <string> text-file-operations: "文件操作";
     in property <string> text-cancel-operation: "取消";
@@ -134,9 +137,11 @@ export component OperationWindow inherits Window {
     in property <string> text-window-close: "关闭";
     in property <string> text-pause-operation: "暂停";
     in property <string> text-resume-operation: "继续";
+    in property <string> text-pausing-operation: "正在暂停";
+    in property <string> text-cancelling-operation: "正在取消";
 
     callback cancel-operation(int);
-    callback toggle-pause-operation(int);
+    callback set-operation-paused(int, bool);
     callback retry-operation(int);
     callback request-hide();
     callback drag-window();
@@ -144,7 +149,7 @@ export component OperationWindow inherits Window {
     changed dark-theme => { VisualStyle.dark-theme = root.dark-theme; }
 
     VerticalLayout {
-        StandaloneTitleBar { title: root.operations.length > 0 ? root.operations[0].title + " | " + root.operations[0].percent : root.text-file-operations; close-label: root.text-window-close; show-minimize: true; minimize-requested => { root.minimized = true; } close-requested => { if (root.operations.length > 0 && root.operations[0].can-cancel) { root.cancel-operation(root.operations[0].id); } else { root.request-hide(); } } drag-window => { root.drag-window(); } }
+        StandaloneTitleBar { title: root.text-file-operations; close-label: root.text-window-close; minimize-label: root.text-window-minimize; show-minimize: true; minimize-requested => { root.minimized = true; } close-requested => { root.request-hide(); } drag-window => { root.drag-window(); } }
         Rectangle {
             vertical-stretch: 1;
             background: VisualStyle.cffffff;
@@ -155,20 +160,24 @@ export component OperationWindow inherits Window {
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
-            if root.operations.length > 0: Rectangle {
+            if root.demo-mode: Text { x: 20px; y: 8px; width: parent.width - 40px; height: 20px; text: root.demo-notice; color: VisualStyle.c62656f; font-size: 12px; vertical-alignment: center; overflow: elide; }
+            if root.operations.length > 0: ListView {
+                y: root.demo-mode ? 34px : 0px;
                 width: parent.width;
-                height: parent.height;
-                if root.operations.length > 0: Rectangle {
-                    property <OperationRow> operation: root.operations[0];
-                    width: parent.width;
-                    height: parent.height;
+                height: root.demo-mode ? parent.height - 34px : parent.height;
+                for operation[index] in root.operations: Rectangle {
+                    height: 230px;
                     background: VisualStyle.cffffff;
-                    Text { x: 20px; y: 8px; width: parent.width - 40px; height: 20px; text: "From:  " + operation.source; color: VisualStyle.c62656f; font-size: 12px; overflow: elide; vertical-alignment: center; }
-                    Text { x: 20px; y: 32px; width: parent.width - 40px; height: 20px; text: "To:       " + operation.destination; color: VisualStyle.c62656f; font-size: 12px; overflow: elide; vertical-alignment: center; }
-                    Text { x: 20px; y: 56px; width: parent.width - 40px; height: 20px; text: "File:     " + operation.current-item; color: VisualStyle.c30333a; font-size: 13px; overflow: elide; vertical-alignment: center; }
+                    accessible-role: groupbox;
+                    accessible-label: operation.accessible-label;
+                    Text { x: 20px; y: 8px; width: parent.width - 40px; height: 22px; text: operation.title; color: VisualStyle.c30333a; font-size: 14px; font-weight: operation.state == 2 ? 700 : 600; overflow: elide; vertical-alignment: center; }
+                    Text { x: 20px; y: 30px; width: parent.width - 40px; height: 18px; text: operation.status + (operation.queue != "" ? " · " + operation.queue : ""); color: VisualStyle.c62656f; font-size: 12px; overflow: elide; vertical-alignment: center; }
+                    Text { x: 20px; y: 50px; width: parent.width - 40px; height: 18px; text: operation.source-line; color: VisualStyle.c62656f; font-size: 11px; overflow: elide; vertical-alignment: center; }
+                    Text { x: 20px; y: 68px; width: parent.width - 40px; height: 18px; text: operation.destination-line; color: VisualStyle.c62656f; font-size: 11px; overflow: elide; vertical-alignment: center; }
+                    Text { x: 20px; y: 86px; width: parent.width - 40px; height: 18px; text: operation.failure-summary != "" ? operation.failure-summary : operation.current-item-line; color: operation.failure-summary != "" ? VisualStyle.cc42b1c : VisualStyle.c30333a; font-size: 12px; overflow: elide; vertical-alignment: center; }
                     Rectangle {
                             x: 20px;
-                            y: 84px;
+                            y: 110px;
                             width: parent.width - 40px;
                             height: 22px;
                             border-radius: 11px;
@@ -184,7 +193,7 @@ export component OperationWindow inherits Window {
                     }
                     HorizontalLayout {
                             x: 20px;
-                            y: 112px;
+                            y: 138px;
                             width: parent.width - 40px;
                             height: 20px;
                             spacing: 20px;
@@ -195,14 +204,15 @@ export component OperationWindow inherits Window {
                     }
                     HorizontalLayout {
                             x: parent.width - self.width - 20px;
-                            y: 148px;
+                            y: 178px;
                             width: 176px;
                             height: 34px;
                             spacing: 8px;
-                            StandaloneActionButton { visible: operation.can-pause; width: 84px; label: operation.paused ? root.text-resume-operation : root.text-pause-operation; clicked => { root.toggle-pause-operation(operation.id); } }
-                            StandaloneActionButton { visible: operation.can-cancel; width: 84px; label: root.text-cancel-operation; clicked => { root.cancel-operation(operation.id); } }
-                            StandaloneActionButton { visible: operation.can-retry; width: 76px; label: root.text-retry-operation; clicked => { root.retry-operation(operation.id); } }
+                            StandaloneActionButton { visible: operation.can-pause || operation.pause-pending; enabled: !operation.pause-pending; width: 84px; label: operation.pause-pending ? root.text-pausing-operation : operation.paused ? root.text-resume-operation : root.text-pause-operation; clicked => { if (!root.demo-mode) { root.set-operation-paused(operation.id, !operation.paused); } } }
+                            StandaloneActionButton { visible: operation.can-cancel || operation.cancel-pending; enabled: operation.can-cancel && !operation.cancel-pending; width: 84px; label: operation.cancel-pending ? root.text-cancelling-operation : root.text-cancel-operation; clicked => { if (!root.demo-mode) { root.cancel-operation(operation.id); } } }
+                            StandaloneActionButton { visible: operation.can-retry; width: 76px; label: root.text-retry-operation; clicked => { if (!root.demo-mode) { root.retry-operation(operation.id); } } }
                     }
+                    Rectangle { visible: index + 1 < root.operations.length; x: 20px; y: parent.height - 1px; width: parent.width - 40px; height: 1px; background: VisualStyle.ce0e2e7; }
                 }
             }
         }
@@ -848,6 +858,7 @@ export component AppWindow inherits Window {
     in property <string> text-drop-link: "在此处创建快捷方式";
     in property <string> text-drop-cancel: "取消";
     in-out property <bool> task-center-open: false;
+    changed task-center-open => { if (root.task-center-open) { root.open-operation-window(); root.task-center-open = false; } }
     in-out property <string> rename-input: "";
     in property <int> rename-entry-id: -1;
     in property <bool> rename-editing: false;
@@ -2133,7 +2144,7 @@ accessible-label: entry.name;
                         background: task-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
                         Text { text: root.operations.length + " " + root.text-task-count; color: VisualStyle.c30333a; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
                         task-touch := TouchArea { clicked => { root.open-operation-window(); } mouse-cursor: pointer; }
-                        accessible-role: button; accessible-label: "File operations";
+                        accessible-role: button; accessible-label: root.text-file-operations;
                     }
                 }
                 }

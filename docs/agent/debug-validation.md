@@ -131,17 +131,16 @@ cargo test issue_20 --quiet
 ```
 
 场景只操作已加载的内存模型，不打开窗口、不访问文件系统、Shell/COM、网络或 Everything。产物记录单字符、连续前缀、同字符循环、稀疏结果身份和请求隔离；超时、上下文清理、分组投影、滚入可见区与输入分流由专项测试覆盖。真实键盘手感、中文输入法、各视图、分组和 DPI 只能由用户手动验证。
-## P2 文件任务状态
+## Issue #62 文件任务中心
 
-文件任务提供三个确定性无界面场景，不执行真实磁盘写入：
+文件任务使用一个确定性无界面场景，不执行真实磁盘写入：
 
 ```powershell
-cargo run -- --agent-scenario file-operation-running --no-ui
-cargo run -- --agent-scenario file-operation-conflict --no-ui
-cargo run -- --agent-scenario file-operation-partial --no-ui
+cargo run -- --agent-scenario file-operation-center --no-ui --agent-state-out artifacts/state/file-operations/task-center.json
+cargo test issue_62_ -- --nocapture
 ```
 
-统一验证把结果写入 `artifacts/state/file-operations/`。稳定状态名分别为 `running`、`waiting_conflict` 和 `partially_completed`，用于任务中心、冲突等待与部分完成回归检查。
+产物一次覆盖本地与网络运行任务、各资源域排队、冲突等待、暂停、部分完成和失败重试，并记录逐项操作能力、失败摘要、速度/剩余时间准备状态及“关闭窗口会取消全部活动任务”语义。真实视觉、键盘和无障碍交互仍由用户手动验收。
 
 ## Issue #61 大目录复制流水线
 

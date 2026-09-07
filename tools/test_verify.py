@@ -53,6 +53,21 @@ class VerifyTests(unittest.TestCase):
             ],
         )
 
+    def test_file_operation_center_uses_one_mixed_task_artifact(self) -> None:
+        steps = dict(verify.scenario_steps())
+        command = steps["agent-file-operation-center"]
+        self.assertEqual(
+            command[1:],
+            [
+                "--agent-scenario",
+                "file-operation-center",
+                "--no-ui",
+                "--agent-state-out",
+                str(verify.STATE_DIR / "file-operations" / "task-center.json"),
+            ],
+        )
+        self.assertNotIn("agent-file-operation-running", steps)
+
     def test_fail_fast_skips_following_steps(self) -> None:
         calls = []
 
