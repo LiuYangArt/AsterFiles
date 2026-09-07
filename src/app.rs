@@ -6903,9 +6903,9 @@ fn create_quick_menu_popup(
 
 fn root_popup_height_for_content(content_height: f32, loading: bool, scale: f32) -> i32 {
     let loading_height = if loading { 20.0 } else { 0.0 };
-    ((40.0 + content_height + loading_height) * scale)
+    ((41.0 + content_height + loading_height) * scale)
         .ceil()
-        .max(40.0) as i32
+        .max(41.0) as i32
 }
 
 fn root_popup_height(ui: &AppWindow, scale: f32) -> i32 {
@@ -22153,6 +22153,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn issue_75_root_menu_height_includes_layout_spacing() {
+        let content_height = 55.0;
+        assert_eq!(
+            root_popup_height_for_content(content_height, false, 1.0),
+            96
+        );
+
+        let menu_ui = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/quick-menu.slint"));
+        assert!(menu_ui.contains(
+            "window-height: max(41px, 41px + root.content-height + (root.loading ? 20px : 0px));"
+        ));
+        assert!(menu_ui.contains("padding: 4px; spacing: 1px;"));
+    }
     #[test]
     fn quick_menu_loaded_content_replaces_placeholder_height() {
         let placeholder_height = context_menu_content_height(
