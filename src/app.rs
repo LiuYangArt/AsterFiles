@@ -4197,6 +4197,19 @@ fn submit_location_navigation(
         }
     }
 }
+fn network_location_from_stable_id<'a>(
+    app: &'a AppState,
+    stable_id: &str,
+) -> Option<&'a NetworkLocation> {
+    let id = stable_id
+        .strip_prefix("network-location:")?
+        .parse::<u64>()
+        .ok()?;
+    app.imported_network_locations
+        .iter()
+        .chain(app.network_locations.iter())
+        .find(|location| location.id == id)
+}
 fn sidebar_navigation_target(app: &AppState, index: usize) -> Option<PathBuf> {
     if let Some(location) = app.sidebar.get(index) {
         return Some(location.path.clone());
@@ -5571,15 +5584,7 @@ fn sidebar_menu_target(
             })
         }
         2 => {
-            let id = stable_id
-                .strip_prefix("network-location:")?
-                .parse::<u64>()
-                .ok()?;
-            let location = app
-                .imported_network_locations
-                .iter()
-                .chain(app.network_locations.iter())
-                .find(|location| location.id == id)?;
+            let location = network_location_from_stable_id(app, stable_id)?;
             let (target, destination) = match &location.target {
                 NetworkTarget::WindowsPath(path) => (
                     ShellMenuItemTarget::FileSystem(path.clone()),
@@ -5599,7 +5604,7 @@ fn sidebar_menu_target(
                 target,
                 destination,
                 quick_access_path: None,
-                network_location_id: Some(id),
+                network_location_id: Some(location.id),
             })
         }
         3 => {
@@ -9655,20 +9660,13 @@ fn wire_callbacks(
     let network_sender_for_network_location = network_sender.clone();
     let state_for_network_location = state.clone();
     ui.on_navigate_network_location(move |stable_id| {
-        let Some(id) = stable_id.as_str().parse::<u64>().ok() else {
-            return;
-        };
         let target = state_for_network_location.lock().ok().and_then(|app| {
-            app.imported_network_locations
-                .iter()
-                .chain(app.network_locations.iter())
-                .find(|location| location.id == id)
-                .map(|location| {
-                    (
-                        app.active_window_state().active_tab,
-                        location.target.clone(),
-                    )
-                })
+            network_location_from_stable_id(&app, stable_id.as_str()).map(|location| {
+                (
+                    app.active_window_state().active_tab,
+                    location.target.clone(),
+                )
+            })
         });
         match target {
             Some((tab_id, NetworkTarget::WindowsPath(path))) => {
@@ -23693,6 +23691,26 @@ mod tests {
             network_location_default_name(Path::new(r"\\server")),
             "server"
         );
+    }
+    #[test]
+    fn issue_73_network_location_sidebar_identity_resolves_to_navigation_target() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\local")], 0, [0, 1, 2, 3]);
+        let target = NetworkTarget::WindowsPath(PathBuf::from(r"\\server\share"));
+        app.network_locations = vec![NetworkLocation {
+            id: 73,
+            source: NetworkLocationSource::AsterOwned,
+            display_name: "NAS".into(),
+            sort_order: 0,
+            target: target.clone(),
+        }];
+
+        assert_eq!(
+            network_location_from_stable_id(&app, "network-location:73")
+                .map(|location| &location.target),
+            Some(&target)
+        );
+        assert!(network_location_from_stable_id(&app, "73").is_none());
+        assert!(network_location_from_stable_id(&app, "network-location:invalid").is_none());
     }
     #[test]
     fn network_sidebar_index_skips_shell_only_location_without_shifting_device() {
