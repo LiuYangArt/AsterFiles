@@ -1701,6 +1701,20 @@ enum WindowCloseAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtrlWAction {
+    CloseActiveTab,
+    RequestWindowClose,
+}
+
+fn ctrl_w_action(can_close_tab: bool) -> CtrlWAction {
+    if can_close_tab {
+        CtrlWAction::CloseActiveTab
+    } else {
+        CtrlWAction::RequestWindowClose
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnmatchedTabDropAction {
     MoveSourceWindow,
     DetachToNewWindow,
@@ -4394,6 +4408,83 @@ fn install_app_window_at(
         );
     });
     Ok(())
+}
+
+fn new_window_location(app: &AppState, source_window: WindowId) -> NavigationLocation {
+    app.window(source_window)
+        .map(WindowState::active)
+        .filter(|tab| tab.kind == TabKind::Files && tab.load_state == LoadState::Complete)
+        .and_then(|tab| tab.current_location.as_ref())
+        .and_then(NavigationLocation::directory_path)
+        .map(|path| NavigationLocation::Directory(path.to_path_buf()))
+        .unwrap_or_else(|| NavigationLocation::Directory(initial_path()))
+}
+
+fn create_new_window(
+    source_ui: &AppWindow,
+    source_window: WindowId,
+    senders: &WorkerSenders,
+    confirmations: &ConfirmationWindows,
+    state: &SharedSessions,
+) -> bool {
+    let candidate = match AppWindow::new() {
+        Ok(candidate) => candidate,
+        Err(_) => return false,
+    };
+    let position = source_ui.window().position();
+    let size = source_ui.window().size();
+    let scale = source_ui.window().scale_factor();
+    let placement = session_store::WindowPlacement {
+        x: position.x.saturating_add(24),
+        y: position.y.saturating_add(24),
+        width: (size.width as f32 / scale).round() as u32,
+        height: (size.height as f32 / scale).round() as u32,
+    };
+    let delete_ui = confirmations.delete.upgrade();
+    let conflict_ui = confirmations.conflict.upgrade();
+    let exit_ui = confirmations.exit.upgrade();
+    let (Some(delete_ui), Some(conflict_ui), Some(exit_ui)) = (delete_ui, conflict_ui, exit_ui)
+    else {
+        return false;
+    };
+    let (destination, tab_id, location) = {
+        let Ok(mut app) = state.lock() else {
+            return false;
+        };
+        let location = new_window_location(&app, source_window);
+        let destination = app.register_window(vec![location.clone()], 0, placement);
+        let tab_id = app
+            .window(destination)
+            .expect("new window is registered")
+            .active_tab;
+        (destination, tab_id, location)
+    };
+    let installed = install_app_window(
+        candidate,
+        destination,
+        &delete_ui,
+        &conflict_ui,
+        &exit_ui,
+        senders,
+        state.clone(),
+    )
+    .is_ok();
+    if !installed {
+        remove_window_runtime(destination);
+        if let Ok(mut app) = state.lock() {
+            let _ = app.close_window(destination);
+        }
+        return false;
+    }
+    submit_location_navigation(
+        &senders.directory,
+        &senders.network_directory,
+        state,
+        tab_id,
+        location,
+        NavigationKind::Refresh,
+    );
+    true
 }
 
 fn detach_tab_into_new_window(
@@ -12595,10 +12686,19 @@ fn wire_mouse_navigation(
                     _ if control
                         && !alt
                         && !shift
+                        && character.is_some_and(|value| value.eq_ignore_ascii_case("n")) =>
+                    {
+                        create_new_window(&ui, window_id, &senders, &confirmations, &state.shared);
+                        true
+                    }
+                    _ if control
+                        && !alt
+                        && !shift
                         && character.is_some_and(|value| value.eq_ignore_ascii_case("w")) =>
                     {
-                        if ui.get_can_close_tab() {
-                            ui.invoke_close_tab(-1);
+                        match ctrl_w_action(ui.get_can_close_tab()) {
+                            CtrlWAction::CloseActiveTab => ui.invoke_close_tab(-1),
+                            CtrlWAction::RequestWindowClose => ui.invoke_request_close(),
                         }
                         true
                     }
@@ -24789,6 +24889,91 @@ mod tests {
             Some(NavigationLocation::Directory(PathBuf::from("three")))
         );
         assert!(!app.active_window_state().tabs.contains_key(&second));
+    }
+
+    #[test]
+    fn issue_71_ctrl_w_routes_close_and_exit_independently_of_address_focus() {
+        assert_eq!(ctrl_w_action(true), CtrlWAction::CloseActiveTab);
+        assert_eq!(ctrl_w_action(false), CtrlWAction::RequestWindowClose);
+
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/app.rs"));
+        let shortcut = source
+            .split_once("value.eq_ignore_ascii_case(\"w\")")
+            .expect("window Ctrl+W route exists")
+            .1
+            .split_once("_ => false")
+            .expect("window Ctrl+W route has a match boundary")
+            .0;
+        assert!(shortcut.contains("ui.invoke_request_close()"));
+        assert!(!shortcut.contains("editing_address"));
+    }
+
+    #[test]
+    fn issue_71_ctrl_n_uses_the_new_window_route() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/app.rs"));
+        let shortcut = source
+            .split_once("value.eq_ignore_ascii_case(\"n\")")
+            .expect("window Ctrl+N route exists")
+            .1
+            .split_once("_ if control")
+            .expect("window Ctrl+N route has a match boundary")
+            .0;
+        assert!(shortcut.contains("create_new_window("));
+        assert!(!shortcut.contains("ui.invoke_new_tab()"));
+    }
+
+    #[test]
+    fn issue_71_new_window_uses_only_a_stable_active_directory() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
+        let source = app.active_window;
+        app.tab_mut(TabId(1)).unwrap().load_state = LoadState::Complete;
+        assert_eq!(
+            new_window_location(&app, source),
+            NavigationLocation::Directory(PathBuf::from("one"))
+        );
+
+        app.tab_mut(TabId(1)).unwrap().load_state = LoadState::Failed;
+        assert_eq!(
+            new_window_location(&app, source),
+            NavigationLocation::Directory(initial_path())
+        );
+
+        app.open_settings();
+        assert_eq!(
+            new_window_location(&app, source),
+            NavigationLocation::Directory(initial_path())
+        );
+    }
+
+    #[test]
+    fn issue_71_closing_active_tab_selects_right_neighbor_and_rejects_late_results() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);
+        let closing = app.create_tab(PathBuf::from("two"));
+        let right = app.create_tab(PathBuf::from("three"));
+        app.active_window_state_mut().active_tab = closing;
+        let (request_id, cancel) = app
+            .active_window_state_mut()
+            .tabs
+            .get_mut(&closing)
+            .unwrap()
+            .begin_directory_navigation(PathBuf::from("two/pending"), NavigationKind::Refresh);
+
+        assert_eq!(app.close_tab(closing), Some(right));
+        assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(app.active_window_state().tab_order, [TabId(1), right]);
+
+        let state = Arc::new(Mutex::new(app));
+        apply_event(
+            &state,
+            DirectoryEvent::Batch {
+                tab_id: closing,
+                request_id,
+                entries: vec![focus_entry(1, "two/late.txt")],
+            },
+        );
+        let app = state.lock().unwrap();
+        assert!(app.tab(closing).is_none());
+        assert!(app.tab(right).unwrap().pending_entries.is_empty());
     }
 
     #[test]

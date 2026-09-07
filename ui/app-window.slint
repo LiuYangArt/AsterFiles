@@ -1305,8 +1305,6 @@ export component AppWindow inherits Window {
         KeyBinding { keys: @keys(Shift + End); enabled: !root.active-is-settings && !root.address-editing; activated => { root.focus-boundary(true, true); } }
         KeyBinding { keys: @keys(Return); enabled: !root.active-is-settings && !root.address-editing; activated => { root.open-entry(-1); } }
         KeyBinding { keys: @keys(Escape); enabled: !root.active-is-settings && !root.address-editing && !root.rectangle-selection-pointer-active && !root.column-drag-pointer-active; activated => { root.clear-selection(); } }
-        KeyBinding { keys: @keys(Control + T); activated => { root.new-tab(); } }
-        KeyBinding { keys: @keys(Control + W); enabled: root.can-close-tab; activated => { root.close-tab(-1); } }
         KeyBinding { keys: @keys(Control + C); enabled: !root.active-is-settings && !root.address-editing; activated => { root.copy-selection(false); } }
         KeyBinding { keys: @keys(Control + X); enabled: !root.active-is-settings && !root.address-editing; activated => { root.copy-selection(true); } }
         KeyBinding { keys: @keys(Control + V); enabled: !root.active-is-settings && !root.address-editing; activated => { root.paste-files(); } }
