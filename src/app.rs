@@ -20980,13 +20980,9 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_drop_link(drop_link.into());
     ui.set_text_drop_cancel(drop_cancel.into());
     let (context_search, context_loading, context_empty) = match language {
-        Language::Chinese => (
-            "搜索命令（支持拼音）",
-            "正在加载 Windows 菜单…",
-            "没有匹配的命令",
-        ),
+        Language::Chinese => ("搜索命令", "正在加载 Windows 菜单…", "没有匹配的命令"),
         Language::English => (
-            "Search commands (supports Pinyin)",
+            "Search commands",
             "Loading Windows menu…",
             "No matching commands",
         ),
@@ -22607,21 +22603,15 @@ mod tests {
     }
 
     #[test]
-    fn issue_72_search_placeholder_explains_pinyin_support_in_chinese() {
+    fn issue_72_search_placeholder_stays_concise() {
         i_slint_backend_testing::init_no_event_loop();
         let ui = AppWindow::new().expect("headless app window should initialize");
 
         apply_ui_texts(&ui, Language::Chinese);
-        assert_eq!(
-            ui.get_text_context_search().as_str(),
-            "搜索命令（支持拼音）"
-        );
+        assert_eq!(ui.get_text_context_search().as_str(), "搜索命令");
 
         apply_ui_texts(&ui, Language::English);
-        assert_eq!(
-            ui.get_text_context_search().as_str(),
-            "Search commands (supports Pinyin)"
-        );
+        assert_eq!(ui.get_text_context_search().as_str(), "Search commands");
     }
     #[test]
     fn quick_menu_filter_matches_text_pinyin_initials_and_verb_without_shell_work() {
