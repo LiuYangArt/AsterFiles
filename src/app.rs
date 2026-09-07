@@ -14421,7 +14421,9 @@ fn wire_operation_window(
     #[cfg(windows)]
     use winit::platform::windows::{CornerPreference, WindowExtWindows};
 
+    let auto_opened = Rc::new(Cell::new(false));
     let operation_weak = operation_ui.as_weak();
+    let auto_opened_for_hide = auto_opened.clone();
     let state_for_hide = state.clone();
     operation_ui.on_request_hide(move || {
         platform::windows::window_trace::log_diagnostic(
@@ -14429,11 +14431,13 @@ fn wire_operation_window(
             "source=close-button",
         );
         cancel_all_operations(&state_for_hide);
+        auto_opened_for_hide.set(false);
         if let Some(operation_ui) = operation_weak.upgrade() {
             let _ = operation_ui.hide();
         }
     });
     let operation_weak = operation_ui.as_weak();
+    let auto_opened_for_native_close = auto_opened.clone();
     let state_for_native_close = state.clone();
     operation_ui.window().on_close_requested(move || {
         platform::windows::window_trace::log_diagnostic(
@@ -14441,6 +14445,7 @@ fn wire_operation_window(
             "source=native-close",
         );
         cancel_all_operations(&state_for_native_close);
+        auto_opened_for_native_close.set(false);
         if let Some(operation_ui) = operation_weak.upgrade() {
             let _ = operation_ui.hide();
         }
@@ -14463,12 +14468,14 @@ fn wire_operation_window(
 
     let state_for_cancel = state.clone();
     let operation_weak = operation_ui.as_weak();
+    let auto_opened_for_cancel = auto_opened.clone();
     operation_ui.on_cancel_operation(move |id| {
         platform::windows::window_trace::log_diagnostic(
             "operation-window-cancel-requested",
             &format!("id={id}"),
         );
         cancel_operations(&state_for_cancel, [OperationId(id as u64)]);
+        auto_opened_for_cancel.set(false);
         if let Some(operation_ui) = operation_weak.upgrade() {
             let _ = operation_ui.hide();
         }
@@ -14503,11 +14510,12 @@ fn wire_operation_window(
         }
     });
 
-    wire_operation_window_opener(ui, operation_ui, state.clone());
+    wire_operation_window_opener(ui, operation_ui, state.clone(), auto_opened.clone());
 
     let operation_weak = operation_ui.as_weak();
     let ui_weak = ui.as_weak();
     let state_for_auto_open = state.clone();
+    let auto_opened_for_timer = auto_opened;
     let timer = slint::Timer::default();
     timer.start(
         slint::TimerMode::Repeated,
@@ -14523,6 +14531,13 @@ fn wire_operation_window(
             if removed > 0 {
                 refresh_operation_badges(&state_for_auto_open);
                 refresh_operation_window(&operation_ui, &state_for_auto_open);
+                let should_close = state_for_auto_open.lock().is_ok_and(|app| {
+                    should_close_auto_opened_operation_window(auto_opened_for_timer.get(), &app)
+                });
+                if should_close {
+                    auto_opened_for_timer.set(false);
+                    let _ = operation_ui.hide();
+                }
             }
             let should_open = state_for_auto_open
                 .lock()
@@ -14532,7 +14547,9 @@ fn wire_operation_window(
                 if let Some(ui) = ui_weak.upgrade() {
                     position_operation_window_next_to_main(&ui, &operation_ui);
                 }
-                let _ = operation_ui.show();
+                if operation_ui.show().is_ok() {
+                    auto_opened_for_timer.set(true);
+                }
             }
         },
     );
@@ -14543,16 +14560,26 @@ fn wire_operation_window_opener(
     ui: &AppWindow,
     operation_ui: &OperationWindow,
     state: SharedSessions,
+    auto_opened: Rc<Cell<bool>>,
 ) {
     let operation_weak = operation_ui.as_weak();
     let ui_weak = ui.as_weak();
     ui.on_open_operation_window(move || {
         if let (Some(ui), Some(operation_ui)) = (ui_weak.upgrade(), operation_weak.upgrade()) {
+            auto_opened.set(false);
             refresh_operation_window(&operation_ui, &state);
             position_operation_window_next_to_main(&ui, &operation_ui);
             let _ = operation_ui.show();
         }
     });
+}
+
+fn should_close_auto_opened_operation_window(auto_opened: bool, app: &AppState) -> bool {
+    auto_opened
+        && !app
+            .operations
+            .iter()
+            .any(|task| operation_has_visible_row(task.state))
 }
 
 fn should_auto_open_operation_window(app: &AppState) -> bool {
@@ -19885,12 +19912,7 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
     let mut rows = app
         .operations
         .iter()
-        .filter(|task| {
-            !matches!(
-                task.state,
-                OperationState::Completed | OperationState::Cancelled
-            )
-        })
+        .filter(|task| operation_has_visible_row(task.state))
         .map(|task| {
             let title = match (app.language, task.kind) {
                 (Language::Chinese, FileOperationKind::CreateFolder) => "新建文件夹",
@@ -20114,6 +20136,10 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
         .collect::<Vec<_>>();
     rows.sort_by_key(|row| (operation_row_rank(row.state), row.id));
     rows
+}
+
+fn operation_has_visible_row(state: OperationState) -> bool {
+    !matches!(state, OperationState::Completed | OperationState::Cancelled)
 }
 
 fn operation_row_rank(state: i32) -> i32 {
@@ -24185,6 +24211,85 @@ mod tests {
             })
             .unwrap();
         assert!(should_auto_open_operation_window(&app));
+    }
+
+    #[test]
+    fn issue_76_auto_opened_operation_window_closes_only_after_successful_rows_are_cleared() {
+        for (kind, item_count) in [
+            (FileOperationKind::RecycleDelete, 1),
+            (FileOperationKind::RecycleDelete, 3),
+            (FileOperationKind::PermanentDelete, 1),
+            (FileOperationKind::PermanentDelete, 3),
+        ] {
+            let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
+            let items = (0..item_count)
+                .map(|index| {
+                    OperationItem::pending(
+                        Some(PathBuf::from(format!("C:/test/item-{index}"))),
+                        None,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let id = app
+                .operations
+                .submit(OperationResource::Local, kind, None, items);
+            app.operations.start_next(OperationResource::Local).unwrap();
+            app.operations.mark_running(id).unwrap();
+
+            assert!(!should_close_auto_opened_operation_window(true, &app));
+
+            app.operations
+                .finish(
+                    id,
+                    OperationState::Completed,
+                    OperationResult {
+                        succeeded: vec![],
+                        skipped: vec![],
+                        failed: vec![],
+                        affected_directories: vec![],
+                    },
+                )
+                .unwrap();
+            assert!(operation_rows(&app).is_empty());
+            assert_eq!(app.operations.prune_transient(Duration::ZERO), 1);
+            assert!(should_close_auto_opened_operation_window(true, &app));
+            assert!(!should_close_auto_opened_operation_window(false, &app));
+        }
+    }
+
+    #[test]
+    fn issue_76_auto_opened_operation_window_keeps_active_and_attention_rows() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
+        let id = app.operations.submit(
+            OperationResource::Local,
+            FileOperationKind::RecycleDelete,
+            None,
+            vec![OperationItem::pending(
+                Some(PathBuf::from("C:/test/running")),
+                None,
+            )],
+        );
+        assert!(!should_close_auto_opened_operation_window(true, &app));
+        app.operations.start_next(OperationResource::Local).unwrap();
+        app.operations.mark_running(id).unwrap();
+        assert!(!should_close_auto_opened_operation_window(true, &app));
+        app.operations.task_mut(id).unwrap().items[0].state = ItemState::Failed;
+        app.operations
+            .finish(
+                id,
+                OperationState::Failed,
+                OperationResult {
+                    succeeded: vec![],
+                    skipped: vec![],
+                    failed: vec![(PathBuf::from("C:/test/running"), "locked".into())],
+                    affected_directories: vec![],
+                },
+            )
+            .unwrap();
+
+        assert_eq!(app.operations.prune_transient(Duration::ZERO), 0);
+        assert!(!operation_rows(&app).is_empty());
+        assert!(!should_close_auto_opened_operation_window(true, &app));
     }
 
     #[test]
