@@ -50,4 +50,13 @@
 - [ ] NanaZip/7-Zip、Git、TortoiseSVN、PowerToys、发送到、属性、打开方式与管理员命令。
 - [ ] 第三方扩展自行显示窗口属于允许边界；基础复制/移动/重命名/删除仍进入 AsterFiles 任务中心。
 
-验收证据放到 artifacts/ui/p2/、artifacts/logs/file-operations/ 和 artifacts/perf/file-operations/。用户提供的首个定位回归截图：C:\Users\LiuYang\AppData\Local\Temp\codex-clipboard-d17953cb-50d2-4539-a4ec-c5c2db873dfc.png。
+## Issue #60 CopyFile2
+
+- [ ] 普通文件、Unicode 与超过 260 字符的长路径：内容、大小、修改时间、只读/隐藏/系统/归档属性正确。
+- [ ] NTFS 备用数据流、扩展属性、压缩文件和 Windows 11 22H2+ 稀疏文件按声明范围保留；符号链接复制链接本身，不递归复制目标。
+- [ ] 覆盖、保留两者、暂停/继续、取消、目标只读和空间不足：正式目标不被半成品破坏，临时项按终态保留或清理。
+- [ ] 跨卷移动仅在目标提交后删除源；模拟源删除失败时显示“目标已完成、源仍存在”，重试不再次复制目标。
+- [ ] SMB 双向分别测普通模式和压缩请求；执行限速、短暂断网和 NAS 重启，记录重试次数、是否恢复及无法恢复时重新复制的原因。
+- [ ] 记录 CopyFile2 与 Robocopy 的同机同数据集结果到 `artifacts/perf/file-operations/`；#42 完成前另记可能无限阻塞的已知边界。
+
+验收证据放到 artifacts/ui/p2/、artifacts/logs/file-operations/ 和 artifacts/perf/file-operations/。用户提供的首个定位回归截图：C:UsersLiuYangAppDataLocalTempcodex-clipboard-d17953cb-50d2-4539-a4ec-c5c2db873dfc.png。

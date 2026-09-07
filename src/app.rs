@@ -15570,7 +15570,7 @@ fn execute_file_operation_request(
                     }
                 }
             }
-            Err(message) => {
+            Err(error) => {
                 let identity = item
                     .source
                     .clone()
@@ -15579,8 +15579,20 @@ fn execute_file_operation_request(
                 if request.cancellation.is_cancelled() {
                     indexed_states.push((item_index, ItemState::Cancelled, None));
                 } else {
-                    failed.push((identity, message.clone()));
-                    indexed_states.push((item_index, ItemState::Failed, Some(message)));
+                    match error {
+                        ExecuteFileOperationError::DestinationCommittedSourceRetained {
+                            destination,
+                            message,
+                        } => {
+                            succeeded.push(destination.clone());
+                            completed_targets.push(destination);
+                            indexed_states.push((item_index, ItemState::Succeeded, Some(message)));
+                        }
+                        ExecuteFileOperationError::Failed(message) => {
+                            failed.push((identity, message.clone()));
+                            indexed_states.push((item_index, ItemState::Failed, Some(message)));
+                        }
+                    }
                 }
             }
         }
@@ -15702,6 +15714,46 @@ fn file_snapshot(path: &Path) -> crate::domain::file_operations::FileSnapshot {
     }
 }
 
+#[derive(Debug)]
+enum ExecuteFileOperationError {
+    Failed(String),
+    DestinationCommittedSourceRetained {
+        destination: PathBuf,
+        message: String,
+    },
+}
+
+impl ExecuteFileOperationError {
+    fn failed_debug(error: impl std::fmt::Debug) -> Self {
+        Self::Failed(format!("{error:?}"))
+    }
+
+    fn from_operation(error: crate::fs::file_operations::OperationError) -> Self {
+        match error {
+            crate::fs::file_operations::OperationError::DestinationCommittedSourceRetained {
+                destination,
+                message,
+                ..
+            } => Self::DestinationCommittedSourceRetained {
+                destination,
+                message,
+            },
+            error => Self::failed_debug(error),
+        }
+    }
+}
+
+impl From<&str> for ExecuteFileOperationError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.to_owned())
+    }
+}
+
+impl From<String> for ExecuteFileOperationError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
 #[allow(clippy::too_many_arguments)]
 fn execute_file_operation_item(
     id: OperationId,
@@ -15715,7 +15767,7 @@ fn execute_file_operation_item(
         crate::domain::file_operations::ConflictAction,
     >,
     conflict_gate: &Arc<Mutex<()>>,
-) -> Result<crate::fs::file_operations::FileOperationReport, String> {
+) -> Result<crate::fs::file_operations::FileOperationReport, ExecuteFileOperationError> {
     if [item.source.as_deref(), item.destination.as_deref()]
         .into_iter()
         .flatten()
@@ -15805,7 +15857,7 @@ fn execute_file_operation_item(
                     }
                     report
                 })
-                .map_err(|error| format!("{error:?}"))
+                .map_err(ExecuteFileOperationError::failed_debug)
         }
         FileOperationKind::Rename => {
             let source = item.source.as_ref().ok_or("missing source")?;
@@ -15827,7 +15879,7 @@ fn execute_file_operation_item(
                     }
                     report
                 })
-                .map_err(|error| format!("{error:?}"))
+                .map_err(ExecuteFileOperationError::failed_debug)
         }
         FileOperationKind::Copy | FileOperationKind::Move => {
             let source = item.source.as_ref().ok_or("missing source")?;
@@ -15870,7 +15922,7 @@ fn execute_file_operation_item(
                     &mut progress,
                 )
             };
-            result.map_err(|error| format!("{error:?}"))
+            result.map_err(ExecuteFileOperationError::from_operation)
         }
         FileOperationKind::RecycleDelete => {
             unreachable!("recycle delete requests are executed as one Shell batch")
@@ -15884,20 +15936,20 @@ fn execute_file_operation_item(
                     &parent.join(".asterfiles-cleanup"),
                     cancel,
                 )
-                .map_err(|error| format!("{error:?}"))?;
+                .map_err(ExecuteFileOperationError::failed_debug)?;
                 if let Some(pending) = report.cleanup_pending.as_ref()
                     && let Err(error) = crate::fs::file_operations::clean_pending(pending, cancel)
                 {
                     let _ = std::fs::rename(pending, path);
-                    return Err(format!(
+                    return Err(ExecuteFileOperationError::Failed(format!(
                         "cleanup pending at {}: {error:?}",
                         display_path(pending)
-                    ));
+                    )));
                 }
                 Ok(report)
             } else {
                 crate::fs::file_operations::permanently_delete(path, cancel)
-                    .map_err(|error| format!("{error:?}"))
+                    .map_err(ExecuteFileOperationError::failed_debug)
             }
         }
         FileOperationKind::FastRemove => {
@@ -15908,15 +15960,15 @@ fn execute_file_operation_item(
                 &parent.join(".asterfiles-cleanup"),
                 cancel,
             )
-            .map_err(|error| format!("{error:?}"))?;
+            .map_err(ExecuteFileOperationError::failed_debug)?;
             if let Some(pending) = report.cleanup_pending.as_ref()
                 && let Err(error) = crate::fs::file_operations::clean_pending(pending, cancel)
             {
                 let _ = std::fs::rename(pending, path);
-                return Err(format!(
+                return Err(ExecuteFileOperationError::Failed(format!(
                     "cleanup pending at {}: {error:?}",
                     display_path(pending)
-                ));
+                )));
             }
             Ok(report)
         }
@@ -24060,6 +24112,7 @@ mod tests {
         assert!(!app.network_discovery_errors.contains_key(&first));
         assert!(app.window(second).is_some());
     }
+
     #[test]
     fn file_operations_use_network_resource_when_either_endpoint_is_unc() {
         let local = OperationItem::pending(

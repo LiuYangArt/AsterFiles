@@ -155,6 +155,19 @@ cargo test issue_61_
 
 10 万小文件场景属于显式人工性能测量，不进入日常测试和统一验证，也不由 Agent 操作应用界面。测量结果写入 `artifacts/perf/file-operations/`，至少记录首个复制开始时间、扫描完成时间、总耗时、原始进度事件数、任务中心模型提交数、主窗口目录模型刷新数和进程 CPU 时间；证据应能判断复制是否早于整树扫描完成、持续进度是否保持设计频率，以及普通进度是否造成无关窗口刷新。
 
+## Issue #60 CopyFile2 专项验证
+
+自动回归不启动窗口：
+
+```powershell
+cargo test issue_60_ -- --nocapture
+cargo test fs::file_operations::tests:: -- --nocapture
+```
+
+专项测试覆盖 CopyFile2 的内容、修改时间、Windows 属性、NTFS 备用数据流、取消清理，以及暂停后对同一临时目标恢复。统一验证继续通过 `cargo test` 纳入这些测试。
+
+真实卷与 SMB 性能证据写入 `artifacts/perf/file-operations/`。每份记录系统版本、源/目标卷类型、数据集、复制模式、首个进度时间、吞吐、CPU、暂停/取消延迟、重试次数、临时项清理、是否从恢复状态继续和结果属性。10 GiB、跨卷、SMB 双向、限速/断网/NAS 重启、压缩/稀疏/符号链接等测试不进入日常验证；它们依赖真实设备，由用户按人工验收清单执行。#42 完成前，SMB 无限阻塞不计为 CopyFile2 层已解决。
+
 ```powershell
 cargo test app::tests::issue_61_100k_small_files_performance_evidence -- --ignored --exact
 ```

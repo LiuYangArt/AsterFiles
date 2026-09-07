@@ -1,14 +1,14 @@
 use std::{
     ffi::{OsStr, OsString},
-    fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    fs, io,
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use crate::domain::file_operations::{CancellationToken, ConflictAction, ConflictCategory};
 
-const COPY_BUFFER_SIZE: usize = 1024 * 1024;
+#[cfg(test)]
+const COPY_TEST_CHUNK_SIZE: usize = 1024 * 1024;
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +59,11 @@ impl FileOperationReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationError {
     Cancelled,
+    DestinationCommittedSourceRetained {
+        source: PathBuf,
+        destination: PathBuf,
+        message: String,
+    },
     InvalidName(NameValidationError),
     SourceInsideDestination,
     DestinationExists(PathBuf),
@@ -321,10 +326,26 @@ fn move_path_with_progress_inner(
         &mut |_| {},
         &mut report,
     )?;
-    remove_entry(source, &CancellationToken::new(), &mut report)?;
-    report.affect(source);
+    remove_source_after_committed_copy(source, &resolution.path, &mut report)?;
     Ok(report)
 }
+
+fn remove_source_after_committed_copy(
+    source: &Path,
+    destination: &Path,
+    report: &mut FileOperationReport,
+) -> Result<(), OperationError> {
+    if let Err(error) = remove_entry(source, &CancellationToken::new(), report) {
+        return Err(OperationError::DestinationCommittedSourceRetained {
+            source: source.to_path_buf(),
+            destination: destination.to_path_buf(),
+            message: format!("目标已完成，源仍存在：{error:?}"),
+        });
+    }
+    report.affect(source);
+    Ok(())
+}
+
 pub fn permanently_delete(
     path: &Path,
     cancel: &CancellationToken,
@@ -657,40 +678,18 @@ fn copy_file_to_new_path(
     progress: &mut FileProgressCallback<'_>,
     report: &mut FileOperationReport,
 ) -> Result<(), OperationError> {
-    let mut input = File::open(source).map_err(|error| OperationError::io(source, error))?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)
-        .map_err(|error| OperationError::io(destination, error))?;
-    let mut copied = 0_u64;
-    let result = (|| {
-        let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
-        loop {
-            check_cancel(cancel)?;
-            let read = input
-                .read(&mut buffer)
-                .map_err(|error| OperationError::io(source, error))?;
-            if read == 0 {
-                break;
+    let copied =
+        crate::platform::windows::copy_file::copy_file(source, destination, cancel, &mut |bytes| {
+            progress(bytes, false, source)
+        })
+        .map_err(|error| match error.kind {
+            crate::platform::windows::copy_file::CopyFileErrorKind::Cancelled => {
+                OperationError::Cancelled
             }
-            output
-                .write_all(&buffer[..read])
-                .map_err(|error| OperationError::io(destination, error))?;
-            copied += read as u64;
-            progress(read as u64, false, source);
-        }
-        output
-            .sync_all()
-            .map_err(|error| OperationError::io(destination, error))?;
-        let permissions = fs::metadata(source)
-            .map_err(|error| OperationError::io(source, error))?
-            .permissions();
-        fs::set_permissions(destination, permissions)
-            .map_err(|error| OperationError::io(destination, error))?;
-        Ok(())
-    })();
-    result?;
+            crate::platform::windows::copy_file::CopyFileErrorKind::Failed => {
+                OperationError::io(destination, error.error)
+            }
+        })?;
     report.bytes += copied;
     progress(0, true, source);
     Ok(())
@@ -1187,7 +1186,7 @@ mod tests {
         let temp = TempDir::new();
         let source = temp.path().join("source.bin");
         let destination = temp.path().join("target.bin");
-        write(&source, &vec![7_u8; COPY_BUFFER_SIZE * 2]);
+        write(&source, &vec![7_u8; COPY_TEST_CHUNK_SIZE * 2]);
         write(&destination, b"old target");
         let cancel = CancellationToken::new();
         let cancel_after_first_chunk = cancel.clone();
@@ -1211,7 +1210,7 @@ mod tests {
         let temp = TempDir::new();
         let source = temp.path().join("source.bin");
         let destination = temp.path().join("target.bin");
-        write(&source, &vec![9_u8; COPY_BUFFER_SIZE * 2]);
+        write(&source, &vec![9_u8; COPY_TEST_CHUNK_SIZE * 2]);
         write(&destination, b"old target");
         let cancel = CancellationToken::new();
         let cancel_after_first_chunk = cancel.clone();
@@ -1233,7 +1232,7 @@ mod tests {
         let temp = TempDir::new();
         let source = temp.path().join("source.bin");
         let destination = temp.path().join("target.bin");
-        let content = vec![3_u8; COPY_BUFFER_SIZE + 17];
+        let content = vec![3_u8; COPY_TEST_CHUNK_SIZE + 17];
         write(&source, &content);
         write(&destination, b"old target");
         let mut increments = Vec::new();
@@ -1252,8 +1251,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fs::read(&destination).unwrap(), content);
-        assert_eq!(report.bytes, (COPY_BUFFER_SIZE + 17) as u64);
-        assert_eq!(increments, vec![COPY_BUFFER_SIZE as u64, 17]);
+        assert_eq!(report.bytes, (COPY_TEST_CHUNK_SIZE + 17) as u64);
+        assert_eq!(increments, vec![COPY_TEST_CHUNK_SIZE as u64, 17]);
         assert!(temporary_siblings(temp.path()).is_empty());
     }
 
@@ -1559,6 +1558,7 @@ mod tests {
         );
         assert!(!destination.exists());
     }
+
     #[test]
     fn move_merges_directories_then_removes_source() {
         let temp = TempDir::new();

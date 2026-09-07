@@ -21,7 +21,8 @@ fn main() {
                 r#"#define ASTERFILES_VERSION_COMMAS {0},{1},{2},{3}
 #define ASTERFILES_VERSION_STRING "{4}"
 #define ASTERFILES_ICON_PATH "{5}"
-#include "{6}"
+#define ASTERFILES_MANIFEST_PATH "{6}"
+#include "{7}"
 "#,
                 version_parts[0],
                 version_parts[1],
@@ -29,12 +30,14 @@ fn main() {
                 version_parts[3],
                 version,
                 resource_path("assets/windows/asterfiles.ico"),
+                resource_path("assets/windows/asterfiles.manifest"),
                 resource_path("assets/windows/asterfiles.rc")
             ),
         )
         .expect("failed to generate Windows version resource");
 
         println!("cargo:rerun-if-changed=assets/windows/asterfiles.rc");
+        println!("cargo:rerun-if-changed=assets/windows/asterfiles.manifest");
         println!("cargo:rerun-if-changed=assets/windows/asterfiles.ico");
         embed_resource::compile(version_resource, embed_resource::NONE)
             .manifest_optional()
