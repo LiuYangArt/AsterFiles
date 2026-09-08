@@ -1355,6 +1355,12 @@ impl TabSession {
         let direction = self.sort_direction;
         self.pending_entries
             .sort_unstable_by(|left, right| compare_entries(left, right, field, direction));
+        self.entry_indices = self
+            .pending_entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.id, index))
+            .collect();
     }
     pub fn resort_entries(&mut self) {
         let field = self.sort_field;
@@ -2169,6 +2175,30 @@ mod tests {
         assert_eq!(
             session.visible_entry(EntryId(1)).unwrap().open_target,
             Some(target)
+        );
+    }
+    #[test]
+    fn issue_64_pending_sort_keeps_entry_indices_current() {
+        let mut directory_link = entry(1, "z-folder.lnk", EntryKind::File, Some(4));
+        directory_link.path = PathBuf::from(r"C:\links\z-folder.lnk");
+        let mut other = entry(2, "a-file.txt", EntryKind::File, Some(4));
+        other.path = PathBuf::from(r"C:\links\a-file.txt");
+        let mut session = TabSession::new(TabId(1));
+        session.append_pending(vec![directory_link, other]);
+        assert!(session.apply_shortcut_target(
+            EntryId(1),
+            Path::new(r"C:\links\z-folder.lnk"),
+            PathBuf::from(r"C:\target"),
+            Some(true)
+        ));
+        session.sort_pending();
+        assert_eq!(
+            session.visible_entry(EntryId(1)).unwrap().display_name,
+            "z-folder.lnk"
+        );
+        assert_eq!(
+            session.visible_entry(EntryId(2)).unwrap().display_name,
+            "a-file.txt"
         );
     }
     #[test]

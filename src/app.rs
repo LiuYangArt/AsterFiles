@@ -19234,9 +19234,10 @@ fn visible_shortcut_entry_ids(ui: &AppWindow, app: &AppState, tab: &TabSession) 
             .max(file_row_height(view_mode))
             / file_row_height(view_mode))
         .ceil() as usize;
-        let start = ((-ui.get_file_viewport_y()).max(0.0) / file_row_height(view_mode)).floor()
+        let start = (((-ui.get_file_viewport_y()).max(0.0) / file_row_height(view_mode)).floor()
             as usize
-            * columns;
+            * columns)
+            .min(entries.len());
         let prefetch = visible_rows.saturating_mul(columns).max(1);
         return entries[start.saturating_sub(prefetch)..entries.len().min(start + prefetch * 2)]
             .iter()
@@ -19424,8 +19425,12 @@ fn apply_shortcut_event(state: &SharedSessions, event: ShortcutEvent) -> Option<
         event.target.path,
         event.target.is_directory,
     );
-    if changed && was_partial {
-        tab.sort_pending();
+    if changed {
+        if was_partial {
+            tab.sort_pending();
+        } else {
+            tab.resort_entries();
+        }
     }
     changed.then_some((event.request.tab_id, event.request.entry_id))
 }
