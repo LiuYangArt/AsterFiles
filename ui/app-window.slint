@@ -849,6 +849,7 @@ export component AppWindow inherits Window {
     in property <string> text-drop-link: "在此处创建快捷方式";
     in property <string> text-drop-cancel: "取消";
     in-out property <string> rename-input: "";
+    in property <int> rename-selection-end: 0;
     in property <int> rename-entry-id: -1;
     in property <bool> rename-editing: false;
     in-out property <bool> rename-submitting: false;
@@ -1834,7 +1835,7 @@ single-line: true;
 vertical-alignment: center;
 init => {
     self.focus();
-    self.select-all();
+    self.set-selection-offsets(0, root.rename-selection-end);
 }
 accepted => {
     if !root.rename-submitting {

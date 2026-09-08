@@ -1559,7 +1559,7 @@ struct PendingRenameUi {
     request_id: RequestId,
     entry_id: EntryId,
     input: String,
-    extension: Option<std::ffi::OsString>,
+    selection_end: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1842,7 +1842,7 @@ struct AppState {
     search_view: SearchViewPreference,
     operations: OperationManager,
     operation_errors: Vec<String>,
-    rename_targets: HashMap<WindowId, (TabId, EntryId, Option<std::ffi::OsString>)>,
+    rename_targets: HashMap<WindowId, (TabId, EntryId)>,
     focus_after_refresh: HashMap<TabId, PendingFocus>,
     pending_rename_ui: HashMap<WindowId, PendingRenameUi>,
     active_operation_directories: HashMap<PathBuf, usize>,
@@ -2743,7 +2743,7 @@ impl AppState {
         self.pending_rename_ui
             .retain(|_, pending| pending.tab_id != closing);
         self.rename_targets
-            .retain(|_, (tab_id, _, _)| *tab_id != closing);
+            .retain(|_, (tab_id, _)| *tab_id != closing);
         self.active_window_state_mut().tab_order.remove(index);
         if closing_was_active {
             let window = self.active_window_state_mut();
@@ -5760,31 +5760,17 @@ fn begin_rename_ui(weak: &slint::Weak<AppWindow>, state: &WindowSessions) {
         }
         let id = app.active().selected[0];
         let entry = app.active().visible_entry(id).cloned();
-        let name = entry.as_ref().map(|entry| {
-            if entry.kind == crate::domain::EntryKind::File {
-                entry
-                    .path
-                    .file_stem()
-                    .unwrap_or(&entry.original_name)
-                    .to_string_lossy()
-                    .into_owned()
-            } else {
-                entry.display_name.clone()
-            }
-        });
-        let extension = entry
-            .filter(|entry| entry.kind == crate::domain::EntryKind::File)
-            .and_then(|entry| entry.path.extension().map(std::ffi::OsStr::to_os_string));
+        let rename = entry.as_ref().map(rename_input_for_entry);
         let tab_id = app.active_window_state().active_tab;
-        app.rename_targets
-            .insert(state.window_id, (tab_id, id, extension));
-        name.map(|name| (id, name))
+        app.rename_targets.insert(state.window_id, (tab_id, id));
+        rename.map(|(input, selection_end)| (id, input, selection_end))
     };
-    if let Some((id, name)) = target
+    if let Some((id, input, selection_end)) = target
         && let Some(ui) = weak.upgrade()
     {
         ui.set_rename_entry_id(id.0 as i32);
-        ui.set_rename_input(name.into());
+        ui.set_rename_input(input.into());
+        ui.set_rename_selection_end(selection_end as i32);
         ui.set_rename_editing(true);
     }
 }
@@ -5831,23 +5817,18 @@ fn submit_rename(
             .map_err(|error| rename_validation_message(app.language, error))?;
         app.rename_targets
             .get(&state.window_id)
-            .and_then(|(tab_id, id, extension)| {
+            .and_then(|(tab_id, id)| {
                 app.window(state.window_id)?
                     .tabs
                     .get(tab_id)?
                     .visible_entry(*id)
                     .and_then(|entry| {
                         entry.path.parent().map(|parent| {
-                            let mut new_name = std::ffi::OsString::from(name);
-                            if let Some(extension) = extension.as_ref() {
-                                new_name.push(".");
-                                new_name.push(extension);
-                            }
                             (
                                 *tab_id,
                                 OperationItem::pending(
                                     Some(entry.path.clone()),
-                                    Some(parent.join(new_name)),
+                                    Some(parent.join(name)),
                                 ),
                             )
                         })
@@ -16313,20 +16294,17 @@ fn detect_unique_created_path(
     added.next().is_none().then_some(path)
 }
 
-fn rename_input_for_entry(entry: &FileEntry) -> (String, Option<std::ffi::OsString>) {
-    if entry.kind == crate::domain::EntryKind::File {
-        (
-            entry
-                .path
-                .file_stem()
-                .unwrap_or(&entry.original_name)
-                .to_string_lossy()
-                .into_owned(),
-            entry.path.extension().map(std::ffi::OsStr::to_os_string),
-        )
+fn rename_input_for_entry(entry: &FileEntry) -> (String, usize) {
+    let input = entry.original_name.to_string_lossy().into_owned();
+    let selection_end = if entry.kind == crate::domain::EntryKind::File {
+        input
+            .rfind('.')
+            .filter(|index| *index > 0)
+            .unwrap_or(input.len())
     } else {
-        (entry.display_name.clone(), None)
-    }
+        input.len()
+    };
+    (input, selection_end)
 }
 
 fn spawn_file_operation_worker() -> (
@@ -18307,7 +18285,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                         .tab(tab_id)
                         .and_then(|tab| tab.focused.and_then(|id| tab.visible_entry(id).cloned()))
                 {
-                    let (input, extension) = rename_input_for_entry(&entry);
+                    let (input, selection_end) = rename_input_for_entry(&entry);
                     app.pending_rename_ui.insert(
                         window_id,
                         PendingRenameUi {
@@ -18315,7 +18293,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                             request_id,
                             entry_id: entry.id,
                             input,
-                            extension,
+                            selection_end,
                         },
                     );
                 }
@@ -18327,7 +18305,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                         .cloned()
                 {
                     app.focus_after_refresh.remove(&tab_id);
-                    let (input, extension) = rename_input_for_entry(&entry);
+                    let (input, selection_end) = rename_input_for_entry(&entry);
                     app.pending_rename_ui.insert(
                         pending.window_id,
                         PendingRenameUi {
@@ -18335,7 +18313,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                             request_id,
                             entry_id: entry.id,
                             input,
-                            extension,
+                            selection_end,
                         },
                     );
                 }
@@ -21174,13 +21152,12 @@ fn apply_pending_rename_ui(ui: &AppWindow, state: &SharedSessions, window_id: Wi
     });
     if let Some(pending) = pending {
         if let Ok(mut app) = state.lock() {
-            app.rename_targets.insert(
-                window_id,
-                (pending.tab_id, pending.entry_id, pending.extension.clone()),
-            );
+            app.rename_targets
+                .insert(window_id, (pending.tab_id, pending.entry_id));
         }
         ui.set_rename_entry_id(pending.entry_id.0 as i32);
         ui.set_rename_input(pending.input.into());
+        ui.set_rename_selection_end(pending.selection_end as i32);
         ui.set_rename_submitting(false);
         ui.set_rename_editing(true);
     }
@@ -28075,6 +28052,70 @@ mod tests {
         );
         assert!(!keyboard_shortcuts_suppressed(false, false));
         assert!(keyboard_shortcuts_suppressed(true, false));
+    }
+    #[test]
+    fn rename_input_keeps_full_name_and_selects_the_windows_stem() {
+        let cases = [
+            ("aaa.txt", crate::domain::EntryKind::File, "aaa.txt", 3),
+            (
+                "archive.tar.gz",
+                crate::domain::EntryKind::File,
+                "archive.tar.gz",
+                11,
+            ),
+            (
+                ".gitignore",
+                crate::domain::EntryKind::File,
+                ".gitignore",
+                10,
+            ),
+            ("README", crate::domain::EntryKind::File, "README", 6),
+            (
+                "folder.name",
+                crate::domain::EntryKind::Directory,
+                "folder.name",
+                11,
+            ),
+            ("报告.txt", crate::domain::EntryKind::File, "报告.txt", 6),
+        ];
+        for (name, kind, expected_input, expected_selection_end) in cases {
+            let mut entry = focus_entry(1, &format!(r"C:\target\{name}"));
+            entry.kind = kind;
+            assert_eq!(
+                rename_input_for_entry(&entry),
+                (expected_input.to_owned(), expected_selection_end)
+            );
+        }
+    }
+    #[test]
+    fn rename_submission_uses_the_complete_edited_name_for_local_and_unc_paths() {
+        for (directory, source, expected) in [
+            (r"C:\target", r"C:\target\old.txt", r"C:\target\new.md"),
+            (
+                r"\\server\share",
+                r"\\server\share\old.txt",
+                r"\\server\share\new.md",
+            ),
+        ] {
+            let mut app = AppState::new_for_test(vec![PathBuf::from(directory)], 0, [0, 1, 2, 3]);
+            let window_id = app.active_window;
+            let tab_id = app.active_window_state().active_tab;
+            let tab = app.tab_mut(tab_id).unwrap();
+            tab.replace_entries(vec![focus_entry(1, source)]);
+            tab.selected = vec![EntryId(1)];
+            app.rename_targets.insert(window_id, (tab_id, EntryId(1)));
+            let shared = Arc::new(Mutex::new(app));
+            let state = WindowSessions::new(shared.clone(), window_id);
+            let (sender, receiver) = mpsc::channel();
+
+            submit_rename(&state, &sender, "new.md").unwrap();
+
+            let request = receiver.try_recv().unwrap();
+            assert_eq!(
+                request.items[0].destination.as_deref(),
+                Some(Path::new(expected))
+            );
+        }
     }
     #[test]
     fn permission_page_has_actionable_copy_in_both_languages() {
