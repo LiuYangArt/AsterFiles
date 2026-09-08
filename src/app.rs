@@ -56,6 +56,7 @@ slint::include_modules!();
 const WORKER_COUNT: usize = 4;
 const NETWORK_WORKER_COUNT: usize = 2;
 const ICON_WORKER_COUNT: usize = 2;
+const SHORTCUT_QUEUE_CAPACITY: usize = 128;
 const DIRECTORY_EVENT_INTERVAL: Duration = Duration::from_millis(16);
 const REBUILT_PROJECTION_BATCH_SIZE: usize = 256;
 const THUMBNAIL_CACHE_CAPACITY: usize = 128;
@@ -927,6 +928,7 @@ struct WorkerSenders {
     shell_menu: platform::windows::context_menu::ShellMenuWorker,
     everything: mpsc::Sender<EverythingRequest>,
     icon: mpsc::Sender<IconRequest>,
+    shortcut: mpsc::SyncSender<ShortcutRequest>,
     network_login: slint::Weak<NetworkLoginWindow>,
     network_login_state: Arc<Mutex<NetworkLoginCoordinator>>,
     network_location_rename: slint::Weak<NetworkLocationRenameWindow>,
@@ -1820,6 +1822,8 @@ struct AppState {
     large_icon_cache: HashMap<(PathBuf, u32), platform::windows_shell_icons::ShellIconRgba>,
     large_icon_cache_order: VecDeque<(PathBuf, u32)>,
     thumbnail_requests: std::collections::HashSet<(TabId, RequestId, PathBuf, u32)>,
+    shortcut_requests: HashSet<ShortcutRequest>,
+    shortcut_completed: HashSet<ShortcutRequest>,
     sidebar: Vec<KnownLocation>,
     quick_access_generation: u64,
     quick_access_pending: HashSet<PathBuf>,
@@ -2057,6 +2061,8 @@ impl AppState {
             large_icon_cache: HashMap::new(),
             large_icon_cache_order: VecDeque::new(),
             thumbnail_requests: std::collections::HashSet::new(),
+            shortcut_requests: HashSet::new(),
+            shortcut_completed: HashSet::new(),
             sidebar: Vec::new(),
             quick_access_generation: 0,
             quick_access_pending: HashSet::new(),
@@ -3417,6 +3423,20 @@ struct IconRequest {
     requested_px: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ShortcutRequest {
+    tab_id: TabId,
+    request_id: RequestId,
+    entry_id: EntryId,
+    path: PathBuf,
+}
+
+#[derive(Debug)]
+struct ShortcutEvent {
+    request: ShortcutRequest,
+    target: platform::ShortcutTarget,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IconTarget {
     Entry(EntryId),
@@ -3887,6 +3907,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     let (everything_sender, everything_receiver) =
         spawn_everything_worker(everything_config, state.clone());
     let (icon_sender, icon_receiver) = spawn_icon_workers(ICON_WORKER_COUNT, state.clone());
+    let (shortcut_sender, shortcut_receiver) = spawn_shortcut_worker(state.clone());
     let (operation_sender, operation_receiver) = spawn_file_operation_worker();
     let (clipboard_sender, clipboard_receiver) = spawn_clipboard_worker();
     let (clipboard_listener, clipboard_notifications) =
@@ -3906,6 +3927,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         shell_menu: shell_menu_worker.clone(),
         everything: everything_sender.clone(),
         icon: icon_sender.clone(),
+        shortcut: shortcut_sender.clone(),
         network_login: network_login_ui.as_weak(),
         network_login_state: network_login.clone(),
         network_location_rename: network_location_rename_ui.as_weak(),
@@ -3936,6 +3958,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         clipboard_sender,
         everything_sender.clone(),
         icon_sender.clone(),
+        shortcut_sender.clone(),
         shell_menu_worker.clone(),
         quick_menu.clone(),
         scoped_state.clone(),
@@ -3997,6 +4020,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         &ui,
         event_receiver,
         icon_sender,
+        shortcut_sender.clone(),
         everything_sender.clone(),
         state.clone(),
     );
@@ -4012,6 +4036,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         EverythingRequest::TestConnection(0)
     });
     start_icon_event_pump(&ui, icon_receiver, state.clone());
+    start_shortcut_event_pump(&ui, shortcut_receiver, state.clone());
     start_file_operation_event_pump(
         &ui,
         &operation_ui,
@@ -4588,6 +4613,7 @@ fn install_app_window_at(
         senders.clipboard.clone(),
         senders.everything.clone(),
         senders.icon.clone(),
+        senders.shortcut.clone(),
         senders.shell_menu.clone(),
         quick_menu.clone(),
         scoped.clone(),
@@ -9677,6 +9703,7 @@ fn wire_callbacks(
     clipboard_sender: mpsc::Sender<ClipboardRequest>,
     everything_sender: mpsc::Sender<EverythingRequest>,
     icon_sender: mpsc::Sender<IconRequest>,
+    shortcut_sender: mpsc::SyncSender<ShortcutRequest>,
     shell_menu_worker: platform::windows::context_menu::ShellMenuWorker,
     quick_menu: SharedQuickMenu,
     state: WindowSessions,
@@ -9774,6 +9801,8 @@ fn wire_callbacks(
 
     let state_for_folder_range = state.clone();
     let everything_for_folder_range = everything_sender.clone();
+    let shortcut_for_folder_range = shortcut_sender.clone();
+    let weak_for_folder_range = ui.as_weak();
     ui.on_request_folder_size_range(move |viewport_y, viewport_height| {
         let target = state_for_folder_range.lock().ok().and_then(|app| {
             let tab = app.active();
@@ -9788,6 +9817,15 @@ fn wire_callbacks(
                 viewport_y,
                 viewport_height,
             );
+            if let Some(ui) = weak_for_folder_range.upgrade() {
+                submit_visible_shortcuts(
+                    &shortcut_for_folder_range,
+                    &state_for_folder_range.shared,
+                    &ui,
+                    tab_id,
+                    request_id,
+                );
+            }
         }
     });
     let weak = ui.as_weak();
@@ -10584,6 +10622,7 @@ fn wire_callbacks(
         shell_menu: shell_menu_worker.clone(),
         everything: everything_sender.clone(),
         icon: icon_sender.clone(),
+        shortcut: shortcut_sender.clone(),
         network_login: network_login_ui.clone(),
         network_login_state: network_login_state.clone(),
         network_location_rename: network_location_rename_ui.clone(),
@@ -17556,6 +17595,7 @@ fn start_event_pump(
     ui: &AppWindow,
     receiver: Arc<Mutex<mpsc::Receiver<DirectoryEvent>>>,
     icon_sender: mpsc::Sender<IconRequest>,
+    shortcut_sender: mpsc::SyncSender<ShortcutRequest>,
     everything_sender: mpsc::Sender<EverythingRequest>,
     state: SharedSessions,
 ) {
@@ -17571,6 +17611,7 @@ fn start_event_pump(
             };
             let state = state.clone();
             let icon_sender = icon_sender.clone();
+            let shortcut_sender = shortcut_sender.clone();
             let everything_sender = everything_sender.clone();
             if weak
                 .upgrade_in_event_loop(move |ui| {
@@ -17639,6 +17680,20 @@ fn start_event_pump(
                         if !network_tab {
                             defer_grid_thumbnails(state.clone(), tab_id, icon_sender.clone());
                         }
+                        if let Some(target_ui) = state
+                            .lock()
+                            .ok()
+                            .and_then(|app| app.window_for_tab(tab_id))
+                            .and_then(window_ui)
+                        {
+                            submit_visible_shortcuts(
+                                &shortcut_sender,
+                                &state,
+                                &target_ui,
+                                tab_id,
+                                request_id,
+                            );
+                        }
                     } else {
                         if let Some((tab_id, request_id)) = finished.filter(|_| !network_tab) {
                             let viewport = state
@@ -17664,6 +17719,20 @@ fn start_event_pump(
                         }
                         if let Some((tab_id, request_id)) = finished {
                             reveal_focused_entry(&ui, &state, tab_id, request_id);
+                            if let Some(target_ui) = state
+                                .lock()
+                                .ok()
+                                .and_then(|app| app.window_for_tab(tab_id))
+                                .and_then(window_ui)
+                            {
+                                submit_visible_shortcuts(
+                                    &shortcut_sender,
+                                    &state,
+                                    &target_ui,
+                                    tab_id,
+                                    request_id,
+                                );
+                            }
                         }
                         if network_root_finished {
                             platform::windows::network::record_runtime_event(
@@ -19147,6 +19216,248 @@ fn submit_visible_folder_sizes(
         }
     };
     submit_folder_size_queries(sender, state, tab_id, queries);
+}
+
+fn visible_shortcut_entry_ids(ui: &AppWindow, app: &AppState, tab: &TabSession) -> Vec<EntryId> {
+    let entries = tab.visible_entries();
+    let view_mode = app
+        .view_mode_for_tab(tab.id)
+        .unwrap_or(app.default_directory_view.view_mode);
+    if matches!(tab.load_state, LoadState::Loading | LoadState::Partial) {
+        let columns = if view_mode.uses_grid_layout() {
+            ui.get_grid_column_count().max(1) as usize
+        } else {
+            1
+        };
+        let visible_rows = (ui
+            .get_file_viewport_height()
+            .max(file_row_height(view_mode))
+            / file_row_height(view_mode))
+        .ceil() as usize;
+        let start = ((-ui.get_file_viewport_y()).max(0.0) / file_row_height(view_mode)).floor()
+            as usize
+            * columns;
+        let prefetch = visible_rows.saturating_mul(columns).max(1);
+        return entries[start.saturating_sub(prefetch)..entries.len().min(start + prefetch * 2)]
+            .iter()
+            .map(|entry| entry.id)
+            .collect();
+    }
+    let groups = directory_group_projections(app, tab, tab.visible_entries());
+    let row_height = file_row_height(view_mode);
+    let viewport_top = (-ui.get_file_viewport_y()).max(0.0);
+    let viewport_height = ui.get_file_viewport_height().max(row_height);
+    let request_top = (viewport_top - viewport_height).max(0.0) as u64;
+    let request_bottom = (viewport_top + viewport_height * 2.0) as u64;
+    let mut ids = Vec::new();
+    if view_mode.uses_grid_layout() {
+        let projection = IconProjection::from_groups(
+            &groups,
+            ui.get_grid_column_count().max(1) as usize,
+            group_header_height(&groups),
+            row_height as u64,
+        );
+        for (index, row) in projection.rows.iter().enumerate() {
+            let Some(top) = projection.offsets.row_start(index) else {
+                continue;
+            };
+            if top > request_bottom {
+                break;
+            }
+            if top.saturating_add(row_height as u64) < request_top {
+                continue;
+            }
+            if let IconVisualRow::Entries { entries, .. } = row {
+                ids.extend(entries.iter().copied());
+            }
+        }
+    } else {
+        let projection =
+            ListProjection::from_groups(&groups, group_header_height(&groups), row_height as u64);
+        for (index, row) in projection.rows.iter().enumerate() {
+            let Some(top) = projection.offsets.row_start(index) else {
+                continue;
+            };
+            if top > request_bottom {
+                break;
+            }
+            if top.saturating_add(row_height as u64) < request_top {
+                continue;
+            }
+            if let ListVisualRow::Entry { entry_id } = row {
+                ids.push(*entry_id);
+            }
+        }
+    }
+    ids
+}
+
+fn submit_visible_shortcuts(
+    sender: &mpsc::SyncSender<ShortcutRequest>,
+    state: &SharedSessions,
+    ui: &AppWindow,
+    tab_id: TabId,
+    request_id: RequestId,
+) {
+    let requests = {
+        let mut app = state.lock().expect("app state mutex is not poisoned");
+        if !app.tab(tab_id).is_some_and(|tab| {
+            tab.latest_request == request_id && tab.page_source == PageSource::Directory
+        }) {
+            return;
+        }
+        app.shortcut_requests
+            .retain(|request| request.tab_id != tab_id || request.request_id == request_id);
+        app.shortcut_completed
+            .retain(|request| request.tab_id != tab_id || request.request_id == request_id);
+        let tab = app.tab(tab_id).expect("validated tab exists");
+        let ids = visible_shortcut_entry_ids(ui, &app, tab);
+        let candidates = ids
+            .into_iter()
+            .filter_map(|entry_id| {
+                let entry = tab.visible_entry(entry_id)?;
+                (entry.open_target.is_none()
+                    && entry
+                        .path
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk")))
+                .then(|| ShortcutRequest {
+                    tab_id,
+                    request_id,
+                    entry_id,
+                    path: entry.path.clone(),
+                })
+            })
+            .filter(|request| {
+                !app.shortcut_requests.contains(request)
+                    && !app.shortcut_completed.contains(request)
+            })
+            .collect::<Vec<_>>();
+        for request in &candidates {
+            app.shortcut_requests.insert(request.clone());
+        }
+        candidates
+    };
+    for request in requests {
+        if sender.try_send(request.clone()).is_err()
+            && let Ok(mut app) = state.lock()
+        {
+            app.shortcut_requests.remove(&request);
+        }
+    }
+}
+
+fn spawn_shortcut_worker(
+    state: SharedSessions,
+) -> (
+    mpsc::SyncSender<ShortcutRequest>,
+    mpsc::Receiver<ShortcutEvent>,
+) {
+    let (request_sender, request_receiver) =
+        mpsc::sync_channel::<ShortcutRequest>(SHORTCUT_QUEUE_CAPACITY);
+    let (event_sender, event_receiver) = mpsc::channel::<ShortcutEvent>();
+    thread::spawn(move || {
+        set_current_thread_low_priority();
+        while let Ok(request) = request_receiver.recv() {
+            let current = state.lock().ok().is_some_and(|app| {
+                app.tab(request.tab_id).is_some_and(|tab| {
+                    tab.latest_request == request.request_id
+                        && tab
+                            .visible_entry(request.entry_id)
+                            .is_some_and(|entry| entry.path == request.path)
+                })
+            });
+            if !current {
+                if let Ok(mut app) = state.lock() {
+                    app.shortcut_requests.remove(&request);
+                    app.shortcut_completed.insert(request);
+                }
+                continue;
+            }
+            match platform::resolve_shortcut_target(&request.path) {
+                Ok(Some(target)) if target.is_directory != Some(false) => {
+                    if event_sender
+                        .send(ShortcutEvent { request, target })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                _ => {
+                    if let Ok(mut app) = state.lock() {
+                        app.shortcut_requests.remove(&request);
+                        app.shortcut_completed.insert(request);
+                    }
+                }
+            }
+        }
+    });
+    (request_sender, event_receiver)
+}
+
+#[cfg(windows)]
+fn set_current_thread_low_priority() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+    };
+
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
+#[cfg(not(windows))]
+fn set_current_thread_low_priority() {}
+
+fn apply_shortcut_event(state: &SharedSessions, event: ShortcutEvent) -> Option<(TabId, EntryId)> {
+    let mut app = state.lock().ok()?;
+    app.shortcut_requests.remove(&event.request);
+    app.shortcut_completed.insert(event.request.clone());
+    let tab = app.tab_mut(event.request.tab_id)?;
+    if !tab.accepts(event.request.request_id) || tab.page_source != PageSource::Directory {
+        return None;
+    }
+    let was_partial = matches!(tab.load_state, LoadState::Loading | LoadState::Partial);
+    let changed = tab.apply_shortcut_target(
+        event.request.entry_id,
+        &event.request.path,
+        event.target.path,
+        event.target.is_directory,
+    );
+    if changed && was_partial {
+        tab.sort_pending();
+    }
+    changed.then_some((event.request.tab_id, event.request.entry_id))
+}
+
+fn start_shortcut_event_pump(
+    ui: &AppWindow,
+    receiver: mpsc::Receiver<ShortcutEvent>,
+    state: SharedSessions,
+) {
+    let weak = ui.as_weak();
+    thread::spawn(move || {
+        while let Ok(event) = receiver.recv() {
+            let state = state.clone();
+            if weak
+                .upgrade_in_event_loop(move |ui| {
+                    if let Some((tab_id, entry_id)) = apply_shortcut_event(&state, event) {
+                        if let Some(window_id) =
+                            state.lock().ok().and_then(|app| app.window_for_tab(tab_id))
+                            && window_ui(window_id).is_some()
+                        {
+                            refresh_tab_window(&state, tab_id);
+                        } else {
+                            update_file_rows(&ui, &state, tab_id, &HashSet::from([entry_id]));
+                        }
+                    }
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
 }
 fn spawn_icon_workers(
     worker_count: usize,
@@ -28475,6 +28786,69 @@ mod tests {
         assert_eq!(
             classify_error(io::ErrorKind::TimedOut),
             LoadState::Disconnected
+        );
+    }
+
+    #[test]
+    fn issue_64_shortcut_event_rejects_stale_request_and_reused_entry_id() {
+        let root = PathBuf::from(r"C:\links");
+        let mut app = AppState::new_for_test(vec![root.clone()], 0, [0, 1, 2, 3]);
+        let tab_id = app.active().id;
+        let request_id = app.active().latest_request;
+        let mut item = focus_entry(1, r"C:\links\docs.lnk");
+        item.kind = crate::domain::EntryKind::File;
+        app.active_window_state_mut()
+            .tabs
+            .get_mut(&tab_id)
+            .unwrap()
+            .replace_entries(vec![item]);
+        let state = Arc::new(Mutex::new(app));
+        let request = ShortcutRequest {
+            tab_id,
+            request_id,
+            entry_id: EntryId(1),
+            path: PathBuf::from(r"C:\links\stale.lnk"),
+        };
+        assert!(
+            apply_shortcut_event(
+                &state,
+                ShortcutEvent {
+                    request,
+                    target: platform::ShortcutTarget {
+                        path: PathBuf::from(r"C:\docs"),
+                        is_directory: Some(true),
+                    },
+                }
+            )
+            .is_none()
+        );
+
+        state
+            .lock()
+            .unwrap()
+            .active_window_state_mut()
+            .tabs
+            .get_mut(&tab_id)
+            .unwrap()
+            .latest_request = RequestId(request_id.0 + 1);
+        let request = ShortcutRequest {
+            tab_id,
+            request_id,
+            entry_id: EntryId(1),
+            path: PathBuf::from(r"C:\links\docs.lnk"),
+        };
+        assert!(
+            apply_shortcut_event(
+                &state,
+                ShortcutEvent {
+                    request,
+                    target: platform::ShortcutTarget {
+                        path: PathBuf::from(r"C:\docs"),
+                        is_directory: Some(true),
+                    },
+                }
+            )
+            .is_none()
         );
     }
 }

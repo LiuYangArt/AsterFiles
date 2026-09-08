@@ -142,6 +142,22 @@ cargo test issue_62_ -- --nocapture
 
 产物一次覆盖本地与网络运行任务、各资源域排队、冲突等待、暂停、部分完成和失败重试，并记录逐项操作能力、失败摘要、速度/剩余时间准备状态及“关闭窗口会取消全部活动任务”语义。真实视觉、键盘和无障碍交互仍由用户手动验收。
 
+## Issue #64 目录首批与快捷方式解析
+
+专项自动测试不打开窗口：
+
+```powershell
+cargo test issue_64_ -- --nocapture
+```
+
+目录枚举直接复用 Windows 枚举返回的普通条目元数据，只对符号链接和 junction 等重解析点进行一次跟随读取。`.lnk` 不再阻塞首批目录批次，而由独立有界单工作线程队列处理；只请求当前可见范围及前后一屏，执行前和回填时均校验 `TabId + RequestId + EntryId + 原始路径`，成功后只更新对应条目和行。首批 32、后续 256 的批次大小保持不变。
+
+10 万普通文件与大量快捷方式的显式性能测量写入 `artifacts/perf/directory-loading/`，记录首批耗时、完整枚举耗时、跟随元数据读取数、快捷方式提交数和完成数。该测量不进入日常统一验证，也不得自动操作 AsterFiles UI。
+
+```powershell
+cargo test fs::directory_reader::tests::issue_64_directory_loading_performance_evidence -- --ignored --exact --nocapture
+```
+
 ## Issue #61 大目录复制流水线
 
 专项无界面测试运行：

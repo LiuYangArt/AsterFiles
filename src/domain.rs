@@ -1176,6 +1176,28 @@ impl TabSession {
             .and_then(|index| self.visible_entries().get(index))
     }
 
+    pub fn apply_shortcut_target(
+        &mut self,
+        entry_id: EntryId,
+        original_path: &Path,
+        target: PathBuf,
+        is_directory: Option<bool>,
+    ) -> bool {
+        let Some(index) = self.visible_entry_index(entry_id) else {
+            return false;
+        };
+        if matches!(self.load_state, LoadState::Loading | LoadState::Partial) {
+            return self.pending_entries.get_mut(index).is_some_and(|entry| {
+                entry.set_shortcut_target(entry_id, original_path, target, is_directory)
+            });
+        }
+        Arc::make_mut(&mut self.entries)
+            .get_mut(index)
+            .is_some_and(|entry| {
+                entry.set_shortcut_target(entry_id, original_path, target, is_directory)
+            })
+    }
+
     pub fn clear_selection(&mut self) {
         self.selected.clear();
         self.focused = None;
@@ -1515,6 +1537,21 @@ impl FileEntry {
             return false;
         }
         self.folder_size = state;
+        true
+    }
+
+    pub fn set_shortcut_target(
+        &mut self,
+        entry_id: EntryId,
+        original_path: &Path,
+        target: PathBuf,
+        is_directory: Option<bool>,
+    ) -> bool {
+        if self.id != entry_id || self.path != original_path || is_directory == Some(false) {
+            return false;
+        }
+        self.kind = EntryKind::Directory;
+        self.open_target = Some(target);
         true
     }
 }
@@ -2088,6 +2125,51 @@ mod tests {
         ));
         assert!(item.set_folder_size(EntryId(3), &original, FolderSizeState::Value(0)));
         assert_eq!(item.folder_size, FolderSizeState::Value(0));
+    }
+    #[test]
+    fn issue_64_shortcut_update_requires_entry_identity_path_and_directory_target() {
+        let original = PathBuf::from(r"C:\links\docs.lnk");
+        let target = PathBuf::from(r"C:\docs");
+        let mut item = entry(3, "docs.lnk", EntryKind::File, Some(4));
+        item.path = original.clone();
+        assert!(!item.set_shortcut_target(EntryId(4), &original, target.clone(), Some(true)));
+        assert!(!item.set_shortcut_target(
+            EntryId(3),
+            Path::new(r"C:\links\other.lnk"),
+            target.clone(),
+            Some(true)
+        ));
+        assert!(!item.set_shortcut_target(EntryId(3), &original, target.clone(), Some(false)));
+        assert!(item.set_shortcut_target(EntryId(3), &original, target.clone(), None));
+        assert_eq!(item.kind, EntryKind::Directory);
+        assert_eq!(item.open_target, Some(target));
+    }
+
+    #[test]
+    fn issue_64_shortcut_update_applies_to_partial_and_committed_models() {
+        let path = PathBuf::from(r"C:\links\docs.lnk");
+        let target = PathBuf::from(r"C:\docs");
+        let mut pending = entry(1, "docs.lnk", EntryKind::File, Some(4));
+        pending.path = path.clone();
+        let mut session = TabSession::new(TabId(1));
+        session.append_pending(vec![pending]);
+        assert!(session.apply_shortcut_target(EntryId(1), &path, target.clone(), Some(true)));
+        assert_eq!(
+            session.visible_entry(EntryId(1)).unwrap().kind,
+            EntryKind::Directory
+        );
+        session.commit_pending();
+        assert!(!session.apply_shortcut_target(
+            EntryId(1),
+            Path::new(r"C:\links\stale.lnk"),
+            target.clone(),
+            Some(true)
+        ));
+        assert!(session.apply_shortcut_target(EntryId(1), &path, target.clone(), Some(true)));
+        assert_eq!(
+            session.visible_entry(EntryId(1)).unwrap().open_target,
+            Some(target)
+        );
     }
     #[test]
     fn partial_selection_uses_the_visible_batch_indices() {

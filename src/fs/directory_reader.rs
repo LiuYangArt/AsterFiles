@@ -82,7 +82,7 @@ pub fn read_directory_batches_filtered(
             continue;
         }
         let path = directory_entry.path();
-        let metadata = fs::metadata(&path).unwrap_or(entry_metadata);
+        let metadata = metadata_for_entry(&path, entry_metadata);
         if cancel.load(AtomicOrdering::Acquire) {
             return Ok(ReadOutcome::Cancelled);
         }
@@ -160,7 +160,7 @@ pub fn read_aggregate_directory_batches_filtered(
                 continue;
             }
             let path = directory_entry.path();
-            let metadata = fs::metadata(&path).unwrap_or(entry_metadata);
+            let metadata = metadata_for_entry(&path, entry_metadata);
             if cancel.load(AtomicOrdering::Acquire) {
                 source_cancelled = true;
                 break;
@@ -204,20 +204,13 @@ fn file_entry(
     metadata: fs::Metadata,
     id: u32,
 ) -> FileEntry {
-    let mut kind = if metadata.is_dir() {
+    let kind = if metadata.is_dir() {
         EntryKind::Directory
     } else if metadata.is_file() {
         EntryKind::File
     } else {
         EntryKind::Other
     };
-    let mut open_target = None;
-    if let Ok(Some(target)) = crate::platform::resolve_shortcut_target(&path)
-        && target.is_directory != Some(false)
-    {
-        kind = EntryKind::Directory;
-        open_target = Some(target.path);
-    }
     FileEntry {
         id: EntryId(id),
         display_name: original_name.to_string_lossy().into_owned(),
@@ -225,7 +218,7 @@ fn file_entry(
         original_name,
         path: path.clone(),
         kind,
-        open_target,
+        open_target: None,
         library_source_index: None,
         parent_display: path
             .parent()
@@ -236,6 +229,23 @@ fn file_entry(
         modified: metadata.modified().ok(),
         created: metadata.created().ok(),
     }
+}
+
+#[cfg(windows)]
+fn metadata_for_entry(path: &Path, metadata: fs::Metadata) -> fs::Metadata {
+    use std::os::windows::fs::MetadataExt;
+
+    if attributes_need_followup_metadata(metadata.file_attributes()) {
+        fs::metadata(path).unwrap_or(metadata)
+    } else {
+        metadata
+    }
+}
+
+#[cfg(windows)]
+fn attributes_need_followup_metadata(attributes: u32) -> bool {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 fn source_error(source: &Path, error: io::Error) -> SourceReadOutcome {
@@ -512,6 +522,111 @@ mod tests {
             show_system: true,
         };
         assert!(attributes_are_visible(HIDDEN | SYSTEM, all));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn issue_64_only_reparse_points_need_followup_metadata() {
+        assert!(!attributes_need_followup_metadata(0));
+        assert!(!attributes_need_followup_metadata(0x10));
+        assert!(attributes_need_followup_metadata(0x400));
+        assert!(attributes_need_followup_metadata(0x410));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn issue_64_shortcuts_do_not_block_directory_batches() {
+        let fixture = TempTree::new("shortcut-batch");
+        fs::write(
+            fixture.child("folder.lnk"),
+            b"not parsed during enumeration",
+        )
+        .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut entries = Vec::new();
+        read_directory_batches_filtered(
+            &fixture.0,
+            &cancel,
+            FileVisibility {
+                show_hidden: true,
+                show_system: true,
+            },
+            |batch| entries.extend(batch),
+        )
+        .unwrap();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.display_name == "folder.lnk")
+            .unwrap();
+        assert_eq!(entry.kind, EntryKind::File);
+        assert!(entry.open_target.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "explicit 100k-entry directory performance evidence"]
+    fn issue_64_directory_loading_performance_evidence() {
+        use std::time::Instant;
+
+        let fixture = TempTree::new("performance");
+        let ordinary = fixture.child("ordinary");
+        let shortcuts = fixture.child("shortcuts");
+        fs::create_dir_all(&ordinary).unwrap();
+        fs::create_dir_all(&shortcuts).unwrap();
+        for index in 0..100_000_u32 {
+            fs::File::create(ordinary.join(format!("file-{index:06}.txt"))).unwrap();
+        }
+        for index in 0..10_000_u32 {
+            fs::File::create(shortcuts.join(format!("link-{index:05}.lnk"))).unwrap();
+        }
+
+        let measure = |path: &Path| {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let started = Instant::now();
+            let mut first_batch_ms = None;
+            let mut count = 0_usize;
+            let outcome = read_directory_batches_filtered(
+                path,
+                &cancel,
+                FileVisibility {
+                    show_hidden: true,
+                    show_system: true,
+                },
+                |batch| {
+                    count += batch.len();
+                    first_batch_ms.get_or_insert_with(|| started.elapsed().as_millis());
+                },
+            )
+            .unwrap();
+            assert_eq!(outcome, ReadOutcome::Complete { skipped: 0 });
+            (
+                first_batch_ms.unwrap_or(0),
+                started.elapsed().as_millis(),
+                count,
+            )
+        };
+        let ordinary_result = measure(&ordinary);
+        let shortcut_result = measure(&shortcuts);
+        let artifact = PathBuf::from("artifacts/perf/directory-loading/issue-64.json");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(
+            artifact,
+            format!(
+                concat!(
+                    "{{\n  \"schema_version\": 1,\n",
+                    "  \"ordinary\": {{\"count\": {}, \"first_batch_ms\": {}, \"full_enumeration_ms\": {}, \"followup_path_metadata_reads\": 0}},\n",
+                    "  \"shortcuts\": {{\"count\": {}, \"first_batch_ms\": {}, \"full_enumeration_ms\": {}, \"resolved_during_enumeration\": 0}},\n",
+                    "  \"batch_sizes\": [32, 256]\n}}\n"
+                ),
+                ordinary_result.2,
+                ordinary_result.0,
+                ordinary_result.1,
+                shortcut_result.2,
+                shortcut_result.0,
+                shortcut_result.1,
+            ),
+        )
+        .unwrap();
     }
 
     #[cfg(windows)]
