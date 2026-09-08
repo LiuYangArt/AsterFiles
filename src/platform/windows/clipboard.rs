@@ -4,7 +4,9 @@ use std::{
     mem::{ManuallyDrop, size_of},
     os::windows::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
-    ptr, thread,
+    ptr,
+    sync::{OnceLock, mpsc},
+    thread,
     time::Duration,
 };
 
@@ -17,7 +19,10 @@ use windows::{
                 IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0,
                 TYMED_HGLOBAL,
             },
-            DataExchange::RegisterClipboardFormatW,
+            DataExchange::{
+                AddClipboardFormatListener, GetClipboardSequenceNumber, RegisterClipboardFormatW,
+                RemoveClipboardFormatListener,
+            },
             Memory::{
                 GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
             },
@@ -26,7 +31,16 @@ use windows::{
                 OleUninitialize, ReleaseStgMedium,
             },
         },
-        UI::Shell::{DROPFILES, DragQueryFileW, HDROP, SHCreateStdEnumFmtEtc},
+        UI::{
+            Shell::{DROPFILES, DragQueryFileW, HDROP, SHCreateStdEnumFmtEtc},
+            WindowsAndMessaging::{
+                CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+                GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, HWND_MESSAGE, MSG, PostMessageW,
+                PostQuitMessage, RegisterClassExW, SetWindowLongPtrW, TranslateMessage,
+                WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLIPBOARDUPDATE, WM_CLOSE, WM_NCCREATE,
+                WM_NCDESTROY, WNDCLASSEXW,
+            },
+        },
     },
     core::{Error as WindowsError, HRESULT, PCWSTR, implement},
 };
@@ -37,6 +51,7 @@ const CF_UNICODETEXT: u16 = 13;
 const DROPEFFECT_COPY: u32 = 1;
 const DROPEFFECT_MOVE: u32 = 2;
 const CLIPBOARD_RETRIES: usize = 8;
+const LISTENER_CLASS: &str = "AsterFiles_Clipboard_Listener";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipboardOperation {
@@ -48,6 +63,177 @@ pub enum ClipboardOperation {
 pub struct ClipboardFileList {
     pub paths: Vec<PathBuf>,
     pub operation: ClipboardOperation,
+}
+
+pub fn sequence_number() -> u32 {
+    unsafe { GetClipboardSequenceNumber() }
+}
+
+pub struct ClipboardListener {
+    hwnd: isize,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl ClipboardListener {
+    pub fn start() -> io::Result<(Self, mpsc::Receiver<u32>)> {
+        let (event_sender, event_receiver) = mpsc::channel();
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let thread = thread::spawn(move || listener_thread(event_sender, ready_sender));
+        let hwnd = match ready_receiver.recv() {
+            Ok(Ok(hwnd)) => hwnd,
+            Ok(Err(error)) => {
+                let _ = thread.join();
+                return Err(error);
+            }
+            Err(_) => {
+                let _ = thread.join();
+                return Err(io::Error::other(
+                    "clipboard listener stopped during startup",
+                ));
+            }
+        };
+        Ok((
+            Self {
+                hwnd,
+                thread: Some(thread),
+            },
+            event_receiver,
+        ))
+    }
+
+    pub fn shutdown(mut self) {
+        self.stop();
+    }
+
+    fn stop(&mut self) {
+        if self.hwnd != 0 {
+            let hwnd = windows::Win32::Foundation::HWND(self.hwnd as *mut _);
+            let _ = unsafe {
+                PostMessageW(
+                    Some(hwnd),
+                    WM_CLOSE,
+                    windows::Win32::Foundation::WPARAM(0),
+                    windows::Win32::Foundation::LPARAM(0),
+                )
+            };
+            self.hwnd = 0;
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for ClipboardListener {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn listener_thread(
+    event_sender: mpsc::Sender<u32>,
+    ready_sender: mpsc::SyncSender<io::Result<isize>>,
+) {
+    let class = listener_class();
+    if class == 0 {
+        let _ = ready_sender.send(Err(io::Error::last_os_error()));
+        return;
+    }
+    let sender = Box::new(event_sender);
+    let sender_pointer = Box::into_raw(sender);
+    let class_name = wide(LISTENER_CLASS);
+    let window = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            windows::core::PCWSTR(class_name.as_ptr()),
+            windows::core::PCWSTR::null(),
+            WINDOW_STYLE::default(),
+            0,
+            0,
+            0,
+            0,
+            Some(HWND_MESSAGE),
+            None,
+            None,
+            Some(sender_pointer.cast()),
+        )
+    };
+    let Ok(window) = window else {
+        unsafe { drop(Box::from_raw(sender_pointer)) };
+        let _ = ready_sender.send(Err(io::Error::last_os_error()));
+        return;
+    };
+    if let Err(error) = unsafe { AddClipboardFormatListener(window) } {
+        let _ = unsafe { DestroyWindow(window) };
+        let _ = ready_sender.send(Err(windows_error(error)));
+        return;
+    }
+    let _ = ready_sender.send(Ok(window.0 as isize));
+    unsafe {
+        let sender = GetWindowLongPtrW(window, GWLP_USERDATA) as *const mpsc::Sender<u32>;
+        if !sender.is_null() {
+            let _ = (*sender).send(sequence_number());
+        }
+        let mut message = MSG::default();
+        while GetMessageW(&mut message, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+}
+
+fn listener_class() -> u16 {
+    static CLASS: OnceLock<u16> = OnceLock::new();
+    *CLASS.get_or_init(|| {
+        let class_name = wide(LISTENER_CLASS);
+        let class = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(listener_window_proc),
+            lpszClassName: windows::core::PCWSTR(class_name.as_ptr()),
+            ..Default::default()
+        };
+        unsafe { RegisterClassExW(&class) }
+    })
+}
+
+unsafe extern "system" fn listener_window_proc(
+    window: windows::Win32::Foundation::HWND,
+    message: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    if message == WM_NCCREATE {
+        let create = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
+        unsafe { SetWindowLongPtrW(window, GWLP_USERDATA, create.lpCreateParams as isize) };
+        return windows::Win32::Foundation::LRESULT(1);
+    }
+    let sender = unsafe { GetWindowLongPtrW(window, GWLP_USERDATA) as *mut mpsc::Sender<u32> };
+    match message {
+        WM_CLIPBOARDUPDATE if !sender.is_null() => {
+            let _ = unsafe { (*sender).send(sequence_number()) };
+            windows::Win32::Foundation::LRESULT(0)
+        }
+        WM_CLOSE => {
+            let _ = unsafe { RemoveClipboardFormatListener(window) };
+            let _ = unsafe { DestroyWindow(window) };
+            windows::Win32::Foundation::LRESULT(0)
+        }
+        WM_NCDESTROY => {
+            if !sender.is_null() {
+                unsafe {
+                    SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+                    drop(Box::from_raw(sender));
+                }
+            }
+            unsafe { PostQuitMessage(0) };
+            windows::Win32::Foundation::LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
+    }
+}
+
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
 }
 
 pub fn write_file_list(paths: &[PathBuf], operation: ClipboardOperation) -> io::Result<()> {
@@ -402,6 +588,19 @@ fn supports_format(format: &FORMATETC, expected: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listener_reports_initial_sequence_and_shuts_down() {
+        let (listener, notifications) = ClipboardListener::start().unwrap();
+        let sequence = notifications.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(sequence, sequence_number());
+        listener.shutdown();
+        assert!(
+            notifications
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+    }
 
     #[test]
     fn dropfiles_preserves_windows_paths() {

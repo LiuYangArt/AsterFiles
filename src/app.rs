@@ -1846,7 +1846,7 @@ struct AppState {
     exit_after_cancel: bool,
     clipboard_has_files: bool,
     cut_paths: Vec<PathBuf>,
-    cut_generation: u64,
+    clipboard_sequence: Option<u32>,
     conflict_responses:
         HashMap<OperationId, mpsc::Sender<crate::domain::file_operations::ConflictDecision>>,
 
@@ -2083,7 +2083,7 @@ impl AppState {
             exit_after_cancel: false,
             clipboard_has_files: false,
             cut_paths: Vec::new(),
-            cut_generation: 0,
+            clipboard_sequence: None,
             conflict_responses: HashMap::new(),
 
             everything_config,
@@ -3621,7 +3621,7 @@ fn apply_progress_event_for_test(
 enum ClipboardRequest {
     Write { paths: Vec<PathBuf>, cut: bool },
     ReadPaste { origin_tab: TabId, target: PathBuf },
-    CheckAvailability,
+    Changed(u32),
 }
 #[derive(Debug)]
 enum ClipboardEvent {
@@ -3629,12 +3629,16 @@ enum ClipboardEvent {
         result: Result<(), String>,
         paths: Vec<PathBuf>,
         cut: bool,
+        sequence: u32,
     },
     Paste {
         origin_tab: TabId,
         result: Result<Option<(FileOperationKind, Vec<OperationItem>)>, String>,
     },
-    Availability(Result<bool, String>),
+    Changed {
+        sequence: u32,
+        result: Result<Option<platform::windows::clipboard::ClipboardFileList>, String>,
+    },
 }
 
 #[derive(Clone)]
@@ -3885,6 +3889,10 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     let (icon_sender, icon_receiver) = spawn_icon_workers(ICON_WORKER_COUNT, state.clone());
     let (operation_sender, operation_receiver) = spawn_file_operation_worker();
     let (clipboard_sender, clipboard_receiver) = spawn_clipboard_worker();
+    let (clipboard_listener, clipboard_notifications) =
+        platform::windows::clipboard::ClipboardListener::start()
+            .map_err(|error| slint::PlatformError::Other(error.to_string()))?;
+    forward_clipboard_notifications(clipboard_notifications, clipboard_sender.clone());
     let (shell_menu_worker, shell_menu_receiver) =
         platform::windows::context_menu::ShellMenuWorker::spawn();
     let quick_menu = Arc::new(Mutex::new(QuickMenuState::default()));
@@ -4026,7 +4034,6 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         state.clone(),
     );
     start_clipboard_event_pump(
-        &ui,
         clipboard_receiver,
         operation_sender.clone(),
         request_sender.clone(),
@@ -4234,6 +4241,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         let _ = session_store::save(&path, &session);
     }
     clear_window_runtimes();
+    clipboard_listener.shutdown();
     platform::windows::drag_drop::shutdown_current();
     let _ = state.lock().ok().and_then(|mut app| {
         let active_window = app.active_window;
@@ -11138,13 +11146,11 @@ fn wire_callbacks(
     let weak = ui.as_weak();
     let state_for_entry_menu = state.clone();
     let anchor_for_entry = context_anchor.clone();
-    let clipboard_for_entry = clipboard_sender.clone();
     let quick_menu_for_entry = quick_menu.clone();
     let shell_menu_for_entry = shell_menu_worker.clone();
     ui.on_show_entry_menu(move |entry_id, x, y| {
         *anchor_for_entry.lock().expect("context anchor mutex") =
             (false, x.round() as i32, y.round() as i32);
-        let _ = clipboard_for_entry.send(ClipboardRequest::CheckAvailability);
         let mut app = state_for_entry_menu
             .lock()
             .expect("app state mutex is not poisoned");
@@ -11346,13 +11352,11 @@ fn wire_callbacks(
     let weak = ui.as_weak();
     let state_for_background_menu = state.clone();
     let anchor_for_background = context_anchor.clone();
-    let clipboard_for_background = clipboard_sender.clone();
     let quick_menu_for_background = quick_menu.clone();
     let shell_menu_for_background = shell_menu_worker.clone();
     ui.on_show_background_menu(move |x, y| {
         *anchor_for_background.lock().expect("context anchor mutex") =
             (true, x.round() as i32, y.round() as i32);
-        let _ = clipboard_for_background.send(ClipboardRequest::CheckAvailability);
         if let Ok(mut app) = state_for_background_menu.lock() {
             let tab_id = app.active_window_state().active_tab;
             if let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) {
@@ -11381,7 +11385,6 @@ fn wire_callbacks(
     let weak = ui.as_weak();
     let state_for_reopen_menu = state.clone();
     let anchor_for_reopen = context_anchor.clone();
-    let clipboard_for_reopen = clipboard_sender.clone();
     let quick_menu_for_reopen = quick_menu.clone();
     let shell_menu_for_reopen = shell_menu_worker.clone();
     ui.on_reopen_context_menu(move |x, y| {
@@ -11405,7 +11408,6 @@ fn wire_callbacks(
         );
         *anchor_for_reopen.lock().expect("context anchor mutex") =
             (background, x.round() as i32, y.round() as i32);
-        let _ = clipboard_for_reopen.send(ClipboardRequest::CheckAvailability);
         if let Ok(mut app) = state_for_reopen_menu.lock() {
             let tab_id = app.active_window_state().active_tab;
             if let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) {
@@ -15228,12 +15230,13 @@ fn spawn_clipboard_worker() -> (
                     .map_err(|error| error.to_string()),
                     paths,
                     cut,
+                    sequence: platform::windows::clipboard::sequence_number(),
                 },
-                ClipboardRequest::CheckAvailability => ClipboardEvent::Availability(
-                    platform::windows::clipboard::read_file_list()
-                        .map(|clipboard| clipboard.is_some())
+                ClipboardRequest::Changed(sequence) => ClipboardEvent::Changed {
+                    sequence: platform::windows::clipboard::sequence_number().max(sequence),
+                    result: platform::windows::clipboard::read_file_list()
                         .map_err(|error| error.to_string()),
-                ),
+                },
                 ClipboardRequest::ReadPaste { origin_tab, target } => ClipboardEvent::Paste {
                     origin_tab,
                     result: platform::windows::clipboard::read_file_list()
@@ -15277,6 +15280,19 @@ fn spawn_clipboard_worker() -> (
         }
     });
     (request_sender, event_receiver)
+}
+
+fn forward_clipboard_notifications(
+    receiver: mpsc::Receiver<u32>,
+    sender: mpsc::Sender<ClipboardRequest>,
+) {
+    thread::spawn(move || {
+        while let Ok(sequence) = receiver.recv() {
+            if sender.send(ClipboardRequest::Changed(sequence)).is_err() {
+                break;
+            }
+        }
+    });
 }
 
 fn quick_menu_for_session(
@@ -15708,22 +15724,23 @@ fn start_shell_menu_event_pump(
     });
 }
 fn start_clipboard_event_pump(
-    ui: &AppWindow,
     receiver: mpsc::Receiver<ClipboardEvent>,
     operation_sender: mpsc::Sender<FileOperationRequest>,
     directory_sender: mpsc::Sender<DirectoryRequest>,
     network_directory_sender: mpsc::SyncSender<DirectoryRequest>,
     state: SharedSessions,
 ) {
-    let weak = ui.as_weak();
     thread::spawn(move || {
         while let Ok(event) = receiver.recv() {
-            let weak = weak.clone();
             let state = state.clone();
             let operation_sender = operation_sender.clone();
             let directory_sender = directory_sender.clone();
             let network_directory_sender = network_directory_sender.clone();
             let _ = slint::invoke_from_event_loop(move || {
+                let cut_paths_before = state
+                    .lock()
+                    .map(|app| app.cut_paths.clone())
+                    .unwrap_or_default();
                 match event {
                     ClipboardEvent::Written {
                         result: Err(error), ..
@@ -15731,7 +15748,9 @@ fn start_clipboard_event_pump(
                     | ClipboardEvent::Paste {
                         result: Err(error), ..
                     }
-                    | ClipboardEvent::Availability(Err(error)) => {
+                    | ClipboardEvent::Changed {
+                        result: Err(error), ..
+                    } => {
                         if let Ok(mut app) = state.lock() {
                             app.operation_errors.push(error);
                         }
@@ -15744,93 +15763,97 @@ fn start_clipboard_event_pump(
                         result: Ok(()),
                         paths,
                         cut,
+                        sequence,
                     } => {
-                        let generation = if let Ok(mut app) = state.lock() {
-                            app.cut_generation = app.cut_generation.wrapping_add(1);
-                            app.cut_paths = if cut { paths.clone() } else { Vec::new() };
-                            app.cut_generation
-                        } else {
-                            0
-                        };
-                        if cut && generation != 0 {
-                            monitor_external_cut(
-                                paths,
-                                generation,
-                                directory_sender.clone(),
-                                network_directory_sender.clone(),
-                                state.clone(),
-                            );
+                        if let Ok(mut app) = state.lock() {
+                            app.clipboard_has_files = true;
+                            app.cut_paths = if cut { paths } else { Vec::new() };
+                            app.clipboard_sequence = Some(sequence);
                         }
                     }
-                    ClipboardEvent::Availability(Ok(available)) => {
-                        if let Ok(mut app) = state.lock() {
-                            app.clipboard_has_files = available;
+                    ClipboardEvent::Changed {
+                        sequence,
+                        result: Ok(snapshot),
+                    } => {
+                        let directories = state
+                            .lock()
+                            .map(|mut app| apply_clipboard_snapshot(&mut app, sequence, snapshot))
+                            .unwrap_or_default();
+                        if !directories.is_empty() {
+                            refresh_affected_tabs(
+                                &directory_sender,
+                                &network_directory_sender,
+                                &state,
+                                &directories,
+                            );
                         }
                     }
                     ClipboardEvent::Paste {
                         result: Ok(None), ..
                     } => {}
                 }
-                if weak.upgrade().is_some() {
-                    refresh_all_windows(&state);
+                let cut_paths_after = state
+                    .lock()
+                    .map(|app| app.cut_paths.clone())
+                    .unwrap_or_default();
+                let changed_paths = cut_paths_before
+                    .into_iter()
+                    .chain(cut_paths_after)
+                    .collect::<HashSet<_>>();
+                let windows = WINDOW_RUNTIMES.with_borrow(|runtimes| {
+                    runtimes
+                        .iter()
+                        .map(|(window_id, runtime)| (*window_id, runtime.ui.clone_strong()))
+                        .collect::<Vec<_>>()
+                });
+                for (window_id, ui) in windows {
+                    let update = state.lock().ok().and_then(|app| {
+                        let window = app.window(window_id)?;
+                        let tab = window.tabs.get(&window.active_tab)?;
+                        let changed = tab
+                            .entries
+                            .iter()
+                            .chain(tab.pending_entries.iter())
+                            .filter(|entry| changed_paths.contains(&entry.path))
+                            .map(|entry| entry.id)
+                            .collect::<HashSet<_>>();
+                        Some((tab.id, changed))
+                    });
+                    if let Some((tab_id, changed)) = update {
+                        update_file_rows(&ui, &state, tab_id, &changed);
+                    }
                 }
             });
         }
     });
 }
 
-fn monitor_external_cut(
-    mut paths: Vec<PathBuf>,
-    generation: u64,
-    directory_sender: mpsc::Sender<DirectoryRequest>,
-    network_directory_sender: mpsc::SyncSender<DirectoryRequest>,
-    state: SharedSessions,
-) {
-    thread::spawn(move || {
-        let parents = paths
-            .iter()
-            .filter_map(|path| path.parent().map(Path::to_path_buf))
-            .collect::<Vec<_>>();
-        for _ in 0..1_200 {
-            thread::sleep(Duration::from_millis(250));
-            if state
-                .lock()
-                .map_or(true, |app| app.cut_generation != generation)
-            {
-                return;
-            }
-            let remaining = existing_paths(&paths);
-            if remaining.len() == paths.len() {
-                continue;
-            }
-            let remaining_for_ui = remaining.clone();
-            let parents_for_ui = parents.clone();
-            let directory_sender_for_ui = directory_sender.clone();
-            let network_directory_sender_for_ui = network_directory_sender.clone();
-            let state_for_ui = state.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                let current = state_for_ui.lock().is_ok_and(|mut app| {
-                    if app.cut_generation != generation {
-                        return false;
-                    }
-                    app.cut_paths = remaining_for_ui;
-                    true
-                });
-                if current {
-                    refresh_affected_tabs(
-                        &directory_sender_for_ui,
-                        &network_directory_sender_for_ui,
-                        &state_for_ui,
-                        &parents_for_ui,
-                    );
-                }
-            });
-            if remaining.is_empty() {
-                return;
-            }
-            paths = remaining;
-        }
+fn apply_clipboard_snapshot(
+    app: &mut AppState,
+    sequence: u32,
+    snapshot: Option<platform::windows::clipboard::ClipboardFileList>,
+) -> Vec<PathBuf> {
+    if app.clipboard_sequence == Some(sequence) {
+        return Vec::new();
+    }
+    app.clipboard_sequence = Some(sequence);
+    app.clipboard_has_files = snapshot.is_some();
+    let preserves_cut = snapshot.as_ref().is_some_and(|clipboard| {
+        clipboard.operation == platform::windows::clipboard::ClipboardOperation::Move
+            && clipboard.paths == app.cut_paths
     });
+    if app.cut_paths.is_empty() || preserves_cut {
+        return Vec::new();
+    }
+    let mut directories = app
+        .cut_paths
+        .iter()
+        .filter_map(|path| path.parent().map(Path::to_path_buf))
+        .collect::<Vec<_>>();
+    directories.sort_unstable();
+    directories.dedup();
+    app.cut_paths.clear();
+    directories
 }
 
 fn completed_target_for_item(
@@ -15963,13 +15986,6 @@ fn rename_input_for_entry(entry: &FileEntry) -> (String, Option<std::ffi::OsStri
     }
 }
 
-fn existing_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
-    paths
-        .iter()
-        .filter(|path| std::fs::symlink_metadata(path).is_ok())
-        .cloned()
-        .collect()
-}
 fn spawn_file_operation_worker() -> (
     mpsc::Sender<FileOperationRequest>,
     mpsc::Receiver<FileOperationEvent>,
@@ -28323,21 +28339,64 @@ mod tests {
     }
 
     #[test]
-    fn external_cut_tracking_keeps_only_sources_still_on_disk() {
-        let temporary = std::env::temp_dir().join(format!(
-            "asterfiles-cut-test-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&temporary);
-        std::fs::create_dir(&temporary).unwrap();
-        let moved = temporary.join("moved.txt");
-        let remaining = temporary.join("remaining.txt");
-        std::fs::write(&moved, b"moved").unwrap();
-        std::fs::write(&remaining, b"remaining").unwrap();
-        std::fs::remove_file(&moved).unwrap();
-        assert_eq!(existing_paths(&[moved, remaining.clone()]), vec![remaining]);
-        std::fs::remove_dir_all(temporary).unwrap();
+    fn clipboard_notifications_update_availability_and_clear_cut_once() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\source")], 0, [0, 1, 2, 3]);
+        app.cut_paths = vec![
+            PathBuf::from(r"C:\source\one.txt"),
+            PathBuf::from(r"C:\source\two.txt"),
+        ];
+        let same_cut = platform::windows::clipboard::ClipboardFileList {
+            paths: app.cut_paths.clone(),
+            operation: platform::windows::clipboard::ClipboardOperation::Move,
+        };
+        app.clipboard_has_files = true;
+        app.clipboard_sequence = Some(10);
+        assert!(apply_clipboard_snapshot(&mut app, 10, Some(same_cut)).is_empty());
+        assert!(app.clipboard_has_files);
+        assert_eq!(app.cut_paths.len(), 2);
+
+        let refresh = apply_clipboard_snapshot(&mut app, 11, None);
+        assert_eq!(refresh, vec![PathBuf::from(r"C:\source")]);
+        assert!(!app.clipboard_has_files);
+        assert!(app.cut_paths.is_empty());
+        assert!(apply_clipboard_snapshot(&mut app, 11, None).is_empty());
+    }
+
+    #[test]
+    fn copied_files_clear_previous_cut_and_keep_paste_available() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\source")], 0, [0, 1, 2, 3]);
+        app.cut_paths = vec![PathBuf::from(r"C:\source\old.txt")];
+        let focused_before = app.active().focused;
+        let selected_before = app.active().selected.clone();
+        let copied = platform::windows::clipboard::ClipboardFileList {
+            paths: vec![PathBuf::from(r"D:\other\new.txt")],
+            operation: platform::windows::clipboard::ClipboardOperation::Copy,
+        };
+        assert_eq!(
+            apply_clipboard_snapshot(&mut app, 20, Some(copied)),
+            vec![PathBuf::from(r"C:\source")]
+        );
+        assert!(app.clipboard_has_files);
+        assert!(app.cut_paths.is_empty());
+        assert_eq!(app.active().focused, focused_before);
+        assert_eq!(app.active().selected, selected_before);
+    }
+
+    #[test]
+    fn stale_and_repeated_cut_notifications_preserve_cut_state() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\source")], 0, [0, 1, 2, 3]);
+        let paths = vec![PathBuf::from(r"C:\source\old.txt")];
+        app.cut_paths = paths.clone();
+        app.clipboard_has_files = true;
+        app.clipboard_sequence = Some(30);
+        let same_cut = platform::windows::clipboard::ClipboardFileList {
+            paths: paths.clone(),
+            operation: platform::windows::clipboard::ClipboardOperation::Move,
+        };
+        assert!(apply_clipboard_snapshot(&mut app, 29, Some(same_cut.clone())).is_empty());
+        assert_eq!(app.cut_paths, paths);
+        assert!(apply_clipboard_snapshot(&mut app, 31, Some(same_cut)).is_empty());
+        assert_eq!(app.cut_paths, paths);
     }
 
     #[test]
