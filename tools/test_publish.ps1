@@ -32,6 +32,7 @@ Describe 'publish.ps1' {
     }
     It 'publishes tag notes through GH_REPO for CLI compatibility' {
         $releaseWorkflowContent | Should Match 'GH_REPO: \$\{\{ github\.repository \}\}'
+        ([regex]::Matches($releaseWorkflowContent, 'uses: actions/checkout@')).Count | Should Be 2
         $releaseWorkflowContent | Should Match 'gh release create .*--notes-from-tag'
         $releaseWorkflowContent | Should Not Match 'gh release create .*--repo'
     }
