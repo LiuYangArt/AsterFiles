@@ -17,10 +17,8 @@ export global VisualStyle {
     out property <color> c24252a: dark-theme ? #f2f2f2 : #24252a;
     out property <color> c303138: dark-theme ? #f2f2f2 : #303138;
     out property <color> c30333a: dark-theme ? #f2f2f2 : #30333a;
-    out property <color> c323437: #323437;
     out property <color> navigation-surface-background: dark-theme ? #323437 : #e9e9e9;
     out property <color> c57595c: dark-theme ? #57595c : #75787c;
-    out property <color> c3b4f83: dark-theme ? #9db5ff : #3b4f83;
     out property <color> c4f535d: dark-theme ? #d0d0d0 : #4f535d;
     out property <color> c4f6bed: dark-theme ? #7fa0ff : #4f6bed;
     out property <color> rectangle-selection-fill: dark-theme ? #7fa0ff1a : #4f6bed1a;
@@ -37,17 +35,12 @@ export global VisualStyle {
     out property <color> cc42b1c: #c42b1c;
     out property <color> cc7d7ff: dark-theme ? #35548f : #c7d7ff;
     out property <color> cd7dae0: dark-theme ? #4a4a4a : #d7dae0;
-    out property <color> cd7dce5: dark-theme ? #4a4a4a : #d7dce5;
     out property <color> cd9dce2: dark-theme ? #454545 : #d9dce2;
     out property <color> cdce6ff: dark-theme ? #263d66 : #dce6ff;
     out property <color> cdde3ed: dark-theme ? #464646 : #dde3ed;
     out property <color> ce0e2e7: dark-theme ? #4b4b4b : #e0e2e7;
     out property <color> ce1e4ea: dark-theme ? #4c4c4c : #e1e4ea;
-    out property <color> ce2e3e7: dark-theme ? #484848 : #e2e3e7;
-    out property <color> ce2e4e9: dark-theme ? #444444 : #e2e4e9;
-    out property <color> ce3e7ef: dark-theme ? #424242 : #e3e7ef;
     out property <color> ce5e9f2: dark-theme ? #414141 : #e5e9f2;
-    out property <color> ce7e8eb: dark-theme ? #404040 : #e7e8eb;
     out property <color> ce8eaf0: dark-theme ? #3d3d3d : #e8eaf0;
     out property <color> cedf1f6: dark-theme ? #424242 : #edf1f6;
     out property <color> ceff4ff: dark-theme ? #303b4d : #eff4ff;
@@ -724,7 +717,6 @@ export component AppWindow inherits Window {
     in property <length> window-width: 1180px;
     default-font-family: "Segoe UI";
 
-    in property <string> current-path: "C:\\";
     in property <image> current-location-icon;
     in property <bool> current-location-is-drive: false;
     in-out property <string> address-input: "C:\\";
@@ -772,8 +764,6 @@ export component AppWindow inherits Window {
     in-out property <bool> context-submenu-parent-open: false;
     in-out property <length> context-submenu-anchor-y: 0px;
     in-out property <length> context-submenu-parent-anchor-y: 0px;
-    in-out property <length> context-active-anchor-y: 0px;
-    in-out property <length> context-submenu-active-anchor-y: 0px;
     in-out property <length> context-menu-content-height: 0px;
     in-out property <length> context-submenu-content-height: 0px;
     in-out property <length> context-submenu-parent-content-height: 0px;
@@ -857,8 +847,6 @@ export component AppWindow inherits Window {
     in property <string> text-drop-move: "移动到此处";
     in property <string> text-drop-link: "在此处创建快捷方式";
     in property <string> text-drop-cancel: "取消";
-    in-out property <bool> task-center-open: false;
-    changed task-center-open => { if (root.task-center-open) { root.open-operation-window(); root.task-center-open = false; } }
     in-out property <string> rename-input: "";
     in property <int> rename-entry-id: -1;
     in property <bool> rename-editing: false;

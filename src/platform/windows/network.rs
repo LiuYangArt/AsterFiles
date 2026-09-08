@@ -421,11 +421,6 @@ pub fn connect_network_share(
 }
 
 #[allow(dead_code)]
-pub fn disconnect_network_share(path: &Path) -> Result<NetworkResult, NetworkAuthError> {
-    disconnect_network_share_inner(path, false)
-}
-
-#[allow(dead_code)]
 pub fn force_disconnect_network_share(path: &Path) -> Result<NetworkResult, NetworkAuthError> {
     disconnect_network_share_inner(path, true)
 }

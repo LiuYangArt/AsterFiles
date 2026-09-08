@@ -1531,7 +1531,7 @@ fn open_task_center_on_live_window(state: &SharedSessions) {
         })
     });
     if let Some(ui) = target {
-        ui.set_task_center_open(true);
+        ui.invoke_open_operation_window();
     }
 }
 
@@ -11539,7 +11539,7 @@ fn wire_callbacks(
         {
             if row.submenu {
                 ui.invoke_cancel_context_submenu_hover();
-                ui.set_context_submenu_anchor_y(ui.get_context_active_anchor_y());
+                ui.set_context_submenu_anchor_y(0.0);
                 ui.invoke_open_context_submenu(index);
             } else {
                 ui.set_context_menu_open(false);
@@ -11682,7 +11682,7 @@ fn wire_callbacks(
         ui.set_context_submenu_open(true);
         if encoded_index < 0 {
             ui.set_context_submenu_parent_anchor_y(ui.get_context_submenu_anchor_y());
-            ui.set_context_submenu_anchor_y(ui.get_context_submenu_active_anchor_y());
+            ui.set_context_submenu_anchor_y(0.0);
             let parent_rows = quick_menu_for_submenu
                 .lock()
                 .ok()
@@ -21228,7 +21228,6 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     } else {
         visible_path.clone()
     };
-    ui.set_current_path(visible_path.into());
     let current_location_path = tab.visible_path();
     ui.set_current_location_icon(
         tab.visible_location()

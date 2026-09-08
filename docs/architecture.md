@@ -1,4 +1,4 @@
-# AsterFiles 架构与路线
+# AsterFiles 架构索引
 
 ## 当前边界
 
@@ -10,7 +10,7 @@ Slint UI
 Rust 文件核心
 ```
 
-当前版本支持普通本地目录及目录快捷方式。界面不直接执行磁盘访问；后台读取按批次更新模型，并通过请求身份和取消标记丢弃过期结果。
+界面不直接执行磁盘、Shell、COM 或网络访问；后台结果按窗口、标签和请求身份隔离。
 
 ## 路径与文字约束
 
@@ -19,25 +19,8 @@ Rust 文件核心
 - 中文等正常 Unicode 文件名应原样显示。无法无损转成 UTF-8 的极端名称使用替代显示文本，但仍必须能通过原始路径正确操作。
 - 正文字体使用 Windows UI 字体及系统中文回退；Segoe Fluent/MDL2 只用于符号，不承担中文显示。
 
-## 下一阶段
+## 维护入口
 
 任务范围与完成状态以 [GitHub Issues](https://github.com/LiuYangArt/AsterFiles/issues) 为准，实施状态和顺序由 [AsterFiles Development](https://github.com/users/LiuYangArt/projects/2) 管理。本文只记录当前有效的架构边界，不维护任务清单。
 
-路径身份、标签会话、后台加载和本地化的前期实施顺序见 [foundation-plan.md](foundation-plan.md)。这些边界从 P0 开始生效；具体网络协议仍属于后置范围。
-
-## 首期不做
-
-- FTP、SFTP、S3、WebDAV；
-- 全盘索引和内容搜索；
-- 插件系统；
-- 替换 Windows Explorer Shell；
-- 云盘特殊语义。
-
-## 后续性能基线（P6）
-
-- 冷启动到窗口出现时间；
-- 首批可见文件出现时间；
-- 目录切换取消延迟；
-- 10 万项目录滚动帧时间 P95/P99；
-- 10 万项目录峰值内存；
-- 图标和缩略图队列积压及缓存命中率。
+路径身份、标签会话、后台加载、文件操作、Windows 集成和网络边界统一见 [foundation-plan.md](foundation-plan.md)。项目执行约束、验证命令和产物路径见仓库根目录的 `AGENTS.md`。

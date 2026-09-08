@@ -606,11 +606,6 @@ impl OperationManager {
         self.active[task.resource.index()] = None;
         Ok(())
     }
-    pub fn clear_terminal(&mut self) -> usize {
-        let before = self.tasks.len();
-        self.tasks.retain(|_, task| !task.state.is_terminal());
-        before - self.tasks.len()
-    }
     pub fn prune_transient(&mut self, minimum_age: Duration) -> usize {
         let before = self.tasks.len();
         self.tasks.retain(|_, task| {
@@ -1130,43 +1125,5 @@ mod tests {
         assert!(!task.progress.scanning_complete);
         assert_eq!(task.items[0].state, ItemState::Succeeded);
         assert_eq!(task.items[1].state, ItemState::Pending);
-    }
-
-    #[test]
-    fn terminal_cleanup_keeps_active_tasks() {
-        let mut manager = OperationManager::new();
-        let finished = manager.submit(
-            OperationResource::Local,
-            FileOperationKind::Copy,
-            None,
-            vec![item("done")],
-        );
-        let queued = manager.submit(
-            OperationResource::Local,
-            FileOperationKind::Move,
-            None,
-            vec![item("queued")],
-        );
-        assert_eq!(
-            manager.start_next(OperationResource::Local).unwrap(),
-            Some(finished)
-        );
-        manager.mark_running(finished).unwrap();
-        manager
-            .finish(
-                finished,
-                OperationState::Completed,
-                OperationResult {
-                    succeeded: vec![PathBuf::from("done")],
-                    skipped: vec![],
-                    failed: vec![],
-                    affected_directories: vec![],
-                },
-            )
-            .unwrap();
-
-        assert_eq!(manager.clear_terminal(), 1);
-        assert!(manager.task(finished).is_none());
-        assert_eq!(manager.task(queued).unwrap().state, OperationState::Queued);
     }
 }
