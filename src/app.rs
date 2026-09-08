@@ -1541,6 +1541,7 @@ pub(crate) struct WindowId(pub(crate) u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingFocusAction {
     Select,
+    Reveal { window_id: WindowId },
     Rename { window_id: WindowId },
 }
 
@@ -2654,14 +2655,23 @@ impl AppState {
         Some(id)
     }
     fn create_tab(&mut self, location: impl Into<NavigationLocation>) -> TabId {
+        self.create_tab_in_window(self.active_window, location)
+            .expect("active window must exist")
+    }
+
+    fn create_tab_in_window(
+        &mut self,
+        window_id: WindowId,
+        location: impl Into<NavigationLocation>,
+    ) -> Option<TabId> {
         let id = self.allocate_tab_id();
         let mut tab = TabSession::new(id);
         tab.current_location = Some(location.into());
-        let window = self.active_window_state_mut();
+        let window = self.windows.get_mut(&window_id)?;
         window.tabs.insert(id, tab);
         window.tab_order.push(id);
         window.active_tab = id;
-        id
+        Some(id)
     }
 
     fn open_settings(&mut self) -> TabId {
@@ -4381,6 +4391,66 @@ fn submit_network_navigation(
     }
 }
 
+fn submit_reveal_navigation(
+    local_sender: &mpsc::Sender<DirectoryRequest>,
+    network_sender: &mpsc::SyncSender<DirectoryRequest>,
+    state: &SharedSessions,
+    window_id: WindowId,
+    origin_tab_id: TabId,
+    parent: PathBuf,
+    target: PathBuf,
+) -> Option<TabId> {
+    let (tab_id, request) = {
+        let mut app = state.lock().ok()?;
+        if app
+            .window(window_id)
+            .is_none_or(|window| window.active_tab != origin_tab_id)
+        {
+            return None;
+        }
+        let tab_id =
+            app.create_tab_in_window(window_id, NavigationLocation::Directory(parent.clone()))?;
+        let visibility = app.file_visibility;
+        let (request_id, cancel) = app
+            .tab_mut(tab_id)?
+            .begin_directory_navigation(parent.clone(), NavigationKind::Refresh);
+        app.focus_after_refresh.insert(
+            tab_id,
+            PendingFocus {
+                directory: parent.clone(),
+                request_id: Some(request_id),
+                paths: vec![target],
+                action: PendingFocusAction::Reveal { window_id },
+            },
+        );
+        (
+            tab_id,
+            DirectoryRequest {
+                tab_id,
+                request_id,
+                path: parent.clone(),
+                library: None,
+                library_sources: None,
+                unavailable_library_sources: 0,
+                visibility,
+                cancel,
+            },
+        )
+    };
+    let sent = if crate::network::is_unc_path(&parent) {
+        network_sender.try_send(request).is_ok()
+    } else {
+        local_sender.send(request).is_ok()
+    };
+    if !sent && let Ok(mut app) = state.lock() {
+        app.focus_after_refresh.remove(&tab_id);
+        if let Some(tab) = app.tab_mut(tab_id) {
+            tab.load_state = LoadState::Failed;
+            tab.error = Some("directory queue is unavailable".to_owned());
+        }
+    }
+    Some(tab_id)
+}
 fn submit_path_navigation(
     local_sender: &mpsc::Sender<DirectoryRequest>,
     network_sender: &mpsc::SyncSender<DirectoryRequest>,
@@ -5853,6 +5923,7 @@ const CMD_NETWORK_LOCATION_RENAME: i32 = 198;
 const CMD_QUICK_ACCESS_PIN: i32 = 199;
 const CMD_QUICK_ACCESS_UNPIN: i32 = 200;
 const CMD_SIDEBAR_VISIBILITY_BASE: i32 = 210;
+const CMD_OPEN_FILE_LOCATION: i32 = 220;
 const NODE_VIEW: i32 = 10_001;
 const NODE_SORT: i32 = 10_002;
 const NODE_GROUP: i32 = 10_003;
@@ -7156,6 +7227,17 @@ fn built_in_context_rows(
             ));
         }
     } else {
+        if app.active().page_source == PageSource::Search {
+            rows.push(quick_menu_row(
+                CMD_OPEN_FILE_LOCATION,
+                0,
+                Texts::new(language).open_file_location(),
+                selected == 1,
+                false,
+                false,
+            ));
+            rows.push(quick_menu_separator());
+        }
         let selected_path = if selected == 1 {
             app.active()
                 .selected
@@ -10630,7 +10712,12 @@ fn wire_callbacks(
             app.pending_shell_creates.remove(&window_id);
             app.pending_rename_ui.remove(&window_id);
             app.focus_after_refresh.retain(|_, pending| {
-                !matches!(pending.action, PendingFocusAction::Rename { window_id: owner } if owner == window_id)
+                !matches!(
+                    pending.action,
+                    PendingFocusAction::Reveal { window_id: owner }
+                        | PendingFocusAction::Rename { window_id: owner }
+                        if owner == window_id
+                )
             });
             app.active_window_state_mut().active_tab = id;
         }
@@ -11975,6 +12062,48 @@ fn wire_callbacks(
             CMD_REFRESH => {
                 if let Some(ui) = weak.upgrade() {
                     ui.invoke_refresh();
+                }
+            }
+            CMD_OPEN_FILE_LOCATION => {
+                let target = quick_menu_for_command
+                    .lock()
+                    .ok()
+                    .and_then(|menu| menu.built_in_key.clone())
+                    .filter(|key| quick_menu_key_is_current(&state_for_context_command.shared, key))
+                    .and_then(|key| match key.scope {
+                        QuickMenuScope::Content { paths, .. } if paths.len() == 1 => {
+                            Some((key.window_id, key.tab_id, paths.into_iter().next()?))
+                        }
+                        _ => None,
+                    });
+                if let Some((window_id, origin_tab_id, path)) = target {
+                    let language = state_for_context_command
+                        .lock()
+                        .map(|app| app.language)
+                        .unwrap_or(Language::Chinese);
+                    let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) else {
+                        if let Ok(mut app) = state_for_context_command.lock()
+                            && let Some(tab) = app.tab_mut(origin_tab_id)
+                        {
+                            tab.error = Some(format!(
+                                "reveal_target_missing:{}",
+                                Texts::new(language).no_parent_location()
+                            ));
+                        }
+                        if let Some(ui) = weak.upgrade() {
+                            refresh_ui(&ui, &state_for_context_command);
+                        }
+                        return;
+                    };
+                    submit_reveal_navigation(
+                        &sender,
+                        &network_sender,
+                        &state_for_context_command,
+                        window_id,
+                        origin_tab_id,
+                        parent.to_path_buf(),
+                        path,
+                    );
                 }
             }
             command if (CMD_SIDEBAR_VISIBILITY_BASE..CMD_SIDEBAR_VISIBILITY_BASE + 5)
@@ -16061,7 +16190,7 @@ fn pending_focus_is_valid(app: &AppState, tab_id: TabId, pending: &PendingFocus)
     }
     match pending.action {
         PendingFocusAction::Select => true,
-        PendingFocusAction::Rename { window_id } => {
+        PendingFocusAction::Reveal { window_id } | PendingFocusAction::Rename { window_id } => {
             app.window_for_tab(tab_id) == Some(window_id)
                 && app
                     .window(window_id)
@@ -17824,22 +17953,28 @@ fn start_event_pump(
                         } else {
                             refresh_all_windows(&state);
                         }
-                        if let Some((tab_id, request_id)) = finished {
-                            reveal_focused_entry(&ui, &state, tab_id, request_id);
-                            if let Some(target_ui) = state
+                        if let Some((tab_id, request_id)) = finished
+                            && let Some(target_ui) = state
                                 .lock()
                                 .ok()
                                 .and_then(|app| app.window_for_tab(tab_id))
                                 .and_then(window_ui)
-                            {
-                                submit_visible_shortcuts(
-                                    &shortcut_sender,
-                                    &state,
-                                    &target_ui,
-                                    tab_id,
-                                    request_id,
-                                );
+                        {
+                            let focused = state.lock().ok().and_then(|app| {
+                                app.tab(tab_id)
+                                    .filter(|tab| tab.latest_request == request_id)
+                                    .and_then(|tab| tab.focused)
+                            });
+                            if let Some(entry_id) = focused {
+                                reveal_entry(&target_ui, &state, tab_id, request_id, entry_id);
                             }
+                            submit_visible_shortcuts(
+                                &shortcut_sender,
+                                &state,
+                                &target_ui,
+                                tab_id,
+                                request_id,
+                            );
                         }
                         if network_root_finished {
                             platform::windows::network::record_runtime_event(
@@ -17956,40 +18091,6 @@ fn reveal_entry(
     ));
 }
 
-fn reveal_focused_entry(
-    ui: &AppWindow,
-    state: &SharedSessions,
-    tab_id: TabId,
-    request_id: RequestId,
-) {
-    const ROW_HEIGHT: f32 = 40.0;
-    let index = state.lock().ok().and_then(|app| {
-        (app.window_for_tab(tab_id) == Some(app.active_window)
-            && app.active_window_state().active_tab == tab_id)
-            .then(|| app.tab(tab_id))
-            .flatten()
-            .filter(|tab| tab.latest_request == request_id)
-            .and_then(|tab| tab.focused.and_then(|id| tab.visible_entry_index(id)))
-    });
-    let Some(index) = index else {
-        return;
-    };
-    let window_height = ui.window().size().height as f32 / ui.window().scale_factor();
-    let visible_height = (window_height - ui.get_file_list_top() - 30.0).max(ROW_HEIGHT);
-    let current = ui.get_file_viewport_y();
-    let row_top = index as f32 * ROW_HEIGHT + current;
-    let row_bottom = row_top + ROW_HEIGHT;
-    let viewport = if row_top < 0.0 {
-        -(index as f32 * ROW_HEIGHT)
-    } else if row_bottom > visible_height {
-        visible_height - (index as f32 + 1.0) * ROW_HEIGHT
-    } else {
-        current
-    };
-    let maximum = (ui.get_files().row_count() as f32 * ROW_HEIGHT - visible_height).max(0.0);
-    ui.set_file_viewport_y(viewport.clamp(-maximum, 0.0));
-}
-
 fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest> {
     let mut app = state.lock().expect("app state mutex is not poisoned");
     let mut icon_requests = Vec::new();
@@ -18035,15 +18136,23 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
             library,
         } => {
             let accepted = app.tab(tab_id).is_some_and(|tab| tab.accepts(request_id));
-            let focus = accepted
+            let pending_focus = accepted
                 .then(|| app.focus_after_refresh.get(&tab_id).cloned())
                 .flatten()
                 .filter(|pending| {
                     library.is_none()
                         && pending.request_id == Some(request_id)
                         && pending.directory == path
-                        && pending_focus_is_valid(&app, tab_id, pending)
                 });
+            let invalid_reveal = pending_focus.as_ref().is_some_and(|pending| {
+                matches!(pending.action, PendingFocusAction::Reveal { .. })
+                    && !pending_focus_is_valid(&app, tab_id, pending)
+            });
+            if invalid_reveal {
+                app.focus_after_refresh.remove(&tab_id);
+            }
+            let focus =
+                pending_focus.filter(|pending| pending_focus_is_valid(&app, tab_id, pending));
             let shell_create = accepted
                 .then(|| app.window_for_tab(tab_id))
                 .flatten()
@@ -18061,6 +18170,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
             });
             if accepted {
                 let consumed_focus = focus.is_some();
+                let language = app.language;
                 let preference = library
                     .as_ref()
                     .map(|_| app.default_directory_view)
@@ -18076,6 +18186,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                     } else {
                         tab.commit_path(path);
                     }
+                    let mut reveal_missing = false;
                     if let Some(focus) = focus.as_ref() {
                         let ids = focus
                             .paths
@@ -18091,6 +18202,9 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                             tab.selected = ids;
                             tab.focused = Some(focused);
                             tab.selection_anchor = Some(focused);
+                        } else {
+                            reveal_missing =
+                                matches!(focus.action, PendingFocusAction::Reveal { .. });
                         }
                     }
                     let shell_created = shell_create.as_ref().and_then(|pending| {
@@ -18104,7 +18218,12 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                         tab.focused = Some(entry.id);
                         tab.selection_anchor = Some(entry.id);
                     }
-                    tab.error = if source_failures > 0 {
+                    tab.error = if reveal_missing {
+                        Some(format!(
+                            "reveal_target_missing:{}",
+                            Texts::new(language).reveal_target_missing()
+                        ))
+                    } else if source_failures > 0 {
                         Some(format!("library_sources:{source_failures}"))
                     } else {
                         (skipped > 0).then(|| skipped.to_string())
@@ -18172,6 +18291,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
             {
                 tab.discard_pending();
                 tab.load_state = LoadState::Cancelled;
+                app.focus_after_refresh.remove(&tab_id);
             }
         }
         DirectoryEvent::Failed {
@@ -18186,6 +18306,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                 tab.discard_pending();
                 tab.load_state = classify_error(kind);
                 tab.error = Some(message);
+                app.focus_after_refresh.remove(&tab_id);
             }
         }
         DirectoryEvent::Slow { tab_id, request_id } => {
@@ -21820,6 +21941,13 @@ fn status_text(tab: &TabSession, texts: Texts) -> String {
             Language::Chinese => "网络连接较慢，仍在等待…".to_owned(),
             Language::English => "The network connection is slow. Still waiting…".to_owned(),
         };
+    }
+    if let Some(message) = tab
+        .error
+        .as_deref()
+        .and_then(|value| value.strip_prefix("reveal_target_missing:"))
+    {
+        return message.to_owned();
     }
     if let Some(failed) = tab
         .error
@@ -27445,6 +27573,230 @@ mod tests {
         }
     }
 
+    #[test]
+    fn issue_59_menu_is_first_and_only_enabled_for_one_search_result() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\search")], 0, [0, 1, 2, 3]);
+        let tab = app.tab_mut(TabId(1)).unwrap();
+        tab.page_source = PageSource::Search;
+        tab.replace_entries(vec![focus_entry(257, r"D:\one\same.txt")]);
+        tab.selected = vec![EntryId(257)];
+
+        let (rows, _) = built_in_context_rows(&app, false, false);
+        assert_eq!(rows[0].id, CMD_OPEN_FILE_LOCATION);
+        assert_eq!(rows[0].label.as_str(), "打开所在位置");
+        assert!(rows[0].enabled);
+        assert!(rows[1].separator);
+
+        app.tab_mut(TabId(1)).unwrap().selected.clear();
+        let (rows, _) = built_in_context_rows(&app, false, false);
+        assert!(!rows[0].enabled);
+        app.tab_mut(TabId(1)).unwrap().page_source = PageSource::Directory;
+        let (rows, _) = built_in_context_rows(&app, false, false);
+        assert!(rows.iter().all(|row| row.id != CMD_OPEN_FILE_LOCATION));
+
+        app.language = Language::English;
+        app.tab_mut(TabId(1)).unwrap().page_source = PageSource::Search;
+        app.tab_mut(TabId(1)).unwrap().selected = vec![EntryId(257)];
+        let (rows, _) = built_in_context_rows(&app, false, false);
+        assert_eq!(rows[0].label.as_str(), "Open file location");
+    }
+
+    #[test]
+    fn issue_59_reveal_request_is_registered_before_worker_delivery() {
+        let app = AppState::new_for_test(vec![PathBuf::from(r"C:\search")], 0, [0, 1, 2, 3]);
+        let window_id = app.active_window;
+        let origin_tab_id = app.active_window_state().active_tab;
+        let state = Arc::new(Mutex::new(app));
+        let (local_sender, local_receiver) = mpsc::channel();
+        let (network_sender, _network_receiver) = mpsc::sync_channel(1);
+        let target = PathBuf::from(r"D:\target\item.txt");
+        let parent = target.parent().unwrap().to_path_buf();
+
+        let tab_id = submit_reveal_navigation(
+            &local_sender,
+            &network_sender,
+            &state,
+            window_id,
+            origin_tab_id,
+            parent.clone(),
+            target.clone(),
+        )
+        .unwrap();
+        let request = local_receiver.try_recv().expect("directory request queued");
+        let app = state.lock().unwrap();
+        let pending = app.focus_after_refresh.get(&tab_id).unwrap();
+        assert_eq!(pending.request_id, Some(request.request_id));
+        assert_eq!(pending.directory, parent);
+        assert_eq!(pending.paths, vec![target]);
+        assert_eq!(app.window(window_id).unwrap().active_tab, tab_id);
+    }
+    #[test]
+    fn issue_59_reveal_matches_the_complete_original_path() {
+        let target = PathBuf::from(r"D:\second\same.txt");
+        let parent = target.parent().unwrap().to_path_buf();
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\search")], 0, [0, 1, 2, 3]);
+        let window_id = app.active_window;
+        let tab_id = app
+            .create_tab_in_window(window_id, NavigationLocation::Directory(parent.clone()))
+            .unwrap();
+        let request_id = {
+            let tab = app.tab_mut(tab_id).unwrap();
+            tab.begin_directory_navigation(parent.clone(), NavigationKind::Refresh)
+                .0
+        };
+        app.focus_after_refresh.insert(
+            tab_id,
+            PendingFocus {
+                directory: parent.clone(),
+                request_id: Some(request_id),
+                paths: vec![target.clone()],
+                action: PendingFocusAction::Reveal { window_id },
+            },
+        );
+        let state = Arc::new(Mutex::new(app));
+        apply_event(
+            &state,
+            DirectoryEvent::Batch {
+                tab_id,
+                request_id,
+                entries: vec![
+                    focus_entry(1, r"D:\first\same.txt"),
+                    focus_entry(2, r"D:\second\same.txt"),
+                ],
+            },
+        );
+        apply_event(
+            &state,
+            DirectoryEvent::Finished {
+                tab_id,
+                request_id,
+                path: parent,
+                skipped: 0,
+                source_failures: 0,
+                library: None,
+            },
+        );
+
+        let app = state.lock().unwrap();
+        let tab = app.tab(tab_id).unwrap();
+        assert_eq!(tab.selected, vec![EntryId(2)]);
+        assert_eq!(tab.focused, Some(EntryId(2)));
+        assert_eq!(tab.selection_anchor, Some(EntryId(2)));
+        assert!(!app.focus_after_refresh.contains_key(&tab_id));
+    }
+
+    #[test]
+    fn issue_59_folder_results_open_their_parent_instead_of_the_folder() {
+        let target = PathBuf::from(r"D:\parent\folder");
+        let parent = target.parent().unwrap().to_path_buf();
+        let app = AppState::new_for_test(vec![PathBuf::from(r"C:\search")], 0, [0, 1, 2, 3]);
+        let window_id = app.active_window;
+        let origin_tab_id = app.active_window_state().active_tab;
+        let state = Arc::new(Mutex::new(app));
+        let (local_sender, local_receiver) = mpsc::channel();
+        let (network_sender, _network_receiver) = mpsc::sync_channel(1);
+        let tab_id = submit_reveal_navigation(
+            &local_sender,
+            &network_sender,
+            &state,
+            window_id,
+            origin_tab_id,
+            parent.clone(),
+            target.clone(),
+        )
+        .unwrap();
+        let request = local_receiver.try_recv().unwrap();
+        assert_eq!(request.path, parent);
+        let mut folder = focus_entry(9, r"D:\parent\folder");
+        folder.kind = crate::domain::EntryKind::Directory;
+        apply_event(
+            &state,
+            DirectoryEvent::Batch {
+                tab_id,
+                request_id: request.request_id,
+                entries: vec![folder],
+            },
+        );
+        apply_event(
+            &state,
+            DirectoryEvent::Finished {
+                tab_id,
+                request_id: request.request_id,
+                path: request.path,
+                skipped: 0,
+                source_failures: 0,
+                library: None,
+            },
+        );
+        let app = state.lock().unwrap();
+        let tab = app.tab(tab_id).unwrap();
+        assert_eq!(tab.visible_path(), Some(parent.as_path()));
+        assert_eq!(tab.selected, vec![EntryId(9)]);
+    }
+
+    #[test]
+    fn issue_59_missing_and_stale_targets_do_not_select_or_steal_focus() {
+        let parent = PathBuf::from(r"D:\target");
+        let target = parent.join("deleted.txt");
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\search")], 0, [0, 1, 2, 3]);
+        let window_id = app.active_window;
+        let tab_id = app
+            .create_tab_in_window(window_id, NavigationLocation::Directory(parent.clone()))
+            .unwrap();
+        let request_id = {
+            let tab = app.tab_mut(tab_id).unwrap();
+            tab.begin_directory_navigation(parent.clone(), NavigationKind::Refresh)
+                .0
+        };
+        app.focus_after_refresh.insert(
+            tab_id,
+            PendingFocus {
+                directory: parent.clone(),
+                request_id: Some(request_id),
+                paths: vec![target],
+                action: PendingFocusAction::Reveal { window_id },
+            },
+        );
+        let state = Arc::new(Mutex::new(app));
+        apply_event(
+            &state,
+            DirectoryEvent::Finished {
+                tab_id,
+                request_id: RequestId(request_id.0.saturating_sub(1)),
+                path: parent.clone(),
+                skipped: 0,
+                source_failures: 0,
+                library: None,
+            },
+        );
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .focus_after_refresh
+                .contains_key(&tab_id)
+        );
+        apply_event(
+            &state,
+            DirectoryEvent::Finished {
+                tab_id,
+                request_id,
+                path: parent,
+                skipped: 0,
+                source_failures: 0,
+                library: None,
+            },
+        );
+        let app = state.lock().unwrap();
+        let tab = app.tab(tab_id).unwrap();
+        assert!(tab.selected.is_empty());
+        assert!(tab.focused.is_none());
+        assert_eq!(
+            status_text(tab, Texts::new(Language::Chinese)),
+            "目标已被移动、重命名或删除"
+        );
+        assert!(!app.focus_after_refresh.contains_key(&tab_id));
+    }
     #[test]
     fn pressing_an_unselected_row_for_drag_does_not_mutate_selection() {
         let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\test")], 0, [0, 1, 2, 3]);

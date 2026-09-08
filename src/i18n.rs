@@ -52,6 +52,21 @@ impl Texts {
         self.choose("文件夹", "Folder")
     }
 
+    pub fn open_file_location(self) -> &'static str {
+        self.choose("打开所在位置", "Open file location")
+    }
+
+    pub fn no_parent_location(self) -> &'static str {
+        self.choose("此项目没有可打开的父目录", "This item has no parent folder")
+    }
+
+    pub fn reveal_target_missing(self) -> &'static str {
+        self.choose(
+            "目标已被移动、重命名或删除",
+            "The item was moved, renamed, or deleted",
+        )
+    }
+
     pub fn sidebar_categories(self) -> [&'static str; 5] {
         match self.language {
             Language::Chinese => ["快速访问", "库", "磁盘", "网络位置", "网络"],
