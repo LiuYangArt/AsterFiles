@@ -19015,8 +19015,8 @@ fn everything_sort(
     match (field, direction) {
         (SortField::Name, SortDirection::Ascending) => EverythingSort::NameAscending,
         (SortField::Name, SortDirection::Descending) => EverythingSort::NameDescending,
-        (SortField::Kind, SortDirection::Ascending) => EverythingSort::ExtensionAscending,
-        (SortField::Kind, SortDirection::Descending) => EverythingSort::ExtensionDescending,
+        (SortField::Kind, SortDirection::Ascending) => EverythingSort::PathAscending,
+        (SortField::Kind, SortDirection::Descending) => EverythingSort::PathDescending,
         (SortField::Size, SortDirection::Ascending) => EverythingSort::SizeAscending,
         (SortField::Size, SortDirection::Descending) => EverythingSort::SizeDescending,
         (SortField::Modified, SortDirection::Ascending) => EverythingSort::ModifiedAscending,
@@ -27043,6 +27043,14 @@ mod tests {
         assert_eq!(
             everything_sort(SortField::Name, SortDirection::Descending),
             EverythingSort::NameDescending
+        );
+        assert_eq!(
+            everything_sort(SortField::Kind, SortDirection::Ascending),
+            EverythingSort::PathAscending
+        );
+        assert_eq!(
+            everything_sort(SortField::Kind, SortDirection::Descending),
+            EverythingSort::PathDescending
         );
         assert_eq!(
             everything_sort(SortField::Size, SortDirection::Ascending),
