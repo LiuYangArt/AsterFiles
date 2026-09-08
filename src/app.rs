@@ -280,6 +280,7 @@ pub fn export_network_foundation_state(path: &Path) -> io::Result<()> {
         display_name: "Windows Share".to_owned(),
         sort_order: 0,
         target: NetworkTarget::WindowsPath(PathBuf::from(r"\\服务器\导入")),
+        shell_path: None,
     };
     let mut catalog = NetworkLocationCatalog::new(Vec::new());
     let owned_id = catalog
@@ -327,13 +328,13 @@ pub fn export_network_foundation_state(path: &Path) -> io::Result<()> {
             "  \"network_directory_queue_bounded\": true,\n",
             "  \"network_refresh_routed_separately\": true,\n",
             "  \"mapped_drive_normalization_scope\": \"sidebar_address_session_restore_clipboard_and_drag_preflight\",\n",
-            "  \"killable_helper_scope\": \"discovery_root_directory_authentication_create_folder_and_rename\",\n",
+            "  \"killable_helper_scope\": \"discovery_root_directory_authentication_and_all_network_file_operations\",\n",
             "  \"network_directory_per_host_limit\": 1,\n",
             "  \"slow_connection_notice_after_ms\": 2000,\n",
             "  \"authentication_temp_storage\": \"windows_dpapi_encrypted\",\n",
             "  \"credential_conflict_requires_confirmation\": true,\n",
             "  \"network_file_operation_resource_separate\": true,\n",
-            "  \"all_network_file_operations_physically_isolated\": false,\n",
+            "  \"all_network_file_operations_physically_isolated\": true,\n",
             "  \"runtime_performance_verified_by_this_scenario\": false,\n",
             "  \"network_auxiliary_work_disabled\": true\n",
             "}}\n"
@@ -1841,6 +1842,7 @@ struct AppState {
     recent_operation_changes: HashMap<PathBuf, RecentOperationChanges>,
     pending_shell_creates: HashMap<WindowId, PendingShellCreate>,
     pending_permanent_delete: Option<(TabId, Vec<OperationItem>)>,
+    pending_imported_network_location_remove: Option<NetworkLocation>,
     exit_after_cancel: bool,
     clipboard_has_files: bool,
     cut_paths: Vec<PathBuf>,
@@ -2077,6 +2079,7 @@ impl AppState {
             recent_operation_changes: HashMap::new(),
             pending_shell_creates: HashMap::new(),
             pending_permanent_delete: None,
+            pending_imported_network_location_remove: None,
             exit_after_cancel: false,
             clipboard_has_files: false,
             cut_paths: Vec::new(),
@@ -5894,6 +5897,7 @@ struct SidebarMenuResolved {
     destination: SidebarDestination,
     quick_access_path: Option<PathBuf>,
     network_location_id: Option<u64>,
+    network_location_source: Option<NetworkLocationSource>,
 }
 
 fn sidebar_menu_target(
@@ -5921,6 +5925,7 @@ fn sidebar_menu_target(
                 quick_access_path: (location.kind == KnownLocationKind::Pinned)
                     .then(|| location.path.clone()),
                 network_location_id: None,
+                network_location_source: None,
             })
         }
         2 => {
@@ -5945,6 +5950,7 @@ fn sidebar_menu_target(
                 destination,
                 quick_access_path: None,
                 network_location_id: Some(location.id),
+                network_location_source: Some(location.source),
             })
         }
         3 => {
@@ -5963,6 +5969,7 @@ fn sidebar_menu_target(
                 destination: SidebarDestination::Directory(path),
                 quick_access_path: None,
                 network_location_id: None,
+                network_location_source: None,
             })
         }
         4 => {
@@ -5983,6 +5990,7 @@ fn sidebar_menu_target(
                 )),
                 quick_access_path: None,
                 network_location_id: None,
+                network_location_source: None,
             })
         }
         _ => None,
@@ -6051,6 +6059,47 @@ fn sidebar_context_rows(
             ),
         ]);
     }
+    if let Some(source) = target.network_location_source {
+        rows.extend([
+            quick_menu_separator(),
+            quick_menu_row(
+                CMD_NETWORK_LOCATION_RENAME,
+                0,
+                text("重命名", "Rename"),
+                true,
+                false,
+                false,
+            ),
+            quick_menu_row(
+                CMD_NETWORK_LOCATION_REMOVE,
+                0,
+                text("移除", "Remove"),
+                true,
+                false,
+                false,
+            ),
+        ]);
+        if source == NetworkLocationSource::AsterOwned {
+            rows.extend([
+                quick_menu_row(
+                    CMD_NETWORK_LOCATION_MOVE_UP,
+                    0,
+                    text("上移", "Move up"),
+                    true,
+                    false,
+                    false,
+                ),
+                quick_menu_row(
+                    CMD_NETWORK_LOCATION_MOVE_DOWN,
+                    0,
+                    text("下移", "Move down"),
+                    true,
+                    false,
+                    false,
+                ),
+            ]);
+        }
+    }
     if target.network_location_id.is_some() {
         rows.extend([
             quick_menu_separator(),
@@ -6082,6 +6131,18 @@ fn selected_network_location_path(
         })
 }
 
+fn selected_network_location(
+    state: &WindowSessions,
+    menu: &SharedQuickMenu,
+) -> Option<NetworkLocation> {
+    let id = menu.lock().ok()?.active_network_location?;
+    let app = state.lock().ok()?;
+    app.imported_network_locations
+        .iter()
+        .chain(app.network_locations.iter())
+        .find(|location| location.id == id)
+        .cloned()
+}
 fn selected_network_location_target(
     state: &WindowSessions,
     menu: &SharedQuickMenu,
@@ -11898,30 +11959,29 @@ fn wire_callbacks(
                 }
             }
             CMD_NETWORK_LOCATION_RENAME => {
-                let selected = quick_menu_for_command
-                    .lock()
-                    .ok()
-                    .and_then(|menu| menu.active_network_location)
-                    .and_then(|id| {
-                        state_for_context_command.lock().ok().and_then(|app| {
-                            app.network_locations
-                                .iter()
-                                .find(|location| location.id == id)
-                                .map(|location| {
-                                    (
-                                        id,
-                                        location.display_name.clone(),
-                                        app.language,
-                                        app.dark_theme(),
-                                    )
-                                })
-                        })
-                    });
-                if let (Some((id, name, language, dark_theme)), Some(window)) =
+                let selected = selected_network_location(
+                    &state_for_context_command,
+                    &quick_menu_for_command,
+                )
+                .and_then(|location| {
+                    state_for_context_command.lock().ok().map(|app| {
+                        (
+                            location,
+                            app.language,
+                            app.dark_theme(),
+                        )
+                    })
+                });
+                if let (Some((location, language, dark_theme)), Some(window)) =
                     (selected, network_location_rename_ui.upgrade())
                 {
                     configure_network_location_rename_window(
-                        &window, id, &name, language, dark_theme,
+                        &window,
+                        location.id,
+                        &location.display_name,
+                        language,
+                        dark_theme,
+                        location.source,
                     );
                     show_network_location_rename_window(&window);
                 }
@@ -11935,6 +11995,46 @@ fn wire_callbacks(
                     {
                         app.operation_errors
                             .push(format!("Failed to copy network address: {error}"));
+                    }
+                }
+            }
+            CMD_NETWORK_LOCATION_REMOVE
+                if selected_network_location(
+                    &state_for_context_command,
+                    &quick_menu_for_command,
+                )
+                .is_some_and(|location| {
+                    location.source == NetworkLocationSource::WindowsImported
+                        && location.shell_path.is_some()
+                }) =>
+            {
+                let selected = selected_network_location(
+                    &state_for_context_command,
+                    &quick_menu_for_command,
+                );
+                if let Some(location) = selected
+                    && let Some(delete_ui) = delete_weak_for_context.upgrade()
+                {
+                    let language = state_for_context_command
+                        .lock()
+                        .map(|app| app.language)
+                        .unwrap_or(Language::Chinese);
+                    delete_ui.set_kind(0);
+                    delete_ui.set_title_text(match language {
+                        Language::Chinese => "移除此网络位置？",
+                        Language::English => "Remove this network location?",
+                    }.into());
+                    delete_ui.set_detail_text(explorer_network_location_warning(language).into());
+                    delete_ui.set_primary_text(match language {
+                        Language::Chinese => "移除",
+                        Language::English => "Remove",
+                    }.into());
+                    if let Ok(mut app) = state_for_context_command.lock() {
+                        app.pending_permanent_delete = None;
+                        app.pending_imported_network_location_remove = Some(location);
+                    }
+                    if let Some(ui) = weak.upgrade() {
+                        show_confirmation_window(&ui, None, &delete_ui);
                     }
                 }
             }
@@ -13732,6 +13832,7 @@ fn wire_confirmation_windows(
         let demo_mode = delete_weak.upgrade().is_some_and(|ui| ui.get_demo_mode());
         if !demo_mode && let Ok(mut app) = state_for_delete.lock() {
             app.pending_permanent_delete = None;
+            app.pending_imported_network_location_remove = None;
         }
         if let Some(ui) = delete_weak.upgrade() {
             let _ = ui.hide();
@@ -13747,12 +13848,32 @@ fn wire_confirmation_windows(
             }
             return;
         }
-        let pending = state_for_delete
+        let (pending, imported_remove) = state_for_delete
             .lock()
-            .ok()
-            .and_then(|mut app| app.pending_permanent_delete.take());
+            .map(|mut app| {
+                (
+                    app.pending_permanent_delete.take(),
+                    app.pending_imported_network_location_remove.take(),
+                )
+            })
+            .unwrap_or_default();
         if let Some(ui) = delete_weak.upgrade() {
             let _ = ui.hide();
+        }
+        if let Some(location) = imported_remove {
+            let state = state_for_delete.shared.clone();
+            thread::spawn(move || {
+                if let Err(error) = mutate_imported_network_location(&location, None) {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Ok(mut app) = state.lock() {
+                            app.operation_errors.push(format!(
+                                "Failed to remove Explorer network location: {error}"
+                            ));
+                        }
+                    });
+                }
+            });
+            return;
         }
         if let Some((origin_tab, items)) = pending {
             submit_delete_items(
@@ -14049,12 +14170,44 @@ fn show_network_location_rename_window(ui: &NetworkLocationRenameWindow) {
         .with_winit_window(|window| window.focus_window());
 }
 
+fn explorer_network_location_warning(language: Language) -> &'static str {
+    match language {
+        Language::Chinese => "此更改会同步影响 Explorer。",
+        Language::English => "This change also affects Explorer.",
+    }
+}
+fn mutate_imported_network_location(
+    location: &NetworkLocation,
+    new_name: Option<&str>,
+) -> io::Result<()> {
+    if location.source != NetworkLocationSource::WindowsImported {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "network location is not imported from Explorer",
+        ));
+    }
+    let shell_path = location.shell_path.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Explorer network location has no filesystem identity",
+        )
+    })?;
+    match new_name {
+        Some(name) => platform::windows::network::rename_network_location(
+            shell_path,
+            std::ffi::OsStr::new(name.trim()),
+        )
+        .map(|_| ()),
+        None => platform::windows::network::remove_network_location(shell_path),
+    }
+}
 fn configure_network_location_rename_window(
     ui: &NetworkLocationRenameWindow,
     id: u64,
     name: &str,
     language: Language,
     dark_theme: bool,
+    source: NetworkLocationSource,
 ) {
     ui.set_location_id(id.to_string().into());
     ui.set_name(name.into());
@@ -14062,14 +14215,28 @@ fn configure_network_location_rename_window(
     match language {
         Language::Chinese => {
             ui.set_title_text("重命名网络位置".into());
-            ui.set_detail_text("输入新的显示名称。".into());
+            ui.set_detail_text(
+                if source == NetworkLocationSource::WindowsImported {
+                    explorer_network_location_warning(Language::Chinese)
+                } else {
+                    "输入新的显示名称。"
+                }
+                .into(),
+            );
             ui.set_cancel_text("取消".into());
             ui.set_save_text("保存".into());
             ui.set_close_text("关闭".into());
         }
         Language::English => {
             ui.set_title_text("Rename network location".into());
-            ui.set_detail_text("Enter a new display name.".into());
+            ui.set_detail_text(
+                if source == NetworkLocationSource::WindowsImported {
+                    explorer_network_location_warning(Language::English)
+                } else {
+                    "Enter a new display name."
+                }
+                .into(),
+            );
             ui.set_cancel_text("Cancel".into());
             ui.set_save_text("Save".into());
             ui.set_close_text("Close".into());
@@ -14106,7 +14273,27 @@ fn wire_network_location_rename_window(ui: &NetworkLocationRenameWindow, state: 
             .upgrade()
             .and_then(|ui| ui.get_location_id().as_str().parse::<u64>().ok());
         let Some(id) = id else { return };
-        if let Ok(mut app) = state.lock() {
+        let imported = state.lock().ok().and_then(|app| {
+            app.imported_network_locations
+                .iter()
+                .find(|location| location.id == id)
+                .cloned()
+        });
+        if let Some(location) = imported {
+            let state_for_result = state.clone();
+            let name = name.to_string();
+            thread::spawn(move || {
+                if let Err(error) = mutate_imported_network_location(&location, Some(&name)) {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Ok(mut app) = state_for_result.lock() {
+                            app.operation_errors.push(format!(
+                                "Failed to rename Explorer network location: {error}"
+                            ));
+                        }
+                    });
+                }
+            });
+        } else if let Ok(mut app) = state.lock() {
             let mut catalog = NetworkLocationCatalog::new(app.network_locations.clone());
             match catalog.rename(id, name.as_str()) {
                 Ok(()) => {
@@ -15821,6 +16008,9 @@ fn run_file_operation_worker(
     });
 }
 
+fn uses_local_recycle_batch(kind: FileOperationKind, resource: OperationResource) -> bool {
+    kind == FileOperationKind::RecycleDelete && resource == OperationResource::Local
+}
 fn execute_file_operation_request(
     request: FileOperationRequest,
     event_sender: &mpsc::Sender<FileOperationEvent>,
@@ -15861,7 +16051,7 @@ fn execute_file_operation_request(
         Instant::now(),
     );
     progress.flush();
-    if request.kind == FileOperationKind::RecycleDelete {
+    if uses_local_recycle_batch(request.kind, request.resource) {
         execute_recycle_delete_request(request, event_sender);
         return;
     }
@@ -16168,6 +16358,29 @@ fn execute_file_operation_item(
             completed_paths: result.completed_path.into_iter().collect(),
         });
     }
+    let has_unc_path = [item.source.as_deref(), item.destination.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(crate::network::is_unc_path);
+    let network_operation = if has_unc_path {
+        match kind {
+            FileOperationKind::Copy => {
+                Some(platform::windows::network::IsolatedNetworkOperationKind::Copy)
+            }
+            FileOperationKind::Move => {
+                Some(platform::windows::network::IsolatedNetworkOperationKind::Move)
+            }
+            FileOperationKind::PermanentDelete => {
+                Some(platform::windows::network::IsolatedNetworkOperationKind::PermanentDelete)
+            }
+            FileOperationKind::RecycleDelete => {
+                Some(platform::windows::network::IsolatedNetworkOperationKind::Recycle)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
     let replace = &mut |category, source: &Path, destination: &Path| {
         let _conflict_gate = conflict_gate
             .lock()
@@ -16191,16 +16404,48 @@ fn execute_file_operation_item(
         {
             return crate::domain::file_operations::ConflictAction::Skip;
         }
-        match response_receiver.recv() {
-            Ok(decision) => {
-                if decision.apply_to_all {
-                    conflict_defaults.insert(category, decision.action);
+        loop {
+            match response_receiver.recv_timeout(Duration::from_millis(50)) {
+                Ok(decision) => {
+                    if decision.apply_to_all {
+                        conflict_defaults.insert(category, decision.action);
+                    }
+                    return decision.action;
                 }
-                decision.action
+                Err(mpsc::RecvTimeoutError::Timeout) if !cancel.is_cancelled() => {}
+                Err(_) => return crate::domain::file_operations::ConflictAction::Skip,
             }
-            Err(_) => crate::domain::file_operations::ConflictAction::Skip,
         }
     };
+    if let Some(network_kind) = network_operation {
+        let source = item.source.as_ref().ok_or("missing source")?;
+        let progress_emitter = RefCell::new(progress_emitter);
+        let report = platform::windows::network::isolated_network_file_operation(
+            network_kind,
+            source,
+            item.destination.as_deref(),
+            cancel,
+            replace,
+            &mut |bytes, current| {
+                progress_emitter.borrow_mut().discovered(bytes, current);
+            },
+            &mut |bytes, file_completed, current| {
+                progress_emitter
+                    .borrow_mut()
+                    .advanced(bytes, file_completed, current);
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        return Ok(crate::fs::file_operations::FileOperationReport {
+            files: report.files,
+            directories: report.directories,
+            bytes: report.bytes,
+            skipped: report.skipped,
+            affected_directories: report.affected_directories,
+            cleanup_pending: None,
+            completed_paths: report.completed_paths,
+        });
+    }
     match kind {
         FileOperationKind::CreateFolder => {
             let destination = item.destination.as_ref().ok_or("missing destination")?;
@@ -16290,7 +16535,7 @@ fn execute_file_operation_item(
             result.map_err(ExecuteFileOperationError::from_operation)
         }
         FileOperationKind::RecycleDelete => {
-            unreachable!("recycle delete requests are executed as one Shell batch")
+            unreachable!("local recycle delete requests are executed as one Shell batch")
         }
         FileOperationKind::PermanentDelete => {
             let path = item.source.as_ref().ok_or("missing source")?;
@@ -19192,34 +19437,85 @@ fn start_library_watcher(
         }
     });
 }
-fn start_network_location_loader(ui: &AppWindow, state: SharedSessions) {
-    let weak = ui.as_weak();
-    thread::spawn(move || {
-        let imported = platform::windows::network::enumerate_network_locations()
-            .unwrap_or_default()
-            .into_iter()
-            .enumerate()
-            .map(|(index, location)| NetworkLocation {
-                id: stable_network_location_id(&location.shell_path),
+fn imported_network_locations(
+    locations: Vec<platform::windows::network::NetworkLocation>,
+) -> Vec<NetworkLocation> {
+    locations
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, location)| {
+            let id = stable_network_location_id(&location.shell_path);
+            let target = location
+                .target
+                .map(NetworkTarget::WindowsPath)
+                .or_else(|| location.shell_identity.map(NetworkTarget::ShellItemId))?;
+            Some(NetworkLocation {
+                id,
                 source: NetworkLocationSource::WindowsImported,
                 display_name: location.label,
                 sort_order: index as u32,
-                target: location
-                    .target
-                    .map(NetworkTarget::WindowsPath)
-                    .or_else(|| location.shell_identity.map(NetworkTarget::ShellItemId))
-                    .expect("Windows network location retains an executable identity"),
+                target,
+                shell_path: Some(location.shell_path),
             })
-            .collect::<Vec<_>>();
-        let state_for_ui = state.clone();
-        let _ = weak.upgrade_in_event_loop(move |_ui| {
-            if let Ok(mut app) = state_for_ui.lock() {
-                app.imported_network_locations = imported;
-                app.network_location_generation =
-                    app.network_location_generation.wrapping_add(1).max(1);
+        })
+        .collect()
+}
+
+fn publish_imported_network_locations(
+    state: SharedSessions,
+    imported: Vec<NetworkLocation>,
+) -> bool {
+    slint::invoke_from_event_loop(move || {
+        let changed = state.lock().is_ok_and(|mut app| {
+            if app.imported_network_locations == imported {
+                return false;
             }
-            refresh_all_windows(&state_for_ui);
+            app.imported_network_locations = imported;
+            app.network_location_generation =
+                app.network_location_generation.wrapping_add(1).max(1);
+            true
         });
+        if changed {
+            refresh_all_windows(&state);
+        }
+    })
+    .is_ok()
+}
+
+fn start_network_location_loader(_ui: &AppWindow, state: SharedSessions) {
+    thread::spawn(move || {
+        let load = || {
+            platform::windows::network::enumerate_network_locations()
+                .map(imported_network_locations)
+        };
+        let initial = load().ok();
+        let Ok(root) = platform::windows::network::network_locations_folder() else {
+            if let Some(imported) = initial {
+                let _ = publish_imported_network_locations(state, imported);
+            }
+            return;
+        };
+        let (events, receiver) = mpsc::channel();
+        let Ok(_watcher) = platform::windows::directory_watch::DirectoryWatch::start(root, events)
+        else {
+            if let Some(imported) = initial {
+                let _ = publish_imported_network_locations(state, imported);
+            }
+            return;
+        };
+        if let Some(imported) = initial
+            && !publish_imported_network_locations(state.clone(), imported)
+        {
+            return;
+        }
+        while receiver.recv().is_ok() {
+            thread::sleep(Duration::from_millis(120));
+            while receiver.try_recv().is_ok() {}
+            let Ok(imported) = load() else { continue };
+            if !publish_imported_network_locations(state.clone(), imported) {
+                break;
+            }
+        }
     });
 }
 
@@ -23261,6 +23557,7 @@ mod tests {
             display_name: "Display network".to_owned(),
             sort_order: 0,
             target: NetworkTarget::ShellItemId(shell_identity.clone()),
+            shell_path: None,
         }];
         let network = sidebar_menu_target(&app, WindowId(1), 2, "network-location:42").unwrap();
         assert!(
@@ -24924,6 +25221,73 @@ mod tests {
         );
     }
     #[test]
+    fn issue_42_network_recycle_bypasses_in_process_shell_batch() {
+        assert!(uses_local_recycle_batch(
+            FileOperationKind::RecycleDelete,
+            OperationResource::Local,
+        ));
+        assert!(!uses_local_recycle_batch(
+            FileOperationKind::RecycleDelete,
+            OperationResource::Network,
+        ));
+    }
+    #[test]
+    fn explorer_network_location_mutation_warning_is_explicit_in_both_languages() {
+        assert_eq!(
+            explorer_network_location_warning(Language::Chinese),
+            "此更改会同步影响 Explorer。"
+        );
+        assert_eq!(
+            explorer_network_location_warning(Language::English),
+            "This change also affects Explorer."
+        );
+    }
+    #[test]
+    fn explorer_network_location_snapshot_keeps_shell_identity_and_stable_id() {
+        let shell_path = PathBuf::from(
+            r"C:\Users\tester\AppData\Roaming\Microsoft\Windows\Network Shortcuts\NAS",
+        );
+        let imported = imported_network_locations(vec![
+            platform::windows::network::NetworkLocation {
+                label: "家庭 NAS".into(),
+                target: Some(PathBuf::from(r"\\server\share")),
+                shell_path: shell_path.clone(),
+                shell_identity: Some(PathBuf::from("shell:::network-location")),
+            },
+            platform::windows::network::NetworkLocation {
+                label: "Shell only".into(),
+                target: None,
+                shell_path: PathBuf::from(r"C:\Network Shortcuts\Virtual"),
+                shell_identity: Some(PathBuf::from("shell:::virtual-network-location")),
+            },
+        ]);
+
+        assert_eq!(imported.len(), 2);
+        assert_eq!(imported[0].id, stable_network_location_id(&shell_path));
+        assert_eq!(imported[0].display_name, "家庭 NAS");
+        assert_eq!(
+            imported[0].target,
+            NetworkTarget::WindowsPath(PathBuf::from(r"\\server\share"))
+        );
+        assert_eq!(
+            imported[1].target,
+            NetworkTarget::ShellItemId(PathBuf::from("shell:::virtual-network-location"))
+        );
+    }
+
+    #[test]
+    fn explorer_network_location_snapshot_drops_items_without_executable_identity() {
+        let imported =
+            imported_network_locations(vec![platform::windows::network::NetworkLocation {
+                label: "Broken".into(),
+                target: None,
+                shell_path: PathBuf::from(r"C:\Network Shortcuts\Broken"),
+                shell_identity: None,
+            }]);
+
+        assert!(imported.is_empty());
+    }
+    #[test]
     fn network_location_name_prefers_share_or_host() {
         assert_eq!(
             network_location_default_name(Path::new(r"\\server\share\folder")),
@@ -24944,6 +25308,7 @@ mod tests {
             display_name: "NAS".into(),
             sort_order: 0,
             target: target.clone(),
+            shell_path: None,
         }];
 
         assert_eq!(
@@ -24964,6 +25329,7 @@ mod tests {
                 display_name: "Path location".into(),
                 sort_order: 0,
                 target: NetworkTarget::WindowsPath(PathBuf::from(r"\\server\share")),
+                shell_path: None,
             },
             NetworkLocation {
                 id: 2,
@@ -24971,6 +25337,7 @@ mod tests {
                 display_name: "Shell only".into(),
                 sort_order: 1,
                 target: NetworkTarget::ShellItemId(PathBuf::from("shell:::virtual")),
+                shell_path: None,
             },
         ];
         let (request_id, _) = app

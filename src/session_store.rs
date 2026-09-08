@@ -302,6 +302,7 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
             display_name: read_string(bytes, &mut offset)?,
             sort_order: read_u32(bytes, &mut offset)?,
             target: NetworkTarget::WindowsPath(PathBuf::from(read_os(bytes, &mut offset)?)),
+            shell_path: None,
         });
     }
     let network_device_count = read_u32(bytes, &mut offset)? as usize;
@@ -820,6 +821,7 @@ mod tests {
                 display_name: "家庭 NAS".to_owned(),
                 sort_order: 0,
                 target: NetworkTarget::WindowsPath(PathBuf::from(r"\\NAS\媒体")),
+                shell_path: None,
             }],
             vec![NetworkDeviceTarget {
                 id: network_device_id(Path::new(r"\\LiuYanghomeNAS")),

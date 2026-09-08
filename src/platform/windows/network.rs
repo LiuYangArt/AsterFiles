@@ -140,9 +140,59 @@ impl Drop for ComGuard {
     }
 }
 
+pub fn network_locations_folder() -> io::Result<PathBuf> {
+    known_folder_path(&FOLDERID_NETHOOD)
+}
+
+fn explorer_network_location_path_in(root: &Path, shell_path: &Path) -> io::Result<PathBuf> {
+    let canonical_root = std::fs::canonicalize(root)?;
+    let canonical_item = std::fs::canonicalize(shell_path)?;
+    if canonical_item.parent() != Some(canonical_root.as_path()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "network location is not a direct Explorer NetHood item",
+        ));
+    }
+    Ok(canonical_item)
+}
+
+fn explorer_network_location_path(shell_path: &Path) -> io::Result<PathBuf> {
+    explorer_network_location_path_in(&network_locations_folder()?, shell_path)
+}
+
+fn valid_network_location_name(name: &OsStr) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
+}
+pub fn rename_network_location(shell_path: &Path, name: &OsStr) -> io::Result<PathBuf> {
+    if !valid_network_location_name(name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "network location name must be one non-empty path component",
+        ));
+    }
+    let source = explorer_network_location_path(shell_path)?;
+    let destination = source
+        .parent()
+        .expect("validated NetHood item has a parent")
+        .join(name);
+    std::fs::rename(&source, &destination)?;
+    Ok(destination)
+}
+
+pub fn remove_network_location(shell_path: &Path) -> io::Result<()> {
+    let item = explorer_network_location_path(shell_path)?;
+    let metadata = std::fs::symlink_metadata(&item)?;
+    if metadata.is_dir() {
+        std::fs::remove_dir_all(item)
+    } else {
+        std::fs::remove_file(item)
+    }
+}
 pub fn enumerate_network_locations() -> io::Result<Vec<NetworkLocation>> {
     let _com = ComGuard::new()?;
-    let items = enumerate_shell_folder(&known_folder_path(&FOLDERID_NETHOOD)?)?;
+    let items = enumerate_shell_folder(&network_locations_folder()?)?;
     Ok(items
         .into_iter()
         .filter_map(|item| {
@@ -841,6 +891,157 @@ pub fn isolated_file_mutation(
     )
 }
 #[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolatedNetworkOperationKind {
+    Copy,
+    Move,
+    PermanentDelete,
+    Recycle,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsolatedNetworkOperationReport {
+    pub files: usize,
+    pub directories: usize,
+    pub bytes: u64,
+    pub skipped: Vec<PathBuf>,
+    pub affected_directories: Vec<PathBuf>,
+    pub completed_paths: Vec<PathBuf>,
+    pub aborted: bool,
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+pub fn isolated_network_file_operation(
+    kind: IsolatedNetworkOperationKind,
+    source: &Path,
+    destination: Option<&Path>,
+    cancel: &crate::domain::file_operations::CancellationToken,
+    resolve_conflict: &mut dyn FnMut(
+        crate::domain::file_operations::ConflictCategory,
+        &Path,
+        &Path,
+    ) -> crate::domain::file_operations::ConflictAction,
+    discovered: &mut dyn FnMut(u64, &Path),
+    progress: &mut dyn FnMut(u64, bool, &Path),
+) -> io::Result<IsolatedNetworkOperationReport> {
+    let stamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let base = std::env::temp_dir().join(format!(
+        "asterfiles-network-operation-{}-{stamp}",
+        std::process::id()
+    ));
+    let input = base.with_extension("in");
+    let output = base.with_extension("out");
+    let event = base.with_extension("event");
+    let response = base.with_extension("response");
+    write_network_operation_input(&input, kind, source, destination)?;
+    let result = (|| {
+        use std::os::windows::process::CommandExt;
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .arg(CHILD_PREFIX)
+            .arg("network-operation")
+            .arg(&input)
+            .arg(&output)
+            .creation_flags(0x08000000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn()?;
+        let job = match KillOnCloseJob::create() {
+            Ok(job) => job,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        if let Err(error) = job.assign(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        let mut last_sequence = 0_u64;
+        let mut last_activity = std::time::Instant::now();
+        loop {
+            if let Some(status) = child.try_wait()? {
+                if !status.success() {
+                    return Err(io::Error::other(format!(
+                        "network operation helper exited with {status}"
+                    )));
+                }
+                return read_network_operation_result(&output);
+            }
+            if cancel.is_cancelled() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "network operation helper cancelled",
+                ));
+            }
+            if let Ok((sequence, helper_event)) = read_network_operation_event(&event)
+                && sequence > last_sequence
+            {
+                last_sequence = sequence;
+                last_activity = std::time::Instant::now();
+                match helper_event {
+                    NetworkOperationEvent::Discovered { bytes, path } => discovered(bytes, &path),
+                    NetworkOperationEvent::Progress {
+                        bytes,
+                        file_completed,
+                        path,
+                    } => progress(bytes, file_completed, &path),
+                    NetworkOperationEvent::Conflict {
+                        category,
+                        source,
+                        destination,
+                    } => {
+                        let action = resolve_conflict(category, &source, &destination);
+                        write_network_operation_response(&response, sequence, action)?;
+                    }
+                }
+            }
+            if last_activity.elapsed() >= ISOLATED_TIMEOUT {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "network operation helper inactive for 10 seconds",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    })();
+    for path in [&input, &output, &event, &response] {
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+enum NetworkOperationEvent {
+    Discovered {
+        bytes: u64,
+        path: PathBuf,
+    },
+    Progress {
+        bytes: u64,
+        file_completed: bool,
+        path: PathBuf,
+    },
+    Conflict {
+        category: crate::domain::file_operations::ConflictCategory,
+        source: PathBuf,
+        destination: PathBuf,
+    },
+}
+#[cfg(windows)]
 pub fn isolated_directory(
     path: &Path,
     visibility: FileVisibility,
@@ -1042,6 +1243,15 @@ pub fn try_run_child_from_args() -> io::Result<bool> {
         let (kind, source, destination) = read_file_mutation_input(&input)?;
         let result = execute_file_mutation(kind, source.as_deref(), destination.as_deref())?;
         write_file_mutation_result(&output, &result)?;
+        return Ok(true);
+    }
+    if mode == "network-operation" {
+        let (kind, source, destination) = read_network_operation_input(&input)?;
+        let event = input.with_extension("event");
+        let response = input.with_extension("response");
+        let result =
+            execute_network_operation(kind, &source, destination.as_deref(), &event, &response)?;
+        write_network_operation_result(&output, &result)?;
         return Ok(true);
     }
     let result = if mode == "devices" {
@@ -1447,6 +1657,439 @@ fn read_file_mutation_result(path: &Path) -> io::Result<IsolatedFileMutationResu
     })
 }
 
+#[cfg(windows)]
+fn write_network_operation_input(
+    path: &Path,
+    kind: IsolatedNetworkOperationKind,
+    source: &Path,
+    destination: Option<&Path>,
+) -> io::Result<()> {
+    let mut bytes = vec![match kind {
+        IsolatedNetworkOperationKind::Copy => 0,
+        IsolatedNetworkOperationKind::Move => 1,
+        IsolatedNetworkOperationKind::PermanentDelete => 2,
+        IsolatedNetworkOperationKind::Recycle => 3,
+    }];
+    write_units(
+        &mut bytes,
+        &source.as_os_str().encode_wide().collect::<Vec<_>>(),
+    )?;
+    write_optional_path(&mut bytes, destination)?;
+    std::fs::write(path, bytes)
+}
+
+#[cfg(windows)]
+fn read_network_operation_input(
+    path: &Path,
+) -> io::Result<(IsolatedNetworkOperationKind, PathBuf, Option<PathBuf>)> {
+    let bytes = std::fs::read(path)?;
+    let mut offset = 0;
+    let kind = match read_byte(&bytes, &mut offset)? {
+        0 => IsolatedNetworkOperationKind::Copy,
+        1 => IsolatedNetworkOperationKind::Move,
+        2 => IsolatedNetworkOperationKind::PermanentDelete,
+        3 => IsolatedNetworkOperationKind::Recycle,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid network operation kind",
+            ));
+        }
+    };
+    let source = PathBuf::from(OsString::from_wide(&read_units_at(&bytes, &mut offset)?));
+    let destination = read_optional_path(&bytes, &mut offset)?;
+    if offset != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing network operation input data",
+        ));
+    }
+    Ok((kind, source, destination))
+}
+
+#[cfg(windows)]
+fn execute_network_operation(
+    kind: IsolatedNetworkOperationKind,
+    source: &Path,
+    destination: Option<&Path>,
+    event_path: &Path,
+    response_path: &Path,
+) -> io::Result<IsolatedNetworkOperationReport> {
+    use crate::domain::file_operations::{CancellationToken, ConflictAction};
+
+    let cancel = CancellationToken::new();
+    let sequence = std::cell::Cell::new(0_u64);
+    let mut conflict = |category, source: &Path, destination: &Path| {
+        sequence.set(sequence.get().saturating_add(1));
+        let _ = write_network_operation_event(
+            event_path,
+            sequence.get(),
+            &NetworkOperationEvent::Conflict {
+                category,
+                source: source.to_path_buf(),
+                destination: destination.to_path_buf(),
+            },
+        );
+        let started = std::time::Instant::now();
+        loop {
+            if let Ok((response_sequence, action)) = read_network_operation_response(response_path)
+                && response_sequence == sequence.get()
+            {
+                return action;
+            }
+            if started.elapsed() >= ISOLATED_TIMEOUT {
+                return ConflictAction::Skip;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let mut discovered = |bytes, path: &Path| {
+        sequence.set(sequence.get().saturating_add(1));
+        let _ = write_network_operation_event(
+            event_path,
+            sequence.get(),
+            &NetworkOperationEvent::Discovered {
+                bytes,
+                path: path.to_path_buf(),
+            },
+        );
+    };
+    let mut progress = |bytes, file_completed, path: &Path| {
+        sequence.set(sequence.get().saturating_add(1));
+        let _ = write_network_operation_event(
+            event_path,
+            sequence.get(),
+            &NetworkOperationEvent::Progress {
+                bytes,
+                file_completed,
+                path: path.to_path_buf(),
+            },
+        );
+    };
+
+    let report = match kind {
+        IsolatedNetworkOperationKind::Copy => {
+            let destination = destination.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing copy destination")
+            })?;
+            crate::fs::file_operations::copy_path_with_progress(
+                source,
+                destination,
+                &cancel,
+                &mut conflict,
+                &mut discovered,
+                &mut progress,
+                &mut |_| {},
+            )
+            .map_err(|error| io::Error::other(format!("{error:?}")))?
+        }
+        IsolatedNetworkOperationKind::Move => {
+            let destination = destination.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing move destination")
+            })?;
+            crate::fs::file_operations::move_path_with_progress(
+                source,
+                destination,
+                &cancel,
+                &mut conflict,
+                &mut discovered,
+                &mut progress,
+            )
+            .map_err(|error| io::Error::other(format!("{error:?}")))?
+        }
+        IsolatedNetworkOperationKind::PermanentDelete => {
+            crate::fs::file_operations::permanently_delete(source, &cancel)
+                .map_err(|error| io::Error::other(format!("{error:?}")))?
+        }
+        IsolatedNetworkOperationKind::Recycle => {
+            let result =
+                crate::platform::windows::file_operation::recycle(&[source.to_path_buf()], || {
+                    false
+                });
+            if let Some(error) = result.items.into_iter().find_map(|item| item.result.err()) {
+                return Err(io::Error::other(error));
+            }
+            return Ok(IsolatedNetworkOperationReport {
+                files: 0,
+                directories: 0,
+                bytes: 0,
+                skipped: Vec::new(),
+                affected_directories: source.parent().map(Path::to_path_buf).into_iter().collect(),
+                completed_paths: vec![source.to_path_buf()],
+                aborted: result.aborted,
+            });
+        }
+    };
+    Ok(IsolatedNetworkOperationReport {
+        files: report.files,
+        directories: report.directories,
+        bytes: report.bytes,
+        skipped: report.skipped,
+        affected_directories: report.affected_directories,
+        completed_paths: report.completed_paths,
+        aborted: false,
+    })
+}
+
+#[cfg(windows)]
+fn write_network_operation_event(
+    path: &Path,
+    sequence: u64,
+    event: &NetworkOperationEvent,
+) -> io::Result<()> {
+    let mut bytes = sequence.to_le_bytes().to_vec();
+    match event {
+        NetworkOperationEvent::Discovered { bytes: count, path } => {
+            bytes.push(0);
+            bytes.extend_from_slice(&count.to_le_bytes());
+            write_units(
+                &mut bytes,
+                &path.as_os_str().encode_wide().collect::<Vec<_>>(),
+            )?;
+        }
+        NetworkOperationEvent::Progress {
+            bytes: count,
+            file_completed,
+            path,
+        } => {
+            bytes.push(1);
+            bytes.extend_from_slice(&count.to_le_bytes());
+            bytes.push(u8::from(*file_completed));
+            write_units(
+                &mut bytes,
+                &path.as_os_str().encode_wide().collect::<Vec<_>>(),
+            )?;
+        }
+        NetworkOperationEvent::Conflict {
+            category,
+            source,
+            destination,
+        } => {
+            bytes.push(2);
+            bytes.push(conflict_category_code(*category));
+            write_units(
+                &mut bytes,
+                &source.as_os_str().encode_wide().collect::<Vec<_>>(),
+            )?;
+            write_units(
+                &mut bytes,
+                &destination.as_os_str().encode_wide().collect::<Vec<_>>(),
+            )?;
+        }
+    }
+    atomic_write(path, &bytes)
+}
+
+#[cfg(windows)]
+fn read_network_operation_event(path: &Path) -> io::Result<(u64, NetworkOperationEvent)> {
+    let bytes = std::fs::read(path)?;
+    let mut offset = 0;
+    let sequence = read_u64(&bytes, &mut offset)?;
+    let event = match read_byte(&bytes, &mut offset)? {
+        0 => NetworkOperationEvent::Discovered {
+            bytes: read_u64(&bytes, &mut offset)?,
+            path: PathBuf::from(OsString::from_wide(&read_units_at(&bytes, &mut offset)?)),
+        },
+        1 => {
+            let count = read_u64(&bytes, &mut offset)?;
+            let file_completed = read_byte(&bytes, &mut offset)? != 0;
+            NetworkOperationEvent::Progress {
+                bytes: count,
+                file_completed,
+                path: PathBuf::from(OsString::from_wide(&read_units_at(&bytes, &mut offset)?)),
+            }
+        }
+        2 => NetworkOperationEvent::Conflict {
+            category: conflict_category_from_code(read_byte(&bytes, &mut offset)?)?,
+            source: PathBuf::from(OsString::from_wide(&read_units_at(&bytes, &mut offset)?)),
+            destination: PathBuf::from(OsString::from_wide(&read_units_at(&bytes, &mut offset)?)),
+        },
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid operation event",
+            ));
+        }
+    };
+    if offset != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing operation event data",
+        ));
+    }
+    Ok((sequence, event))
+}
+
+#[cfg(windows)]
+fn write_network_operation_response(
+    path: &Path,
+    sequence: u64,
+    action: crate::domain::file_operations::ConflictAction,
+) -> io::Result<()> {
+    let mut bytes = sequence.to_le_bytes().to_vec();
+    bytes.push(match action {
+        crate::domain::file_operations::ConflictAction::Replace => 0,
+        crate::domain::file_operations::ConflictAction::Skip => 1,
+        crate::domain::file_operations::ConflictAction::KeepBoth => 2,
+    });
+    atomic_write(path, &bytes)
+}
+
+#[cfg(windows)]
+fn read_network_operation_response(
+    path: &Path,
+) -> io::Result<(u64, crate::domain::file_operations::ConflictAction)> {
+    let bytes = std::fs::read(path)?;
+    let mut offset = 0;
+    let sequence = read_u64(&bytes, &mut offset)?;
+    let action = match read_byte(&bytes, &mut offset)? {
+        0 => crate::domain::file_operations::ConflictAction::Replace,
+        1 => crate::domain::file_operations::ConflictAction::Skip,
+        2 => crate::domain::file_operations::ConflictAction::KeepBoth,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid conflict response",
+            ));
+        }
+    };
+    if offset != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing conflict response data",
+        ));
+    }
+    Ok((sequence, action))
+}
+
+#[cfg(windows)]
+fn conflict_category_code(category: crate::domain::file_operations::ConflictCategory) -> u8 {
+    use crate::domain::file_operations::ConflictCategory::*;
+    match category {
+        ExistingFile => 0,
+        ExistingDirectory => 1,
+        TypeMismatch => 2,
+        DestinationReadOnly => 3,
+        SourceInsideDestination => 4,
+        Other => 5,
+    }
+}
+
+#[cfg(windows)]
+fn conflict_category_from_code(
+    code: u8,
+) -> io::Result<crate::domain::file_operations::ConflictCategory> {
+    use crate::domain::file_operations::ConflictCategory::*;
+    match code {
+        0 => Ok(ExistingFile),
+        1 => Ok(ExistingDirectory),
+        2 => Ok(TypeMismatch),
+        3 => Ok(DestinationReadOnly),
+        4 => Ok(SourceInsideDestination),
+        5 => Ok(Other),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid conflict category",
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let mut temporary_name = path.as_os_str().to_os_string();
+    temporary_name.push(format!(".writing-{}", std::process::id()));
+    let temporary = PathBuf::from(temporary_name);
+    std::fs::write(&temporary, bytes)?;
+    let temporary_wide = wide_null(temporary.as_os_str());
+    let path_wide = wide_null(path.as_os_str());
+    if unsafe {
+        MoveFileExW(
+            temporary_wide.as_ptr(),
+            path_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        let error = io::Error::last_os_error();
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_network_operation_result(
+    path: &Path,
+    result: &IsolatedNetworkOperationReport,
+) -> io::Result<()> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(result.files as u64).to_le_bytes());
+    bytes.extend_from_slice(&(result.directories as u64).to_le_bytes());
+    bytes.extend_from_slice(&result.bytes.to_le_bytes());
+    write_path_list(&mut bytes, &result.skipped)?;
+    write_path_list(&mut bytes, &result.affected_directories)?;
+    write_path_list(&mut bytes, &result.completed_paths)?;
+    bytes.push(u8::from(result.aborted));
+    std::fs::write(path, bytes)
+}
+
+#[cfg(windows)]
+fn read_network_operation_result(path: &Path) -> io::Result<IsolatedNetworkOperationReport> {
+    let bytes = std::fs::read(path)?;
+    let mut offset = 0;
+    let files = usize::try_from(read_u64(&bytes, &mut offset)?)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file count too large"))?;
+    let directories = usize::try_from(read_u64(&bytes, &mut offset)?)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "directory count too large"))?;
+    let transferred = read_u64(&bytes, &mut offset)?;
+    let skipped = read_path_list(&bytes, &mut offset)?;
+    let affected_directories = read_path_list(&bytes, &mut offset)?;
+    let completed_paths = read_path_list(&bytes, &mut offset)?;
+    let aborted = read_byte(&bytes, &mut offset)? != 0;
+    if offset != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing operation result data",
+        ));
+    }
+    Ok(IsolatedNetworkOperationReport {
+        files,
+        directories,
+        bytes: transferred,
+        skipped,
+        affected_directories,
+        completed_paths,
+        aborted,
+    })
+}
+
+#[cfg(windows)]
+fn write_path_list(bytes: &mut Vec<u8>, paths: &[PathBuf]) -> io::Result<()> {
+    let count = u32::try_from(paths.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "too many paths"))?;
+    bytes.extend_from_slice(&count.to_le_bytes());
+    for path in paths {
+        write_units(bytes, &path.as_os_str().encode_wide().collect::<Vec<_>>())?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_path_list(bytes: &[u8], offset: &mut usize) -> io::Result<Vec<PathBuf>> {
+    let count = read_u32(bytes, offset)? as usize;
+    if count > MAX_HELPER_ITEMS {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "too many paths"));
+    }
+    (0..count)
+        .map(|_| {
+            read_units_at(bytes, offset).map(|units| PathBuf::from(OsString::from_wide(&units)))
+        })
+        .collect()
+}
 #[cfg(windows)]
 fn write_optional_path(bytes: &mut Vec<u8>, value: Option<&Path>) -> io::Result<()> {
     bytes.push(u8::from(value.is_some()));
@@ -1883,6 +2526,55 @@ mod isolated_codec_tests {
 
     #[cfg(windows)]
     #[test]
+    fn explorer_network_location_mutations_are_limited_to_direct_nethood_items() {
+        let root = std::env::temp_dir().join(format!(
+            "asterfiles-nethood-mutation-{}",
+            std::process::id()
+        ));
+        let outside =
+            std::env::temp_dir().join(format!("asterfiles-nethood-outside-{}", std::process::id()));
+        let item = root.join("NAS");
+        let nested = item.join("target.lnk");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&item).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(&nested, b"shortcut").unwrap();
+
+        assert_eq!(
+            super::explorer_network_location_path_in(&root, &item).unwrap(),
+            std::fs::canonicalize(&item).unwrap()
+        );
+        assert_eq!(
+            super::explorer_network_location_path_in(&root, &nested)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            super::explorer_network_location_path_in(&root, &outside)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(super::valid_network_location_name(std::ffi::OsStr::new(
+            "家庭 NAS"
+        )));
+        assert!(!super::valid_network_location_name(std::ffi::OsStr::new(
+            ""
+        )));
+        assert!(!super::valid_network_location_name(std::ffi::OsStr::new(
+            r"folder\name"
+        )));
+        assert!(!super::valid_network_location_name(std::ffi::OsStr::new(
+            ".."
+        )));
+
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
     fn authentication_input_and_result_codecs_round_trip() {
         let input_file =
             std::env::temp_dir().join(format!("asterfiles-auth-input-{}", std::process::id()));
@@ -1959,6 +2651,102 @@ mod isolated_codec_tests {
         );
         let _ = std::fs::remove_file(input_file);
         let _ = std::fs::remove_file(output_file);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn network_operation_codecs_preserve_raw_paths_and_reports() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let source = std::path::PathBuf::from(std::ffi::OsString::from_wide(&[
+            b'\\' as u16,
+            b'\\' as u16,
+            b's' as u16,
+            0xd800,
+        ]));
+        let destination = source.join("目标");
+        let input = std::env::temp_dir().join(format!(
+            "asterfiles-network-operation-input-{}",
+            std::process::id()
+        ));
+        let output = std::env::temp_dir().join(format!(
+            "asterfiles-network-operation-output-{}",
+            std::process::id()
+        ));
+        super::write_network_operation_input(
+            &input,
+            super::IsolatedNetworkOperationKind::Copy,
+            &source,
+            Some(&destination),
+        )
+        .unwrap();
+        assert_eq!(
+            super::read_network_operation_input(&input).unwrap(),
+            (
+                super::IsolatedNetworkOperationKind::Copy,
+                source.clone(),
+                Some(destination.clone())
+            )
+        );
+        let report = super::IsolatedNetworkOperationReport {
+            files: 2,
+            directories: 1,
+            bytes: 42,
+            skipped: vec![source.clone()],
+            affected_directories: vec![source.clone()],
+            completed_paths: vec![destination],
+            aborted: false,
+        };
+        super::write_network_operation_result(&output, &report).unwrap();
+        assert_eq!(
+            super::read_network_operation_result(&output).unwrap(),
+            report
+        );
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(output);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn network_operation_event_and_conflict_response_round_trip() {
+        let event_file = std::env::temp_dir().join(format!(
+            "asterfiles-network-operation-event-{}",
+            std::process::id()
+        ));
+        let response_file = std::env::temp_dir().join(format!(
+            "asterfiles-network-operation-response-{}",
+            std::process::id()
+        ));
+        super::write_network_operation_event(
+            &event_file,
+            9,
+            &super::NetworkOperationEvent::Conflict {
+                category: crate::domain::file_operations::ConflictCategory::TypeMismatch,
+                source: std::path::PathBuf::from(r"\\服务器\共享\源"),
+                destination: std::path::PathBuf::from(r"\\服务器\共享\目标"),
+            },
+        )
+        .unwrap();
+        let (sequence, event) = super::read_network_operation_event(&event_file).unwrap();
+        assert_eq!(sequence, 9);
+        assert!(matches!(
+            event,
+            super::NetworkOperationEvent::Conflict {
+                category: crate::domain::file_operations::ConflictCategory::TypeMismatch,
+                ..
+            }
+        ));
+        super::write_network_operation_response(
+            &response_file,
+            sequence,
+            crate::domain::file_operations::ConflictAction::KeepBoth,
+        )
+        .unwrap();
+        assert_eq!(
+            super::read_network_operation_response(&response_file).unwrap(),
+            (9, crate::domain::file_operations::ConflictAction::KeepBoth)
+        );
+        let _ = std::fs::remove_file(event_file);
+        let _ = std::fs::remove_file(response_file);
     }
     #[cfg(windows)]
     #[test]

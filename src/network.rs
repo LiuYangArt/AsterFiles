@@ -29,6 +29,7 @@ pub struct NetworkLocation {
     pub display_name: String,
     pub sort_order: u32,
     pub target: NetworkTarget,
+    pub shell_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -110,6 +111,7 @@ impl NetworkLocationCatalog {
             display_name,
             sort_order,
             target: NetworkTarget::WindowsPath(path),
+            shell_path: None,
         });
         Ok(id)
     }
@@ -492,6 +494,7 @@ mod tests {
             display_name: "Explorer".into(),
             sort_order: 77,
             target: NetworkTarget::WindowsPath(PathBuf::from(r"\\server\imported")),
+            shell_path: None,
         };
         let mut catalog = NetworkLocationCatalog::new(vec![imported.clone()]);
         let first = catalog
@@ -528,6 +531,7 @@ mod tests {
             display_name: "Explorer".into(),
             sort_order: 0,
             target: NetworkTarget::WindowsPath(PathBuf::from(r"\\server\imported")),
+            shell_path: None,
         };
         let mut catalog = NetworkLocationCatalog::new(vec![imported]);
         assert_eq!(
@@ -558,6 +562,7 @@ mod tests {
             display_name: "Virtual network location".into(),
             sort_order: 0,
             target: NetworkTarget::ShellItemId(PathBuf::from("shell:::{virtual-network-location}")),
+            shell_path: None,
         };
 
         assert!(matches!(location.target, NetworkTarget::ShellItemId(_)));

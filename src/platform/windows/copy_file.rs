@@ -108,7 +108,7 @@ pub fn copy_file(
             }
             Err(error)
                 if network_copy
-                    && retry_count < 2
+                    && retry_count < MAX_NETWORK_AUTO_RETRIES
                     && WIN32_ERROR::from_error(&error).is_some_and(is_retryable_network_error) =>
             {
                 retry_count += 1;
@@ -175,6 +175,8 @@ fn wide_path(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
 
+const MAX_NETWORK_AUTO_RETRIES: u8 = 1;
+
 fn is_retryable_network_error(error: WIN32_ERROR) -> bool {
     matches!(
         error,
@@ -227,6 +229,11 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn issue_42_network_copy_retries_at_most_once() {
+        assert_eq!(MAX_NETWORK_AUTO_RETRIES, 1);
     }
 
     #[test]
