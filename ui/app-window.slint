@@ -780,7 +780,8 @@ export component AppWindow inherits Window {
     private property <int> active-geometry-revision: root.view-mode * 1000003 + root.projected-content-revision;
     in-out property <length> search-scroll-y: 0px;
     in property <int> search-total-items: 0;
-    out property <length> sidebar-viewport-y: 0px;
+    in-out property <length> sidebar-viewport-y: 0px;
+
     out property <length> quick-access-drop-left: 0px;
     out property <length> quick-access-drop-top: 0px;
     out property <length> quick-access-drop-width: 0px;
@@ -859,6 +860,12 @@ export component AppWindow inherits Window {
     in-out property <bool> drives-expanded: true;
     in-out property <bool> network-locations-expanded: true;
     in-out property <bool> network-expanded: false;
+    in property <bool> quick-access-visible: true;
+    in property <bool> libraries-visible: false;
+    in property <bool> drives-visible: true;
+    in property <bool> network-locations-visible: true;
+    in property <bool> network-visible: true;
+
     in property <bool> network-discovery-loading: false;
     in property <bool> network-discovery-empty: false;
     in property <string> network-discovery-error: "";
@@ -995,6 +1002,7 @@ export component AppWindow inherits Window {
     callback navigate-library(string);
     callback navigate-network-location(string);
     callback show-sidebar-menu(int, string, float, float);
+    callback show-sidebar-background-menu(float, float);
     callback toggle-network();
     callback refresh-network();
     callback navigate-breadcrumb(int);
@@ -1472,9 +1480,22 @@ export component AppWindow inherits Window {
                     }
                     changed visible-height => { self.clamp-viewport(); }
                     changed viewport-height => { self.clamp-viewport(); }
+
                     sidebar-wheel := TouchArea {
                         width: sidebar-scroll.visible-width;
                         height: sidebar-scroll.visible-height;
+                        pointer-event(event) => {
+                            if event.button == PointerEventButton.right && event.kind == PointerEventKind.up {
+                                root.sidebar-keyboard-active = false;
+                                root.sidebar-keyboard-stable-id = "";
+                                root.context-menu-anchor-x = self.absolute-position.x + self.mouse-x - root.absolute-position.x;
+                                root.context-menu-anchor-y = self.absolute-position.y + self.mouse-y - root.absolute-position.y;
+                                root.show-sidebar-background-menu(
+                                    root.context-menu-anchor-x / 1px,
+                                    root.context-menu-anchor-y / 1px
+                                );
+                            }
+                        }
                         scroll-event(event) => {
                             let maximum = max(0px, sidebar-content.preferred-height - sidebar-scroll.visible-height);
                             if maximum > 0px && event.delta-y != 0px {
@@ -1487,34 +1508,34 @@ export component AppWindow inherits Window {
                 sidebar-content := VerticalLayout {
                     width: sidebar-scroll.width;
                     padding-top: 4px; padding-bottom: 12px; padding-left: 10px; padding-right: 10px; spacing: 0px;
-                    quick-access-header := SidebarGroupHeader { label: root.text-quick-access; expanded: root.quick-access-expanded; toggled => { root.quick-access-expanded = !root.quick-access-expanded; sidebar-scroll.clamp-viewport(); } changed absolute-position => { root.quick-access-drop-left = self.absolute-position.x - root.absolute-position.x; root.quick-access-drop-top = self.absolute-position.y - root.absolute-position.y; } changed width => { root.quick-access-drop-width = self.width; } changed height => { root.quick-access-drop-height = self.height; } init => { root.quick-access-drop-left = self.absolute-position.x - root.absolute-position.x; root.quick-access-drop-top = self.absolute-position.y - root.absolute-position.y; root.quick-access-drop-width = self.width; root.quick-access-drop-height = self.height; } }
+                    quick-access-header := SidebarGroupHeader { visible: root.quick-access-visible; height: self.visible ? 30px : 0px; label: root.text-quick-access; expanded: root.quick-access-expanded; toggled => { root.quick-access-expanded = !root.quick-access-expanded; sidebar-scroll.clamp-viewport(); } changed absolute-position => { root.quick-access-drop-left = self.absolute-position.x - root.absolute-position.x; root.quick-access-drop-top = self.absolute-position.y - root.absolute-position.y; } changed width => { root.quick-access-drop-width = self.width; } changed height => { root.quick-access-drop-height = self.height; } init => { root.quick-access-drop-left = self.absolute-position.x - root.absolute-position.x; root.quick-access-drop-top = self.absolute-position.y - root.absolute-position.y; root.quick-access-drop-width = self.width; root.quick-access-drop-height = self.height; } }
 
                     for location in root.sidebar-items: Rectangle {
-                        visible: location.group-kind == 0 && root.quick-access-expanded;
+                        visible: root.quick-access-visible && location.group-kind == 0 && root.quick-access-expanded;
                         height: self.visible ? 30px : 0px; border-radius: 5px; background: side-touch.pressed ? VisualStyle.cdde3ed : side-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
                         HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : (location.icon-kind == 0 ? IconMap.location-home : location.icon-kind == 1 ? IconMap.location-desktop : location.icon-kind == 2 ? IconMap.location-downloads : location.icon-kind == 3 ? IconMap.location-documents : location.icon-kind == 4 ? IconMap.location-pictures : location.icon-kind == 5 ? IconMap.location-music : IconMap.location-videos); } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         side-touch := TouchArea { mouse-cursor: pointer; clicked => { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.width - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.height - root.absolute-position.y) / 1px; root.navigate-sidebar(location.index); } pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.stable-id != "" { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px; root.show-sidebar-menu(location.group-kind, location.stable-id, root.sidebar-keyboard-anchor-x, root.sidebar-keyboard-anchor-y); } } }
                         accessible-role: button; accessible-label: location.label;
                     }
-                    SidebarGroupHeader { label: root.text-libraries; expanded: root.libraries-expanded; toggled => { root.libraries-expanded = !root.libraries-expanded; sidebar-scroll.clamp-viewport(); } }
+                    SidebarGroupHeader { visible: root.libraries-visible; height: self.visible ? 30px : 0px; label: root.text-libraries; expanded: root.libraries-expanded; toggled => { root.libraries-expanded = !root.libraries-expanded; sidebar-scroll.clamp-viewport(); } }
                     for location in root.sidebar-items: Rectangle {
-                        visible: location.group-kind == 4 && root.libraries-expanded;
+                        visible: root.libraries-visible && location.group-kind == 4 && root.libraries-expanded;
                         height: self.visible ? 30px : 0px; border-radius: 5px; background: library-touch.pressed ? VisualStyle.cdde3ed : library-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
                         HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.file-folder; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         library-touch := TouchArea { mouse-cursor: pointer; clicked => { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.width - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.height - root.absolute-position.y) / 1px; root.navigate-library(location.stable-id); } pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.stable-id != "" { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px; root.show-sidebar-menu(location.group-kind, location.stable-id, root.sidebar-keyboard-anchor-x, root.sidebar-keyboard-anchor-y); } } }
                         accessible-role: button; accessible-label: location.label;
                     }
-                    SidebarGroupHeader { label: root.text-drives; expanded: root.drives-expanded; toggled => { root.drives-expanded = !root.drives-expanded; sidebar-scroll.clamp-viewport(); } }
+                    SidebarGroupHeader { visible: root.drives-visible; height: self.visible ? 30px : 0px; label: root.text-drives; expanded: root.drives-expanded; toggled => { root.drives-expanded = !root.drives-expanded; sidebar-scroll.clamp-viewport(); } }
                     for location in root.sidebar-items: Rectangle {
-                        visible: location.group-kind == 1 && root.drives-expanded;
+                        visible: root.drives-visible && location.group-kind == 1 && root.drives-expanded;
                         height: self.visible ? 30px : 0px; border-radius: 5px; background: drive-touch.pressed ? VisualStyle.cdde3ed : drive-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
                         HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.location-drive; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         drive-touch := TouchArea { mouse-cursor: pointer; clicked => { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.width - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.height - root.absolute-position.y) / 1px; root.navigate-sidebar(location.index); } pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.stable-id != "" { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px; root.show-sidebar-menu(location.group-kind, location.stable-id, root.sidebar-keyboard-anchor-x, root.sidebar-keyboard-anchor-y); } } }
                         accessible-role: button; accessible-label: location.label;
                     }
-                    SidebarGroupHeader { label: root.text-network-locations; expanded: root.network-locations-expanded; toggled => { root.network-locations-expanded = !root.network-locations-expanded; sidebar-scroll.clamp-viewport(); } }
+                    SidebarGroupHeader { visible: root.network-locations-visible; height: self.visible ? 30px : 0px; label: root.text-network-locations; expanded: root.network-locations-expanded; toggled => { root.network-locations-expanded = !root.network-locations-expanded; sidebar-scroll.clamp-viewport(); } }
                     for location in root.sidebar-items: Rectangle {
-                        visible: location.group-kind == 2 && root.network-locations-expanded;
+                        visible: root.network-locations-visible && location.group-kind == 2 && root.network-locations-expanded;
                         height: self.visible ? 30px : 0px; border-radius: 5px; background: network-location-touch.pressed ? VisualStyle.cdde3ed : network-location-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
                         HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.location-drive; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         network-location-touch := TouchArea {
@@ -1529,8 +1550,8 @@ export component AppWindow inherits Window {
                         }
                         accessible-role: button; accessible-label: location.label;
                     }
-                    SidebarGroupHeader { label: root.text-network; expanded: root.network-expanded; toggled => { root.network-expanded = !root.network-expanded; root.toggle-network(); sidebar-scroll.clamp-viewport(); } }
-                    if root.network-expanded: Rectangle {
+                    SidebarGroupHeader { visible: root.network-visible; height: self.visible ? 30px : 0px; label: root.text-network; expanded: root.network-expanded; toggled => { root.network-expanded = !root.network-expanded; root.toggle-network(); sidebar-scroll.clamp-viewport(); } }
+                    if root.network-visible && root.network-expanded: Rectangle {
                         height: root.network-discovery-loading || root.network-discovery-empty || root.network-discovery-error != "" ? 28px : 0px;
                         status-text := Text { x: 8px; width: parent.width - 16px; text: root.network-discovery-error != "" ? root.network-discovery-error : root.network-discovery-loading ? root.text-network-discovery-loading : root.network-discovery-empty ? root.text-network-discovery-empty : ""; color: VisualStyle.c777a84; font-size: 11px; vertical-alignment: center; overflow: elide; }
                         status-touch := TouchArea { enabled: !root.network-discovery-loading; mouse-cursor: self.enabled ? pointer : default; clicked => { root.refresh-network(); } }
@@ -1539,7 +1560,7 @@ export component AppWindow inherits Window {
                         accessible-enabled: !root.network-discovery-loading;
                     }
                     for location in root.sidebar-items: Rectangle {
-                        visible: location.group-kind == 3 && root.network-expanded;
+                        visible: root.network-visible && location.group-kind == 3 && root.network-expanded;
                         height: self.visible ? 30px : 0px; border-radius: 5px; background: network-touch.pressed ? VisualStyle.cdde3ed : network-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
                         HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.location-drive; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         network-touch := TouchArea { mouse-cursor: pointer; clicked => { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.width - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.height - root.absolute-position.y) / 1px; root.navigate-sidebar(location.index); } pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.stable-id != "" { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px; root.show-sidebar-menu(location.group-kind, location.stable-id, root.sidebar-keyboard-anchor-x, root.sidebar-keyboard-anchor-y); } } }

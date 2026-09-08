@@ -20,7 +20,7 @@ use crate::{
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-const MAGIC: &[u8; 6] = b"ASTF13";
+const MAGIC: &[u8; 6] = b"ASTF14";
 const MAX_TABS: usize = 1_024;
 const MAX_WINDOWS: usize = 128;
 const MAX_NETWORK_LOCATIONS: usize = 1_024;
@@ -59,6 +59,56 @@ impl ThemeMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SidebarVisibility {
+    values: [bool; 5],
+}
+
+impl Default for SidebarVisibility {
+    fn default() -> Self {
+        Self {
+            values: [true, false, true, true, true],
+        }
+    }
+}
+
+impl SidebarVisibility {
+    const fn storage_bits(self) -> u8 {
+        (self.values[0] as u8)
+            | ((self.values[1] as u8) << 1)
+            | ((self.values[2] as u8) << 2)
+            | ((self.values[3] as u8) << 3)
+            | ((self.values[4] as u8) << 4)
+    }
+
+    pub const fn is_visible(self, index: usize) -> bool {
+        self.values[index]
+    }
+
+    pub fn toggle(&mut self, index: usize) -> bool {
+        let Some(visible) = self.values.get_mut(index) else {
+            return false;
+        };
+        *visible = !*visible;
+        true
+    }
+
+    const fn from_storage_bits(bits: u8) -> Option<Self> {
+        if bits & !0x1f != 0 {
+            return None;
+        }
+        Some(Self {
+            values: [
+                bits & 0x01 != 0,
+                bits & 0x02 != 0,
+                bits & 0x04 != 0,
+                bits & 0x08 != 0,
+                bits & 0x10 != 0,
+            ],
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WindowPlacement {
     pub x: i32,
     pub y: i32,
@@ -77,6 +127,7 @@ pub struct SessionState {
     pub everything: EverythingConfig,
     pub file_visibility: FileVisibility,
     pub file_list_quick_search: bool,
+    pub sidebar_visibility: SidebarVisibility,
     pub network_locations: Vec<NetworkLocation>,
     pub network_devices: Vec<NetworkDeviceTarget>,
 }
@@ -109,6 +160,7 @@ impl SessionState {
             EverythingConfig::default(),
             FileVisibility::default(),
             false,
+            SidebarVisibility::default(),
             Vec::new(),
             Vec::new(),
         )
@@ -125,6 +177,7 @@ impl SessionState {
         everything: EverythingConfig,
         file_visibility: FileVisibility,
         file_list_quick_search: bool,
+        sidebar_visibility: SidebarVisibility,
         network_locations: Vec<NetworkLocation>,
         network_devices: Vec<NetworkDeviceTarget>,
     ) -> io::Result<Self> {
@@ -161,6 +214,7 @@ impl SessionState {
             everything,
             file_visibility,
             file_list_quick_search,
+            sidebar_visibility,
             network_locations,
             network_devices,
         })
@@ -196,6 +250,7 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
         state.everything.clone(),
         state.file_visibility,
         state.file_list_quick_search,
+        state.sidebar_visibility,
         state.network_locations.clone(),
         state.network_devices.clone(),
     )?;
@@ -218,6 +273,7 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
     bytes.push(u8::from(state.file_visibility.show_hidden));
     bytes.push(u8::from(state.file_visibility.show_system));
     bytes.push(u8::from(state.file_list_quick_search));
+    bytes.push(state.sidebar_visibility.storage_bits());
     bytes.extend_from_slice(&(state.network_locations.len() as u32).to_le_bytes());
     for location in &state.network_locations {
         bytes.extend_from_slice(&location.id.to_le_bytes());
@@ -290,6 +346,8 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
     };
     let file_list_quick_search =
         read_bool(bytes, &mut offset, "invalid file-list quick-search setting")?;
+    let sidebar_visibility = SidebarVisibility::from_storage_bits(read_u8(bytes, &mut offset)?)
+        .ok_or_else(|| invalid_data("invalid sidebar visibility setting"))?;
     let network_location_count = read_u32(bytes, &mut offset)? as usize;
     if network_location_count > MAX_NETWORK_LOCATIONS {
         return Err(invalid_data("too many network locations"));
@@ -357,6 +415,7 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
         everything,
         file_visibility,
         file_list_quick_search,
+        sidebar_visibility,
         network_locations,
         network_devices,
     )
@@ -815,6 +874,9 @@ mod tests {
                 show_system: false,
             },
             true,
+            SidebarVisibility {
+                values: [true, false, true, false, true],
+            },
             vec![NetworkLocation {
                 id: 7,
                 source: NetworkLocationSource::AsterOwned,
@@ -834,9 +896,15 @@ mod tests {
     }
 
     #[test]
-    fn astf13_round_trip_preserves_settings_network_locations_devices_and_raw_paths() {
+    fn astf14_round_trip_preserves_settings_network_locations_devices_and_raw_paths() {
         let state = sample_state();
         assert!(state.file_list_quick_search);
+        assert_eq!(
+            state.sidebar_visibility,
+            SidebarVisibility {
+                values: [true, false, true, false, true],
+            }
+        );
         let decoded = decode(&encode(&state).unwrap()).unwrap();
         assert_eq!(decoded, state);
         let NavigationLocation::Library(library) = &decoded.windows[0].tab_locations[1] else {
@@ -877,6 +945,30 @@ mod tests {
         );
     }
     #[test]
+    fn sidebar_visibility_defaults_to_libraries_hidden() {
+        let state = SessionState::new(
+            WindowPlacement {
+                x: 0,
+                y: 0,
+                width: 1180,
+                height: 760,
+            },
+            0,
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(state.sidebar_visibility, SidebarVisibility::default());
+        assert_eq!(
+            state.sidebar_visibility,
+            SidebarVisibility {
+                values: [true, false, true, true, true],
+            }
+        );
+        assert_eq!(state.sidebar_visibility.storage_bits(), 0x1d);
+        assert!(SidebarVisibility::from_storage_bits(0x20).is_none());
+    }
+
+    #[test]
     fn quick_search_defaults_off() {
         let state = SessionState::new(
             WindowPlacement {
@@ -894,7 +986,7 @@ mod tests {
 
     #[test]
     fn rejects_old_formats() {
-        for version in 1..=12 {
+        for version in 1..=13 {
             let bytes = format!("ASTF{version}\0\0\0\0");
             assert_eq!(
                 decode(bytes.as_bytes()).unwrap_err().kind(),

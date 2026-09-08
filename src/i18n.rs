@@ -52,6 +52,19 @@ impl Texts {
         self.choose("文件夹", "Folder")
     }
 
+    pub fn sidebar_categories(self) -> [&'static str; 5] {
+        match self.language {
+            Language::Chinese => ["快速访问", "库", "磁盘", "网络位置", "网络"],
+            Language::English => [
+                "Quick access",
+                "Libraries",
+                "Drives",
+                "Network locations",
+                "Network",
+            ],
+        }
+    }
+
     pub fn search_state(self, state: SearchState) -> &'static str {
         match state {
             SearchState::Waiting => self.choose("输入内容以搜索", "Type to search"),

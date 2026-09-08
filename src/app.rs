@@ -1808,6 +1808,7 @@ struct AppState {
     theme_mode: session_store::ThemeMode,
     file_visibility: crate::domain::FileVisibility,
     file_list_quick_search: bool,
+    sidebar_visibility: session_store::SidebarVisibility,
     system_dark_theme: bool,
     icons: HashMap<(TabId, RequestId, EntryId), platform::windows_shell_icons::ShellIconRgba>,
     icon_cache: HashMap<PathBuf, platform::windows_shell_icons::ShellIconRgba>,
@@ -2047,6 +2048,7 @@ impl AppState {
             theme_mode,
             file_visibility: crate::domain::FileVisibility::default(),
             file_list_quick_search: false,
+            sidebar_visibility: session_store::SidebarVisibility::default(),
             system_dark_theme,
             icons: HashMap::new(),
             icon_cache: HashMap::new(),
@@ -3770,6 +3772,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         language,
         file_visibility,
         file_list_quick_search,
+        sidebar_visibility,
         network_locations,
         network_devices,
     ) = restored
@@ -3798,6 +3801,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 session.language,
                 session.file_visibility,
                 session.file_list_quick_search,
+                session.sidebar_visibility,
                 session.network_locations,
                 session.network_devices,
             )
@@ -3816,6 +3820,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 Language::Chinese,
                 crate::domain::FileVisibility::default(),
                 false,
+                session_store::SidebarVisibility::default(),
                 Vec::new(),
                 Vec::new(),
             )
@@ -3856,6 +3861,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     if let Ok(mut app) = state.lock() {
         app.file_visibility = file_visibility;
         app.file_list_quick_search = file_list_quick_search;
+        app.sidebar_visibility = sidebar_visibility;
         app.network_locations = network_locations;
         app.network_location_generation = app.network_location_generation.wrapping_add(1).max(1);
         if !network_devices.is_empty() {
@@ -4187,6 +4193,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         language,
         file_visibility,
         file_list_quick_search,
+        sidebar_visibility,
         network_locations,
         network_devices,
     ) = {
@@ -4231,6 +4238,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             app.language,
             app.file_visibility,
             app.file_list_quick_search,
+            app.sidebar_visibility,
             app.network_locations.clone(),
             app.network_discovery
                 .values()
@@ -4259,6 +4267,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             everything_config,
             file_visibility,
             file_list_quick_search,
+            sidebar_visibility,
             network_locations,
             network_devices,
         )
@@ -5843,6 +5852,7 @@ const CMD_NETWORK_LOCATION_MANAGE_CREDENTIALS: i32 = 197;
 const CMD_NETWORK_LOCATION_RENAME: i32 = 198;
 const CMD_QUICK_ACCESS_PIN: i32 = 199;
 const CMD_QUICK_ACCESS_UNPIN: i32 = 200;
+const CMD_SIDEBAR_VISIBILITY_BASE: i32 = 210;
 const NODE_VIEW: i32 = 10_001;
 const NODE_SORT: i32 = 10_002;
 const NODE_GROUP: i32 = 10_003;
@@ -5863,6 +5873,7 @@ enum QuickMenuScope {
         generation: u64,
         target: platform::windows::context_menu::ShellMenuItemTarget,
     },
+    SidebarBackground,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -6149,6 +6160,37 @@ fn sidebar_context_rows(
     }
     rows
 }
+fn sidebar_visibility_rows(
+    visibility: session_store::SidebarVisibility,
+    language: Language,
+) -> Vec<ContextCommandRow> {
+    let labels = Texts::new(language).sidebar_categories();
+    labels
+        .into_iter()
+        .enumerate()
+        .map(|(index, label)| {
+            quick_menu_row(
+                CMD_SIDEBAR_VISIBILITY_BASE + index as i32,
+                0,
+                label,
+                true,
+                visibility.is_visible(index),
+                false,
+            )
+        })
+        .collect()
+}
+
+fn toggle_sidebar_visibility(
+    visibility: &mut session_store::SidebarVisibility,
+    command: i32,
+) -> bool {
+    let Ok(index) = usize::try_from(command - CMD_SIDEBAR_VISIBILITY_BASE) else {
+        return false;
+    };
+    visibility.toggle(index)
+}
+
 fn selected_network_location_path(
     state: &WindowSessions,
     menu: &SharedQuickMenu,
@@ -6412,6 +6454,7 @@ fn quick_menu_key_is_current(state: &SharedSessions, key: &QuickMenuKey) -> bool
                     current.generation == *generation && current.target == *target
                 })
             }
+            QuickMenuScope::SidebarBackground => true,
         }
     })
 }
@@ -11302,6 +11345,53 @@ fn wire_callbacks(
         );
     });
     let weak = ui.as_weak();
+    let state_for_sidebar_background = state.clone();
+    let quick_menu_for_sidebar_background = quick_menu.clone();
+    ui.on_show_sidebar_background_menu(move |x, y| {
+        let Some(ui) = weak.upgrade() else { return };
+        let (visibility, language, tab_id, navigation_request) = state_for_sidebar_background
+            .lock()
+            .ok()
+            .map(|app| {
+                let tab = app.active();
+                (
+                    app.sidebar_visibility,
+                    app.language,
+                    tab.id,
+                    tab.latest_request,
+                )
+            })
+            .unwrap();
+        let rows = sidebar_visibility_rows(visibility, language);
+        let key = QuickMenuKey {
+            window_id: state_for_sidebar_background.window_id,
+            tab_id,
+            navigation_request,
+            scope: QuickMenuScope::SidebarBackground,
+        };
+        if let Ok(mut menu) = quick_menu_for_sidebar_background.lock() {
+            menu.identity = None;
+            menu.built_in_key = Some(key);
+            menu.active_sidebar_target = None;
+            menu.active_network_location = None;
+            menu.active_quick_access_path = None;
+            menu.built_in_rows = rows.clone();
+            menu.all_rows = rows;
+            menu.submenu_rows.clear();
+            menu.submenu_history.clear();
+        }
+        ui.set_context_menu_anchor_x(x);
+        ui.set_context_menu_anchor_y(y);
+        ui.set_context_search("".into());
+        ui.set_context_shell_loading(false);
+        ui.set_context_submenu_open(false);
+        project_filtered_context_menu(&ui, &quick_menu_for_sidebar_background, "");
+        ui.set_context_menu_open(true);
+        if let Some(window_id) = window_id_for_ui(&ui) {
+            open_quick_menu_popup(window_id, x, y);
+        }
+    });
+    let weak = ui.as_weak();
     let state_for_column_menu = state.clone();
     let quick_menu_for_column = quick_menu.clone();
     let anchor_for_column = context_anchor.clone();
@@ -11886,6 +11976,22 @@ fn wire_callbacks(
                 if let Some(ui) = weak.upgrade() {
                     ui.invoke_refresh();
                 }
+            }
+            command if (CMD_SIDEBAR_VISIBILITY_BASE..CMD_SIDEBAR_VISIBILITY_BASE + 5)
+                .contains(&command) =>
+            {
+                let is_sidebar_background = quick_menu_for_command.lock().ok().is_some_and(|menu| {
+                    menu.built_in_key.as_ref().is_some_and(|key| {
+                        matches!(key.scope, QuickMenuScope::SidebarBackground)
+                            && quick_menu_key_is_current(&state_for_context_command.shared, key)
+                    })
+                });
+                if is_sidebar_background
+                    && let Ok(mut app) = state_for_context_command.lock()
+                {
+                    toggle_sidebar_visibility(&mut app.sidebar_visibility, command);
+                }
+                refresh_all_windows(&state_for_context_command.shared);
             }
             CMD_QUICK_ACCESS_PIN | CMD_QUICK_ACCESS_UNPIN => {
                 let path = current_sidebar_menu_target(&state_for_context_command, &quick_menu_for_command)
@@ -15670,6 +15776,7 @@ fn start_shell_menu_event_pump(
                                     }
                                     refresh_all_windows(&state);
                                 }
+                                QuickMenuScope::SidebarBackground => {}
                             }
                         }
                         let _ =
@@ -21455,6 +21562,24 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
         }
     }
     ui.set_sidebar_items(ModelRc::new(VecModel::from(sidebar_rows)));
+    let sidebar_visibility_changed = (0..5).any(|index| {
+        let projected = match index {
+            0 => ui.get_quick_access_visible(),
+            1 => ui.get_libraries_visible(),
+            2 => ui.get_drives_visible(),
+            3 => ui.get_network_locations_visible(),
+            _ => ui.get_network_visible(),
+        };
+        projected != app.sidebar_visibility.is_visible(index)
+    });
+    ui.set_quick_access_visible(app.sidebar_visibility.is_visible(0));
+    ui.set_libraries_visible(app.sidebar_visibility.is_visible(1));
+    ui.set_drives_visible(app.sidebar_visibility.is_visible(2));
+    ui.set_network_locations_visible(app.sidebar_visibility.is_visible(3));
+    ui.set_network_visible(app.sidebar_visibility.is_visible(4));
+    if sidebar_visibility_changed {
+        ui.set_sidebar_viewport_y(0.0);
+    }
 
     let discovery_state = app
         .network_discovery
@@ -23309,6 +23434,64 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn sidebar_visibility_menu_has_five_independent_localized_toggles() {
+        let mut visibility = session_store::SidebarVisibility::default();
+        assert!(visibility.toggle(3));
+        let chinese = sidebar_visibility_rows(visibility, Language::Chinese);
+        assert_eq!(chinese.len(), 5);
+        assert_eq!(
+            chinese
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            ["快速访问", "库", "磁盘", "网络位置", "网络"]
+        );
+        assert_eq!(
+            chinese.iter().map(|row| row.checked).collect::<Vec<_>>(),
+            [true, false, true, false, true]
+        );
+        let english = sidebar_visibility_rows(visibility, Language::English);
+        assert_eq!(
+            english
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Quick access",
+                "Libraries",
+                "Drives",
+                "Network locations",
+                "Network"
+            ]
+        );
+    }
+
+    #[test]
+    fn sidebar_visibility_commands_toggle_only_the_selected_category() {
+        let mut visibility = session_store::SidebarVisibility::default();
+        for offset in 0..5 {
+            let before = visibility;
+            assert!(toggle_sidebar_visibility(
+                &mut visibility,
+                CMD_SIDEBAR_VISIBILITY_BASE + offset
+            ));
+            let before_bits: [bool; 5] = std::array::from_fn(|index| before.is_visible(index));
+            let after_bits: [bool; 5] = std::array::from_fn(|index| visibility.is_visible(index));
+            for index in 0..5 {
+                assert_eq!(
+                    after_bits[index],
+                    if index == offset as usize {
+                        !before_bits[index]
+                    } else {
+                        before_bits[index]
+                    }
+                );
+            }
+        }
+        assert!(!toggle_sidebar_visibility(&mut visibility, 999));
+    }
+
     #[test]
     fn network_directory_scheduler_serializes_one_host_and_allows_another() {
         let mut scheduler = NetworkDirectoryScheduler::default();
@@ -28354,6 +28537,63 @@ mod tests {
 
         assert!(ui.get_sidebar_viewport_y() > scrolled_to_bottom);
     }
+    #[test]
+    fn issue_74_hiding_all_categories_clamps_scroll_and_preserves_expansion() {
+        let ui = headless_file_view();
+        ui.window()
+            .set_size(slint::LogicalSize::new(1_180.0, 520.0));
+        ui.set_quick_access_expanded(false);
+        ui.set_libraries_expanded(true);
+        ui.set_drives_expanded(true);
+        ui.set_network_locations_expanded(true);
+        ui.set_network_expanded(true);
+        ui.set_sidebar_items(ModelRc::new(VecModel::from(
+            (0..48)
+                .map(|index| SidebarRow {
+                    index,
+                    stable_id: index.to_string().into(),
+                    label: format!("Sidebar {index}").into(),
+                    icon_kind: 0,
+                    group_kind: index % 5,
+                    source_kind: 0,
+                    is_drive: false,
+                    icon: Image::default(),
+                })
+                .collect::<Vec<_>>(),
+        )));
+        update_test_layout(&ui);
+        use i_slint_backend_testing::ElementRoot;
+        let scroll = ui
+            .root_element()
+            .query_descendants()
+            .match_id("AppWindow::sidebar-scroll")
+            .find_all()
+            .into_iter()
+            .next()
+            .expect("sidebar scroll view exists");
+        scroll.scroll(0.0, -5_000.0);
+        update_test_layout(&ui);
+        assert!(ui.get_sidebar_viewport_y() < 0.0);
+        ui.set_quick_access_visible(false);
+        ui.set_libraries_visible(false);
+        ui.set_drives_visible(false);
+        ui.set_network_locations_visible(false);
+        ui.set_network_visible(false);
+        ui.set_sidebar_viewport_y(0.0);
+        update_test_layout(&ui);
+
+        assert_eq!(ui.get_sidebar_viewport_y(), 0.0);
+        assert!(!ui.get_quick_access_expanded());
+        assert!(ui.get_libraries_expanded());
+        assert!(ui.get_drives_expanded());
+        assert!(ui.get_network_locations_expanded());
+        assert!(ui.get_network_expanded());
+
+        ui.set_quick_access_visible(true);
+        update_test_layout(&ui);
+        assert!(!ui.get_quick_access_expanded());
+    }
+
     #[test]
     fn sidebar_wheel_scrolls_sidebar_without_moving_file_list() {
         use i_slint_backend_testing::ElementRoot;
