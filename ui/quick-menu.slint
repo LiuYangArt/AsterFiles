@@ -14,7 +14,7 @@ component PopupCommandList inherits Rectangle {
     callback open-submenu(int, length);
     callback hover(int, length);
     callback cancel-hover();
-    background: root.dark-theme ? #252525 : #ffffff;
+    background: transparent;
     private property <color> foreground: root.dark-theme ? #f2f2f2 : #30333a;
     private property <color> muted-foreground: root.dark-theme ? #8a8a8a : #9a9da3;
     private property <color> secondary-foreground: root.dark-theme ? #a9a9a9 : #72747d;
@@ -76,7 +76,7 @@ export component QuickMenuWindow inherits Window {
     no-frame: true;
     width: 320px;
     height: root.window-height;
-    background: root.dark-theme ? #252525 : #ffffff;
+    background: transparent;
     default-font-family: "Segoe UI";
     in property <[PopupCommandRow]> rows;
     in property <length> content-height: 0px;
@@ -85,6 +85,7 @@ export component QuickMenuWindow inherits Window {
     in property <int> active-index: -1;
     in property <length> window-height: max(41px, 41px + root.content-height + (root.loading ? 20px : 0px));
     in property <bool> dark-theme: false;
+    in property <bool> backdrop-enabled: true;
     in property <string> search-text: "";
     in property <string> loading-text: "";
     in property <string> empty-text: "";
@@ -97,7 +98,7 @@ export component QuickMenuWindow inherits Window {
     callback dismiss();
     panel := Rectangle {
         width: parent.width; height: parent.height;
-        background: root.dark-theme ? #252525 : #ffffff; border-color: root.dark-theme ? #4b4b4b : #e0e2e7; border-width: 1px; border-radius: 8px;
+        background: root.backdrop-enabled ? (transparent) : (root.dark-theme ? #252525 : #ffffff); border-color: root.dark-theme ? #99505050 : #b3d8dadd; border-width: 1px; border-radius: 8px;
         VerticalLayout {
             padding: 4px; spacing: 1px;
             search-box := Rectangle {
@@ -132,7 +133,7 @@ export component QuickSubmenuWindow inherits Window {
     no-frame: true;
     width: 280px;
     height: root.window-height;
-    background: root.dark-theme ? #252525 : #ffffff;
+    background: transparent;
     default-font-family: "Segoe UI";
     in property <[PopupCommandRow]> rows;
     in property <length> content-height: 0px;
@@ -140,6 +141,7 @@ export component QuickSubmenuWindow inherits Window {
     in property <int> active-index: -1;
     in property <length> window-height: max(28px, 8px + root.content-height + (root.loading ? 20px : 0px));
     in property <bool> dark-theme: false;
+    in property <bool> backdrop-enabled: true;
     in property <string> loading-text: "";
     in property <string> empty-text: "";
     callback move(int);
@@ -150,7 +152,7 @@ export component QuickSubmenuWindow inherits Window {
     callback dismiss();
     panel := Rectangle {
         width: parent.width; height: parent.height;
-        background: root.dark-theme ? #252525 : #ffffff; border-color: root.dark-theme ? #4b4b4b : #e0e2e7; border-width: 1px; border-radius: 6px;
+        background: root.backdrop-enabled ? (transparent) : (root.dark-theme ? #252525 : #ffffff); border-color: root.dark-theme ? #99505050 : #b3d8dadd; border-width: 1px; border-radius: 6px;
         menu-focus := FocusScope {
             width: parent.width; height: parent.height;
             key-pressed(event) => {

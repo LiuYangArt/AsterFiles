@@ -290,7 +290,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .with_owner_window(owner as _)
                         .with_active(false)
                         .with_decorations(false)
-                        .with_transparent(false)
+                        .with_transparent(true)
                         .with_window_level(WindowLevel::Normal)
                         .with_visible(false)
                         .with_drag_and_drop(false)

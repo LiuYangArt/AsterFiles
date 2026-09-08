@@ -1,4 +1,5 @@
 use std::{
+    ffi::c_void,
     io,
     sync::atomic::{AtomicIsize, Ordering},
 };
@@ -6,12 +7,16 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::{
-        Dwm::{DWMWA_CLOAK, DwmFlush, DwmSetWindowAttribute},
+        Dwm::{
+            DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW, DWMWA_CLOAK, DWMWA_SYSTEMBACKDROP_TYPE,
+            DWMWA_USE_IMMERSIVE_DARK_MODE, DwmFlush, DwmSetWindowAttribute,
+        },
         Gdi::{
             ClientToScreen, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO,
             MonitorFromPoint,
         },
     },
+    System::LibraryLoader::{GetModuleHandleW, GetProcAddress},
     UI::WindowsAndMessaging::{
         GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GWLP_HWNDPARENT, GetForegroundWindow, GetWindow,
         IsWindow, MA_NOACTIVATE, STYLESTRUCT, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
@@ -26,6 +31,84 @@ use crate::quick_menu_popup::{PhysicalPoint, PhysicalRect};
 
 static PENDING_WINDOW_OWNER: AtomicIsize = AtomicIsize::new(0);
 const POPUP_SUBCLASS_ID: usize = 0x4153_504f;
+
+const WCA_ACCENT_POLICY: u32 = 19;
+const ACCENT_ENABLE_ACRYLICBLURBEHIND: i32 = 4;
+const ACCENT_DISABLED: i32 = 0;
+
+#[repr(C)]
+struct AccentPolicy {
+    state: i32,
+    flags: u32,
+    gradient_color: u32,
+    animation_id: u32,
+}
+
+#[repr(C)]
+struct WindowCompositionAttributeData {
+    attribute: u32,
+    data: *mut c_void,
+    size: usize,
+}
+
+type SetWindowCompositionAttribute =
+    unsafe extern "system" fn(HWND, *mut WindowCompositionAttributeData) -> i32;
+
+fn backdrop_type(enabled: bool) -> i32 {
+    if enabled {
+        DWMSBT_TRANSIENTWINDOW
+    } else {
+        DWMSBT_NONE
+    }
+}
+
+fn acrylic_gradient_color(dark_theme: bool, opacity: u8) -> u32 {
+    let alpha = ((u32::from(opacity.min(100)) * 255 + 50) / 100).max(1);
+    let rgb = if dark_theme { 0x0020_2020 } else { 0x00d3_d3d3 };
+    (alpha << 24) | rgb
+}
+
+fn set_acrylic_composition(
+    hwnd: HWND,
+    enabled: bool,
+    dark_theme: bool,
+    opacity: u8,
+) -> io::Result<()> {
+    const USER32: &[u16] = &[117, 115, 101, 114, 51, 50, 46, 100, 108, 108, 0];
+    let module = unsafe { GetModuleHandleW(USER32.as_ptr()) };
+    if module.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    const FUNCTION_NAME: &[u8] = b"SetWindowCompositionAttribute\0";
+
+    let Some(function) = (unsafe { GetProcAddress(module, FUNCTION_NAME.as_ptr()) }) else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "SetWindowCompositionAttribute is unavailable",
+        ));
+    };
+    let set_window_composition_attribute: SetWindowCompositionAttribute =
+        unsafe { std::mem::transmute(function) };
+    let mut policy = AccentPolicy {
+        state: if enabled {
+            ACCENT_ENABLE_ACRYLICBLURBEHIND
+        } else {
+            ACCENT_DISABLED
+        },
+        flags: 0,
+        gradient_color: acrylic_gradient_color(dark_theme, opacity),
+        animation_id: 0,
+    };
+    let mut data = WindowCompositionAttributeData {
+        attribute: WCA_ACCENT_POLICY,
+        data: (&mut policy as *mut AccentPolicy).cast(),
+        size: std::mem::size_of::<AccentPolicy>(),
+    };
+    if unsafe { set_window_composition_attribute(hwnd, &mut data) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 unsafe extern "system" fn popup_window_proc(
     hwnd: HWND,
@@ -162,6 +245,46 @@ pub fn attach_owner(popup: isize, owner: isize) -> io::Result<()> {
     Ok(())
 }
 
+pub fn set_backdrop(hwnd: isize, enabled: bool, dark_theme: bool, opacity: u8) -> io::Result<()> {
+    if hwnd == 0 || unsafe { IsWindow(hwnd as HWND) } == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "popup window was destroyed",
+        ));
+    }
+    set_acrylic_composition(hwnd as HWND, enabled, dark_theme, opacity)?;
+    let backdrop = backdrop_type(enabled);
+    let dark = i32::from(dark_theme);
+    for (attribute, value, name) in [
+        (
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            backdrop,
+            "DWMWA_SYSTEMBACKDROP_TYPE",
+        ),
+        (
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            dark,
+            "DWMWA_USE_IMMERSIVE_DARK_MODE",
+        ),
+    ] {
+        let result = unsafe {
+            DwmSetWindowAttribute(
+                hwnd as HWND,
+                attribute as u32,
+                (&value as *const i32).cast(),
+                std::mem::size_of::<i32>() as u32,
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::other(format!(
+                "DwmSetWindowAttribute({name}) failed: 0x{:08x}",
+                result as u32
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn set_cloaked(hwnd: isize, cloaked: bool) -> io::Result<()> {
     if hwnd == 0 || unsafe { IsWindow(hwnd as HWND) } == 0 {
         return Err(io::Error::new(
@@ -285,6 +408,16 @@ pub fn focus_window(hwnd: isize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quick_menu_backdrop_setting_maps_to_transient_or_none() {
+        assert_eq!(backdrop_type(true), DWMSBT_TRANSIENTWINDOW);
+        assert_eq!(backdrop_type(false), DWMSBT_NONE);
+        assert_eq!(acrylic_gradient_color(true, 60), 0x9920_2020);
+        assert_eq!(acrylic_gradient_color(false, 60), 0x99d3_d3d3);
+        assert_eq!(acrylic_gradient_color(true, 0), 0x0120_2020);
+        assert_eq!(acrylic_gradient_color(false, 100), 0xffd3_d3d3);
+    }
 
     #[test]
     fn quick_menu_popup_preserves_styles_across_backend_rewrites() {

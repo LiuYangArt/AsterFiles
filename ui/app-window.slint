@@ -1,4 +1,4 @@
-import { CheckBox, LineEdit, ListView, ScrollView } from "std-widgets.slint";
+import { CheckBox, LineEdit, ListView, ScrollView, Slider } from "std-widgets.slint";
 import { IconMap } from "icons/icon-map.slint";
 export { PopupCommandRow, QuickMenuWindow, QuickSubmenuWindow } from "quick-menu.slint";
 
@@ -886,6 +886,8 @@ export component AppWindow inherits Window {
     in property <int> language-mode: 0;
     in property <bool> show-hidden-files: true;
     in property <bool> show-system-files: false;
+    in property <bool> quick-menu-backdrop: true;
+    in property <float> quick-menu-backdrop-opacity: 85;
     in property <bool> active-is-settings: false;
     in property <bool> debug-tools-enabled: false;
     in property <string> text-menu: "菜单";
@@ -901,6 +903,8 @@ export component AppWindow inherits Window {
     in property <string> text-show-hidden-files: "显示隐藏文件";
     in property <string> text-show-system-files: "显示系统文件";
     in property <string> text-file-list-quick-search: "文件列表快速搜索";
+    in property <string> text-quick-menu-backdrop: "右键菜单磨砂效果";
+    in property <string> text-quick-menu-backdrop-opacity: "菜单背景不透明度";
     in property <string> text-settings-general: "常规";
     in property <string> text-settings-appearance: "外观";
     in property <string> text-settings-developer: "开发工具";
@@ -1066,6 +1070,8 @@ export component AppWindow inherits Window {
     callback change-language(int);
     callback change-file-visibility(bool, bool);
     callback change-file-list-quick-search(bool);
+    callback change-quick-menu-backdrop(bool);
+    callback change-quick-menu-backdrop-opacity(float);
     callback update-everything-config(string, string);
     callback select-everything-program();
     callback test-everything-connection();
@@ -2242,7 +2248,7 @@ accessible-label: entry.name;
                                 }
                             }
                             if root.settings-section == 1: Rectangle {
-                                height: 112px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                height: 212px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
                                 VerticalLayout {
                                     padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 12px;
                                     Text { text: root.text-theme; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
@@ -2256,6 +2262,21 @@ accessible-label: entry.name;
                                             theme-card-touch := TouchArea { mouse-cursor: pointer; clicked => { root.change-theme(index); } }
                                             accessible-role: button; accessible-label: theme-option;
                                         }
+                                    }
+                                    CheckBox { text: root.text-quick-menu-backdrop; checked: root.quick-menu-backdrop; toggled => { root.change-quick-menu-backdrop(self.checked); } }
+                                    HorizontalLayout {
+                                        height: 20px;
+                                        Text { text: root.text-quick-menu-backdrop-opacity; color: VisualStyle.c30333a; font-size: 13px; vertical-alignment: center; }
+                                        Text { text: root.quick-menu-backdrop-opacity + "%"; color: VisualStyle.c62656f; font-size: 13px; horizontal-alignment: right; vertical-alignment: center; }
+                                    }
+                                    Slider {
+                                        height: 28px;
+                                        enabled: root.quick-menu-backdrop;
+                                        minimum: 0;
+                                        maximum: 100;
+                                        step: 5;
+                                        value: root.quick-menu-backdrop-opacity;
+                                        changed(value) => { root.change-quick-menu-backdrop-opacity(value); }
                                     }
                                 }
                             }

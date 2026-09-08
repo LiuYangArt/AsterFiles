@@ -1809,6 +1809,8 @@ struct AppState {
     theme_mode: session_store::ThemeMode,
     file_visibility: crate::domain::FileVisibility,
     file_list_quick_search: bool,
+    quick_menu_backdrop: bool,
+    quick_menu_backdrop_opacity: u8,
     sidebar_visibility: session_store::SidebarVisibility,
     system_dark_theme: bool,
     icons: HashMap<(TabId, RequestId, EntryId), platform::windows_shell_icons::ShellIconRgba>,
@@ -2049,6 +2051,8 @@ impl AppState {
             theme_mode,
             file_visibility: crate::domain::FileVisibility::default(),
             file_list_quick_search: false,
+            quick_menu_backdrop: true,
+            quick_menu_backdrop_opacity: session_store::DEFAULT_QUICK_MENU_BACKDROP_OPACITY,
             sidebar_visibility: session_store::SidebarVisibility::default(),
             system_dark_theme,
             icons: HashMap::new(),
@@ -3782,6 +3786,8 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         language,
         file_visibility,
         file_list_quick_search,
+        quick_menu_backdrop,
+        quick_menu_backdrop_opacity,
         sidebar_visibility,
         network_locations,
         network_devices,
@@ -3811,6 +3817,8 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 session.language,
                 session.file_visibility,
                 session.file_list_quick_search,
+                session.quick_menu_backdrop,
+                session.quick_menu_backdrop_opacity,
                 session.sidebar_visibility,
                 session.network_locations,
                 session.network_devices,
@@ -3830,6 +3838,8 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 Language::Chinese,
                 crate::domain::FileVisibility::default(),
                 false,
+                true,
+                session_store::DEFAULT_QUICK_MENU_BACKDROP_OPACITY,
                 session_store::SidebarVisibility::default(),
                 Vec::new(),
                 Vec::new(),
@@ -3871,6 +3881,8 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     if let Ok(mut app) = state.lock() {
         app.file_visibility = file_visibility;
         app.file_list_quick_search = file_list_quick_search;
+        app.quick_menu_backdrop = quick_menu_backdrop;
+        app.quick_menu_backdrop_opacity = quick_menu_backdrop_opacity;
         app.sidebar_visibility = sidebar_visibility;
         app.network_locations = network_locations;
         app.network_location_generation = app.network_location_generation.wrapping_add(1).max(1);
@@ -4203,6 +4215,8 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         language,
         file_visibility,
         file_list_quick_search,
+        quick_menu_backdrop,
+        quick_menu_backdrop_opacity,
         sidebar_visibility,
         network_locations,
         network_devices,
@@ -4248,6 +4262,8 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             app.language,
             app.file_visibility,
             app.file_list_quick_search,
+            app.quick_menu_backdrop,
+            app.quick_menu_backdrop_opacity,
             app.sidebar_visibility,
             app.network_locations.clone(),
             app.network_discovery
@@ -4277,6 +4293,8 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
             everything_config,
             file_visibility,
             file_list_quick_search,
+            quick_menu_backdrop,
+            quick_menu_backdrop_opacity,
             sidebar_visibility,
             network_locations,
             network_devices,
@@ -7444,7 +7462,10 @@ fn create_quick_menu_popup(
             return Err(error);
         }
     };
-    root.set_dark_theme(state.lock().is_ok_and(|app| app.dark_theme()));
+    if let Ok(app) = state.lock() {
+        root.set_dark_theme(app.dark_theme());
+        root.set_backdrop_enabled(app.quick_menu_backdrop);
+    }
     Ok(QuickMenuPopupRuntime {
         root,
         branches: Vec::new(),
@@ -7517,6 +7538,7 @@ fn update_root_popup_projection(window_id: WindowId) {
         popup.set_search(ui.get_context_search());
         popup.set_active_index(ui.get_context_active_index());
         popup.set_dark_theme(ui.get_dark_theme());
+        popup.set_backdrop_enabled(ui.get_quick_menu_backdrop());
         popup.set_search_text(ui.get_text_context_search());
         popup.set_loading_text(ui.get_text_context_loading());
         popup.set_empty_text(ui.get_text_context_empty());
@@ -7666,6 +7688,10 @@ fn update_open_submenu_projection(window_id: WindowId) {
     }
 }
 
+fn normalized_quick_menu_backdrop_opacity(opacity: f32) -> u8 {
+    opacity.round().clamp(0.0, 100.0) as u8
+}
+
 fn open_quick_menu_popup(window_id: WindowId, client_x: f32, client_y: f32) {
     let started_at = Instant::now();
     WINDOW_RUNTIMES.with_borrow_mut(|runtimes| {
@@ -7737,6 +7763,16 @@ fn open_quick_menu_popup(window_id: WindowId, client_x: f32, client_y: f32) {
             popup.owner_hwnd,
         )
         .is_ok();
+        if owner_attached
+            && let Err(error) = platform::windows::quick_menu_window::set_backdrop(
+                root_hwnd,
+                ui.get_quick_menu_backdrop(),
+                ui.get_dark_theme(),
+                normalized_quick_menu_backdrop_opacity(ui.get_quick_menu_backdrop_opacity()),
+            )
+        {
+            trace_quick_menu("quick_menu_backdrop_failed", error.to_string());
+        }
         let cloaked = owner_attached
             && platform::windows::quick_menu_window::set_cloaked(root_hwnd, true).is_ok();
         if cloaked {
@@ -8091,6 +8127,8 @@ fn open_quick_submenu_popup_attempt(
         slot.window
             .set_active_index(ui.get_context_submenu_active_index());
         slot.window.set_dark_theme(ui.get_dark_theme());
+        slot.window
+            .set_backdrop_enabled(ui.get_quick_menu_backdrop());
         slot.window.set_loading_text(ui.get_text_context_loading());
         slot.window.set_empty_text(ui.get_text_context_empty());
         slot.window
@@ -8110,6 +8148,14 @@ fn open_quick_submenu_popup_attempt(
             hide_quick_submenu_slots_from(popup, depth);
             let _ = popup.session.close_branch_and_descendants(event);
             return None;
+        }
+        if let Err(error) = platform::windows::quick_menu_window::set_backdrop(
+            hwnd,
+            ui.get_quick_menu_backdrop(),
+            ui.get_dark_theme(),
+            normalized_quick_menu_backdrop_opacity(ui.get_quick_menu_backdrop_opacity()),
+        ) {
+            trace_quick_menu("quick_submenu_backdrop_failed", error.to_string());
         }
         let loading = ui.get_context_submenu_loading();
         if already_visible {
@@ -11136,6 +11182,28 @@ fn wire_callbacks(
         }
         if let Some(ui) = weak_for_quick_search.upgrade() {
             refresh_ui(&ui, &state_for_quick_search);
+        }
+    });
+
+    let weak_for_menu_backdrop = ui.as_weak();
+    let state_for_menu_backdrop = state.clone();
+    ui.on_change_quick_menu_backdrop(move |enabled| {
+        if let Ok(mut app) = state_for_menu_backdrop.lock() {
+            app.quick_menu_backdrop = enabled;
+        }
+        if let Some(ui) = weak_for_menu_backdrop.upgrade() {
+            refresh_ui(&ui, &state_for_menu_backdrop);
+        }
+    });
+
+    let weak_for_menu_opacity = ui.as_weak();
+    let state_for_menu_opacity = state.clone();
+    ui.on_change_quick_menu_backdrop_opacity(move |opacity| {
+        if let Ok(mut app) = state_for_menu_opacity.lock() {
+            app.quick_menu_backdrop_opacity = normalized_quick_menu_backdrop_opacity(opacity);
+        }
+        if let Some(ui) = weak_for_menu_opacity.upgrade() {
+            refresh_ui(&ui, &state_for_menu_opacity);
         }
     });
 
@@ -21802,6 +21870,8 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     ui.set_show_hidden_files(app.file_visibility.show_hidden);
     ui.set_show_system_files(app.file_visibility.show_system);
     ui.set_file_list_quick_search(app.file_list_quick_search);
+    ui.set_quick_menu_backdrop(app.quick_menu_backdrop);
+    ui.set_quick_menu_backdrop_opacity(f32::from(app.quick_menu_backdrop_opacity));
     ui.set_everything_path(
         app.everything_config
             .executable_path
@@ -22298,6 +22368,8 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
         show_hidden_files,
         show_system_files,
         file_list_quick_search,
+        quick_menu_backdrop,
+        quick_menu_backdrop_opacity,
         settings_general,
         settings_appearance,
         settings_developer,
@@ -22365,6 +22437,8 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "显示隐藏文件",
             "显示系统文件",
             "文件列表快速搜索",
+            "右键菜单磨砂效果",
+            "菜单背景不透明度",
             "常规",
             "外观",
             "开发工具",
@@ -22432,6 +22506,8 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "Show hidden files",
             "Show system files",
             "File list quick search",
+            "Context menu acrylic effect",
+            "Menu background opacity",
             "General",
             "Appearance",
             "Developer tools",
@@ -22516,6 +22592,8 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_show_hidden_files(show_hidden_files.into());
     ui.set_text_show_system_files(show_system_files.into());
     ui.set_text_file_list_quick_search(file_list_quick_search.into());
+    ui.set_text_quick_menu_backdrop(quick_menu_backdrop.into());
+    ui.set_text_quick_menu_backdrop_opacity(quick_menu_backdrop_opacity.into());
     ui.set_text_settings_general(settings_general.into());
     ui.set_text_settings_appearance(settings_appearance.into());
     ui.set_text_settings_developer(settings_developer.into());
@@ -24058,6 +24136,23 @@ mod tests {
                 SHELL_CONTEXT_COMMAND_BASE + 42,
             ]
         );
+    }
+
+    #[test]
+    fn issue_68_root_and_submenus_share_the_backdrop_setting() {
+        let menu_ui = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/quick-menu.slint"));
+        assert_eq!(
+            menu_ui
+                .matches("in property <bool> backdrop-enabled: true;")
+                .count(),
+            2
+        );
+
+        let app_ui = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
+        assert!(app_ui.contains("in property <bool> quick-menu-backdrop: true;"));
+        assert!(app_ui.contains("in property <float> quick-menu-backdrop-opacity: 85;"));
+        assert!(app_ui.contains("callback change-quick-menu-backdrop(bool);"));
+        assert!(app_ui.contains("callback change-quick-menu-backdrop-opacity(float);"));
     }
 
     #[test]

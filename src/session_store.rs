@@ -20,7 +20,8 @@ use crate::{
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-const MAGIC: &[u8; 6] = b"ASTF14";
+const MAGIC: &[u8; 6] = b"ASTF15";
+pub const DEFAULT_QUICK_MENU_BACKDROP_OPACITY: u8 = 85;
 const MAX_TABS: usize = 1_024;
 const MAX_WINDOWS: usize = 128;
 const MAX_NETWORK_LOCATIONS: usize = 1_024;
@@ -127,6 +128,8 @@ pub struct SessionState {
     pub everything: EverythingConfig,
     pub file_visibility: FileVisibility,
     pub file_list_quick_search: bool,
+    pub quick_menu_backdrop: bool,
+    pub quick_menu_backdrop_opacity: u8,
     pub sidebar_visibility: SidebarVisibility,
     pub network_locations: Vec<NetworkLocation>,
     pub network_devices: Vec<NetworkDeviceTarget>,
@@ -160,6 +163,8 @@ impl SessionState {
             EverythingConfig::default(),
             FileVisibility::default(),
             false,
+            true,
+            DEFAULT_QUICK_MENU_BACKDROP_OPACITY,
             SidebarVisibility::default(),
             Vec::new(),
             Vec::new(),
@@ -177,6 +182,8 @@ impl SessionState {
         everything: EverythingConfig,
         file_visibility: FileVisibility,
         file_list_quick_search: bool,
+        quick_menu_backdrop: bool,
+        quick_menu_backdrop_opacity: u8,
         sidebar_visibility: SidebarVisibility,
         network_locations: Vec<NetworkLocation>,
         network_devices: Vec<NetworkDeviceTarget>,
@@ -202,6 +209,9 @@ impl SessionState {
         validate_search_preference(search_view)?;
         validate_directory_views(&directory_views)?;
         validate_everything_config(&everything)?;
+        if quick_menu_backdrop_opacity > 100 {
+            return Err(invalid_data("invalid quick-menu backdrop opacity"));
+        }
         validate_network_locations(&network_locations)?;
         validate_network_devices(&network_devices)?;
         Ok(Self {
@@ -214,6 +224,8 @@ impl SessionState {
             everything,
             file_visibility,
             file_list_quick_search,
+            quick_menu_backdrop,
+            quick_menu_backdrop_opacity,
             sidebar_visibility,
             network_locations,
             network_devices,
@@ -250,6 +262,8 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
         state.everything.clone(),
         state.file_visibility,
         state.file_list_quick_search,
+        state.quick_menu_backdrop,
+        state.quick_menu_backdrop_opacity,
         state.sidebar_visibility,
         state.network_locations.clone(),
         state.network_devices.clone(),
@@ -273,6 +287,8 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
     bytes.push(u8::from(state.file_visibility.show_hidden));
     bytes.push(u8::from(state.file_visibility.show_system));
     bytes.push(u8::from(state.file_list_quick_search));
+    bytes.push(u8::from(state.quick_menu_backdrop));
+    bytes.push(state.quick_menu_backdrop_opacity);
     bytes.push(state.sidebar_visibility.storage_bits());
     bytes.extend_from_slice(&(state.network_locations.len() as u32).to_le_bytes());
     for location in &state.network_locations {
@@ -346,6 +362,11 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
     };
     let file_list_quick_search =
         read_bool(bytes, &mut offset, "invalid file-list quick-search setting")?;
+    let quick_menu_backdrop = read_bool(bytes, &mut offset, "invalid quick-menu backdrop setting")?;
+    let quick_menu_backdrop_opacity = read_u8(bytes, &mut offset)?;
+    if quick_menu_backdrop_opacity > 100 {
+        return Err(invalid_data("invalid quick-menu backdrop opacity"));
+    }
     let sidebar_visibility = SidebarVisibility::from_storage_bits(read_u8(bytes, &mut offset)?)
         .ok_or_else(|| invalid_data("invalid sidebar visibility setting"))?;
     let network_location_count = read_u32(bytes, &mut offset)? as usize;
@@ -415,6 +436,8 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
         everything,
         file_visibility,
         file_list_quick_search,
+        quick_menu_backdrop,
+        quick_menu_backdrop_opacity,
         sidebar_visibility,
         network_locations,
         network_devices,
@@ -874,6 +897,8 @@ mod tests {
                 show_system: false,
             },
             true,
+            false,
+            42,
             SidebarVisibility {
                 values: [true, false, true, false, true],
             },
@@ -896,9 +921,11 @@ mod tests {
     }
 
     #[test]
-    fn astf14_round_trip_preserves_settings_network_locations_devices_and_raw_paths() {
+    fn astf15_round_trip_preserves_settings_network_locations_devices_and_raw_paths() {
         let state = sample_state();
         assert!(state.file_list_quick_search);
+        assert!(!state.quick_menu_backdrop);
+        assert_eq!(state.quick_menu_backdrop_opacity, 42);
         assert_eq!(
             state.sidebar_visibility,
             SidebarVisibility {
@@ -969,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn quick_search_defaults_off() {
+    fn quick_search_defaults_off_and_quick_menu_backdrop_defaults_on() {
         let state = SessionState::new(
             WindowPlacement {
                 x: 0,
@@ -982,11 +1009,16 @@ mod tests {
         )
         .unwrap();
         assert!(!state.file_list_quick_search);
+        assert!(state.quick_menu_backdrop);
+        assert_eq!(
+            state.quick_menu_backdrop_opacity,
+            DEFAULT_QUICK_MENU_BACKDROP_OPACITY
+        );
     }
 
     #[test]
     fn rejects_old_formats() {
-        for version in 1..=13 {
+        for version in 1..=14 {
             let bytes = format!("ASTF{version}\0\0\0\0");
             assert_eq!(
                 decode(bytes.as_bytes()).unwrap_err().kind(),
