@@ -1,4 +1,5 @@
 $scriptContent = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'publish.ps1') -Raw
+$releaseWorkflowContent = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) '.github/workflows/release.yml') -Raw
 $tokens = $null
 $errors = $null
 [System.Management.Automation.Language.Parser]::ParseInput($scriptContent, [ref]$tokens, [ref]$errors) | Out-Null
@@ -28,5 +29,10 @@ Describe 'publish.ps1' {
 
     It 'uses an explicit valid tag refspec' {
         $scriptContent | Should Match "refs/tags/\{0\}:refs/tags/\{0\}"
+    }
+    It 'publishes tag notes through GH_REPO for CLI compatibility' {
+        $releaseWorkflowContent | Should Match 'GH_REPO: \$\{\{ github\.repository \}\}'
+        $releaseWorkflowContent | Should Match 'gh release create .*--notes-from-tag'
+        $releaseWorkflowContent | Should Not Match 'gh release create .*--repo'
     }
 }
