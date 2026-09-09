@@ -40,6 +40,20 @@ pub struct RecycleResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecycleProgress {
+    Preparing {
+        prepared: usize,
+        total: usize,
+        current: Option<PathBuf>,
+    },
+    Executing {
+        work_total: Option<u32>,
+        work_completed: u32,
+        current: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestoreRecycleResult {
     Completed,
     Pending {
@@ -256,11 +270,20 @@ pub fn recycle(
     paths: &[PathBuf],
     is_cancelled: impl Fn() -> bool + Send + Sync + 'static,
 ) -> RecycleResult {
+    recycle_with_progress(paths, is_cancelled, |_| {})
+}
+
+pub fn recycle_with_progress(
+    paths: &[PathBuf],
+    is_cancelled: impl Fn() -> bool + Send + Sync + 'static,
+    on_progress: impl Fn(RecycleProgress) + Send + Sync + 'static,
+) -> RecycleResult {
     let owned_paths = paths.to_vec();
     let is_cancelled: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(is_cancelled);
+    let on_progress: Arc<dyn Fn(RecycleProgress) + Send + Sync> = Arc::new(on_progress);
     match thread::Builder::new()
         .name("asterfiles-recycle".into())
-        .spawn(move || recycle_on_com_thread(owned_paths, is_cancelled))
+        .spawn(move || recycle_on_com_thread(owned_paths, is_cancelled, on_progress))
     {
         Ok(worker) => worker
             .join()
@@ -272,13 +295,14 @@ pub fn recycle(
 fn recycle_on_com_thread(
     paths: Vec<PathBuf>,
     is_cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    on_progress: Arc<dyn Fn(RecycleProgress) + Send + Sync>,
 ) -> RecycleResult {
     let com = match ComApartment::initialize() {
         Ok(com) => com,
         Err(error) => return failed_result(&paths, &error.to_string()),
     };
 
-    let result = recycle_batch(&paths, is_cancelled);
+    let result = recycle_batch(&paths, is_cancelled, on_progress);
     drop(com);
     result
 }
@@ -286,6 +310,7 @@ fn recycle_on_com_thread(
 fn recycle_batch(
     paths: &[PathBuf],
     is_cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    on_progress: Arc<dyn Fn(RecycleProgress) + Send + Sync>,
 ) -> RecycleResult {
     let operation: IFileOperation =
         match unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_LOCAL_SERVER) } {
@@ -293,12 +318,18 @@ fn recycle_batch(
             Err(error) => return failed_result(paths, &windows_error(error).to_string()),
         };
     let results = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let current_item = Arc::new(std::sync::Mutex::new(None));
     let mut queued = Vec::with_capacity(paths.len());
     let mut initial = HashMap::new();
 
     if let Err(error) = unsafe { operation.SetOperationFlags(recycle_flags()) } {
         return failed_result(paths, &windows_error(error).to_string());
     }
+    on_progress(RecycleProgress::Preparing {
+        prepared: 0,
+        total: paths.len(),
+        current: paths.first().cloned(),
+    });
     for (index, path) in paths.iter().enumerate() {
         if is_cancelled() {
             break;
@@ -324,8 +355,19 @@ fn recycle_batch(
                 initial.insert(index, Err(error.to_string()));
             }
         }
+        on_progress(RecycleProgress::Preparing {
+            prepared: index + 1,
+            total: paths.len(),
+            current: Some(path.clone()),
+        });
     }
 
+    let progress_sink = IFileOperationProgressSink::from(RecycleProgressSink {
+        on_progress: on_progress.clone(),
+        current_item,
+        is_cancelled: is_cancelled.clone(),
+    });
+    let advise_cookie = unsafe { operation.Advise(&progress_sink) }.ok();
     let perform_error = if queued.is_empty() || is_cancelled() {
         None
     } else {
@@ -334,6 +376,9 @@ fn recycle_batch(
             .err()
             .map(|error| error.to_string())
     };
+    if let Some(cookie) = advise_cookie {
+        let _ = unsafe { operation.Unadvise(cookie) };
+    }
     let aborted = unsafe { operation.GetAnyOperationsAborted() }
         .map(|value| value.as_bool())
         .unwrap_or(false);
@@ -385,6 +430,23 @@ fn windows_error(error: WindowsError) -> io::Error {
     io::Error::other(error.to_string())
 }
 
+fn recycle_execution_progress(
+    total: u32,
+    completed: u32,
+    current: Option<PathBuf>,
+) -> RecycleProgress {
+    RecycleProgress::Executing {
+        work_total: (total > 0).then_some(total),
+        work_completed: completed,
+        current,
+    }
+}
+#[implement(IFileOperationProgressSink)]
+struct RecycleProgressSink {
+    on_progress: Arc<dyn Fn(RecycleProgress) + Send + Sync>,
+    current_item: Arc<std::sync::Mutex<Option<PathBuf>>>,
+    is_cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+}
 #[implement(IFileOperationProgressSink)]
 struct DeleteResultSink {
     index: usize,
@@ -441,6 +503,150 @@ fn merge_recycle_results(
         .collect()
 }
 
+#[allow(non_snake_case)]
+impl IFileOperationProgressSink_Impl for RecycleProgressSink_Impl {
+    fn StartOperations(&self) -> windows::core::Result<()> {
+        (self.on_progress)(recycle_execution_progress(
+            0,
+            0,
+            self.current_item
+                .lock()
+                .expect("recycle progress item poisoned")
+                .clone(),
+        ));
+        Ok(())
+    }
+    fn FinishOperations(&self, _result: HRESULT) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PreRenameItem(
+        &self,
+        _flags: u32,
+        _item: windows::core::Ref<IShellItem>,
+        _new_name: &PCWSTR,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PostRenameItem(
+        &self,
+        _flags: u32,
+        _item: windows::core::Ref<IShellItem>,
+        _new_name: &PCWSTR,
+        _result: HRESULT,
+        _created: windows::core::Ref<IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PreMoveItem(
+        &self,
+        _flags: u32,
+        _item: windows::core::Ref<IShellItem>,
+        _destination: windows::core::Ref<IShellItem>,
+        _new_name: &PCWSTR,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PostMoveItem(
+        &self,
+        _flags: u32,
+        _item: windows::core::Ref<IShellItem>,
+        _destination: windows::core::Ref<IShellItem>,
+        _new_name: &PCWSTR,
+        _result: HRESULT,
+        _created: windows::core::Ref<IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PreCopyItem(
+        &self,
+        _flags: u32,
+        _item: windows::core::Ref<IShellItem>,
+        _destination: windows::core::Ref<IShellItem>,
+        _new_name: &PCWSTR,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PostCopyItem(
+        &self,
+        _flags: u32,
+        _item: windows::core::Ref<IShellItem>,
+        _destination: windows::core::Ref<IShellItem>,
+        _new_name: &PCWSTR,
+        _result: HRESULT,
+        _created: windows::core::Ref<IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PreDeleteItem(
+        &self,
+        _flags: u32,
+        item: windows::core::Ref<IShellItem>,
+    ) -> windows::core::Result<()> {
+        if (self.is_cancelled)() {
+            return Err(WindowsError::from_hresult(HRESULT(0x80004004_u32 as i32)));
+        }
+        if let Some(path) = item.as_ref().and_then(shell_item_path) {
+            *self
+                .current_item
+                .lock()
+                .expect("recycle progress item poisoned") = Some(path.clone());
+            (self.on_progress)(recycle_execution_progress(0, 0, Some(path)));
+        }
+        Ok(())
+    }
+    fn PostDeleteItem(
+        &self,
+        _flags: u32,
+        _item: windows::core::Ref<IShellItem>,
+        _result: HRESULT,
+        _created: windows::core::Ref<IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PreNewItem(
+        &self,
+        _flags: u32,
+        _destination: windows::core::Ref<IShellItem>,
+        _new_name: &PCWSTR,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PostNewItem(
+        &self,
+        _flags: u32,
+        _destination: windows::core::Ref<IShellItem>,
+        _new_name: &PCWSTR,
+        _template_name: &PCWSTR,
+        _attributes: u32,
+        _result: HRESULT,
+        _created: windows::core::Ref<IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn UpdateProgress(&self, total: u32, completed: u32) -> windows::core::Result<()> {
+        if (self.is_cancelled)() {
+            return Err(WindowsError::from_hresult(HRESULT(0x80004004_u32 as i32)));
+        }
+        (self.on_progress)(recycle_execution_progress(
+            total,
+            completed,
+            self.current_item
+                .lock()
+                .expect("recycle progress item poisoned")
+                .clone(),
+        ));
+        Ok(())
+    }
+    fn ResetTimer(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PauseTimer(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn ResumeTimer(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
 #[allow(non_snake_case)]
 impl IFileOperationProgressSink_Impl for DeleteResultSink_Impl {
     fn StartOperations(&self) -> windows::core::Result<()> {
@@ -624,6 +830,25 @@ impl Drop for ComApartment {
 mod tests {
     use super::*;
 
+    #[test]
+    fn issue_81_shell_progress_preserves_work_units_and_unknown_totals() {
+        assert_eq!(
+            recycle_execution_progress(0, 0, Some(PathBuf::from("current"))),
+            RecycleProgress::Executing {
+                work_total: None,
+                work_completed: 0,
+                current: Some(PathBuf::from("current")),
+            }
+        );
+        assert_eq!(
+            recycle_execution_progress(100, 37, Some(PathBuf::from("current"))),
+            RecycleProgress::Executing {
+                work_total: Some(100),
+                work_completed: 37,
+                current: Some(PathBuf::from("current")),
+            }
+        );
+    }
     #[test]
     fn empty_path_is_rejected_without_shell_ui() {
         let result = recycle(&[PathBuf::new()], || false);

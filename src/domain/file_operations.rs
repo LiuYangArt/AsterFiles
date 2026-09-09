@@ -356,6 +356,7 @@ pub struct OperationProgress {
     pub total_bytes: Option<u64>,
     pub discovered_bytes: u64,
     pub scanning_complete: bool,
+    pub prepared_items: usize,
     pub current_item: Option<PathBuf>,
     pub recent_speed_bps: Option<u64>,
 }

@@ -250,12 +250,59 @@ impl Texts {
         }
     }
 
+    pub fn recycle_preparing(self, prepared: usize, total: usize) -> String {
+        match self.language {
+            Language::Chinese => format!("正在准备 · {prepared} / {total} 个所选项目"),
+            Language::English => format!("Preparing · {prepared} / {total} selected items"),
+        }
+    }
+
+    pub fn recycle_discovered(self, items: usize, bytes: u64, complete: bool) -> String {
+        let items = format_grouped_decimal(items);
+        let size = (bytes > 0)
+            .then(|| self.size(Some(bytes)))
+            .map(|size| match self.language {
+                Language::Chinese => format!("（{size}）"),
+                Language::English => format!(" ({size})"),
+            })
+            .unwrap_or_default();
+        let phase = if complete {
+            self.choose(" · 正在移到回收站", " · Moving to Recycle Bin")
+        } else {
+            ""
+        };
+        match self.language {
+            Language::Chinese => format!("已发现 {items} 项{size}{phase}"),
+            Language::English => format!("{items} items discovered{size}{phase}"),
+        }
+    }
+
+    pub fn recycle_discovery_phase(self, complete: bool) -> &'static str {
+        if complete {
+            self.choose("已完成内容统计", "Discovery complete")
+        } else {
+            self.choose("正在发现项目", "Discovering items")
+        }
+    }
+
     fn choose<T>(self, chinese: T, english: T) -> T {
         match self.language {
             Language::Chinese => chinese,
             Language::English => english,
         }
     }
+}
+
+fn format_grouped_decimal(value: usize) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
 }
 
 #[cfg(test)]

@@ -896,6 +896,63 @@ fn ensure_identity(path: &Path, expected: FileIdentity) -> Result<(), OperationE
     }
 }
 
+pub fn discover_paths_with_progress(
+    paths: &[PathBuf],
+    is_cancelled: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut(usize, u64, &Path),
+) -> bool {
+    let mut pending = paths.iter().rev().cloned().collect::<Vec<_>>();
+    let mut discovered_items = 0_usize;
+    let mut discovered_bytes = 0_u64;
+    while let Some(path) = pending.pop() {
+        if is_cancelled() {
+            return false;
+        }
+        let metadata = fs::symlink_metadata(&path).ok();
+        let bytes = metadata.as_ref().map_or(0, discovered_size);
+        discovered_items = discovered_items.saturating_add(1);
+        discovered_bytes = discovered_bytes.saturating_add(bytes);
+        progress(discovered_items, discovered_bytes, &path);
+
+        let Some(metadata) = metadata else {
+            continue;
+        };
+        if !is_traversable_directory(&metadata) {
+            continue;
+        }
+        let Ok(children) = fs::read_dir(&path) else {
+            continue;
+        };
+        let mut child_paths = Vec::new();
+        for child in children {
+            if is_cancelled() {
+                return false;
+            }
+            if let Ok(child) = child {
+                child_paths.push(child.path());
+            }
+        }
+        pending.extend(child_paths.into_iter().rev());
+    }
+    true
+}
+
+fn is_traversable_directory(metadata: &fs::Metadata) -> bool {
+    if !metadata.file_type().is_dir() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
 pub type FileProgressCallback<'a> = dyn FnMut(u64, bool, &Path) + 'a;
 pub type FileDiscoveredCallback<'a> = dyn FnMut(u64, &Path) + 'a;
 pub type DestinationCreatedCallback<'a> = dyn FnMut(&Path) + 'a;
@@ -1688,6 +1745,57 @@ fn copy_symlink(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn issue_81_recycle_discovery_counts_items_bytes_and_skips_reparse_targets() {
+        let temp = TempDir::new();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("one.bin"), [1_u8, 2, 3]).unwrap();
+        let nested = root.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("two.bin"), [4_u8, 5]).unwrap();
+
+        let mut snapshots = Vec::new();
+        assert!(discover_paths_with_progress(
+            std::slice::from_ref(&root),
+            &|| false,
+            &mut |items, bytes, path| snapshots.push((items, bytes, path.to_path_buf())),
+        ));
+        let (items, bytes, _) = snapshots.last().unwrap();
+        assert_eq!(*items, 4);
+        assert_eq!(*bytes, 5);
+        assert!(
+            snapshots
+                .windows(2)
+                .all(|pair| { pair[0].0 < pair[1].0 && pair[0].1 <= pair[1].1 })
+        );
+    }
+
+    #[test]
+    fn issue_81_recycle_discovery_honors_cancellation() {
+        let temp = TempDir::new();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        for index in 0..16 {
+            fs::write(root.join(format!("{index}.txt")), b"x").unwrap();
+        }
+        let cancelled = Cell::new(false);
+        let mut reports = 0_usize;
+        assert!(!discover_paths_with_progress(
+            std::slice::from_ref(&root),
+            &|| cancelled.get(),
+            &mut |_, _, _| {
+                reports += 1;
+                if reports == 3 {
+                    cancelled.set(true);
+                }
+            },
+        ));
+        assert_eq!(reports, 3);
+    }
+
     use crate::domain::file_operations::UndoHistory;
     use std::time::{SystemTime, UNIX_EPOCH};
 

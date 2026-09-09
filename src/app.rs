@@ -3533,6 +3533,17 @@ enum FileOperationEvent {
         conflict: crate::domain::file_operations::OperationConflict,
         response: mpsc::Sender<crate::domain::file_operations::ConflictDecision>,
     },
+    RecycleProgress {
+        id: OperationId,
+        progress: platform::windows::file_operation::RecycleProgress,
+    },
+    RecycleDiscovery {
+        id: OperationId,
+        discovered_items: usize,
+        discovered_bytes: u64,
+        complete: bool,
+        current_item: PathBuf,
+    },
     Finished {
         id: OperationId,
         result: OperationResult,
@@ -3680,6 +3691,65 @@ impl<'a> OperationProgressEmitter<'a> {
     }
 }
 
+#[derive(Debug)]
+struct RecycleProgressCoalescer {
+    last_sent_at: Option<Instant>,
+    pending: Option<platform::windows::file_operation::RecycleProgress>,
+    executing: bool,
+}
+
+impl RecycleProgressCoalescer {
+    fn new() -> Self {
+        Self {
+            last_sent_at: None,
+            pending: None,
+            executing: false,
+        }
+    }
+
+    fn push(
+        &mut self,
+        progress: platform::windows::file_operation::RecycleProgress,
+    ) -> Option<platform::windows::file_operation::RecycleProgress> {
+        let now = Instant::now();
+        let entering_execution = matches!(
+            progress,
+            platform::windows::file_operation::RecycleProgress::Executing { .. }
+        ) && !self.executing;
+        let preparation_finished = matches!(
+            progress,
+            platform::windows::file_operation::RecycleProgress::Preparing {
+                prepared,
+                total,
+                ..
+            } if prepared == total
+        );
+        self.executing |= matches!(
+            progress,
+            platform::windows::file_operation::RecycleProgress::Executing { .. }
+        );
+        self.pending = Some(progress);
+        let due = self
+            .last_sent_at
+            .is_none_or(|last| now.saturating_duration_since(last) >= OPERATION_PROGRESS_INTERVAL);
+        if due || entering_execution || preparation_finished {
+            self.last_sent_at = Some(now);
+            self.pending.take()
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    fn make_due_for_test(&mut self) {
+        self.last_sent_at = Some(Instant::now() - OPERATION_PROGRESS_INTERVAL);
+    }
+    fn flush(&mut self) -> Option<platform::windows::file_operation::RecycleProgress> {
+        let progress = self.pending.take()?;
+        self.last_sent_at = Some(Instant::now());
+        Some(progress)
+    }
+}
 #[cfg(test)]
 fn apply_progress_event_for_test(
     app: &mut AppState,
@@ -5372,7 +5442,7 @@ fn enqueue_operation(
             .ok()
             .flatten()
             .and_then(|id| {
-                let _ = app.operations.mark_running(id);
+                mark_operation_running_if_ready(&mut app.operations, id);
                 let task = app.operations.task(id)?;
                 let request = FileOperationRequest {
                     id,
@@ -15394,6 +15464,27 @@ fn refresh_operation_progress(ui: &OperationWindow, state: &SharedSessions) {
     update_operation_rows(ui, rows);
 }
 
+fn queue_operation_progress_refresh(
+    operation_weak: slint::Weak<OperationWindow>,
+    state: SharedSessions,
+    queued: &Arc<AtomicBool>,
+) {
+    if queued.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let queued_for_callback = queued.clone();
+    if slint::invoke_from_event_loop(move || {
+        if let Some(operation_ui) = operation_weak.upgrade() {
+            refresh_operation_progress(&operation_ui, &state);
+        }
+        queued_for_callback.store(false, Ordering::Release);
+    })
+    .is_err()
+    {
+        queued.store(false, Ordering::Release);
+    }
+}
+
 fn update_operation_rows(ui: &OperationWindow, rows: Vec<OperationRow>) {
     let current = ui.get_operations();
     let Some(model) = current.as_any().downcast_ref::<VecModel<OperationRow>>() else {
@@ -16571,6 +16662,15 @@ fn uses_local_recycle_batch(kind: FileOperationKind, resource: OperationResource
     kind == FileOperationKind::RecycleDelete && resource == OperationResource::Local
 }
 
+fn mark_operation_running_if_ready(operations: &mut OperationManager, id: OperationId) {
+    let Some((kind, resource)) = operations.task(id).map(|task| (task.kind, task.resource)) else {
+        return;
+    };
+    if !uses_local_recycle_batch(kind, resource) {
+        let _ = operations.mark_running(id);
+    }
+}
+
 fn undo_source_kind(kind: FileOperationKind) -> Option<UndoSourceKind> {
     match kind {
         FileOperationKind::CreateFolder => Some(UndoSourceKind::CreateFolder),
@@ -16752,6 +16852,10 @@ fn execute_file_operation_request(
         .first()
         .and_then(|item| item.source.clone().or_else(|| item.destination.clone()))
         .unwrap_or_default();
+    if uses_local_recycle_batch(request.kind, request.resource) {
+        execute_recycle_delete_request(request, event_sender);
+        return;
+    }
     let copy_or_move = matches!(
         request.kind,
         FileOperationKind::Copy | FileOperationKind::Move
@@ -16776,10 +16880,6 @@ fn execute_file_operation_request(
         Instant::now(),
     );
     progress.flush();
-    if uses_local_recycle_batch(request.kind, request.resource) {
-        execute_recycle_delete_request(request, event_sender);
-        return;
-    }
     if request.kind == FileOperationKind::Undo {
         execute_undo_request(request, event_sender);
         return;
@@ -16953,6 +17053,54 @@ fn execute_file_operation_request(
     });
 }
 
+fn start_recycle_discovery(
+    id: OperationId,
+    paths: Vec<PathBuf>,
+    cancellation: crate::domain::file_operations::CancellationToken,
+    stop: Arc<AtomicBool>,
+    events: mpsc::Sender<FileOperationEvent>,
+) -> Option<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("asterfiles-recycle-discovery".into())
+        .spawn(move || {
+            let now = Instant::now();
+            let mut last_sent_at = now.checked_sub(OPERATION_PROGRESS_INTERVAL).unwrap_or(now);
+            let mut latest_items = 0_usize;
+            let mut latest_bytes = 0_u64;
+            let mut latest_path = paths.first().cloned().unwrap_or_default();
+            let complete = crate::fs::file_operations::discover_paths_with_progress(
+                &paths,
+                &|| cancellation.is_cancelled() || stop.load(Ordering::Acquire),
+                &mut |items, bytes, current| {
+                    latest_items = items;
+                    latest_bytes = bytes;
+                    latest_path = current.to_path_buf();
+                    let now = Instant::now();
+                    if now.saturating_duration_since(last_sent_at) >= OPERATION_PROGRESS_INTERVAL {
+                        let _ = events.send(FileOperationEvent::RecycleDiscovery {
+                            id,
+                            discovered_items: items,
+                            discovered_bytes: bytes,
+                            complete: false,
+                            current_item: current.to_path_buf(),
+                        });
+                        last_sent_at = now;
+                    }
+                },
+            );
+            if complete {
+                let _ = events.send(FileOperationEvent::RecycleDiscovery {
+                    id,
+                    discovered_items: latest_items,
+                    discovered_bytes: latest_bytes,
+                    complete: true,
+                    current_item: latest_path,
+                });
+            }
+        })
+        .ok()
+}
+
 fn execute_recycle_delete_request(
     request: FileOperationRequest,
     event_sender: &mpsc::Sender<FileOperationEvent>,
@@ -16987,9 +17135,49 @@ fn execute_recycle_delete_request(
         .iter()
         .map(|(_, path)| path.clone())
         .collect::<Vec<_>>();
+    let discovery_stop = Arc::new(AtomicBool::new(false));
+    let discovery_worker = start_recycle_discovery(
+        request.id,
+        paths.clone(),
+        request.cancellation.clone(),
+        discovery_stop.clone(),
+        event_sender.clone(),
+    );
     let cancellation = request.cancellation.clone();
-    let recycle =
-        platform::windows::file_operation::recycle(&paths, move || cancellation.is_cancelled());
+    let progress_events = event_sender.clone();
+    let progress_id = request.id;
+    let coalescer = Arc::new(Mutex::new(RecycleProgressCoalescer::new()));
+    let callback_coalescer = coalescer.clone();
+    let recycle = platform::windows::file_operation::recycle_with_progress(
+        &paths,
+        move || cancellation.is_cancelled(),
+        move |progress| {
+            let committed = callback_coalescer
+                .lock()
+                .ok()
+                .and_then(|mut coalescer| coalescer.push(progress));
+            if let Some(progress) = committed {
+                let _ = progress_events.send(FileOperationEvent::RecycleProgress {
+                    id: progress_id,
+                    progress,
+                });
+            }
+        },
+    );
+    if let Some(progress) = coalescer
+        .lock()
+        .ok()
+        .and_then(|mut coalescer| coalescer.flush())
+    {
+        let _ = event_sender.send(FileOperationEvent::RecycleProgress {
+            id: request.id,
+            progress,
+        });
+    }
+    discovery_stop.store(true, Ordering::Release);
+    if let Some(worker) = discovery_worker {
+        let _ = worker.join();
+    }
     let mut succeeded = Vec::new();
     let mut failed = Vec::new();
     let mut affected = Vec::new();
@@ -17030,13 +17218,13 @@ fn execute_recycle_delete_request(
         let _ = event_sender.send(FileOperationEvent::Progress {
             id: request.id,
             completed_items: completed_in_round + 1,
-            completed_files: succeeded.len(),
-            total_files: Some(paths.len()),
-            discovered_files: paths.len(),
+            completed_files: 0,
+            total_files: None,
+            discovered_files: 0,
             processed_bytes: 0,
-            total_bytes: Some(0),
+            total_bytes: None,
             discovered_bytes: 0,
-            scanning_complete: true,
+            scanning_complete: false,
             current_item: path,
             recent_speed_bps: None,
         });
@@ -17558,6 +17746,69 @@ fn start_file_operation_event_pump(
     thread::spawn(move || {
         while let Ok(event) = receiver.recv() {
             let event = match event {
+                FileOperationEvent::RecycleProgress { id, progress } => {
+                    if let Ok(mut app) = state.lock()
+                        && let Some(task) = app.operations.task_mut(id)
+                        && !task.cancellation.is_cancelled()
+                    {
+                        match progress {
+                            platform::windows::file_operation::RecycleProgress::Preparing {
+                                prepared,
+                                current,
+                                ..
+                            } => {
+                                task.progress.prepared_items = prepared;
+                                if let Some(current) = current {
+                                    task.progress.current_item = Some(current);
+                                }
+                            }
+                            platform::windows::file_operation::RecycleProgress::Executing {
+                                current,
+                                ..
+                            } => {
+                                if task.state == OperationState::Preflight {
+                                    let _ = app.operations.mark_running(id);
+                                }
+                                if let Some(task) = app.operations.task_mut(id)
+                                    && let Some(current) = current
+                                {
+                                    task.progress.current_item = Some(current);
+                                }
+                            }
+                        }
+                    }
+                    queue_operation_progress_refresh(
+                        operation_weak.clone(),
+                        state.clone(),
+                        &progress_refresh_queued,
+                    );
+                    continue;
+                }
+                FileOperationEvent::RecycleDiscovery {
+                    id,
+                    discovered_items,
+                    discovered_bytes,
+                    complete,
+                    current_item,
+                } => {
+                    if let Ok(mut app) = state.lock()
+                        && let Some(task) = app.operations.task_mut(id)
+                        && !task.cancellation.is_cancelled()
+                    {
+                        task.progress.discovered_files =
+                            task.progress.discovered_files.max(discovered_items);
+                        task.progress.discovered_bytes =
+                            task.progress.discovered_bytes.max(discovered_bytes);
+                        task.progress.scanning_complete |= complete;
+                        task.progress.current_item = Some(current_item);
+                    }
+                    queue_operation_progress_refresh(
+                        operation_weak.clone(),
+                        state.clone(),
+                        &progress_refresh_queued,
+                    );
+                    continue;
+                }
                 FileOperationEvent::Progress {
                     id,
                     completed_items,
@@ -17578,29 +17829,21 @@ fn start_file_operation_event_pump(
                         task.progress.completed_items = completed_items;
                         task.progress.completed_files = completed_files;
                         task.progress.total_files = total_files;
-                        task.progress.discovered_files = discovered_files;
+                        task.progress.discovered_files =
+                            task.progress.discovered_files.max(discovered_files);
                         task.progress.processed_bytes = processed_bytes;
                         task.progress.total_bytes = total_bytes;
-                        task.progress.discovered_bytes = discovered_bytes;
-                        task.progress.scanning_complete = scanning_complete;
+                        task.progress.discovered_bytes =
+                            task.progress.discovered_bytes.max(discovered_bytes);
+                        task.progress.scanning_complete |= scanning_complete;
                         task.progress.current_item = Some(current_item);
                         task.progress.recent_speed_bps = recent_speed_bps;
                     }
-                    if !progress_refresh_queued.swap(true, Ordering::AcqRel) {
-                        let operation_weak = operation_weak.clone();
-                        let state = state.clone();
-                        let progress_refresh_queued = progress_refresh_queued.clone();
-                        let queued_flag = progress_refresh_queued.clone();
-                        let queued = slint::invoke_from_event_loop(move || {
-                            if let Some(operation_ui) = operation_weak.upgrade() {
-                                refresh_operation_progress(&operation_ui, &state);
-                            }
-                            queued_flag.store(false, Ordering::Release);
-                        });
-                        if queued.is_err() {
-                            progress_refresh_queued.store(false, Ordering::Release);
-                        }
-                    }
+                    queue_operation_progress_refresh(
+                        operation_weak.clone(),
+                        state.clone(),
+                        &progress_refresh_queued,
+                    );
                     continue;
                 }
                 event => event,
@@ -17618,6 +17861,8 @@ fn start_file_operation_event_pump(
                 let event_operation_id = match &event {
                     FileOperationEvent::DestinationCreated { id, .. }
                     | FileOperationEvent::Progress { id, .. }
+                    | FileOperationEvent::RecycleProgress { id, .. }
+                    | FileOperationEvent::RecycleDiscovery { id, .. }
                     | FileOperationEvent::Conflict { id, .. }
                     | FileOperationEvent::Finished { id, .. } => *id,
                 };
@@ -17633,7 +17878,9 @@ fn start_file_operation_event_pump(
                             );
                         }
                     }
-                    FileOperationEvent::Progress { .. } => unreachable!(),
+                    FileOperationEvent::Progress { .. }
+                    | FileOperationEvent::RecycleProgress { .. }
+                    | FileOperationEvent::RecycleDiscovery { .. } => unreachable!(),
                     FileOperationEvent::Conflict {
                         id,
                         conflict,
@@ -17804,7 +18051,7 @@ fn start_file_operation_event_pump(
                             }
                             let next = app.operations.start_next(resource).ok().flatten().and_then(
                                 |next_id| {
-                                    let _ = app.operations.mark_running(next_id);
+                                    mark_operation_running_if_ready(&mut app.operations, next_id);
                                     app.operations.task(next_id).cloned().map(|task| {
                                         let request = FileOperationRequest {
                                             id: next_id,
@@ -18188,7 +18435,7 @@ fn prepare_retry(state: &SharedSessions, id: OperationId) -> Option<FileOperatio
         return None;
     }
     let started = app.operations.start_next(resource).ok().flatten()?;
-    app.operations.mark_running(started).ok()?;
+    mark_operation_running_if_ready(&mut app.operations, started);
     let task = app.operations.task(started)?;
     let request = FileOperationRequest {
         id: started,
@@ -21610,8 +21857,11 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
                     Language::English => format!("Queue position {position}"),
                 },
             );
-            let progress_known = task.progress.scanning_complete;
-            let progress = if progress_known {
+            let recycle_progress = uses_local_recycle_batch(task.kind, task.resource);
+            let progress_known = !recycle_progress && task.progress.scanning_complete;
+            let progress = if recycle_progress {
+                0.0
+            } else if progress_known {
                 task.progress
                     .total_bytes
                     .filter(|total| *total > 0)
@@ -21626,7 +21876,21 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
             } else {
                 0.0
             };
-            let (transferred, speed_text, eta_text) = if progress_known {
+            let (transferred, speed_text, eta_text) = if recycle_progress {
+                let transferred = String::new();
+                let texts = Texts::new(app.language);
+                let phase = if task.state == OperationState::Preflight {
+                    texts.recycle_preparing(
+                        task.progress.prepared_items.min(task.progress.total_items),
+                        task.progress.total_items,
+                    )
+                } else {
+                    texts
+                        .recycle_discovery_phase(task.progress.scanning_complete)
+                        .to_owned()
+                };
+                (transferred, phase, "—".to_owned())
+            } else if progress_known {
                 task.progress
                     .total_bytes
                     .filter(|total| *total > 0)
@@ -21758,19 +22022,36 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
                     String::new()
                 }
                 .into(),
-                file_progress: task
-                    .progress
-                    .total_files
-                    .map(|total| format!("{} / {total}", task.progress.completed_files.min(total)))
-                    .unwrap_or_else(|| match app.language {
-                        Language::Chinese => {
-                            format!("正在扫描 · 已处理 {} 项", task.progress.completed_files)
-                        }
-                        Language::English => {
-                            format!("Scanning · {} processed", task.progress.completed_files)
-                        }
-                    })
-                    .into(),
+                file_progress: if recycle_progress {
+                    let texts = Texts::new(app.language);
+                    if task.state == OperationState::Preflight {
+                        texts.recycle_preparing(
+                            task.progress.prepared_items.min(task.progress.total_items),
+                            task.progress.total_items,
+                        )
+                    } else {
+                        texts.recycle_discovered(
+                            task.progress.discovered_files,
+                            task.progress.discovered_bytes,
+                            task.progress.scanning_complete,
+                        )
+                    }
+                } else {
+                    task.progress
+                        .total_files
+                        .map(|total| {
+                            format!("{} / {total}", task.progress.completed_files.min(total))
+                        })
+                        .unwrap_or_else(|| match app.language {
+                            Language::Chinese => {
+                                format!("正在扫描 · 已处理 {} 项", task.progress.completed_files)
+                            }
+                            Language::English => {
+                                format!("Scanning · {} processed", task.progress.completed_files)
+                            }
+                        })
+                }
+                .into(),
                 transferred: transferred.into(),
                 speed: speed_text.into(),
                 eta: eta_text.into(),
@@ -21789,7 +22070,8 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
                         | OperationState::Paused
                         | OperationState::WaitingConflict
                 ),
-                can_pause: matches!(task.state, OperationState::Running | OperationState::Paused),
+                can_pause: !recycle_progress
+                    && matches!(task.state, OperationState::Running | OperationState::Paused),
                 can_retry: task.kind != FileOperationKind::Undo
                     && matches!(
                         task.state,
@@ -23497,6 +23779,141 @@ fn initial_path() -> PathBuf {
 mod tests {
     use super::*;
 
+    fn recycle_task_for_test(state: OperationState) -> (AppState, OperationId) {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
+        let id = app.operations.submit(
+            OperationResource::Local,
+            FileOperationKind::RecycleDelete,
+            None,
+            vec![
+                OperationItem::pending(Some(PathBuf::from("C:/test/one")), None),
+                OperationItem::pending(Some(PathBuf::from("C:/test/two")), None),
+            ],
+        );
+        app.operations.start_next(OperationResource::Local).unwrap();
+        if state == OperationState::Running {
+            app.operations.mark_running(id).unwrap();
+        }
+        (app, id)
+    }
+
+    #[test]
+    fn issue_81_recycle_progress_is_time_coalesced_but_phase_changes_flush() {
+        use platform::windows::file_operation::RecycleProgress;
+
+        let mut coalescer = RecycleProgressCoalescer::new();
+        assert!(
+            coalescer
+                .push(RecycleProgress::Preparing {
+                    prepared: 0,
+                    total: 2,
+                    current: None,
+                })
+                .is_some()
+        );
+        assert!(
+            coalescer
+                .push(RecycleProgress::Preparing {
+                    prepared: 1,
+                    total: 2,
+                    current: Some(PathBuf::from("one")),
+                })
+                .is_none()
+        );
+        assert!(
+            coalescer
+                .push(RecycleProgress::Preparing {
+                    prepared: 2,
+                    total: 2,
+                    current: Some(PathBuf::from("two")),
+                })
+                .is_some()
+        );
+        assert!(
+            coalescer
+                .push(RecycleProgress::Executing {
+                    work_total: None,
+                    work_completed: 0,
+                    current: Some(PathBuf::from("one")),
+                })
+                .is_some()
+        );
+        assert!(
+            coalescer
+                .push(RecycleProgress::Executing {
+                    work_total: Some(100),
+                    work_completed: 1,
+                    current: Some(PathBuf::from("one")),
+                })
+                .is_none()
+        );
+        coalescer.make_due_for_test();
+        assert!(matches!(
+            coalescer.push(RecycleProgress::Executing {
+                work_total: Some(100),
+                work_completed: 37,
+                current: Some(PathBuf::from("one")),
+            }),
+            Some(RecycleProgress::Executing {
+                work_total: Some(100),
+                work_completed: 37,
+                ..
+            })
+        ));
+        assert!(
+            coalescer
+                .push(RecycleProgress::Executing {
+                    work_total: Some(100),
+                    work_completed: 38,
+                    current: Some(PathBuf::from("one")),
+                })
+                .is_none()
+        );
+        assert!(matches!(
+            coalescer.flush(),
+            Some(RecycleProgress::Executing {
+                work_total: Some(100),
+                work_completed: 38,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn issue_81_recycle_rows_prioritize_discovery_progress() {
+        let (mut preparing, preparing_id) = recycle_task_for_test(OperationState::Preflight);
+        let task = preparing.operations.task_mut(preparing_id).unwrap();
+        task.progress.prepared_items = 1;
+        task.progress.current_item = Some(PathBuf::from("C:/test/one"));
+        let row = operation_rows(&preparing).remove(0);
+        assert_eq!(row.status.as_str(), "正在准备");
+        assert_eq!(row.file_progress.as_str(), "正在准备 · 1 / 2 个所选项目");
+        assert!(!row.progress_known);
+        assert!(row.percent.is_empty());
+        assert!(!row.can_pause);
+
+        let (mut executing, executing_id) = recycle_task_for_test(OperationState::Running);
+        let task = executing.operations.task_mut(executing_id).unwrap();
+        task.progress.discovered_files = 22_998;
+        task.progress.discovered_bytes = 8 * 1_073_741_824;
+        let row = operation_rows(&executing).remove(0);
+        assert_eq!(row.file_progress.as_str(), "已发现 22,998 项（8.0 GB）");
+        assert_eq!(row.speed.as_str(), "正在发现项目");
+        assert!(row.transferred.is_empty());
+        assert!(!row.progress_known);
+        assert!(row.percent.is_empty());
+
+        let task = executing.operations.task_mut(executing_id).unwrap();
+        task.progress.scanning_complete = true;
+        let row = operation_rows(&executing).remove(0);
+        assert_eq!(
+            row.file_progress.as_str(),
+            "已发现 22,998 项（8.0 GB） · 正在移到回收站"
+        );
+        assert_eq!(row.speed.as_str(), "已完成内容统计");
+        assert!(row.percent.is_empty());
+        assert!(!row.progress_known);
+    }
     #[test]
     fn issue_61_progress_emitter_coalesces_and_flushes_scan_completion() {
         let (sender, receiver) = mpsc::channel();
