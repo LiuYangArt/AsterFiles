@@ -60,6 +60,28 @@ impl Texts {
         self.choose("此项目没有可打开的父目录", "This item has no parent folder")
     }
 
+    pub fn undo_empty(self) -> &'static str {
+        self.choose("没有可撤销的文件操作", "There is no file operation to undo")
+    }
+
+    pub fn undo_busy(self) -> &'static str {
+        self.choose(
+            "文件操作进行中，暂时无法撤销",
+            "Wait for the current file operation before undoing",
+        )
+    }
+
+    pub fn undo_partial(self) -> &'static str {
+        self.choose(
+            "部分文件无法安全撤销，可再次按 Ctrl+Z 重试",
+            "Some files could not be safely undone; press Ctrl+Z to retry",
+        )
+    }
+
+    pub fn undo_unavailable(self) -> &'static str {
+        self.choose("撤销工作线程不可用", "The undo worker is unavailable")
+    }
+
     pub fn reveal_target_missing(self) -> &'static str {
         self.choose(
             "目标已被移动、重命名或删除",

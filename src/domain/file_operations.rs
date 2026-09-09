@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -24,6 +24,209 @@ pub enum FileOperationKind {
     RecycleDelete,
     PermanentDelete,
     FastRemove,
+    Undo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UndoSourceKind {
+    CreateFolder,
+    Rename,
+    Copy,
+    Move,
+    RecycleDelete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UndoItem {
+    RemoveCreated {
+        path: PathBuf,
+        manifest: Vec<(PathBuf, FileIdentity)>,
+    },
+    RemoveEmptyDirectory {
+        path: PathBuf,
+        identity: FileIdentity,
+        quarantined: bool,
+    },
+    RemoveQuarantined {
+        path: PathBuf,
+        manifest: Vec<(PathBuf, FileIdentity)>,
+    },
+    MoveBack {
+        current: PathBuf,
+        original: PathBuf,
+        manifest: Vec<(PathBuf, FileIdentity)>,
+        manifest_complete: bool,
+    },
+    MoveBackQuarantined {
+        current: PathBuf,
+        original: PathBuf,
+        manifest: Vec<(PathBuf, FileIdentity)>,
+        manifest_complete: bool,
+    },
+    RestoreRecycled {
+        original: PathBuf,
+        absolute_pidl: Vec<u8>,
+    },
+    FinalizeRestore {
+        temporary: PathBuf,
+        original: PathBuf,
+        identity: FileIdentity,
+    },
+}
+
+impl UndoItem {
+    pub fn directories(&self) -> Vec<PathBuf> {
+        match self {
+            Self::RemoveCreated { path, .. }
+            | Self::RemoveEmptyDirectory { path, .. }
+            | Self::RemoveQuarantined { path, .. } => {
+                path.parent().map(Path::to_path_buf).into_iter().collect()
+            }
+            Self::MoveBack {
+                current, original, ..
+            }
+            | Self::MoveBackQuarantined {
+                current, original, ..
+            } => [current.parent(), original.parent()]
+                .into_iter()
+                .flatten()
+                .map(Path::to_path_buf)
+                .collect(),
+            Self::RestoreRecycled { original, .. } => original
+                .parent()
+                .map(Path::to_path_buf)
+                .into_iter()
+                .collect(),
+            Self::FinalizeRestore {
+                temporary,
+                original,
+                ..
+            } => [temporary.parent(), original.parent()]
+                .into_iter()
+                .flatten()
+                .map(Path::to_path_buf)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub volume_serial: u64,
+    pub file_index: [u8; 16],
+    pub is_directory: bool,
+    pub size_bytes: u64,
+    pub modified: Option<SystemTime>,
+    pub change_time: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoEntry {
+    pub source_kind: UndoSourceKind,
+    pub items: Vec<UndoItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UndoBeginError {
+    Empty,
+    Busy,
+}
+
+#[derive(Debug, Default)]
+pub struct UndoHistory {
+    entries: VecDeque<UndoEntry>,
+    in_progress: Option<UndoEntry>,
+    last_failure: Option<String>,
+}
+
+impl UndoHistory {
+    pub const MAX_ENTRIES: usize = 32;
+    pub const MAX_SNAPSHOT_ITEMS: usize = 100_000;
+
+    pub fn push(&mut self, entry: UndoEntry) {
+        let snapshot_items = entry
+            .items
+            .iter()
+            .map(|item| match item {
+                UndoItem::RemoveCreated { manifest, .. }
+                | UndoItem::RemoveQuarantined { manifest, .. }
+                | UndoItem::MoveBack { manifest, .. }
+                | UndoItem::MoveBackQuarantined { manifest, .. } => manifest.len(),
+                UndoItem::RemoveEmptyDirectory { .. }
+                | UndoItem::RestoreRecycled { .. }
+                | UndoItem::FinalizeRestore { .. } => 1,
+            })
+            .sum::<usize>();
+        if entry.items.is_empty() || snapshot_items > Self::MAX_SNAPSHOT_ITEMS {
+            return;
+        }
+        self.entries.push_back(entry);
+        while self.entries.len() > Self::MAX_ENTRIES {
+            self.entries.pop_front();
+        }
+        while self
+            .entries
+            .iter()
+            .flat_map(|entry| &entry.items)
+            .map(|item| match item {
+                UndoItem::RemoveCreated { manifest, .. }
+                | UndoItem::RemoveQuarantined { manifest, .. }
+                | UndoItem::MoveBack { manifest, .. }
+                | UndoItem::MoveBackQuarantined { manifest, .. } => manifest.len(),
+                UndoItem::RemoveEmptyDirectory { .. }
+                | UndoItem::RestoreRecycled { .. }
+                | UndoItem::FinalizeRestore { .. } => 1,
+            })
+            .sum::<usize>()
+            > Self::MAX_SNAPSHOT_ITEMS
+        {
+            self.entries.pop_front();
+        }
+        self.last_failure = None;
+    }
+
+    pub fn begin(&mut self, local_operation_busy: bool) -> Result<UndoEntry, UndoBeginError> {
+        if local_operation_busy || self.in_progress.is_some() {
+            return Err(UndoBeginError::Busy);
+        }
+        let entry = self.entries.pop_back().ok_or(UndoBeginError::Empty)?;
+        self.in_progress = Some(entry.clone());
+        self.last_failure = None;
+        Ok(entry)
+    }
+
+    pub fn finish(&mut self, failed_items: Vec<UndoItem>, failure: Option<String>) {
+        let Some(mut entry) = self.in_progress.take() else {
+            return;
+        };
+        if failed_items.is_empty() {
+            self.last_failure = None;
+            return;
+        }
+        entry.items = failed_items;
+        self.entries.push_back(entry);
+        self.last_failure = failure;
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_available(&self) -> bool {
+        !self.entries.is_empty() && self.in_progress.is_none()
+    }
+
+    pub fn in_progress(&self) -> bool {
+        self.in_progress.is_some()
+    }
+
+    pub fn latest_kind(&self) -> Option<UndoSourceKind> {
+        self.entries.back().map(|entry| entry.source_kind)
+    }
+
+    pub fn last_failure(&self) -> Option<&str> {
+        self.last_failure.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,6 +555,9 @@ pub struct OperationTask {
     pub state: OperationState,
     pub execution_round: u32,
     pub items: Vec<OperationItem>,
+    pub undo_items: Vec<UndoItem>,
+    pub undo_source_manifests: Vec<Option<Vec<(PathBuf, FileIdentity)>>>,
+    pub undo_source_kind: Option<UndoSourceKind>,
     pub progress: OperationProgress,
     pub conflict: Option<OperationConflict>,
     pub result: Option<OperationResult>,
@@ -385,6 +591,9 @@ impl OperationTask {
                 ..Default::default()
             },
             items,
+            undo_items: Vec::new(),
+            undo_source_manifests: Vec::new(),
+            undo_source_kind: None,
             conflict: None,
             result: None,
             cancellation: CancellationToken::new(),
@@ -543,6 +752,62 @@ impl OperationManager {
         self.queues[resource.index()].push_back(id);
         id
     }
+    pub fn set_undo_source_manifests(
+        &mut self,
+        id: OperationId,
+        manifests: Vec<Option<Vec<(PathBuf, FileIdentity)>>>,
+    ) {
+        if let Some(task) = self.tasks.get_mut(&id) {
+            task.undo_source_manifests = manifests;
+        }
+    }
+    pub fn submit_undo(
+        &mut self,
+        origin_tab: Option<TabId>,
+        source_kind: UndoSourceKind,
+        undo_items: Vec<UndoItem>,
+    ) -> OperationId {
+        let items = undo_items
+            .iter()
+            .map(|item| match item {
+                UndoItem::RemoveCreated { path, .. }
+                | UndoItem::RemoveEmptyDirectory { path, .. }
+                | UndoItem::RemoveQuarantined { path, .. } => {
+                    OperationItem::pending(Some(path.clone()), None)
+                }
+                UndoItem::MoveBack {
+                    current, original, ..
+                }
+                | UndoItem::MoveBackQuarantined {
+                    current, original, ..
+                } => OperationItem::pending(Some(current.clone()), Some(original.clone())),
+                UndoItem::RestoreRecycled { original, .. } => {
+                    OperationItem::pending(None, Some(original.clone()))
+                }
+                UndoItem::FinalizeRestore {
+                    temporary,
+                    original,
+                    ..
+                } => OperationItem::pending(Some(temporary.clone()), Some(original.clone())),
+            })
+            .collect();
+        let id = self.submit(
+            OperationResource::Local,
+            FileOperationKind::Undo,
+            origin_tab,
+            items,
+        );
+        self.tasks
+            .get_mut(&id)
+            .expect("submitted undo task exists")
+            .undo_items = undo_items;
+        self.tasks
+            .get_mut(&id)
+            .expect("submitted undo task exists")
+            .undo_source_kind = Some(source_kind);
+        id
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &OperationTask> {
         self.tasks.values()
     }
@@ -645,6 +910,17 @@ impl OperationManager {
             .expect("operation must exist")
             .set_paused(paused)
     }
+    pub fn abort_before_dispatch(&mut self, id: OperationId) -> bool {
+        let Some(resource) = self.tasks.get(&id).map(|task| task.resource) else {
+            return false;
+        };
+        if self.active[resource.index()] == Some(id) {
+            self.active[resource.index()] = None;
+        }
+        self.queues[resource.index()].retain(|queued| *queued != id);
+        self.tasks.remove(&id).is_some()
+    }
+
     pub fn remove_terminal(&mut self, id: OperationId) -> bool {
         let Some(resource) = self
             .tasks
@@ -698,6 +974,99 @@ mod tests {
     fn item(name: &str) -> OperationItem {
         OperationItem::pending(Some(PathBuf::from(name)), None)
     }
+    fn identity(seed: u8) -> FileIdentity {
+        FileIdentity {
+            volume_serial: 1,
+            file_index: [seed; 16],
+            is_directory: false,
+            size_bytes: 1,
+            modified: None,
+            change_time: 0,
+        }
+    }
+
+    fn undo_entry(seed: u8, snapshot_count: usize) -> UndoEntry {
+        UndoEntry {
+            source_kind: UndoSourceKind::Copy,
+            items: vec![UndoItem::RemoveCreated {
+                path: PathBuf::from(format!("copy-{seed}")),
+                manifest: (0..snapshot_count)
+                    .map(|index| {
+                        (
+                            PathBuf::from(format!("copy-{seed}/{index}")),
+                            identity(seed),
+                        )
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    #[test]
+    fn issue_83_undo_history_is_lifo_and_requeues_only_failed_items() {
+        let mut history = UndoHistory::default();
+        history.push(undo_entry(1, 1));
+        history.push(undo_entry(2, 2));
+
+        let latest = history.begin(false).unwrap();
+        assert_eq!(latest.items, undo_entry(2, 2).items);
+        let remaining = vec![latest.items[0].clone()];
+        history.finish(remaining.clone(), Some("locked".to_owned()));
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.last_failure(), Some("locked"));
+        assert_eq!(history.begin(false).unwrap().items, remaining);
+    }
+
+    #[test]
+    fn issue_83_undo_history_rejects_busy_and_bounds_entries() {
+        let mut history = UndoHistory::default();
+        assert_eq!(history.begin(false), Err(UndoBeginError::Empty));
+        for seed in 0..=(UndoHistory::MAX_ENTRIES as u8) {
+            history.push(undo_entry(seed, 1));
+        }
+        assert_eq!(history.len(), UndoHistory::MAX_ENTRIES);
+        assert_eq!(history.begin(true), Err(UndoBeginError::Busy));
+    }
+
+    #[test]
+    fn issue_83_undo_history_rejects_an_oversized_snapshot() {
+        let mut history = UndoHistory::default();
+        history.push(undo_entry(
+            1,
+            UndoHistory::MAX_SNAPSHOT_ITEMS.saturating_add(1),
+        ));
+        assert!(!history.is_available());
+    }
+
+    #[test]
+    fn issue_83_history_accepts_stage_aware_retry_items() {
+        let mut history = UndoHistory::default();
+        history.push(UndoEntry {
+            source_kind: UndoSourceKind::RecycleDelete,
+            items: vec![UndoItem::FinalizeRestore {
+                temporary: PathBuf::from("temporary.txt"),
+                original: PathBuf::from("original.txt"),
+                identity: identity(9),
+            }],
+        });
+        let entry = history.begin(false).unwrap();
+        history.finish(entry.items.clone(), Some("occupied".to_owned()));
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.begin(false).unwrap().items, entry.items);
+    }
+    #[test]
+    fn issue_83_operation_manager_projects_undo_items() {
+        let mut manager = OperationManager::new();
+        let entry = undo_entry(3, 1);
+        let id = manager.submit_undo(None, entry.source_kind, entry.items.clone());
+        let task = manager.task(id).unwrap();
+
+        assert_eq!(task.kind, FileOperationKind::Undo);
+        assert_eq!(task.undo_items, entry.items);
+        assert_eq!(task.items.len(), 1);
+    }
+
     #[test]
     fn issue_61_new_task_starts_with_unknown_scan_totals() {
         let task = OperationTask::new(
@@ -1084,6 +1453,37 @@ mod tests {
 
         assert_eq!(manager.task(id).unwrap().state, OperationState::Paused);
         assert!(manager.task(id).unwrap().cancellation.is_paused());
+    }
+
+    #[test]
+    fn issue_83_abort_before_dispatch_releases_the_resource_lane() {
+        let mut manager = OperationManager::new();
+        let id = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::Undo,
+            None,
+            vec![item("undo")],
+        );
+        assert_eq!(
+            manager.start_next(OperationResource::Local).unwrap(),
+            Some(id)
+        );
+        manager.mark_running(id).unwrap();
+
+        assert!(manager.abort_before_dispatch(id));
+        assert_eq!(manager.active_id(OperationResource::Local), None);
+        assert!(manager.task(id).is_none());
+
+        let next = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![item("next")],
+        );
+        assert_eq!(
+            manager.start_next(OperationResource::Local).unwrap(),
+            Some(next)
+        );
     }
     #[test]
     fn issue_61_retry_resets_scan_discovery_and_keeps_successes() {

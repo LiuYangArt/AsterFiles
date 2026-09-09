@@ -31,6 +31,7 @@ use crate::{
         file_operations::{
             FileOperationKind, ItemState, OperationId, OperationItem, OperationManager,
             OperationResource, OperationResult, OperationState, TransferRateEstimator,
+            UndoBeginError, UndoEntry, UndoHistory, UndoItem, UndoSourceKind,
         },
         folder_size_scheduler::{FOLDER_SIZE_QUEUE_CAPACITY, FolderSizeCommit, FolderSizeQuery},
     },
@@ -456,7 +457,7 @@ pub fn export_folder_size_scheduler_state(path: &Path) -> io::Result<()> {
     std::fs::write(
         path,
         format!(
-            "{{\n  \"schema_version\": 1,\n  \"scenario\": \"folder-size-scheduler\",\n  \"visible_range\": {{\"entry_count\": 80, \"first_submitted\": {}, \"repeated_submitted\": {}, \"scrolled_submitted\": {}, \"submit_limit\": 24}},\n  \"complete_sort\": {{\"directory_count\": {}, \"completed\": {}, \"terminal_failures\": 5, \"final_refreshes\": {}}},\n  \"cancellation\": {{\"old_generation_rejected\": {}}}\n}}\n",
+            "{{\n  \"schema_version\": 2,\n  \"scenario\": \"folder-size-scheduler\",\n  \"visible_range\": {{\"entry_count\": 80, \"first_submitted\": {}, \"repeated_submitted\": {}, \"scrolled_submitted\": {}, \"submit_limit\": 24}},\n  \"complete_sort\": {{\"directory_count\": {}, \"completed\": {}, \"terminal_failures\": 5, \"final_refreshes\": {}}},\n  \"cancellation\": {{\"old_generation_rejected\": {}}}\n}}\n",
             first.len(),
             repeated.len(),
             scrolled.len(),
@@ -882,6 +883,27 @@ pub fn export_tab_cross_window_state(path: &Path) -> io::Result<()> {
 }
 
 pub fn export_file_operation_center_state(path: &Path) -> io::Result<()> {
+    let mut history = UndoHistory::default();
+    history.push(UndoEntry {
+        source_kind: UndoSourceKind::RecycleDelete,
+        items: vec![UndoItem::RestoreRecycled {
+            original: PathBuf::from(r"C:\Example\restored.txt"),
+            absolute_pidl: vec![0, 0],
+        }],
+    });
+    let undo_depth = history.len();
+    let undo_available = history.is_available();
+    let undo_in_progress = history.in_progress();
+    let undo_latest_kind = history
+        .latest_kind()
+        .map(|kind| match kind {
+            UndoSourceKind::CreateFolder => "create_folder".to_owned(),
+            UndoSourceKind::Rename => "rename".to_owned(),
+            UndoSourceKind::Copy => "copy".to_owned(),
+            UndoSourceKind::Move => "move".to_owned(),
+            UndoSourceKind::RecycleDelete => "recycle_delete".to_owned(),
+        })
+        .unwrap_or_default();
     let states = [
         (1, "local", "running", 0, true, true, false),
         (2, "network", "running", 0, true, true, false),
@@ -905,12 +927,21 @@ pub fn export_file_operation_center_state(path: &Path) -> io::Result<()> {
         path,
         format!(
             concat!(
-                "{{\n  \"schema_version\": 1,\n",
+                "{{\n  \"schema_version\": 2,\n",
                 "  \"scenario\": \"file-operation-center\",\n",
                 "  \"scope\": \"pure_model_no_ui_no_io\",\n",
                 "  \"close_semantics\": {{\"action\":\"cancel_all_and_close\",\"task_states_unchanged\":false}},\n",
+                "  \"undo\": {{\"available\":{},\"history_depth\":{},\"latest_kind\":\"{}\",\"in_progress\":{},\"last_failure\":{},\"source\":\"live_model_projection\"}},\n",
                 "  \"operations\": [\n    {}\n  ]\n}}\n"
             ),
+            undo_available,
+            undo_depth,
+            undo_latest_kind,
+            undo_in_progress,
+            history
+                .last_failure()
+                .map(|value| format!("{:?}", value))
+                .unwrap_or_else(|| "null".to_owned()),
             operations
         ),
     )
@@ -1841,7 +1872,10 @@ struct AppState {
     directory_view_lru: VecDeque<PathBuf>,
     search_view: SearchViewPreference,
     operations: OperationManager,
+    undo_history: UndoHistory,
     operation_errors: Vec<String>,
+    operation_notice: Option<(u64, String)>,
+    operation_notice_generation: u64,
     rename_targets: HashMap<WindowId, (TabId, EntryId)>,
     focus_after_refresh: HashMap<TabId, PendingFocus>,
     pending_rename_ui: HashMap<WindowId, PendingRenameUi>,
@@ -2083,7 +2117,10 @@ impl AppState {
             directory_views,
             search_view,
             operations: OperationManager::new(),
+            undo_history: UndoHistory::default(),
             operation_errors: Vec::new(),
+            operation_notice: None,
+            operation_notice_generation: 0,
             rename_targets: HashMap::new(),
             focus_after_refresh: HashMap::new(),
             pending_rename_ui: HashMap::new(),
@@ -3465,6 +3502,9 @@ struct FileOperationRequest {
     kind: FileOperationKind,
     resource: OperationResource,
     items: Vec<OperationItem>,
+    undo_items: Vec<UndoItem>,
+    undo_source_manifests:
+        Vec<Option<Vec<(PathBuf, crate::domain::file_operations::FileIdentity)>>>,
     cancellation: crate::domain::file_operations::CancellationToken,
 }
 
@@ -3498,6 +3538,8 @@ enum FileOperationEvent {
         result: OperationResult,
         item_states: Vec<(usize, ItemState, Option<String>)>,
         completed_targets: Vec<PathBuf>,
+        undo_items: Option<Vec<UndoItem>>,
+        failed_undo_items: Vec<UndoItem>,
     },
 }
 
@@ -5265,6 +5307,29 @@ fn context_target_at(
     (entry, entry.is_none())
 }
 
+fn capture_undo_source_manifests(
+    kind: FileOperationKind,
+    resource: OperationResource,
+    items: &[OperationItem],
+) -> Vec<Option<Vec<(PathBuf, crate::domain::file_operations::FileIdentity)>>> {
+    if resource != OperationResource::Local
+        || !matches!(kind, FileOperationKind::Rename | FileOperationKind::Move)
+    {
+        return vec![None; items.len()];
+    }
+    let mut remaining = UndoHistory::MAX_SNAPSHOT_ITEMS;
+    items
+        .iter()
+        .map(|item| {
+            let source = item.source.as_deref()?;
+            let manifest =
+                crate::fs::file_operations::collect_tree_identities(source, remaining).ok()?;
+            remaining = remaining.saturating_sub(manifest.len());
+            Some(manifest)
+        })
+        .collect()
+}
+
 fn enqueue_operation(
     state: &SharedSessions,
     sender: &mpsc::Sender<FileOperationRequest>,
@@ -5293,8 +5358,12 @@ fn enqueue_operation(
         if app.tab(origin_tab).is_none() {
             return;
         }
-        app.operations
+        let undo_source_manifests = capture_undo_source_manifests(kind, resource, &items);
+        let operation_id = app
+            .operations
             .submit(resource, kind, Some(origin_tab), items);
+        app.operations
+            .set_undo_source_manifests(operation_id, undo_source_manifests);
         if app.operations.active_id(resource).is_some() {
             return;
         }
@@ -5310,6 +5379,8 @@ fn enqueue_operation(
                     kind: task.kind,
                     resource: task.resource,
                     items: task.items.clone(),
+                    undo_items: task.undo_items.clone(),
+                    undo_source_manifests: task.undo_source_manifests.clone(),
                     cancellation: task.cancellation.clone(),
                 };
                 register_operation_directories(&mut app, request.kind, &request.items);
@@ -5319,6 +5390,103 @@ fn enqueue_operation(
     refresh_operation_badges(state);
     if let Some(request) = request {
         let _ = sender.send(request);
+    }
+}
+
+fn schedule_operation_notice_clear(state: SharedSessions, generation: u64) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(4));
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Ok(mut app) = state.lock()
+                && app
+                    .operation_notice
+                    .as_ref()
+                    .is_some_and(|(current, _)| *current == generation)
+            {
+                app.operation_notice = None;
+            }
+            refresh_all_windows(&state);
+        });
+    });
+}
+fn show_operation_notice(state: &SharedSessions, message: String) {
+    let generation = {
+        let mut app = state.lock().expect("app state mutex is not poisoned");
+        app.operation_notice_generation = app.operation_notice_generation.wrapping_add(1).max(1);
+        let generation = app.operation_notice_generation;
+        app.operation_notice = Some((generation, message));
+        generation
+    };
+    refresh_all_windows(state);
+    schedule_operation_notice_clear(state.clone(), generation);
+}
+fn request_undo(
+    state: &SharedSessions,
+    sender: &mpsc::Sender<FileOperationRequest>,
+    origin_tab: TabId,
+) {
+    let request = {
+        let mut app = state.lock().expect("app state mutex is not poisoned");
+        let busy = app
+            .operations
+            .iter()
+            .any(|task| task.resource == OperationResource::Local && task.state.is_active());
+        let entry = match app.undo_history.begin(busy) {
+            Ok(entry) => entry,
+            Err(UndoBeginError::Empty) => {
+                let message = Texts::new(app.language).undo_empty().to_owned();
+                drop(app);
+                show_operation_notice(state, message);
+                return;
+            }
+            Err(UndoBeginError::Busy) => {
+                let message = Texts::new(app.language).undo_busy().to_owned();
+                drop(app);
+                show_operation_notice(state, message);
+                return;
+            }
+        };
+        let source_kind = entry.source_kind;
+        let undo_items = entry.items;
+        let submitted_id =
+            app.operations
+                .submit_undo(Some(origin_tab), source_kind, undo_items.clone());
+        let Some(id) = app
+            .operations
+            .start_next(OperationResource::Local)
+            .ok()
+            .flatten()
+        else {
+            let message = Texts::new(app.language).undo_unavailable().to_owned();
+            app.operations.abort_before_dispatch(submitted_id);
+            app.undo_history.finish(undo_items, Some(message.clone()));
+            drop(app);
+            show_operation_notice(state, message);
+            return;
+        };
+        let _ = app.operations.mark_running(id);
+        let task = app.operations.task(id).expect("started undo task exists");
+        FileOperationRequest {
+            id,
+            kind: task.kind,
+            resource: task.resource,
+            items: task.items.clone(),
+            undo_items: task.undo_items.clone(),
+            undo_source_manifests: vec![None; task.items.len()],
+            cancellation: task.cancellation.clone(),
+        }
+    };
+    refresh_operation_badges(state);
+    let operation_id = request.id;
+    let undo_items = request.undo_items.clone();
+    if sender.send(request).is_err()
+        && let Ok(mut app) = state.lock()
+    {
+        let message = Texts::new(app.language).undo_unavailable().to_owned();
+        app.operations.abort_before_dispatch(operation_id);
+        app.undo_history.finish(undo_items, Some(message.clone()));
+        drop(app);
+        show_operation_notice(state, message);
     }
 }
 
@@ -5412,6 +5580,12 @@ fn operation_directories(kind: FileOperationKind, items: &[OperationItem]) -> Ha
                 .and_then(Path::parent)
                 .map(Path::to_path_buf)
                 .into_iter()
+                .collect(),
+            FileOperationKind::Undo => [item.source.as_deref(), item.destination.as_deref()]
+                .into_iter()
+                .flatten()
+                .filter_map(Path::parent)
+                .map(Path::to_path_buf)
                 .collect(),
         })
         .collect()
@@ -12616,6 +12790,18 @@ fn wire_callbacks(
         }
     });
 
+    let state_for_undo = state.clone();
+    let sender_for_undo = operation_sender.clone();
+    ui.on_request_undo(move || {
+        let origin_tab = state_for_undo
+            .lock()
+            .ok()
+            .map(|app| app.active_window_state().active_tab);
+        if let Some(origin_tab) = origin_tab {
+            request_undo(&state_for_undo, &sender_for_undo, origin_tab);
+        }
+    });
+
     let state_for_copy = state.clone();
     let clipboard_for_copy = clipboard_sender.clone();
     ui.on_copy_selection(move |cut| {
@@ -13222,6 +13408,23 @@ fn wire_mouse_navigation(
                             }
                         } else if !type_select_active {
                             ui.invoke_clear_selection();
+                        }
+                        true
+                    }
+                    _ if control
+                        && !alt
+                        && !shift
+                        && !settings_active
+                        && !editing_address
+                        && ui.get_file_list_keyboard_target()
+                        && character.is_some_and(|value| value.eq_ignore_ascii_case("z")) =>
+                    {
+                        let origin_tab = state
+                            .lock()
+                            .ok()
+                            .map(|app| app.active_window_state().active_tab);
+                        if let Some(origin_tab) = origin_tab {
+                            request_undo(&shared_state, &senders.operation, origin_tab);
                         }
                         true
                     }
@@ -16348,6 +16551,170 @@ fn run_file_operation_worker(
 fn uses_local_recycle_batch(kind: FileOperationKind, resource: OperationResource) -> bool {
     kind == FileOperationKind::RecycleDelete && resource == OperationResource::Local
 }
+
+fn undo_source_kind(kind: FileOperationKind) -> Option<UndoSourceKind> {
+    match kind {
+        FileOperationKind::CreateFolder => Some(UndoSourceKind::CreateFolder),
+        FileOperationKind::Rename => Some(UndoSourceKind::Rename),
+        FileOperationKind::Copy => Some(UndoSourceKind::Copy),
+        FileOperationKind::Move => Some(UndoSourceKind::Move),
+        FileOperationKind::RecycleDelete => Some(UndoSourceKind::RecycleDelete),
+        FileOperationKind::PermanentDelete
+        | FileOperationKind::FastRemove
+        | FileOperationKind::Undo => None,
+    }
+}
+
+fn undo_manifest_from_report(
+    target: &Path,
+    report: &crate::fs::file_operations::FileOperationReport,
+    limit: usize,
+) -> Option<Vec<(PathBuf, crate::domain::file_operations::FileIdentity)>> {
+    let mut identities = report
+        .undo_identities
+        .iter()
+        .filter(|(path, _)| {
+            path.as_path() == target
+                || path
+                    .strip_prefix(target)
+                    .is_ok_and(|relative| !relative.as_os_str().is_empty())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    identities.sort_by(|left, right| left.0.cmp(&right.0));
+    identities.dedup_by(|left, right| left.0 == right.0);
+    let target_identity = identities
+        .iter()
+        .find(|(path, _)| path == target)
+        .map(|(_, identity)| *identity)?;
+    if identities.is_empty() || identities.len() > limit {
+        return None;
+    }
+    let actual = crate::fs::file_operations::collect_tree_identities(target, limit).ok()?;
+    let actual_by_path = actual.into_iter().collect::<HashMap<_, _>>();
+    if actual_by_path.len() != identities.len()
+        || identities.iter().any(|(path, identity)| {
+            actual_by_path.get(path).is_none_or(|actual| {
+                actual.volume_serial != identity.volume_serial
+                    || actual.file_index != identity.file_index
+                    || actual.is_directory != identity.is_directory
+            })
+        })
+    {
+        return None;
+    }
+    let current_target = actual_by_path.get(target)?;
+    if current_target.volume_serial != target_identity.volume_serial
+        || current_target.file_index != target_identity.file_index
+        || current_target.is_directory != target_identity.is_directory
+    {
+        return None;
+    }
+    identities
+        .into_iter()
+        .map(|(path, identity)| {
+            let current = *actual_by_path.get(&path)?;
+            Some((
+                path,
+                if identity.is_directory {
+                    current
+                } else {
+                    identity
+                },
+            ))
+        })
+        .collect::<Option<Vec<_>>>()
+}
+
+fn rebase_undo_manifest(
+    manifest: &[(PathBuf, crate::domain::file_operations::FileIdentity)],
+    source: &Path,
+    destination: &Path,
+) -> Option<Vec<(PathBuf, crate::domain::file_operations::FileIdentity)>> {
+    manifest
+        .iter()
+        .map(|(path, identity)| {
+            let relative = path.strip_prefix(source).ok()?;
+            Some((destination.join(relative), *identity))
+        })
+        .collect()
+}
+
+fn undo_items_for_success(
+    kind: FileOperationKind,
+    item: &OperationItem,
+    report: &crate::fs::file_operations::FileOperationReport,
+    completed_target: Option<&Path>,
+    destination_existed: bool,
+    source_manifest: Option<&[(PathBuf, crate::domain::file_operations::FileIdentity)]>,
+    snapshot_limit: usize,
+) -> Option<Vec<UndoItem>> {
+    match kind {
+        FileOperationKind::CreateFolder => {
+            let target = completed_target?;
+            let identity = report
+                .undo_identities
+                .iter()
+                .find(|(path, _)| path == target)
+                .map(|(_, identity)| *identity)?;
+            Some(vec![UndoItem::RemoveEmptyDirectory {
+                path: target.to_path_buf(),
+                identity,
+                quarantined: false,
+            }])
+        }
+        FileOperationKind::Copy => {
+            if !report.undo_root_created_exclusively {
+                return None;
+            }
+            let target = report.undo_root.as_deref()?;
+            let manifest = undo_manifest_from_report(target, report, snapshot_limit)?;
+            Some(vec![UndoItem::RemoveCreated {
+                path: target.to_path_buf(),
+                manifest,
+            }])
+        }
+        FileOperationKind::Rename | FileOperationKind::Move => {
+            let target = completed_target?;
+            let original = item.source.as_ref()?;
+            if original == target || (kind == FileOperationKind::Move && destination_existed) {
+                return None;
+            }
+            let source_manifest = source_manifest?;
+            if source_manifest.is_empty() || source_manifest.len() > snapshot_limit {
+                return None;
+            }
+            let manifest = rebase_undo_manifest(source_manifest, original, target)?;
+            let current =
+                crate::fs::file_operations::collect_tree_identities(target, snapshot_limit).ok()?;
+            if current.len() != manifest.len()
+                || current.iter().zip(&manifest).any(
+                    |((path, actual), (expected_path, expected))| {
+                        path != expected_path
+                            || actual.is_directory != expected.is_directory
+                            || (!actual.is_directory
+                                && (actual.size_bytes != expected.size_bytes
+                                    || actual.modified != expected.modified))
+                    },
+                )
+            {
+                return None;
+            }
+            let manifest = current;
+            let manifest_complete = true;
+            Some(vec![UndoItem::MoveBack {
+                current: target.to_path_buf(),
+                original: original.clone(),
+                manifest,
+                manifest_complete,
+            }])
+        }
+        FileOperationKind::RecycleDelete
+        | FileOperationKind::PermanentDelete
+        | FileOperationKind::FastRemove
+        | FileOperationKind::Undo => None,
+    }
+}
 fn execute_file_operation_request(
     request: FileOperationRequest,
     event_sender: &mpsc::Sender<FileOperationEvent>,
@@ -16359,6 +16726,8 @@ fn execute_file_operation_request(
     let mut affected = Vec::new();
     let mut indexed_states = Vec::new();
     let mut completed_targets = Vec::new();
+    let mut undo_items = Some(Vec::new());
+    let mut undo_snapshot_remaining = UndoHistory::MAX_SNAPSHOT_ITEMS;
     let current_item = request
         .items
         .first()
@@ -16392,6 +16761,10 @@ fn execute_file_operation_request(
         execute_recycle_delete_request(request, event_sender);
         return;
     }
+    if request.kind == FileOperationKind::Undo {
+        execute_undo_request(request, event_sender);
+        return;
+    }
     let mut conflict_defaults = HashMap::new();
     let mut completed_in_round = 0;
     for (item_index, item) in request.items.iter().enumerate() {
@@ -16402,6 +16775,11 @@ fn execute_file_operation_request(
             indexed_states.push((item_index, ItemState::Cancelled, None));
             continue;
         }
+        let destination_existed = request.resource == OperationResource::Local
+            && item
+                .destination
+                .as_deref()
+                .is_some_and(|path| std::fs::symlink_metadata(path).is_ok());
         let destination_was_existing_directory = request.resource == OperationResource::Local
             && item.source != item.destination
             && item
@@ -16426,12 +16804,59 @@ fn execute_file_operation_request(
         );
         match outcome {
             Ok(report) => {
-                if report.skipped.is_empty()
-                    && let Some(target) = completed_target_for_item(
-                        item,
-                        &report.completed_paths,
-                        destination_was_existing_directory,
-                    )
+                let completed_target = report
+                    .skipped
+                    .is_empty()
+                    .then(|| {
+                        completed_target_for_item(
+                            item,
+                            &report.completed_paths,
+                            destination_was_existing_directory,
+                        )
+                    })
+                    .flatten();
+                if report.skipped.is_empty() {
+                    if request.resource == OperationResource::Local {
+                        if let Some(candidate) = undo_items_for_success(
+                            request.kind,
+                            item,
+                            &report,
+                            completed_target.as_deref(),
+                            destination_existed,
+                            request
+                                .undo_source_manifests
+                                .get(item_index)
+                                .and_then(|manifest| manifest.as_deref()),
+                            undo_snapshot_remaining,
+                        ) {
+                            let used = candidate
+                                .iter()
+                                .map(|item| match item {
+                                    UndoItem::RemoveCreated { manifest, .. }
+                                    | UndoItem::RemoveQuarantined { manifest, .. }
+                                    | UndoItem::MoveBack { manifest, .. }
+                                    | UndoItem::MoveBackQuarantined { manifest, .. } => {
+                                        manifest.len()
+                                    }
+                                    UndoItem::RemoveEmptyDirectory { .. }
+                                    | UndoItem::RestoreRecycled { .. }
+                                    | UndoItem::FinalizeRestore { .. } => 1,
+                                })
+                                .sum::<usize>();
+                            if let Some(items) = undo_items.as_mut() {
+                                items.extend(candidate);
+                            }
+                            undo_snapshot_remaining = undo_snapshot_remaining.saturating_sub(used);
+                        } else {
+                            undo_items = None;
+                        }
+                    } else {
+                        undo_items = None;
+                    }
+                } else {
+                    undo_items = None;
+                }
+                if let Some(target) = completed_target
                     && !completed_targets.contains(&target)
                 {
                     completed_targets.push(target);
@@ -16449,7 +16874,7 @@ fn execute_file_operation_request(
                     .or_else(|| item.source.clone())
                     .unwrap_or_default();
                 if report.skipped.is_empty() {
-                    succeeded.push(identity);
+                    succeeded.push(identity.clone());
                     indexed_states.push((item_index, ItemState::Succeeded, None));
                 } else {
                     skipped.extend(report.skipped);
@@ -16462,6 +16887,7 @@ fn execute_file_operation_request(
                 }
             }
             Err(error) => {
+                undo_items = None;
                 let identity = item
                     .source
                     .clone()
@@ -16480,7 +16906,7 @@ fn execute_file_operation_request(
                             indexed_states.push((item_index, ItemState::Succeeded, Some(message)));
                         }
                         ExecuteFileOperationError::Failed(message) => {
-                            failed.push((identity, message.clone()));
+                            failed.push((identity.clone(), message.clone()));
                             indexed_states.push((item_index, ItemState::Failed, Some(message)));
                         }
                     }
@@ -16503,6 +16929,8 @@ fn execute_file_operation_request(
         },
         item_states: indexed_states,
         completed_targets,
+        undo_items,
+        failed_undo_items: Vec::new(),
     });
 }
 
@@ -16531,6 +16959,8 @@ fn execute_recycle_delete_request(
                 .map(|(index, _)| (*index, ItemState::Cancelled, None))
                 .collect(),
             completed_targets: Vec::new(),
+            undo_items: None,
+            failed_undo_items: Vec::new(),
         });
         return;
     }
@@ -16545,6 +16975,7 @@ fn execute_recycle_delete_request(
     let mut failed = Vec::new();
     let mut affected = Vec::new();
     let mut item_states = Vec::new();
+    let mut undo_items = Some(Vec::new());
     for (completed_in_round, result) in recycle.items.into_iter().enumerate() {
         let (index, path) = pending[result.index].clone();
         if let Some(parent) = path.parent().map(Path::to_path_buf)
@@ -16554,13 +16985,25 @@ fn execute_recycle_delete_request(
         }
         match result.result {
             Ok(()) => {
+                if let Some(absolute_pidl) = result.recycled_identity {
+                    if let Some(items) = undo_items.as_mut() {
+                        items.push(UndoItem::RestoreRecycled {
+                            original: path.clone(),
+                            absolute_pidl,
+                        });
+                    }
+                } else {
+                    undo_items = None;
+                }
                 succeeded.push(path.clone());
                 item_states.push((index, ItemState::Succeeded, None));
             }
             Err(message) if recycle.aborted || request.cancellation.is_cancelled() => {
+                undo_items = None;
                 item_states.push((index, ItemState::Cancelled, Some(message)));
             }
             Err(message) => {
+                undo_items = None;
                 failed.push((path.clone(), message.clone()));
                 item_states.push((index, ItemState::Failed, Some(message)));
             }
@@ -16589,6 +17032,143 @@ fn execute_recycle_delete_request(
         },
         item_states,
         completed_targets: Vec::new(),
+        undo_items,
+        failed_undo_items: Vec::new(),
+    });
+}
+
+fn undo_report_for_paths(paths: &[PathBuf]) -> crate::fs::file_operations::FileOperationReport {
+    let mut affected_directories = paths
+        .iter()
+        .filter_map(|path| path.parent().map(Path::to_path_buf))
+        .collect::<Vec<_>>();
+    affected_directories.sort();
+    affected_directories.dedup();
+    crate::fs::file_operations::FileOperationReport {
+        files: 0,
+        directories: 0,
+        bytes: 0,
+        skipped: Vec::new(),
+        affected_directories,
+        cleanup_pending: None,
+        completed_paths: paths.to_vec(),
+        undo_identities: Vec::new(),
+        undo_root: None,
+        undo_root_created_exclusively: false,
+    }
+}
+
+fn execute_undo_request(
+    request: FileOperationRequest,
+    event_sender: &mpsc::Sender<FileOperationEvent>,
+) {
+    let mut succeeded = Vec::new();
+    let mut failed = Vec::new();
+    let mut affected = Vec::new();
+    let mut item_states = Vec::new();
+    let mut failed_undo_items = Vec::new();
+    for (index, undo_item) in request.undo_items.iter().enumerate() {
+        if request.cancellation.is_cancelled() {
+            item_states.push((index, ItemState::Cancelled, None));
+            failed_undo_items.push(undo_item.clone());
+            continue;
+        }
+        let identity = request.items[index]
+            .source
+            .clone()
+            .or_else(|| request.items[index].destination.clone())
+            .unwrap_or_default();
+        let outcome = match undo_item {
+            UndoItem::RestoreRecycled {
+                original,
+                absolute_pidl,
+            } => {
+                let cancellation = request.cancellation.clone();
+                platform::windows::file_operation::restore_recycled(
+                    original,
+                    absolute_pidl,
+                    move || cancellation.is_cancelled(),
+                )
+                .map(|restored| match restored {
+                    platform::windows::file_operation::RestoreRecycleResult::Completed => {
+                        crate::fs::file_operations::UndoExecution::Completed(undo_report_for_paths(
+                            std::slice::from_ref(original),
+                        ))
+                    }
+                    platform::windows::file_operation::RestoreRecycleResult::Pending {
+                        temporary,
+                        identity,
+                        message,
+                    } => crate::fs::file_operations::UndoExecution::RetryWith {
+                        item: UndoItem::FinalizeRestore {
+                            temporary,
+                            original: original.clone(),
+                            identity,
+                        },
+                        message,
+                        affected_directories: undo_item.directories(),
+                    },
+                })
+            }
+            _ => crate::fs::file_operations::execute_undo_item(undo_item, &request.cancellation)
+                .map_err(|error| format!("{error:?}")),
+        };
+        match outcome {
+            Ok(crate::fs::file_operations::UndoExecution::Completed(report)) => {
+                succeeded.push(identity.clone());
+                item_states.push((index, ItemState::Succeeded, None));
+                for directory in report.affected_directories {
+                    if !affected.contains(&directory) {
+                        affected.push(directory);
+                    }
+                }
+            }
+            Ok(crate::fs::file_operations::UndoExecution::RetryWith {
+                item,
+                message,
+                affected_directories,
+            }) => {
+                failed.push((identity.clone(), message.clone()));
+                item_states.push((index, ItemState::Failed, Some(message)));
+                failed_undo_items.push(item);
+                for directory in affected_directories {
+                    if !affected.contains(&directory) {
+                        affected.push(directory);
+                    }
+                }
+            }
+            Err(message) => {
+                failed.push((identity.clone(), message.clone()));
+                item_states.push((index, ItemState::Failed, Some(message)));
+                failed_undo_items.push(undo_item.clone());
+            }
+        }
+        let _ = event_sender.send(FileOperationEvent::Progress {
+            id: request.id,
+            completed_items: index + 1,
+            completed_files: succeeded.len(),
+            total_files: Some(request.undo_items.len()),
+            discovered_files: request.undo_items.len(),
+            processed_bytes: 0,
+            total_bytes: Some(0),
+            discovered_bytes: 0,
+            scanning_complete: true,
+            current_item: identity,
+            recent_speed_bps: None,
+        });
+    }
+    let _ = event_sender.send(FileOperationEvent::Finished {
+        id: request.id,
+        result: OperationResult {
+            succeeded,
+            skipped: Vec::new(),
+            failed,
+            affected_directories: affected,
+        },
+        item_states,
+        completed_targets: Vec::new(),
+        undo_items: None,
+        failed_undo_items,
     });
 }
 fn file_snapshot(path: &Path) -> crate::domain::file_operations::FileSnapshot {
@@ -16693,6 +17273,9 @@ fn execute_file_operation_item(
             affected_directories: result.affected_directories,
             cleanup_pending: None,
             completed_paths: result.completed_path.into_iter().collect(),
+            undo_identities: Vec::new(),
+            undo_root: None,
+            undo_root_created_exclusively: false,
         });
     }
     let has_unc_path = [item.source.as_deref(), item.destination.as_deref()]
@@ -16781,6 +17364,9 @@ fn execute_file_operation_item(
             affected_directories: report.affected_directories,
             cleanup_pending: None,
             completed_paths: report.completed_paths,
+            undo_identities: Vec::new(),
+            undo_root: None,
+            undo_root_created_exclusively: false,
         });
     }
     match kind {
@@ -16788,8 +17374,8 @@ fn execute_file_operation_item(
             let destination = item.destination.as_ref().ok_or("missing destination")?;
             let parent = destination.parent().ok_or("missing parent")?;
             let name = destination.file_name().ok_or("missing name")?;
-            crate::fs::file_operations::create_folder(parent, name)
-                .map(|path| {
+            crate::fs::file_operations::create_folder_with_identity(parent, name)
+                .map(|(path, identity)| {
                     let mut report = crate::fs::file_operations::FileOperationReport {
                         files: 0,
                         directories: 1,
@@ -16798,7 +17384,11 @@ fn execute_file_operation_item(
                         affected_directories: vec![],
                         cleanup_pending: None,
                         completed_paths: vec![path.clone()],
+                        undo_identities: Vec::new(),
+                        undo_root: None,
+                        undo_root_created_exclusively: false,
                     };
+                    report.undo_identities.push((path.clone(), identity));
                     if let Some(parent) = path.parent() {
                         report.affected_directories.push(parent.to_path_buf());
                     }
@@ -16810,8 +17400,8 @@ fn execute_file_operation_item(
             let source = item.source.as_ref().ok_or("missing source")?;
             let destination = item.destination.as_ref().ok_or("missing destination")?;
             let name = destination.file_name().ok_or("missing name")?;
-            crate::fs::file_operations::rename_path(source, name)
-                .map(|path| {
+            crate::fs::file_operations::rename_path_with_identity(source, name)
+                .map(|(path, identity)| {
                     let mut report = crate::fs::file_operations::FileOperationReport {
                         files: 1,
                         directories: 0,
@@ -16820,7 +17410,11 @@ fn execute_file_operation_item(
                         affected_directories: vec![],
                         cleanup_pending: None,
                         completed_paths: vec![path.clone()],
+                        undo_identities: Vec::new(),
+                        undo_root: None,
+                        undo_root_created_exclusively: false,
                     };
+                    report.undo_identities.push((path.clone(), identity));
                     if let Some(parent) = path.parent() {
                         report.affected_directories.push(parent.to_path_buf());
                     }
@@ -16871,6 +17465,7 @@ fn execute_file_operation_item(
             };
             result.map_err(ExecuteFileOperationError::from_operation)
         }
+        FileOperationKind::Undo => unreachable!("undo requests use the undo batch executor"),
         FileOperationKind::RecycleDelete => {
             unreachable!("local recycle delete requests are executed as one Shell batch")
         }
@@ -17052,6 +17647,8 @@ fn start_file_operation_event_pump(
                         result,
                         item_states,
                         completed_targets,
+                        undo_items,
+                        failed_undo_items,
                     } => {
                         let (affected, next) = {
                             let mut app = state.lock().expect("app state mutex is not poisoned");
@@ -17125,8 +17722,33 @@ fn start_file_operation_event_pump(
                             } else {
                                 queue_completed_focus(&mut app, &completed_targets);
                             }
+                            if kind == FileOperationKind::Undo {
+                                let failure = failed_undo_items
+                                    .first()
+                                    .map(|_| Texts::new(app.language).undo_partial().to_owned());
+                                let notice = failure.clone();
+                                app.undo_history.finish(failed_undo_items, failure);
+                                if let Some(message) = notice {
+                                    app.operation_notice_generation =
+                                        app.operation_notice_generation.wrapping_add(1).max(1);
+                                    let generation = app.operation_notice_generation;
+                                    app.operation_notice = Some((generation, message));
+                                    schedule_operation_notice_clear(state.clone(), generation);
+                                }
+                            } else if terminal == OperationState::Completed
+                                && result.failed.is_empty()
+                                && result.skipped.is_empty()
+                                && task_items.iter().all(|item| {
+                                    item.state == ItemState::Succeeded && item.error.is_none()
+                                })
+                                && let (Some(source_kind), Some(items)) =
+                                    (undo_source_kind(kind), undo_items)
+                                && !items.is_empty()
+                            {
+                                app.undo_history.push(UndoEntry { source_kind, items });
+                            }
                             let _ = app.operations.finish(id, terminal, result);
-                            if cancelled {
+                            if cancelled && kind != FileOperationKind::Undo {
                                 app.operations.remove_terminal(id);
                             }
                             let next = app.operations.start_next(resource).ok().flatten().and_then(
@@ -17138,6 +17760,10 @@ fn start_file_operation_event_pump(
                                             kind: task.kind,
                                             resource: task.resource,
                                             items: task.items.clone(),
+                                            undo_items: task.undo_items.clone(),
+                                            undo_source_manifests: task
+                                                .undo_source_manifests
+                                                .clone(),
                                             cancellation: task.cancellation.clone(),
                                         };
                                         register_operation_directories(
@@ -17493,6 +18119,8 @@ fn prepare_retry(state: &SharedSessions, id: OperationId) -> Option<FileOperatio
         kind: task.kind,
         resource: task.resource,
         items: task.items.clone(),
+        undo_items: task.undo_items.clone(),
+        undo_source_manifests: vec![None; task.items.len()],
         cancellation: task.cancellation.clone(),
     };
     register_operation_directories(&mut app, request.kind, &request.items);
@@ -20799,9 +21427,14 @@ fn update_selection_summary(ui: &AppWindow, state: &SharedSessions) {
     let operation_rows = operation_rows(&app);
     ui.set_operations(ModelRc::new(VecModel::from(operation_rows)));
     ui.set_operation_error(
-        app.operation_errors
-            .last()
-            .cloned()
+        app.operation_notice
+            .as_ref()
+            .map(|(_, message)| message.clone())
+            .or_else(|| {
+                ui.get_rename_editing()
+                    .then(|| app.operation_errors.last().cloned())
+                    .flatten()
+            })
             .unwrap_or_default()
             .into(),
     );
@@ -20826,6 +21459,14 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
                     Language::Chinese,
                     FileOperationKind::PermanentDelete | FileOperationKind::FastRemove,
                 ) => "删除",
+                (Language::Chinese, FileOperationKind::Undo) => match task.undo_source_kind {
+                    Some(UndoSourceKind::CreateFolder) => "撤销新建文件夹",
+                    Some(UndoSourceKind::Rename) => "撤销重命名",
+                    Some(UndoSourceKind::Copy) => "撤销复制",
+                    Some(UndoSourceKind::Move) => "撤销移动",
+                    Some(UndoSourceKind::RecycleDelete) => "恢复回收站项目",
+                    None => "撤销文件操作",
+                },
                 (Language::English, FileOperationKind::CreateFolder) => "Create folder",
                 (Language::English, FileOperationKind::Rename) => "Rename",
                 (Language::English, FileOperationKind::Copy) => "Copy",
@@ -20835,6 +21476,14 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
                     Language::English,
                     FileOperationKind::PermanentDelete | FileOperationKind::FastRemove,
                 ) => "Delete",
+                (Language::English, FileOperationKind::Undo) => match task.undo_source_kind {
+                    Some(UndoSourceKind::CreateFolder) => "Undo create folder",
+                    Some(UndoSourceKind::Rename) => "Undo rename",
+                    Some(UndoSourceKind::Copy) => "Undo copy",
+                    Some(UndoSourceKind::Move) => "Undo move",
+                    Some(UndoSourceKind::RecycleDelete) => "Restore recycled items",
+                    None => "Undo file operation",
+                },
             };
             let status = operation_status_text(app.language, task.state);
             let queue = app.operations.queue_position(task.id).map_or_else(
@@ -21024,15 +21673,17 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
                         | OperationState::WaitingConflict
                 ),
                 can_pause: matches!(task.state, OperationState::Running | OperationState::Paused),
-                can_retry: matches!(
-                    task.state,
-                    OperationState::Failed | OperationState::PartiallyCompleted
-                ) && task.items.iter().any(|item| {
-                    matches!(
-                        item.state,
-                        ItemState::Failed | ItemState::Cancelled | ItemState::Pending
+                can_retry: task.kind != FileOperationKind::Undo
+                    && matches!(
+                        task.state,
+                        OperationState::Failed | OperationState::PartiallyCompleted
                     )
-                }),
+                    && task.items.iter().any(|item| {
+                        matches!(
+                            item.state,
+                            ItemState::Failed | ItemState::Cancelled | ItemState::Pending
+                        )
+                    }),
             }
         })
         .collect::<Vec<_>>();
@@ -28042,6 +28693,55 @@ mod tests {
     }
 
     #[test]
+    fn issue_83_directory_rename_creates_a_root_identity_undo_item() {
+        let temp = std::env::temp_dir().join(format!(
+            "asterfiles-issue-83-directory-rename-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir(&temp).unwrap();
+        let original = temp.join("folder");
+        let current = temp.join("renamed");
+        std::fs::create_dir(&current).unwrap();
+        std::fs::write(current.join("child.txt"), b"content").unwrap();
+        let item = OperationItem::pending(Some(original.clone()), Some(current.clone()));
+        let report = undo_report_for_paths(std::slice::from_ref(&current));
+        let source_manifest = crate::fs::file_operations::collect_tree_identities(
+            &current,
+            UndoHistory::MAX_SNAPSHOT_ITEMS,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(path, identity)| {
+            let relative = path.strip_prefix(&current).unwrap();
+            (original.join(relative), identity)
+        })
+        .collect::<Vec<_>>();
+
+        let undo = undo_items_for_success(
+            FileOperationKind::Rename,
+            &item,
+            &report,
+            Some(&current),
+            false,
+            Some(&source_manifest),
+            UndoHistory::MAX_SNAPSHOT_ITEMS,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            &undo[0],
+            UndoItem::MoveBack {
+                current: target,
+                original: source,
+                manifest,
+                manifest_complete: true,
+            } if target == &current && source == &original && manifest.len() == 2
+        ));
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
     fn rename_validation_keeps_invalid_names_out_of_operation_queue() {
         assert!(crate::fs::file_operations::validate_name(std::ffi::OsStr::new("")).is_err());
         assert!(
@@ -28821,6 +29521,22 @@ mod tests {
 
         ui.window().request_redraw();
         let _ = ui.root_element().query_descendants().find_all();
+    }
+
+    #[test]
+    fn issue_83_ctrl_z_routes_only_from_the_file_list_focus_domain() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
+        assert!(source.contains("callback request-undo();"));
+        assert!(source.contains(
+            "KeyBinding { keys: @keys(Control + Z); enabled: root.file-list-keyboard-target; activated => { root.request-undo(); } }"
+        ));
+        assert!(source.contains("&& !root.address-editing"));
+        assert!(source.contains("&& !root.rename-editing"));
+        assert!(source.contains("&& !root.context-menu-open"));
+        assert!(source.contains("!root.active-is-settings"));
+        assert!(source.contains("&& !root.menu-open"));
+        assert!(source.contains("&& !root.tabs-menu-open"));
+        assert!(source.contains("&& !root.drop-menu-open"));
     }
 
     #[test]

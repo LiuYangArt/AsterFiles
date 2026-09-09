@@ -5,7 +5,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::domain::file_operations::{CancellationToken, ConflictAction, ConflictCategory};
+use crate::domain::file_operations::{
+    CancellationToken, ConflictAction, ConflictCategory, FileIdentity, UndoItem,
+};
 
 #[cfg(test)]
 const COPY_TEST_CHUNK_SIZE: usize = 1024 * 1024;
@@ -29,6 +31,9 @@ pub struct FileOperationReport {
     pub affected_directories: Vec<PathBuf>,
     pub cleanup_pending: Option<PathBuf>,
     pub completed_paths: Vec<PathBuf>,
+    pub undo_identities: Vec<(PathBuf, FileIdentity)>,
+    pub undo_root: Option<PathBuf>,
+    pub undo_root_created_exclusively: bool,
 }
 
 impl FileOperationReport {
@@ -41,6 +46,9 @@ impl FileOperationReport {
             affected_directories: Vec::new(),
             cleanup_pending: None,
             completed_paths: Vec::new(),
+            undo_identities: Vec::new(),
+            undo_root: None,
+            undo_root_created_exclusively: false,
         }
     }
 
@@ -151,6 +159,13 @@ pub fn keep_both_path(destination: &Path) -> PathBuf {
 }
 
 pub fn create_folder(parent: &Path, name: &OsStr) -> Result<PathBuf, OperationError> {
+    create_folder_with_identity(parent, name).map(|(path, _)| path)
+}
+
+pub fn create_folder_with_identity(
+    parent: &Path,
+    name: &OsStr,
+) -> Result<(PathBuf, FileIdentity), OperationError> {
     validate_name(name).map_err(OperationError::InvalidName)?;
     let requested = parent.join(name);
     let path = if path_exists(&requested) {
@@ -159,15 +174,24 @@ pub fn create_folder(parent: &Path, name: &OsStr) -> Result<PathBuf, OperationEr
         requested
     };
     fs::create_dir(&path).map_err(|error| OperationError::io(&path, error))?;
-    Ok(path)
+    let identity = file_identity(&path)?;
+    Ok((path, identity))
 }
 
 pub fn rename_path(source: &Path, new_name: &OsStr) -> Result<PathBuf, OperationError> {
+    rename_path_with_identity(source, new_name).map(|(path, _)| path)
+}
+
+pub fn rename_path_with_identity(
+    source: &Path,
+    new_name: &OsStr,
+) -> Result<(PathBuf, FileIdentity), OperationError> {
     validate_name(new_name).map_err(OperationError::InvalidName)?;
     let parent = source.parent().unwrap_or_else(|| Path::new(""));
     let destination = parent.join(new_name);
     if source == destination {
-        return Ok(destination);
+        let identity = file_identity(&destination)?;
+        return Ok((destination, identity));
     }
     if path_exists(&destination) && !same_path_ignoring_ascii_case(source, &destination) {
         return Err(OperationError::DestinationExists(destination));
@@ -182,7 +206,694 @@ pub fn rename_path(source: &Path, new_name: &OsStr) -> Result<PathBuf, Operation
     } else {
         fs::rename(source, &destination).map_err(|error| OperationError::io(source, error))?;
     }
-    Ok(destination)
+    let identity = file_identity(&destination)?;
+    Ok((destination, identity))
+}
+
+pub fn file_identity(path: &Path) -> Result<FileIdentity, OperationError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| OperationError::io(path, error))?;
+    #[cfg(windows)]
+    {
+        use std::{os::windows::ffi::OsStrExt, ptr};
+        use windows::Win32::{
+            Foundation::CloseHandle,
+            Storage::FileSystem::{
+                CreateFileW, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
+                FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileBasicInfo, FileIdInfo,
+                GetFileInformationByHandleEx, OPEN_EXISTING,
+            },
+        };
+
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if wide.contains(&0) {
+            return Err(OperationError::Io {
+                path: path.to_path_buf(),
+                kind: io::ErrorKind::InvalidInput,
+                message: "path contains a null character".to_owned(),
+            });
+        }
+        wide.push(0);
+        let handle = unsafe {
+            CreateFileW(
+                windows::core::PCWSTR(wide.as_ptr()),
+                FILE_READ_ATTRIBUTES.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        }
+        .map_err(|error| OperationError::Io {
+            path: path.to_path_buf(),
+            kind: io::ErrorKind::Other,
+            message: error.to_string(),
+        })?;
+        let mut info = FILE_ID_INFO::default();
+        let mut basic = FILE_BASIC_INFO::default();
+        let result = unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileIdInfo,
+                ptr::addr_of_mut!(info).cast(),
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+        };
+        let basic_result = unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileBasicInfo,
+                ptr::addr_of_mut!(basic).cast(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        };
+        let _ = unsafe { CloseHandle(handle) };
+        result.map_err(|error| OperationError::Io {
+            path: path.to_path_buf(),
+            kind: io::ErrorKind::Other,
+            message: error.to_string(),
+        })?;
+        basic_result.map_err(|error| OperationError::Io {
+            path: path.to_path_buf(),
+            kind: io::ErrorKind::Other,
+            message: error.to_string(),
+        })?;
+        Ok(FileIdentity {
+            volume_serial: info.VolumeSerialNumber,
+            file_index: info.FileId.Identifier,
+            is_directory: metadata.file_type().is_dir(),
+            size_bytes: metadata.len(),
+            modified: metadata.modified().ok(),
+            change_time: basic.ChangeTime,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(FileIdentity {
+            volume_serial: 0,
+            file_index: [0; 16],
+            is_directory: metadata.file_type().is_dir(),
+            size_bytes: metadata.len(),
+            modified: metadata.modified().ok(),
+            change_time: 0,
+        })
+    }
+}
+
+pub enum UndoExecution {
+    Completed(FileOperationReport),
+    RetryWith {
+        item: UndoItem,
+        message: String,
+        affected_directories: Vec<PathBuf>,
+    },
+}
+
+pub fn execute_undo_item(
+    item: &UndoItem,
+    cancel: &CancellationToken,
+) -> Result<UndoExecution, OperationError> {
+    check_cancel(cancel)?;
+    match item {
+        UndoItem::RemoveEmptyDirectory {
+            path,
+            identity,
+            quarantined,
+        } => {
+            ensure_identity(path, *identity)?;
+            if !*quarantined && file_identity(path)?.change_time != identity.change_time {
+                return Err(OperationError::Io {
+                    path: path.clone(),
+                    kind: io::ErrorKind::InvalidData,
+                    message: "created folder changed after creation".to_owned(),
+                });
+            }
+            if fs::read_dir(path)
+                .map_err(|error| OperationError::io(path, error))?
+                .next()
+                .is_some()
+            {
+                return Err(OperationError::Io {
+                    path: path.clone(),
+                    kind: io::ErrorKind::DirectoryNotEmpty,
+                    message: "created folder is no longer empty".to_owned(),
+                });
+            }
+            let isolated = if *quarantined {
+                path.clone()
+            } else {
+                let isolated = unique_sibling_preserving_name(path, ".asterfiles-undo-empty");
+                fs::rename(path, &isolated).map_err(|error| OperationError::io(path, error))?;
+                isolated
+            };
+            if let Err(error) = ensure_identity(&isolated, *identity).and_then(|_| {
+                if fs::read_dir(&isolated)
+                    .map_err(|error| OperationError::io(&isolated, error))?
+                    .next()
+                    .is_none()
+                {
+                    Ok(())
+                } else {
+                    Err(OperationError::Io {
+                        path: isolated.clone(),
+                        kind: io::ErrorKind::DirectoryNotEmpty,
+                        message: "created folder changed while being isolated".to_owned(),
+                    })
+                }
+            }) {
+                if !*quarantined && fs::rename(&isolated, path).is_ok() {
+                    return Err(error);
+                }
+                return Ok(UndoExecution::RetryWith {
+                    item: UndoItem::RemoveEmptyDirectory {
+                        path: isolated,
+                        identity: *identity,
+                        quarantined: true,
+                    },
+                    message: format!("新建文件夹已隔离，但清理前发现变化：{error:?}"),
+                    affected_directories: item.directories(),
+                });
+            }
+            match fs::remove_dir(&isolated) {
+                Ok(()) => {
+                    let mut report = FileOperationReport::new();
+                    report.affected_directories.extend(item.directories());
+                    report.directories = 1;
+                    Ok(UndoExecution::Completed(report))
+                }
+                Err(error) => Ok(UndoExecution::RetryWith {
+                    item: UndoItem::RemoveEmptyDirectory {
+                        path: isolated,
+                        identity: *identity,
+                        quarantined: true,
+                    },
+                    message: format!("新建文件夹已隔离，等待完成清理：{error}"),
+                    affected_directories: item.directories(),
+                }),
+            }
+        }
+        UndoItem::RemoveCreated { path, manifest } => {
+            ensure_manifest_strict(path, manifest)?;
+            let quarantined = unique_sibling_preserving_name(path, ".asterfiles-undo");
+            fs::rename(path, &quarantined).map_err(|error| OperationError::io(path, error))?;
+            let quarantined_manifest = match rebase_manifest(manifest, path, &quarantined)
+                .and_then(|manifest| refresh_manifest_identities(&manifest))
+            {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    let _ = fs::rename(&quarantined, path);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = ensure_manifest(&quarantined, &quarantined_manifest) {
+                if fs::rename(&quarantined, path).is_err() {
+                    return Ok(UndoExecution::RetryWith {
+                        item: UndoItem::RemoveQuarantined {
+                            path: quarantined,
+                            manifest: quarantined_manifest,
+                        },
+                        message: format!("撤销隔离后发现内容变化，且无法恢复原位置：{error:?}"),
+                        affected_directories: item.directories(),
+                    });
+                }
+                return Err(error);
+            }
+            remove_quarantined(&quarantined, quarantined_manifest, item.directories())
+        }
+        UndoItem::RemoveQuarantined { path, manifest } => {
+            ensure_manifest(path, manifest)?;
+            remove_quarantined(path, manifest.clone(), item.directories())
+        }
+        UndoItem::MoveBack {
+            current,
+            original,
+            manifest,
+            manifest_complete,
+        } => {
+            ensure_undo_manifest(current, manifest, *manifest_complete, true)?;
+            if path_exists(original) {
+                return Err(OperationError::DestinationExists(original.clone()));
+            }
+            let quarantined = unique_sibling_preserving_name(current, ".asterfiles-undo-move");
+            fs::rename(current, &quarantined)
+                .map_err(|error| OperationError::io(current, error))?;
+            let quarantined_manifest = match rebase_manifest(manifest, current, &quarantined)
+                .and_then(|manifest| refresh_manifest_identities(&manifest))
+            {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    let _ = fs::rename(&quarantined, current);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = ensure_undo_manifest(
+                &quarantined,
+                &quarantined_manifest,
+                *manifest_complete,
+                false,
+            ) {
+                if fs::rename(&quarantined, current).is_err() {
+                    return Ok(UndoExecution::RetryWith {
+                        item: UndoItem::MoveBackQuarantined {
+                            current: quarantined,
+                            original: original.clone(),
+                            manifest: quarantined_manifest,
+                            manifest_complete: *manifest_complete,
+                        },
+                        message: format!(
+                            "撤销移动隔离后发现内容变化，且无法恢复当前位置：{error:?}"
+                        ),
+                        affected_directories: item.directories(),
+                    });
+                }
+                return Err(error);
+            }
+            execute_quarantined_move_back(
+                &quarantined,
+                original,
+                &quarantined_manifest,
+                *manifest_complete,
+                cancel,
+                item.directories(),
+            )
+        }
+        UndoItem::MoveBackQuarantined {
+            current,
+            original,
+            manifest,
+            manifest_complete,
+        } => {
+            ensure_undo_manifest(current, manifest, *manifest_complete, true)?;
+            if path_exists(original) {
+                return Err(OperationError::DestinationExists(original.clone()));
+            }
+            execute_quarantined_move_back(
+                current,
+                original,
+                manifest,
+                *manifest_complete,
+                cancel,
+                item.directories(),
+            )
+        }
+        UndoItem::FinalizeRestore {
+            temporary,
+            original,
+            identity,
+        } => {
+            ensure_identity(temporary, *identity)?;
+            if file_identity(temporary)?.change_time != identity.change_time {
+                return Err(OperationError::Io {
+                    path: temporary.clone(),
+                    kind: io::ErrorKind::InvalidData,
+                    message: "restored item changed while waiting".to_owned(),
+                });
+            }
+            if path_exists(original) {
+                return Err(OperationError::DestinationExists(original.clone()));
+            }
+            fs::rename(temporary, original).map_err(|error| OperationError::io(original, error))?;
+            let mut report = FileOperationReport::new();
+            report.affect(temporary);
+            report.affect(original);
+            Ok(UndoExecution::Completed(report))
+        }
+        UndoItem::RestoreRecycled { .. } => Err(OperationError::Io {
+            path: PathBuf::new(),
+            kind: io::ErrorKind::Unsupported,
+            message: "recycle restore must use the Windows Shell".to_owned(),
+        }),
+    }
+}
+
+fn execute_quarantined_move_back(
+    current: &Path,
+    original: &Path,
+    manifest: &[(PathBuf, FileIdentity)],
+    manifest_complete: bool,
+    cancel: &CancellationToken,
+    affected_directories: Vec<PathBuf>,
+) -> Result<UndoExecution, OperationError> {
+    if fs::rename(current, original).is_ok() {
+        let mut report = FileOperationReport::new();
+        report.affect(current);
+        report.affect(original);
+        return Ok(UndoExecution::Completed(report));
+    }
+    check_cancel(cancel)?;
+    if !manifest_complete {
+        return Ok(UndoExecution::RetryWith {
+            item: UndoItem::MoveBackQuarantined {
+                current: current.to_path_buf(),
+                original: original.to_path_buf(),
+                manifest: manifest.to_vec(),
+                manifest_complete,
+            },
+            message: "撤销移动暂时无法恢复原位置，可重试".to_owned(),
+            affected_directories,
+        });
+    }
+    let staging = unique_sibling_preserving_name(original, ".asterfiles-undo-restore");
+    let mut no_conflict = |_: ConflictCategory, _: &Path, _: &Path| ConflictAction::Skip;
+    let mut discovered = |_: u64, _: &Path| {};
+    let mut progress = |_: u64, _: bool, _: &Path| {};
+    let copy = copy_path_with_progress(
+        current,
+        &staging,
+        cancel,
+        &mut no_conflict,
+        &mut discovered,
+        &mut progress,
+        &mut |_| {},
+    );
+    let copy_report = match copy {
+        Ok(report) => report,
+        Err(error) => {
+            return Ok(UndoExecution::RetryWith {
+                item: UndoItem::MoveBackQuarantined {
+                    current: current.to_path_buf(),
+                    original: original.to_path_buf(),
+                    manifest: manifest.to_vec(),
+                    manifest_complete,
+                },
+                message: format!(
+                    "撤销移动尚未完成；临时副本保留在 {}，可重试：{error:?}",
+                    staging.display()
+                ),
+                affected_directories,
+            });
+        }
+    };
+    let Some(staging_manifest) = complete_manifest_from_report(&staging, &copy_report) else {
+        return Ok(UndoExecution::RetryWith {
+            item: UndoItem::MoveBackQuarantined {
+                current: current.to_path_buf(),
+                original: original.to_path_buf(),
+                manifest: manifest.to_vec(),
+                manifest_complete,
+            },
+            message: format!(
+                "临时副本无法确认，已保留在 {}；撤销可重试",
+                staging.display()
+            ),
+            affected_directories,
+        });
+    };
+    if ensure_manifest_strict(&staging, &staging_manifest).is_err() {
+        return Ok(UndoExecution::RetryWith {
+            item: UndoItem::MoveBackQuarantined {
+                current: current.to_path_buf(),
+                original: original.to_path_buf(),
+                manifest: manifest.to_vec(),
+                manifest_complete,
+            },
+            message: format!(
+                "临时副本发生变化，已保留在 {}；撤销可重试",
+                staging.display()
+            ),
+            affected_directories,
+        });
+    }
+    if path_exists(original) {
+        return Ok(UndoExecution::RetryWith {
+            item: UndoItem::MoveBackQuarantined {
+                current: current.to_path_buf(),
+                original: original.to_path_buf(),
+                manifest: manifest.to_vec(),
+                manifest_complete,
+            },
+            message: format!(
+                "原位置已被占用；临时副本保留在 {}，清理冲突后可重试",
+                staging.display()
+            ),
+            affected_directories,
+        });
+    }
+    if let Err(error) = fs::rename(&staging, original) {
+        return Ok(UndoExecution::RetryWith {
+            item: UndoItem::MoveBackQuarantined {
+                current: current.to_path_buf(),
+                original: original.to_path_buf(),
+                manifest: manifest.to_vec(),
+                manifest_complete,
+            },
+            message: format!(
+                "撤销移动无法恢复原位置；临时副本保留在 {}：{error}",
+                staging.display()
+            ),
+            affected_directories,
+        });
+    }
+    match remove_quarantined(current, manifest.to_vec(), affected_directories) {
+        Ok(UndoExecution::Completed(mut report)) => {
+            report.affect(original);
+            Ok(UndoExecution::Completed(report))
+        }
+        other => other,
+    }
+}
+
+fn complete_manifest_from_report(
+    root: &Path,
+    report: &FileOperationReport,
+) -> Option<Vec<(PathBuf, FileIdentity)>> {
+    let mut expected = report
+        .undo_identities
+        .iter()
+        .filter(|(path, _)| path == root || path.starts_with(root))
+        .cloned()
+        .collect::<Vec<_>>();
+    expected.sort_by(|left, right| left.0.cmp(&right.0));
+    expected.dedup_by(|left, right| left.0 == right.0);
+    let current = collect_tree_identities(root, expected.len().saturating_add(1)).ok()?;
+    if current.len() != expected.len()
+        || current
+            .iter()
+            .zip(&expected)
+            .any(|((path, actual), (expected_path, expected))| {
+                path != expected_path || !same_stable_file(*expected, *actual)
+            })
+    {
+        return None;
+    }
+    Some(current)
+}
+fn remove_quarantined(
+    path: &Path,
+    manifest: Vec<(PathBuf, FileIdentity)>,
+    affected_directories: Vec<PathBuf>,
+) -> Result<UndoExecution, OperationError> {
+    let mut removal_order = manifest.clone();
+    removal_order.sort_by(|left, right| {
+        right
+            .0
+            .components()
+            .count()
+            .cmp(&left.0.components().count())
+            .then_with(|| right.0.cmp(&left.0))
+    });
+    let mut report = FileOperationReport::new();
+    for (entry, identity) in removal_order {
+        if let Err(error) = ensure_identity(&entry, identity).and_then(|_| {
+            let metadata =
+                fs::symlink_metadata(&entry).map_err(|error| OperationError::io(&entry, error))?;
+            if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+                fs::remove_dir(&entry).map_err(|error| OperationError::io(&entry, error))?;
+                report.directories += 1;
+            } else {
+                fs::remove_file(&entry).map_err(|error| OperationError::io(&entry, error))?;
+                report.files += 1;
+            }
+            Ok(())
+        }) {
+            let remaining = manifest
+                .into_iter()
+                .filter(|(entry, _)| path_exists(entry))
+                .collect::<Vec<_>>();
+            return Ok(UndoExecution::RetryWith {
+                item: UndoItem::RemoveQuarantined {
+                    path: path.to_path_buf(),
+                    manifest: remaining,
+                },
+                message: format!("撤销已完成，但临时清理失败：{error:?}"),
+                affected_directories,
+            });
+        }
+    }
+    report.affected_directories.extend(affected_directories);
+    Ok(UndoExecution::Completed(report))
+}
+fn rebase_manifest(
+    manifest: &[(PathBuf, FileIdentity)],
+    old_root: &Path,
+    new_root: &Path,
+) -> Result<Vec<(PathBuf, FileIdentity)>, OperationError> {
+    manifest
+        .iter()
+        .map(|(path, identity)| {
+            let relative = path
+                .strip_prefix(old_root)
+                .map_err(|_| OperationError::Io {
+                    path: path.clone(),
+                    kind: io::ErrorKind::InvalidData,
+                    message: "undo manifest is outside its root".to_owned(),
+                })?;
+            let rebased = if relative.as_os_str().is_empty() {
+                new_root.to_path_buf()
+            } else {
+                new_root.join(relative)
+            };
+            Ok((rebased, *identity))
+        })
+        .collect()
+}
+
+fn refresh_manifest_identities(
+    manifest: &[(PathBuf, FileIdentity)],
+) -> Result<Vec<(PathBuf, FileIdentity)>, OperationError> {
+    manifest
+        .iter()
+        .map(|(path, _)| file_identity(path).map(|identity| (path.clone(), identity)))
+        .collect()
+}
+fn ensure_undo_manifest(
+    root: &Path,
+    expected: &[(PathBuf, FileIdentity)],
+    complete: bool,
+    strict: bool,
+) -> Result<(), OperationError> {
+    if complete {
+        if strict {
+            ensure_manifest_strict(root, expected)
+        } else {
+            ensure_manifest(root, expected)
+        }
+    } else if expected.len() == 1 && expected[0].0 == root {
+        ensure_identity(root, expected[0].1)?;
+        if strict && file_identity(root)?.change_time != expected[0].1.change_time {
+            return Err(OperationError::Io {
+                path: root.to_path_buf(),
+                kind: io::ErrorKind::InvalidData,
+                message: "item changed after the original operation".to_owned(),
+            });
+        }
+        Ok(())
+    } else {
+        Err(OperationError::Io {
+            path: root.to_path_buf(),
+            kind: io::ErrorKind::InvalidData,
+            message: "undo manifest is incomplete".to_owned(),
+        })
+    }
+}
+fn ensure_manifest_strict(
+    root: &Path,
+    expected: &[(PathBuf, FileIdentity)],
+) -> Result<(), OperationError> {
+    ensure_manifest(root, expected)?;
+    for (path, identity) in expected {
+        let actual = file_identity(path)?;
+        if actual.change_time != identity.change_time {
+            return Err(OperationError::Io {
+                path: path.clone(),
+                kind: io::ErrorKind::InvalidData,
+                message: "item changed after the original operation".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn ensure_manifest(
+    root: &Path,
+    expected: &[(PathBuf, FileIdentity)],
+) -> Result<(), OperationError> {
+    let mut actual_paths = Vec::new();
+    collect_tree_paths(root, expected.len().saturating_add(1), &mut actual_paths)?;
+    if actual_paths.len() != expected.len()
+        || actual_paths
+            .iter()
+            .zip(expected)
+            .any(|(actual, (path, _))| actual != path)
+    {
+        return Err(OperationError::Io {
+            path: root.to_path_buf(),
+            kind: io::ErrorKind::InvalidData,
+            message: "item tree changed after the original operation".to_owned(),
+        });
+    }
+    for (path, identity) in expected {
+        ensure_identity(path, *identity)?;
+    }
+    Ok(())
+}
+
+pub fn collect_tree_identities(
+    root: &Path,
+    limit: usize,
+) -> Result<Vec<(PathBuf, FileIdentity)>, OperationError> {
+    let mut paths = Vec::new();
+    collect_tree_paths(root, limit, &mut paths)?;
+    paths
+        .into_iter()
+        .map(|path| file_identity(&path).map(|identity| (path, identity)))
+        .collect()
+}
+
+fn collect_tree_paths(
+    root: &Path,
+    limit: usize,
+    paths: &mut Vec<PathBuf>,
+) -> Result<(), OperationError> {
+    if paths.len() >= limit {
+        return Err(OperationError::Io {
+            path: root.to_path_buf(),
+            kind: io::ErrorKind::OutOfMemory,
+            message: "undo snapshot item limit exceeded".to_owned(),
+        });
+    }
+    paths.push(root.to_path_buf());
+    let metadata = fs::symlink_metadata(root).map_err(|error| OperationError::io(root, error))?;
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        let children = fs::read_dir(root).map_err(|error| OperationError::io(root, error))?;
+        for child in children {
+            if paths.len() >= limit {
+                return Err(OperationError::Io {
+                    path: root.to_path_buf(),
+                    kind: io::ErrorKind::OutOfMemory,
+                    message: "undo snapshot item limit exceeded".to_owned(),
+                });
+            }
+            let child = child
+                .map_err(|error| OperationError::io(root, error))?
+                .path();
+            collect_tree_paths(&child, limit, paths)?;
+        }
+    }
+    Ok(())
+}
+
+fn same_stable_file(expected: FileIdentity, actual: FileIdentity) -> bool {
+    expected.volume_serial == actual.volume_serial
+        && expected.file_index == actual.file_index
+        && expected.is_directory == actual.is_directory
+}
+
+fn ensure_identity(path: &Path, expected: FileIdentity) -> Result<(), OperationError> {
+    let actual = file_identity(path)?;
+    if same_stable_file(expected, actual)
+        && (expected.is_directory
+            || (expected.size_bytes == actual.size_bytes && expected.modified == actual.modified))
+    {
+        Ok(())
+    } else {
+        Err(OperationError::Io {
+            path: path.to_path_buf(),
+            kind: io::ErrorKind::InvalidData,
+            message: "item changed after the original operation".to_owned(),
+        })
+    }
 }
 
 pub type FileProgressCallback<'a> = dyn FnMut(u64, bool, &Path) + 'a;
@@ -202,6 +913,12 @@ pub fn copy_path_with_progress(
     let kept_destination = same_location.then(|| keep_both_path(destination));
     let destination = kept_destination.as_deref().unwrap_or(destination);
     reject_destination_inside_source(source, destination)?;
+    let source_metadata =
+        fs::symlink_metadata(source).map_err(|error| OperationError::io(source, error))?;
+    let destination_existed = path_exists(destination);
+    let copy_into_existing_directory = destination_existed
+        && source_metadata.file_type().is_dir()
+        && fs::symlink_metadata(destination).is_ok_and(|metadata| metadata.file_type().is_dir());
     let mut report = FileOperationReport::new();
     copy_entry(
         source,
@@ -213,6 +930,24 @@ pub fn copy_path_with_progress(
         destination_created,
         &mut report,
     )?;
+    let actual_root = if copy_into_existing_directory {
+        None
+    } else if report
+        .completed_paths
+        .iter()
+        .any(|path| path == destination)
+    {
+        Some(destination.to_path_buf())
+    } else {
+        report
+            .completed_paths
+            .iter()
+            .find(|path| path.parent() == destination.parent())
+            .cloned()
+    };
+    report.undo_root = actual_root.clone();
+    report.undo_root_created_exclusively =
+        actual_root.is_some_and(|path| !destination_existed || path != destination);
     Ok(report)
 }
 
@@ -445,13 +1180,24 @@ fn copy_resolved_entry(
         fs::symlink_metadata(source).map_err(|error| OperationError::io(source, error))?;
     let file_type = source_metadata.file_type();
     if file_type.is_symlink() {
-        copy_symlink_safely(
+        let private_identity = copy_symlink_safely(
             source,
             &resolution.path,
             &source_metadata,
             resolution.replace_existing,
             cancel,
         )?;
+        let published_identity = file_identity(&resolution.path)?;
+        if !same_stable_file(private_identity, published_identity) {
+            return Err(OperationError::Io {
+                path: resolution.path.clone(),
+                kind: io::ErrorKind::InvalidData,
+                message: "copied link was replaced while being published".to_owned(),
+            });
+        }
+        report
+            .undo_identities
+            .push((resolution.path.clone(), published_identity));
         report.files += 1;
         report.affect(&resolution.path);
     } else if file_type.is_dir() {
@@ -506,8 +1252,12 @@ fn copy_directory(
 ) -> Result<(), OperationError> {
     if !path_exists(destination) {
         fs::create_dir(destination).map_err(|error| OperationError::io(destination, error))?;
+        let identity = file_identity(destination)?;
         report.directories += 1;
         report.affect(destination);
+        report
+            .undo_identities
+            .push((destination.to_path_buf(), identity));
         destination_created(destination);
     }
     for entry in fs::read_dir(source).map_err(|error| OperationError::io(source, error))? {
@@ -630,6 +1380,11 @@ fn merge_report(report: &mut FileOperationReport, child: FileOperationReport) {
             report.completed_paths.push(path);
         }
     }
+    if report.undo_root.is_none() {
+        report.undo_root = child.undo_root;
+    }
+    report.undo_root_created_exclusively |= child.undo_root_created_exclusively;
+    report.undo_identities.extend(child.undo_identities);
     for directory in child.affected_directories {
         if !report.affected_directories.contains(&directory) {
             report.affected_directories.push(directory);
@@ -651,6 +1406,13 @@ fn copy_file_safely(
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
+    let private_identity = match file_identity(&temporary) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
     if let Err(error) = if replace_existing {
         replace_with_temporary(&temporary, destination)
     } else {
@@ -659,6 +1421,17 @@ fn copy_file_safely(
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
+    let published_identity = file_identity(destination)?;
+    if !same_stable_file(private_identity, published_identity) {
+        return Err(OperationError::Io {
+            path: destination.to_path_buf(),
+            kind: io::ErrorKind::InvalidData,
+            message: "copied item was replaced while being published".to_owned(),
+        });
+    }
+    report
+        .undo_identities
+        .push((destination.to_path_buf(), published_identity));
     report.files += 1;
     report.affect(destination);
     Ok(())
@@ -694,22 +1467,30 @@ fn copy_symlink_safely(
     metadata: &fs::Metadata,
     replace_existing: bool,
     cancel: &CancellationToken,
-) -> Result<(), OperationError> {
+) -> Result<FileIdentity, OperationError> {
     check_cancel(cancel)?;
     let temporary = unique_sibling(destination, ".asterfiles-copy");
     if let Err(error) = copy_symlink(source, &temporary, metadata) {
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
+    let identity = match file_identity(&temporary) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
     let result = if replace_existing {
         replace_with_temporary(&temporary, destination)
     } else {
         fs::rename(&temporary, destination).map_err(|error| OperationError::io(destination, error))
     };
-    if result.is_err() {
+    if let Err(error) = result {
         let _ = fs::remove_file(&temporary);
+        return Err(error);
     }
-    result
+    Ok(identity)
 }
 
 fn replace_with_temporary(temporary: &Path, destination: &Path) -> Result<(), OperationError> {
@@ -832,6 +1613,21 @@ fn path_exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
+fn unique_sibling_preserving_name(path: &Path, marker: &str) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let name = path.file_name().unwrap_or_else(|| OsStr::new("item"));
+    loop {
+        let mut candidate_name = OsString::from(format!(
+            "{marker}-{}-",
+            UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        candidate_name.push(name);
+        let candidate = parent.join(candidate_name);
+        if !path_exists(&candidate) {
+            return candidate;
+        }
+    }
+}
 fn unique_sibling(path: &Path, marker: &str) -> PathBuf {
     let parent = path.parent().unwrap_or_else(|| Path::new(""));
     loop {
@@ -892,6 +1688,7 @@ fn copy_symlink(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::file_operations::UndoHistory;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TempDir(PathBuf);
@@ -1389,6 +2186,290 @@ mod tests {
             7
         );
         worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn issue_83_empty_created_folder_can_be_undone() {
+        let temp = TempDir::new();
+        let folder = create_folder(temp.path(), OsStr::new("created")).unwrap();
+        let item = UndoItem::RemoveCreated {
+            path: folder.clone(),
+            manifest: collect_tree_identities(&folder, UndoHistory::MAX_SNAPSHOT_ITEMS).unwrap(),
+        };
+
+        execute_undo_item(&item, &CancellationToken::new()).unwrap();
+        assert!(!folder.exists());
+    }
+
+    #[test]
+    fn issue_83_remove_created_isolated_retry_state_is_safe() {
+        let temp = TempDir::new();
+        let created = temp.path().join("created");
+        fs::create_dir(&created).unwrap();
+        write(&created.join("known.txt"), b"known");
+        let manifest = collect_tree_identities(&created, UndoHistory::MAX_SNAPSHOT_ITEMS).unwrap();
+        let quarantined = temp.path().join(".asterfiles-undo-created");
+        fs::rename(&created, &quarantined).unwrap();
+        let quarantined_manifest = refresh_manifest_identities(
+            &rebase_manifest(&manifest, &created, &quarantined).unwrap(),
+        )
+        .unwrap();
+        write(&created, b"external");
+        let item = UndoItem::RemoveQuarantined {
+            path: quarantined.clone(),
+            manifest: quarantined_manifest,
+        };
+
+        let outcome = execute_undo_item(&item, &CancellationToken::new()).unwrap();
+        assert!(matches!(outcome, UndoExecution::Completed(_)));
+        assert_eq!(fs::read(created).unwrap(), b"external");
+        assert!(!quarantined.exists());
+    }
+    #[test]
+    fn issue_83_move_then_undo_restores_the_original_path() {
+        let temp = TempDir::new();
+        let original = temp.path().join("original.txt");
+        let current = temp.path().join("moved.txt");
+        write(&original, b"content");
+        move_path_with_progress(
+            &original,
+            &current,
+            &CancellationToken::new(),
+            &mut replace,
+            &mut |_, _| {},
+            &mut |_, _, _| {},
+        )
+        .unwrap();
+        let item = UndoItem::MoveBack {
+            current: current.clone(),
+            original: original.clone(),
+            manifest: collect_tree_identities(&current, UndoHistory::MAX_SNAPSHOT_ITEMS).unwrap(),
+            manifest_complete: true,
+        };
+
+        execute_undo_item(&item, &CancellationToken::new()).unwrap();
+        assert_eq!(fs::read(original).unwrap(), b"content");
+        assert!(!current.exists());
+    }
+    #[test]
+    fn issue_83_non_empty_directory_rename_can_be_undone() {
+        let temp = TempDir::new();
+        let original = temp.path().join("folder");
+        let current = temp.path().join("renamed");
+        fs::create_dir(&current).unwrap();
+        write(&current.join("child.txt"), b"content");
+        let item = UndoItem::MoveBack {
+            current: current.clone(),
+            original: original.clone(),
+            manifest: vec![(current.clone(), file_identity(&current).unwrap())],
+            manifest_complete: false,
+        };
+
+        execute_undo_item(&item, &CancellationToken::new()).unwrap();
+        assert_eq!(fs::read(original.join("child.txt")).unwrap(), b"content");
+        assert!(!current.exists());
+    }
+
+    #[test]
+    fn issue_83_copy_then_undo_removes_only_the_created_file() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source.txt");
+        let destination = temp.path().join("copy.txt");
+        write(&source, b"content");
+        let report = copy_path_with_progress(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut replace,
+            &mut |_, _| {},
+            &mut |_, _, _| {},
+            &mut |_| {},
+        )
+        .unwrap();
+        let item = UndoItem::RemoveCreated {
+            path: destination.clone(),
+            manifest: report.undo_identities,
+        };
+
+        execute_undo_item(&item, &CancellationToken::new()).unwrap();
+        assert_eq!(fs::read(source).unwrap(), b"content");
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn issue_83_non_empty_directory_copy_can_be_safely_undone() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source-tree");
+        let destination = temp.path().join("copied-tree");
+        fs::create_dir(&source).unwrap();
+        write(&source.join("child.txt"), b"content");
+        let report = copy_path_with_progress(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut replace,
+            &mut |_, _| {},
+            &mut |_, _, _| {},
+            &mut |_| {},
+        )
+        .unwrap();
+        let actual =
+            collect_tree_identities(&destination, UndoHistory::MAX_SNAPSHOT_ITEMS).unwrap();
+        let actual_by_path = actual
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let manifest = report
+            .undo_identities
+            .into_iter()
+            .map(|(path, identity)| {
+                let current = actual_by_path[&path];
+                (
+                    path,
+                    if identity.is_directory {
+                        current
+                    } else {
+                        identity
+                    },
+                )
+            })
+            .collect();
+        let item = UndoItem::RemoveCreated {
+            path: destination.clone(),
+            manifest,
+        };
+
+        execute_undo_item(&item, &CancellationToken::new()).unwrap();
+        assert!(!destination.exists());
+        assert_eq!(fs::read(source.join("child.txt")).unwrap(), b"content");
+    }
+    #[test]
+    fn issue_83_copy_report_marks_only_an_exclusive_root_as_undoable() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let exclusive = temp.path().join("exclusive");
+        let existing = temp.path().join("existing");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&existing).unwrap();
+        write(&source.join("child.txt"), b"content");
+
+        let exclusive_report = copy_path_with_progress(
+            &source,
+            &exclusive,
+            &CancellationToken::new(),
+            &mut replace,
+            &mut |_, _| {},
+            &mut |_, _, _| {},
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            exclusive_report.undo_root.as_deref(),
+            Some(exclusive.as_path())
+        );
+        assert!(exclusive_report.undo_root_created_exclusively);
+
+        let merged_report = copy_path_with_progress(
+            &source,
+            &existing,
+            &CancellationToken::new(),
+            &mut replace,
+            &mut |_, _| {},
+            &mut |_, _, _| {},
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(merged_report.undo_root, None);
+        assert!(!merged_report.undo_root_created_exclusively);
+    }
+
+    #[test]
+    fn issue_83_replaced_file_is_never_marked_as_an_exclusive_copy() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source.txt");
+        let destination = temp.path().join("destination.txt");
+        write(&source, b"new");
+        write(&destination, b"old");
+        let report = copy_path_with_progress(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut replace,
+            &mut |_, _| {},
+            &mut |_, _, _| {},
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"new");
+        assert!(!report.undo_root_created_exclusively);
+    }
+    #[test]
+    fn issue_83_rename_then_undo_restores_the_original_name() {
+        let temp = TempDir::new();
+        let original = temp.path().join("original.txt");
+        write(&original, b"content");
+        let current = rename_path(&original, OsStr::new("renamed.txt")).unwrap();
+        let item = UndoItem::MoveBack {
+            current: current.clone(),
+            original: original.clone(),
+            manifest: collect_tree_identities(&current, UndoHistory::MAX_SNAPSHOT_ITEMS).unwrap(),
+            manifest_complete: true,
+        };
+
+        execute_undo_item(&item, &CancellationToken::new()).unwrap();
+        assert_eq!(fs::read(original).unwrap(), b"content");
+        assert!(!current.exists());
+    }
+    #[test]
+    fn issue_83_undo_copy_refuses_an_externally_modified_file() {
+        let temp = TempDir::new();
+        let copied = temp.path().join("copy.txt");
+        write(&copied, b"original");
+        let manifest = collect_tree_identities(&copied, UndoHistory::MAX_SNAPSHOT_ITEMS).unwrap();
+        write(&copied, b"externally changed");
+
+        let item = UndoItem::RemoveCreated {
+            path: copied.clone(),
+            manifest,
+        };
+        assert!(execute_undo_item(&item, &CancellationToken::new()).is_err());
+        assert_eq!(fs::read(copied).unwrap(), b"externally changed");
+    }
+
+    #[test]
+    fn issue_83_undo_copy_refuses_an_added_directory_child() {
+        let temp = TempDir::new();
+        let copied = temp.path().join("copy");
+        fs::create_dir(&copied).unwrap();
+        write(&copied.join("original.txt"), b"original");
+        let manifest = collect_tree_identities(&copied, UndoHistory::MAX_SNAPSHOT_ITEMS).unwrap();
+        write(&copied.join("external.txt"), b"external");
+
+        let item = UndoItem::RemoveCreated {
+            path: copied.clone(),
+            manifest,
+        };
+        assert!(execute_undo_item(&item, &CancellationToken::new()).is_err());
+        assert!(copied.join("original.txt").exists());
+        assert!(copied.join("external.txt").exists());
+    }
+
+    #[test]
+    fn issue_83_undo_move_refuses_an_occupied_original_path() {
+        let temp = TempDir::new();
+        let current = temp.path().join("renamed.txt");
+        let original = temp.path().join("original.txt");
+        write(&current, b"moved");
+        write(&original, b"external");
+        let item = UndoItem::MoveBack {
+            current: current.clone(),
+            original: original.clone(),
+            manifest: collect_tree_identities(&current, UndoHistory::MAX_SNAPSHOT_ITEMS).unwrap(),
+            manifest_complete: true,
+        };
+
+        assert!(execute_undo_item(&item, &CancellationToken::new()).is_err());
+        assert_eq!(fs::read(current).unwrap(), b"moved");
+        assert_eq!(fs::read(original).unwrap(), b"external");
     }
 
     #[test]
