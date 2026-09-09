@@ -16326,33 +16326,52 @@ fn start_clipboard_event_pump(
                 let changed_paths = cut_paths_before
                     .into_iter()
                     .chain(cut_paths_after)
-                    .collect::<HashSet<_>>();
-                let windows = WINDOW_RUNTIMES.with_borrow(|runtimes| {
-                    runtimes
-                        .iter()
-                        .map(|(window_id, runtime)| (*window_id, runtime.ui.clone_strong()))
-                        .collect::<Vec<_>>()
-                });
-                for (window_id, ui) in windows {
-                    let update = state.lock().ok().and_then(|app| {
-                        let window = app.window(window_id)?;
-                        let tab = window.tabs.get(&window.active_tab)?;
-                        let changed = tab
-                            .entries
-                            .iter()
-                            .chain(tab.pending_entries.iter())
-                            .filter(|entry| changed_paths.contains(&entry.path))
-                            .map(|entry| entry.id)
-                            .collect::<HashSet<_>>();
-                        Some((tab.id, changed))
-                    });
-                    if let Some((tab_id, changed)) = update {
-                        update_file_rows(&ui, &state, tab_id, &changed);
-                    }
-                }
+                    .collect::<Vec<_>>();
+                refresh_cut_rows(&state, &changed_paths);
             });
         }
     });
+}
+
+fn clear_completed_cut_paths(app: &mut AppState, restored: &[PathBuf]) -> Vec<PathBuf> {
+    let changed = app
+        .cut_paths
+        .iter()
+        .filter(|path| restored.contains(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    app.cut_paths.retain(|path| !restored.contains(path));
+    changed
+}
+
+fn refresh_cut_rows(state: &SharedSessions, changed_paths: &[PathBuf]) {
+    if changed_paths.is_empty() {
+        return;
+    }
+    let changed_paths = changed_paths.iter().collect::<HashSet<_>>();
+    let windows = WINDOW_RUNTIMES.with_borrow(|runtimes| {
+        runtimes
+            .iter()
+            .map(|(window_id, runtime)| (*window_id, runtime.ui.clone_strong()))
+            .collect::<Vec<_>>()
+    });
+    for (window_id, ui) in windows {
+        let update = state.lock().ok().and_then(|app| {
+            let window = app.window(window_id)?;
+            let tab = window.tabs.get(&window.active_tab)?;
+            let entries = tab
+                .entries
+                .iter()
+                .chain(tab.pending_entries.iter())
+                .filter(|entry| changed_paths.contains(&entry.path))
+                .map(|entry| entry.id)
+                .collect::<HashSet<_>>();
+            Some((tab.id, entries))
+        });
+        if let Some((tab_id, entries)) = update {
+            update_file_rows(&ui, state, tab_id, &entries);
+        }
+    }
 }
 
 fn apply_clipboard_snapshot(
@@ -17650,7 +17669,7 @@ fn start_file_operation_event_pump(
                         undo_items,
                         failed_undo_items,
                     } => {
-                        let (affected, next) = {
+                        let (affected, next, clear_completed_cut, undo_failure) = {
                             let mut app = state.lock().expect("app state mutex is not poisoned");
                             if let Some(task) = app.operations.task_mut(id) {
                                 for (index, status, error) in item_states {
@@ -17678,7 +17697,14 @@ fn start_file_operation_event_pump(
                             } else {
                                 OperationState::Failed
                             };
-                            let (resource, kind, origin_tab, task_items) = app
+                            let (
+                                resource,
+                                kind,
+                                origin_tab,
+                                task_items,
+                                undo_cut_paths,
+                                undo_task_source_kind,
+                            ) = app
                                 .operations
                                 .task(id)
                                 .map(|task| {
@@ -17687,6 +17713,19 @@ fn start_file_operation_event_pump(
                                         task.kind,
                                         task.origin_tab,
                                         task.items.clone(),
+                                        task.undo_items
+                                            .iter()
+                                            .zip(task.items.iter())
+                                            .filter_map(|(item, task_item)| match item {
+                                                UndoItem::MoveBack { original, .. }
+                                                    if task_item.state == ItemState::Succeeded =>
+                                                {
+                                                    Some(original.clone())
+                                                }
+                                                _ => None,
+                                            })
+                                            .collect::<Vec<_>>(),
+                                        task.undo_source_kind,
                                     )
                                 })
                                 .unwrap_or((
@@ -17694,6 +17733,8 @@ fn start_file_operation_event_pump(
                                     FileOperationKind::Copy,
                                     None,
                                     Vec::new(),
+                                    Vec::new(),
+                                    None,
                                 ));
                             let mut affected = result.affected_directories.clone();
                             let registered =
@@ -17747,6 +17788,16 @@ fn start_file_operation_event_pump(
                             {
                                 app.undo_history.push(UndoEntry { source_kind, items });
                             }
+                            let undo_failure =
+                                if kind == FileOperationKind::Undo && !result.failed.is_empty() {
+                                    Some(undo_failure_message(
+                                        app.language,
+                                        undo_task_source_kind,
+                                        &result.failed[0].1,
+                                    ))
+                                } else {
+                                    None
+                                };
                             let _ = app.operations.finish(id, terminal, result);
                             if cancelled && kind != FileOperationKind::Undo {
                                 app.operations.remove_terminal(id);
@@ -17775,8 +17826,33 @@ fn start_file_operation_event_pump(
                                     })
                                 },
                             );
-                            (affected, next)
+                            let clear_completed_cut = if kind == FileOperationKind::Undo {
+                                undo_cut_paths
+                            } else {
+                                Vec::new()
+                            };
+
+                            (affected, next, clear_completed_cut, undo_failure)
                         };
+                        if let (Some(ui), Some(message)) = (weak.upgrade(), undo_failure) {
+                            show_undo_failure_dialog(
+                                &ui,
+                                state
+                                    .lock()
+                                    .map(|app| app.language)
+                                    .unwrap_or(Language::Chinese),
+                                &message,
+                            );
+                        }
+                        if !clear_completed_cut.is_empty() {
+                            let changed = state
+                                .lock()
+                                .map(|mut app| {
+                                    clear_completed_cut_paths(&mut app, &clear_completed_cut)
+                                })
+                                .unwrap_or_default();
+                            refresh_cut_rows(&state, &changed);
+                        }
                         if let Some(request) = next {
                             let _ = sender.send(request);
                         }
@@ -21441,6 +21517,47 @@ fn update_selection_summary(ui: &AppWindow, state: &SharedSessions) {
     ui.set_selected_count(tab.selected.len() as i32);
     ui.set_context_menu_has_entry(!tab.selected.is_empty() || tab.focused.is_some());
     ui.set_status_text(status_text(tab, Texts::new(app.language)).into());
+}
+
+fn undo_failure_message(
+    language: Language,
+    source_kind: Option<UndoSourceKind>,
+    reason: &str,
+) -> String {
+    let changed = reason.contains("item changed after the original operation")
+        || reason.contains("item tree changed after the original operation")
+        || reason.contains("created folder changed after creation")
+        || reason.contains("created folder is no longer empty");
+    match (language, source_kind, changed) {
+        (Language::Chinese, Some(UndoSourceKind::Copy), true) => {
+            "无法撤销复制：复制后的文件或文件夹已经被修改。为避免丢失这些修改，AsterFiles 没有删除它。".to_owned()
+        }
+        (Language::English, Some(UndoSourceKind::Copy), true) => {
+            "Could not undo the copy because the copied file or folder was modified. AsterFiles kept it to avoid losing those changes.".to_owned()
+        }
+        (Language::Chinese, Some(UndoSourceKind::Rename | UndoSourceKind::Move), true) => {
+            "无法撤销：操作后的文件或文件夹已经被修改。为避免丢失这些修改，AsterFiles 保持当前位置不变。".to_owned()
+        }
+        (Language::English, Some(UndoSourceKind::Rename | UndoSourceKind::Move), true) => {
+            "Could not undo because the file or folder was modified after the operation. AsterFiles left it in place to avoid losing those changes.".to_owned()
+        }
+        (Language::Chinese, Some(UndoSourceKind::CreateFolder), true) => {
+            "无法撤销新建文件夹：该文件夹已经包含内容或被修改。为避免丢失数据，AsterFiles 没有删除它。".to_owned()
+        }
+        (Language::English, Some(UndoSourceKind::CreateFolder), true) => {
+            "Could not undo folder creation because the folder now contains content or was modified. AsterFiles kept it to avoid data loss.".to_owned()
+        }
+        (Language::Chinese, _, _) => format!("无法安全撤销文件操作。\n\n原因：{reason}"),
+        (Language::English, _, _) => format!("The file operation could not be safely undone.\n\nReason: {reason}"),
+    }
+}
+
+fn show_undo_failure_dialog(ui: &AppWindow, language: Language, message: &str) {
+    let title = match language {
+        Language::Chinese => "无法撤销文件操作",
+        Language::English => "Could not undo file operation",
+    };
+    platform::windows::show_error_dialog(native_window_handle(ui), title, message);
 }
 
 fn operation_rows(app: &AppState) -> Vec<OperationRow> {
@@ -30105,6 +30222,37 @@ mod tests {
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
+    #[test]
+    fn issue_83_move_undo_clears_only_successfully_restored_cut_paths() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\source")], 0, [0, 1, 2, 3]);
+        let restored_file = PathBuf::from(r"C:\source\restored.txt");
+        let restored_folder = PathBuf::from(r"C:\source\restored-folder");
+        let still_cut = PathBuf::from(r"C:\source\still-cut.txt");
+        app.cut_paths = vec![
+            restored_file.clone(),
+            restored_folder.clone(),
+            still_cut.clone(),
+        ];
+
+        let changed =
+            clear_completed_cut_paths(&mut app, &[restored_file.clone(), restored_folder.clone()]);
+
+        assert_eq!(changed, vec![restored_file, restored_folder]);
+        assert_eq!(app.cut_paths, vec![still_cut]);
+    }
+
+    #[test]
+    fn issue_83_modified_copy_undo_explains_why_the_copy_was_kept() {
+        let message = undo_failure_message(
+            Language::Chinese,
+            Some(UndoSourceKind::Copy),
+            "item changed after the original operation",
+        );
+
+        assert!(message.contains("无法撤销复制"));
+        assert!(message.contains("复制后的文件或文件夹已经被修改"));
+        assert!(message.contains("没有删除"));
+    }
     #[test]
     fn clipboard_notifications_update_availability_and_clear_cut_once() {
         let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\source")], 0, [0, 1, 2, 3]);

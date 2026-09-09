@@ -53,6 +53,23 @@ pub fn move_window(hwnd: isize, x: i32, y: i32) -> io::Result<()> {
     Ok(())
 }
 
+pub fn show_error_dialog(owner: isize, title: &str, message: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TASKMODAL, MessageBoxW,
+    };
+
+    let title = title.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let message = message.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    unsafe {
+        MessageBoxW(
+            owner as windows_sys::Win32::Foundation::HWND,
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR | MB_TASKMODAL | MB_SETFOREGROUND,
+        );
+    }
+}
+
 pub fn begin_window_drag(hwnd: isize) -> io::Result<()> {
     if hwnd == 0 {
         return Err(io::Error::new(
