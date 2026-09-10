@@ -3768,6 +3768,7 @@ fn apply_progress_event_for_test(
 #[derive(Debug)]
 enum ClipboardRequest {
     Write { paths: Vec<PathBuf>, cut: bool },
+    CancelCut { paths: Vec<PathBuf>, sequence: u32 },
     ReadPaste { origin_tab: TabId, target: PathBuf },
     Changed(u32),
 }
@@ -5797,6 +5798,30 @@ fn request_clipboard_write(
         .unwrap_or_default();
     if !paths.is_empty() {
         let _ = sender.send(ClipboardRequest::Write { paths, cut });
+    }
+}
+
+fn pending_clipboard_cut(app: &AppState) -> Option<(Vec<PathBuf>, u32)> {
+    (!app.cut_paths.is_empty()).then(|| {
+        app.clipboard_sequence
+            .map(|sequence| (app.cut_paths.clone(), sequence))
+    })?
+}
+
+fn request_cancel_clipboard_cut(
+    state: &WindowSessions,
+    sender: &mpsc::Sender<ClipboardRequest>,
+) -> bool {
+    let pending = state
+        .lock()
+        .ok()
+        .and_then(|app| pending_clipboard_cut(&app));
+    if let Some((paths, sequence)) = pending {
+        sender
+            .send(ClipboardRequest::CancelCut { paths, sequence })
+            .is_ok()
+    } else {
+        false
     }
 }
 
@@ -13254,6 +13279,26 @@ fn wire_mouse_navigation(
                 ui.invoke_cancel_column_drag_from_window();
                 cancelled = true;
             }
+            if !cancelled
+                && !type_select_active
+                && !ui.get_active_is_settings()
+                && !ui.get_address_editing()
+                && !ui.get_rename_editing()
+                && ui.get_file_list_keyboard_target()
+                && request_cancel_clipboard_cut(&state, &senders.clipboard)
+            {
+                cancelled = true;
+            }
+            if !cancelled
+                && !type_select_active
+                && !ui.get_active_is_settings()
+                && !ui.get_address_editing()
+                && !ui.get_rename_editing()
+                && ui.get_file_list_keyboard_target()
+            {
+                ui.invoke_clear_selection();
+                cancelled = true;
+            }
             return if cancelled || type_select_active {
                 EventResult::PreventDefault
             } else {
@@ -15854,6 +15899,19 @@ fn spawn_clipboard_worker() -> (
                     result: platform::windows::clipboard::read_file_list()
                         .map_err(|error| error.to_string()),
                 },
+                ClipboardRequest::CancelCut { paths, sequence } => {
+                    match platform::windows::clipboard::cancel_file_cut_if_current(sequence, &paths)
+                    {
+                        Ok((sequence, snapshot)) => ClipboardEvent::Changed {
+                            sequence,
+                            result: Ok(snapshot),
+                        },
+                        Err(error) => ClipboardEvent::Changed {
+                            sequence: platform::windows::clipboard::sequence_number(),
+                            result: Err(error.to_string()),
+                        },
+                    }
+                }
                 ClipboardRequest::ReadPaste { origin_tab, target } => ClipboardEvent::Paste {
                     origin_tab,
                     result: platform::windows::clipboard::read_file_list()
@@ -30694,6 +30752,40 @@ mod tests {
         assert!(apply_clipboard_snapshot(&mut app, 11, None).is_empty());
     }
 
+    #[test]
+    fn issue_85_pending_cut_cancellation_preserves_selection() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\source")], 0, [0, 1, 2, 3]);
+        let tab_id = app.active_window_state().active_tab;
+        app.tab_mut(tab_id)
+            .unwrap()
+            .replace_entries(vec![focus_entry(1, r"C:\source\old.txt")]);
+        app.tab_mut(tab_id)
+            .unwrap()
+            .select_entry(EntryId(1), false, false);
+        app.cut_paths = vec![PathBuf::from(r"C:\source\old.txt")];
+        app.clipboard_sequence = Some(10);
+        let focused_before = app.active().focused;
+        let selected_before = app.active().selected.clone();
+
+        assert_eq!(
+            pending_clipboard_cut(&app),
+            Some((app.cut_paths.clone(), 10))
+        );
+        assert_eq!(app.active().focused, focused_before);
+        assert_eq!(app.active().selected, selected_before);
+    }
+
+    #[test]
+    fn issue_85_copy_and_absent_sequence_are_not_cancellable_cuts() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\source")], 0, [0, 1, 2, 3]);
+        app.clipboard_has_files = true;
+        app.clipboard_sequence = Some(10);
+        assert_eq!(pending_clipboard_cut(&app), None);
+
+        app.cut_paths = vec![PathBuf::from(r"C:\source\old.txt")];
+        app.clipboard_sequence = None;
+        assert_eq!(pending_clipboard_cut(&app), None);
+    }
     #[test]
     fn copied_files_clear_previous_cut_and_keep_paste_available() {
         let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\source")], 0, [0, 1, 2, 3]);

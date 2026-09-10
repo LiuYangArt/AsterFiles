@@ -20,7 +20,8 @@ use windows::{
                 TYMED_HGLOBAL,
             },
             DataExchange::{
-                AddClipboardFormatListener, GetClipboardSequenceNumber, RegisterClipboardFormatW,
+                AddClipboardFormatListener, CloseClipboard, EmptyClipboard,
+                GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW,
                 RemoveClipboardFormatListener,
             },
             Memory::{
@@ -265,6 +266,61 @@ pub fn write_file_list(paths: &[PathBuf], operation: ClipboardOperation) -> io::
     })
 }
 
+pub fn cancel_file_cut_if_current(
+    expected_sequence: u32,
+    expected_paths: &[PathBuf],
+) -> io::Result<(u32, Option<ClipboardFileList>)> {
+    let _ole = OleApartment::initialize()?;
+    let snapshot = read_file_list_from_current()?;
+    if sequence_number() == expected_sequence
+        && snapshot.as_ref().is_some_and(|clipboard| {
+            clipboard.operation == ClipboardOperation::Move && clipboard.paths == expected_paths
+        })
+    {
+        let _ = clear_clipboard_if_sequence(expected_sequence)?;
+    }
+    read_stable_file_list_snapshot()
+}
+
+fn read_stable_file_list_snapshot() -> io::Result<(u32, Option<ClipboardFileList>)> {
+    for _ in 0..CLIPBOARD_RETRIES {
+        let before = sequence_number();
+        let snapshot = read_file_list_from_current()?;
+        let after = sequence_number();
+        if before == after {
+            return Ok((after, snapshot));
+        }
+    }
+    Err(io::Error::other(
+        "clipboard changed while reading cancellation result",
+    ))
+}
+
+fn clear_clipboard_if_sequence(expected_sequence: u32) -> io::Result<bool> {
+    let mut last_error = None;
+    for attempt in 0..CLIPBOARD_RETRIES {
+        match unsafe { OpenClipboard(None) } {
+            Ok(()) => {
+                let matches = sequence_number() == expected_sequence;
+                let result = if matches {
+                    unsafe { EmptyClipboard() }.map(|()| true)
+                } else {
+                    Ok(false)
+                };
+                let close_result = unsafe { CloseClipboard() };
+                return result
+                    .and_then(|cleared| close_result.map(|()| cleared))
+                    .map_err(windows_error);
+            }
+            Err(error) => last_error = Some(error),
+        }
+        if attempt + 1 < CLIPBOARD_RETRIES {
+            thread::sleep(Duration::from_millis(5 * (attempt as u64 + 1)));
+        }
+    }
+    Err(windows_error(last_error.expect("clipboard retry must run")))
+}
+
 pub fn write_text(value: &std::ffi::OsStr) -> io::Result<()> {
     let _ole = OleApartment::initialize()?;
     let bytes = encode_unicode_text(value);
@@ -287,6 +343,10 @@ fn encode_unicode_text(value: &std::ffi::OsStr) -> Vec<u8> {
 
 pub fn read_file_list() -> io::Result<Option<ClipboardFileList>> {
     let _ole = OleApartment::initialize()?;
+    read_file_list_from_current()
+}
+
+fn read_file_list_from_current() -> io::Result<Option<ClipboardFileList>> {
     let data_object = retry_get_clipboard().map_err(windows_error)?;
 
     let drop_format = format_etc(CF_HDROP);
