@@ -24219,7 +24219,6 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
         modified,
         size,
         request_access,
-        menu,
         settings,
         theme,
         theme_system,
@@ -24288,7 +24287,6 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "修改时间",
             "大小",
             "使用 Windows 请求访问权限",
-            "菜单",
             "设置",
             "主题",
             "跟随系统",
@@ -24357,7 +24355,6 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "Modified",
             "Size",
             "Request access with Windows",
-            "Menu",
             "Settings",
             "Theme",
             "Use system setting",
@@ -24442,7 +24439,6 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_modified(modified.into());
     ui.set_text_size(size.into());
     ui.set_text_request_access(request_access.into());
-    ui.set_text_menu(menu.into());
     ui.set_text_settings(settings.into());
     ui.set_text_settings_title(settings.into());
     ui.set_text_theme(theme.into());
@@ -31182,7 +31178,7 @@ mod tests {
         assert!(source.contains("&& !root.rename-editing"));
         assert!(source.contains("&& !root.context-menu-open"));
         assert!(source.contains("!root.active-is-settings"));
-        assert!(source.contains("&& !root.menu-open"));
+        assert!(!source.contains("root.menu-open"));
         assert!(source.contains("&& !root.tabs-menu-open"));
         assert!(source.contains("&& !root.drop-menu-open"));
     }
@@ -31196,7 +31192,7 @@ mod tests {
             source
                 .matches("VisualStyle.navigation-surface-background")
                 .count(),
-            6
+            7
         );
         assert!(source.contains("shape-color: VisualStyle.navigation-surface-background;"));
         assert!(source.contains("fill: VisualStyle.navigation-surface-background;"));
@@ -31453,6 +31449,94 @@ mod tests {
         update_test_layout(&ui);
 
         assert!(ui.get_sidebar_viewport_y() > scrolled_to_bottom);
+    }
+    #[test]
+    fn issue_87_settings_stays_fixed_and_preserves_sidebar_background_hit_area() {
+        use i_slint_backend_testing::ElementRoot;
+        use std::{cell::Cell, rc::Rc};
+
+        let ui = headless_file_view();
+        ui.window()
+            .set_size(slint::LogicalSize::new(1_180.0, 520.0));
+        ui.set_quick_access_expanded(true);
+        ui.set_libraries_expanded(true);
+        ui.set_drives_expanded(true);
+        ui.set_network_locations_expanded(true);
+        ui.set_network_expanded(true);
+        ui.set_sidebar_items(ModelRc::new(VecModel::from(
+            (0..48)
+                .map(|index| SidebarRow {
+                    index,
+                    stable_id: index.to_string().into(),
+                    label: format!("Sidebar {index}").into(),
+                    icon_kind: 0,
+                    group_kind: index % 5,
+                    source_kind: 0,
+                    is_drive: false,
+                    drive_progress: 0.0,
+                    drive_state: 3,
+                    drive_status: "".into(),
+                    icon: Image::default(),
+                })
+                .collect::<Vec<_>>(),
+        )));
+        let open_settings_count = Rc::new(Cell::new(0));
+        let open_settings_count_for_callback = open_settings_count.clone();
+        ui.on_open_settings(move || {
+            open_settings_count_for_callback.set(open_settings_count_for_callback.get() + 1);
+        });
+        let background_menu_count = Rc::new(Cell::new(0));
+        let background_menu_count_for_callback = background_menu_count.clone();
+        ui.on_show_sidebar_background_menu(move |_, _| {
+            background_menu_count_for_callback.set(background_menu_count_for_callback.get() + 1);
+        });
+        update_test_layout(&ui);
+
+        let find = |id: &str| {
+            ui.root_element()
+                .query_descendants()
+                .match_id(id)
+                .find_all()
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("missing element: {id}"))
+        };
+        let settings_row = find("AppWindow::settings-row");
+        let settings_button = find("AppWindow::settings-button");
+        let sidebar_scroll = find("AppWindow::sidebar-scroll");
+        let initial_y = settings_row.absolute_position().y;
+
+        assert_eq!(settings_row.size().height, 42.0);
+        assert_eq!(settings_button.size().width, 34.0);
+        assert_eq!(settings_button.size().height, 34.0);
+        assert!(settings_button.size().width < settings_row.size().width);
+
+        sidebar_scroll.scroll(0.0, -5_000.0);
+        update_test_layout(&ui);
+        assert_eq!(settings_row.absolute_position().y, initial_y);
+
+        settings_button.mock_single_click(slint::platform::PointerEventButton::Left);
+        assert_eq!(open_settings_count.get(), 1);
+        assert_eq!(background_menu_count.get(), 0);
+
+        settings_button.mock_single_click(slint::platform::PointerEventButton::Right);
+        assert_eq!(open_settings_count.get(), 1);
+        assert_eq!(background_menu_count.get(), 0);
+
+        settings_row.mock_single_click(slint::platform::PointerEventButton::Left);
+        assert_eq!(open_settings_count.get(), 1);
+        assert_eq!(background_menu_count.get(), 0);
+
+        settings_row.mock_single_click(slint::platform::PointerEventButton::Right);
+        assert_eq!(background_menu_count.get(), 1);
+
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
+        assert!(!source.contains("action-menu"));
+        assert!(!source.contains("root.menu-open"));
+        assert!(source.contains("settings-row := Rectangle"));
+        assert!(source.contains("settings-button := Rectangle"));
+        assert!(source.contains("icon-size: 22px;"));
+        assert!(!source.contains("Text { text: root.text-settings;"));
     }
     #[test]
     fn issue_74_hiding_all_categories_clamps_scroll_and_preserves_expansion() {

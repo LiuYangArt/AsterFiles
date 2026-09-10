@@ -838,7 +838,6 @@ export component AppWindow inherits Window {
     out property <bool> file-list-keyboard-target: !root.active-is-settings
         && !root.address-editing
         && !root.rename-editing
-        && !root.menu-open
         && !root.tabs-menu-open
         && !root.context-menu-open
         && !root.drop-menu-open;
@@ -895,7 +894,6 @@ export component AppWindow inherits Window {
     in property <float> quick-menu-backdrop-opacity: 85;
     in property <bool> active-is-settings: false;
     in property <bool> debug-tools-enabled: false;
-    in property <string> text-menu: "菜单";
     in property <string> text-settings: "设置";
     in property <string> text-settings-title: "设置";
     in property <string> text-theme: "主题";
@@ -1208,20 +1206,25 @@ export component AppWindow inherits Window {
     function dismiss-menus-and-drag-window(pointer-x: length, pointer-y: length) {
         root.context-menu-open = false; root.dismiss-context-menu();
         root.tabs-menu-open = false;
-        root.menu-open = false;
-        if pointer-y < 46px && pointer-x >= 8px + 34px + 5px + root.tab-strip-width + (root.tabs-overflow ? 33px : 0px) + 5px + 34px + 5px && pointer-x < root.width - 3 * 46px {
+        if pointer-y < 46px && pointer-x >= 8px + root.tab-strip-width + (root.tabs-overflow ? 33px : 0px) + 5px + 34px + 5px && pointer-x < root.width - 3 * 46px {
             root.drag-window-after-menu-dismiss();
         }
+    }
+    function show-sidebar-background-menu-at(pointer-x: length, pointer-y: length) {
+        root.sidebar-keyboard-active = false;
+        root.sidebar-keyboard-stable-id = "";
+        root.context-menu-anchor-x = pointer-x;
+        root.context-menu-anchor-y = pointer-y;
+        root.show-sidebar-background-menu(pointer-x / 1px, pointer-y / 1px);
     }
     in-out property <length> context-menu-anchor-x: 24px;
     in-out property <length> context-menu-anchor-y: 140px;
     private property <length> keyboard-menu-anchor-x: 24px;
     private property <length> keyboard-menu-anchor-y: 140px;
-    private property <bool> menu-open: false;
     private property <int> settings-section: 0;
     private property <bool> minimal: root.window-width < 900px;
     // Keep a compact drag target between the add button and window controls.
-    private property <length> max-tab-cluster-width: max(80px, root.window-width - 8px - 34px - 34px - 36px - 3 * 46px - 12px);
+    private property <length> max-tab-cluster-width: max(80px, root.window-width - 8px - 34px - 36px - 3 * 46px - 12px);
     private property <bool> tabs-overflow: root.tabs.length * 80px + 5px * max(0, root.tabs.length - 1) > root.max-tab-cluster-width;
     private property <length> max-tab-strip-width: max(80px, root.max-tab-cluster-width - (root.tabs-overflow ? 33px : 0px));
     out property <length> tab-current-width: root.tabs.length == 0 ? 178px : max(80px, min(178px, (root.max-tab-strip-width - 5px * max(0, root.tabs.length - 1)) / root.tabs.length));
@@ -1371,14 +1374,6 @@ export component AppWindow inherits Window {
             HorizontalLayout {
                 x: 8px; y: 12px; width: parent.width - 8px - 3 * 46px; height: 34px; spacing: 5px;
                 Rectangle {
-                    width: 34px; height: 34px; border-radius: 6px;
-                    background: menu-touch.pressed ? VisualStyle.cd9dce2 : menu-touch.has-hover ? VisualStyle.ce8eaf0 : transparent;
-                    Image { width: 20px; height: 20px; x: 7px; y: 7px; source: IconMap.action-menu; colorize: VisualStyle.c303138; }
-                    menu-touch := TouchArea { mouse-cursor: pointer; clicked => { root.menu-open = !root.menu-open; } }
-                    accessible-role: button; accessible-label: root.text-menu;
-                    Tooltip { text: @markdown("\{root.text-menu}"); }
-                }
-                Rectangle {
                     width: root.tab-strip-width; height: 34px; clip: true;
                     tab-strip := Flickable {
                     width: parent.width; height: parent.height;
@@ -1414,7 +1409,7 @@ export component AppWindow inherits Window {
                                     if event.button == PointerEventButton.left && event.kind == PointerEventKind.down && !tab.is-settings {
                                         root.tab-drag-pointer-active = true;
                                         root.tab-drag-source-index = index;
-                                        root.begin-tab-drag(tab.id, index, ((8 + 34 + 5) * 1px + index * (root.tab-width + 5px) + tab-strip.viewport-x + self.mouse-x) / 1px, (12px + self.mouse-y) / 1px);
+                                        root.begin-tab-drag(tab.id, index, (8px + index * (root.tab-width + 5px) + tab-strip.viewport-x + self.mouse-x) / 1px, (12px + self.mouse-y) / 1px);
                                     }
                                     if (event.button == PointerEventButton.middle && event.kind == PointerEventKind.up && root.can-close-tab) {
                                         root.close-tab(tab.id);
@@ -1422,9 +1417,9 @@ export component AppWindow inherits Window {
                                 }
                                 moved => {
                                     if self.pressed && root.tab-drag-pointer-active && root.tab-drag-source-index == index {
-                                        root.tab-drag-pointer-x = (8 + 34 + 5) * 1px + index * (root.tab-width + 5px) + tab-strip.viewport-x + self.mouse-x;
+                                        root.tab-drag-pointer-x = 8px + index * (root.tab-width + 5px) + tab-strip.viewport-x + self.mouse-x;
                                         root.tab-drag-pointer-y = 12px + self.mouse-y;
-                                        let insertion = root.update-tab-drag(root.tab-drag-pointer-x / 1px, root.tab-drag-pointer-y / 1px, 8 + 34 + 5, root.tab-strip-width / 1px, tab-strip.viewport-x / 1px, root.tab-width / 1px);
+                                        let insertion = root.update-tab-drag(root.tab-drag-pointer-x / 1px, root.tab-drag-pointer-y / 1px, 8, root.tab-strip-width / 1px, tab-strip.viewport-x / 1px, root.tab-width / 1px);
                                         if insertion >= -1 {
                                             root.tab-dragging = true;
                                             root.suppress-tab-click = true;
@@ -1508,8 +1503,11 @@ export component AppWindow inherits Window {
             spacing: 0px;
             if !root.minimal: Rectangle {
                 width: root.compact ? 184px : 218px; background: VisualStyle.navigation-surface-background; border-width: 0px; clip: true;
-                sidebar-scroll := ScrollView {
-                    width: parent.width; height: parent.height;
+                VerticalLayout {
+                    spacing: 0px;
+                    sidebar-scroll := ScrollView {
+                        vertical-stretch: 1;
+                        width: parent.width;
                     viewport-width: self.width;
                     viewport-height: max(self.height, sidebar-content.preferred-height);
                     horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
@@ -1526,13 +1524,9 @@ export component AppWindow inherits Window {
                         height: sidebar-scroll.visible-height;
                         pointer-event(event) => {
                             if event.button == PointerEventButton.right && event.kind == PointerEventKind.up {
-                                root.sidebar-keyboard-active = false;
-                                root.sidebar-keyboard-stable-id = "";
-                                root.context-menu-anchor-x = self.absolute-position.x + self.mouse-x - root.absolute-position.x;
-                                root.context-menu-anchor-y = self.absolute-position.y + self.mouse-y - root.absolute-position.y;
-                                root.show-sidebar-background-menu(
-                                    root.context-menu-anchor-x / 1px,
-                                    root.context-menu-anchor-y / 1px
+                                root.show-sidebar-background-menu-at(
+                                    self.absolute-position.x + self.mouse-x - root.absolute-position.x,
+                                    self.absolute-position.y + self.mouse-y - root.absolute-position.y
                                 );
                             }
                         }
@@ -1631,6 +1625,48 @@ export component AppWindow inherits Window {
                     }
                     Rectangle { vertical-stretch: 1; }
                 }
+                    }
+                    settings-row := Rectangle {
+                        height: 42px;
+                        background: VisualStyle.navigation-surface-background;
+
+                        settings-row-background := TouchArea {
+                            pointer-event(event) => {
+                                if event.button == PointerEventButton.right && event.kind == PointerEventKind.up {
+                                    root.sidebar-keyboard-active = false;
+                                    root.sidebar-keyboard-stable-id = "";
+                                    root.context-menu-anchor-x = self.absolute-position.x + self.mouse-x - root.absolute-position.x;
+                                    root.context-menu-anchor-y = self.absolute-position.y + self.mouse-y - root.absolute-position.y;
+                                    root.show-sidebar-background-menu(
+                                        root.context-menu-anchor-x / 1px,
+                                        root.context-menu-anchor-y / 1px
+                                    );
+                                }
+                            }
+                        }
+
+                        settings-button := Rectangle {
+                            x: 10px;
+                            y: 4px;
+                            width: 34px;
+                            height: 34px;
+                            border-radius: 5px;
+                            background: settings-touch.pressed ? VisualStyle.cdde3ed : settings-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
+                            InlineIcon {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                icon-source: IconMap.action-settings;
+                                icon-size: 22px;
+                            }
+                            settings-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.open-settings(); }
+                            }
+                            accessible-role: button;
+                            accessible-label: root.text-settings;
+                            Tooltip { text: @markdown("\{root.text-settings}"); }
+                        }
+                    }
                 }
             }
 
@@ -2597,48 +2633,6 @@ if root.tabs-menu-open: TouchArea {
             }
         }
     }
-    if root.menu-open: TouchArea {
-        z: 19;
-        width: parent.width;
-        height: parent.height;
-        pointer-event(event) => {
-            if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
-                root.dismiss-menus-and-drag-window(
-                    self.absolute-position.x + self.mouse-x - root.absolute-position.x,
-                    self.absolute-position.y + self.mouse-y - root.absolute-position.y
-                );
-            }
-        }
-        clicked => { root.menu-open = false; }
-    }
-
-    if root.menu-open: Rectangle {
-        x: 8px; y: 46px; width: 190px; height: 54px; z: 20;
-        background: VisualStyle.cffffff; border-color: VisualStyle.ce0e2e7; border-width: 1px; border-radius: 7px;
-        Rectangle {
-            x: 6px; y: 6px; width: parent.width - 12px; height: 42px; border-radius: 5px;
-            background: settings-menu-touch.pressed ? VisualStyle.cdde3ed : settings-menu-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
-            HorizontalLayout {
-                padding-left: 10px; padding-right: 10px; spacing: 10px;
-                Rectangle {
-                    width: 18px; height: parent.height;
-                    Image {
-                        width: 18px; height: 18px;
-                        y: (parent.height - self.height) / 2;
-                        source: IconMap.action-settings;
-                        colorize: VisualStyle.c303138;
-                    }
-                }
-                Text { text: root.text-settings; color: VisualStyle.c30333a; font-size: 13px; vertical-alignment: center; }
-            }
-            settings-menu-touch := TouchArea {
-                mouse-cursor: pointer;
-                clicked => { root.menu-open = false; root.open-settings(); }
-            }
-            accessible-role: button; accessible-label: root.text-settings;
-        }
-    }
-
 
     }
 }
