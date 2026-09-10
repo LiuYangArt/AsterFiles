@@ -907,6 +907,28 @@ export component AppWindow inherits Window {
     in property <string> text-quick-menu-backdrop: "右键菜单磨砂效果";
     in property <string> text-quick-menu-backdrop-opacity: "菜单背景不透明度";
     in property <string> text-settings-general: "常规";
+    in property <string> text-system-integration: "";
+    in property <string> text-folder-default-title: "";
+    in property <string> text-folder-default-detail: "";
+    in property <string> text-win-e-title: "";
+    in property <string> text-win-e-detail: "";
+    in property <string> text-win-e-risk: "";
+    in property <string> text-integration-status: "";
+
+    in property <string> text-integration-path-label: "";
+    in property <string> text-integration-enable: "";
+    in property <string> text-integration-repair: "";
+    in property <string> text-integration-restore: "";
+    in property <string> text-integration-experimental: "";
+    in property <bool> folder-integration-enabled: false;
+    in property <bool> folder-integration-needs-repair: false;
+    in property <bool> win-e-integration-enabled: false;
+    in property <bool> win-e-integration-needs-repair: false;
+    in property <bool> system-integration-busy: false;
+    in property <string> folder-integration-status: "";
+    in property <string> win-e-integration-status: "";
+    in property <string> folder-integration-bound-path: "";
+    in property <string> win-e-integration-bound-path: "";
     in property <string> text-settings-appearance: "外观";
     in property <string> text-settings-developer: "开发工具";
     in property <string> text-settings-about: "关于";
@@ -1073,6 +1095,12 @@ export component AppWindow inherits Window {
     callback change-file-list-quick-search(bool);
     callback change-quick-menu-backdrop(bool);
     callback change-quick-menu-backdrop-opacity(float);
+    callback enable-folder-integration();
+    callback repair-folder-integration();
+    callback restore-folder-integration();
+    callback enable-win-e-integration();
+    callback repair-win-e-integration();
+    callback restore-win-e-integration();
     callback update-everything-config(string, string);
     callback select-everything-program();
     callback test-everything-connection();
@@ -2229,24 +2257,89 @@ accessible-label: entry.name;
                             width: settings-scroll.width;
                             spacing: 16px;
                             Text { text: root.settings-title(root.settings-section); color: VisualStyle.c30333a; font-size: 22px; font-weight: 600; height: 44px; }
-                            if root.settings-section == 0: Rectangle {
-                                height: 202px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
-                                VerticalLayout {
-                                    padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 12px;
-                                    Text { text: root.text-language; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
-                                    HorizontalLayout {
-                                        height: 42px; spacing: 8px;
-                                        for language-option[index] in [root.text-language-chinese, root.text-language-english]: Rectangle {
-                                            horizontal-stretch: 1; border-radius: 6px; border-width: root.language-mode == index ? 2px : 1px;
-                                            border-color: root.language-mode == index ? VisualStyle.c4f6bed : VisualStyle.ce0e2e7;
-                                            background: language-card-touch.pressed ? VisualStyle.cdde3ed : language-card-touch.has-hover ? VisualStyle.cedf1f6 : VisualStyle.cffffff;
-                                            Text { text: language-option; color: VisualStyle.c30333a; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
-                                            language-card-touch := TouchArea { mouse-cursor: pointer; clicked => { root.change-language(index); } }
-                                            accessible-role: button; accessible-label: language-option;
+                            if root.settings-section == 0: VerticalLayout {
+                                spacing: 12px;
+                                Rectangle {
+                                    height: 202px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                    VerticalLayout {
+                                        padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 12px;
+                                        Text { text: root.text-language; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
+                                        HorizontalLayout {
+                                            height: 42px; spacing: 8px;
+                                            for language-option[index] in [root.text-language-chinese, root.text-language-english]: Rectangle {
+                                                horizontal-stretch: 1; border-radius: 6px; border-width: root.language-mode == index ? 2px : 1px;
+                                                border-color: root.language-mode == index ? VisualStyle.c4f6bed : VisualStyle.ce0e2e7;
+                                                background: language-card-touch.pressed ? VisualStyle.cdde3ed : language-card-touch.has-hover ? VisualStyle.cedf1f6 : VisualStyle.cffffff;
+                                                Text { text: language-option; color: VisualStyle.c30333a; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                                                language-card-touch := TouchArea { mouse-cursor: pointer; clicked => { root.change-language(index); } }
+                                                accessible-role: button; accessible-label: language-option;
+                                            }
+                                        }
+                                        CheckBox { text: root.text-show-hidden-files; checked: root.show-hidden-files; toggled => { root.change-file-visibility(self.checked, root.show-system-files); } }
+                                        CheckBox { text: root.text-show-system-files; checked: root.show-system-files; toggled => { root.change-file-visibility(root.show-hidden-files, self.checked); } }
+                                    }
+                                }
+                                Rectangle {
+                                    height: 208px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                    VerticalLayout {
+                                        padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 8px;
+                                        Text { text: root.text-system-integration; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
+                                        Text { text: root.text-folder-default-title; color: VisualStyle.c30333a; font-size: 14px; font-weight: 600; }
+                                        Text { text: root.text-folder-default-detail; color: VisualStyle.c62656f; font-size: 12px; wrap: word-wrap; }
+                                        Text { text: root.text-integration-status + " " + root.folder-integration-status; color: root.folder-integration-enabled && !root.folder-integration-needs-repair ? VisualStyle.c4f6bed : VisualStyle.c62656f; font-size: 12px; overflow: elide; }
+                                        HorizontalLayout {
+                                            height: 32px; spacing: 8px;
+                                            StandaloneActionButton {
+                                                width: 132px; height: 32px; enabled: !root.system-integration-busy && (!root.folder-integration-enabled || root.folder-integration-needs-repair);
+                                                label: root.folder-integration-needs-repair ? root.text-integration-repair : root.text-integration-enable;
+                                                clicked => {
+                                                    if root.folder-integration-needs-repair { root.repair-folder-integration(); }
+                                                    else { root.enable-folder-integration(); }
+                                                }
+                                            }
+                                            StandaloneActionButton { horizontal-stretch: 1; height: 32px; enabled: !root.system-integration-busy && root.folder-integration-enabled; label: root.text-integration-restore; clicked => { root.restore-folder-integration(); } }
+                                        }
+                                        Rectangle {
+                                            height: 18px;
+                                            Text { text: root.text-integration-path-label + " " + root.folder-integration-bound-path; color: VisualStyle.c62656f; font-size: 11px; overflow: elide; }
+                                            Tooltip { text: @markdown("\{root.folder-integration-bound-path}"); }
                                         }
                                     }
-                                    CheckBox { text: root.text-show-hidden-files; checked: root.show-hidden-files; toggled => { root.change-file-visibility(self.checked, root.show-system-files); } }
-                                    CheckBox { text: root.text-show-system-files; checked: root.show-system-files; toggled => { root.change-file-visibility(root.show-hidden-files, self.checked); } }
+                                }
+                                Rectangle {
+                                    height: 238px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                    VerticalLayout {
+                                        padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 8px;
+                                        HorizontalLayout {
+                                            height: 22px; spacing: 10px;
+                                            Text { text: root.text-win-e-title; color: VisualStyle.c30333a; font-size: 14px; font-weight: 600; vertical-alignment: center; }
+                                            Rectangle {
+                                                width: 72px; height: 22px; border-radius: 11px; background: VisualStyle.ce5e9f2;
+                                                Text { text: root.text-integration-experimental; color: VisualStyle.c62656f; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
+                                            }
+                                            Rectangle { horizontal-stretch: 1; }
+                                        }
+                                        Text { text: root.text-win-e-detail; color: VisualStyle.c62656f; font-size: 12px; wrap: word-wrap; }
+                                        Text { text: root.text-win-e-risk; color: VisualStyle.cc42b1c; font-size: 11px; wrap: word-wrap; }
+                                        Text { text: root.text-integration-status + " " + root.win-e-integration-status; color: root.win-e-integration-enabled && !root.win-e-integration-needs-repair ? VisualStyle.c4f6bed : VisualStyle.c62656f; font-size: 12px; overflow: elide; }
+                                        Rectangle {
+                                            height: 18px;
+                                            Text { text: root.text-integration-path-label + " " + root.win-e-integration-bound-path; color: VisualStyle.c62656f; font-size: 11px; overflow: elide; }
+                                            Tooltip { text: @markdown("\{root.win-e-integration-bound-path}"); }
+                                        }
+                                        HorizontalLayout {
+                                            height: 32px; spacing: 8px;
+                                            StandaloneActionButton {
+                                                width: 132px; height: 32px; enabled: !root.system-integration-busy && (!root.win-e-integration-enabled || root.win-e-integration-needs-repair);
+                                                label: root.win-e-integration-needs-repair ? root.text-integration-repair : root.text-integration-enable;
+                                                clicked => {
+                                                    if root.win-e-integration-needs-repair { root.repair-win-e-integration(); }
+                                                    else { root.enable-win-e-integration(); }
+                                                }
+                                            }
+                                            StandaloneActionButton { horizontal-stretch: 1; height: 32px; enabled: !root.system-integration-busy && root.win-e-integration-enabled; label: root.text-integration-restore; clicked => { root.restore-win-e-integration(); } }
+                                        }
+                                    }
                                 }
                             }
                             if root.settings-section == 1: Rectangle {

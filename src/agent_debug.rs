@@ -1,5 +1,7 @@
 use std::{
-    env, fs, io,
+    env,
+    ffi::OsString,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -77,12 +79,17 @@ pub struct AgentOptions {
     pub scenario: Option<AgentScenario>,
     pub state_output: Option<PathBuf>,
     pub no_ui: bool,
+    pub external_paths: Vec<PathBuf>,
 }
 
 impl AgentOptions {
     pub fn from_env() -> Result<Self, String> {
+        Self::from_arguments(env::args_os().skip(1))
+    }
+
+    fn from_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Self, String> {
         let mut options = Self::default();
-        let mut arguments = env::args_os().skip(1);
+        let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
             match argument.to_string_lossy().as_ref() {
                 "--agent-scenario" => {
@@ -98,7 +105,10 @@ impl AgentOptions {
                         })?));
                 }
                 "--no-ui" => options.no_ui = true,
-                unknown => return Err(format!("unknown argument: {unknown}")),
+                _ if argument.to_string_lossy().starts_with('-') => {
+                    return Err(format!("unknown argument: {}", argument.to_string_lossy()));
+                }
+                _ => options.external_paths.push(PathBuf::from(argument)),
             }
         }
         if options.no_ui && options.scenario.is_none() {
@@ -110,6 +120,9 @@ impl AgentOptions {
         Ok(options)
     }
 
+    pub fn take_external_paths(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.external_paths)
+    }
     pub fn state_output(&self) -> Option<PathBuf> {
         self.scenario.map(|scenario| {
             self.state_output
@@ -394,6 +407,39 @@ mod tests {
     use super::*;
     use crate::domain::{TabId, TabSession};
 
+    #[test]
+    fn external_paths_accept_multiple_raw_windows_arguments() {
+        let arguments = [
+            OsString::from(r"C:\Folder With Spaces"),
+            OsString::from(r"C:\中文"),
+        ];
+
+        let options = AgentOptions::from_arguments(arguments).expect("paths are accepted");
+
+        assert_eq!(
+            options.external_paths,
+            vec![
+                PathBuf::from(r"C:\Folder With Spaces"),
+                PathBuf::from(r"C:\中文"),
+            ]
+        );
+    }
+
+    #[test]
+    fn external_paths_accept_long_and_nonexistent_values_without_loss() {
+        let long = PathBuf::from(format!(r"C:\{}\不存在", "long-segment".repeat(30)));
+        let options = AgentOptions::from_arguments([long.clone().into_os_string()])
+            .expect("path validity is checked by navigation, not argument parsing");
+
+        assert_eq!(options.external_paths, [long]);
+    }
+    #[test]
+    fn unknown_options_still_fail() {
+        let error = AgentOptions::from_arguments([OsString::from("--unknown")])
+            .expect_err("unknown switches are rejected");
+
+        assert!(error.contains("unknown argument"));
+    }
     #[test]
     fn windows_libraries_scenario_has_stable_name_and_nested_default_path() {
         let scenario = parse_scenario("windows-libraries").expect("scenario is registered");

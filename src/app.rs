@@ -1898,6 +1898,12 @@ struct AppState {
     everything_busy: bool,
     everything_folder_sizes_indexed: Option<bool>,
     pending_right_drops: HashMap<WindowId, (TabId, platform::windows::drag_drop::DropIntent)>,
+    folder_integration_status: Option<platform::windows::shell_integration::ShellIntegrationStatus>,
+    win_e_integration_status: Option<platform::windows::shell_integration::ShellIntegrationStatus>,
+    system_integration_generation: u64,
+    system_integration_busy: bool,
+    folder_integration_error: Option<String>,
+    win_e_integration_error: Option<String>,
     tab_drag: Option<TabDragSession>,
     column_drag: Option<ColumnDragSession>,
 }
@@ -2142,6 +2148,12 @@ impl AppState {
             everything_busy: false,
             everything_folder_sizes_indexed: None,
             pending_right_drops: HashMap::new(),
+            folder_integration_status: None,
+            win_e_integration_status: None,
+            system_integration_generation: 0,
+            system_integration_busy: false,
+            folder_integration_error: None,
+            win_e_integration_error: None,
             tab_drag: None,
             column_drag: None,
         }
@@ -3865,7 +3877,26 @@ struct IconEvent {
     requested_px: u32,
 }
 
-pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> {
+fn startup_locations(
+    restored_locations: Vec<NavigationLocation>,
+    active_index: usize,
+    external_paths: Vec<PathBuf>,
+) -> (Vec<NavigationLocation>, usize) {
+    if external_paths.is_empty() {
+        return (restored_locations, active_index);
+    }
+    let locations = external_paths
+        .into_iter()
+        .map(NavigationLocation::Directory)
+        .collect::<Vec<_>>();
+    let active_index = locations.len().saturating_sub(1);
+    (locations, active_index)
+}
+pub fn run(
+    scenario: Option<AgentScenario>,
+    initial_external_paths: Vec<PathBuf>,
+    external_path_receiver: Option<mpsc::Receiver<Vec<PathBuf>>>,
+) -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
     let network_login_ui = NetworkLoginWindow::new()?;
     let network_location_rename_ui = NetworkLocationRenameWindow::new()?;
@@ -3958,6 +3989,13 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
                 Vec::new(),
             )
         });
+    let additional_windows = if initial_external_paths.is_empty() {
+        additional_windows
+    } else {
+        Vec::new()
+    };
+    let (restored_locations, active_index) =
+        startup_locations(restored_locations, active_index, initial_external_paths);
     ui.window()
         .set_position(slint::PhysicalPosition::new(window.x, window.y));
     ui.window().set_size(slint::LogicalSize::new(
@@ -4211,7 +4249,7 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     start_library_loader(&ui, state.clone(), request_sender.clone());
     start_network_location_loader(&ui, state.clone());
     start_network_discovery_event_pump(&ui, network_discovery_receiver, state.clone());
-
+    refresh_system_integration_state(state.clone());
     refresh_window_ui(&ui, &state, initial_window_id);
     refresh_operation_window(&operation_ui, &state);
     refresh_confirmation_windows(&delete_ui, &conflict_ui, &exit_ui, &state);
@@ -4245,6 +4283,14 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
         }
     }
 
+    if let Some(receiver) = external_path_receiver {
+        start_external_path_pump(
+            receiver,
+            state.clone(),
+            request_sender.clone(),
+            network_request_sender.clone(),
+        );
+    }
     let drag_drop_target_timer =
         wire_native_drag_drop(&ui, operation_sender.clone(), scoped_state.clone());
     let directory_watch_timer = start_directory_watchers(request_sender.clone(), state.clone());
@@ -4425,6 +4471,59 @@ pub fn run(scenario: Option<AgentScenario>) -> Result<(), slint::PlatformError> 
     result
 }
 
+fn start_external_path_pump(
+    receiver: mpsc::Receiver<Vec<PathBuf>>,
+    state: SharedSessions,
+    local_sender: mpsc::Sender<DirectoryRequest>,
+    network_sender: mpsc::SyncSender<DirectoryRequest>,
+) {
+    thread::spawn(move || {
+        while let Ok(paths) = receiver.recv() {
+            let paths = if paths.is_empty() {
+                vec![initial_path()]
+            } else {
+                paths
+            };
+            let state_for_ui = state.clone();
+            let local_for_ui = local_sender.clone();
+            let network_for_ui = network_sender.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                open_external_paths(&state_for_ui, &local_for_ui, &network_for_ui, paths);
+            });
+        }
+    });
+}
+
+fn open_external_paths(
+    state: &SharedSessions,
+    local_sender: &mpsc::Sender<DirectoryRequest>,
+    network_sender: &mpsc::SyncSender<DirectoryRequest>,
+    paths: Vec<PathBuf>,
+) {
+    for path in paths {
+        let tab_id = state
+            .lock()
+            .ok()
+            .map(|mut app| app.create_tab(NavigationLocation::Directory(path.clone())));
+        let Some(tab_id) = tab_id else {
+            continue;
+        };
+        submit_path_navigation(
+            local_sender,
+            network_sender,
+            state,
+            tab_id,
+            path,
+            NavigationKind::Refresh,
+        );
+    }
+    refresh_all_windows(state);
+    let active_window = state.lock().ok().map(|app| app.active_window);
+    if let Some(ui) = active_window.and_then(window_ui) {
+        ui.window().request_redraw();
+        platform::windows::restore_and_focus_window(native_window_handle(&ui));
+    }
+}
 fn submit_navigation(
     sender: &mpsc::Sender<DirectoryRequest>,
     state: &SharedSessions,
@@ -10107,6 +10206,120 @@ fn network_discovery_needed(app: &AppState, window_id: WindowId) -> bool {
         .get(&window_id)
         .is_none_or(|discovery| discovery.devices().is_empty())
 }
+#[derive(Clone, Copy)]
+enum SystemIntegrationAction {
+    EnableFolder,
+    RepairFolder,
+    RestoreFolder,
+    EnableWinE,
+    RepairWinE,
+    RestoreWinE,
+}
+
+impl SystemIntegrationAction {
+    fn error_slot(self, app: &mut AppState) -> &mut Option<String> {
+        match self {
+            Self::EnableFolder | Self::RepairFolder | Self::RestoreFolder => {
+                &mut app.folder_integration_error
+            }
+            Self::EnableWinE | Self::RepairWinE | Self::RestoreWinE => {
+                &mut app.win_e_integration_error
+            }
+        }
+    }
+
+    fn run(self) -> std::io::Result<()> {
+        match self {
+            Self::EnableFolder => platform::windows::shell_integration::enable_folder_open(),
+            Self::RepairFolder => platform::windows::shell_integration::repair_folder_open(),
+            Self::RestoreFolder => platform::windows::shell_integration::restore_folder_open(),
+            Self::EnableWinE => platform::windows::shell_integration::enable_win_e(),
+            Self::RepairWinE => platform::windows::shell_integration::repair_win_e(),
+            Self::RestoreWinE => platform::windows::shell_integration::restore_win_e(),
+        }
+    }
+}
+
+fn refresh_system_integration_state(state: SharedSessions) {
+    let generation = if let Ok(mut app) = state.lock() {
+        app.system_integration_generation =
+            app.system_integration_generation.wrapping_add(1).max(1);
+        app.system_integration_generation
+    } else {
+        return;
+    };
+    thread::spawn(move || {
+        let folder = platform::windows::shell_integration::folder_open_status();
+        let win_e = platform::windows::shell_integration::win_e_status();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Ok(mut app) = state.lock()
+                && app.system_integration_generation == generation
+            {
+                app.folder_integration_error = folder.as_ref().err().map(ToString::to_string);
+                app.win_e_integration_error = win_e.as_ref().err().map(ToString::to_string);
+                app.folder_integration_status = folder.ok();
+                app.win_e_integration_status = win_e.ok();
+            }
+            refresh_all_windows(&state);
+        });
+    });
+}
+
+fn run_system_integration_action(state: SharedSessions, action: SystemIntegrationAction) {
+    if let Ok(mut app) = state.lock() {
+        if app.system_integration_busy {
+            return;
+        }
+        app.system_integration_busy = true;
+        app.system_integration_generation =
+            app.system_integration_generation.wrapping_add(1).max(1);
+        *action.error_slot(&mut app) = None;
+    }
+    refresh_all_windows(&state);
+    thread::spawn(move || {
+        let result = action.run();
+
+        let folder = platform::windows::shell_integration::folder_open_status();
+        let win_e = platform::windows::shell_integration::win_e_status();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Ok(mut app) = state.lock() {
+                app.system_integration_busy = false;
+                *action.error_slot(&mut app) = result.err().map(|error| error.to_string());
+                app.folder_integration_status = folder.ok();
+                app.win_e_integration_status = win_e.ok();
+            }
+            refresh_all_windows(&state);
+        });
+    });
+}
+
+fn wire_system_integration(ui: &AppWindow, state: &WindowSessions) {
+    let shared = state.shared.clone();
+    ui.on_enable_folder_integration({
+        let state = shared.clone();
+        move || run_system_integration_action(state.clone(), SystemIntegrationAction::EnableFolder)
+    });
+    ui.on_repair_folder_integration({
+        let state = shared.clone();
+        move || run_system_integration_action(state.clone(), SystemIntegrationAction::RepairFolder)
+    });
+    ui.on_restore_folder_integration({
+        let state = shared.clone();
+        move || run_system_integration_action(state.clone(), SystemIntegrationAction::RestoreFolder)
+    });
+    ui.on_enable_win_e_integration({
+        let state = shared.clone();
+        move || run_system_integration_action(state.clone(), SystemIntegrationAction::EnableWinE)
+    });
+    ui.on_repair_win_e_integration({
+        let state = shared.clone();
+        move || run_system_integration_action(state.clone(), SystemIntegrationAction::RepairWinE)
+    });
+    ui.on_restore_win_e_integration({
+        let state = shared.clone();
+        move || run_system_integration_action(state.clone(), SystemIntegrationAction::RestoreWinE)
+    });
+}
 #[allow(clippy::too_many_arguments)]
 fn wire_callbacks(
     ui: &AppWindow,
@@ -10129,6 +10342,7 @@ fn wire_callbacks(
     quick_menu: SharedQuickMenu,
     state: WindowSessions,
 ) {
+    wire_system_integration(ui, &state);
     let weak_for_network = ui.as_weak();
     let discovery_sender_for_ui = network_discovery_sender.clone();
     let discovery_state_for_ui = state.clone();
@@ -11624,6 +11838,7 @@ fn wire_callbacks(
             .lock()
             .expect("app state mutex is not poisoned")
             .open_settings();
+        refresh_system_integration_state(state_for_settings.shared.clone());
         if let Some(ui) = weak.upgrade() {
             refresh_ui(&ui, &state_for_settings);
         }
@@ -13092,6 +13307,11 @@ fn wire_mouse_navigation(
     let cursor_position = Cell::new(winit::dpi::PhysicalPosition::new(0.0, 0.0));
     let ctrl_wheel_accumulator = Cell::new(0.0_f32);
     ui.window().on_winit_window_event(move |_, event| {
+        if matches!(event, WindowEvent::Focused(true))
+            && let Ok(mut app) = state.lock()
+        {
+            app.active_window = window_id;
+        }
         if matches!(event, WindowEvent::CloseRequested) {
             if weak
                 .upgrade()
@@ -22488,6 +22708,65 @@ fn directory_display_entries(tab: &TabSession) -> &[FileEntry] {
     }
 }
 
+fn shell_integration_projection(
+    status: Option<&platform::windows::shell_integration::ShellIntegrationStatus>,
+    language: Language,
+) -> (bool, bool, String, Option<PathBuf>) {
+    use platform::windows::shell_integration::{
+        ShellIntegrationRepairReason, ShellIntegrationStatus,
+    };
+    match status {
+        Some(ShellIntegrationStatus::Enabled { executable }) => (
+            true,
+            false,
+            match language {
+                Language::Chinese => "已启用".to_owned(),
+                Language::English => "Enabled".to_owned(),
+            },
+            Some(executable.clone()),
+        ),
+        Some(ShellIntegrationStatus::NeedsRepair {
+            bound_executable,
+            reason,
+        }) => (
+            true,
+            true,
+            match (language, reason) {
+                (Language::Chinese, ShellIntegrationRepairReason::ExecutableMovedOrMissing) => {
+                    "程序已移动或不存在，需要修复".to_owned()
+                }
+                (Language::Chinese, ShellIntegrationRepairReason::RegistryChanged) => {
+                    "Windows 配置已变化，需要修复".to_owned()
+                }
+                (Language::English, ShellIntegrationRepairReason::ExecutableMovedOrMissing) => {
+                    "The program moved or is missing; repair is required".to_owned()
+                }
+                (Language::English, ShellIntegrationRepairReason::RegistryChanged) => {
+                    "Windows settings changed; repair is required".to_owned()
+                }
+            },
+            Some(bound_executable.clone()),
+        ),
+        Some(ShellIntegrationStatus::Disabled) => (
+            false,
+            false,
+            match language {
+                Language::Chinese => "未启用".to_owned(),
+                Language::English => "Disabled".to_owned(),
+            },
+            None,
+        ),
+        None => (
+            false,
+            false,
+            match language {
+                Language::Chinese => "正在读取…".to_owned(),
+                Language::English => "Checking…".to_owned(),
+            },
+            None,
+        ),
+    }
+}
 fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId) {
     let app = state.lock().expect("app state mutex is not poisoned");
     let texts = Texts::new(app.language);
@@ -22514,6 +22793,39 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
             return;
         }
     }
+    let (folder_enabled, folder_needs_repair, folder_status, folder_path) =
+        shell_integration_projection(app.folder_integration_status.as_ref(), app.language);
+    let (win_e_enabled, win_e_needs_repair, win_e_status, win_e_path) =
+        shell_integration_projection(app.win_e_integration_status.as_ref(), app.language);
+    ui.set_folder_integration_enabled(folder_enabled);
+    ui.set_folder_integration_needs_repair(folder_needs_repair);
+    ui.set_win_e_integration_enabled(win_e_enabled);
+    ui.set_win_e_integration_needs_repair(win_e_needs_repair);
+    ui.set_system_integration_busy(app.system_integration_busy);
+    ui.set_folder_integration_status(
+        app.folder_integration_error
+            .as_deref()
+            .unwrap_or(&folder_status)
+            .into(),
+    );
+    ui.set_win_e_integration_status(
+        app.win_e_integration_error
+            .as_deref()
+            .unwrap_or(&win_e_status)
+            .into(),
+    );
+    ui.set_folder_integration_bound_path(
+        folder_path
+            .map(|path| display_path(&path))
+            .unwrap_or_default()
+            .into(),
+    );
+    ui.set_win_e_integration_bound_path(
+        win_e_path
+            .map(|path| display_path(&path))
+            .unwrap_or_default()
+            .into(),
+    );
     let active_is_settings = tab.kind == TabKind::Settings;
     ui.set_active_is_settings(active_is_settings);
     let view_mode = app
@@ -23679,6 +23991,62 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_file_list_quick_search(file_list_quick_search.into());
     ui.set_text_quick_menu_backdrop(quick_menu_backdrop.into());
     ui.set_text_quick_menu_backdrop_opacity(quick_menu_backdrop_opacity.into());
+    let (
+        system_integration,
+        folder_default_title,
+        folder_default_detail,
+        win_e_title,
+        win_e_detail,
+        win_e_risk,
+        integration_status,
+        integration_path_label,
+        integration_enable,
+        integration_repair,
+        integration_restore,
+        integration_experimental,
+    ) = match language {
+        Language::Chinese => (
+            "系统集成",
+            "默认使用 AsterFiles 打开文件夹",
+            "让本地文件夹和磁盘的默认打开动作进入 AsterFiles。仅影响当前用户，不需要管理员权限。",
+            "使用 Win+E 打开 AsterFiles",
+            "将 Windows 的资源管理器快捷键转到 AsterFiles，可与文件夹默认打开独立设置。",
+            "实验功能：依赖 Windows 内部行为，系统更新后可能失效。",
+            "状态：",
+            "程序：",
+            "启用",
+            "修复",
+            "恢复 Windows 文件资源管理器",
+            "实验功能",
+        ),
+        Language::English => (
+            "System integration",
+            "Open folders with AsterFiles by default",
+            "Route the default action for local folders and drives to AsterFiles. This affects only the current user and requires no administrator access.",
+            "Open AsterFiles with Win+E",
+            "Route the Windows File Explorer shortcut to AsterFiles independently of folder handling.",
+            "Experimental: this depends on internal Windows behavior and may stop working after an update.",
+            "Status:",
+            "Program:",
+            "Enable",
+            "Repair",
+            "Restore Windows File Explorer",
+            "Experimental",
+        ),
+    };
+    ui.set_text_system_integration(system_integration.into());
+    ui.set_text_folder_default_title(folder_default_title.into());
+    ui.set_text_folder_default_detail(folder_default_detail.into());
+    ui.set_text_win_e_title(win_e_title.into());
+    ui.set_text_win_e_detail(win_e_detail.into());
+    ui.set_text_win_e_risk(win_e_risk.into());
+    ui.set_text_integration_status(integration_status.into());
+
+    ui.set_text_integration_path_label(integration_path_label.into());
+    ui.set_text_integration_enable(integration_enable.into());
+    ui.set_text_integration_repair(integration_repair.into());
+    ui.set_text_integration_restore(integration_restore.into());
+    ui.set_text_integration_experimental(integration_experimental.into());
     ui.set_text_settings_general(settings_general.into());
     ui.set_text_settings_appearance(settings_appearance.into());
     ui.set_text_settings_developer(settings_developer.into());
@@ -23853,6 +24221,42 @@ mod tests {
             app.operations.mark_running(id).unwrap();
         }
         (app, id)
+    }
+
+    #[test]
+    fn external_startup_paths_replace_restored_session_and_activate_last_path() {
+        let restored = vec![NavigationLocation::Directory(PathBuf::from(r"C:\Restored"))];
+        let external = vec![
+            PathBuf::from(r"C:\Folder With Spaces"),
+            PathBuf::from(r"C:\中文"),
+        ];
+
+        let (locations, active) = startup_locations(restored, 0, external.clone());
+
+        assert_eq!(active, 1);
+        assert_eq!(
+            locations,
+            external
+                .into_iter()
+                .map(NavigationLocation::Directory)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn external_paths_open_as_new_tabs_in_the_active_window() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\Existing")], 0, [0, 1, 2, 3]);
+        let existing = app.active_window_state().active_tab;
+        let first = app.create_tab(NavigationLocation::Directory(PathBuf::from(r"C:\One")));
+        let second = app.create_tab(NavigationLocation::Directory(PathBuf::from(r"C:\Two")));
+
+        assert_ne!(existing, first);
+        assert_ne!(first, second);
+        assert_eq!(app.active_window_state().active_tab, second);
+        assert_eq!(
+            app.active_window_state().tab_order,
+            [existing, first, second]
+        );
     }
 
     #[test]
@@ -27031,6 +27435,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn external_tabs_are_created_in_the_most_recent_window() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("first")], 0, [0, 1, 2, 3]);
+        let first_window = app.active_window;
+        let first_tab = app.active_window_state().active_tab;
+        let second_window = app.register_window(
+            vec![NavigationLocation::Directory(PathBuf::from("second"))],
+            0,
+            test_window_placement(160),
+        );
+        app.active_window = second_window;
+
+        let external = app.create_tab(NavigationLocation::Directory(PathBuf::from("external")));
+
+        assert_eq!(app.window(first_window).unwrap().tab_order, [first_tab]);
+        assert_eq!(app.window(second_window).unwrap().active_tab, external);
+        assert_eq!(app.window(second_window).unwrap().tab_order.len(), 2);
+    }
     #[test]
     fn window_registry_allocates_global_tab_ids_without_reuse() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("one")], 0, [0, 1, 2, 3]);

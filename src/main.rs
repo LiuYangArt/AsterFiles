@@ -35,8 +35,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     };
 
-    let agent_options = agent_debug::AgentOptions::from_env()
+    let mut agent_options = agent_debug::AgentOptions::from_env()
         .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+    let external_paths = agent_options.take_external_paths();
 
     if let Some(scenario) = agent_options.scenario {
         if scenario == agent_debug::AgentScenario::FileOperationCenter {
@@ -273,6 +274,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let (external_paths, mut primary_instance) =
+        match platform::windows::single_instance::coordinate(&external_paths)? {
+            platform::windows::single_instance::InstanceOutcome::Primary(primary) => {
+                (external_paths, Some(primary))
+            }
+            platform::windows::single_instance::InstanceOutcome::Forwarded => return Ok(()),
+            platform::windows::single_instance::InstanceOutcome::Fallback => {
+                eprintln!(
+                    "AsterFiles could not contact the running instance; starting a fallback window."
+                );
+                (external_paths, None)
+            }
+        };
     #[cfg(windows)]
     {
         use slint::winit_030::winit::platform::windows::{
@@ -317,7 +331,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .select()?;
     }
 
-    app::run(agent_options.scenario)?;
+    let external_path_receiver = primary_instance
+        .as_mut()
+        .map(platform::windows::single_instance::PrimaryInstance::take_receiver);
+    app::run(
+        agent_options.scenario,
+        external_paths,
+        external_path_receiver,
+    )?;
+    drop(primary_instance);
     Ok(())
 }
 

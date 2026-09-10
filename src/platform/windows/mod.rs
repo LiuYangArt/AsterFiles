@@ -12,7 +12,10 @@ pub mod libraries;
 pub mod network;
 pub mod quick_access;
 pub mod quick_menu_window;
+pub mod shell_integration;
 pub mod shortcut;
+pub mod single_instance;
+
 pub mod tab_insertion_indicator;
 pub mod window_trace;
 
@@ -53,6 +56,18 @@ pub fn move_window(hwnd: isize, x: i32, y: i32) -> io::Result<()> {
     Ok(())
 }
 
+pub fn restore_and_focus_window(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SW_RESTORE, SetForegroundWindow, ShowWindow,
+    };
+
+    if hwnd != 0 {
+        unsafe {
+            ShowWindow(hwnd as windows_sys::Win32::Foundation::HWND, SW_RESTORE);
+            SetForegroundWindow(hwnd as windows_sys::Win32::Foundation::HWND);
+        }
+    }
+}
 pub fn show_error_dialog(owner: isize, title: &str, message: &str) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TASKMODAL, MessageBoxW,
