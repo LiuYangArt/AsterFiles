@@ -5,6 +5,7 @@ pub mod copy_file;
 #[allow(dead_code)]
 pub mod directory_watch;
 pub mod drag_drop;
+pub mod drives;
 pub mod everything;
 pub mod everything_file_picker;
 pub mod file_operation;

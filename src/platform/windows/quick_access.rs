@@ -120,6 +120,7 @@ mod tests {
             kind: KnownLocationKind::Pinned,
             label: "项目".into(),
             path: original.clone(),
+            drive_root: None,
         };
         assert!(contains(&[item], &original));
     }
@@ -130,6 +131,7 @@ mod tests {
             kind: KnownLocationKind::Pinned,
             label: "Assets".into(),
             path: PathBuf::from(r"D:\Assets"),
+            drive_root: None,
         }];
         assert!(contains(&items, Path::new(r"d:\assets")));
         assert!(!contains(&items, Path::new(r"D:\Other")));

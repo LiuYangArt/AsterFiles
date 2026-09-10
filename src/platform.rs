@@ -16,6 +16,7 @@ pub struct KnownLocation {
     pub kind: KnownLocationKind,
     pub label: String,
     pub path: PathBuf,
+    pub drive_root: Option<PathBuf>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShortcutTarget {
@@ -99,6 +100,7 @@ mod windows_impl {
                     kind: KnownLocationKind::Home,
                     label: "主页".to_owned(),
                     path,
+                    drive_root: None,
                 }]
             })
             .unwrap_or_default();
@@ -184,6 +186,7 @@ mod windows_impl {
                 kind: KnownLocationKind::Pinned,
                 label,
                 path,
+                drive_root: None,
             });
         }
         return Ok(result);
@@ -232,22 +235,24 @@ mod windows_impl {
             .filter(move |index| mask & (1 << index) != 0)
             .map(|index| {
                 let letter = (b'A' + index as u8) as char;
-                let path = PathBuf::from(format!(r"{letter}:\"));
-                let volume = volume_label(&path);
+                let drive_root = PathBuf::from(format!(r"{letter}:\"));
+                let volume = volume_label(&drive_root);
                 let label = if volume.is_empty() {
                     format!("{letter}:")
                 } else {
                     format!("{volume} ({letter}:)")
                 };
-                let path = if drive_is_remote(&path) {
-                    super::windows::network::network_drive_to_unc(&path).unwrap_or(path)
+                let path = if drive_is_remote(&drive_root) {
+                    super::windows::network::network_drive_to_unc(&drive_root)
+                        .unwrap_or_else(|_| drive_root.clone())
                 } else {
-                    path
+                    drive_root.clone()
                 };
                 KnownLocation {
                     kind: KnownLocationKind::Drive,
                     label,
                     path,
+                    drive_root: Some(drive_root),
                 }
             })
     }

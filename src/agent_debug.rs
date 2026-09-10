@@ -39,6 +39,7 @@ pub enum AgentScenario {
     QuickMenuSearch,
     QuickMenuPopup,
     NetworkFoundation,
+    DriveCapacity,
     FileListTypeSelect,
 }
 
@@ -60,6 +61,7 @@ impl AgentScenario {
             Self::QuickMenuSearch => "quick-menu-search",
             Self::QuickMenuPopup => "quick-menu-popup",
             Self::NetworkFoundation => "network-foundation",
+            Self::DriveCapacity => "drive-capacity",
             Self::FileListTypeSelect => "file-list-type-select",
         }
     }
@@ -69,6 +71,9 @@ impl AgentScenario {
             Self::WindowsLibraries => Path::new(DEFAULT_STATE_DIR)
                 .join("windows-libraries")
                 .join("foundation.json"),
+            Self::DriveCapacity => Path::new(DEFAULT_STATE_DIR)
+                .join("drives")
+                .join("capacity.json"),
             _ => Path::new(DEFAULT_STATE_DIR).join(format!("{}.json", self.name())),
         }
     }
@@ -149,6 +154,7 @@ fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
         "quick-menu-search" => Ok(AgentScenario::QuickMenuSearch),
         "quick-menu-popup" => Ok(AgentScenario::QuickMenuPopup),
         "network-foundation" => Ok(AgentScenario::NetworkFoundation),
+        "drive-capacity" => Ok(AgentScenario::DriveCapacity),
         "file-list-type-select" => Ok(AgentScenario::FileListTypeSelect),
         _ => Err(format!("unknown agent scenario: {value}")),
     }
@@ -224,6 +230,7 @@ pub fn apply_scenario(session: &mut TabSession, scenario: AgentScenario) {
         | AgentScenario::QuickMenuSearch
         | AgentScenario::QuickMenuPopup
         | AgentScenario::NetworkFoundation
+        | AgentScenario::DriveCapacity
         | AgentScenario::FileListTypeSelect => {
             session.current_location = Some(crate::domain::NavigationLocation::Directory(
                 PathBuf::from(r"C:\AgentScenarios\FolderSizes"),
@@ -449,6 +456,17 @@ mod tests {
         assert_eq!(
             scenario.default_path(),
             PathBuf::from("artifacts/state/windows-libraries/foundation.json")
+        );
+    }
+    #[test]
+    fn drive_capacity_scenario_has_stable_name_and_nested_default_path() {
+        let scenario = parse_scenario("drive-capacity").expect("scenario is registered");
+
+        assert_eq!(scenario, AgentScenario::DriveCapacity);
+        assert_eq!(scenario.name(), "drive-capacity");
+        assert_eq!(
+            scenario.default_path(),
+            PathBuf::from("artifacts/state/drives/capacity.json")
         );
     }
     #[test]

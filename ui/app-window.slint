@@ -8,7 +8,7 @@ export struct GridRow { group-header: bool, group-label: string, group-detail: s
 export struct HistoryRow { index: int, label: string }
 export struct BreadcrumbRow { index: int, label: string, current: bool }
 export struct TabRow { id: int, title: string, active: bool, loading: bool, icon: image, is-drive: bool, is-settings: bool }
-export struct SidebarRow { index: int, stable-id: string, label: string, icon-kind: int, group-kind: int, source-kind: int, is-drive: bool, icon: image }
+export struct SidebarRow { index: int, stable-id: string, label: string, icon-kind: int, group-kind: int, source-kind: int, is-drive: bool, icon: image, drive-progress: float, drive-state: int, drive-status: string }
 export struct ColumnRow { kind: int, label: string, visible: bool, min-width: length, content-left: length, content-right: length, icon-slot: length }
 export struct ContextCommandRow { id: int, node-id: int, label: string, search-text: string, hint: string, enabled: bool, separator: bool, shell: bool, checked: bool, default: bool, submenu: bool, loading: bool, placeholder: bool, icon-kind: int }
 export struct OperationRow { id: int, title: string, status: string, queue: string, failure-summary: string, accessible-label: string, source-line: string, destination-line: string, current-item-line: string, percent: string, file-progress: string, transferred: string, speed: string, eta: string, progress: float, progress-known: bool, state: int, paused: bool, pause-pending: bool, cancel-pending: bool, can-pause: bool, can-cancel: bool, can-retry: bool }
@@ -23,6 +23,10 @@ export global VisualStyle {
     out property <color> c4f6bed: dark-theme ? #7fa0ff : #4f6bed;
     out property <color> rectangle-selection-fill: dark-theme ? #7fa0ff1a : #4f6bed1a;
     out property <color> rectangle-selection-border: dark-theme ? #7fa0ff99 : #4f6bed99;
+    out property <color> drive-progress-track: dark-theme ? #55585c : #c9ccd1;
+    out property <color> drive-progress-fill: dark-theme ? #7fa0ff : #4f6bed;
+    out property <color> drive-progress-warning: dark-theme ? #ff8c82 : #c42b1c;
+    out property <color> drive-progress-unavailable: dark-theme ? #686868 : #aeb1b6;
     out property <color> c62656f: dark-theme ? #c6c6c6 : #62656f;
     out property <color> c666a74: dark-theme ? #bcbcbc : #666a74;
     out property <color> c696b74: dark-theme ? #bdbdbd : #696b74;
@@ -1562,12 +1566,35 @@ export component AppWindow inherits Window {
                         accessible-role: button; accessible-label: location.label;
                     }
                     SidebarGroupHeader { visible: root.drives-visible; height: self.visible ? 30px : 0px; label: root.text-drives; expanded: root.drives-expanded; toggled => { root.drives-expanded = !root.drives-expanded; sidebar-scroll.clamp-viewport(); } }
-                    for location in root.sidebar-items: Rectangle {
+                    for location in root.sidebar-items: drive-row := Rectangle {
                         visible: root.drives-visible && location.group-kind == 1 && root.drives-expanded;
-                        height: self.visible ? 30px : 0px; border-radius: 5px; background: drive-touch.pressed ? VisualStyle.cdde3ed : drive-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
-                        HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.location-drive; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
+                        height: self.visible ? 40px : 0px;
+                        border-radius: 5px;
+                        background: drive-touch.pressed ? VisualStyle.cdde3ed : drive-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
+                        HorizontalLayout {
+                            padding-left: 8px; padding-right: 8px; spacing: 10px;
+                            InlineIcon { icon-size: 16px; icon-source: location.icon.width != 0 ? location.icon : IconMap.location-drive; }
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                Text { y: 2px; width: parent.width; height: 21px; text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; }
+                                drive-track := Rectangle {
+                                    y: 28px; width: parent.width; height: 3px; border-radius: 2px; clip: true;
+                                    background: location.drive-state == 3 ? VisualStyle.drive-progress-unavailable : VisualStyle.drive-progress-track;
+                                    Rectangle {
+                                        visible: location.drive-state != 3;
+                                        x: location.drive-state == 0 ? -parent.width * 0.35 + parent.width * 1.35 * mod(animation-tick(), 1400ms) / 1400ms : 0px;
+                                        width: location.drive-state == 0 ? parent.width * 0.35 : parent.width * max(0, min(1, location.drive-progress));
+                                        height: parent.height;
+                                        border-radius: parent.border-radius;
+                                        background: location.drive-state == 2 ? VisualStyle.drive-progress-warning : VisualStyle.drive-progress-fill;
+                                    }
+                                }
+                            }
+                        }
                         drive-touch := TouchArea { mouse-cursor: pointer; clicked => { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.width - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.height - root.absolute-position.y) / 1px; root.navigate-sidebar(location.index); } pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.stable-id != "" { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px; root.show-sidebar-menu(location.group-kind, location.stable-id, root.sidebar-keyboard-anchor-x, root.sidebar-keyboard-anchor-y); } } }
-                        accessible-role: button; accessible-label: location.label;
+                        accessible-role: button;
+                        accessible-label: location.drive-status == "" ? location.label : location.label + ", " + location.drive-status;
+                        if location.drive-status != "": Tooltip { text: @markdown("\{location.drive-status}"); }
                     }
                     SidebarGroupHeader { visible: root.network-locations-visible; height: self.visible ? 30px : 0px; label: root.text-network-locations; expanded: root.network-locations-expanded; toggled => { root.network-locations-expanded = !root.network-locations-expanded; sidebar-scroll.clamp-viewport(); } }
                     for location in root.sidebar-items: Rectangle {

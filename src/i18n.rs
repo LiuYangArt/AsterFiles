@@ -89,6 +89,20 @@ impl Texts {
         )
     }
 
+    pub fn drive_usage_loading(self) -> &'static str {
+        self.choose("正在读取磁盘占用", "Checking drive usage")
+    }
+
+    pub fn drive_usage_unavailable(self) -> &'static str {
+        self.choose("磁盘占用信息不可用", "Drive usage unavailable")
+    }
+
+    pub fn drive_usage_status(self, warning: bool) -> &'static str {
+        match warning {
+            true => self.choose("磁盘空间不足", "Low disk space"),
+            false => self.choose("磁盘占用正常", "Drive usage normal"),
+        }
+    }
     pub fn sidebar_categories(self) -> [&'static str; 5] {
         match self.language {
             Language::Chinese => ["快速访问", "库", "磁盘", "网络位置", "网络"],

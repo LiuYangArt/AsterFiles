@@ -60,6 +60,14 @@ cargo run -- --agent-scenario drag-drop-foundation --no-ui
 
 统一验证写入 `artifacts/state/drag-drop/foundation.json`。`drag_drop` 对象包含生命周期、是否注册、源数量、目标、协商效果、拒绝原因、最后事件和事件序号。无界面场景固定为 `unregistered`；真实窗口创建后才在主 winit/STA 线程完成注册。生命周期测试直接验证多窗口逐个注销、重复注销、统一退出注销和线程本地清理，保证每个窗口最多成功注销一次，且析构阶段不再调用 Windows 拖放撤销接口。
 
+## Issue #16 侧栏磁盘占用条
+
+```powershell
+cargo run -- --agent-scenario drive-capacity --no-ui --agent-state-out artifacts/state/drives/capacity.json
+cargo test issue_16_ -- --nocapture
+```
+
+无界面场景只使用确定性内存夹具，不启动窗口、不读取真实磁盘容量，也不访问 Shell、网络或目录。产物覆盖占用比例、零容量、防溢出、10% 警戒阈值、查询中与不可用状态、侧栏加载代次，以及文件任务完成后只刷新受影响卷。真实容量与 Windows 属性页对照、光驱无介质、断开映射盘、移动盘热插拔、窗口重新激活刷新、浅色/深色和 100%/125%/150% DPI 由用户手动验收；结构化运行日志写入 `artifacts/logs/drives/`，性能证据写入 `artifacts/perf/drives/`。
 ## Issue #15 快速访问
 
 ```powershell

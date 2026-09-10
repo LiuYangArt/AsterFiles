@@ -90,6 +90,11 @@ SCENARIOS = [
         STATE_DIR / "quick-access" / "state.json",
     ),
     (
+        "agent-drive-capacity",
+        "drive-capacity",
+        STATE_DIR / "drives" / "capacity.json",
+    ),
+    (
         "agent-file-list-type-select",
         "file-list-type-select",
         STATE_DIR / "file-list" / "type-select.json",

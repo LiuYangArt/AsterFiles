@@ -53,6 +53,22 @@ class VerifyTests(unittest.TestCase):
             ],
         )
 
+    def test_drive_capacity_scenario_uses_debug_and_stable_artifact(self) -> None:
+        steps = dict(verify.scenario_steps())
+        command = steps["agent-drive-capacity"]
+
+        self.assertEqual(command[0], str(verify.DEBUG))
+        self.assertEqual(
+            command[1:],
+            [
+                "--agent-scenario",
+                "drive-capacity",
+                "--no-ui",
+                "--agent-state-out",
+                str(verify.STATE_DIR / "drives" / "capacity.json"),
+            ],
+        )
+
     def test_file_operation_center_uses_one_mixed_task_artifact(self) -> None:
         steps = dict(verify.scenario_steps())
         command = steps["agent-file-operation-center"]

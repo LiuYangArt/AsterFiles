@@ -171,6 +171,58 @@ impl TypeSelectState {
     }
 }
 
+pub fn export_drive_capacity_state(path: &Path) -> io::Result<()> {
+    let normal = platform::windows::drives::DriveCapacity {
+        total: 1_000,
+        available: 250,
+    };
+    let warning = platform::windows::drives::DriveCapacity {
+        total: 1_000,
+        available: 99,
+    };
+    let zero = platform::windows::drives::DriveCapacity {
+        total: 0,
+        available: 0,
+    };
+    let stale_rejected = {
+        let current_generation = 2_u64;
+        let stale_generation = 1_u64;
+        stale_generation != current_generation
+    };
+    let affected = affected_drive_roots(&[
+        PathBuf::from(r"C:\Users\Example"),
+        PathBuf::from(r"D:\Work"),
+        PathBuf::from(r"C:\Temp"),
+        PathBuf::from(r"\\server\share"),
+    ]);
+    let state = format!(
+        concat!(
+            "{{\n",
+            "  \"schema_version\": 1,\n",
+            "  \"scenario\": \"drive-capacity\",\n",
+            "  \"scope\": \"pure_model_no_disk_io_no_ui\",\n",
+            "  \"normal_used_ratio\": {:.2},\n",
+            "  \"warning_used_ratio\": {:.3},\n",
+            "  \"warning_below_ten_percent\": {},\n",
+            "  \"zero_total_safe\": {},\n",
+            "  \"stale_generation_rejected\": {},\n",
+            "  \"affected_local_roots\": {},\n",
+            "  \"unc_excluded_from_local_refresh\": {}\n",
+            "}}\n"
+        ),
+        normal.used_ratio(),
+        warning.used_ratio(),
+        warning.is_low_space(),
+        zero.used_ratio() == 0.0 && !zero.is_low_space(),
+        stale_rejected,
+        affected.len(),
+        !affected.contains(Path::new(r"\\server\share")),
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, state)
+}
 pub fn export_file_list_type_select_state(path: &Path) -> io::Result<()> {
     let context = TypeSelectContext {
         tab_id: TabId(1),
@@ -1884,6 +1936,49 @@ fn unmatched_tab_drop_action(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriveCapacityStatus {
+    Loading,
+    Ready,
+    Unavailable,
+}
+
+#[derive(Debug, Clone)]
+struct DriveCapacityState {
+    status: DriveCapacityStatus,
+    total: u64,
+    available: u64,
+    last_updated: Option<Instant>,
+    request_generation: u64,
+}
+
+impl DriveCapacityState {
+    fn loading(request_generation: u64) -> Self {
+        Self {
+            status: DriveCapacityStatus::Loading,
+            total: 0,
+            available: 0,
+            last_updated: None,
+            request_generation,
+        }
+    }
+
+    fn apply(&mut self, result: io::Result<platform::windows::drives::DriveCapacity>) {
+        self.last_updated = Some(Instant::now());
+        match result {
+            Ok(capacity) => {
+                self.status = DriveCapacityStatus::Ready;
+                self.total = capacity.total;
+                self.available = capacity.available;
+            }
+            Err(_) => {
+                self.status = DriveCapacityStatus::Unavailable;
+                self.total = 0;
+                self.available = 0;
+            }
+        }
+    }
+}
 #[derive(Debug)]
 struct AppState {
     windows: HashMap<WindowId, WindowState>,
@@ -1924,6 +2019,8 @@ struct AppState {
     shortcut_requests: HashSet<ShortcutRequest>,
     shortcut_completed: HashSet<ShortcutRequest>,
     sidebar: Vec<KnownLocation>,
+    drive_capacity: HashMap<PathBuf, DriveCapacityState>,
+    drive_generation: u64,
     quick_access_generation: u64,
     quick_access_pending: HashSet<PathBuf>,
 
@@ -2177,6 +2274,8 @@ impl AppState {
             shortcut_requests: HashSet::new(),
             shortcut_completed: HashSet::new(),
             sidebar: Vec::new(),
+            drive_capacity: HashMap::new(),
+            drive_generation: 0,
             quick_access_generation: 0,
             quick_access_pending: HashSet::new(),
 
@@ -4365,6 +4464,7 @@ pub fn run(
     let drag_drop_target_timer =
         wire_native_drag_drop(&ui, operation_sender.clone(), scoped_state.clone());
     let directory_watch_timer = start_directory_watchers(request_sender.clone(), state.clone());
+    let drive_capacity_timer = start_drive_capacity_timer(state.clone());
     WINDOW_RUNTIMES.with_borrow_mut(|runtimes| {
         runtimes.insert(
             initial_window_id,
@@ -4409,6 +4509,7 @@ pub fn run(
         coordinator.cancel();
     }
     drop(directory_watch_timer);
+    drop(drive_capacity_timer);
     for weak in [delete_weak, conflict_weak, exit_weak] {
         if let Some(window) = weak.upgrade() {
             let _ = window.hide();
@@ -13384,10 +13485,11 @@ fn wire_mouse_navigation(
     let cursor_position = Cell::new(winit::dpi::PhysicalPosition::new(0.0, 0.0));
     let ctrl_wheel_accumulator = Cell::new(0.0_f32);
     ui.window().on_winit_window_event(move |_, event| {
-        if matches!(event, WindowEvent::Focused(true))
-            && let Ok(mut app) = state.lock()
-        {
-            app.active_window = window_id;
+        if matches!(event, WindowEvent::Focused(true)) {
+            if let Ok(mut app) = state.lock() {
+                app.active_window = window_id;
+            }
+            begin_drive_capacity_refresh(&state, None, Duration::from_secs(15));
         }
         if matches!(event, WindowEvent::CloseRequested) {
             if weak
@@ -18459,6 +18561,14 @@ fn start_file_operation_event_pump(
                             let _ = sender.send(request);
                         }
                         refresh_operation_badges(&state);
+                        let affected_roots = affected_drive_roots(&affected);
+                        if !affected_roots.is_empty() {
+                            begin_drive_capacity_refresh(
+                                &state,
+                                Some(&affected_roots),
+                                Duration::ZERO,
+                            );
+                        }
                         refresh_affected_tabs(
                             &directory_sender,
                             &network_directory_sender,
@@ -21196,6 +21306,70 @@ fn spawn_icon_workers(
     (request_sender, event_receiver)
 }
 
+fn drive_projection(
+    language: Language,
+    capacity: Option<&DriveCapacityState>,
+) -> (f32, i32, String) {
+    let texts = Texts::new(language);
+    match capacity {
+        Some(capacity) if capacity.status == DriveCapacityStatus::Unavailable => {
+            (0.0, 3, texts.drive_usage_unavailable().to_owned())
+        }
+        Some(capacity) if capacity.status == DriveCapacityStatus::Ready => {
+            let progress =
+                platform::windows::drives::used_ratio(capacity.total, capacity.available);
+            let warning =
+                platform::windows::drives::is_low_space(capacity.total, capacity.available);
+            (
+                progress,
+                if warning { 2 } else { 1 },
+                texts.drive_usage_status(warning).to_owned(),
+            )
+        }
+        None | Some(_) => (0.0, 0, texts.drive_usage_loading().to_owned()),
+    }
+}
+
+fn update_drive_sidebar_rows(state: &SharedSessions, root: &Path) {
+    let projection = {
+        let Ok(app) = state.lock() else { return };
+        let row_index = app
+            .sidebar
+            .iter()
+            .position(|location| location.drive_root.as_deref() == Some(root));
+        row_index.map(|index| {
+            (
+                index,
+                drive_projection(app.language, app.drive_capacity.get(root)),
+            )
+        })
+    };
+    let Some((index, (progress, drive_state, status))) = projection else {
+        return;
+    };
+    let windows = WINDOW_RUNTIMES.with_borrow(|runtimes| {
+        runtimes
+            .values()
+            .map(|runtime| runtime.ui.clone_strong())
+            .collect::<Vec<_>>()
+    });
+    for ui in windows {
+        let rows = ui.get_sidebar_items();
+        let Some(model) = rows.as_any().downcast_ref::<VecModel<SidebarRow>>() else {
+            continue;
+        };
+        let Some(mut row) = model.row_data(index) else {
+            continue;
+        };
+        if !row.is_drive {
+            continue;
+        }
+        row.drive_progress = progress;
+        row.drive_state = drive_state;
+        row.drive_status = status.clone().into();
+        model.set_row_data(index, row);
+    }
+}
 fn start_sidebar_icon_loader(ui: &AppWindow, state: SharedSessions) {
     let locations = state
         .lock()
@@ -21232,6 +21406,15 @@ fn start_sidebar_icon_loader(ui: &AppWindow, state: SharedSessions) {
     });
 }
 
+fn start_drive_capacity_timer(state: SharedSessions) -> slint::Timer {
+    let timer = slint::Timer::default();
+    timer.start(
+        slint::TimerMode::Repeated,
+        Duration::from_secs(15),
+        move || begin_drive_capacity_refresh(&state, None, Duration::from_secs(60)),
+    );
+    timer
+}
 fn start_sidebar_loader(ui: &AppWindow, state: SharedSessions) {
     reload_quick_access(ui.as_weak(), state);
 }
@@ -21247,10 +21430,16 @@ fn reload_quick_access(weak: slint::Weak<AppWindow>, state: SharedSessions) {
         let state_for_ui = state.clone();
         let weak_for_icons = weak.clone();
         let _ = weak.upgrade_in_event_loop(move |ui| {
-            if let Ok(mut app) = state_for_ui.lock()
+            let accepted = if let Ok(mut app) = state_for_ui.lock()
                 && app.quick_access_generation == generation
             {
                 app.sidebar = locations;
+                true
+            } else {
+                false
+            };
+            if accepted {
+                begin_drive_capacity_refresh(&state_for_ui, None, Duration::ZERO);
             }
             refresh_all_windows(&state_for_ui);
             if let Some(owner) = weak_for_icons.upgrade() {
@@ -21260,6 +21449,127 @@ fn reload_quick_access(weak: slint::Weak<AppWindow>, state: SharedSessions) {
             }
         });
     });
+}
+
+fn begin_drive_capacity_refresh(
+    state: &SharedSessions,
+    requested_roots: Option<&HashSet<PathBuf>>,
+    minimum_age: Duration,
+) {
+    let requests = {
+        let Ok(mut app) = state.lock() else { return };
+        let roots = app
+            .sidebar
+            .iter()
+            .filter_map(|location| location.drive_root.clone())
+            .collect::<HashSet<_>>();
+        app.drive_capacity.retain(|root, _| roots.contains(root));
+        let now = Instant::now();
+        let mut requests = Vec::new();
+        for root in roots {
+            if requested_roots.is_some_and(|targets| !targets.contains(&root)) {
+                continue;
+            }
+
+            let should_refresh = app.drive_capacity.get(&root).is_none_or(|capacity| {
+                capacity.status != DriveCapacityStatus::Loading
+                    && capacity
+                        .last_updated
+                        .is_none_or(|updated| now.saturating_duration_since(updated) >= minimum_age)
+            });
+            if should_refresh {
+                app.drive_generation = app.drive_generation.wrapping_add(1).max(1);
+                let generation = app.drive_generation;
+                app.drive_capacity
+                    .insert(root.clone(), DriveCapacityState::loading(generation));
+                requests.push((root, generation));
+            }
+        }
+        requests
+    };
+    for root in requests.iter().map(|(root, _)| root) {
+        update_drive_sidebar_rows(state, root);
+    }
+    for (root, generation) in requests {
+        let timeout_state = state.clone();
+        let timeout_root = root.clone();
+        slint::Timer::single_shot(Duration::from_secs(10), move || {
+            let timed_out = if let Ok(mut app) = timeout_state.lock()
+                && app
+                    .drive_capacity
+                    .get(&timeout_root)
+                    .is_some_and(|capacity| {
+                        capacity.status == DriveCapacityStatus::Loading
+                            && capacity.request_generation == generation
+                    }) {
+                if let Some(capacity) = app.drive_capacity.get_mut(&timeout_root) {
+                    capacity.status = DriveCapacityStatus::Unavailable;
+                    capacity.last_updated = Some(Instant::now());
+                    capacity.request_generation =
+                        capacity.request_generation.wrapping_add(1).max(1);
+                }
+                true
+            } else {
+                false
+            };
+            if timed_out {
+                eprintln!(
+                    "{{\"event\":\"drive_capacity_timed_out\",\"root\":{:?},\"generation\":{generation}}}",
+                    timeout_root
+                );
+                update_drive_sidebar_rows(&timeout_state, &timeout_root);
+            }
+        });
+        let state_for_result = state.clone();
+        thread::spawn(move || {
+            let result = platform::windows::drives::query_capacity(&root);
+            let root_for_log = root.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let accepted = if let Ok(mut app) = state_for_result.lock() {
+                    let still_present = app
+                        .sidebar
+                        .iter()
+                        .any(|location| location.drive_root.as_ref() == Some(&root));
+                    if still_present
+                        && app
+                            .drive_capacity
+                            .get(&root)
+                            .is_some_and(|capacity| capacity.request_generation == generation)
+                    {
+                        if let Some(capacity) = app.drive_capacity.get_mut(&root) {
+                            capacity.apply(result);
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if accepted {
+                    eprintln!(
+                        "{{\"event\":\"drive_capacity_updated\",\"root\":{:?},\"generation\":{generation}}}",
+                        root_for_log
+                    );
+                    update_drive_sidebar_rows(&state_for_result, &root);
+                }
+            });
+        });
+    }
+}
+
+fn drive_root_for_path(path: &Path) -> Option<PathBuf> {
+    let value = path.as_os_str().to_string_lossy();
+    let bytes = value.as_bytes();
+    (bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic())
+        .then(|| PathBuf::from(format!("{}:\\", (bytes[0] as char).to_ascii_uppercase())))
+}
+
+fn affected_drive_roots(paths: &[PathBuf]) -> HashSet<PathBuf> {
+    paths
+        .iter()
+        .filter_map(|path| drive_root_for_path(path))
+        .collect()
 }
 
 fn library_stable_id(identity: &std::ffi::OsStr) -> String {
@@ -23178,34 +23488,45 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
         .sidebar
         .iter()
         .enumerate()
-        .map(|(index, location)| SidebarRow {
-            index: index as i32,
-            stable_id: format!("location:{index}").into(),
-            label: match (app.language, location.kind) {
-                (Language::Chinese, KnownLocationKind::Home) => "主页",
-                (Language::English, KnownLocationKind::Home) => "Home",
-                (_, KnownLocationKind::Pinned | KnownLocationKind::Drive) => {
-                    location.label.as_str()
+        .map(|(index, location)| {
+            let (drive_progress, drive_state, drive_status) =
+                if let Some(root) = location.drive_root.as_deref() {
+                    drive_projection(app.language, app.drive_capacity.get(root))
+                } else {
+                    (0.0, 3, String::new())
+                };
+            SidebarRow {
+                index: index as i32,
+                stable_id: format!("location:{index}").into(),
+                label: match (app.language, location.kind) {
+                    (Language::Chinese, KnownLocationKind::Home) => "主页",
+                    (Language::English, KnownLocationKind::Home) => "Home",
+                    (_, KnownLocationKind::Pinned | KnownLocationKind::Drive) => {
+                        location.label.as_str()
+                    }
                 }
+                .into(),
+                icon_kind: match location.kind {
+                    KnownLocationKind::Home => 0,
+                    KnownLocationKind::Drive => 7,
+                    KnownLocationKind::Pinned => 3,
+                },
+                is_drive: location.kind == KnownLocationKind::Drive,
+                drive_progress,
+                drive_state,
+                drive_status: drive_status.into(),
+                group_kind: if location.kind == KnownLocationKind::Drive {
+                    1
+                } else {
+                    0
+                },
+                source_kind: 0,
+                icon: app
+                    .sidebar_icons
+                    .get(&location.path)
+                    .map(shell_icon_image)
+                    .unwrap_or_default(),
             }
-            .into(),
-            icon_kind: match location.kind {
-                KnownLocationKind::Home => 0,
-                KnownLocationKind::Drive => 7,
-                KnownLocationKind::Pinned => 3,
-            },
-            is_drive: location.kind == KnownLocationKind::Drive,
-            group_kind: if location.kind == KnownLocationKind::Drive {
-                1
-            } else {
-                0
-            },
-            source_kind: 0,
-            icon: app
-                .sidebar_icons
-                .get(&location.path)
-                .map(shell_icon_image)
-                .unwrap_or_default(),
         })
         .collect::<Vec<_>>();
     for (row, location) in sidebar_rows.iter_mut().zip(app.sidebar.iter()) {
@@ -23222,6 +23543,9 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
             group_kind: 4,
             source_kind: 0,
             is_drive: false,
+            drive_progress: 0.0,
+            drive_state: 3,
+            drive_status: "".into(),
             icon: app
                 .library_icons
                 .get(library.id.as_os_str())
@@ -23251,6 +23575,9 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
                 2
             },
             is_drive: false,
+            drive_progress: 0.0,
+            drive_state: 3,
+            drive_status: "".into(),
             icon: app
                 .sidebar_icons
                 .get(match &location.target {
@@ -23275,6 +23602,9 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
                 group_kind: 3,
                 source_kind: 0,
                 is_drive: false,
+                drive_progress: 0.0,
+                drive_state: 3,
+                drive_status: "".into(),
                 icon: Image::default(),
             });
         }
@@ -25968,6 +26298,73 @@ mod tests {
     }
 
     #[test]
+    fn issue_16_drive_projection_covers_loading_ready_warning_and_unavailable() {
+        let loading = DriveCapacityState::loading(1);
+        assert_eq!(drive_projection(Language::Chinese, Some(&loading)).1, 0);
+
+        let mut ready = DriveCapacityState::loading(2);
+        ready.apply(Ok(platform::windows::drives::DriveCapacity {
+            total: 1_000,
+            available: 250,
+        }));
+        let (progress, state, status) = drive_projection(Language::English, Some(&ready));
+        assert!((progress - 0.75).abs() < f32::EPSILON);
+        assert_eq!(state, 1);
+        assert_eq!(status, "Drive usage normal");
+
+        ready.apply(Ok(platform::windows::drives::DriveCapacity {
+            total: 1_000,
+            available: 99,
+        }));
+        assert_eq!(drive_projection(Language::Chinese, Some(&ready)).1, 2);
+
+        ready.apply(Err(io::Error::other("unavailable")));
+        assert_eq!(drive_projection(Language::English, Some(&ready)).1, 3);
+    }
+
+    #[test]
+    fn issue_16_affected_drive_refresh_keeps_only_unique_local_roots() {
+        let roots = affected_drive_roots(&[
+            PathBuf::from(r"c:\one"),
+            PathBuf::from(r"C:\two"),
+            PathBuf::from(r"D:\three"),
+            PathBuf::from(r"\\server\share\four"),
+        ]);
+        assert_eq!(roots.len(), 2);
+        assert!(roots.contains(Path::new(r"C:\")));
+        assert!(roots.contains(Path::new(r"D:\")));
+    }
+
+    #[test]
+    fn issue_16_stale_drive_result_identity_requires_root_and_generation() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\current")], 0, [0, 1, 2, 3]);
+        let root = PathBuf::from(r"C:\");
+        app.sidebar = vec![KnownLocation {
+            kind: KnownLocationKind::Drive,
+            label: "C:".to_owned(),
+            path: root.clone(),
+            drive_root: Some(root.clone()),
+        }];
+        app.drive_capacity
+            .insert(root.clone(), DriveCapacityState::loading(7));
+        assert!(
+            app.drive_capacity
+                .get(&root)
+                .is_some_and(|state| state.request_generation == 7)
+        );
+        assert!(
+            app.drive_capacity
+                .get(&root)
+                .is_none_or(|state| state.request_generation != 6)
+        );
+        app.sidebar.clear();
+        assert!(
+            !app.sidebar
+                .iter()
+                .any(|location| location.drive_root.as_ref() == Some(&root))
+        );
+    }
+    #[test]
     fn issue_50_sidebar_targets_use_model_identity_and_generation() {
         let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\current")], 0, [0, 1, 2, 3]);
         app.quick_access_generation = 7;
@@ -25975,6 +26372,7 @@ mod tests {
             kind: KnownLocationKind::Drive,
             label: "Display only".to_owned(),
             path: PathBuf::from(r"Z:\"),
+            drive_root: Some(PathBuf::from(r"Z:\")),
         }];
         let target = sidebar_menu_target(&app, WindowId(1), 1, "location:0").expect("drive target");
         assert_eq!(target.generation, 7);
@@ -25993,6 +26391,7 @@ mod tests {
             kind: KnownLocationKind::Pinned,
             label: "Pinned".to_owned(),
             path: PathBuf::from(r"C:\Pinned"),
+            drive_root: None,
         }];
         let shared = Arc::new(Mutex::new(app));
         let resolved =
@@ -26070,6 +26469,7 @@ mod tests {
             kind: KnownLocationKind::Pinned,
             label: "Pinned".to_owned(),
             path: PathBuf::from(r"C:\Pinned"),
+            drive_root: None,
         }];
         let shared = Arc::new(Mutex::new(app));
         let state = WindowSessions::new(shared.clone(), WindowId(1));
@@ -30869,6 +31269,9 @@ mod tests {
                     group_kind: index % 4,
                     source_kind: 0,
                     is_drive: false,
+                    drive_progress: 0.0,
+                    drive_state: 3,
+                    drive_status: "".into(),
                     icon: Image::default(),
                 })
                 .collect::<Vec<_>>(),
@@ -30910,6 +31313,9 @@ mod tests {
                     group_kind: index % 4,
                     source_kind: 0,
                     is_drive: false,
+                    drive_progress: 0.0,
+                    drive_state: 3,
+                    drive_status: "".into(),
                     icon: Image::default(),
                 })
                 .collect::<Vec<_>>(),
@@ -30936,6 +31342,62 @@ mod tests {
     }
 
     #[test]
+    fn issue_16_drive_row_is_compact_and_other_rows_keep_their_height() {
+        use i_slint_backend_testing::ElementRoot;
+
+        let ui = headless_file_view();
+        ui.set_quick_access_expanded(true);
+        ui.set_drives_expanded(true);
+        ui.set_sidebar_items(ModelRc::new(VecModel::from(vec![
+            SidebarRow {
+                index: 0,
+                stable_id: "location:0".into(),
+                label: "Home".into(),
+                icon_kind: 0,
+                group_kind: 0,
+                source_kind: 0,
+                is_drive: false,
+                drive_progress: 0.0,
+                drive_state: 3,
+                drive_status: "".into(),
+                icon: Image::default(),
+            },
+            SidebarRow {
+                index: 1,
+                stable_id: "location:1".into(),
+                label: "System (C:)".into(),
+                icon_kind: 7,
+                group_kind: 1,
+                source_kind: 0,
+                is_drive: true,
+                drive_progress: 0.75,
+                drive_state: 1,
+                drive_status: "Drive usage normal".into(),
+                icon: Image::default(),
+            },
+        ])));
+        update_test_layout(&ui);
+
+        let drive = ui
+            .root_element()
+            .query_descendants()
+            .match_id("AppWindow::drive-row")
+            .find_all()
+            .into_iter()
+            .find(|element| element.size().height > 0.0)
+            .expect("visible drive row exists");
+        assert_eq!(drive.size().height, 40.0);
+        let quick_row = ui
+            .root_element()
+            .query_descendants()
+            .match_type_name("Rectangle")
+            .find_all()
+            .into_iter()
+            .find(|element| element.size().height == 30.0)
+            .expect("regular sidebar row keeps compact height");
+        assert_eq!(quick_row.size().height, 30.0);
+    }
+    #[test]
     fn issue_70_sidebar_collapse_clamps_stale_scroll_position() {
         use i_slint_backend_testing::ElementRoot;
 
@@ -30957,6 +31419,9 @@ mod tests {
                     group_kind: index % 5,
                     source_kind: 0,
                     is_drive: false,
+                    drive_progress: 0.0,
+                    drive_state: 3,
+                    drive_status: "".into(),
                     icon: Image::default(),
                 })
                 .collect::<Vec<_>>(),
@@ -31009,6 +31474,9 @@ mod tests {
                     group_kind: index % 5,
                     source_kind: 0,
                     is_drive: false,
+                    drive_progress: 0.0,
+                    drive_state: 3,
+                    drive_status: "".into(),
                     icon: Image::default(),
                 })
                 .collect::<Vec<_>>(),
@@ -31067,6 +31535,9 @@ mod tests {
                     group_kind: index % 4,
                     source_kind: 0,
                     is_drive: false,
+                    drive_progress: 0.0,
+                    drive_state: 3,
+                    drive_status: "".into(),
                     icon: Image::default(),
                 })
                 .collect::<Vec<_>>(),
