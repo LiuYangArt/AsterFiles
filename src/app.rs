@@ -67,6 +67,29 @@ const OPERATION_PROGRESS_INTERVAL: Duration = Duration::from_millis(125);
 const OPERATION_PROGRESS_BYTES: u64 = 4 * 1024 * 1024;
 const OPERATION_PROGRESS_FILES: usize = 128;
 
+fn entry_type_icon_key(
+    path: &Path,
+    kind: crate::domain::EntryKind,
+) -> Option<platform::windows_shell_icons::ShellTypeIconKey> {
+    let network = crate::network::is_unc_path(path);
+    if kind == crate::domain::EntryKind::Directory && !network {
+        return None;
+    }
+    let path_specific_local_file = !network
+        && path.extension().is_some_and(|extension| {
+            matches!(
+                extension.to_string_lossy().to_ascii_lowercase().as_str(),
+                "exe" | "lnk" | "ico" | "url"
+            )
+        });
+    (!path_specific_local_file).then(|| {
+        platform::windows_shell_icons::ShellTypeIconKey::for_entry(
+            path,
+            kind == crate::domain::EntryKind::Directory,
+        )
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TypeSelectContext {
     tab_id: TabId,
@@ -1191,39 +1214,71 @@ fn grid_thumbnail_requests(
             })
         })
         .collect::<Vec<_>>();
-    let requests = entry_ids
+    let tab_id = tab.id;
+    let request_id = tab.latest_request;
+    let entries = entry_ids
         .into_iter()
-        .filter_map(|entry_id| {
-            let entry = tab.visible_entry(entry_id)?;
-            (!app
-                .thumbnail_cache
+        .filter_map(|entry_id| tab.visible_entry(entry_id).cloned())
+        .collect::<Vec<_>>();
+    let mut requests = Vec::new();
+    for entry in entries {
+        if crate::network::is_unc_path(&entry.path) {
+            let Some(key) = entry_type_icon_key(&entry.path, entry.kind) else {
+                continue;
+            };
+            if app.type_icon_cache.contains_key(&key)
+                || app
+                    .type_icon_requests
+                    .contains(&(tab_id, request_id, key.clone()))
+            {
+                continue;
+            }
+            app.type_icon_requests
+                .insert((tab_id, request_id, key.clone()));
+            requests.push(IconRequest {
+                tab_id,
+                request_id,
+                target: IconTarget::Entry(entry.id),
+                path: key.query_path(),
+                thumbnail: false,
+                requested_px: 0,
+                type_key: Some(key),
+            });
+            continue;
+        }
+        if !app
+            .thumbnail_cache
+            .contains_key(&(entry.path.clone(), requested_px))
+            && !app
+                .large_icon_cache
                 .contains_key(&(entry.path.clone(), requested_px))
-                && !app
-                    .large_icon_cache
-                    .contains_key(&(entry.path.clone(), requested_px))
-                && !app.thumbnail_requests.contains(&(
-                    tab.id,
-                    tab.latest_request,
-                    entry.path.clone(),
-                    requested_px,
-                )))
-            .then(|| IconRequest {
-                tab_id: tab.id,
-                request_id: tab.latest_request,
+            && !app.thumbnail_requests.contains(&(
+                tab_id,
+                request_id,
+                entry.path.clone(),
+                requested_px,
+            ))
+        {
+            requests.push(IconRequest {
+                tab_id,
+                request_id,
                 target: IconTarget::Entry(entry.id),
                 path: entry.path.clone(),
                 thumbnail: true,
                 requested_px,
-            })
-        })
-        .collect::<Vec<_>>();
+                type_key: None,
+            });
+        }
+    }
     for request in &requests {
-        app.thumbnail_requests.insert((
-            request.tab_id,
-            request.request_id,
-            request.path.clone(),
-            request.requested_px,
-        ));
+        if request.thumbnail {
+            app.thumbnail_requests.insert((
+                request.tab_id,
+                request.request_id,
+                request.path.clone(),
+                request.requested_px,
+            ));
+        }
     }
     requests
 }
@@ -1846,6 +1901,15 @@ struct AppState {
     system_dark_theme: bool,
     icons: HashMap<(TabId, RequestId, EntryId), platform::windows_shell_icons::ShellIconRgba>,
     icon_cache: HashMap<PathBuf, platform::windows_shell_icons::ShellIconRgba>,
+    type_icon_cache: HashMap<
+        platform::windows_shell_icons::ShellTypeIconKey,
+        platform::windows_shell_icons::ShellIconRgba,
+    >,
+    type_icon_requests: HashSet<(
+        TabId,
+        RequestId,
+        platform::windows_shell_icons::ShellTypeIconKey,
+    )>,
     sidebar_icons: HashMap<PathBuf, platform::windows_shell_icons::ShellIconRgba>,
     libraries: Vec<platform::windows::libraries::WindowsLibrary>,
     library_failures: Vec<platform::windows::libraries::LibraryFailure>,
@@ -2097,6 +2161,8 @@ impl AppState {
             system_dark_theme,
             icons: HashMap::new(),
             icon_cache: HashMap::new(),
+            type_icon_cache: HashMap::new(),
+            type_icon_requests: HashSet::new(),
             sidebar_icons: HashMap::new(),
             libraries: Vec::new(),
             library_failures: Vec::new(),
@@ -2778,6 +2844,8 @@ impl AppState {
             cancel_folder_sizes(&mut tab);
             tab.cancel_pending();
             self.icons.retain(|(tab_id, _, _), _| *tab_id != closing);
+            self.type_icon_requests
+                .retain(|(tab_id, _, _)| *tab_id != closing);
             if tab.kind == TabKind::Files
                 && let Some(path) = tab.current_location.take()
             {
@@ -3486,6 +3554,7 @@ struct IconRequest {
     path: PathBuf,
     thumbnail: bool,
     requested_px: u32,
+    type_key: Option<platform::windows_shell_icons::ShellTypeIconKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -3867,6 +3936,7 @@ impl NetworkLoginCoordinator {
     }
 }
 
+#[derive(Clone)]
 struct IconEvent {
     tab_id: TabId,
     request_id: RequestId,
@@ -3875,6 +3945,7 @@ struct IconEvent {
     icon: platform::windows_shell_icons::ShellIconRgba,
     actual_thumbnail: bool,
     requested_px: u32,
+    type_key: Option<platform::windows_shell_icons::ShellTypeIconKey>,
 }
 
 fn startup_locations(
@@ -4540,6 +4611,8 @@ fn submit_navigation(
         app.icons.retain(|(icon_tab, _, _), _| *icon_tab != tab_id);
         app.thumbnail_requests
             .retain(|(request_tab, _, _, _)| *request_tab != tab_id);
+        app.type_icon_requests
+            .retain(|(request_tab, _, _)| *request_tab != tab_id);
         app.focus_after_refresh.remove(&tab_id);
         let Some(tab) = app.tab_mut(tab_id) else {
             return false;
@@ -4582,6 +4655,8 @@ fn submit_network_navigation(
         app.icons.retain(|(icon_tab, _, _), _| *icon_tab != tab_id);
         app.thumbnail_requests
             .retain(|(request_tab, _, _, _)| *request_tab != tab_id);
+        app.type_icon_requests
+            .retain(|(request_tab, _, _)| *request_tab != tab_id);
         app.focus_after_refresh.remove(&tab_id);
         let Some(tab) = app.tab_mut(tab_id) else {
             return false;
@@ -4725,6 +4800,8 @@ fn submit_library_navigation(
         app.icons.retain(|(icon_tab, _, _), _| *icon_tab != tab_id);
         app.thumbnail_requests
             .retain(|(request_tab, _, _, _)| *request_tab != tab_id);
+        app.type_icon_requests
+            .retain(|(request_tab, _, _)| *request_tab != tab_id);
         app.focus_after_refresh.remove(&tab_id);
         let visibility = app.file_visibility;
         let Some(tab) = app.tab_mut(tab_id) else {
@@ -19169,10 +19246,8 @@ fn start_event_pump(
                             "network_root_event_apply_completed",
                         );
                     }
-                    if !network_tab {
-                        for request in icon_requests {
-                            let _ = icon_sender.send(request);
-                        }
+                    for request in icon_requests {
+                        let _ = icon_sender.send(request);
                     }
                     if let Some((tab_id, request_id)) = batch {
                         if let Some(window_id) =
@@ -19188,9 +19263,7 @@ fn start_event_pump(
                         } else {
                             append_active_file_rows(&ui, &state, tab_id, request_id);
                         }
-                        if !network_tab {
-                            defer_grid_thumbnails(state.clone(), tab_id, icon_sender.clone());
-                        }
+                        defer_grid_thumbnails(state.clone(), tab_id, icon_sender.clone());
                         if let Some(target_ui) = state
                             .lock()
                             .ok()
@@ -19377,25 +19450,40 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
         } => {
             let accepted = app.tab(tab_id).is_some_and(|tab| tab.accepts(request_id));
             if accepted {
-                let local_entries = entries
-                    .iter()
-                    .filter(|entry| !crate::network::is_unc_path(&entry.path));
-                if !app
+                let grid_layout = app
                     .view_mode_for_tab(tab_id)
-                    .is_some_and(ViewMode::uses_grid_layout)
-                {
-                    icon_requests.extend(
-                        local_entries
-                            .filter(|entry| !app.icon_cache.contains_key(&entry.path))
-                            .map(|entry| IconRequest {
-                                tab_id,
-                                request_id,
-                                target: IconTarget::Entry(entry.id),
-                                path: entry.path.clone(),
-                                thumbnail: false,
-                                requested_px: 0,
-                            }),
-                    );
+                    .is_some_and(ViewMode::uses_grid_layout);
+                if !grid_layout {
+                    icon_requests.extend(entries.iter().filter_map(|entry| {
+                        let type_key = entry_type_icon_key(&entry.path, entry.kind);
+                        if type_key.as_ref().is_some_and(|key| {
+                            app.type_icon_cache.contains_key(key)
+                                || app.type_icon_requests.contains(&(
+                                    tab_id,
+                                    request_id,
+                                    key.clone(),
+                                ))
+                        }) || (type_key.is_none() && app.icon_cache.contains_key(&entry.path))
+                        {
+                            return None;
+                        }
+                        if let Some(key) = type_key.as_ref() {
+                            app.type_icon_requests
+                                .insert((tab_id, request_id, key.clone()));
+                        }
+                        Some(IconRequest {
+                            tab_id,
+                            request_id,
+                            target: IconTarget::Entry(entry.id),
+                            path: type_key
+                                .as_ref()
+                                .map(platform::windows_shell_icons::ShellTypeIconKey::query_path)
+                                .unwrap_or_else(|| entry.path.clone()),
+                            thumbnail: false,
+                            requested_px: 0,
+                            type_key,
+                        })
+                    }));
                 }
                 app.tab_mut(tab_id)
                     .expect("accepted tab exists")
@@ -19556,6 +19644,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                         path: location_path,
                         thumbnail: false,
                         requested_px: 0,
+                        type_key: None,
                     });
                 }
             }
@@ -21000,6 +21089,12 @@ fn spawn_icon_workers(
                             )))
                 });
                 if !is_current {
+                    if let Some(key) = request.type_key
+                        && let Ok(mut app) = state.lock()
+                    {
+                        app.type_icon_requests
+                            .remove(&(request.tab_id, request.request_id, key));
+                    }
                     continue;
                 }
                 let cached = state.lock().ok().and_then(|app| {
@@ -21011,6 +21106,8 @@ fn spawn_icon_workers(
                                     .get(&(request.path.clone(), request.requested_px))
                             })
                             .cloned()
+                    } else if let Some(key) = request.type_key.as_ref() {
+                        app.type_icon_cache.get(key).cloned()
                     } else {
                         app.icon_cache.get(&request.path).cloned()
                     }
@@ -21054,6 +21151,13 @@ fn spawn_icon_workers(
                             false,
                         )
                     }
+                } else if let Some(key) = request.type_key.as_ref() {
+                    (
+                        cached.or_else(|| {
+                            platform::windows_shell_icons::shell_type_icon_rgba(key).ok()
+                        }),
+                        false,
+                    )
                 } else {
                     (
                         cached.or_else(|| {
@@ -21071,16 +21175,20 @@ fn spawn_icon_workers(
                         icon,
                         actual_thumbnail,
                         requested_px: request.requested_px,
+                        type_key: request.type_key,
                     });
-                } else if request.thumbnail
-                    && let Ok(mut app) = state.lock()
-                {
-                    app.thumbnail_requests.remove(&(
-                        request.tab_id,
-                        request.request_id,
-                        request.path,
-                        request.requested_px,
-                    ));
+                } else if let Ok(mut app) = state.lock() {
+                    if request.thumbnail {
+                        app.thumbnail_requests.remove(&(
+                            request.tab_id,
+                            request.request_id,
+                            request.path,
+                            request.requested_px,
+                        ));
+                    } else if let Some(key) = request.type_key {
+                        app.type_icon_requests
+                            .remove(&(request.tab_id, request.request_id, key));
+                    }
                 }
             }
         });
@@ -21604,10 +21712,11 @@ fn start_icon_event_pump(
     });
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct IconUpdate {
     tab_id: TabId,
     entry_id: Option<EntryId>,
+    type_key: Option<platform::windows_shell_icons::ShellTypeIconKey>,
 }
 
 fn insert_bounded_image(
@@ -21636,6 +21745,10 @@ fn insert_bounded_image(
 
 fn apply_icon_event(state: &SharedSessions, event: IconEvent) -> Option<IconUpdate> {
     let mut app = state.lock().expect("app state mutex is not poisoned");
+    if let Some(key) = event.type_key.as_ref() {
+        app.type_icon_requests
+            .remove(&(event.tab_id, event.request_id, key.clone()));
+    }
     if event.requested_px > 0 {
         app.thumbnail_requests.remove(&(
             event.tab_id,
@@ -21677,12 +21790,15 @@ fn apply_icon_event(state: &SharedSessions, event: IconEvent) -> Option<IconUpda
             event.icon.clone(),
             LARGE_ICON_CACHE_CAPACITY,
         );
+    } else if let Some(key) = event.type_key.as_ref() {
+        app.type_icon_cache.insert(key.clone(), event.icon);
     } else {
         app.icon_cache.insert(event.path, event.icon);
     }
     Some(IconUpdate {
         tab_id: event.tab_id,
         entry_id,
+        type_key: event.type_key,
     })
 }
 
@@ -21690,9 +21806,12 @@ fn icon_event_is_current(app: &AppState, event: &IconEvent) -> bool {
     app.tab(event.tab_id).is_some_and(|tab| {
         tab.latest_request == event.request_id
             && match event.target {
-                IconTarget::Entry(entry_id) => tab
-                    .visible_entry(entry_id)
-                    .is_some_and(|entry| entry.path == event.path),
+                IconTarget::Entry(entry_id) => tab.visible_entry(entry_id).is_some_and(|entry| {
+                    event.type_key.as_ref().is_some_and(|key| {
+                        entry_type_icon_key(&entry.path, entry.kind).as_ref() == Some(key)
+                            && event.path == key.query_path()
+                    }) || (event.type_key.is_none() && entry.path == event.path)
+                }),
                 IconTarget::Location => tab.visible_path() == Some(event.path.as_path()),
             }
     })
@@ -21801,6 +21920,19 @@ fn update_icon_row(ui: &AppWindow, state: &SharedSessions, update: IconUpdate) {
     let Some(tab) = window.tabs.get(&update.tab_id) else {
         return;
     };
+    if let Some(type_key) = update.type_key {
+        let entry_ids = tab
+            .visible_entries()
+            .iter()
+            .filter(|entry| {
+                entry_type_icon_key(&entry.path, entry.kind).as_ref() == Some(&type_key)
+            })
+            .map(|entry| entry.id)
+            .collect::<HashSet<_>>();
+        drop(app);
+        update_file_rows(ui, state, update.tab_id, &entry_ids);
+        return;
+    }
     let Some(entry_id) = update.entry_id else {
         let path = tab.visible_path();
         ui.set_current_location_icon(
@@ -23356,6 +23488,10 @@ fn file_row(
         app.icons
             .get(&(tab.id, tab.latest_request, entry.id))
             .or_else(|| app.icon_cache.get(&entry.path))
+            .or_else(|| {
+                entry_type_icon_key(&entry.path, entry.kind)
+                    .and_then(|key| app.type_icon_cache.get(&key))
+            })
     });
     FileRow {
         id: entry.id.0 as i32,
@@ -26796,7 +26932,7 @@ mod tests {
     }
 
     #[test]
-    fn network_directory_events_never_request_shell_icons() {
+    fn issue_65_network_entries_request_shared_type_icons_without_thumbnails() {
         let path = PathBuf::from(r"\\server\share");
         let mut app = AppState::new_for_test(vec![path.clone()], 0, [0, 1, 2, 3]);
         let tab = app.tab_mut(TabId(1)).unwrap();
@@ -26809,7 +26945,12 @@ mod tests {
             DirectoryEvent::Batch {
                 tab_id: TabId(1),
                 request_id: RequestId(4),
-                entries: vec![focus_entry(1, r"\\server\share\folder")],
+                entries: vec![
+                    focus_entry(1, r"\\server\share\model.blend"),
+                    focus_entry(2, r"\\server\share\mesh.FBX"),
+                    focus_entry(3, r"\\server\share\surface.obj"),
+                    focus_entry(4, r"\\server\share\README"),
+                ],
             },
         );
         let finished = apply_event(
@@ -26824,8 +26965,98 @@ mod tests {
             },
         );
 
-        assert!(batch.is_empty());
+        assert_eq!(batch.len(), 4);
+        assert!(batch.iter().all(|request| !request.thumbnail));
+        assert!(batch.iter().all(|request| request.type_key.is_some()));
+        assert_eq!(
+            batch[0].type_key,
+            entry_type_icon_key(
+                Path::new(r"C:\local\model.BLEND"),
+                crate::domain::EntryKind::File,
+            )
+        );
+        assert_eq!(
+            batch[3].type_key,
+            Some(platform::windows_shell_icons::ShellTypeIconKey::GenericFile)
+        );
+        assert!(
+            batch
+                .iter()
+                .all(|request| !crate::network::is_unc_path(&request.path))
+        );
         assert!(finished.is_empty());
+    }
+
+    #[test]
+    fn issue_65_network_type_requests_are_deduplicated_per_extension() {
+        let mut app =
+            AppState::new_for_test(vec![PathBuf::from(r"\\server\share")], 0, [0, 1, 2, 3]);
+        let tab = app.tab_mut(TabId(1)).unwrap();
+        tab.latest_request = RequestId(8);
+        tab.load_state = LoadState::Loading;
+        let state = Arc::new(Mutex::new(app));
+
+        let requests = apply_event(
+            &state,
+            DirectoryEvent::Batch {
+                tab_id: TabId(1),
+                request_id: RequestId(8),
+                entries: vec![
+                    focus_entry(1, r"\\server\share\one.obj"),
+                    focus_entry(2, r"\\server\share\two.OBJ"),
+                ],
+            },
+        );
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .tab(TabId(1))
+                .unwrap()
+                .pending_entries
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn issue_65_type_icon_events_keep_request_and_entry_identity() {
+        let mut app =
+            AppState::new_for_test(vec![PathBuf::from(r"\\server\share")], 0, [0, 1, 2, 3]);
+        let tab = app.tab_mut(TabId(1)).unwrap();
+        tab.latest_request = RequestId(12);
+        tab.replace_entries(vec![focus_entry(1, r"\\server\share\model.obj")]);
+        let key = entry_type_icon_key(
+            Path::new(r"\\server\share\model.obj"),
+            crate::domain::EntryKind::File,
+        )
+        .unwrap();
+        let event = IconEvent {
+            tab_id: TabId(1),
+            request_id: RequestId(12),
+            target: IconTarget::Entry(EntryId(1)),
+            path: key.query_path(),
+            icon: platform::windows_shell_icons::ShellIconRgba {
+                width: 1,
+                height: 1,
+                pixels: vec![0, 0, 0, 0],
+            },
+            actual_thumbnail: false,
+            requested_px: 0,
+            type_key: Some(key),
+        };
+
+        assert!(icon_event_is_current(&app, &event));
+        let mut stale_request = event.clone();
+        stale_request.request_id = RequestId(11);
+        assert!(!icon_event_is_current(&app, &stale_request));
+        let mut wrong_entry = event;
+        wrong_entry.target = IconTarget::Entry(EntryId(2));
+        assert!(!icon_event_is_current(&app, &wrong_entry));
+        app.active_window_state_mut().tabs.remove(&TabId(1));
+        assert!(!icon_event_is_current(&app, &stale_request));
     }
 
     #[test]
@@ -27865,6 +28096,7 @@ mod tests {
             },
             actual_thumbnail: false,
             requested_px: 0,
+            type_key: None,
         };
         assert!(icon_event_is_current(&app, &event));
     }
@@ -29152,6 +29384,7 @@ mod tests {
             },
             actual_thumbnail: false,
             requested_px: 0,
+            type_key: None,
         };
         assert!(icon_event_is_current(&app, &event));
 
@@ -29163,6 +29396,7 @@ mod tests {
             icon: event.icon.clone(),
             actual_thumbnail: false,
             requested_px: 0,
+            type_key: None,
         };
         assert!(icon_event_is_current(&app, &location_event));
 

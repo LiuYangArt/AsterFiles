@@ -1,4 +1,77 @@
-use std::{io, path::Path};
+use std::{ffi::OsString, io, path::Path};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ShellTypeIconKey {
+    Directory,
+    Extension(OsString),
+    GenericFile,
+}
+
+impl ShellTypeIconKey {
+    pub fn for_entry(path: &Path, directory: bool) -> Self {
+        if directory {
+            return Self::Directory;
+        }
+        path.extension()
+            .filter(|extension| !extension.is_empty())
+            .map(|extension| Self::Extension(lowercase_extension(extension)))
+            .unwrap_or(Self::GenericFile)
+    }
+
+    pub fn query_path(&self) -> std::path::PathBuf {
+        match self {
+            Self::Directory => "asterfiles-folder".into(),
+            Self::Extension(extension) => {
+                let mut name = OsString::from("asterfiles.");
+                name.push(extension);
+                name.into()
+            }
+            Self::GenericFile => "asterfiles-file".into(),
+        }
+    }
+
+    #[cfg(windows)]
+    fn lookup(
+        &self,
+    ) -> (
+        OsString,
+        windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES,
+    ) {
+        use windows::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+        };
+
+        let path = self.query_path().into_os_string();
+        let attributes = if matches!(self, Self::Directory) {
+            FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            FILE_ATTRIBUTE_NORMAL
+        };
+        (path, attributes)
+    }
+}
+
+#[cfg(windows)]
+fn lowercase_extension(extension: &std::ffi::OsStr) -> OsString {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    let lowered: Vec<u16> = extension
+        .encode_wide()
+        .map(|unit| {
+            if (b'A' as u16..=b'Z' as u16).contains(&unit) {
+                unit + u16::from(b'a' - b'A')
+            } else {
+                unit
+            }
+        })
+        .collect();
+    OsString::from_wide(&lowered)
+}
+
+#[cfg(not(windows))]
+fn lowercase_extension(extension: &std::ffi::OsStr) -> OsString {
+    OsString::from(extension.to_string_lossy().to_lowercase())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellIconRgba {
@@ -76,7 +149,7 @@ mod windows_impl {
         core::PCWSTR,
     };
 
-    use super::{Path, ShellIconRgba, ShellThumbnailRgba, ThumbnailSource, io};
+    use super::{Path, ShellIconRgba, ShellThumbnailRgba, ShellTypeIconKey, ThumbnailSource, io};
 
     pub struct ShellWorkerApartment {
         _com: ComInitialization,
@@ -89,6 +162,25 @@ mod windows_impl {
     pub fn shell_icon_rgba(path: &Path) -> io::Result<ShellIconRgba> {
         let icon = ShellIcon::for_path(path)?;
         icon.to_rgba()
+    }
+
+    pub fn shell_type_icon_rgba(key: &ShellTypeIconKey) -> io::Result<ShellIconRgba> {
+        let (lookup_name, attributes) = key.lookup();
+        let wide_name = wide_null(&lookup_name);
+        let mut file_info = SHFILEINFOW::default();
+        let result = unsafe {
+            SHGetFileInfoW(
+                PCWSTR(wide_name.as_ptr()),
+                attributes,
+                Some(&mut file_info),
+                size_of::<SHFILEINFOW>() as u32,
+                SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES,
+            )
+        };
+        if result == 0 || file_info.hIcon.is_invalid() {
+            return Err(io::Error::other("Windows Shell type icon unavailable"));
+        }
+        ShellIcon(file_info.hIcon).to_rgba()
     }
 
     pub fn shell_large_icon_rgba(path: &Path, size: u32) -> io::Result<ShellIconRgba> {
@@ -410,11 +502,42 @@ mod windows_impl {
 #[cfg(windows)]
 pub use windows_impl::{
     initialize_shell_worker, shell_icon_rgba, shell_large_icon_rgba, shell_thumbnail_rgba,
+    shell_type_icon_rgba,
 };
 
 #[cfg(test)]
 mod tests {
-    use super::ShellIconRgba;
+    use std::path::Path;
+
+    use super::{ShellIconRgba, ShellTypeIconKey};
+
+    #[test]
+    fn type_icon_keys_match_for_local_and_unc_entries() {
+        for extension in ["blend", "fbx", "obj"] {
+            assert_eq!(
+                ShellTypeIconKey::for_entry(
+                    Path::new(&format!(r"C:\local\asset.{extension}")),
+                    false,
+                ),
+                ShellTypeIconKey::for_entry(
+                    Path::new(&format!(r"\\server\share\asset.{extension}")),
+                    false,
+                ),
+            );
+        }
+        assert_eq!(
+            ShellTypeIconKey::for_entry(Path::new(r"C:\local\asset.BLEND"), false),
+            ShellTypeIconKey::for_entry(Path::new(r"\\server\share\asset.blend"), false),
+        );
+        assert_eq!(
+            ShellTypeIconKey::for_entry(Path::new("README"), false),
+            ShellTypeIconKey::GenericFile
+        );
+        assert_eq!(
+            ShellTypeIconKey::for_entry(Path::new("folder.txt"), true),
+            ShellTypeIconKey::Directory
+        );
+    }
 
     #[test]
     fn converts_bgra_pixels_to_rgba() {
