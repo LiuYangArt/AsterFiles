@@ -12234,14 +12234,16 @@ fn wire_callbacks(
                     .lock()
                     .expect("network login coordinator mutex is not poisoned")
                     .begin(window_id, tab_id, failed_request_id, target.clone());
-                if let Some(login) = network_login_for_access.upgrade() {
+                if let (Some(login), Some(ui)) =
+                    (network_login_for_access.upgrade(), weak.upgrade())
+                {
                     configure_network_login_window(&login, &state_for_access, &target);
                     login.set_username("".into());
                     login.set_password("".into());
                     login.set_remember(false);
                     login.set_conflict(false);
                     login.set_busy(false);
-                    show_network_login_window(&login);
+                    show_centered_dialog(&ui, &login);
                 }
                 return;
             }
@@ -13481,8 +13483,8 @@ fn wire_callbacks(
                         )
                     })
                 });
-                if let (Some((location, language, dark_theme)), Some(window)) =
-                    (selected, network_location_rename_ui.upgrade())
+                if let (Some((location, language, dark_theme)), Some(window), Some(ui)) =
+                    (selected, network_location_rename_ui.upgrade(), weak.upgrade())
                 {
                     configure_network_location_rename_window(
                         &window,
@@ -13492,7 +13494,7 @@ fn wire_callbacks(
                         dark_theme,
                         location.source,
                     );
-                    show_network_location_rename_window(&window);
+                    show_centered_dialog(&ui, &window);
                 }
             }
             CMD_NETWORK_LOCATION_COPY_ADDRESS => {
@@ -15346,10 +15348,23 @@ fn wire_window_controls(ui: &AppWindow) {
     });
 }
 
-fn configure_confirmation_window(ui: &ConfirmationWindow) {
+/// 二级弹窗与确认窗口保持同一套窗口行为：不可缩放、保持前置。
+fn configure_secondary_dialog_window<T: slint::ComponentHandle>(ui: &T) {
     #[cfg(windows)]
     use winit::platform::windows::{CornerPreference, WindowExtWindows};
 
+    ui.window().with_winit_window(|window| {
+        window.set_resizable(false);
+        window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
+        #[cfg(windows)]
+        {
+            window.set_corner_preference(CornerPreference::Round);
+            window.set_undecorated_shadow(true);
+        }
+    });
+}
+
+fn configure_confirmation_window(ui: &ConfirmationWindow) {
     ui.window().on_close_requested({
         let weak = ui.as_weak();
         move || {
@@ -15367,15 +15382,7 @@ fn configure_confirmation_window(ui: &ConfirmationWindow) {
             });
         }
     });
-    ui.window().with_winit_window(|window| {
-        window.set_resizable(false);
-        window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
-        #[cfg(windows)]
-        {
-            window.set_corner_preference(CornerPreference::Round);
-            window.set_undecorated_shadow(true);
-        }
-    });
+    configure_secondary_dialog_window(ui);
 }
 
 fn wire_confirmation_windows(
@@ -15685,7 +15692,7 @@ fn wire_debug_showcase(
             3 => {
                 if let Some(window) = operation_weak.upgrade() {
                     refresh_debug_operation_window(&window, &state);
-                    position_operation_window_next_to_main(&ui, &window);
+                    position_window_centered(&ui, None, &window);
                     let _ = window.show();
                 }
             }
@@ -15721,24 +15728,12 @@ fn show_confirmation_window(
         .with_winit_window(|window| window.focus_window());
 }
 
-fn show_network_login_window(ui: &NetworkLoginWindow) {
-    if ui.window().is_visible() {
-        ui.window()
-            .with_winit_window(|window| window.focus_window());
-        return;
+/// 二级弹窗的显示路径：先按发起窗口定位，再显示并聚焦；已可见时只重新定位并聚焦。
+fn show_centered_dialog<T: slint::ComponentHandle>(main: &AppWindow, ui: &T) {
+    position_window_centered(main, None, ui);
+    if !ui.window().is_visible() {
+        let _ = ui.show();
     }
-    let _ = ui.show();
-    ui.window()
-        .with_winit_window(|window| window.focus_window());
-}
-
-fn show_network_location_rename_window(ui: &NetworkLocationRenameWindow) {
-    if ui.window().is_visible() {
-        ui.window()
-            .with_winit_window(|window| window.focus_window());
-        return;
-    }
-    let _ = ui.show();
     ui.window()
         .with_winit_window(|window| window.focus_window());
 }
@@ -15818,6 +15813,7 @@ fn configure_network_location_rename_window(
 }
 
 fn wire_network_location_rename_window(ui: &NetworkLocationRenameWindow, state: SharedSessions) {
+    configure_secondary_dialog_window(ui);
     ui.window().on_close_requested({
         let weak = ui.as_weak();
         move || {
@@ -15967,6 +15963,7 @@ fn wire_network_login_window(
     state: SharedSessions,
     login_state: Arc<Mutex<NetworkLoginCoordinator>>,
 ) {
+    configure_secondary_dialog_window(login);
     let login_weak = login.as_weak();
     let login_state_for_cancel = login_state.clone();
     login.on_safe_cancel(move || {
@@ -16132,14 +16129,46 @@ fn wire_network_login_window(
     });
 }
 
-fn position_window_centered(
+/// 物理屏幕上的一个窗口矩形，只用于计算二级窗口落点。
+#[derive(Clone, Copy)]
+struct WindowRect {
+    position: (i32, i32),
+    size: (u32, u32),
+}
+
+/// 二级窗口的锚点：发起它的窗口及其所在显示器。
+#[derive(Clone, Copy)]
+struct SecondaryWindowAnchor {
+    window: WindowRect,
+    monitor: WindowRect,
+}
+
+/// 居中于锚点窗口，并夹取在锚点所在显示器内。
+/// 独立成纯函数，便于覆盖多屏、负坐标和越界情形。
+fn centered_window_position(
+    anchor: WindowRect,
+    target_size: (u32, u32),
+    monitor: WindowRect,
+) -> (i32, i32) {
+    let (target_width, target_height) = (target_size.0 as i32, target_size.1 as i32);
+    let centered_x = anchor.position.0 + (anchor.size.0 as i32 - target_width) / 2;
+    let centered_y = anchor.position.1 + (anchor.size.1 as i32 - target_height) / 2;
+    // 弹窗比显示器还大时退回显示器原点，保证结果始终落在可见区域内。
+    let max_x = (monitor.position.0 + monitor.size.0 as i32 - target_width).max(monitor.position.0);
+    let max_y =
+        (monitor.position.1 + monitor.size.1 as i32 - target_height).max(monitor.position.1);
+    (
+        centered_x.clamp(monitor.position.0, max_x),
+        centered_y.clamp(monitor.position.1, max_y),
+    )
+}
+
+/// 冲突确认在文件操作窗口可见时以它为准，其余二级窗口以发起它的主窗口为准。
+fn secondary_window_anchor(
     ui: &AppWindow,
     operation_ui: Option<&OperationWindow>,
-    target_ui: &ConfirmationWindow,
-) {
-    let target_size = target_ui.window().size();
-    let operation_visible = operation_ui.is_some_and(|window| window.window().is_visible());
-    let mut target = None;
+) -> Option<SecondaryWindowAnchor> {
+    let mut anchor = None;
     let mut calculate = |source: &winit::window::Window| {
         let Some(monitor) = source.current_monitor() else {
             return;
@@ -16148,28 +16177,43 @@ fn position_window_centered(
         let monitor_size = monitor.size();
         let source_position = source.outer_position().unwrap_or(monitor_position);
         let source_size = source.outer_size();
-        let centered_x =
-            source_position.x + (source_size.width as i32 - target_size.width as i32) / 2;
-        let centered_y =
-            source_position.y + (source_size.height as i32 - target_size.height as i32) / 2;
-        let max_x = monitor_position.x + monitor_size.width as i32 - target_size.width as i32;
-        let max_y = monitor_position.y + monitor_size.height as i32 - target_size.height as i32;
-        target = Some(slint::PhysicalPosition::new(
-            centered_x.clamp(monitor_position.x, max_x.max(monitor_position.x)),
-            centered_y.clamp(monitor_position.y, max_y.max(monitor_position.y)),
-        ));
+        anchor = Some(SecondaryWindowAnchor {
+            window: WindowRect {
+                position: (source_position.x, source_position.y),
+                size: (source_size.width, source_size.height),
+            },
+            monitor: WindowRect {
+                position: (monitor_position.x, monitor_position.y),
+                size: (monitor_size.width, monitor_size.height),
+            },
+        });
     };
-    if operation_visible {
-        operation_ui
-            .expect("visible operation window exists")
-            .window()
-            .with_winit_window(&mut calculate);
+    if let Some(operation_ui) = operation_ui.filter(|window| window.window().is_visible()) {
+        operation_ui.window().with_winit_window(&mut calculate);
     } else {
         ui.window().with_winit_window(calculate);
     }
-    if let Some(position) = target {
-        target_ui.window().set_position(position);
-    }
+    anchor
+}
+
+/// 所有二级窗口共用的落点：居中于发起窗口，并夹取在该窗口所在显示器内。
+fn position_window_centered<T: slint::ComponentHandle>(
+    ui: &AppWindow,
+    operation_ui: Option<&OperationWindow>,
+    target_ui: &T,
+) {
+    let Some(anchor) = secondary_window_anchor(ui, operation_ui) else {
+        return;
+    };
+    let target_size = target_ui.window().size();
+    let (x, y) = centered_window_position(
+        anchor.window,
+        (target_size.width, target_size.height),
+        anchor.monitor,
+    );
+    target_ui
+        .window()
+        .set_position(slint::PhysicalPosition::new(x, y));
 }
 
 fn wire_operation_window(
@@ -16296,7 +16340,7 @@ fn wire_operation_window(
             if should_open && !operation_ui.window().is_visible() {
                 refresh_operation_window(&operation_ui, &state_for_auto_open);
                 if let Some(ui) = ui_weak.upgrade() {
-                    position_operation_window_next_to_main(&ui, &operation_ui);
+                    position_window_centered(&ui, None, &operation_ui);
                 }
                 if operation_ui.show().is_ok() {
                     auto_opened_for_timer.set(true);
@@ -16319,7 +16363,7 @@ fn wire_operation_window_opener(
         if let (Some(ui), Some(operation_ui)) = (ui_weak.upgrade(), operation_weak.upgrade()) {
             auto_opened.set(false);
             refresh_operation_window(&operation_ui, &state);
-            position_operation_window_next_to_main(&ui, &operation_ui);
+            position_window_centered(&ui, None, &operation_ui);
             let _ = operation_ui.show();
         }
     });
@@ -16342,33 +16386,6 @@ fn should_auto_open_operation_window(app: &AppState) -> bool {
             )
             && task.cancellation.active_elapsed(task.started_at) >= Duration::from_millis(800)
     })
-}
-
-fn position_operation_window_next_to_main(ui: &AppWindow, operation_ui: &OperationWindow) {
-    let mut target = None;
-    ui.window().with_winit_window(|main| {
-        let Some(monitor) = main.current_monitor() else {
-            return;
-        };
-        let monitor_position = monitor.position();
-        let monitor_size = monitor.size();
-        let operation_size = operation_ui.window().size();
-        let main_position = main.outer_position().unwrap_or(monitor_position);
-        let main_size = main.outer_size();
-        let centered_x =
-            main_position.x + (main_size.width as i32 - operation_size.width as i32) / 2;
-        let centered_y =
-            main_position.y + (main_size.height as i32 - operation_size.height as i32) / 2;
-        let max_x = monitor_position.x + monitor_size.width as i32 - operation_size.width as i32;
-        let max_y = monitor_position.y + monitor_size.height as i32 - operation_size.height as i32;
-        target = Some(slint::PhysicalPosition::new(
-            centered_x.clamp(monitor_position.x, max_x.max(monitor_position.x)),
-            centered_y.clamp(monitor_position.y, max_y.max(monitor_position.y)),
-        ));
-    });
-    if let Some(position) = target {
-        operation_ui.window().set_position(position);
-    }
 }
 
 fn refresh_operation_window(ui: &OperationWindow, state: &SharedSessions) {
@@ -26211,6 +26228,68 @@ fn initial_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rect(x: i32, y: i32, width: u32, height: u32) -> WindowRect {
+        WindowRect {
+            position: (x, y),
+            size: (width, height),
+        }
+    }
+
+    #[test]
+    fn issue_90_centered_window_position_follows_the_anchor_monitor() {
+        // 主窗口位于左侧带负坐标的显示器时，弹窗必须留在同一显示器内。
+        assert_eq!(
+            centered_window_position(
+                rect(-1900, 100, 1200, 800),
+                (460, 210),
+                rect(-1920, 0, 1920, 1080)
+            ),
+            (-1530, 395)
+        );
+        assert_eq!(
+            centered_window_position(
+                rect(100, 100, 1000, 700),
+                (520, 286),
+                rect(0, 0, 2560, 1440)
+            ),
+            (340, 307)
+        );
+    }
+
+    #[test]
+    fn issue_90_centered_window_position_clamps_into_the_monitor() {
+        // 锚点窗口贴边或部分越界时，弹窗仍不得越出显示器。
+        assert_eq!(
+            centered_window_position(rect(0, 0, 400, 300), (460, 210), rect(0, 0, 1920, 1080)),
+            (0, 45)
+        );
+        assert_eq!(
+            centered_window_position(
+                rect(1880, 1040, 400, 300),
+                (460, 210),
+                rect(0, 0, 1920, 1080)
+            ),
+            (1460, 870)
+        );
+    }
+
+    #[test]
+    fn issue_90_centered_window_position_never_escapes_a_small_monitor() {
+        // 弹窗比锚点所在显示器还大时退化到显示器原点，不产生可见区域外的负坐标。
+        assert_eq!(
+            centered_window_position(rect(0, 0, 400, 300), (520, 286), rect(0, 0, 400, 300)),
+            (0, 7)
+        );
+        assert_eq!(
+            centered_window_position(
+                rect(-1920, 0, 300, 200),
+                (520, 286),
+                rect(-1920, 0, 400, 300)
+            ),
+            (-1920, 0)
+        );
+    }
 
     #[test]
     fn issue_86_new_tab_policy_and_explicit_targets_are_separate() {
