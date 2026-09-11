@@ -41,6 +41,7 @@ pub enum AgentScenario {
     QuickMenuPopup,
     NetworkFoundation,
     DriveCapacity,
+    Home,
     FileListTypeSelect,
 }
 
@@ -64,6 +65,7 @@ impl AgentScenario {
             Self::QuickMenuPopup => "quick-menu-popup",
             Self::NetworkFoundation => "network-foundation",
             Self::DriveCapacity => "drive-capacity",
+            Self::Home => "home",
             Self::FileListTypeSelect => "file-list-type-select",
         }
     }
@@ -76,6 +78,7 @@ impl AgentScenario {
             Self::DriveCapacity => Path::new(DEFAULT_STATE_DIR)
                 .join("drives")
                 .join("capacity.json"),
+            Self::Home => Path::new(DEFAULT_STATE_DIR).join("home").join("state.json"),
             Self::ThumbnailScheduler => Path::new(DEFAULT_STATE_DIR)
                 .join("thumbnails")
                 .join("scheduler.json"),
@@ -161,6 +164,7 @@ fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
         "quick-menu-popup" => Ok(AgentScenario::QuickMenuPopup),
         "network-foundation" => Ok(AgentScenario::NetworkFoundation),
         "drive-capacity" => Ok(AgentScenario::DriveCapacity),
+        "home" => Ok(AgentScenario::Home),
         "file-list-type-select" => Ok(AgentScenario::FileListTypeSelect),
         _ => Err(format!("unknown agent scenario: {value}")),
     }
@@ -238,10 +242,15 @@ pub fn apply_scenario(session: &mut TabSession, scenario: AgentScenario) {
         | AgentScenario::QuickMenuPopup
         | AgentScenario::NetworkFoundation
         | AgentScenario::DriveCapacity
+        | AgentScenario::Home
         | AgentScenario::FileListTypeSelect => {
-            session.current_location = Some(crate::domain::NavigationLocation::Directory(
-                PathBuf::from(r"C:\AgentScenarios\FolderSizes"),
-            ));
+            session.current_location = if scenario == AgentScenario::Home {
+                Some(crate::domain::NavigationLocation::Home)
+            } else {
+                Some(crate::domain::NavigationLocation::Directory(PathBuf::from(
+                    r"C:\AgentScenarios\FolderSizes",
+                )))
+            };
             session.load_state = LoadState::Complete;
         }
         AgentScenario::FileOperationCenter => {
@@ -270,6 +279,7 @@ pub fn export_state(
 struct AgentState {
     scenario: &'static str,
     current_path: String,
+    location_kind: &'static str,
     page_state: &'static str,
     visible_page_operations: Vec<&'static str>,
     error_type: Option<&'static str>,
@@ -283,6 +293,12 @@ impl AgentState {
         let operation_state = operation_state_for_scenario(scenario);
         Self {
             scenario: scenario.name(),
+            location_kind: match session.visible_location() {
+                Some(crate::domain::NavigationLocation::Home) => "home",
+                Some(crate::domain::NavigationLocation::Directory(_)) => "directory",
+                Some(crate::domain::NavigationLocation::Library(_)) => "library",
+                None => "none",
+            },
             current_path: session
                 .visible_path()
                 .map(|path| path.as_os_str().to_string_lossy().into_owned())
@@ -348,8 +364,9 @@ impl AgentState {
             .map(|value| format!("\"{}\"", escape_json(value)))
             .unwrap_or_else(|| "null".to_owned());
         format!(
-            "{{\n  \"schema_version\": 1,\n  \"scenario\": \"{}\",\n  \"current_path\": \"{}\",\n  \"page_state\": \"{}\",\n  \"visible_page_operations\": [{}],\n  \"error_type\": {},\n  \"drag_drop\": {},\n  \"network_foundation\": {}\n}}\n",
+            "{{\n  \"schema_version\": 1,\n  \"scenario\": \"{}\",\n  \"location_kind\": \"{}\",\n  \"current_path\": \"{}\",\n  \"page_state\": \"{}\",\n  \"visible_page_operations\": [{}],\n  \"error_type\": {},\n  \"drag_drop\": {},\n  \"network_foundation\": {}\n}}\n",
             escape_json(self.scenario),
+            escape_json(self.location_kind),
             escape_json(&self.current_path),
             escape_json(self.page_state),
             operations,

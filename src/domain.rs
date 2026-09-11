@@ -85,6 +85,7 @@ impl Hash for LibraryLocationId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NavigationLocation {
+    Home,
     Directory(PathBuf),
     Library(LibraryLocationId),
 }
@@ -93,12 +94,13 @@ impl NavigationLocation {
     pub fn directory_path(&self) -> Option<&Path> {
         match self {
             Self::Directory(path) => Some(path),
-            Self::Library(_) => None,
+            Self::Home | Self::Library(_) => None,
         }
     }
 
     pub fn display_name(&self) -> String {
         match self {
+            Self::Home => "Home".to_owned(),
             Self::Directory(path) => display_path(path),
             Self::Library(library) => library.display_name.clone(),
         }
@@ -612,6 +614,13 @@ impl TabSession {
         }
     }
 
+    pub fn new_home(id: TabId) -> Self {
+        let mut tab = Self::new(id);
+        tab.current_location = Some(NavigationLocation::Home);
+        tab.load_state = LoadState::Complete;
+        tab
+    }
+
     pub fn new_settings(id: TabId) -> Self {
         let mut tab = Self::new(id);
         tab.kind = TabKind::Settings;
@@ -669,7 +678,7 @@ impl TabSession {
                 display_name: library.display_name.clone(),
                 sources: Vec::new(),
             },
-            None => SearchScope::Global,
+            Some(NavigationLocation::Home) | None => SearchScope::Global,
         };
         self.search_depth = SearchDepth::Recursive;
         self.search_query.clear();
@@ -907,6 +916,32 @@ impl TabSession {
         kind: NavigationKind,
     ) -> (RequestId, Arc<AtomicBool>) {
         self.begin_navigation(NavigationLocation::Directory(path), kind)
+    }
+
+    pub fn navigate_home(&mut self, kind: NavigationKind) -> RequestId {
+        self.cancel_pending();
+        self.latest_request.0 += 1;
+        self.navigation_kind = kind;
+        self.commit_location(NavigationLocation::Home);
+        self.page_source = PageSource::Directory;
+        self.directory_snapshot = None;
+        self.search_scope = SearchScope::Global;
+        self.search_depth = SearchDepth::Recursive;
+        self.search_query.clear();
+        self.search_state = SearchState::Waiting;
+        self.search_total = None;
+        self.search_file_total = None;
+        self.search_requested_pages.clear();
+        self.search_pending_pages.clear();
+        self.search_cached_pages.clear();
+        self.search_page_retries.clear();
+        self.pending_entries.clear();
+        self.replace_entries(Vec::new());
+        self.folder_sizes.cancel(self.latest_request);
+        self.load_state = LoadState::Complete;
+        self.error = None;
+        self.cancel = None;
+        self.latest_request
     }
 
     pub fn accepts(&self, request_id: RequestId) -> bool {
@@ -1656,6 +1691,48 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn issue_86_home_has_independent_identity_and_no_directory_path() {
+        let home = NavigationLocation::Home;
+        assert_eq!(home.display_name(), "Home");
+        assert_eq!(home.directory_path(), None);
+        assert_ne!(home, NavigationLocation::Directory(PathBuf::from("Home")));
+
+        let tab = TabSession::new_home(TabId(86));
+        assert_eq!(tab.current_location, Some(NavigationLocation::Home));
+        assert_eq!(tab.load_state, LoadState::Complete);
+        assert!(tab.entries.is_empty());
+        assert!(tab.back_history.is_empty());
+    }
+
+    #[test]
+    fn issue_86_home_and_directory_participate_in_back_forward_history() {
+        let mut session = TabSession::new_home(TabId(86));
+        let directory = NavigationLocation::Directory(PathBuf::from(r"C:\work"));
+
+        session.begin_navigation(directory.clone(), NavigationKind::Normal);
+        session.commit_location(directory.clone());
+        session.commit_pending();
+        assert_eq!(session.back_target(), Some(NavigationLocation::Home));
+
+        session.navigate_home(NavigationKind::Back);
+        assert_eq!(session.current_location, Some(NavigationLocation::Home));
+        assert_eq!(session.forward_target(), Some(directory.clone()));
+
+        session.begin_navigation(directory.clone(), NavigationKind::Forward);
+        session.commit_location(directory.clone());
+        session.commit_pending();
+        assert_eq!(session.current_location, Some(directory));
+        assert_eq!(session.back_target(), Some(NavigationLocation::Home));
+    }
+
+    #[test]
+    fn issue_86_duplicate_complete_preserves_home_identity() {
+        let source = TabSession::new_home(TabId(1));
+        let duplicate = TabSession::duplicate_complete(TabId(2), &source);
+        assert_eq!(duplicate.current_location, Some(NavigationLocation::Home));
+        assert_eq!(duplicate.load_state, LoadState::Complete);
+    }
     #[test]
     fn library_identity_is_lossless_and_independent_from_display_name() {
         let first = LibraryLocationId::new(OsString::from("library::stable"), "Documents".into());

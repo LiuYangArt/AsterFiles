@@ -6,18 +6,18 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KnownLocationKind {
-    Home,
     Pinned,
     Drive,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnownLocation {
     pub kind: KnownLocationKind,
     pub label: String,
     pub path: PathBuf,
     pub drive_root: Option<PathBuf>,
 }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShortcutTarget {
     pub path: PathBuf,
@@ -60,16 +60,10 @@ mod windows_impl {
         ptr,
     };
 
-    use windows_sys::{
-        Win32::{
-            Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW},
-            System::{Com::CoTaskMemFree, WindowsProgramming::DRIVE_REMOTE},
-            UI::{
-                Shell::{FOLDERID_Profile, SHGetKnownFolderPath, ShellExecuteW},
-                WindowsAndMessaging::SW_SHOWNORMAL,
-            },
-        },
-        core::GUID,
+    use windows_sys::Win32::{
+        Storage::FileSystem::{GetLogicalDrives, GetVolumeInformationW},
+        System::Com::CoTaskMemFree,
+        UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
     };
 
     use super::{KnownLocation, KnownLocationKind, Path, PathBuf, ShortcutTarget};
@@ -93,22 +87,8 @@ mod windows_impl {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
         std::time::Duration::from_millis(unsafe { GetDoubleClickTime() }.into())
     }
-    pub fn known_locations() -> Vec<KnownLocation> {
-        let mut locations = known_folder(&FOLDERID_Profile)
-            .map(|path| {
-                vec![KnownLocation {
-                    kind: KnownLocationKind::Home,
-                    label: "主页".to_owned(),
-                    path,
-                    drive_root: None,
-                }]
-            })
-            .unwrap_or_default();
-        if let Ok(pinned) = explorer_pinned_locations() {
-            locations.extend(pinned);
-        }
-        locations.extend(logical_drives());
-        locations
+    pub fn logical_drive_locations() -> impl Iterator<Item = KnownLocation> {
+        logical_drives()
     }
 
     pub fn explorer_pinned_locations() -> std::io::Result<Vec<KnownLocation>> {
@@ -209,26 +189,6 @@ mod windows_impl {
         }
     }
 
-    fn known_folder(id: &GUID) -> Option<PathBuf> {
-        let mut pointer = ptr::null_mut();
-        let result = unsafe { SHGetKnownFolderPath(id, 0, ptr::null_mut(), &mut pointer) };
-        if result < 0 || pointer.is_null() {
-            return None;
-        }
-        let length = unsafe {
-            let mut length = 0;
-            while *pointer.add(length) != 0 {
-                length += 1;
-            }
-            length
-        };
-        let path = PathBuf::from(OsString::from_wide(unsafe {
-            std::slice::from_raw_parts(pointer, length)
-        }));
-        unsafe { CoTaskMemFree(pointer.cast()) };
-        Some(path)
-    }
-
     fn logical_drives() -> impl Iterator<Item = KnownLocation> {
         let mask = unsafe { GetLogicalDrives() };
         (0..26)
@@ -242,29 +202,15 @@ mod windows_impl {
                 } else {
                     format!("{volume} ({letter}:)")
                 };
-                let path = if drive_is_remote(&drive_root) {
-                    super::windows::network::network_drive_to_unc(&drive_root)
-                        .unwrap_or_else(|_| drive_root.clone())
-                } else {
-                    drive_root.clone()
-                };
                 KnownLocation {
                     kind: KnownLocationKind::Drive,
                     label,
-                    path,
+                    path: drive_root.clone(),
                     drive_root: Some(drive_root),
                 }
             })
     }
 
-    fn drive_is_remote(path: &Path) -> bool {
-        let root = path
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<_>>();
-        unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_REMOTE }
-    }
     fn volume_label(path: &Path) -> String {
         let root = path
             .as_os_str()
@@ -412,7 +358,8 @@ mod windows_impl {
 }
 
 #[cfg(windows)]
+#[allow(unused_imports)]
 pub use windows_impl::{
-    double_click_interval, explorer_pinned_locations, known_locations, open_path, open_url,
+    double_click_interval, explorer_pinned_locations, logical_drive_locations, open_path, open_url,
     open_windows_credentials, request_folder_access, resolve_shortcut_target,
 };

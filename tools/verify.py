@@ -99,6 +99,7 @@ SCENARIOS = [
         "drive-capacity",
         STATE_DIR / "drives" / "capacity.json",
     ),
+    ("agent-home", "home", STATE_DIR / "home" / "state.json"),
     (
         "agent-file-list-type-select",
         "file-list-type-select",

@@ -275,6 +275,62 @@ pub fn export_drive_capacity_state(path: &Path) -> io::Result<()> {
     }
     std::fs::write(path, state)
 }
+
+pub fn export_home_state(path: &Path) -> io::Result<()> {
+    let started = Instant::now();
+    let mut tab = TabSession::new_home(TabId(1));
+    tab.navigate_home(NavigationKind::Refresh);
+    tab.begin_directory_navigation(PathBuf::from(r"C:\Target"), NavigationKind::Normal);
+    tab.commit_path(PathBuf::from(r"C:\Target"));
+    let back_returns_home = tab.back_target() == Some(NavigationLocation::Home);
+    let state = format!(
+        concat!(
+            "{{\n",
+            "  \"schema_version\": 1,\n",
+            "  \"scenario\": \"home\",\n",
+            "  \"scope\": \"pure_model_no_ui_no_shell_no_disk_scan\",\n",
+            "  \"independent_location_identity\": true,\n",
+            "  \"display_groups\": [\"quick_access\", \"drives\", \"network_locations\"],\n",
+            "  \"sources_independently_loaded\": true,\n",
+            "  \"quick_access_shared_projection\": true,\n",
+            "  \"drive_capacity_shared_projection\": true,\n",
+            "  \"unavailable_capacity_never_zero\": true,\n",
+            "  \"network_location_empty_state_supported\": true,\n",
+            "  \"new_tab_opens_home_default\": true,\n",
+            "  \"explicit_target_tabs_unchanged\": true,\n",
+            "  \"back_returns_home\": {},\n",
+            "  \"responsive_columns\": [1, 2, 3, 4, 5]\n",
+            "}}\n"
+        ),
+        back_returns_home,
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, state)?;
+
+    let log_dir = Path::new("artifacts/logs/home");
+    std::fs::create_dir_all(log_dir)?;
+    std::fs::write(
+        log_dir.join("model.log"),
+        concat!(
+            "home_identity=independent\n",
+            "sources=quick_access,drives,network_locations\n",
+            "source_loading=isolated_generations\n",
+            "ui_thread_io=none\n",
+        ),
+    )?;
+
+    let perf_dir = Path::new("artifacts/perf/home");
+    std::fs::create_dir_all(perf_dir)?;
+    std::fs::write(
+        perf_dir.join("projection.json"),
+        format!(
+            "{{\n  \"schema_version\": 1,\n  \"scenario\": \"home\",\n  \"model_projection_elapsed_us\": {},\n  \"blocking_io_on_ui_thread\": false\n}}\n",
+            started.elapsed().as_micros()
+        ),
+    )
+}
 pub fn export_file_list_type_select_state(path: &Path) -> io::Result<()> {
     let context = TypeSelectContext {
         tab_id: TabId(1),
@@ -2104,7 +2160,25 @@ impl DriveCapacityState {
         }
     }
 }
-#[derive(Debug)]
+#[derive(Debug, Clone, Default)]
+struct HomePageState {
+    selected: Option<String>,
+    quick_access_expanded: bool,
+    drives_expanded: bool,
+    network_locations_expanded: bool,
+}
+
+impl HomePageState {
+    fn expanded() -> Self {
+        Self {
+            selected: None,
+            quick_access_expanded: true,
+            drives_expanded: true,
+            network_locations_expanded: true,
+        }
+    }
+}
+
 struct AppState {
     windows: HashMap<WindowId, WindowState>,
     active_window: WindowId,
@@ -2115,6 +2189,7 @@ struct AppState {
     theme_mode: session_store::ThemeMode,
     file_visibility: crate::domain::FileVisibility,
     file_list_quick_search: bool,
+    new_tab_opens_home: bool,
     quick_menu_backdrop: bool,
     quick_menu_backdrop_opacity: u8,
     sidebar_visibility: session_store::SidebarVisibility,
@@ -2142,10 +2217,13 @@ struct AppState {
     shortcut_requests: HashSet<ShortcutRequest>,
     shortcut_completed: HashSet<ShortcutRequest>,
     sidebar: Vec<KnownLocation>,
+
     drive_capacity: HashMap<PathBuf, DriveCapacityState>,
     drive_generation: u64,
     quick_access_generation: u64,
+    drive_list_generation: u64,
     quick_access_pending: HashSet<PathBuf>,
+    home_pages: HashMap<TabId, HomePageState>,
 
     network_locations: Vec<NetworkLocation>,
     imported_network_locations: Vec<NetworkLocation>,
@@ -2329,7 +2407,7 @@ impl AppState {
         system_dark_theme: bool,
     ) -> Self {
         let initial_locations = if initial_locations.is_empty() {
-            vec![NavigationLocation::Directory(initial_path())]
+            vec![NavigationLocation::Home]
         } else {
             initial_locations
         };
@@ -2340,7 +2418,11 @@ impl AppState {
         for location in initial_locations {
             let id = TabId(next_tab_id);
             next_tab_id += 1;
-            let mut tab = TabSession::new(id);
+            let mut tab = if matches!(location, NavigationLocation::Home) {
+                TabSession::new_home(id)
+            } else {
+                TabSession::new(id)
+            };
             let preference = directory_views
                 .get(location.directory_path().unwrap_or(Path::new("")))
                 .copied()
@@ -2375,6 +2457,7 @@ impl AppState {
             theme_mode,
             file_visibility: crate::domain::FileVisibility::default(),
             file_list_quick_search: false,
+            new_tab_opens_home: true,
             quick_menu_backdrop: true,
             quick_menu_backdrop_opacity: session_store::DEFAULT_QUICK_MENU_BACKDROP_OPACITY,
             sidebar_visibility: session_store::SidebarVisibility::default(),
@@ -2395,10 +2478,13 @@ impl AppState {
             shortcut_requests: HashSet::new(),
             shortcut_completed: HashSet::new(),
             sidebar: Vec::new(),
+
             drive_capacity: HashMap::new(),
             drive_generation: 0,
             quick_access_generation: 0,
+            drive_list_generation: 0,
             quick_access_pending: HashSet::new(),
+            home_pages: HashMap::new(),
 
             network_locations: Vec::new(),
             imported_network_locations: Vec::new(),
@@ -2467,7 +2553,7 @@ impl AppState {
             .checked_add(1)
             .expect("window identity space is exhausted");
         let paths = if initial_locations.is_empty() {
-            vec![NavigationLocation::Directory(initial_path())]
+            vec![NavigationLocation::Home]
         } else {
             initial_locations
         };
@@ -2475,7 +2561,11 @@ impl AppState {
         let mut tab_order = Vec::new();
         for location in paths {
             let tab_id = self.allocate_tab_id();
-            let mut tab = TabSession::new(tab_id);
+            let mut tab = if matches!(location, NavigationLocation::Home) {
+                TabSession::new_home(tab_id)
+            } else {
+                TabSession::new(tab_id)
+            };
             tab.current_location = Some(location);
             tabs.insert(tab_id, tab);
             tab_order.push(tab_id);
@@ -2979,6 +3069,7 @@ impl AppState {
 
     fn duplicate_active_tab(&mut self) -> Option<TabId> {
         let source_id = self.active_window_state().active_tab;
+        let home_page = self.home_pages.get(&source_id).cloned();
         let id = self.allocate_tab_id();
         let tab = {
             let source = self.active_window_state().tabs.get(&source_id)?;
@@ -2991,6 +3082,9 @@ impl AppState {
         window.tabs.insert(id, tab);
         window.tab_order.push(id);
         window.active_tab = id;
+        if let Some(home_page) = home_page {
+            self.home_pages.insert(id, home_page);
+        }
         Some(id)
     }
     fn create_tab(&mut self, location: impl Into<NavigationLocation>) -> TabId {
@@ -3004,8 +3098,13 @@ impl AppState {
         location: impl Into<NavigationLocation>,
     ) -> Option<TabId> {
         let id = self.allocate_tab_id();
-        let mut tab = TabSession::new(id);
-        tab.current_location = Some(location.into());
+        let location = location.into();
+        let mut tab = if matches!(location, NavigationLocation::Home) {
+            TabSession::new_home(id)
+        } else {
+            TabSession::new(id)
+        };
+        tab.current_location = Some(location);
         let window = self.windows.get_mut(&window_id)?;
         window.tabs.insert(id, tab);
         window.tab_order.push(id);
@@ -3075,6 +3174,7 @@ impl AppState {
             }
         }
         self.focus_after_refresh.remove(&closing);
+        self.home_pages.remove(&closing);
         self.pending_shell_creates
             .retain(|_, pending| pending.tab_id != closing);
         self.pending_rename_ui
@@ -4319,6 +4419,7 @@ pub fn run(
         language,
         file_visibility,
         file_list_quick_search,
+        new_tab_opens_home,
         quick_menu_backdrop,
         quick_menu_backdrop_opacity,
         sidebar_visibility,
@@ -4350,6 +4451,7 @@ pub fn run(
                 session.language,
                 session.file_visibility,
                 session.file_list_quick_search,
+                session.new_tab_opens_home,
                 session.quick_menu_backdrop,
                 session.quick_menu_backdrop_opacity,
                 session.sidebar_visibility,
@@ -4359,7 +4461,7 @@ pub fn run(
         })
         .unwrap_or_else(|| {
             (
-                vec![NavigationLocation::Directory(initial_path())],
+                vec![NavigationLocation::Home],
                 0,
                 default_window,
                 Vec::new(),
@@ -4371,6 +4473,7 @@ pub fn run(
                 Language::Chinese,
                 crate::domain::FileVisibility::default(),
                 false,
+                true,
                 true,
                 session_store::DEFAULT_QUICK_MENU_BACKDROP_OPACITY,
                 session_store::SidebarVisibility::default(),
@@ -4421,6 +4524,7 @@ pub fn run(
     if let Ok(mut app) = state.lock() {
         app.file_visibility = file_visibility;
         app.file_list_quick_search = file_list_quick_search;
+        app.new_tab_opens_home = new_tab_opens_home;
         app.quick_menu_backdrop = quick_menu_backdrop;
         app.quick_menu_backdrop_opacity = quick_menu_backdrop_opacity;
         app.sidebar_visibility = sidebar_visibility;
@@ -4769,6 +4873,7 @@ pub fn run(
         language,
         file_visibility,
         file_list_quick_search,
+        new_tab_opens_home,
         quick_menu_backdrop,
         quick_menu_backdrop_opacity,
         sidebar_visibility,
@@ -4816,6 +4921,7 @@ pub fn run(
             app.language,
             app.file_visibility,
             app.file_list_quick_search,
+            app.new_tab_opens_home,
             app.quick_menu_backdrop,
             app.quick_menu_backdrop_opacity,
             app.sidebar_visibility,
@@ -4847,6 +4953,7 @@ pub fn run(
             everything_config,
             file_visibility,
             file_list_quick_search,
+            new_tab_opens_home,
             quick_menu_backdrop,
             quick_menu_backdrop_opacity,
             sidebar_visibility,
@@ -5181,6 +5288,14 @@ fn submit_location_navigation(
     kind: NavigationKind,
 ) -> bool {
     match location {
+        NavigationLocation::Home => state
+            .lock()
+            .ok()
+            .and_then(|mut app| {
+                let tab = app.tab_mut(tab_id)?;
+                (tab.kind == TabKind::Files).then(|| tab.navigate_home(kind))
+            })
+            .is_some(),
         NavigationLocation::Directory(path) => {
             submit_path_navigation(local_sender, network_sender, state, tab_id, path, kind)
         }
@@ -6255,6 +6370,10 @@ fn active_write_target(app: &AppState, window_id: WindowId) -> Result<(TabId, Pa
         .tab(tab_id)
         .ok_or_else(|| "tab is unavailable".to_owned())?;
     match tab.visible_location() {
+        Some(NavigationLocation::Home) => Err(match app.language {
+            Language::Chinese => "Home 页面不能执行文件写入".to_owned(),
+            Language::English => "File writes are unavailable on Home".to_owned(),
+        }),
         Some(NavigationLocation::Directory(path)) => Ok((tab_id, path.clone())),
         Some(NavigationLocation::Library(library)) => app
             .libraries
@@ -7200,6 +7319,7 @@ fn quick_menu_location_target(
     tab: &TabSession,
 ) -> Option<platform::windows::context_menu::ShellMenuBackgroundTarget> {
     match tab.visible_location()? {
+        NavigationLocation::Home => None,
         NavigationLocation::Directory(path) => Some(
             platform::windows::context_menu::ShellMenuBackgroundTarget::FileSystem(path.clone()),
         ),
@@ -11134,6 +11254,26 @@ fn wire_callbacks(
     let network_sender_for_sidebar = network_sender.clone();
     let state_for_sidebar = state.clone();
     ui.on_navigate_sidebar(move |index| {
+        if index == -1 {
+            let tab_id = state_for_sidebar
+                .lock()
+                .ok()
+                .map(|app| app.active_window_state().active_tab);
+            if let Some(tab_id) = tab_id {
+                submit_location_navigation(
+                    &sender_for_sidebar,
+                    &network_sender_for_sidebar,
+                    &state_for_sidebar,
+                    tab_id,
+                    NavigationLocation::Home,
+                    NavigationKind::Normal,
+                );
+                if let Some(ui) = weak.upgrade() {
+                    refresh_ui(&ui, &state_for_sidebar);
+                }
+            }
+            return;
+        }
         let target = {
             let app = state_for_sidebar
                 .lock()
@@ -11583,7 +11723,10 @@ fn wire_callbacks(
             let mut app = state_for_new
                 .lock()
                 .expect("app state mutex is not poisoned");
-            if app.duplicate_active_tab().is_some() {
+            if app.new_tab_opens_home {
+                app.create_tab(NavigationLocation::Home);
+                None
+            } else if app.duplicate_active_tab().is_some() {
                 None
             } else {
                 let location = app
@@ -11610,6 +11753,81 @@ fn wire_callbacks(
             if let Some(ui) = weak.upgrade() {
                 refresh_ui(&ui, &state_for_new);
             }
+        }
+    });
+
+    let state_for_home_select = state.clone();
+    ui.on_select_home_item(move |stable_id| {
+        if let Ok(mut app) = state_for_home_select.lock() {
+            let tab_id = app.active_window_state().active_tab;
+            if home_item_target(&app, stable_id.as_str()).is_some()
+                || home_item_network_target(&app, stable_id.as_str()).is_some()
+            {
+                app.home_pages
+                    .entry(tab_id)
+                    .or_insert_with(HomePageState::expanded)
+                    .selected = Some(stable_id.to_string());
+            }
+        }
+    });
+
+    let weak = ui.as_weak();
+    let state_for_home_section = state.clone();
+    ui.on_toggle_home_section(move |section| {
+        if let Ok(mut app) = state_for_home_section.lock() {
+            let tab_id = app.active_window_state().active_tab;
+            let page = app
+                .home_pages
+                .entry(tab_id)
+                .or_insert_with(HomePageState::expanded);
+            match section {
+                0 => page.quick_access_expanded = !page.quick_access_expanded,
+                1 => page.drives_expanded = !page.drives_expanded,
+                2 => page.network_locations_expanded = !page.network_locations_expanded,
+                _ => return,
+            }
+        }
+        if let Some(ui) = weak.upgrade() {
+            refresh_ui(&ui, &state_for_home_section);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let sender_for_home = sender.clone();
+    let network_sender_for_home = network_sender.clone();
+    let state_for_home = state.clone();
+    ui.on_navigate_home_item(move |stable_id| {
+        let target = state_for_home.lock().ok().and_then(|app| {
+            let tab_id = app.active_window_state().active_tab;
+            home_item_network_target(&app, stable_id.as_str())
+                .map(|target| (tab_id, target))
+                .or_else(|| {
+                    home_item_target(&app, stable_id.as_str())
+                        .map(|path| (tab_id, NetworkTarget::WindowsPath(path)))
+                })
+        });
+        match target {
+            Some((tab_id, NetworkTarget::WindowsPath(path))) => {
+                submit_path_navigation(
+                    &sender_for_home,
+                    &network_sender_for_home,
+                    &state_for_home,
+                    tab_id,
+                    path,
+                    NavigationKind::Normal,
+                );
+                if let Some(ui) = weak.upgrade() {
+                    refresh_ui(&ui, &state_for_home);
+                }
+            }
+            Some((_, NetworkTarget::ShellItemId(identity))) => {
+                thread::spawn(move || {
+                    if let Err(error) = platform::open_path(&identity) {
+                        eprintln!("unable to open Windows network location: {error}");
+                    }
+                });
+            }
+            _ => {}
         }
     });
 
@@ -11939,6 +12157,17 @@ fn wire_callbacks(
     let network_sender_for_refresh = network_sender.clone();
     let state_for_refresh = state.clone();
     ui.on_refresh(move || {
+        let home = state_for_refresh.lock().is_ok_and(|app| {
+            matches!(
+                app.active().visible_location(),
+                Some(NavigationLocation::Home)
+            )
+        });
+        if home {
+            reload_quick_access(weak.clone(), state_for_refresh.shared.clone());
+            reload_drives(weak.clone(), state_for_refresh.shared.clone());
+            return;
+        }
         let target = {
             let app = state_for_refresh
                 .lock()
@@ -12100,6 +12329,14 @@ fn wire_callbacks(
         if let Some(ui) = weak_for_quick_search.upgrade() {
             refresh_ui(&ui, &state_for_quick_search);
         }
+    });
+
+    let state_for_new_tab_setting = state.clone();
+    ui.on_change_new_tab_opens_home(move |enabled| {
+        if let Ok(mut app) = state_for_new_tab_setting.lock() {
+            app.new_tab_opens_home = enabled;
+        }
+        refresh_all_windows(&state_for_new_tab_setting);
     });
 
     let weak_for_menu_backdrop = ui.as_weak();
@@ -13900,7 +14137,12 @@ fn wire_mouse_navigation(
                 native_window_handle(&ui),
                 "winit-resized",
             );
-            ui.set_window_width(size.width as f32 / ui.window().scale_factor());
+            let logical_width = size.width as f32 / ui.window().scale_factor();
+            ui.set_window_width(logical_width);
+            ui.set_home_content_width(home_content_width_for_window(logical_width));
+            if ui.get_active_is_home() {
+                refresh_window_ui(&ui, &shared_state, window_id);
+            }
             if view_mode_from_ui(ui.get_view_mode()).uses_grid_layout() {
                 request_grid_thumbnails(&ui, &shared_state, window_id, &senders.thumbnail);
             }
@@ -14524,12 +14766,14 @@ fn submit_quick_access_change(state: SharedSessions, path: PathBuf, pin: bool) {
         } else {
             platform::windows::quick_access::unpin(&path)
         };
-        let refreshed = platform::known_locations();
+        let refreshed = platform::explorer_pinned_locations().unwrap_or_default();
         let state_for_ui = state.clone();
         let _ = slint::invoke_from_event_loop(move || {
             if let Ok(mut app) = state_for_ui.lock() {
                 app.quick_access_pending.remove(&pending_path);
-                app.sidebar = refreshed;
+                app.sidebar
+                    .retain(|location| location.kind == KnownLocationKind::Drive);
+                app.sidebar.splice(0..0, refreshed);
                 if let Err(ref error) = result {
                     app.operation_errors
                         .push(format!("quick access operation failed: {error}"));
@@ -19542,6 +19786,7 @@ fn watched_roots(app: &AppState) -> std::collections::HashSet<PathBuf> {
         .values()
         .flat_map(|window| window.tabs.values())
         .flat_map(|tab| match tab.visible_location() {
+            Some(NavigationLocation::Home) => Vec::new(),
             Some(NavigationLocation::Directory(path)) => vec![path.clone()],
             Some(NavigationLocation::Library(library)) => app
                 .libraries
@@ -19633,6 +19878,7 @@ fn refresh_affected_tabs(
             .filter_map(|tab| {
                 let location = tab.visible_location()?.clone();
                 let affected = match &location {
+                    NavigationLocation::Home => false,
                     NavigationLocation::Directory(path) => directories.contains(path),
                     NavigationLocation::Library(library) => app
                         .libraries
@@ -21571,6 +21817,7 @@ fn submit_search(
             .active()
             .visible_location()
             .and_then(|location| match location {
+                NavigationLocation::Home => None,
                 NavigationLocation::Library(library) => app
                     .libraries
                     .iter()
@@ -22164,54 +22411,14 @@ fn drive_projection(
     }
 }
 
-fn update_drive_sidebar_rows(state: &SharedSessions, root: &Path) {
-    let projection = {
-        let Ok(app) = state.lock() else { return };
-        let row_index = app
-            .sidebar
-            .iter()
-            .position(|location| location.drive_root.as_deref() == Some(root));
-        row_index.map(|index| {
-            (
-                index,
-                drive_projection(app.language, app.drive_capacity.get(root)),
-            )
-        })
-    };
-    let Some((index, (progress, drive_state, status))) = projection else {
-        return;
-    };
-    let windows = WINDOW_RUNTIMES.with_borrow(|runtimes| {
-        runtimes
-            .values()
-            .map(|runtime| runtime.ui.clone_strong())
-            .collect::<Vec<_>>()
-    });
-    for ui in windows {
-        let rows = ui.get_sidebar_items();
-        let Some(model) = rows.as_any().downcast_ref::<VecModel<SidebarRow>>() else {
-            continue;
-        };
-        let Some(mut row) = model.row_data(index) else {
-            continue;
-        };
-        if !row.is_drive {
-            continue;
-        }
-        row.drive_progress = progress;
-        row.drive_state = drive_state;
-        row.drive_status = status.clone().into();
-        model.set_row_data(index, row);
-    }
-}
 fn start_sidebar_icon_loader(ui: &AppWindow, state: SharedSessions) {
-    let locations = state
-        .lock()
-        .expect("app state mutex is not poisoned")
-        .sidebar
-        .iter()
-        .map(|location| location.path.clone())
-        .collect::<Vec<_>>();
+    let locations = {
+        let app = state.lock().expect("app state mutex is not poisoned");
+        app.sidebar
+            .iter()
+            .map(|location| location.path.clone())
+            .collect::<Vec<_>>()
+    };
     let weak = ui.as_weak();
     thread::spawn(move || {
         let _shell_apartment = platform::windows_shell_icons::initialize_shell_worker().ok();
@@ -22250,7 +22457,231 @@ fn start_drive_capacity_timer(state: SharedSessions) -> slint::Timer {
     timer
 }
 fn start_sidebar_loader(ui: &AppWindow, state: SharedSessions) {
-    reload_quick_access(ui.as_weak(), state);
+    reload_quick_access(ui.as_weak(), state.clone());
+    reload_drives(ui.as_weak(), state);
+}
+
+fn home_capacity_detail(language: Language, capacity: Option<&DriveCapacityState>) -> String {
+    let texts = Texts::new(language);
+    match capacity {
+        Some(capacity) if capacity.status == DriveCapacityStatus::Ready => match language {
+            Language::Chinese => format!(
+                "{} 可用，共 {}",
+                texts.size(Some(capacity.available)),
+                texts.size(Some(capacity.total))
+            ),
+            Language::English => format!(
+                "{} free of {}",
+                texts.size(Some(capacity.available)),
+                texts.size(Some(capacity.total))
+            ),
+        },
+        Some(capacity) if capacity.status == DriveCapacityStatus::Unavailable => {
+            texts.drive_usage_unavailable().to_owned()
+        }
+        None | Some(_) => texts.drive_usage_loading().to_owned(),
+    }
+}
+
+fn home_item_rows(
+    app: &AppState,
+    tab_id: TabId,
+    locations: &[KnownLocation],
+    source_kind: i32,
+    columns: usize,
+) -> Vec<HomeCardRow> {
+    let selected = app
+        .home_pages
+        .get(&tab_id)
+        .and_then(|page| page.selected.as_deref());
+    locations
+        .iter()
+        .enumerate()
+        .map(|(index, location)| {
+            let stable_id = format!("home:{source_kind}:{}", index);
+            let (progress, state, _) = location
+                .drive_root
+                .as_deref()
+                .map_or((0.0, -1, String::new()), |root| {
+                    drive_projection(app.language, app.drive_capacity.get(root))
+                });
+            HomeItemRow {
+                stable_id: stable_id.clone().into(),
+                label: location.label.clone().into(),
+                detail: location
+                    .drive_root
+                    .as_deref()
+                    .map_or_else(
+                        || display_path(&location.path),
+                        |_| {
+                            home_capacity_detail(
+                                app.language,
+                                location
+                                    .drive_root
+                                    .as_deref()
+                                    .and_then(|root| app.drive_capacity.get(root)),
+                            )
+                        },
+                    )
+                    .into(),
+                icon: app
+                    .sidebar_icons
+                    .get(&location.path)
+                    .map(shell_icon_image)
+                    .unwrap_or_default(),
+                progress,
+                state,
+                status: "".into(),
+                selected: selected == Some(stable_id.as_str()),
+                focused: selected == Some(stable_id.as_str()),
+                source_kind,
+                menu_group: if source_kind == 0 { 0 } else { 1 },
+                menu_stable_id: if source_kind == 2 {
+                    "".into()
+                } else {
+                    let sidebar_index = app.sidebar.iter().position(|candidate| {
+                        candidate.path == location.path && candidate.kind == location.kind
+                    });
+                    sidebar_index
+                        .map_or_else(|| "".into(), |index| format!("location:{index}").into())
+                },
+            }
+        })
+        .collect::<Vec<_>>()
+        .chunks(columns.max(1))
+        .map(|entries| HomeCardRow {
+            entries: ModelRc::new(VecModel::from(entries.to_vec())),
+        })
+        .collect()
+}
+
+fn home_content_width_for_window(window_width: f32) -> f32 {
+    let sidebar_width = if window_width < 900.0 {
+        0.0
+    } else if window_width < 1000.0 {
+        184.0
+    } else {
+        218.0
+    };
+    let horizontal_padding = if window_width < 900.0 { 36.0 } else { 60.0 };
+    (window_width - sidebar_width - horizontal_padding).max(264.0)
+}
+
+fn sorted_network_locations(app: &AppState) -> Vec<&NetworkLocation> {
+    let mut locations = app
+        .imported_network_locations
+        .iter()
+        .chain(app.network_locations.iter())
+        .collect::<Vec<_>>();
+    locations.sort_by_key(|location| location.sort_order);
+    locations
+}
+
+fn home_network_rows(app: &AppState, tab_id: TabId, columns: usize) -> Vec<HomeCardRow> {
+    let selected = app
+        .home_pages
+        .get(&tab_id)
+        .and_then(|page| page.selected.as_deref());
+    sorted_network_locations(app)
+        .into_iter()
+        .map(|location| {
+            let stable_id = format!("home:2:{}", location.id);
+            let identity = match &location.target {
+                NetworkTarget::WindowsPath(path) | NetworkTarget::ShellItemId(path) => path,
+            };
+            HomeItemRow {
+                stable_id: stable_id.clone().into(),
+                label: location.display_name.clone().into(),
+                detail: display_path(identity).into(),
+                icon: app
+                    .sidebar_icons
+                    .get(identity)
+                    .map(shell_icon_image)
+                    .unwrap_or_default(),
+                progress: 0.0,
+                state: -1,
+                status: "".into(),
+                selected: selected == Some(stable_id.as_str()),
+                focused: selected == Some(stable_id.as_str()),
+                source_kind: 2,
+                menu_group: 2,
+                menu_stable_id: format!("network-location:{}", location.id).into(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .chunks(columns.max(1))
+        .map(|entries| HomeCardRow {
+            entries: ModelRc::new(VecModel::from(entries.to_vec())),
+        })
+        .collect()
+}
+
+fn home_item_target(app: &AppState, stable_id: &str) -> Option<PathBuf> {
+    let mut parts = stable_id.strip_prefix("home:")?.split(':');
+    let source = parts.next()?.parse::<i32>().ok()?;
+    let index = parts.next()?.parse::<usize>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    match source {
+        0 => app
+            .sidebar
+            .iter()
+            .filter(|location| location.kind == KnownLocationKind::Pinned)
+            .nth(index),
+        1 => app
+            .sidebar
+            .iter()
+            .filter(|location| location.kind == KnownLocationKind::Drive)
+            .nth(index),
+        2 => {
+            return sorted_network_locations(app)
+                .into_iter()
+                .find(|location| location.id == index as u64)
+                .and_then(|location| match &location.target {
+                    NetworkTarget::WindowsPath(path) => Some(path.clone()),
+                    NetworkTarget::ShellItemId(_) => None,
+                });
+        }
+        _ => None,
+    }
+    .map(|location| location.path.clone())
+}
+
+fn home_item_network_target(app: &AppState, stable_id: &str) -> Option<NetworkTarget> {
+    let id = stable_id.strip_prefix("home:2:")?.parse::<u64>().ok()?;
+    sorted_network_locations(app)
+        .into_iter()
+        .find(|location| location.id == id)
+        .map(|location| location.target.clone())
+}
+
+fn replace_quick_access_projection(
+    app: &mut AppState,
+    generation: u64,
+    locations: Vec<KnownLocation>,
+) -> bool {
+    if app.quick_access_generation != generation {
+        return false;
+    }
+    app.sidebar
+        .retain(|location| location.kind == KnownLocationKind::Drive);
+    app.sidebar.splice(0..0, locations);
+    true
+}
+
+fn replace_drive_projection(
+    app: &mut AppState,
+    generation: u64,
+    drives: Vec<KnownLocation>,
+) -> bool {
+    if app.drive_list_generation != generation {
+        return false;
+    }
+    app.sidebar
+        .retain(|location| location.kind != KnownLocationKind::Drive);
+    app.sidebar.extend(drives);
+    true
 }
 
 fn reload_quick_access(weak: slint::Weak<AppWindow>, state: SharedSessions) {
@@ -22260,25 +22691,46 @@ fn reload_quick_access(weak: slint::Weak<AppWindow>, state: SharedSessions) {
         app.quick_access_generation
     };
     thread::spawn(move || {
-        let locations = platform::known_locations();
+        let locations = platform::explorer_pinned_locations().unwrap_or_default();
         let state_for_ui = state.clone();
         let weak_for_icons = weak.clone();
         let _ = weak.upgrade_in_event_loop(move |ui| {
-            let accepted = if let Ok(mut app) = state_for_ui.lock()
-                && app.quick_access_generation == generation
-            {
-                app.sidebar = locations;
-                true
-            } else {
-                false
-            };
+            let accepted = state_for_ui.lock().is_ok_and(|mut app| {
+                replace_quick_access_projection(&mut app, generation, locations)
+            });
+            if accepted {
+                refresh_all_windows(&state_for_ui);
+            }
+            if accepted && let Some(owner) = weak_for_icons.upgrade() {
+                start_sidebar_icon_loader(&owner, state_for_ui.clone());
+            } else if accepted {
+                start_sidebar_icon_loader(&ui, state_for_ui.clone());
+            }
+        });
+    });
+}
+
+fn reload_drives(weak: slint::Weak<AppWindow>, state: SharedSessions) {
+    let generation = {
+        let Ok(mut app) = state.lock() else { return };
+        app.drive_list_generation = app.drive_list_generation.wrapping_add(1).max(1);
+        app.drive_list_generation
+    };
+    thread::spawn(move || {
+        let drives = platform::logical_drive_locations().collect::<Vec<_>>();
+        let state_for_ui = state.clone();
+        let weak_for_icons = weak.clone();
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            let accepted = state_for_ui
+                .lock()
+                .is_ok_and(|mut app| replace_drive_projection(&mut app, generation, drives));
             if accepted {
                 begin_drive_capacity_refresh(&state_for_ui, None, Duration::ZERO);
+                refresh_all_windows(&state_for_ui);
             }
-            refresh_all_windows(&state_for_ui);
-            if let Some(owner) = weak_for_icons.upgrade() {
+            if accepted && let Some(owner) = weak_for_icons.upgrade() {
                 start_sidebar_icon_loader(&owner, state_for_ui.clone());
-            } else {
+            } else if accepted {
                 start_sidebar_icon_loader(&ui, state_for_ui.clone());
             }
         });
@@ -22321,8 +22773,8 @@ fn begin_drive_capacity_refresh(
         }
         requests
     };
-    for root in requests.iter().map(|(root, _)| root) {
-        update_drive_sidebar_rows(state, root);
+    if !requests.is_empty() {
+        refresh_all_windows(state);
     }
     for (root, generation) in requests {
         let timeout_state = state.clone();
@@ -22351,7 +22803,7 @@ fn begin_drive_capacity_refresh(
                     "{{\"event\":\"drive_capacity_timed_out\",\"root\":{:?},\"generation\":{generation}}}",
                     timeout_root
                 );
-                update_drive_sidebar_rows(&timeout_state, &timeout_root);
+                refresh_all_windows(&timeout_state);
             }
         });
         let state_for_result = state.clone();
@@ -22385,7 +22837,7 @@ fn begin_drive_capacity_refresh(
                         "{{\"event\":\"drive_capacity_updated\",\"root\":{:?},\"generation\":{generation}}}",
                         root_for_log
                     );
-                    update_drive_sidebar_rows(&state_for_result, &root);
+                    refresh_all_windows(&state_for_result);
                 }
             });
         });
@@ -22476,7 +22928,7 @@ fn reload_libraries(
                     .flat_map(|window| window.tabs.values())
                     .filter_map(|tab| match tab.current_location.as_ref()? {
                         NavigationLocation::Library(library) => Some((tab.id, library.clone())),
-                        NavigationLocation::Directory(_) => None,
+                        NavigationLocation::Home | NavigationLocation::Directory(_) => None,
                     })
                     .collect::<Vec<_>>()
             };
@@ -22608,6 +23060,7 @@ fn start_network_location_loader(_ui: &AppWindow, state: SharedSessions) {
 
 fn normalize_restored_location(location: NavigationLocation) -> NavigationLocation {
     match location {
+        NavigationLocation::Home => NavigationLocation::Home,
         NavigationLocation::Directory(path)
             if crate::domain::folder_size_scheduler::is_internal_cleanup_path(&path) =>
         {
@@ -24266,8 +24719,54 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
             .unwrap_or_default()
             .into(),
     );
+    let logical_width = ui.window().size().width as f32 / ui.window().scale_factor();
+    ui.set_window_width(logical_width);
+    ui.set_home_content_width(home_content_width_for_window(logical_width));
     let active_is_settings = tab.kind == TabKind::Settings;
+    let active_is_home = matches!(tab.visible_location(), Some(NavigationLocation::Home));
     ui.set_active_is_settings(active_is_settings);
+    ui.set_active_is_home(active_is_home);
+    let home_page = app
+        .home_pages
+        .get(&tab.id)
+        .cloned()
+        .unwrap_or_else(HomePageState::expanded);
+    ui.set_home_quick_access_expanded(home_page.quick_access_expanded);
+    ui.set_home_drives_expanded(home_page.drives_expanded);
+    ui.set_home_network_locations_expanded(home_page.network_locations_expanded);
+    let home_columns = ui.get_home_column_count().max(1) as usize;
+    let quick_access = app
+        .sidebar
+        .iter()
+        .filter(|location| location.kind == KnownLocationKind::Pinned)
+        .cloned()
+        .collect::<Vec<_>>();
+    let drives = app
+        .sidebar
+        .iter()
+        .filter(|location| location.kind == KnownLocationKind::Drive)
+        .cloned()
+        .collect::<Vec<_>>();
+    ui.set_home_quick_access_items(ModelRc::new(VecModel::from(home_item_rows(
+        &app,
+        tab.id,
+        &quick_access,
+        0,
+        home_columns,
+    ))));
+    ui.set_home_drive_items(ModelRc::new(VecModel::from(home_item_rows(
+        &app,
+        tab.id,
+        &drives,
+        1,
+        home_columns,
+    ))));
+    ui.set_home_network_locations_items(ModelRc::new(VecModel::from(home_network_rows(
+        &app,
+        tab.id,
+        home_columns,
+    ))));
+    ui.set_home_selected_id(home_page.selected.unwrap_or_default().into());
     let view_mode = app
         .view_mode_for_tab(tab.id)
         .unwrap_or(app.default_directory_view.view_mode);
@@ -24352,10 +24851,9 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
             .wrapping_add(preference_revision),
     );
     ui.set_search_total_items(total.min(i32::MAX as u32) as i32);
-    ui.set_window_width(ui.window().size().width as f32 / ui.window().scale_factor());
     let visible_path = tab
         .visible_location()
-        .map(NavigationLocation::display_name)
+        .map(|location| navigation_display_name(location, app.language))
         .unwrap_or_default();
     let address_input = if tab.address_editing {
         tab.address_input.clone()
@@ -24366,6 +24864,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     ui.set_current_location_icon(
         tab.visible_location()
             .and_then(|location| match location {
+                NavigationLocation::Home => None,
                 NavigationLocation::Directory(path) => app.icon_cache.get(path),
                 NavigationLocation::Library(library) => app.library_icons.get(&library.identity),
             })
@@ -24433,7 +24932,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
                     texts.settings().to_owned()
                 } else {
                     tab.visible_location()
-                        .map(NavigationLocation::display_name)
+                        .map(|location| navigation_display_name(location, app.language))
                         .unwrap_or_else(|| display_path(Path::new("C:\\")))
                 }
                 .into(),
@@ -24445,6 +24944,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
                     .map(shell_icon_image)
                     .unwrap_or_default(),
                 is_drive: tab.visible_path().is_some_and(is_drive_root),
+                is_home: matches!(tab.visible_location(), Some(NavigationLocation::Home)),
                 is_settings: tab.kind == TabKind::Settings,
             })
             .collect::<Vec<_>>(),
@@ -24454,9 +24954,13 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
         breadcrumb_paths
             .iter()
             .enumerate()
-            .map(|(index, (label, _))| BreadcrumbRow {
+            .map(|(index, (label, location))| BreadcrumbRow {
                 index: index as i32,
-                label: label.clone().into(),
+                label: match location {
+                    NavigationLocation::Home => navigation_display_name(location, app.language),
+                    _ => label.clone(),
+                }
+                .into(),
                 current: index + 1 == breadcrumb_paths.len(),
             })
             .collect::<Vec<_>>(),
@@ -24468,7 +24972,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
             .enumerate()
             .map(|(index, path)| HistoryRow {
                 index: index as i32,
-                label: path.display_name().into(),
+                label: navigation_display_name(path, app.language).into(),
             })
             .collect::<Vec<_>>(),
     )));
@@ -24479,7 +24983,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
             .enumerate()
             .map(|(index, path)| HistoryRow {
                 index: index as i32,
-                label: path.display_name().into(),
+                label: navigation_display_name(path, app.language).into(),
             })
             .collect::<Vec<_>>(),
     )));
@@ -24497,16 +25001,8 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
             SidebarRow {
                 index: index as i32,
                 stable_id: format!("location:{index}").into(),
-                label: match (app.language, location.kind) {
-                    (Language::Chinese, KnownLocationKind::Home) => "主页",
-                    (Language::English, KnownLocationKind::Home) => "Home",
-                    (_, KnownLocationKind::Pinned | KnownLocationKind::Drive) => {
-                        location.label.as_str()
-                    }
-                }
-                .into(),
+                label: location.label.as_str().into(),
                 icon_kind: match location.kind {
-                    KnownLocationKind::Home => 0,
                     KnownLocationKind::Drive => 7,
                     KnownLocationKind::Pinned => 3,
                 },
@@ -24528,7 +25024,27 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
             }
         })
         .collect::<Vec<_>>();
-    for (row, location) in sidebar_rows.iter_mut().zip(app.sidebar.iter()) {
+    sidebar_rows.insert(
+        0,
+        SidebarRow {
+            index: -1,
+            stable_id: "".into(),
+            label: match app.language {
+                Language::Chinese => "主页",
+                Language::English => "Home",
+            }
+            .into(),
+            icon_kind: 0,
+            group_kind: 0,
+            source_kind: 0,
+            is_drive: false,
+            icon: Image::default(),
+            drive_progress: 0.0,
+            drive_state: 3,
+            drive_status: "".into(),
+        },
+    );
+    for (row, location) in sidebar_rows.iter_mut().skip(1).zip(app.sidebar.iter()) {
         if location.kind == KnownLocationKind::Pinned {
             row.source_kind = 3;
         }
@@ -24553,13 +25069,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
         });
     }
     let mut network_row_index = app.sidebar.len();
-    let mut locations = app
-        .imported_network_locations
-        .iter()
-        .chain(app.network_locations.iter())
-        .collect::<Vec<_>>();
-    locations.sort_by_key(|location| location.sort_order);
-    for location in locations {
+    for location in sorted_network_locations(&app) {
         let index = network_row_index;
         network_row_index += 1;
         sidebar_rows.push(SidebarRow {
@@ -24728,6 +25238,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     ui.set_show_hidden_files(app.file_visibility.show_hidden);
     ui.set_show_system_files(app.file_visibility.show_system);
     ui.set_file_list_quick_search(app.file_list_quick_search);
+    ui.set_new_tab_opens_home(app.new_tab_opens_home);
     ui.set_quick_menu_backdrop(app.quick_menu_backdrop);
     ui.set_quick_menu_backdrop_opacity(f32::from(app.quick_menu_backdrop_opacity));
     ui.set_everything_path(
@@ -25242,6 +25753,7 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
         show_hidden_files,
         show_system_files,
         file_list_quick_search,
+        new_tab_opens_home,
         quick_menu_backdrop,
         quick_menu_backdrop_opacity,
         settings_general,
@@ -25310,6 +25822,7 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "显示隐藏文件",
             "显示系统文件",
             "文件列表快速搜索",
+            "新标签页打开 Home",
             "右键菜单磨砂效果",
             "菜单背景不透明度",
             "常规",
@@ -25378,6 +25891,7 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             "Show hidden files",
             "Show system files",
             "File list quick search",
+            "Open Home in new tabs",
             "Context menu acrylic effect",
             "Menu background opacity",
             "General",
@@ -25432,6 +25946,10 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_drives(drives.into());
     match language {
         Language::Chinese => {
+            ui.set_text_home_quick_access("快速访问".into());
+            ui.set_text_home_drives("磁盘".into());
+            ui.set_text_home_network_locations("网络位置".into());
+            ui.set_text_home_network_locations_empty("暂无网络位置".into());
             ui.set_text_network_locations("网络位置".into());
             ui.set_text_network("网络".into());
             ui.set_text_network_discovery_loading("正在发现网络设备…".into());
@@ -25439,6 +25957,10 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
             ui.set_text_network_discovery_error("网络设备发现失败".into());
         }
         Language::English => {
+            ui.set_text_home_quick_access("Quick access".into());
+            ui.set_text_home_drives("Drives".into());
+            ui.set_text_home_network_locations("Network locations".into());
+            ui.set_text_home_network_locations_empty("No network locations".into());
             ui.set_text_network_locations("Network locations".into());
             ui.set_text_network("Network".into());
             ui.set_text_network_discovery_loading("Discovering network devices…".into());
@@ -25463,6 +25985,7 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_show_hidden_files(show_hidden_files.into());
     ui.set_text_show_system_files(show_system_files.into());
     ui.set_text_file_list_quick_search(file_list_quick_search.into());
+    ui.set_text_new_tab_opens_home(new_tab_opens_home.into());
     ui.set_text_quick_menu_backdrop(quick_menu_backdrop.into());
     ui.set_text_quick_menu_backdrop_opacity(quick_menu_backdrop_opacity.into());
     let (
@@ -25656,6 +26179,16 @@ fn display_path(path: &Path) -> String {
     path.as_os_str().to_string_lossy().into_owned()
 }
 
+fn navigation_display_name(location: &NavigationLocation, language: Language) -> String {
+    match location {
+        NavigationLocation::Home => match language {
+            Language::Chinese => "主页".to_owned(),
+            Language::English => "Home".to_owned(),
+        },
+        _ => location.display_name(),
+    }
+}
+
 fn network_location_default_name(path: &Path) -> String {
     path.file_name()
         .filter(|name| !name.is_empty())
@@ -25678,6 +26211,164 @@ fn initial_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue_86_new_tab_policy_and_explicit_targets_are_separate() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\One")], 0, [0, 1, 2, 3]);
+        app.new_tab_opens_home = true;
+        let home = app.create_tab(NavigationLocation::Home);
+        assert_eq!(
+            app.tab(home).unwrap().current_location,
+            Some(NavigationLocation::Home)
+        );
+
+        let explicit = app.create_tab(NavigationLocation::Directory(PathBuf::from(r"D:\Target")));
+        assert_eq!(
+            app.tab(explicit).unwrap().current_location,
+            Some(NavigationLocation::Directory(PathBuf::from(r"D:\Target")))
+        );
+
+        app.new_tab_opens_home = false;
+        app.tab_mut(explicit).unwrap().load_state = LoadState::Complete;
+        let duplicate = app.duplicate_active_tab().unwrap();
+        assert_eq!(
+            app.tab(duplicate).unwrap().current_location,
+            Some(NavigationLocation::Directory(PathBuf::from(r"D:\Target")))
+        );
+
+        let home_page = HomePageState {
+            selected: Some("home:0:0".to_owned()),
+            quick_access_expanded: false,
+            ..HomePageState::expanded()
+        };
+        app.active_window_state_mut().active_tab = home;
+        app.home_pages.insert(home, home_page.clone());
+        let duplicated_home = app.duplicate_active_tab().unwrap();
+        assert_eq!(
+            app.home_pages.get(&duplicated_home).unwrap().selected,
+            home_page.selected
+        );
+        assert!(!app.home_pages[&duplicated_home].quick_access_expanded);
+    }
+
+    #[test]
+    fn issue_86_home_sources_ignore_stale_results_and_do_not_overwrite_each_other() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\One")], 0, [0, 1, 2, 3]);
+        app.quick_access_generation = 2;
+        app.drive_list_generation = 4;
+        let pinned = KnownLocation {
+            kind: KnownLocationKind::Pinned,
+            label: "Pinned".to_owned(),
+            path: PathBuf::from(r"C:\Pinned"),
+            drive_root: None,
+        };
+        let drive = KnownLocation {
+            kind: KnownLocationKind::Drive,
+            label: "C:".to_owned(),
+            path: PathBuf::from(r"C:\"),
+            drive_root: Some(PathBuf::from(r"C:\")),
+        };
+        let second_drive = KnownLocation {
+            kind: KnownLocationKind::Drive,
+            label: "Z:".to_owned(),
+            path: PathBuf::from(r"Z:\"),
+            drive_root: Some(PathBuf::from(r"Z:\")),
+        };
+        app.sidebar = vec![drive.clone()];
+
+        assert!(!replace_quick_access_projection(
+            &mut app,
+            1,
+            vec![pinned.clone()]
+        ));
+        assert_eq!(app.sidebar, vec![drive.clone()]);
+        assert!(replace_quick_access_projection(
+            &mut app,
+            2,
+            vec![pinned.clone()]
+        ));
+        assert_eq!(app.sidebar, vec![pinned.clone(), drive.clone()]);
+
+        assert!(!replace_drive_projection(
+            &mut app,
+            3,
+            vec![second_drive.clone()]
+        ));
+        assert_eq!(app.sidebar, vec![pinned.clone(), drive]);
+        assert!(replace_drive_projection(
+            &mut app,
+            4,
+            vec![second_drive.clone()]
+        ));
+        assert_eq!(app.sidebar, vec![pinned, second_drive]);
+
+        app.home_pages.insert(
+            TabId(1),
+            HomePageState {
+                selected: Some("home:0:0".to_owned()),
+                quick_access_expanded: false,
+                ..HomePageState::expanded()
+            },
+        );
+        app.home_pages.insert(TabId(2), HomePageState::expanded());
+        assert_ne!(
+            app.home_pages[&TabId(1)].quick_access_expanded,
+            app.home_pages[&TabId(2)].quick_access_expanded
+        );
+    }
+
+    #[test]
+    fn issue_86_home_layout_switches_between_default_and_narrow_columns() {
+        let ui = AppWindow::new().unwrap();
+        ui.set_home_content_width(home_content_width_for_window(1693.0));
+        assert_eq!(ui.get_home_column_count(), 5);
+        ui.set_home_content_width(home_content_width_for_window(1180.0));
+        assert_eq!(ui.get_home_column_count(), 3);
+        ui.set_home_content_width(home_content_width_for_window(950.0));
+        assert_eq!(ui.get_home_column_count(), 2);
+        ui.set_home_content_width(home_content_width_for_window(820.0));
+        assert_eq!(ui.get_home_column_count(), 2);
+        ui.set_home_content_width(home_content_width_for_window(520.0));
+        assert_eq!(ui.get_home_column_count(), 1);
+        assert_eq!(ui.get_home_card_width(), 264.0);
+        let source = include_str!("../ui/app-window.slint");
+        assert!(source.contains("wrap: root.item.source-kind == 2 ? word-wrap : no-wrap"));
+        assert!(source.contains("visible: root.item.source-kind != 2"));
+        assert!(source.contains("height: home-scroll.viewport-height"));
+    }
+
+    #[test]
+    fn issue_86_home_projection_preserves_raw_targets_and_network_location_empty_state() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\One")], 0, [0, 1, 2, 3]);
+        app.sidebar = vec![KnownLocation {
+            kind: KnownLocationKind::Pinned,
+            label: "Display only".to_owned(),
+            path: PathBuf::from(r"C:\Raw\Target"),
+            drive_root: None,
+        }];
+        assert_eq!(
+            home_item_target(&app, "home:0:0"),
+            Some(PathBuf::from(r"C:\Raw\Target"))
+        );
+        assert!(sorted_network_locations(&app).is_empty());
+        app.network_locations = vec![NetworkLocation {
+            id: 86,
+            source: NetworkLocationSource::AsterOwned,
+            display_name: "Network location".to_owned(),
+            sort_order: 0,
+            target: NetworkTarget::WindowsPath(PathBuf::from(r"\\server\share")),
+            shell_path: None,
+        }];
+        assert_eq!(
+            home_item_target(&app, "home:2:86"),
+            Some(PathBuf::from(r"\\server\share"))
+        );
+        assert_eq!(
+            home_item_network_target(&app, "home:2:86"),
+            Some(NetworkTarget::WindowsPath(PathBuf::from(r"\\server\share")))
+        );
+        assert_eq!(home_item_target(&app, "Display only"), None);
+    }
 
     fn recycle_task_for_test(state: OperationState) -> (AppState, OperationId) {
         let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);

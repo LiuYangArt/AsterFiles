@@ -20,7 +20,7 @@ use crate::{
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-const MAGIC: &[u8; 6] = b"ASTF15";
+const MAGIC: &[u8; 6] = b"ASTF16";
 pub const DEFAULT_QUICK_MENU_BACKDROP_OPACITY: u8 = 85;
 const MAX_TABS: usize = 1_024;
 const MAX_WINDOWS: usize = 128;
@@ -128,6 +128,7 @@ pub struct SessionState {
     pub everything: EverythingConfig,
     pub file_visibility: FileVisibility,
     pub file_list_quick_search: bool,
+    pub new_tab_opens_home: bool,
     pub quick_menu_backdrop: bool,
     pub quick_menu_backdrop_opacity: u8,
     pub sidebar_visibility: SidebarVisibility,
@@ -164,6 +165,7 @@ impl SessionState {
             FileVisibility::default(),
             false,
             true,
+            true,
             DEFAULT_QUICK_MENU_BACKDROP_OPACITY,
             SidebarVisibility::default(),
             Vec::new(),
@@ -182,6 +184,7 @@ impl SessionState {
         everything: EverythingConfig,
         file_visibility: FileVisibility,
         file_list_quick_search: bool,
+        new_tab_opens_home: bool,
         quick_menu_backdrop: bool,
         quick_menu_backdrop_opacity: u8,
         sidebar_visibility: SidebarVisibility,
@@ -224,6 +227,7 @@ impl SessionState {
             everything,
             file_visibility,
             file_list_quick_search,
+            new_tab_opens_home,
             quick_menu_backdrop,
             quick_menu_backdrop_opacity,
             sidebar_visibility,
@@ -262,6 +266,7 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
         state.everything.clone(),
         state.file_visibility,
         state.file_list_quick_search,
+        state.new_tab_opens_home,
         state.quick_menu_backdrop,
         state.quick_menu_backdrop_opacity,
         state.sidebar_visibility,
@@ -287,6 +292,7 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
     bytes.push(u8::from(state.file_visibility.show_hidden));
     bytes.push(u8::from(state.file_visibility.show_system));
     bytes.push(u8::from(state.file_list_quick_search));
+    bytes.push(u8::from(state.new_tab_opens_home));
     bytes.push(u8::from(state.quick_menu_backdrop));
     bytes.push(state.quick_menu_backdrop_opacity);
     bytes.push(state.sidebar_visibility.storage_bits());
@@ -362,6 +368,7 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
     };
     let file_list_quick_search =
         read_bool(bytes, &mut offset, "invalid file-list quick-search setting")?;
+    let new_tab_opens_home = read_bool(bytes, &mut offset, "invalid new-tab Home setting")?;
     let quick_menu_backdrop = read_bool(bytes, &mut offset, "invalid quick-menu backdrop setting")?;
     let quick_menu_backdrop_opacity = read_u8(bytes, &mut offset)?;
     if quick_menu_backdrop_opacity > 100 {
@@ -436,6 +443,7 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
         everything,
         file_visibility,
         file_list_quick_search,
+        new_tab_opens_home,
         quick_menu_backdrop,
         quick_menu_backdrop_opacity,
         sidebar_visibility,
@@ -539,6 +547,7 @@ fn validate_search_preference(value: SearchViewPreference) -> io::Result<()> {
 
 fn validate_navigation_location(location: &NavigationLocation) -> io::Result<()> {
     match location {
+        NavigationLocation::Home => Ok(()),
         NavigationLocation::Directory(path) => validate_path(path),
         NavigationLocation::Library(library) => {
             if library.identity.is_empty() || library.display_name.trim().is_empty() {
@@ -670,6 +679,10 @@ fn write_navigation_location(bytes: &mut Vec<u8>, location: &NavigationLocation)
             write_os(bytes, &library.identity)?;
             write_string(bytes, &library.display_name)
         }
+        NavigationLocation::Home => {
+            bytes.push(2);
+            Ok(())
+        }
     }
 }
 
@@ -684,6 +697,7 @@ fn read_navigation_location(bytes: &[u8], offset: &mut usize) -> io::Result<Navi
                 read_string(bytes, offset)?,
             ),
         )),
+        2 => Ok(NavigationLocation::Home),
         _ => Err(invalid_data("invalid navigation location kind")),
     }
 }
@@ -874,6 +888,7 @@ mod tests {
                         OsString::from(r"C:\Libraries\媒体.library-ms"),
                         "媒体".to_owned(),
                     )),
+                    NavigationLocation::Home,
                 ],
             }],
             DirectoryViewPreference::default(),
@@ -896,6 +911,7 @@ mod tests {
                 show_hidden: true,
                 show_system: false,
             },
+            true,
             true,
             false,
             42,
@@ -921,9 +937,10 @@ mod tests {
     }
 
     #[test]
-    fn astf15_round_trip_preserves_settings_network_locations_devices_and_raw_paths() {
+    fn issue_86_astf16_round_trip_preserves_home_setting_network_locations_devices_and_raw_paths() {
         let state = sample_state();
         assert!(state.file_list_quick_search);
+        assert!(state.new_tab_opens_home);
         assert!(!state.quick_menu_backdrop);
         assert_eq!(state.quick_menu_backdrop_opacity, 42);
         assert_eq!(
@@ -944,6 +961,16 @@ mod tests {
         assert_eq!(library.display_name, "媒体");
     }
 
+    #[test]
+    fn issue_86_home_location_uses_its_own_storage_tag() {
+        let mut bytes = Vec::new();
+        write_navigation_location(&mut bytes, &NavigationLocation::Home).unwrap();
+        assert_eq!(bytes, vec![2]);
+        assert_eq!(
+            read_navigation_location(&bytes, &mut 0).unwrap(),
+            NavigationLocation::Home
+        );
+    }
     #[test]
     fn rejects_invalid_library_locations_and_unknown_location_kind() {
         let mut state = sample_state();
@@ -967,7 +994,7 @@ mod tests {
         );
 
         assert_eq!(
-            read_navigation_location(&[2], &mut 0).unwrap_err().kind(),
+            read_navigation_location(&[3], &mut 0).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
     }
@@ -1017,8 +1044,43 @@ mod tests {
     }
 
     #[test]
-    fn rejects_old_formats() {
-        for version in 1..=14 {
+    fn issue_86_new_tab_home_setting_defaults_on_and_round_trips_off_for_multiple_windows() {
+        let default_state = SessionState::new(
+            WindowPlacement {
+                x: 0,
+                y: 0,
+                width: 1180,
+                height: 760,
+            },
+            0,
+            vec![NavigationLocation::Home],
+        )
+        .unwrap();
+        assert!(default_state.new_tab_opens_home);
+
+        let mut state = sample_state();
+        state.windows.push(WindowSessionState {
+            placement: WindowPlacement {
+                x: 40,
+                y: 40,
+                width: 1180,
+                height: 760,
+            },
+            active_tab: 0,
+            tab_locations: vec![NavigationLocation::Home],
+        });
+        state.new_tab_opens_home = false;
+        let decoded = decode(&encode(&state).unwrap()).unwrap();
+        assert!(!decoded.new_tab_opens_home);
+        assert_eq!(decoded.windows.len(), 2);
+        assert_eq!(
+            decoded.windows[1].tab_locations,
+            vec![NavigationLocation::Home]
+        );
+    }
+    #[test]
+    fn issue_86_rejects_old_formats() {
+        for version in 1..=15 {
             let bytes = format!("ASTF{version}\0\0\0\0");
             assert_eq!(
                 decode(bytes.as_bytes()).unwrap_err().kind(),

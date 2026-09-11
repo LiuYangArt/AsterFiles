@@ -7,11 +7,13 @@ export struct FileRow { id: int, loaded: bool, group-header: bool, group-label: 
 export struct GridRow { group-header: bool, group-label: string, group-detail: string, group-count: int, entries: [FileRow] }
 export struct HistoryRow { index: int, label: string }
 export struct BreadcrumbRow { index: int, label: string, current: bool }
-export struct TabRow { id: int, title: string, active: bool, loading: bool, icon: image, is-drive: bool, is-settings: bool }
+export struct TabRow { id: int, title: string, active: bool, loading: bool, icon: image, is-drive: bool, is-home: bool, is-settings: bool }
 export struct SidebarRow { index: int, stable-id: string, label: string, icon-kind: int, group-kind: int, source-kind: int, is-drive: bool, icon: image, drive-progress: float, drive-state: int, drive-status: string }
 export struct ColumnRow { kind: int, label: string, visible: bool, min-width: length, content-left: length, content-right: length, icon-slot: length }
 export struct ContextCommandRow { id: int, node-id: int, label: string, search-text: string, hint: string, enabled: bool, separator: bool, shell: bool, checked: bool, default: bool, submenu: bool, loading: bool, placeholder: bool, icon-kind: int }
 export struct OperationRow { id: int, title: string, status: string, queue: string, failure-summary: string, accessible-label: string, source-line: string, destination-line: string, current-item-line: string, percent: string, file-progress: string, transferred: string, speed: string, eta: string, progress: float, progress-known: bool, state: int, paused: bool, pause-pending: bool, cancel-pending: bool, can-pause: bool, can-cancel: bool, can-retry: bool }
+export struct HomeItemRow { stable-id: string, label: string, detail: string, icon: image, progress: float, state: int, status: string, selected: bool, focused: bool, source-kind: int, menu-group: int, menu-stable-id: string }
+export struct HomeCardRow { entries: [HomeItemRow] }
 export global VisualStyle {
     in-out property <bool> dark-theme: false;
     out property <color> c24252a: dark-theme ? #f2f2f2 : #24252a;
@@ -703,6 +705,109 @@ component AddressEditor inherits Rectangle {
     }
 }
 
+component HomeCard inherits Rectangle {
+    in property <HomeItemRow> item;
+    in property <string> selected-id;
+    callback selected(string);
+    callback activated(string);
+    callback menu-requested(int, string, float, float);
+    height: item.state >= 0 ? 82px : 64px;
+    border-radius: 7px;
+    border-width: 0px;
+    background: root.selected-id == item.stable-id ? VisualStyle.cdce6ff : card-touch.pressed ? VisualStyle.cdde3ed : card-touch.has-hover ? VisualStyle.cedf1f6 : VisualStyle.cfafbfc;
+
+    card-focus := FocusScope {
+        width: parent.width; height: parent.height;
+        KeyBinding { keys: @keys(Return); activated => { root.activated(root.item.stable-id); } }
+        KeyBinding { keys: @keys(Space); activated => { root.selected(root.item.stable-id); } }
+    }
+    HorizontalLayout {
+        padding-left: 14px; padding-right: 14px; padding-top: 11px; padding-bottom: 11px; spacing: 12px;
+        InlineIcon {
+            width: 42px; height: 42px;
+            icon-size: 38px;
+            icon-source: root.item.icon.width != 0 ? root.item.icon : (root.item.source-kind == 0 ? IconMap.file-folder : IconMap.location-drive);
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+            Text { x: 0px; y: 0px; width: parent.width; height: root.item.source-kind == 2 ? parent.height : 20px; text: root.item.label; color: VisualStyle.c30333a; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: root.item.source-kind == 2 ? clip : elide; wrap: root.item.source-kind == 2 ? word-wrap : no-wrap; }
+            Text { visible: root.item.source-kind != 2; x: 0px; y: 21px; width: parent.width; height: 17px; text: root.item.detail; color: VisualStyle.c62656f; font-size: 11px; vertical-alignment: center; overflow: elide; }
+            if root.item.state >= 0 && root.item.source-kind != 0: Rectangle {
+                x: 0px; y: 43px; width: parent.width; height: 4px; border-radius: 2px; clip: true;
+                background: root.item.state == 3 ? VisualStyle.drive-progress-unavailable : VisualStyle.drive-progress-track;
+                Rectangle {
+                    visible: root.item.state != 3;
+                    x: root.item.state == 0 ? -parent.width * 0.35 + parent.width * 1.35 * mod(animation-tick(), 1400ms) / 1400ms : 0px;
+                    width: root.item.state == 0 ? parent.width * 0.35 : parent.width * max(0, min(1, root.item.progress));
+                    height: parent.height; border-radius: parent.border-radius;
+                    background: root.item.state == 2 ? VisualStyle.drive-progress-warning : VisualStyle.drive-progress-fill;
+                }
+            }
+
+        }
+    }
+    card-touch := TouchArea {
+        mouse-cursor: pointer;
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down && event.button == PointerEventButton.left { card-focus.focus(); }
+            if event.kind == PointerEventKind.up && event.button == PointerEventButton.right && root.item.menu-stable-id != "" {
+                root.selected(root.item.stable-id);
+                root.menu-requested(root.item.menu-group, root.item.menu-stable-id, (self.absolute-position.x + self.mouse-x) / 1px, (self.absolute-position.y + self.mouse-y) / 1px);
+            }
+        }
+        clicked => { root.selected(root.item.stable-id); }
+        double-clicked => { root.activated(root.item.stable-id); }
+    }
+    accessible-role: button;
+    accessible-label: root.item.status == "" ? root.item.label + ", " + root.item.detail : root.item.label + ", " + root.item.detail + ", " + root.item.status;
+}
+
+component HomeSection inherits Rectangle {
+    in property <string> title;
+    in property <[HomeCardRow]> rows;
+    in property <string> selected-id;
+    in property <bool> expanded: true;
+    in property <int> column-count: 2;
+    in property <length> card-width: 264px;
+    in property <bool> show-empty: false;
+    in property <string> empty-text: "";
+    callback toggle-expanded();
+    callback select-item(string);
+    callback activate-item(string);
+    callback item-menu-requested(int, string, float, float);
+    height: section-layout.preferred-height;
+    section-layout := VerticalLayout {
+        spacing: 8px;
+        Rectangle {
+            height: 34px; border-radius: 5px;
+            background: header-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
+            Rectangle {
+                x: 10px; width: 12px; height: parent.height;
+                Path {
+                    x: 2px; y: (parent.height - self.height) / 2; width: 8px; height: 8px;
+                    viewbox-width: 8; viewbox-height: 8; fit: fill;
+                    commands: root.expanded ? "M 1 2.5 L 4 5.5 L 7 2.5" : "M 2.5 1 L 5.5 4 L 2.5 7";
+                    stroke: VisualStyle.c666a74; stroke-width: 1.2px; stroke-line-cap: round; stroke-line-join: round; fill: transparent;
+                }
+            }
+            Text { x: 34px; width: parent.width - 44px; text: root.title; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; vertical-alignment: center; }
+            header-touch := TouchArea { mouse-cursor: pointer; clicked => { root.toggle-expanded(); } }
+            accessible-role: button; accessible-label: root.title; accessible-expanded: root.expanded;
+        }
+        if root.expanded: VerticalLayout {
+            spacing: 8px;
+            for row in root.rows: HorizontalLayout {
+                height: row.entries.length > 0 && row.entries[0].state >= 0 ? 82px : 64px; spacing: 10px;
+                for item in row.entries: HomeCard { width: root.card-width; item: item; selected-id: root.selected-id; selected(id) => { root.select-item(id); } activated(id) => { root.activate-item(id); } menu-requested(group, id, x, y) => { root.item-menu-requested(group, id, x, y); } }
+                Rectangle { horizontal-stretch: 1; }
+            }
+            if root.show-empty: Rectangle {
+                height: 58px; border-radius: 7px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                Text { x: 16px; width: parent.width - 32px; text: root.empty-text; color: VisualStyle.c62656f; font-size: 12px; vertical-alignment: center; horizontal-alignment: center; wrap: word-wrap; }
+            }
+        }
+    }
+}
 export component AppWindow inherits Window {
     title: "AsterFiles";
     icon: @image-url("../assets/app-icon.png");
@@ -744,6 +849,12 @@ export component AppWindow inherits Window {
 
     in property <[FileRow]> files;
     in property <[GridRow]> grid-rows;
+    in property <[HomeCardRow]> home-quick-access-items;
+    in property <[HomeCardRow]> home-drive-items;
+    in property <[HomeCardRow]> home-network-locations-items;
+    out property <int> home-column-count: max(1, floor((root.home-content-width + 10px) / (264px + 10px)));
+    out property <length> home-card-width: 264px;
+    in-out property <length> home-content-width: 264px;
     in property <int> grid-column-count: 1;
     in-out property <int> projected-file-tab-id: -1;
     in-out property <int> projected-file-request-id: -1;
@@ -833,7 +944,7 @@ export component AppWindow inherits Window {
     }
     changed file-viewport-y => { root.sync-active-file-viewport(); }
 
-    out property <bool> file-list-keyboard-target: !root.active-is-settings
+    out property <bool> file-list-keyboard-target: !root.active-is-settings && !root.active-is-home
         && !root.address-editing
         && !root.rename-editing
         && !root.tabs-menu-open
@@ -862,6 +973,10 @@ export component AppWindow inherits Window {
     in-out property <bool> drives-expanded: true;
     in-out property <bool> network-locations-expanded: true;
     in-out property <bool> network-expanded: false;
+    in-out property <bool> home-quick-access-expanded: true;
+    in-out property <bool> home-drives-expanded: true;
+    in-out property <bool> home-network-locations-expanded: true;
+    in-out property <string> home-selected-id: "";
     in property <bool> quick-access-visible: true;
     in property <bool> libraries-visible: false;
     in property <bool> drives-visible: true;
@@ -891,6 +1006,8 @@ export component AppWindow inherits Window {
     in property <bool> quick-menu-backdrop: true;
     in property <float> quick-menu-backdrop-opacity: 85;
     in property <bool> active-is-settings: false;
+    in property <bool> active-is-home: false;
+    in property <bool> new-tab-opens-home: true;
     in property <bool> debug-tools-enabled: false;
     in property <string> text-settings: "设置";
     in property <string> text-settings-title: "设置";
@@ -904,6 +1021,7 @@ export component AppWindow inherits Window {
     in property <string> text-show-hidden-files: "显示隐藏文件";
     in property <string> text-show-system-files: "显示系统文件";
     in property <string> text-file-list-quick-search: "文件列表快速搜索";
+    in property <string> text-new-tab-opens-home: "新标签页打开 Home";
     in property <string> text-quick-menu-backdrop: "右键菜单磨砂效果";
     in property <string> text-quick-menu-backdrop-opacity: "菜单背景不透明度";
     in property <string> text-settings-general: "常规";
@@ -986,6 +1104,10 @@ export component AppWindow inherits Window {
     in property <string> text-up: "向上";
     in property <string> text-refresh: "刷新";
     in property <string> text-home: "常用位置";
+    in property <string> text-home-quick-access: "快速访问";
+    in property <string> text-home-drives: "磁盘";
+    in property <string> text-home-network-locations: "网络位置";
+    in property <string> text-home-network-locations-empty: "暂无网络位置";
     in property <string> text-desktop: "桌面";
     in property <string> text-downloads: "下载";
     in property <string> text-documents: "文档";
@@ -1024,6 +1146,9 @@ export component AppWindow inherits Window {
     callback navigate-up();
     callback refresh();
     callback request-folder-access();
+    callback navigate-home-item(string);
+    callback select-home-item(string);
+    callback toggle-home-section(int);
 
     callback navigate-sidebar(int);
     callback navigate-library(string);
@@ -1093,6 +1218,7 @@ export component AppWindow inherits Window {
     callback change-language(int);
     callback change-file-visibility(bool, bool);
     callback change-file-list-quick-search(bool);
+    callback change-new-tab-opens-home(bool);
     callback change-quick-menu-backdrop(bool);
     callback change-quick-menu-backdrop-opacity(float);
     callback enable-folder-integration();
@@ -1341,27 +1467,27 @@ export component AppWindow inherits Window {
         KeyBinding { keys: @keys(Control + R); enabled: root.can-refresh; activated => { root.refresh(); } }
         KeyBinding { keys: @keys(Control + L); enabled: !root.active-is-settings; activated => { root.begin-search(); } }
         KeyBinding { keys: @keys(Alt + D); enabled: !root.active-is-settings; activated => { root.begin-search(); } }
-        KeyBinding { keys: @keys(Control + A); enabled: !root.active-is-settings && !root.address-editing; activated => { root.select-all(); } }
-        KeyBinding { keys: @keys(Control + Space); enabled: !root.active-is-settings && !root.address-editing; activated => { root.toggle-focused(); } }
-        KeyBinding { keys: @keys(UpArrow); enabled: !root.active-is-settings && !root.address-editing; activated => { root.move-focus(-1, false); } }
-        KeyBinding { keys: @keys(DownArrow); enabled: !root.active-is-settings && !root.address-editing; activated => { root.move-focus(1, false); } }
-        KeyBinding { keys: @keys(Shift + UpArrow); enabled: !root.active-is-settings && !root.address-editing; activated => { root.move-focus(-1, true); } }
-        KeyBinding { keys: @keys(Shift + DownArrow); enabled: !root.active-is-settings && !root.address-editing; activated => { root.move-focus(1, true); } }
-        KeyBinding { keys: @keys(Home); enabled: !root.active-is-settings && !root.address-editing; activated => { root.focus-boundary(false, false); } }
-        KeyBinding { keys: @keys(End); enabled: !root.active-is-settings && !root.address-editing; activated => { root.focus-boundary(true, false); } }
-        KeyBinding { keys: @keys(Shift + Home); enabled: !root.active-is-settings && !root.address-editing; activated => { root.focus-boundary(false, true); } }
-        KeyBinding { keys: @keys(Shift + End); enabled: !root.active-is-settings && !root.address-editing; activated => { root.focus-boundary(true, true); } }
-        KeyBinding { keys: @keys(Return); enabled: !root.active-is-settings && !root.address-editing; activated => { root.open-entry(-1); } }
+        KeyBinding { keys: @keys(Control + A); enabled: !root.active-is-settings && !root.active-is-home && !root.address-editing; activated => { root.select-all(); } }
+        KeyBinding { keys: @keys(Control + Space); enabled: !root.active-is-settings && !root.active-is-home && !root.address-editing; activated => { root.toggle-focused(); } }
+        KeyBinding { keys: @keys(UpArrow); enabled: !root.active-is-settings && !root.active-is-home && !root.address-editing; activated => { root.move-focus(-1, false); } }
+        KeyBinding { keys: @keys(DownArrow); enabled: !root.active-is-settings && !root.active-is-home && !root.address-editing; activated => { root.move-focus(1, false); } }
+        KeyBinding { keys: @keys(Shift + UpArrow); enabled: !root.active-is-settings && !root.active-is-home && !root.address-editing; activated => { root.move-focus(-1, true); } }
+        KeyBinding { keys: @keys(Shift + DownArrow); enabled: !root.active-is-settings && !root.active-is-home && !root.address-editing; activated => { root.move-focus(1, true); } }
+        KeyBinding { keys: @keys(Home); enabled: !root.active-is-settings && !root.active-is-home && !root.address-editing; activated => { root.focus-boundary(false, false); } }
+        KeyBinding { keys: @keys(End); enabled: !root.active-is-settings && !root.active-is-home && !root.address-editing; activated => { root.focus-boundary(true, false); } }
+        KeyBinding { keys: @keys(Shift + Home); enabled: !root.active-is-settings && !root.active-is-home && !root.address-editing; activated => { root.focus-boundary(false, true); } }
+        KeyBinding { keys: @keys(Shift + End); enabled: !root.active-is-settings && !root.active-is-home && !root.address-editing; activated => { root.focus-boundary(true, true); } }
+        KeyBinding { keys: @keys(Return); enabled: !root.active-is-settings && !root.active-is-home && !root.address-editing; activated => { root.open-entry(-1); } }
         KeyBinding { keys: @keys(Control + Z); enabled: root.file-list-keyboard-target; activated => { root.request-undo(); } }
-        KeyBinding { keys: @keys(Control + C); enabled: !root.active-is-settings && !root.address-editing; activated => { root.copy-selection(false); } }
-        KeyBinding { keys: @keys(Control + X); enabled: !root.active-is-settings && !root.address-editing; activated => { root.copy-selection(true); } }
-        KeyBinding { keys: @keys(Control + V); enabled: !root.active-is-settings && !root.address-editing; activated => { root.paste-files(); } }
-        KeyBinding { keys: @keys(F2); enabled: !root.active-is-settings && !root.address-editing; activated => { root.begin-rename(); } }
-        KeyBinding { keys: @keys(Delete); enabled: !root.active-is-settings && !root.address-editing; activated => { root.request-delete(false); } }
-        KeyBinding { keys: @keys(Shift + Delete); enabled: !root.active-is-settings && !root.address-editing; activated => { root.request-delete(true); } }
+        KeyBinding { keys: @keys(Control + C); enabled: !root.active-is-settings && !root.active-is-home && !root.address-editing; activated => { root.copy-selection(false); } }
+        KeyBinding { keys: @keys(Control + X); enabled: !root.active-is-settings && !root.active-is-home && !root.address-editing; activated => { root.copy-selection(true); } }
+        KeyBinding { keys: @keys(Control + V); enabled: !root.active-is-settings && !root.active-is-home && !root.address-editing; activated => { root.paste-files(); } }
+        KeyBinding { keys: @keys(F2); enabled: !root.active-is-settings && !root.active-is-home && !root.address-editing; activated => { root.begin-rename(); } }
+        KeyBinding { keys: @keys(Delete); enabled: !root.active-is-settings && !root.active-is-home && !root.address-editing; activated => { root.request-delete(false); } }
+        KeyBinding { keys: @keys(Shift + Delete); enabled: !root.active-is-settings && !root.active-is-home && !root.address-editing; activated => { root.request-delete(true); } }
         KeyBinding {
             keys: @keys(Shift + F10);
-            enabled: !root.active-is-settings && !root.address-editing;
+            enabled: !root.active-is-settings && !root.active-is-home && !root.address-editing;
             activated => { root.show-keyboard-context-menu(); }
         }
 
@@ -1433,7 +1559,7 @@ export component AppWindow inherits Window {
                                 x: VisualStyle.tab-shoulder-width;
                                 width: parent.width - VisualStyle.tab-shoulder-span;
                                 padding-left: 10px; padding-right: 7px; spacing: 6px;
-                                InlineIcon { icon-source: tab.is-settings ? IconMap.action-settings : (tab.icon.width != 0 ? tab.icon : (tab.is-drive ? IconMap.location-drive : IconMap.file-folder)); icon-size: 16px; }
+                                InlineIcon { icon-source: tab.is-settings ? IconMap.action-settings : tab.is-home ? IconMap.location-home : (tab.icon.width != 0 ? tab.icon : (tab.is-drive ? IconMap.location-drive : IconMap.file-folder)); icon-size: 16px; }
                                 Text { text: tab.title; color: VisualStyle.c303138; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
                                 Text { visible: tab.loading && !(root.can-close-tab && tab-touch.has-hover); text: "…"; color: VisualStyle.c4f6bed; vertical-alignment: center; }
                                 Rectangle {
@@ -1490,7 +1616,7 @@ export component AppWindow inherits Window {
                 if !root.compact: IconButton { icon-source: IconMap.action-refresh; tip: root.text-refresh + " (F5)"; enabled: root.can-refresh; button-label: root.text-refresh; clicked => { root.refresh(); } }
                 Rectangle {
                     height: 38px; horizontal-stretch: 1; background: VisualStyle.cffffff; border-width: root.address-editing ? 1px : 0px; border-color: VisualStyle.c4f6bed; border-radius: 5px;
-                    if !root.address-editing: Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; HorizontalLayout { padding-left: 8px; padding-right: 8px; padding-top: 3px; padding-bottom: 3px; spacing: 2px; Rectangle { width: 18px; height: 100%; InlineIcon { y: (parent.height - self.height) / 2; icon-source: root.current-location-icon.width != 0 ? root.current-location-icon : (root.current-location-is-drive ? IconMap.location-drive : IconMap.file-folder); icon-size: 16px; } address-drag-touch := TouchArea { enabled: root.can-refresh && !root.search-results-mode; mouse-cursor: self.enabled ? grab : default; pointer-event(event) => { if event.button == PointerEventButton.left && event.kind == PointerEventKind.down { root.begin-address-drag((self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px, (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px); } if event.button == PointerEventButton.left && event.kind == PointerEventKind.up { root.end-address-drag(); } } moved => { if self.pressed { root.update-address-drag((self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px, (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px); } } } } for crumb in root.breadcrumbs: BreadcrumbButton { label: crumb.label; current: crumb.current; clicked => { root.navigate-breadcrumb(crumb.index); } } Rectangle { horizontal-stretch: 1; TouchArea { mouse-cursor: text; clicked => { root.begin-search(); } } } } }
+                    if !root.address-editing: Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; HorizontalLayout { padding-left: 8px; padding-right: 8px; padding-top: 3px; padding-bottom: 3px; spacing: 2px; Rectangle { width: 18px; height: 100%; InlineIcon { y: (parent.height - self.height) / 2; icon-source: root.current-location-icon.width != 0 ? root.current-location-icon : (root.active-is-home ? IconMap.location-home : (root.current-location-is-drive ? IconMap.location-drive : IconMap.file-folder)); icon-size: 16px; } address-drag-touch := TouchArea { enabled: root.can-refresh && !root.search-results-mode; mouse-cursor: self.enabled ? grab : default; pointer-event(event) => { if event.button == PointerEventButton.left && event.kind == PointerEventKind.down { root.begin-address-drag((self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px, (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px); } if event.button == PointerEventButton.left && event.kind == PointerEventKind.up { root.end-address-drag(); } } moved => { if self.pressed { root.update-address-drag((self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px, (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px); } } } } for crumb in root.breadcrumbs: BreadcrumbButton { label: crumb.label; current: crumb.current; clicked => { root.navigate-breadcrumb(crumb.index); } } Rectangle { horizontal-stretch: 1; TouchArea { mouse-cursor: text; clicked => { root.begin-search(); } } } } }
                     address-editor := AddressEditor { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: parent.height - 4px; text <=> root.address-input; address-label: root.search-mode ? root.text-parent-path : root.text-address; cancel-label: root.text-cancel-edit; depth-enabled: root.search-mode && root.search-depth-enabled; recursive: root.search-recursive; depth-label: !root.search-depth-enabled ? root.text-search-global-disabled : (root.search-recursive ? root.text-search-recursive : root.text-search-current); changed(value) => { root.address-input-changed(value); } accepted(value) => { root.navigate-path(value); } cancelled => { root.cancel-address-edit(); } toggle-depth => { root.toggle-search-depth(); } }
 
                 }
@@ -1672,7 +1798,7 @@ export component AppWindow inherits Window {
                 VerticalLayout {
                     spacing: 0px;
                     Rectangle {
-                    height: root.view-mode == 0 ? 38px : 0px; visible: root.view-mode == 0; background: VisualStyle.cffffff; border-width: 0px; clip: true;
+                    height: root.view-mode == 0 && !root.active-is-home ? 38px : 0px; visible: root.view-mode == 0 && !root.active-is-home; background: VisualStyle.cffffff; border-width: 0px; clip: true;
                     header-viewport := Rectangle {
                         width: parent.width - 28px; height: parent.height; clip: true;
                         header-columns := Rectangle {
@@ -1777,8 +1903,53 @@ export component AppWindow inherits Window {
                     }
                 }
 
+                if root.active-is-home: Rectangle {
+                    vertical-stretch: 1;
+                    background: VisualStyle.cffffff;
+                    home-scroll := ScrollView {
+                        width: parent.width; height: parent.height;
+                        horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+                        vertical-scrollbar-policy: ScrollBarPolicy.as-needed;
+                        viewport-width: self.width;
+                        viewport-height: max(self.height, home-content.preferred-height);
+                        home-content := VerticalLayout {
+                            width: home-scroll.width;
+                            height: home-scroll.viewport-height;
+
+                            padding-left: root.minimal ? 18px : 30px;
+                            padding-right: root.minimal ? 18px : 30px;
+                            padding-top: 22px; padding-bottom: 30px; spacing: 18px;
+                            Text { text: root.text-home; color: VisualStyle.c30333a; font-size: 24px; font-weight: 600; height: 36px; }
+                            HomeSection {
+                                title: root.text-home-quick-access; rows: root.home-quick-access-items; selected-id: root.home-selected-id; expanded: root.home-quick-access-expanded; column-count: root.home-column-count; card-width: root.home-card-width;
+                                toggle-expanded => { root.toggle-home-section(0); }
+                                select-item(id) => { root.home-selected-id = id; root.select-home-item(id); }
+                                activate-item(id) => { root.navigate-home-item(id); }
+                                item-menu-requested(group, id, x, y) => { root.show-sidebar-menu(group, id, x - root.absolute-position.x / 1px, y - root.absolute-position.y / 1px); }
+                            }
+                            HomeSection {
+                                title: root.text-home-drives; rows: root.home-drive-items; selected-id: root.home-selected-id; expanded: root.home-drives-expanded; column-count: root.home-column-count; card-width: root.home-card-width;
+                                toggle-expanded => { root.toggle-home-section(1); }
+                                select-item(id) => { root.home-selected-id = id; root.select-home-item(id); }
+                                activate-item(id) => { root.navigate-home-item(id); }
+                                item-menu-requested(group, id, x, y) => { root.show-sidebar-menu(group, id, x - root.absolute-position.x / 1px, y - root.absolute-position.y / 1px); }
+                            }
+                            HomeSection {
+                                title: root.text-home-network-locations; rows: root.home-network-locations-items; selected-id: root.home-selected-id; expanded: root.home-network-locations-expanded; column-count: root.home-column-count; card-width: root.home-card-width;
+                                show-empty: root.home-network-locations-items.length == 0; empty-text: root.text-home-network-locations-empty;
+                                toggle-expanded => { root.toggle-home-section(2); }
+                                select-item(id) => { root.home-selected-id = id; root.select-home-item(id); }
+                                activate-item(id) => { root.navigate-home-item(id); }
+                                item-menu-requested(group, id, x, y) => { root.show-sidebar-menu(group, id, x - root.absolute-position.x / 1px, y - root.absolute-position.y / 1px); }
+                            }
+                            Rectangle { vertical-stretch: 1; }
+                        }
+                    }
+                }
+
                 content-area := Rectangle {
-                    vertical-stretch: 1; background: VisualStyle.cffffff;
+                    visible: !root.active-is-home;
+                    vertical-stretch: root.active-is-home ? 0 : 1; background: VisualStyle.cffffff;
                     background-touch := TouchArea {
                         pointer-event(event) => {
                             if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
@@ -2234,7 +2405,8 @@ accessible-label: entry.name;
                 }
 
                 status-bar := Rectangle {
-                    height: 30px; background: VisualStyle.cfafbfc;
+                    visible: !root.active-is-home;
+                    height: root.active-is-home ? 0px : 30px; background: VisualStyle.cfafbfc;
                     Text { x: 14px; text: root.operation-error != "" ? root.operation-error : root.status-text; color: root.operation-error != "" ? VisualStyle.cc42b1c : VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; }
                     Rectangle {
                         x: parent.width - 220px; width: 84px; height: 26px; y: 2px;
@@ -2324,7 +2496,7 @@ accessible-label: entry.name;
                             if root.settings-section == 0: VerticalLayout {
                                 spacing: 12px;
                                 Rectangle {
-                                    height: 202px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                    height: 232px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
                                     VerticalLayout {
                                         padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 12px;
                                         Text { text: root.text-language; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
@@ -2339,6 +2511,7 @@ accessible-label: entry.name;
                                                 accessible-role: button; accessible-label: language-option;
                                             }
                                         }
+                                        CheckBox { text: root.text-new-tab-opens-home; checked: root.new-tab-opens-home; toggled => { root.change-new-tab-opens-home(self.checked); } }
                                         CheckBox { text: root.text-show-hidden-files; checked: root.show-hidden-files; toggled => { root.change-file-visibility(self.checked, root.show-system-files); } }
                                         CheckBox { text: root.text-show-system-files; checked: root.show-system-files; toggled => { root.change-file-visibility(root.show-hidden-files, self.checked); } }
                                     }
@@ -2623,7 +2796,7 @@ if root.tabs-menu-open: TouchArea {
                 background: tab.active ? VisualStyle.cdce6ff : (tabs-menu-touch.has-hover ? VisualStyle.cedf1f6 : transparent);
                 HorizontalLayout {
                     padding-left: 8px; padding-right: 8px; spacing: 8px;
-                    InlineIcon { icon-source: tab.is-settings ? IconMap.action-settings : (tab.icon.width != 0 ? tab.icon : (tab.is-drive ? IconMap.location-drive : IconMap.file-folder)); icon-size: 16px; }
+                    InlineIcon { icon-source: tab.is-settings ? IconMap.action-settings : tab.is-home ? IconMap.location-home : (tab.icon.width != 0 ? tab.icon : (tab.is-drive ? IconMap.location-drive : IconMap.file-folder)); icon-size: 16px; }
                     Text { text: tab.title; color: VisualStyle.c303138; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; font-weight: tab.active ? 600 : 400; }
                 }
                 tabs-menu-touch := TouchArea {

@@ -40,6 +40,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let external_paths = agent_options.take_external_paths();
 
     if let Some(scenario) = agent_options.scenario {
+        if scenario == agent_debug::AgentScenario::Home {
+            let output = agent_options
+                .state_output()
+                .expect("scenario has a default state output");
+            app::export_home_state(&output)?;
+            println!(
+                "{{\"event\":\"agent_state_exported\",\"scenario\":\"{}\",\"artifact\":{:?}}}",
+                scenario.name(),
+                output.to_string_lossy().as_ref()
+            );
+            if agent_options.no_ui {
+                return Ok(());
+            }
+        }
         if scenario == agent_debug::AgentScenario::DriveCapacity {
             let output = agent_options
                 .state_output()
