@@ -355,10 +355,8 @@ pub fn current_state(hwnd: isize) -> DragDropState {
         .unwrap_or_default()
 }
 
-#[derive(Default)]
 struct DragContext {
     paths: Vec<PathBuf>,
-    effect: DropEffect,
     allowed_effects: u32,
     right_button: bool,
 }
@@ -369,7 +367,7 @@ struct NativeDropTarget {
     helper: Option<IDropTargetHelper>,
     state: SharedState,
     target: SharedTarget,
-    context: Mutex<DragContext>,
+    context: Mutex<Option<DragContext>>,
     tab_context: Mutex<Option<TabDragPayload>>,
     intents: mpsc::Sender<DropIntent>,
 }
@@ -397,6 +395,22 @@ impl NativeDropTarget {
         }
     }
 
+    fn reject_drop(&self, reason: &'static str, output: *mut DROPEFFECT) {
+        set_native_effect(output, DropEffect::None);
+        self.update(
+            DragDropEvent::Dropped,
+            &[],
+            None,
+            DropEffect::None,
+            Some(reason),
+            None,
+        );
+        crate::operation_audit::record(
+            "native_drag_reject",
+            format!("hwnd={} reason={reason}", self.hwnd),
+        );
+    }
+
     fn target(&self, point: &POINTL) -> Option<DropTarget> {
         self.target
             .lock()
@@ -414,6 +428,13 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
         _point: &POINTL,
         native_effect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
+        // A new native entry owns a fresh gesture, even if data extraction fails.
+        if let Ok(mut context) = self.context.lock() {
+            *context = None;
+        }
+        if let Ok(mut context) = self.tab_context.lock() {
+            *context = None;
+        }
         let tab_payload = data.as_ref().and_then(read_tab_drag_payload);
         if let Some(payload) =
             tab_payload.filter(|payload| payload.process_id == std::process::id())
@@ -452,11 +473,19 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
         let (effect, reason) = negotiate_target_effect(&paths, target.as_ref(), key_state.0);
         set_native_effect(native_effect, effect);
         if let Ok(mut context) = self.context.lock() {
-            context.paths = paths.clone();
-            context.effect = effect;
-            context.allowed_effects = allowed_effects(offered);
-            context.right_button = key_state.0 & MK_RBUTTON.0 != 0;
+            *context = (!paths.is_empty()).then(|| DragContext {
+                paths: paths.clone(),
+                allowed_effects: allowed_effects(offered),
+                right_button: key_state.0 & MK_RBUTTON.0 != 0,
+            });
         }
+        crate::operation_audit::record(
+            "native_drag_enter",
+            format!(
+                "hwnd={} paths={paths:?} target={target:?} offered={} effect={effect:?}",
+                self.hwnd, offered.0
+            ),
+        );
         self.update(
             DragDropEvent::Entered,
             &paths,
@@ -487,15 +516,20 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
             return Ok(());
         }
         let target = self.target(_point);
-        let paths = self
+        let Some(paths) = self
             .context
             .lock()
-            .map(|context| context.paths.clone())
-            .unwrap_or_default();
+            .ok()
+            .and_then(|context| context.as_ref().map(|context| context.paths.clone()))
+        else {
+            set_native_effect(native_effect, DropEffect::None);
+            return Ok(());
+        };
         let (effect, reason) = negotiate_target_effect(&paths, target.as_ref(), key_state.0);
         set_native_effect(native_effect, effect);
-        if let Ok(mut context) = self.context.lock() {
-            context.effect = effect;
+        if let Ok(mut context) = self.context.lock()
+            && let Some(context) = context.as_mut()
+        {
             context.right_button |= key_state.0 & MK_RBUTTON.0 != 0;
         }
         self.update(
@@ -510,6 +544,10 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
     }
 
     fn DragLeave(&self) -> windows::core::Result<()> {
+        if let Ok(mut context) = self.context.lock() {
+            *context = None;
+        }
+        crate::operation_audit::record("native_drag_leave", format!("hwnd={}", self.hwnd));
         if self
             .tab_context
             .lock()
@@ -527,9 +565,6 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
                 let _ = unsafe { helper.DragLeave() };
             }
             return Ok(());
-        }
-        if let Ok(mut context) = self.context.lock() {
-            *context = DragContext::default();
         }
         self.update(DragDropEvent::Left, &[], None, DropEffect::None, None, None);
         Ok(())
@@ -580,25 +615,42 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
             set_native_effect(native_effect, DropEffect::Move);
             return Ok(());
         }
-        let paths = data
-            .as_ref()
-            .map(read_drop_paths)
-            .transpose()
-            .map_err(windows::core::Error::from)?
-            .unwrap_or_default();
-        let target = self.target(_point);
-        let offered = unsafe { native_effect.as_ref() }
-            .copied()
-            .unwrap_or(DROPEFFECT_NONE);
-        let (offered_effects, tracked_right_button) = self
+        // Consume before invoking the data object: errors and reentrant Drop cannot reuse a gesture.
+        let Some(context) = self
             .context
             .lock()
-            .map(|context| (context.allowed_effects, context.right_button))
-            .unwrap_or_else(|_| (allowed_effects(offered), false));
-        let right_button = tracked_right_button || key_state.0 & MK_RBUTTON.0 != 0;
+            .ok()
+            .and_then(|mut context| context.take())
+        else {
+            self.reject_drop("no_active_file_drag", native_effect);
+            return Ok(());
+        };
+        let received_paths = match data.as_ref().map(read_drop_paths).transpose() {
+            Ok(Some(paths)) => paths,
+            Ok(None) => Vec::new(),
+            Err(error) => {
+                self.reject_drop("unreadable_drop_data", native_effect);
+                return Err(windows::core::Error::from(error));
+            }
+        };
+        if received_paths != context.paths {
+            self.reject_drop("source_paths_changed", native_effect);
+            return Ok(());
+        }
+        let paths = context.paths;
+        let target = self.target(_point);
+        let offered_effects = context.allowed_effects;
+        let right_button = context.right_button;
         let effective_key_state = drop_key_state(key_state.0, right_button);
         let (effect, reason) =
             negotiate_target_effect(&paths, target.as_ref(), effective_key_state);
+        if matches!(target, Some(DropTarget::Directory(_)))
+            && effect != DropEffect::None
+            && offered_effects & allowed_effects(effect.native()) == 0
+        {
+            self.reject_drop("effect_not_offered", native_effect);
+            return Ok(());
+        }
         set_native_effect(native_effect, effect);
         if let (Some(target), None) = (target.clone(), reason) {
             let allowed_effects = match &target {
@@ -607,8 +659,12 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
                 }
                 DropTarget::QuickAccessPin => ALLOW_LINK,
             };
-            eprintln!(
-                "drag-drop: native Drop right_button={right_button} allowed_effects={allowed_effects}"
+            crate::operation_audit::record(
+                "native_drag_drop",
+                format!(
+                    "hwnd={} paths={paths:?} target={target:?} effect={effect:?} right_button={right_button} allowed_effects={allowed_effects}",
+                    self.hwnd
+                ),
             );
             let _ = self.intents.send(DropIntent {
                 paths: paths.clone(),
@@ -620,6 +676,15 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
                 allowed_effects,
             });
         }
+        if let Some(reason) = reason {
+            crate::operation_audit::record(
+                "native_drag_reject",
+                format!(
+                    "hwnd={} paths={paths:?} target={target:?} reason={reason}",
+                    self.hwnd
+                ),
+            );
+        }
         self.update(
             DragDropEvent::Dropped,
             &paths,
@@ -628,9 +693,6 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
             reason,
             Some(_point),
         );
-        if let Ok(mut context) = self.context.lock() {
-            *context = DragContext::default();
-        }
         Ok(())
     }
 }
@@ -1722,7 +1784,7 @@ impl DragDropRegistration {
             helper,
             state: state.clone(),
             target: current_target,
-            context: Mutex::new(DragContext::default()),
+            context: Mutex::new(None),
             tab_context: Mutex::new(None),
             intents,
         });
@@ -1780,6 +1842,193 @@ fn windows_error(error: windows::core::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn memory_file_data(paths: &[PathBuf]) -> IDataObject {
+        IDataObject::from(OutboundDataObject {
+            formats: vec![(CF_HDROP, encode_dropfiles(paths).unwrap())],
+            dynamic_formats: Mutex::new(Vec::new()),
+            performed_format: 0,
+            performed_effect: Arc::new(Mutex::new(None)),
+            accept_extra_set_data: false,
+        })
+    }
+
+    fn memory_drop_target() -> (IDropTarget, mpsc::Receiver<DropIntent>) {
+        let (intents, receiver) = mpsc::channel();
+        let state = Arc::new(Mutex::new(DragDropState::default()));
+        state.lock().unwrap().record(DragDropEvent::Registered);
+        let target = IDropTarget::from(NativeDropTarget {
+            hwnd: 0,
+            helper: None,
+            state,
+            target: Arc::new(Mutex::new(DropTargetSnapshot {
+                current: Some(PathBuf::from(r"C:\MemoryTarget")),
+                ..DropTargetSnapshot::default()
+            })),
+            context: Mutex::new(None),
+            tab_context: Mutex::new(None),
+            intents,
+        });
+        (target, receiver)
+    }
+
+    fn all_native_effects() -> DROPEFFECT {
+        DROPEFFECT(DROPEFFECT_COPY.0 | DROPEFFECT_MOVE.0 | DROPEFFECT_LINK.0)
+    }
+
+    #[test]
+    fn native_file_drop_rejects_isolated_over_leave_and_duplicate_callbacks() {
+        let _ole = OleApartment::initialize().unwrap();
+        let data = memory_file_data(&[PathBuf::from(r"C:\MemorySource\Bridge")]);
+        let (target, intents) = memory_drop_target();
+        let point = POINTL { x: 10, y: 10 };
+        let mut effect = all_native_effects();
+        unsafe {
+            target
+                .Drop(&data, MODIFIERKEYS_FLAGS(0), point, &mut effect)
+                .unwrap();
+        }
+        assert_eq!(effect, DROPEFFECT_NONE);
+        assert!(intents.try_recv().is_err());
+        effect = all_native_effects();
+        unsafe {
+            target.DragOver(MK_LBUTTON, point, &mut effect).unwrap();
+            target
+                .Drop(&data, MODIFIERKEYS_FLAGS(0), point, &mut effect)
+                .unwrap();
+        }
+        assert_eq!(effect, DROPEFFECT_NONE);
+        assert!(intents.try_recv().is_err());
+        effect = all_native_effects();
+        unsafe {
+            target
+                .DragEnter(&data, MK_LBUTTON, point, &mut effect)
+                .unwrap();
+            target.DragLeave().unwrap();
+            target
+                .Drop(&data, MODIFIERKEYS_FLAGS(0), point, &mut effect)
+                .unwrap();
+        }
+        assert_eq!(effect, DROPEFFECT_NONE);
+        assert!(intents.try_recv().is_err());
+        effect = all_native_effects();
+        unsafe {
+            target
+                .DragEnter(&data, MK_LBUTTON, point, &mut effect)
+                .unwrap();
+            target
+                .Drop(&data, MODIFIERKEYS_FLAGS(0), point, &mut effect)
+                .unwrap();
+        }
+        assert_eq!(intents.try_recv().unwrap().effect, DropEffect::Move);
+        effect = all_native_effects();
+        unsafe {
+            target
+                .Drop(&data, MODIFIERKEYS_FLAGS(0), point, &mut effect)
+                .unwrap();
+        }
+        assert_eq!(effect, DROPEFFECT_NONE);
+        assert!(intents.try_recv().is_err());
+    }
+
+    #[test]
+    fn native_file_drop_consumes_context_when_source_identity_changes() {
+        let _ole = OleApartment::initialize().unwrap();
+        let original = memory_file_data(&[PathBuf::from(r"C:\MemorySource\Bridge")]);
+        let replaced = memory_file_data(&[PathBuf::from(r"C:\MemorySource\Whitebox")]);
+        let (target, intents) = memory_drop_target();
+        let point = POINTL { x: 10, y: 10 };
+        let mut effect = all_native_effects();
+        unsafe {
+            target
+                .DragEnter(&original, MK_LBUTTON, point, &mut effect)
+                .unwrap();
+            target
+                .Drop(&replaced, MODIFIERKEYS_FLAGS(0), point, &mut effect)
+                .unwrap();
+        }
+        assert_eq!(effect, DROPEFFECT_NONE);
+        assert!(intents.try_recv().is_err());
+        effect = all_native_effects();
+        unsafe {
+            target
+                .Drop(&original, MODIFIERKEYS_FLAGS(0), point, &mut effect)
+                .unwrap();
+        }
+        assert_eq!(effect, DROPEFFECT_NONE);
+        assert!(intents.try_recv().is_err());
+    }
+
+    #[test]
+    fn native_file_drop_preserves_copy_move_link_and_tracked_right_button() {
+        let _ole = OleApartment::initialize().unwrap();
+        let paths = vec![PathBuf::from(r"C:\MemorySource\中文 Bridge")];
+        let data = memory_file_data(&paths);
+        let point = POINTL { x: 10, y: 10 };
+        for (modifier, button, expected) in [
+            (0, MK_LBUTTON.0, DropEffect::Move),
+            (MK_CONTROL.0, MK_LBUTTON.0, DropEffect::Copy),
+            (MK_ALT, MK_LBUTTON.0, DropEffect::Link),
+            (0, MK_RBUTTON.0, DropEffect::Move),
+        ] {
+            let (target, intents) = memory_drop_target();
+            let mut effect = all_native_effects();
+            unsafe {
+                target
+                    .DragEnter(
+                        &data,
+                        MODIFIERKEYS_FLAGS(modifier | button),
+                        point,
+                        &mut effect,
+                    )
+                    .unwrap();
+                target
+                    .DragOver(MODIFIERKEYS_FLAGS(modifier | button), point, &mut effect)
+                    .unwrap();
+                target
+                    .Drop(&data, MODIFIERKEYS_FLAGS(modifier), point, &mut effect)
+                    .unwrap();
+            }
+            let intent = intents.try_recv().unwrap();
+            assert_eq!(intent.paths, paths);
+            assert_eq!(intent.effect, expected);
+            assert_eq!(effect, expected.native());
+            assert_eq!(intent.right_button, button == MK_RBUTTON.0);
+            assert_eq!(intent.allowed_effects, ALLOW_COPY | ALLOW_MOVE | ALLOW_LINK);
+            assert!(intents.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn native_file_drop_cannot_expand_the_entered_source_effect_mask() {
+        let _ole = OleApartment::initialize().unwrap();
+        let data = memory_file_data(&[PathBuf::from(r"C:\MemorySource\Bridge")]);
+        let (target, intents) = memory_drop_target();
+        let point = POINTL { x: 10, y: 10 };
+        let mut effect = DROPEFFECT_COPY;
+        unsafe {
+            target
+                .DragEnter(
+                    &data,
+                    MODIFIERKEYS_FLAGS(MK_LBUTTON.0 | MK_CONTROL.0),
+                    point,
+                    &mut effect,
+                )
+                .unwrap();
+        }
+        effect = all_native_effects();
+        unsafe {
+            target.Drop(&data, MK_SHIFT, point, &mut effect).unwrap();
+        }
+        assert_eq!(effect, DROPEFFECT_NONE);
+        assert!(intents.try_recv().is_err());
+        effect = all_native_effects();
+        unsafe {
+            target.Drop(&data, MK_CONTROL, point, &mut effect).unwrap();
+        }
+        assert_eq!(effect, DROPEFFECT_NONE);
+        assert!(intents.try_recv().is_err());
+    }
 
     #[test]
     fn outbound_dropfiles_preserve_unicode_long_and_unc_paths() {

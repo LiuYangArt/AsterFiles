@@ -952,7 +952,6 @@ export component AppWindow inherits Window {
         && !root.drop-menu-open;
     in-out property <bool> context-menu-open: false;
     in-out property <bool> drop-menu-open: false;
-    private property <bool> internal-drag-pointer-active: false;
     in property <bool> drop-can-copy: false;
     in property <bool> drop-can-move: false;
     in property <bool> drop-can-link: false;
@@ -1192,12 +1191,13 @@ export component AppWindow inherits Window {
     callback show-column-menu(int, float, float);
     callback open-entry(int);
     callback activate-entry(int, bool, bool);
-    callback begin-internal-drag(int, float, float, bool, bool, bool);
+    callback arm-internal-drag(float, float);
+    callback begin-internal-drag(int);
+    callback cancel-internal-drag();
     callback update-internal-drag(float, float);
     public function release-internal-drag-pointer() {
-        root.internal-drag-pointer-active = false;
+        root.cancel-internal-drag();
     }
-    callback end-internal-drag(float, float, bool, bool, bool);
     callback choose-drop-effect(int);
     public function show-drop-menu(x: float, y: float) {
         root.context-menu-anchor-x = x * 1px;
@@ -2156,7 +2156,7 @@ accessible-label: entry.name;
                                     if event.kind == PointerEventKind.down {
                                         self.click-control = event.modifiers.control;
                                         self.click-shift = event.modifiers.shift;
-                                        if event.button == PointerEventButton.right && event.kind == PointerEventKind.down {
+                                        if event.button == PointerEventButton.right {
                                             root.show-entry-menu(
                                                 entry.id,
                                                 (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
@@ -2164,34 +2164,11 @@ accessible-label: entry.name;
                                             );
                                         }
                                         if event.button == PointerEventButton.left {
-
-                                            root.internal-drag-pointer-active = true;
-                                            root.begin-internal-drag(
-                                                entry.id,
-                                                (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
-                                                (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px,
-                                                event.modifiers.control,
-                                                event.modifiers.shift,
-                                                false
-                                            );
+                                            root.begin-internal-drag(entry.id);
                                         }
                                     }
-                                    if event.kind == PointerEventKind.move && self.pressed && root.internal-drag-pointer-active {
-                                        root.update-internal-drag(
-                                            (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
-                                            (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px
-                                        );
-                                    }
-                                    if event.kind == PointerEventKind.up && event.button == PointerEventButton.left && self.pressed && root.internal-drag-pointer-active {
-
-                                        root.internal-drag-pointer-active = false;
-                                        root.end-internal-drag(
-                                            (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
-                                            (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px,
-                                            event.modifiers.control,
-                                            event.modifiers.shift,
-                                            false
-                                        );
+                                    if event.kind == PointerEventKind.up && event.button == PointerEventButton.left {
+                                        root.cancel-internal-drag();
                                     }
                                 }
                                 scroll-event(event) => {
@@ -2311,7 +2288,7 @@ accessible-label: entry.name;
                                         if event.kind == PointerEventKind.down {
                                             self.click-control = event.modifiers.control;
                                             self.click-shift = event.modifiers.shift;
-                                            if event.button == PointerEventButton.right && event.kind == PointerEventKind.down {
+                                            if event.button == PointerEventButton.right {
                                                 root.show-entry-menu(
                                                     entry.id,
                                                     (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
@@ -2319,32 +2296,11 @@ accessible-label: entry.name;
                                                 );
                                             }
                                             if event.button == PointerEventButton.left {
-                                                root.internal-drag-pointer-active = true;
-                                                root.begin-internal-drag(
-                                                    entry.id,
-                                                    (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
-                                                    (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px,
-                                                    event.modifiers.control,
-                                                    event.modifiers.shift,
-                                                    false
-                                                );
+                                                root.begin-internal-drag(entry.id);
                                             }
                                         }
-                                        if event.kind == PointerEventKind.move && self.pressed && root.internal-drag-pointer-active {
-                                            root.update-internal-drag(
-                                                (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
-                                                (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px
-                                            );
-                                        }
-                                        if event.kind == PointerEventKind.up && event.button == PointerEventButton.left && root.internal-drag-pointer-active {
-                                            root.internal-drag-pointer-active = false;
-                                            root.end-internal-drag(
-                                                (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
-                                                (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px,
-                                                event.modifiers.control,
-                                                event.modifiers.shift,
-                                                false
-                                            );
+                                        if event.kind == PointerEventKind.up && event.button == PointerEventButton.left {
+                                            root.cancel-internal-drag();
                                         }
                                     }
                                     clicked => { root.activate-entry(entry.id, self.click-control, self.click-shift); }

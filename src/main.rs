@@ -6,7 +6,10 @@ mod domain;
 mod fs;
 mod group_projection;
 mod i18n;
+#[cfg(test)]
+mod input_order_tests;
 mod network;
+mod operation_audit;
 mod platform;
 mod quick_menu_popup;
 mod session_store;
@@ -19,6 +22,15 @@ fn main_network_child() -> std::io::Result<bool> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    struct AuditFlush;
+    impl Drop for AuditFlush {
+        fn drop(&mut self) {
+            if let Err(error) = operation_audit::flush() {
+                eprintln!("file operation audit flush failed: {error}");
+            }
+        }
+    }
+    let _audit_flush = AuditFlush;
     #[cfg(windows)]
     if main_network_child()? {
         return Ok(());

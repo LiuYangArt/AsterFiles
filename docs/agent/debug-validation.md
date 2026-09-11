@@ -221,3 +221,16 @@ cargo test fs::file_operations::tests:: -- --nocapture
 ```powershell
 cargo test app::tests::issue_61_100k_small_files_performance_evidence -- --ignored --exact
 ```
+
+
+## Issue #93 普通点击不得移动文件
+
+专项命令：`cargo test issue_93 -- --nocapture`、`cargo test native_file_drop -- --nocapture`、`cargo test operation_audit -- --nocapture`；统一检查使用 `python tools/verify.py --quick`，包含 Debug 构建。
+
+Slint testing 后端验证真实 clicked/pressed/Up 顺序、释放期间布局位移，以及实际列表/网格重建模型后的取消。内存状态与无窗口 COM 测试覆盖原始路径、标签/请求隔离、合法拖动只授权一次、孤立/取消/重复 Drop 零提交，以及复制/移动/快捷方式效果。测试不操作真实 AsterFiles 窗口或工作目录。
+
+审计日志位于 `artifacts/logs/file-operation-audit.jsonl`，记录时间、PID、事件、原始来源/目标和结果。专项日志为 `artifacts/logs/issue-93-tests.log`，统一汇总为 `artifacts/verify/summary.json`。
+
+人工验收仅用新建临时目录：创建 Bridge、Whitebox 与测试文件；在列表和网格分别连续单击、双击 Bridge 后侧键返回，确认目录位置不变；再验证主动拖动、Ctrl 复制、Shift 移动和 Escape 取消，并在 Explorer 核对结果。用户确认前保持 Issue 打开和 Project In review，不构建 Release。
+
+事件顺序证据与长期排查入口见 [#93 postmortem](../postmortem/postmortem-2026-09-11-file-drag-safety.md)。

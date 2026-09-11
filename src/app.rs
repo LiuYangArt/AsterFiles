@@ -4647,7 +4647,6 @@ pub fn run(
     );
     wire_internal_drag_drop(
         &ui,
-        operation_sender.clone(),
         request_sender.clone(),
         network_request_sender.clone(),
         scoped_state.clone(),
@@ -5467,7 +5466,6 @@ fn install_app_window_at(
     );
     wire_internal_drag_drop(
         &ui,
-        senders.operation.clone(),
         senders.directory.clone(),
         senders.network_directory.clone(),
         scoped.clone(),
@@ -5848,16 +5846,6 @@ fn single_tab_window_drop_position(
     )
 }
 
-fn drag_paths_for_pressed_entry(app: &AppState, entry_id: EntryId) -> Vec<PathBuf> {
-    let tab = app.active();
-    if tab.selected.contains(&entry_id) {
-        return selected_paths(app);
-    }
-    tab.visible_entry(entry_id)
-        .map(|entry| vec![entry.path.clone()])
-        .unwrap_or_default()
-}
-
 fn selected_paths(app: &AppState) -> Vec<PathBuf> {
     app.active()
         .selected
@@ -6071,6 +6059,10 @@ fn enqueue_operation(
             return;
         }
         let undo_source_manifests = capture_undo_source_manifests(kind, resource, &items);
+        crate::operation_audit::record(
+            "operation_enqueued",
+            format!("tab={origin_tab:?} kind={kind:?} items={items:?}"),
+        );
         let operation_id = app
             .operations
             .submit(resource, kind, Some(origin_tab), items);
@@ -9819,191 +9811,153 @@ fn dismiss_quick_menu_session(window_id: WindowId, restore_focus: bool) {
         ui.invoke_dismiss_context_menu();
     }
 }
+#[derive(Debug)]
+struct InternalDrag {
+    origin_tab: TabId,
+    request_id: RequestId,
+    entries: Vec<(EntryId, PathBuf)>,
+    start_x: f32,
+    start_y: f32,
+}
+
+#[derive(Default)]
+struct FileDragGesture {
+    press: Option<(f32, f32)>,
+    pending: Option<InternalDrag>,
+}
+
+impl FileDragGesture {
+    fn cancel(&mut self, reason: &str) {
+        if let Some(drag) = self.pending.take() {
+            crate::operation_audit::record(
+                "drag_cancelled",
+                format!("reason={reason} drag={drag:?}"),
+            );
+        }
+        self.press = None;
+    }
+
+    fn arm(&mut self, x: f32, y: f32) {
+        self.cancel("new_pointer_press");
+        if x.is_finite() && y.is_finite() {
+            self.press = Some((x, y));
+        }
+    }
+
+    fn bind_entry(&mut self, app: &AppState, id: EntryId) {
+        let Some((start_x, start_y)) = self.press.take() else {
+            return;
+        };
+        let tab = app.active();
+        let Some(entry) = tab.visible_entry(id) else {
+            return;
+        };
+        let entries = if tab.selected.contains(&id) {
+            tab.selected
+                .iter()
+                .filter_map(|id| tab.visible_entry(*id))
+                .map(|entry| (entry.id, entry.path.clone()))
+                .collect()
+        } else {
+            vec![(entry.id, entry.path.clone())]
+        };
+        let drag = InternalDrag {
+            origin_tab: tab.id,
+            request_id: tab.latest_request,
+            entries,
+            start_x,
+            start_y,
+        };
+        crate::operation_audit::record("drag_armed", format!("{drag:?}"));
+        self.pending = Some(drag);
+    }
+
+    fn take_native_start(&mut self, app: &AppState, x: f32, y: f32) -> Option<InternalDrag> {
+        let drag = self.pending.as_ref()?;
+        let tab = app.active();
+        if tab.id != drag.origin_tab
+            || tab.latest_request != drag.request_id
+            || drag.entries.is_empty()
+            || drag.entries.iter().any(|(id, path)| {
+                tab.visible_entry(*id)
+                    .is_none_or(|entry| entry.path != *path)
+            })
+        {
+            self.cancel("source_identity_changed");
+            return None;
+        }
+        if !x.is_finite() || !y.is_finite() || (x - drag.start_x).hypot(y - drag.start_y) < 4.0 {
+            return None;
+        }
+        self.pending.take()
+    }
+}
+
 fn wire_internal_drag_drop(
     ui: &AppWindow,
-    operation_sender: mpsc::Sender<FileOperationRequest>,
     directory_sender: mpsc::Sender<DirectoryRequest>,
     network_directory_sender: mpsc::SyncSender<DirectoryRequest>,
     state: WindowSessions,
 ) {
-    #[derive(Debug)]
-    struct InternalDrag {
-        entry_id: EntryId,
-        origin_tab: TabId,
-        paths: Vec<PathBuf>,
-        source_directories: Vec<PathBuf>,
-        start_x: f32,
-        start_y: f32,
-        outbound_started: bool,
-        right_button: bool,
-    }
-
-    let drag = Arc::new(Mutex::new(None::<InternalDrag>));
-
+    let gesture = Rc::new(RefCell::new(FileDragGesture::default()));
+    let for_arm = gesture.clone();
+    ui.on_arm_internal_drag(move |x, y| for_arm.borrow_mut().arm(x, y));
+    let for_begin = gesture.clone();
     let state_for_begin = state.clone();
-    let drag_for_begin = drag.clone();
-    ui.on_begin_internal_drag(move |entry_id, x, y, _control, _shift, right_button| {
-        let app = state_for_begin
+    ui.on_begin_internal_drag(move |entry_id| {
+        if let Ok(app) = state_for_begin.lock() {
+            for_begin
+                .borrow_mut()
+                .bind_entry(&app, EntryId(entry_id as u32));
+        }
+    });
+    let for_cancel = gesture.clone();
+    ui.on_cancel_internal_drag(move || for_cancel.borrow_mut().cancel("release_or_context_change"));
+    let weak = ui.as_weak();
+    ui.on_update_internal_drag(move |x, y| {
+        let Some(ui) = weak.upgrade() else { return };
+        let drag = state
             .lock()
-            .expect("app state mutex is not poisoned");
-        let id = EntryId(entry_id as u32);
-        let origin_tab = app.active_window_state().active_tab;
-        let paths = drag_paths_for_pressed_entry(&app, id);
+            .ok()
+            .and_then(|app| gesture.borrow_mut().take_native_start(&app, x, y));
+        let Some(drag) = drag else { return };
+        let paths = drag
+            .entries
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect::<Vec<_>>();
         let source_directories = paths
             .iter()
             .filter_map(|path| path.parent().map(Path::to_path_buf))
-            .collect();
-        if let Ok(mut drag) = drag_for_begin.lock() {
-            *drag = Some(InternalDrag {
-                entry_id: id,
-                origin_tab,
-                paths,
-                source_directories,
-                start_x: x,
-                start_y: y,
-                outbound_started: false,
-                right_button,
-            });
-        }
-    });
-
-    let weak_for_update = ui.as_weak();
-    let state_for_update = state.clone();
-    let drag_for_update = drag.clone();
-    let directory_for_update = directory_sender.clone();
-    let network_directory_for_update = network_directory_sender.clone();
-    ui.on_update_internal_drag(move |x, y| {
-        let Some(ui) = weak_for_update.upgrade() else {
-            return;
-        };
-        let outbound = drag_for_update.lock().ok().and_then(|mut drag| {
-            let drag = drag.as_mut()?;
-            let distance = ((x - drag.start_x).powi(2) + (y - drag.start_y).powi(2)).sqrt();
-            if !should_release_internal_pointer_grab(distance, drag.outbound_started) {
-                return None;
-            }
-            drag.outbound_started = true;
-            Some((
-                drag.paths.clone(),
-                drag.source_directories.clone(),
-                drag.right_button,
-            ))
-        });
-        let Some((paths, source_directories, right_button)) = outbound else {
-            return;
-        };
-        // OLE must own pointer routing before the window can receive its own native drop callbacks.
+            .collect::<Vec<_>>();
+        // Only a native pointer move can enter OLE; releasing a Slint item never authorizes a file operation.
         ui.invoke_release_internal_drag_pointer();
         ui.set_drop_hover_entry_id(-1);
-        eprintln!("drag-drop: threshold reached, entering DoDragDrop right_button={right_button}");
-        let outbound_result = platform::windows::drag_drop::begin_outbound_drag(
+        crate::operation_audit::record("drag_ole_started", format!("{drag:?} pointer=({x},{y})"));
+        let result = platform::windows::drag_drop::begin_outbound_drag(
             &paths,
             platform::windows::drag_drop::DropEffect::Move,
         );
-        eprintln!("drag-drop: DoDragDrop returned result={outbound_result:?}");
-        match outbound_result {
+        crate::operation_audit::record(
+            "drag_ole_finished",
+            format!("source={paths:?} result={result:?}"),
+        );
+        match result {
             Ok(result) if should_refresh_outbound_drag_source(result) => {
-                // External targets own the operation; refresh only the source views and never infer item removal.
                 refresh_affected_tabs(
-                    &directory_for_update,
-                    &network_directory_for_update,
-                    &state_for_update,
+                    &directory_sender,
+                    &network_directory_sender,
+                    &state,
                     &source_directories,
                 );
             }
             Ok(_) => {}
             Err(error) => {
-                if let Ok(mut app) = state_for_update.lock() {
+                if let Ok(mut app) = state.lock() {
                     app.operation_errors
                         .push(format!("outbound drag failed: {error}"));
                 }
             }
-        }
-    });
-    let weak_for_end = ui.as_weak();
-    let state_for_end = state.clone();
-    let drag_for_end = drag.clone();
-    ui.on_end_internal_drag(move |x, y, control, shift, right_button| {
-        let Some(ui) = weak_for_end.upgrade() else {
-            return;
-        };
-        ui.set_drop_hover_entry_id(-1);
-        let Some(drag) = drag_for_end.lock().ok().and_then(|mut drag| drag.take()) else {
-            return;
-        };
-        if drag.outbound_started {
-            return;
-        }
-        let distance = ((x - drag.start_x).powi(2) + (y - drag.start_y).powi(2)).sqrt();
-        if distance < 4.0 {
-            if right_button {
-                ui.invoke_show_entry_menu(drag.entry_id.0 as i32, x, y);
-            }
-            return;
-        }
-        let target = state_for_end.lock().ok().and_then(|app| {
-            internal_drag_target(
-                &app,
-                x,
-                y,
-                FileHitGeometry {
-                    list_left: ui.get_file_list_left(),
-                    list_top: ui.get_file_list_top(),
-                    viewport_x: ui.get_file_viewport_x(),
-                    viewport_y: ui.get_file_viewport_y(),
-                    viewport_width: ui.get_file_viewport_width(),
-                    columns_width: ui.get_details_hit_width(),
-                },
-                ui.get_search_scroll_y(),
-                ui.get_grid_column_count().max(1) as usize,
-            )
-            .map(|(_, path)| path)
-        });
-        let Some(target) = target else {
-            return;
-        };
-        let key_state = (if control { 8 } else { 0 })
-            | (if shift { 4 } else { 0 })
-            | (if right_button { 2 } else { 0 });
-        let (effect, reason) =
-            platform::windows::drag_drop::negotiate_effect(&drag.paths, Some(&target), key_state);
-        if reason.is_some() {
-            return;
-        }
-        let intent = platform::windows::drag_drop::DropIntent {
-            paths: drag.paths,
-            target: platform::windows::drag_drop::DropTarget::Directory(target),
-            effect,
-            right_button,
-            screen_x: x.round() as i32,
-            screen_y: y.round() as i32,
-            allowed_effects: platform::windows::drag_drop::ALLOW_COPY
-                | platform::windows::drag_drop::ALLOW_MOVE
-                | platform::windows::drag_drop::ALLOW_LINK,
-        };
-        if right_button {
-            ui.set_drop_can_copy(true);
-            ui.set_drop_can_move(true);
-            ui.set_drop_can_link(true);
-            if let Ok(mut app) = state_for_end.lock() {
-                app.pending_right_drops
-                    .insert(state_for_end.window_id, (drag.origin_tab, intent));
-            }
-            ui.invoke_show_drop_menu(x, y);
-        } else {
-            let origin_tab = state_for_end.lock().ok().and_then(|app| {
-                app.window(state_for_end.window_id)
-                    .map(|window| window.active_tab)
-            });
-            let Some(origin_tab) = origin_tab else {
-                return;
-            };
-            dispatch_drop_operation(
-                intent,
-                origin_tab,
-                state_for_end.shared.clone(),
-                operation_sender.clone(),
-            );
         }
     });
 }
@@ -13993,6 +13947,30 @@ fn wire_mouse_navigation(
     let cursor_position = Cell::new(winit::dpi::PhysicalPosition::new(0.0, 0.0));
     let ctrl_wheel_accumulator = Cell::new(0.0_f32);
     ui.window().on_winit_window_event(move |_, event| {
+        if let Some(ui) = weak.upgrade() {
+            match event {
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button: winit::event::MouseButton::Left,
+                    ..
+                } => {
+                    let position = cursor_position
+                        .get()
+                        .to_logical::<f32>(f64::from(ui.window().scale_factor()));
+                    ui.invoke_arm_internal_drag(position.x, position.y);
+                }
+                WindowEvent::MouseInput { .. }
+                | WindowEvent::Focused(false)
+                | WindowEvent::CloseRequested
+                | WindowEvent::Occluded(true)
+                | WindowEvent::CursorLeft { .. }
+                | WindowEvent::Resized(_)
+                | WindowEvent::ScaleFactorChanged { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::KeyboardInput { .. } => ui.invoke_cancel_internal_drag(),
+                _ => {}
+            }
+        }
         if matches!(event, WindowEvent::Focused(true)) {
             if let Ok(mut app) = state.lock() {
                 app.active_window = window_id;
@@ -14241,6 +14219,8 @@ fn wire_mouse_navigation(
         match event {
             WindowEvent::CursorMoved { position, .. } => {
                 cursor_position.set(*position);
+                let logical = position.to_logical::<f32>(f64::from(ui.window().scale_factor()));
+                ui.invoke_update_internal_drag(logical.x, logical.y);
                 EventResult::Propagate
             }
             WindowEvent::MouseWheel { delta, .. } if !ui.get_active_is_settings() => {
@@ -14665,10 +14645,6 @@ fn wire_mouse_navigation(
     });
 }
 
-fn should_release_internal_pointer_grab(distance: f32, outbound_started: bool) -> bool {
-    distance >= 4.0 && !outbound_started
-}
-
 fn should_start_native_tab_drag(became_dragging: bool, native_started: bool) -> bool {
     became_dragging && !native_started
 }
@@ -14727,6 +14703,10 @@ fn dispatch_drop_operation(
     state: SharedSessions,
     operation_sender: mpsc::Sender<FileOperationRequest>,
 ) {
+    crate::operation_audit::record(
+        "drop_dispatch",
+        format!("tab={origin_tab:?} intent={intent:?}"),
+    );
     thread::spawn(move || match prepare_drop_operation(intent) {
         Ok(PreparedDrop::Operation(kind, items)) => {
             let _ = slint::invoke_from_event_loop(move || {
@@ -15143,63 +15123,6 @@ fn drop_target_snapshot(
             )
         },
     })
-}
-
-fn internal_drag_target(
-    app: &AppState,
-    x: f32,
-    y: f32,
-    geometry: FileHitGeometry,
-    search_scroll_y: f32,
-    grid_columns: usize,
-) -> Option<(EntryId, PathBuf)> {
-    let tab = app.active();
-    let view_mode = app.active_view_mode();
-    let local_x = x - geometry.list_left;
-    if view_mode == ViewMode::Details && !geometry.details_contains(x) {
-        return None;
-    }
-    if view_mode != ViewMode::Details
-        && (local_x < 16.0 || local_x >= geometry.viewport_width - 16.0)
-    {
-        return None;
-    }
-    let content_y = y - geometry.list_top + (-geometry.viewport_y).max(0.0);
-    let local_row = (content_y / file_row_height(view_mode)).floor() as usize;
-    let local_index = if file_layout_geometry(view_mode).grid {
-        let column = ((local_x - 16.0)
-            / (file_layout_geometry(view_mode).card_width + 8.0).max(1.0))
-        .floor() as usize;
-        local_row
-            .saturating_mul(grid_columns.max(1))
-            .saturating_add(column.min(grid_columns.max(1) - 1))
-    } else {
-        local_row
-    };
-    let entry = if tab.page_source == PageSource::Search {
-        let window = search_window_for_scroll(
-            search_scroll_y,
-            tab.search_total.unwrap_or(0),
-            view_mode,
-            grid_columns,
-        );
-        let id = window
-            .start
-            .checked_add(local_index as u32)?
-            .checked_add(1)?;
-        tab.visible_entry(EntryId(id))?
-    } else {
-        let id = directory_entry_at_visual_point(
-            app,
-            tab,
-            view_mode,
-            grid_columns,
-            x - geometry.list_left,
-            content_y,
-        )?;
-        tab.visible_entry(id)?
-    };
-    (entry.kind == crate::domain::EntryKind::Directory).then(|| (entry.id, entry.path.clone()))
 }
 
 fn create_drop_shortcuts(shortcuts: Vec<(PathBuf, PathBuf)>) -> Result<(), String> {
@@ -17903,6 +17826,13 @@ fn execute_file_operation_request(
     event_sender: &mpsc::Sender<FileOperationEvent>,
     conflict_gate: &Arc<Mutex<()>>,
 ) {
+    crate::operation_audit::record(
+        "operation_started",
+        format!(
+            "id={:?} kind={:?} items={:?}",
+            request.id, request.kind, request.items
+        ),
+    );
     let mut succeeded = Vec::new();
     let mut skipped = Vec::new();
     let mut failed = Vec::new();
@@ -19404,6 +19334,10 @@ fn start_file_operation_event_pump(
                         undo_items,
                         failed_undo_items,
                     } => {
+                        crate::operation_audit::record(
+                            "operation_finished",
+                            format!("id={id:?} result={result:?} items={item_states:?}"),
+                        );
                         let (affected, next, clear_completed_cut, undo_failure) = {
                             let mut app = state.lock().expect("app state mutex is not poisoned");
                             if let Some(task) = app.operations.task_mut(id) {
@@ -24678,6 +24612,7 @@ fn shell_integration_projection(
     }
 }
 fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId) {
+    ui.invoke_cancel_internal_drag();
     let app = state.lock().expect("app state mutex is not poisoned");
     let texts = Texts::new(app.language);
     let Some(window) = app.window(window_id) else {
@@ -32475,8 +32410,15 @@ mod tests {
         ]);
         tab.select_entry(EntryId(1), false, false);
 
+        let mut gesture = FileDragGesture::default();
+        gesture.arm(0.0, 0.0);
+        gesture.bind_entry(&app, EntryId(2));
+        let drag = gesture.take_native_start(&app, 5.0, 0.0).unwrap();
         assert_eq!(
-            drag_paths_for_pressed_entry(&app, EntryId(2)),
+            drag.entries
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect::<Vec<_>>(),
             vec![PathBuf::from(r"C:\test\two.txt")]
         );
         let tab = &app.active_window_state().tabs[&TabId(1)];
@@ -32500,8 +32442,15 @@ mod tests {
         tab.select_entry(EntryId(1), false, false);
         tab.select_entry(EntryId(2), true, false);
 
+        let mut gesture = FileDragGesture::default();
+        gesture.arm(0.0, 0.0);
+        gesture.bind_entry(&app, EntryId(2));
+        let drag = gesture.take_native_start(&app, 5.0, 0.0).unwrap();
         assert_eq!(
-            drag_paths_for_pressed_entry(&app, EntryId(2)),
+            drag.entries
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect::<Vec<_>>(),
             vec![
                 PathBuf::from(r"C:\test\one.txt"),
                 PathBuf::from(r"C:\test\two.txt"),
@@ -33030,60 +32979,6 @@ mod tests {
         );
     }
     #[test]
-    fn internal_drag_targets_only_directory_rows_with_viewport_offset() {
-        let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
-        app.active_window_state_mut()
-            .tabs
-            .get_mut(&TabId(1))
-            .unwrap()
-            .replace_entries(vec![
-                FileEntry {
-                    id: EntryId(1),
-                    original_name: "file.txt".into(),
-                    display_name: "file.txt".into(),
-                    name_highlights: Vec::new(),
-                    path: PathBuf::from(r"C:\test\file.txt"),
-                    kind: crate::domain::EntryKind::File,
-                    open_target: None,
-                    library_source_index: None,
-                    parent_display: String::new(),
-                    size_bytes: Some(1),
-                    folder_size: crate::domain::FolderSizeState::Unknown,
-                    modified: None,
-                    created: None,
-                },
-                FileEntry {
-                    id: EntryId(2),
-                    original_name: "folder".into(),
-                    display_name: "folder".into(),
-                    name_highlights: Vec::new(),
-                    path: PathBuf::from(r"C:\test\folder"),
-                    kind: crate::domain::EntryKind::Directory,
-                    open_target: None,
-                    library_source_index: None,
-                    parent_display: String::new(),
-                    size_bytes: None,
-                    folder_size: crate::domain::FolderSizeState::Unknown,
-                    modified: None,
-                    created: None,
-                },
-            ]);
-
-        assert_eq!(
-            internal_drag_target(&app, 16.0, 20.0, test_hit_geometry(0.0, 0.0), 0.0, 1),
-            None
-        );
-        assert_eq!(
-            internal_drag_target(&app, 416.0, 20.0, test_hit_geometry(0.0, -40.0), 0.0, 1,),
-            None
-        );
-        assert_eq!(
-            internal_drag_target(&app, 16.0, 20.0, test_hit_geometry(0.0, -40.0), 0.0, 1),
-            Some((EntryId(2), PathBuf::from(r"C:\test\folder")))
-        );
-    }
-
-    #[test]
     fn drop_preflight_preserves_paths_and_builds_operation_items() {
         let temporary = std::env::temp_dir().join(format!(
             "asterfiles-drop-test-{}-{:?}",
@@ -33202,13 +33097,6 @@ mod tests {
         );
         std::fs::remove_dir_all(temporary).unwrap();
     }
-    #[test]
-    fn internal_drag_releases_pointer_grab_once_before_ole() {
-        assert!(!should_release_internal_pointer_grab(3.9, false));
-        assert!(should_release_internal_pointer_grab(4.0, false));
-        assert!(!should_release_internal_pointer_grab(8.0, true));
-    }
-
     #[test]
     fn rectangle_selection_starts_only_after_threshold() {
         assert!(!rectangle_selection_started(10.0, 10.0, 13.0, 13.0));
@@ -34472,3 +34360,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "drag_safety_tests.rs"]
+mod drag_safety_tests;

@@ -891,6 +891,15 @@ impl TabSession {
     ) -> (RequestId, Arc<AtomicBool>) {
         self.cancel_pending();
         self.latest_request.0 += 1;
+        crate::operation_audit::record(
+            "navigation",
+            format!(
+                "tab={:?} request={:?} from={:?} to={location:?} kind={kind:?}",
+                self.id,
+                self.latest_request,
+                self.visible_location()
+            ),
+        );
         self.requested_location = Some(location);
         self.page_source = PageSource::Directory;
         self.directory_snapshot = None;
