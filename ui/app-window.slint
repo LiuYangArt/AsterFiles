@@ -3,7 +3,7 @@ import { IconMap } from "icons/icon-map.slint";
 export { PopupCommandRow, QuickMenuWindow, QuickSubmenuWindow } from "quick-menu.slint";
 
 export struct HighlightSegment { text: string, highlighted: bool }
-export struct FileRow { id: int, loaded: bool, group-header: bool, group-label: string, group-detail: string, group-count: int, name: string, name-segments: [HighlightSegment], kind: string, parent-path: string, size: string, modified: string, created: string, is-directory: bool, selected: bool, focused: bool, cut: bool, icon: image }
+export struct FileRow { id: int, loaded: bool, group-header: bool, group-label: string, group-detail: string, group-count: int, name: string, name-segments: [HighlightSegment], kind: string, parent-path: string, size: string, modified: string, created: string, is-directory: bool, selected: bool, focused: bool, cut: bool, thumbnail-state: int, icon: image }
 export struct GridRow { group-header: bool, group-label: string, group-detail: string, group-count: int, entries: [FileRow] }
 export struct HistoryRow { index: int, label: string }
 export struct BreadcrumbRow { index: int, label: string, current: bool }
@@ -2108,11 +2108,14 @@ accessible-label: entry.name;
                                 border-radius: 7px;
                                 background: entry.selected ? VisualStyle.cdce6ff : card-touch.has-hover ? VisualStyle.ceff4ff : transparent;
                                 Image {
-                                    x: root.view-mode == 6 ? 8px : (parent.width - root.view-icon-size(root.view-mode)) / 2;
-                                    y: root.view-mode == 6 ? 8px : 8px;
-                                    width: root.view-icon-size(root.view-mode); height: root.view-icon-size(root.view-mode);
+                                    private property <length> fallback-size: root.view-mode == 6 ? 32px : 48px;
+                                    x: entry.icon.width != 0 ? (root.view-mode == 6 ? 8px : (parent.width - root.view-icon-size(root.view-mode)) / 2) : (parent.width - self.width) / 2;
+                                    y: entry.icon.width != 0 ? 8px : (root.view-icon-size(root.view-mode) - self.height) / 2 + 8px;
+                                    width: entry.icon.width != 0 ? root.view-icon-size(root.view-mode) : self.fallback-size;
+                                    height: entry.icon.width != 0 ? root.view-icon-size(root.view-mode) : self.fallback-size;
                                     source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document);
                                     image-fit: contain;
+                                    opacity: entry.thumbnail-state == 1 ? 0.5 : 1;
                                 }
                                 Text {
                                     x: root.view-mode == 6 ? 64px : 7px;

@@ -138,7 +138,7 @@ mod windows_impl {
                 Shell::{
                     IShellItemImageFactory, SHCreateItemFromParsingName, SHFILEINFOW, SHGFI_ICON,
                     SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SIIGBF_BIGGERSIZEOK,
-                    SIIGBF_ICONONLY, SIIGBF_INCACHEONLY, SIIGBF_SCALEUP, SIIGBF_THUMBNAILONLY,
+                    SIIGBF_INCACHEONLY, SIIGBF_SCALEUP, SIIGBF_THUMBNAILONLY,
                 },
                 WindowsAndMessaging::{
                     DI_NORMAL, DestroyIcon, DrawIconEx, GetSystemMetrics, HICON, SM_CXICON,
@@ -181,26 +181,6 @@ mod windows_impl {
             return Err(io::Error::other("Windows Shell type icon unavailable"));
         }
         ShellIcon(file_info.hIcon).to_rgba()
-    }
-
-    pub fn shell_large_icon_rgba(path: &Path, size: u32) -> io::Result<ShellIconRgba> {
-        use windows::Win32::Foundation::SIZE;
-        let wide = wide_null(path.as_os_str());
-        let factory: IShellItemImageFactory = unsafe {
-            SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).map_err(windows_error)?
-        };
-        let bitmap = unsafe {
-            factory
-                .GetImage(
-                    SIZE {
-                        cx: size as i32,
-                        cy: size as i32,
-                    },
-                    SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
-                )
-                .map_err(windows_error)?
-        };
-        owned_bitmap_to_rgba(bitmap)
     }
 
     pub fn shell_thumbnail_rgba(
@@ -501,8 +481,7 @@ mod windows_impl {
 
 #[cfg(windows)]
 pub use windows_impl::{
-    initialize_shell_worker, shell_icon_rgba, shell_large_icon_rgba, shell_thumbnail_rgba,
-    shell_type_icon_rgba,
+    initialize_shell_worker, shell_icon_rgba, shell_thumbnail_rgba, shell_type_icon_rgba,
 };
 
 #[cfg(test)]

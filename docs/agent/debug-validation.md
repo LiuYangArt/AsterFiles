@@ -77,6 +77,14 @@ cargo test quick_access --quiet
 
 无界面场景只验证原始路径身份、独立投放目标、单文件夹限制、文件任务隔离、加载代次和多窗口共享投影，不修改真实 Windows Shell。真实 Explorer 双向同步、文件列表拖入、地址栏图标拖入、Escape 与 100%/125%/150% DPI 由用户手动验收；结构化运行日志整理到 `artifacts/logs/quick-access/`。
 
+## Issue #88 大图片目录缩略图调度
+
+```powershell
+cargo run -- --agent-scenario thumbnail-scheduler --agent-state-out artifacts/state/thumbnails/scheduler.json --no-ui
+```
+
+场景使用 2743 个纯内存项目，不启动窗口、不扫描真实目录、不访问 Windows Shell。它覆盖首屏计划被队列上限约束、大跨度视口跳转替换旧待处理项，以及旧视口结果被拒绝；产物为 `artifacts/state/thumbnails/scheduler.json`。单元测试另覆盖两秒延迟重试和最多一次自动重试。真实图片解码、占位清晰度、滚动手感和桌面窗口稳定性只能由用户手动验收；结构化运行日志和性能数据分别写入 `artifacts/logs/thumbnails/` 与 `artifacts/perf/thumbnails/`。
+
 ## Issue #5 文件夹大小调度
 
 ```powershell

@@ -258,6 +258,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
         }
+        if scenario == agent_debug::AgentScenario::ThumbnailScheduler {
+            let output = agent_options
+                .state_output()
+                .expect("scenario has a default state output");
+            app::export_thumbnail_scheduler_state(&output)?;
+            println!(
+                "{{\"event\":\"agent_state_exported\",\"scenario\":\"{}\",\"artifact\":{:?}}}",
+                scenario.name(),
+                output.to_string_lossy().as_ref()
+            );
+            if agent_options.no_ui {
+                return Ok(());
+            }
+        }
         if scenario == agent_debug::AgentScenario::ShellThumbnail {
             let output = agent_options
                 .state_output()

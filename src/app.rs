@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -34,6 +34,7 @@ use crate::{
             UndoBeginError, UndoEntry, UndoHistory, UndoItem, UndoSourceKind,
         },
         folder_size_scheduler::{FOLDER_SIZE_QUEUE_CAPACITY, FolderSizeCommit, FolderSizeQuery},
+        thumbnail_scheduler::{ThumbnailKey, ThumbnailPlans},
     },
     fs::{
         ReadOutcome, SourceReadState, read_aggregate_directory_batches_filtered,
@@ -61,11 +62,61 @@ const SHORTCUT_QUEUE_CAPACITY: usize = 128;
 const DIRECTORY_EVENT_INTERVAL: Duration = Duration::from_millis(16);
 const REBUILT_PROJECTION_BATCH_SIZE: usize = 256;
 const THUMBNAIL_CACHE_CAPACITY: usize = 128;
-const LARGE_ICON_CACHE_CAPACITY: usize = 128;
+const THUMBNAIL_RETRY_DELAY: Duration = Duration::from_secs(2);
+const THUMBNAIL_MAX_ATTEMPTS: u8 = 2;
 const TYPE_SELECT_TIMEOUT: Duration = Duration::from_millis(1_000);
 const OPERATION_PROGRESS_INTERVAL: Duration = Duration::from_millis(125);
 const OPERATION_PROGRESS_BYTES: u64 = 4 * 1024 * 1024;
 const OPERATION_PROGRESS_FILES: usize = 128;
+
+pub fn export_thumbnail_scheduler_state(path: &Path) -> io::Result<()> {
+    use crate::domain::thumbnail_scheduler::{
+        THUMBNAIL_QUEUE_CAPACITY, ThumbnailKey, ThumbnailPlan,
+    };
+
+    let key = |index: u32| ThumbnailKey {
+        tab_id: TabId(1),
+        request_id: RequestId(9),
+        entry_id: EntryId(index),
+        path: PathBuf::from(format!(r"C:\AgentScenarios\Thumbnails\{index}.png")),
+        requested_px: 256,
+    };
+    let mut plan = ThumbnailPlan::default();
+    plan.replace((0..2_743).map(key));
+    let bounded_initial = plan.pending_len() == THUMBNAIL_QUEUE_CAPACITY;
+    let (_, old_in_flight) = plan.next().expect("initial thumbnail work exists");
+    let latest_generation = plan.replace((1_300..1_324).map(key));
+    let stale_rejected = !plan.finish(&old_in_flight);
+    let latest_visible_scheduled = plan.wanted_keys().contains(&key(1_300));
+    let state = format!(
+        concat!(
+            "{{\n",
+            "  \"schema_version\": 1,\n",
+            "  \"scenario\": \"thumbnail-scheduler\",\n",
+            "  \"scope\": \"pure_model_no_ui_no_shell_no_disk_scan\",\n",
+            "  \"dataset_items\": 2743,\n",
+            "  \"queue_capacity\": {},\n",
+            "  \"bounded_initial_plan\": {},\n",
+            "  \"latest_generation\": {},\n",
+            "  \"latest_visible_scheduled\": {},\n",
+            "  \"stale_result_rejected\": {},\n",
+            "  \"pending_after_jump\": {},\n",
+            "  \"in_flight_after_jump\": {}\n",
+            "}}\n"
+        ),
+        THUMBNAIL_QUEUE_CAPACITY,
+        bounded_initial,
+        latest_generation,
+        latest_visible_scheduled,
+        stale_rejected,
+        plan.pending_len(),
+        plan.in_flight_len(),
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, state)
+}
 
 fn entry_type_icon_key(
     path: &Path,
@@ -1034,6 +1085,7 @@ struct WorkerSenders {
     shell_menu: platform::windows::context_menu::ShellMenuWorker,
     everything: mpsc::Sender<EverythingRequest>,
     icon: mpsc::Sender<IconRequest>,
+    thumbnail: ThumbnailScheduler,
     shortcut: mpsc::SyncSender<ShortcutRequest>,
     network_login: slint::Weak<NetworkLoginWindow>,
     network_login_state: Arc<Mutex<NetworkLoginCoordinator>>,
@@ -1140,6 +1192,63 @@ struct QuickSubmenuPopupRuntime {
 
 thread_local! {
     static WINDOW_RUNTIMES: RefCell<HashMap<WindowId, WindowRuntime>> = RefCell::new(HashMap::new());
+    static GRID_ENTRY_POSITIONS: RefCell<GridEntryPositions> = RefCell::new(HashMap::new());
+    static GRID_THUMBNAIL_RESIDENTS: RefCell<HashMap<WindowId, HashSet<EntryId>>> = RefCell::new(HashMap::new());
+}
+
+type GridEntryPositions = HashMap<WindowId, HashMap<EntryId, (usize, usize)>>;
+
+fn rebuild_grid_entry_positions(ui: &AppWindow, window_id: WindowId) {
+    let positions = ui
+        .get_grid_rows()
+        .iter()
+        .enumerate()
+        .flat_map(|(row_index, row)| {
+            row.entries
+                .iter()
+                .enumerate()
+                .filter_map(move |(entry_index, entry)| {
+                    (entry.id > 0).then_some((EntryId(entry.id as u32), (row_index, entry_index)))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<HashMap<_, _>>();
+    GRID_ENTRY_POSITIONS.with_borrow_mut(|by_window| {
+        by_window.insert(window_id, positions);
+    });
+}
+
+fn update_grid_thumbnail_residents(ui: &AppWindow, window_id: WindowId, wanted: &HashSet<EntryId>) {
+    let removed = GRID_THUMBNAIL_RESIDENTS.with_borrow_mut(|by_window| {
+        let resident = by_window.entry(window_id).or_default();
+        let removed = resident.difference(wanted).copied().collect::<Vec<_>>();
+        *resident = wanted.clone();
+        removed
+    });
+    let positions = GRID_ENTRY_POSITIONS
+        .with_borrow(|by_window| by_window.get(&window_id).cloned().unwrap_or_default());
+    let grid = ui.get_grid_rows();
+    for entry_id in removed {
+        let Some((row_index, entry_index)) = positions.get(&entry_id).copied() else {
+            continue;
+        };
+        let Some(row) = grid.row_data(row_index) else {
+            continue;
+        };
+        let Some(entries) = row.entries.as_any().downcast_ref::<VecModel<FileRow>>() else {
+            continue;
+        };
+        let Some(mut entry) = entries.row_data(entry_index) else {
+            continue;
+        };
+        if entry.id == entry_id.0 as i32 {
+            entry.icon = Image::default();
+            if entry.thumbnail_state == 2 {
+                entry.thumbnail_state = 1;
+            }
+            entries.set_row_data(entry_index, entry);
+        }
+    }
 }
 
 fn native_tab_drag_image(
@@ -1215,26 +1324,26 @@ fn grid_thumbnail_request_rows(
         .collect()
 }
 
-fn grid_thumbnail_requests(
+fn grid_thumbnail_plan(
     ui: &AppWindow,
     state: &SharedSessions,
     window_id: WindowId,
-) -> Vec<IconRequest> {
+) -> (TabId, HashSet<EntryId>, Vec<IconRequest>) {
     let visible_height = ui.window().size().height as f32 / ui.window().scale_factor()
         - ui.get_file_list_top()
         - 30.0;
     let mut app = state.lock().expect("app state mutex is not poisoned");
     let Some(window) = app.window(window_id) else {
-        return Vec::new();
+        return (TabId(0), HashSet::new(), Vec::new());
     };
     let Some(tab) = window.tabs.get(&window.active_tab) else {
-        return Vec::new();
+        return (TabId(0), HashSet::new(), Vec::new());
     };
     let Some(view_mode) = app.view_mode_for_tab(tab.id) else {
-        return Vec::new();
+        return (TabId(0), HashSet::new(), Vec::new());
     };
     if tab.kind != TabKind::Files || !view_mode.uses_grid_layout() {
-        return Vec::new();
+        return (tab.id, HashSet::new(), Vec::new());
     }
     let requested_px = grid_thumbnail_request_px(view_mode, ui.window().scale_factor());
 
@@ -1272,6 +1381,7 @@ fn grid_thumbnail_requests(
         .into_iter()
         .filter_map(|entry_id| tab.visible_entry(entry_id).cloned())
         .collect::<Vec<_>>();
+    let resident_ids = entries.iter().map(|entry| entry.id).collect::<HashSet<_>>();
     let mut requests = Vec::new();
     for entry in entries {
         if crate::network::is_unc_path(&entry.path) {
@@ -1301,15 +1411,11 @@ fn grid_thumbnail_requests(
         if !app
             .thumbnail_cache
             .contains_key(&(entry.path.clone(), requested_px))
-            && !app
-                .large_icon_cache
-                .contains_key(&(entry.path.clone(), requested_px))
-            && !app.thumbnail_requests.contains(&(
-                tab_id,
-                request_id,
-                entry.path.clone(),
-                requested_px,
-            ))
+            && thumbnail_retry_due(
+                app.thumbnail_failures
+                    .get(&(tab_id, request_id, entry.path.clone(), requested_px)),
+                Instant::now(),
+            )
         {
             requests.push(IconRequest {
                 tab_id,
@@ -1322,31 +1428,31 @@ fn grid_thumbnail_requests(
             });
         }
     }
-    for request in &requests {
-        if request.thumbnail {
-            app.thumbnail_requests.insert((
-                request.tab_id,
-                request.request_id,
-                request.path.clone(),
-                request.requested_px,
-            ));
-        }
-    }
-    requests
+    (tab_id, resident_ids, requests)
+}
+
+fn thumbnail_retry_due(failure: Option<&(u8, Instant)>, now: Instant) -> bool {
+    failure.is_none_or(|(attempts, failed_at)| {
+        *attempts < THUMBNAIL_MAX_ATTEMPTS
+            && now.saturating_duration_since(*failed_at) >= THUMBNAIL_RETRY_DELAY
+    })
 }
 
 fn request_grid_thumbnails(
     ui: &AppWindow,
     state: &SharedSessions,
     window_id: WindowId,
-    sender: &mpsc::Sender<IconRequest>,
+    scheduler: &ThumbnailScheduler,
 ) {
-    for request in grid_thumbnail_requests(ui, state, window_id) {
-        let _ = sender.send(request);
+    let (tab_id, resident_ids, requests) = grid_thumbnail_plan(ui, state, window_id);
+    update_grid_thumbnail_residents(ui, window_id, &resident_ids);
+    if tab_id.0 != 0 {
+        update_file_rows(ui, state, tab_id, &resident_ids);
+        scheduler.replace(tab_id, requests);
     }
 }
 
-fn defer_grid_thumbnails(state: SharedSessions, tab_id: TabId, sender: mpsc::Sender<IconRequest>) {
+fn defer_grid_thumbnails(state: SharedSessions, tab_id: TabId, scheduler: ThumbnailScheduler) {
     slint::Timer::single_shot(DIRECTORY_EVENT_INTERVAL, move || {
         let Some(window_id) = state.lock().ok().and_then(|app| app.window_for_tab(tab_id)) else {
             return;
@@ -1354,7 +1460,19 @@ fn defer_grid_thumbnails(state: SharedSessions, tab_id: TabId, sender: mpsc::Sen
         let Some(ui) = window_ui(window_id) else {
             return;
         };
-        request_grid_thumbnails(&ui, &state, window_id, &sender);
+        request_grid_thumbnails(&ui, &state, window_id, &scheduler);
+    });
+}
+
+fn defer_thumbnail_retry(state: SharedSessions, tab_id: TabId, scheduler: ThumbnailScheduler) {
+    slint::Timer::single_shot(THUMBNAIL_RETRY_DELAY, move || {
+        let Some(window_id) = state.lock().ok().and_then(|app| app.window_for_tab(tab_id)) else {
+            return;
+        };
+        let Some(ui) = window_ui(window_id) else {
+            return;
+        };
+        request_grid_thumbnails(&ui, &state, window_id, &scheduler);
     });
 }
 
@@ -2013,9 +2131,7 @@ struct AppState {
     network_location_generation: u64,
     thumbnail_cache: HashMap<(PathBuf, u32), platform::windows_shell_icons::ShellIconRgba>,
     thumbnail_cache_order: VecDeque<(PathBuf, u32)>,
-    large_icon_cache: HashMap<(PathBuf, u32), platform::windows_shell_icons::ShellIconRgba>,
-    large_icon_cache_order: VecDeque<(PathBuf, u32)>,
-    thumbnail_requests: std::collections::HashSet<(TabId, RequestId, PathBuf, u32)>,
+    thumbnail_failures: HashMap<(TabId, RequestId, PathBuf, u32), (u8, Instant)>,
     shortcut_requests: HashSet<ShortcutRequest>,
     shortcut_completed: HashSet<ShortcutRequest>,
     sidebar: Vec<KnownLocation>,
@@ -2268,9 +2384,7 @@ impl AppState {
             network_location_generation: 0,
             thumbnail_cache: HashMap::new(),
             thumbnail_cache_order: VecDeque::new(),
-            large_icon_cache: HashMap::new(),
-            large_icon_cache_order: VecDeque::new(),
-            thumbnail_requests: std::collections::HashSet::new(),
+            thumbnail_failures: HashMap::new(),
             shortcut_requests: HashSet::new(),
             shortcut_completed: HashSet::new(),
             sidebar: Vec::new(),
@@ -3265,58 +3379,58 @@ struct FileLayoutGeometry {
 fn file_layout_geometry(view_mode: ViewMode) -> FileLayoutGeometry {
     match view_mode {
         ViewMode::Details => FileLayoutGeometry {
-            row_height: 40.0,
+            row_height: 32.0,
             card_width: 0.0,
-            card_height: 40.0,
+            card_height: 32.0,
             icon_request_px: 32,
             grid: false,
         },
         ViewMode::List => FileLayoutGeometry {
-            row_height: 34.0,
+            row_height: 30.0,
             card_width: 0.0,
-            card_height: 34.0,
+            card_height: 30.0,
             icon_request_px: 32,
             grid: false,
         },
         ViewMode::SmallIcons => FileLayoutGeometry {
-            row_height: 86.0,
+            row_height: 78.0,
             card_width: 88.0,
-            card_height: 78.0,
+            card_height: 70.0,
             icon_request_px: 32,
             grid: true,
         },
         ViewMode::MediumIcons => FileLayoutGeometry {
-            row_height: 148.0,
+            row_height: 132.0,
             card_width: 140.0,
-            card_height: 140.0,
+            card_height: 124.0,
             icon_request_px: 100,
             grid: true,
         },
         ViewMode::LargeIcons => FileLayoutGeometry {
-            row_height: 196.0,
+            row_height: 180.0,
             card_width: 188.0,
-            card_height: 188.0,
+            card_height: 172.0,
             icon_request_px: 148,
             grid: true,
         },
         ViewMode::ExtraLargeIcons => FileLayoutGeometry {
-            row_height: 220.0,
+            row_height: 204.0,
             card_width: 196.0,
-            card_height: 212.0,
+            card_height: 196.0,
             icon_request_px: 168,
             grid: true,
         },
         ViewMode::Tiles => FileLayoutGeometry {
-            row_height: 86.0,
+            row_height: 78.0,
             card_width: 292.0,
-            card_height: 78.0,
+            card_height: 70.0,
             icon_request_px: 48,
             grid: true,
         },
         ViewMode::Content => FileLayoutGeometry {
-            row_height: 76.0,
+            row_height: 68.0,
             card_width: 0.0,
-            card_height: 76.0,
+            card_height: 68.0,
             icon_request_px: 48,
             grid: false,
         },
@@ -3654,6 +3768,90 @@ struct IconRequest {
     thumbnail: bool,
     requested_px: u32,
     type_key: Option<platform::windows_shell_icons::ShellTypeIconKey>,
+}
+
+#[derive(Clone)]
+struct ThumbnailScheduler {
+    shared: Arc<(Mutex<ThumbnailSchedulerState>, Condvar)>,
+    icon_sender: mpsc::Sender<IconRequest>,
+}
+
+#[derive(Default)]
+struct ThumbnailSchedulerState {
+    plans: ThumbnailPlans,
+}
+
+impl ThumbnailScheduler {
+    fn new(icon_sender: mpsc::Sender<IconRequest>) -> Self {
+        Self {
+            shared: Arc::default(),
+            icon_sender,
+        }
+    }
+
+    fn replace(&self, tab_id: TabId, requests: Vec<IconRequest>) {
+        let mut thumbnails = Vec::with_capacity(requests.len());
+        for request in requests {
+            if request.thumbnail {
+                thumbnails.push(request);
+            } else {
+                let _ = self.icon_sender.send(request);
+            }
+        }
+        let (lock, wake) = &*self.shared;
+        let mut state = lock
+            .lock()
+            .expect("thumbnail scheduler mutex is not poisoned");
+        state.plans.replace(
+            tab_id,
+            thumbnails.into_iter().filter_map(|request| {
+                Some(ThumbnailKey {
+                    tab_id: request.tab_id,
+                    request_id: request.request_id,
+                    entry_id: match request.target {
+                        IconTarget::Entry(entry_id) => entry_id,
+                        IconTarget::Location => return None,
+                    },
+                    path: request.path,
+                    requested_px: request.requested_px,
+                })
+            }),
+        );
+        wake.notify_all();
+    }
+
+    fn recv(&self) -> (u64, ThumbnailKey) {
+        let (lock, wake) = &*self.shared;
+        let mut state = lock
+            .lock()
+            .expect("thumbnail scheduler mutex is not poisoned");
+        loop {
+            if let Some(request) = state.plans.next_any() {
+                return request;
+            }
+            state = wake
+                .wait(state)
+                .expect("thumbnail scheduler mutex is not poisoned");
+        }
+    }
+
+    fn finish(&self, key: &ThumbnailKey) -> bool {
+        self.shared
+            .0
+            .lock()
+            .expect("thumbnail scheduler mutex is not poisoned")
+            .plans
+            .finish(key)
+    }
+
+    fn accepts(&self, key: &ThumbnailKey) -> bool {
+        self.shared
+            .0
+            .lock()
+            .expect("thumbnail scheduler mutex is not poisoned")
+            .plans
+            .accepts(key)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -4045,6 +4243,8 @@ struct IconEvent {
     actual_thumbnail: bool,
     requested_px: u32,
     type_key: Option<platform::windows_shell_icons::ShellTypeIconKey>,
+    thumbnail_failed: bool,
+    thumbnail_plan: Option<(u64, ThumbnailKey)>,
 }
 
 fn startup_locations(
@@ -4255,7 +4455,8 @@ pub fn run(
     let should_discover_everything = everything_config.executable_path.is_none();
     let (everything_sender, everything_receiver) =
         spawn_everything_worker(everything_config, state.clone());
-    let (icon_sender, icon_receiver) = spawn_icon_workers(ICON_WORKER_COUNT, state.clone());
+    let (icon_sender, thumbnail_scheduler, icon_receiver) =
+        spawn_icon_workers(ICON_WORKER_COUNT, state.clone());
     let (shortcut_sender, shortcut_receiver) = spawn_shortcut_worker(state.clone());
     let (operation_sender, operation_receiver) = spawn_file_operation_worker();
     let (clipboard_sender, clipboard_receiver) = spawn_clipboard_worker();
@@ -4276,6 +4477,7 @@ pub fn run(
         shell_menu: shell_menu_worker.clone(),
         everything: everything_sender.clone(),
         icon: icon_sender.clone(),
+        thumbnail: thumbnail_scheduler.clone(),
         shortcut: shortcut_sender.clone(),
         network_login: network_login_ui.as_weak(),
         network_login_state: network_login.clone(),
@@ -4307,6 +4509,7 @@ pub fn run(
         clipboard_sender,
         everything_sender.clone(),
         icon_sender.clone(),
+        thumbnail_scheduler.clone(),
         shortcut_sender.clone(),
         shell_menu_worker.clone(),
         quick_menu.clone(),
@@ -4369,6 +4572,7 @@ pub fn run(
         &ui,
         event_receiver,
         icon_sender,
+        thumbnail_scheduler.clone(),
         shortcut_sender.clone(),
         everything_sender.clone(),
         state.clone(),
@@ -4384,7 +4588,7 @@ pub fn run(
     } else {
         EverythingRequest::TestConnection(0)
     });
-    start_icon_event_pump(&ui, icon_receiver, state.clone());
+    start_icon_event_pump(&ui, icon_receiver, state.clone(), thumbnail_scheduler);
     start_shortcut_event_pump(&ui, shortcut_receiver, state.clone());
     start_file_operation_event_pump(
         &ui,
@@ -4710,8 +4914,8 @@ fn submit_navigation(
             cancel_folder_sizes(tab);
         }
         app.icons.retain(|(icon_tab, _, _), _| *icon_tab != tab_id);
-        app.thumbnail_requests
-            .retain(|(request_tab, _, _, _)| *request_tab != tab_id);
+        app.thumbnail_failures
+            .retain(|(request_tab, _, _, _), _| *request_tab != tab_id);
         app.type_icon_requests
             .retain(|(request_tab, _, _)| *request_tab != tab_id);
         app.focus_after_refresh.remove(&tab_id);
@@ -4754,8 +4958,8 @@ fn submit_network_navigation(
             cancel_folder_sizes(tab);
         }
         app.icons.retain(|(icon_tab, _, _), _| *icon_tab != tab_id);
-        app.thumbnail_requests
-            .retain(|(request_tab, _, _, _)| *request_tab != tab_id);
+        app.thumbnail_failures
+            .retain(|(request_tab, _, _, _), _| *request_tab != tab_id);
         app.type_icon_requests
             .retain(|(request_tab, _, _)| *request_tab != tab_id);
         app.focus_after_refresh.remove(&tab_id);
@@ -4899,8 +5103,8 @@ fn submit_library_navigation(
             cancel_folder_sizes(tab);
         }
         app.icons.retain(|(icon_tab, _, _), _| *icon_tab != tab_id);
-        app.thumbnail_requests
-            .retain(|(request_tab, _, _, _)| *request_tab != tab_id);
+        app.thumbnail_failures
+            .retain(|(request_tab, _, _, _), _| *request_tab != tab_id);
         app.type_icon_requests
             .retain(|(request_tab, _, _)| *request_tab != tab_id);
         app.focus_after_refresh.remove(&tab_id);
@@ -5100,6 +5304,7 @@ fn install_app_window_at(
         senders.clipboard.clone(),
         senders.everything.clone(),
         senders.icon.clone(),
+        senders.thumbnail.clone(),
         senders.shortcut.clone(),
         senders.shell_menu.clone(),
         quick_menu.clone(),
@@ -6126,8 +6331,8 @@ fn set_view_mode(state: &WindowSessions, mode: ViewMode) {
         } else if let Some(path) = app.active().visible_path().map(Path::to_path_buf) {
             app.update_directory_preference(path, |preference| preference.view_mode = mode);
         }
-        app.thumbnail_requests
-            .retain(|(request_tab, _, _, _)| *request_tab != tab_id);
+        app.thumbnail_failures
+            .retain(|(request_tab, _, _, _), _| *request_tab != tab_id);
     }
 }
 
@@ -10515,6 +10720,7 @@ fn wire_callbacks(
     clipboard_sender: mpsc::Sender<ClipboardRequest>,
     everything_sender: mpsc::Sender<EverythingRequest>,
     icon_sender: mpsc::Sender<IconRequest>,
+    thumbnail_scheduler: ThumbnailScheduler,
     shortcut_sender: mpsc::SyncSender<ShortcutRequest>,
     shell_menu_worker: platform::windows::context_menu::ShellMenuWorker,
     quick_menu: SharedQuickMenu,
@@ -10615,6 +10821,7 @@ fn wire_callbacks(
     let state_for_folder_range = state.clone();
     let everything_for_folder_range = everything_sender.clone();
     let shortcut_for_folder_range = shortcut_sender.clone();
+    let thumbnails_for_folder_range = thumbnail_scheduler.clone();
     let weak_for_folder_range = ui.as_weak();
     ui.on_request_folder_size_range(move |viewport_y, viewport_height| {
         let target = state_for_folder_range.lock().ok().and_then(|app| {
@@ -10631,6 +10838,12 @@ fn wire_callbacks(
                 viewport_height,
             );
             if let Some(ui) = weak_for_folder_range.upgrade() {
+                request_grid_thumbnails(
+                    &ui,
+                    &state_for_folder_range.shared,
+                    state_for_folder_range.window_id,
+                    &thumbnails_for_folder_range,
+                );
                 submit_visible_shortcuts(
                     &shortcut_for_folder_range,
                     &state_for_folder_range.shared,
@@ -11190,7 +11403,7 @@ fn wire_callbacks(
 
     let weak = ui.as_weak();
     let state_for_view = state.clone();
-    let icon_for_view = icon_sender.clone();
+    let thumbnails_for_view = thumbnail_scheduler.clone();
     ui.on_change_view_mode(move |mode| {
         if let Some(ui) = weak.upgrade()
             && ui.get_column_dragging()
@@ -11219,8 +11432,8 @@ fn wire_callbacks(
             } else if let Some(path) = path {
                 app.update_directory_preference(path, |preference| preference.view_mode = mode);
             }
-            app.thumbnail_requests
-                .retain(|(request_tab, _, _, _)| *request_tab != tab_id);
+            app.thumbnail_failures
+                .retain(|(request_tab, _, _, _), _| *request_tab != tab_id);
         }
         if let Some(ui) = weak.upgrade() {
             if let Some(index) = preserved_search_index {
@@ -11238,7 +11451,7 @@ fn wire_callbacks(
                 &ui,
                 &state_for_view.shared,
                 state_for_view.window_id,
-                &icon_for_view,
+                &thumbnails_for_view,
             );
         }
     });
@@ -11440,6 +11653,7 @@ fn wire_callbacks(
         shell_menu: shell_menu_worker.clone(),
         everything: everything_sender.clone(),
         icon: icon_sender.clone(),
+        thumbnail: thumbnail_scheduler.clone(),
         shortcut: shortcut_sender.clone(),
         network_login: network_login_ui.clone(),
         network_login_state: network_login_state.clone(),
@@ -13078,7 +13292,7 @@ fn wire_callbacks(
                             &ui,
                             &state_for_context_command.shared,
                             state_for_context_command.window_id,
-                            &icon_sender,
+                            &thumbnail_scheduler,
                         );
                     }
                 }
@@ -13633,7 +13847,7 @@ fn wire_mouse_navigation(
             );
             ui.set_window_width(size.width as f32 / ui.window().scale_factor());
             if view_mode_from_ui(ui.get_view_mode()).uses_grid_layout() {
-                request_grid_thumbnails(&ui, &shared_state, window_id, &senders.icon);
+                request_grid_thumbnails(&ui, &shared_state, window_id, &senders.thumbnail);
             }
             return EventResult::Propagate;
         }
@@ -13781,7 +13995,12 @@ fn wire_mouse_navigation(
                             set_view_mode(&state, next);
                             refresh_all_windows(&shared_state);
                             ui.set_file_viewport_y(viewport);
-                            request_grid_thumbnails(&ui, &shared_state, window_id, &senders.icon);
+                            request_grid_thumbnails(
+                                &ui,
+                                &shared_state,
+                                window_id,
+                                &senders.thumbnail,
+                            );
                         }
                     }
                     return EventResult::PreventDefault;
@@ -13797,7 +14016,7 @@ fn wire_mouse_navigation(
                     ui.set_file_viewport_y(viewport);
                 }
                 if view_mode_from_ui(ui.get_view_mode()).uses_grid_layout() {
-                    request_grid_thumbnails(&ui, &shared_state, window_id, &senders.icon);
+                    request_grid_thumbnails(&ui, &shared_state, window_id, &senders.thumbnail);
                 }
                 EventResult::PreventDefault
             }
@@ -19293,6 +19512,7 @@ fn start_event_pump(
     ui: &AppWindow,
     receiver: Arc<Mutex<mpsc::Receiver<DirectoryEvent>>>,
     icon_sender: mpsc::Sender<IconRequest>,
+    thumbnail_scheduler: ThumbnailScheduler,
     shortcut_sender: mpsc::SyncSender<ShortcutRequest>,
     everything_sender: mpsc::Sender<EverythingRequest>,
     state: SharedSessions,
@@ -19309,6 +19529,7 @@ fn start_event_pump(
             };
             let state = state.clone();
             let icon_sender = icon_sender.clone();
+            let thumbnail_scheduler = thumbnail_scheduler.clone();
             let shortcut_sender = shortcut_sender.clone();
             let everything_sender = everything_sender.clone();
             if weak
@@ -19373,7 +19594,7 @@ fn start_event_pump(
                         } else {
                             append_active_file_rows(&ui, &state, tab_id, request_id);
                         }
-                        defer_grid_thumbnails(state.clone(), tab_id, icon_sender.clone());
+                        defer_grid_thumbnails(state.clone(), tab_id, thumbnail_scheduler.clone());
                         if let Some(target_ui) = state
                             .lock()
                             .ok()
@@ -20670,6 +20891,7 @@ fn empty_file_row() -> FileRow {
         selected: false,
         focused: false,
         cut: false,
+        thumbnail_state: 0,
         icon: Image::default(),
     }
 }
@@ -20896,7 +21118,7 @@ fn submit_visible_folder_sizes(
     viewport_y: f32,
     viewport_height: f32,
 ) {
-    const ROW_HEIGHT: f32 = 40.0;
+    const ROW_HEIGHT: f32 = 32.0;
     let queries = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         if app.everything_folder_sizes_indexed == Some(false) {
@@ -21169,13 +21391,46 @@ fn start_shortcut_event_pump(
 fn spawn_icon_workers(
     worker_count: usize,
     state: SharedSessions,
-) -> (mpsc::Sender<IconRequest>, mpsc::Receiver<IconEvent>) {
+) -> (
+    mpsc::Sender<IconRequest>,
+    ThumbnailScheduler,
+    mpsc::Receiver<IconEvent>,
+) {
     let (request_sender, request_receiver) = mpsc::channel::<IconRequest>();
     let request_receiver = Arc::new(Mutex::new(request_receiver));
+    let thumbnail_scheduler = ThumbnailScheduler::new(request_sender.clone());
     let (event_sender, event_receiver) = mpsc::channel::<IconEvent>();
     for _ in 0..worker_count {
-        let requests = request_receiver.clone();
+        let thumbnails = thumbnail_scheduler.clone();
         let events = event_sender.clone();
+        let state = state.clone();
+        thread::spawn(move || {
+            let _shell_apartment = platform::windows_shell_icons::initialize_shell_worker().ok();
+            loop {
+                let (generation, key) = thumbnails.recv();
+                let request = IconRequest {
+                    tab_id: key.tab_id,
+                    request_id: key.request_id,
+                    target: IconTarget::Entry(key.entry_id),
+                    path: key.path.clone(),
+                    thumbnail: true,
+                    requested_px: key.requested_px,
+                    type_key: None,
+                };
+                run_icon_request(
+                    request,
+                    Some((generation, key)),
+                    &state,
+                    &events,
+                    &thumbnails,
+                );
+            }
+        });
+    }
+    {
+        let requests = request_receiver;
+        let thumbnails = thumbnail_scheduler.clone();
+        let events = event_sender;
         let state = state.clone();
         thread::spawn(move || {
             let _shell_apartment = platform::windows_shell_icons::initialize_shell_worker().ok();
@@ -21184,126 +21439,137 @@ fn spawn_icon_workers(
                     .lock()
                     .expect("icon request receiver mutex is not poisoned")
                     .recv();
-                let Ok(request) = request else {
-                    break;
-                };
-                let is_current = state.lock().ok().is_some_and(|app| {
-                    app.tab(request.tab_id)
-                        .is_some_and(|tab| tab.latest_request == request.request_id)
-                        && (!request.thumbnail
-                            || app.thumbnail_requests.contains(&(
-                                request.tab_id,
-                                request.request_id,
-                                request.path.clone(),
-                                request.requested_px,
-                            )))
-                });
-                if !is_current {
-                    if let Some(key) = request.type_key
-                        && let Ok(mut app) = state.lock()
-                    {
-                        app.type_icon_requests
-                            .remove(&(request.tab_id, request.request_id, key));
-                    }
-                    continue;
-                }
-                let cached = state.lock().ok().and_then(|app| {
-                    if request.thumbnail {
-                        app.thumbnail_cache
-                            .get(&(request.path.clone(), request.requested_px))
-                            .or_else(|| {
-                                app.large_icon_cache
-                                    .get(&(request.path.clone(), request.requested_px))
-                            })
-                            .cloned()
-                    } else if let Some(key) = request.type_key.as_ref() {
-                        app.type_icon_cache.get(key).cloned()
-                    } else {
-                        app.icon_cache.get(&request.path).cloned()
-                    }
-                });
-                let (icon, actual_thumbnail) = if request.thumbnail {
-                    if let Some(cached) = cached {
-                        let actual = state.lock().is_ok_and(|app| {
-                            app.thumbnail_cache
-                                .contains_key(&(request.path.clone(), request.requested_px))
-                        });
-                        (Some(cached), actual)
-                    } else if let Some(thumbnail) =
-                        platform::windows_shell_icons::shell_thumbnail_rgba(
-                            &request.path,
-                            request.requested_px,
-                            true,
-                        )
-                        .ok()
-                        .filter(|thumbnail| {
-                            thumbnail.image.width.max(thumbnail.image.height)
-                                >= request.requested_px
-                        })
-                        .or_else(|| {
-                            platform::windows_shell_icons::shell_thumbnail_rgba(
-                                &request.path,
-                                request.requested_px,
-                                false,
-                            )
-                            .ok()
-                        })
-                    {
-                        let _source = thumbnail.source;
-                        (Some(thumbnail.image), true)
-                    } else {
-                        (
-                            platform::windows_shell_icons::shell_large_icon_rgba(
-                                &request.path,
-                                request.requested_px,
-                            )
-                            .ok(),
-                            false,
-                        )
-                    }
-                } else if let Some(key) = request.type_key.as_ref() {
-                    (
-                        cached.or_else(|| {
-                            platform::windows_shell_icons::shell_type_icon_rgba(key).ok()
-                        }),
-                        false,
-                    )
-                } else {
-                    (
-                        cached.or_else(|| {
-                            platform::windows_shell_icons::shell_icon_rgba(&request.path).ok()
-                        }),
-                        false,
-                    )
-                };
-                if let Some(icon) = icon {
-                    let _ = events.send(IconEvent {
-                        tab_id: request.tab_id,
-                        request_id: request.request_id,
-                        target: request.target,
-                        path: request.path,
-                        icon,
-                        actual_thumbnail,
-                        requested_px: request.requested_px,
-                        type_key: request.type_key,
-                    });
-                } else if let Ok(mut app) = state.lock() {
-                    if request.thumbnail {
-                        app.thumbnail_requests.remove(&(
-                            request.tab_id,
-                            request.request_id,
-                            request.path,
-                            request.requested_px,
-                        ));
-                    } else if let Some(key) = request.type_key {
-                        app.type_icon_requests
-                            .remove(&(request.tab_id, request.request_id, key));
-                    }
-                }
+                let Ok(request) = request else { break };
+                run_icon_request(request, None, &state, &events, &thumbnails);
             }
         });
     }
-    (request_sender, event_receiver)
+    (request_sender, thumbnail_scheduler, event_receiver)
+}
+
+fn run_icon_request(
+    request: IconRequest,
+    thumbnail_plan: Option<(u64, ThumbnailKey)>,
+    state: &SharedSessions,
+    events: &mpsc::Sender<IconEvent>,
+    thumbnails: &ThumbnailScheduler,
+) {
+    let planned_current = thumbnail_plan
+        .as_ref()
+        .is_none_or(|(_, key)| thumbnails.accepts(key));
+    let is_current = state.lock().ok().is_some_and(|app| {
+        app.tab(request.tab_id)
+            .is_some_and(|tab| tab.latest_request == request.request_id)
+    }) && planned_current;
+    if !is_current {
+        if let Some(key) = request.type_key
+            && let Ok(mut app) = state.lock()
+        {
+            app.type_icon_requests
+                .remove(&(request.tab_id, request.request_id, key));
+        }
+        if let Some((_, key)) = thumbnail_plan {
+            thumbnails.finish(&key);
+        }
+        return;
+    }
+    let cached = state.lock().ok().and_then(|app| {
+        if request.thumbnail {
+            app.thumbnail_cache
+                .get(&(request.path.clone(), request.requested_px))
+                .cloned()
+        } else if let Some(key) = request.type_key.as_ref() {
+            app.type_icon_cache.get(key).cloned()
+        } else {
+            app.icon_cache.get(&request.path).cloned()
+        }
+    });
+    let (icon, actual_thumbnail) = if request.thumbnail {
+        if let Some(cached) = cached {
+            let actual = state.lock().is_ok_and(|app| {
+                app.thumbnail_cache
+                    .contains_key(&(request.path.clone(), request.requested_px))
+            });
+            (Some(cached), actual)
+        } else if let Some(thumbnail) = platform::windows_shell_icons::shell_thumbnail_rgba(
+            &request.path,
+            request.requested_px,
+            true,
+        )
+        .ok()
+        .filter(|thumbnail| {
+            thumbnail.image.width.max(thumbnail.image.height) >= request.requested_px
+        })
+        .or_else(|| {
+            platform::windows_shell_icons::shell_thumbnail_rgba(
+                &request.path,
+                request.requested_px,
+                false,
+            )
+            .ok()
+        }) {
+            let _source = thumbnail.source;
+            (Some(thumbnail.image), true)
+        } else {
+            (None, false)
+        }
+    } else if let Some(key) = request.type_key.as_ref() {
+        (
+            cached.or_else(|| platform::windows_shell_icons::shell_type_icon_rgba(key).ok()),
+            false,
+        )
+    } else {
+        (
+            cached.or_else(|| platform::windows_shell_icons::shell_icon_rgba(&request.path).ok()),
+            false,
+        )
+    };
+    let thumbnail_failed = request.thumbnail && icon.is_none();
+    if let Some((_, key)) = thumbnail_plan.as_ref()
+        && !thumbnails.accepts(key)
+    {
+        thumbnails.finish(key);
+        return;
+    }
+    if let Some(icon) = icon {
+        let _ = events.send(IconEvent {
+            tab_id: request.tab_id,
+            request_id: request.request_id,
+            target: request.target,
+            path: request.path,
+            icon,
+            actual_thumbnail,
+            requested_px: request.requested_px,
+            type_key: request.type_key,
+            thumbnail_failed: false,
+            thumbnail_plan: thumbnail_plan.clone(),
+        });
+    } else if request.thumbnail {
+        let _ = events.send(IconEvent {
+            tab_id: request.tab_id,
+            request_id: request.request_id,
+            target: request.target,
+            path: request.path,
+            icon: platform::windows_shell_icons::ShellIconRgba {
+                width: 0,
+                height: 0,
+                pixels: Vec::new(),
+            },
+            actual_thumbnail: false,
+            requested_px: request.requested_px,
+            type_key: None,
+            thumbnail_failed,
+            thumbnail_plan: thumbnail_plan.clone(),
+        });
+    } else if let Ok(mut app) = state.lock()
+        && let Some(key) = request.type_key
+    {
+        app.type_icon_requests
+            .remove(&(request.tab_id, request.request_id, key));
+    }
+    if let Some((_, key)) = thumbnail_plan {
+        thumbnails.finish(&key);
+    }
 }
 
 fn drive_projection(
@@ -21990,13 +22256,23 @@ fn start_icon_event_pump(
     ui: &AppWindow,
     receiver: mpsc::Receiver<IconEvent>,
     state: SharedSessions,
+    thumbnails: ThumbnailScheduler,
 ) {
     let weak = ui.as_weak();
     thread::spawn(move || {
         while let Ok(event) = receiver.recv() {
             let state = state.clone();
+            let thumbnails = thumbnails.clone();
             if weak
                 .upgrade_in_event_loop(move |ui| {
+                    if event
+                        .thumbnail_plan
+                        .as_ref()
+                        .is_some_and(|(_, key)| !thumbnails.accepts(key))
+                    {
+                        return;
+                    }
+                    let retry_tab = event.thumbnail_failed.then_some(event.tab_id);
                     if let Some(update) = apply_icon_event(&state, event) {
                         if let Some(window_id) = state
                             .lock()
@@ -22012,6 +22288,9 @@ fn start_icon_event_pump(
                         } else {
                             update_icon_row(&ui, &state, update);
                         }
+                    }
+                    if let Some(tab_id) = retry_tab {
+                        defer_thumbnail_retry(state.clone(), tab_id, thumbnails.clone());
                     }
                 })
                 .is_err()
@@ -22055,17 +22334,34 @@ fn insert_bounded_image(
 
 fn apply_icon_event(state: &SharedSessions, event: IconEvent) -> Option<IconUpdate> {
     let mut app = state.lock().expect("app state mutex is not poisoned");
+    if event.thumbnail_failed {
+        if !icon_event_is_current(&app, &event) {
+            return None;
+        }
+        let key = (
+            event.tab_id,
+            event.request_id,
+            event.path,
+            event.requested_px,
+        );
+        let attempt = app
+            .thumbnail_failures
+            .get(&key)
+            .map_or(1, |(attempts, _)| attempts.saturating_add(1));
+        app.thumbnail_failures
+            .insert(key, (attempt, Instant::now()));
+        return Some(IconUpdate {
+            tab_id: event.tab_id,
+            entry_id: match event.target {
+                IconTarget::Entry(entry_id) => Some(entry_id),
+                IconTarget::Location => None,
+            },
+            type_key: None,
+        });
+    }
     if let Some(key) = event.type_key.as_ref() {
         app.type_icon_requests
             .remove(&(event.tab_id, event.request_id, key.clone()));
-    }
-    if event.requested_px > 0 {
-        app.thumbnail_requests.remove(&(
-            event.tab_id,
-            event.request_id,
-            event.path.clone(),
-            event.requested_px,
-        ));
     }
     if !icon_event_is_current(&app, &event) {
         return None;
@@ -22083,6 +22379,12 @@ fn apply_icon_event(state: &SharedSessions, event: IconEvent) -> Option<IconUpda
         IconTarget::Location => None,
     };
     if event.actual_thumbnail {
+        app.thumbnail_failures.remove(&(
+            event.tab_id,
+            event.request_id,
+            event.path.clone(),
+            event.requested_px,
+        ));
         let app = &mut *app;
         insert_bounded_image(
             &mut app.thumbnail_cache,
@@ -22090,15 +22392,6 @@ fn apply_icon_event(state: &SharedSessions, event: IconEvent) -> Option<IconUpda
             (event.path.clone(), event.requested_px),
             event.icon.clone(),
             THUMBNAIL_CACHE_CAPACITY,
-        );
-    } else if event.requested_px > 0 {
-        let app = &mut *app;
-        insert_bounded_image(
-            &mut app.large_icon_cache,
-            &mut app.large_icon_cache_order,
-            (event.path.clone(), event.requested_px),
-            event.icon.clone(),
-            LARGE_ICON_CACHE_CAPACITY,
         );
     } else if let Some(key) = event.type_key.as_ref() {
         app.type_icon_cache.insert(key.clone(), event.icon);
@@ -22371,27 +22664,28 @@ fn update_file_rows(
         }
     }
 
+    let positions = GRID_ENTRY_POSITIONS
+        .with_borrow(|by_window| by_window.get(&window_id).cloned().unwrap_or_default());
     let grid_model = ui.get_grid_rows();
-    if let Some(grid_model) = grid_model.as_any().downcast_ref::<VecModel<GridRow>>() {
-        for row_index in 0..grid_model.row_count() {
-            let Some(grid_row) = grid_model.row_data(row_index) else {
-                continue;
-            };
-            let Some(entries) = grid_row
-                .entries
-                .as_any()
-                .downcast_ref::<VecModel<FileRow>>()
-            else {
-                continue;
-            };
-            for entry_index in 0..entries.row_count() {
-                let Some(existing) = entries.row_data(entry_index) else {
-                    continue;
-                };
-                if let Some(updated) = rows.get(&EntryId(existing.id as u32)) {
-                    entries.set_row_data(entry_index, updated.clone());
-                }
-            }
+    for (entry_id, updated) in rows {
+        let Some((row_index, entry_index)) = positions.get(&entry_id).copied() else {
+            continue;
+        };
+        let Some(grid_row) = grid_model.row_data(row_index) else {
+            continue;
+        };
+        let Some(entries) = grid_row
+            .entries
+            .as_any()
+            .downcast_ref::<VecModel<FileRow>>()
+        else {
+            continue;
+        };
+        if entries
+            .row_data(entry_index)
+            .is_some_and(|existing| existing.id == entry_id.0 as i32)
+        {
+            entries.set_row_data(entry_index, updated);
         }
     }
 }
@@ -23340,6 +23634,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     ui.set_files(ModelRc::new(VecModel::from(file_rows)));
     ui.set_grid_column_count(grid_columns as i32);
     ui.set_grid_rows(ModelRc::new(VecModel::from(grid_rows)));
+    rebuild_grid_entry_positions(ui, window_id);
     let preference_revision = if tab.page_source == PageSource::Search {
         0
     } else {
@@ -23806,22 +24101,21 @@ fn file_row(
             })
             .collect::<Vec<_>>()
     };
-    let grid_image = grid_requested_px.and_then(|requested_px| {
-        app.thumbnail_cache
-            .get(&(entry.path.clone(), requested_px))
-            .or_else(|| {
-                app.large_icon_cache
-                    .get(&(entry.path.clone(), requested_px))
-            })
-    });
+    let grid_image = grid_requested_px
+        .and_then(|requested_px| app.thumbnail_cache.get(&(entry.path.clone(), requested_px)));
     let image = grid_image.or_else(|| {
-        app.icons
-            .get(&(tab.id, tab.latest_request, entry.id))
-            .or_else(|| app.icon_cache.get(&entry.path))
-            .or_else(|| {
-                entry_type_icon_key(&entry.path, entry.kind)
-                    .and_then(|key| app.type_icon_cache.get(&key))
+        grid_requested_px
+            .is_none()
+            .then(|| {
+                app.icons
+                    .get(&(tab.id, tab.latest_request, entry.id))
+                    .or_else(|| app.icon_cache.get(&entry.path))
+                    .or_else(|| {
+                        entry_type_icon_key(&entry.path, entry.kind)
+                            .and_then(|key| app.type_icon_cache.get(&key))
+                    })
             })
+            .flatten()
     });
     FileRow {
         id: entry.id.0 as i32,
@@ -23856,6 +24150,20 @@ fn file_row(
         selected: tab.selected.contains(&entry.id),
         focused: tab.focused == Some(entry.id),
         cut: app.cut_paths.contains(&entry.path),
+        thumbnail_state: grid_requested_px.map_or(0, |requested_px| {
+            if grid_image.is_some() {
+                2
+            } else if app.thumbnail_failures.contains_key(&(
+                tab.id,
+                tab.latest_request,
+                entry.path.clone(),
+                requested_px,
+            )) {
+                3
+            } else {
+                1
+            }
+        }),
         icon: image.map(shell_icon_image).unwrap_or_default(),
     }
 }
@@ -25900,6 +26208,42 @@ mod tests {
     }
 
     #[test]
+    fn issue_88_rust_geometry_matches_the_slint_view_geometry() {
+        for (mode, row_height, card_width, card_height) in [
+            (ViewMode::Details, 32.0, 0.0, 32.0),
+            (ViewMode::List, 30.0, 0.0, 30.0),
+            (ViewMode::SmallIcons, 78.0, 88.0, 70.0),
+            (ViewMode::MediumIcons, 132.0, 140.0, 124.0),
+            (ViewMode::LargeIcons, 180.0, 188.0, 172.0),
+            (ViewMode::ExtraLargeIcons, 204.0, 196.0, 196.0),
+            (ViewMode::Tiles, 78.0, 292.0, 70.0),
+            (ViewMode::Content, 68.0, 0.0, 68.0),
+        ] {
+            let geometry = file_layout_geometry(mode);
+            assert_eq!(geometry.row_height, row_height, "{mode:?}");
+            assert_eq!(geometry.card_width, card_width, "{mode:?}");
+            assert_eq!(geometry.card_height, card_height, "{mode:?}");
+        }
+
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
+        for literal in [
+            "mode == 1 ? 30px",
+            "mode == 7 ? 68px",
+            "mode == 3 ? 78px",
+            "mode == 4 ? 180px",
+            "mode == 5 ? 204px",
+            "mode == 6 ? 78px",
+            "mode == 2 ? 132px",
+            ": 32px;",
+        ] {
+            assert!(
+                source.contains(literal),
+                "missing Slint geometry: {literal}"
+            );
+        }
+    }
+
+    #[test]
     fn issue_18_grid_batches_skip_eager_icons_but_details_keep_them() {
         let mut grid = AppState::new_for_test(vec![PathBuf::from(r"C:\grid")], 0, [0, 1, 2, 3]);
         grid.update_directory_preference(PathBuf::from(r"C:\grid"), |preference| {
@@ -25972,6 +26316,20 @@ mod tests {
         assert!(!cache.contains_key(&(PathBuf::from("first.png"), 256)));
         assert!(cache.contains_key(&(PathBuf::from("second.png"), 256)));
         assert!(cache.contains_key(&(PathBuf::from("third.png"), 256)));
+    }
+    #[test]
+    fn issue_88_thumbnail_retry_is_delayed_and_bounded() {
+        let now = Instant::now();
+        assert!(thumbnail_retry_due(None, now));
+        assert!(!thumbnail_retry_due(Some(&(1, now)), now));
+        assert!(thumbnail_retry_due(
+            Some(&(1, now - THUMBNAIL_RETRY_DELAY)),
+            now
+        ));
+        assert!(!thumbnail_retry_due(
+            Some(&(THUMBNAIL_MAX_ATTEMPTS, now - THUMBNAIL_RETRY_DELAY)),
+            now
+        ));
     }
     fn context_test_row(
         id: i32,
@@ -27202,27 +27560,27 @@ mod tests {
         let window = search_window_for_index(65_536, 133_796, 1);
         assert_eq!(
             search_window_viewport_y(65_536, window, ViewMode::Details, 1),
-            -256.0 * 40.0
+            -256.0 * 32.0
         );
         let grid_window = search_window_for_index(65_536, 133_796, 4);
         assert_eq!(grid_window.start % 4, 0);
         assert_eq!(
             search_window_viewport_y(65_536, grid_window, ViewMode::MediumIcons, 4),
-            -64.0 * 148.0
+            -64.0 * 132.0
         );
     }
     #[test]
     fn logical_search_scroll_maps_each_view_mode_to_absolute_result_index() {
         assert_eq!(
-            search_result_index_at_scroll(-65_536.0 * 40.0, 133_796, ViewMode::Details, 1),
+            search_result_index_at_scroll(-65_536.0 * 32.0, 133_796, ViewMode::Details, 1),
             65_536
         );
         assert_eq!(
-            search_result_index_at_scroll(-65_536.0 * 34.0, 133_796, ViewMode::List, 1),
+            search_result_index_at_scroll(-65_536.0 * 30.0, 133_796, ViewMode::List, 1),
             65_536
         );
         assert_eq!(
-            search_result_index_at_scroll(-16_384.0 * 148.0, 133_796, ViewMode::MediumIcons, 4),
+            search_result_index_at_scroll(-16_384.0 * 132.0, 133_796, ViewMode::MediumIcons, 4),
             65_536
         );
         assert_eq!(
@@ -27309,18 +27667,18 @@ mod tests {
 
         assert!(requests.is_empty());
         assert_eq!(
-            grid_thumbnail_request_rows(&vec![148.0; 125], -296.0, 444.0, 296.0),
+            grid_thumbnail_request_rows(&vec![132.0; 125], -264.0, 396.0, 264.0),
             (0..=7).collect::<Vec<_>>()
         );
         assert_eq!(
-            grid_thumbnail_request_rows(&vec![148.0; 125], -1480.0, 296.0, 296.0),
+            grid_thumbnail_request_rows(&vec![132.0; 125], -1320.0, 264.0, 264.0),
             (7..=14).collect::<Vec<_>>()
         );
         assert_eq!(
             grid_thumbnail_request_rows(
-                &[32.0, 220.0, 220.0, 32.0, 220.0, 220.0, 220.0],
-                -500.0,
-                220.0,
+                &[32.0, 204.0, 204.0, 32.0, 204.0, 204.0, 204.0],
+                -468.0,
+                204.0,
                 0.0,
             ),
             vec![3, 4]
@@ -27442,6 +27800,8 @@ mod tests {
             actual_thumbnail: false,
             requested_px: 0,
             type_key: Some(key),
+            thumbnail_failed: false,
+            thumbnail_plan: None,
         };
 
         assert!(icon_event_is_current(&app, &event));
@@ -28493,6 +28853,8 @@ mod tests {
             actual_thumbnail: false,
             requested_px: 0,
             type_key: None,
+            thumbnail_failed: false,
+            thumbnail_plan: None,
         };
         assert!(icon_event_is_current(&app, &event));
     }
@@ -29781,6 +30143,8 @@ mod tests {
             actual_thumbnail: false,
             requested_px: 0,
             type_key: None,
+            thumbnail_failed: false,
+            thumbnail_plan: None,
         };
         assert!(icon_event_is_current(&app, &event));
 
@@ -29793,6 +30157,8 @@ mod tests {
             actual_thumbnail: false,
             requested_px: 0,
             type_key: None,
+            thumbnail_failed: false,
+            thumbnail_plan: None,
         };
         assert!(icon_event_is_current(&app, &location_event));
 
@@ -30982,7 +31348,7 @@ mod tests {
                 600.0,
                 0.0,
                 400.0,
-                SelectionRect::from_points(0.0, 39.0, 20.0, 41.0),
+                SelectionRect::from_points(0.0, 31.0, 20.0, 33.0),
             ),
             HashSet::from([EntryId(1), EntryId(2)])
         );
@@ -30994,7 +31360,7 @@ mod tests {
                 600.0,
                 0.0,
                 400.0,
-                SelectionRect::from_points(16.0, 35.0, 20.0, 67.0),
+                SelectionRect::from_points(16.0, 31.0, 20.0, 59.0),
             ),
             HashSet::from([EntryId(2)])
         );
@@ -31006,7 +31372,7 @@ mod tests {
                 600.0,
                 0.0,
                 400.0,
-                SelectionRect::from_points(161.0, 145.0, 171.0, 155.0),
+                SelectionRect::from_points(161.0, 129.0, 171.0, 139.0),
             ),
             HashSet::from([EntryId(5)])
         );
@@ -31115,7 +31481,7 @@ mod tests {
                 600.0,
                 0.0,
                 400.0,
-                SelectionRect::from_points(0.0, 256.0 * 40.0, 20.0, 257.0 * 40.0),
+                SelectionRect::from_points(0.0, 256.0 * 32.0, 20.0, 257.0 * 32.0),
             ),
             HashSet::from([EntryId(257)])
         );
@@ -31127,7 +31493,7 @@ mod tests {
                 600.0,
                 0.0,
                 400.0,
-                SelectionRect::from_points(0.0, 0.0, 20.0, 40.0),
+                SelectionRect::from_points(0.0, 0.0, 20.0, 32.0),
             )
             .is_empty()
         );
@@ -31664,9 +32030,9 @@ mod tests {
     #[test]
     fn scroll_delta_uses_active_row_height_and_logical_dpi_units() {
         for (mode, expected) in [
-            (ViewMode::Details, -120.0),
-            (ViewMode::List, -102.0),
-            (ViewMode::MediumIcons, -444.0),
+            (ViewMode::Details, -96.0),
+            (ViewMode::List, -90.0),
+            (ViewMode::MediumIcons, -396.0),
         ] {
             assert_eq!(
                 logical_scroll_delta(&MouseScrollDelta::LineDelta(0.0, -1.0), mode, 1.0),
@@ -31728,21 +32094,21 @@ mod tests {
     fn file_scroll_geometry_matches_every_view_mode_and_grid_remainder() {
         assert_eq!(
             file_scroll_maximum(67, ViewMode::Details, 6, 590.0),
-            2_090.0
+            1_554.0
         );
-        assert_eq!(file_scroll_maximum(67, ViewMode::List, 6, 590.0), 1_688.0);
+        assert_eq!(file_scroll_maximum(67, ViewMode::List, 6, 590.0), 1_420.0);
         assert_eq!(
             file_scroll_maximum(67, ViewMode::MediumIcons, 6, 590.0),
-            1_186.0
+            994.0
         );
         assert_eq!(
             file_scroll_maximum(66, ViewMode::MediumIcons, 6, 590.0),
-            1_038.0
+            862.0
         );
         assert_eq!(file_scroll_maximum(2, ViewMode::MediumIcons, 6, 590.0), 0.0);
         assert_eq!(
             file_scroll_maximum(67, ViewMode::Details, 6, 590.5),
-            2_089.5
+            1_553.5
         );
     }
     #[test]
@@ -31754,12 +32120,12 @@ mod tests {
         assert_eq!(rectangle_selection_scroll_delta(250.0, 100.0, 500.0), 0.0);
         assert_eq!(
             file_scroll_maximum(100, ViewMode::Details, 1, 400.0),
-            3_600.0
+            2_800.0
         );
-        assert_eq!(file_scroll_maximum(100, ViewMode::List, 1, 400.0), 3_000.0);
+        assert_eq!(file_scroll_maximum(100, ViewMode::List, 1, 400.0), 2_600.0);
         assert_eq!(
             file_scroll_maximum(10, ViewMode::MediumIcons, 3, 400.0),
-            192.0
+            128.0
         );
         assert_eq!(file_scroll_maximum(2, ViewMode::MediumIcons, 3, 400.0), 0.0);
     }

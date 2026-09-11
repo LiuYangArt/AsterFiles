@@ -60,6 +60,11 @@ SCENARIOS = [
         STATE_DIR / "thumbnails" / "shell-png.json",
     ),
     (
+        "agent-thumbnail-scheduler",
+        "thumbnail-scheduler",
+        STATE_DIR / "thumbnails" / "scheduler.json",
+    ),
+    (
         "agent-windows-libraries",
         "windows-libraries",
         STATE_DIR / "windows-libraries" / "foundation.json",

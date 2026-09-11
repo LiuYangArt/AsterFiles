@@ -35,6 +35,7 @@ pub enum AgentScenario {
     WindowsLibraries,
     QuickAccess,
     ShellThumbnail,
+    ThumbnailScheduler,
     FolderSizeScheduler,
     QuickMenuSearch,
     QuickMenuPopup,
@@ -57,6 +58,7 @@ impl AgentScenario {
             Self::WindowsLibraries => "windows-libraries",
             Self::QuickAccess => "quick-access",
             Self::ShellThumbnail => "shell-thumbnail",
+            Self::ThumbnailScheduler => "thumbnail-scheduler",
             Self::FolderSizeScheduler => "folder-size-scheduler",
             Self::QuickMenuSearch => "quick-menu-search",
             Self::QuickMenuPopup => "quick-menu-popup",
@@ -74,6 +76,9 @@ impl AgentScenario {
             Self::DriveCapacity => Path::new(DEFAULT_STATE_DIR)
                 .join("drives")
                 .join("capacity.json"),
+            Self::ThumbnailScheduler => Path::new(DEFAULT_STATE_DIR)
+                .join("thumbnails")
+                .join("scheduler.json"),
             _ => Path::new(DEFAULT_STATE_DIR).join(format!("{}.json", self.name())),
         }
     }
@@ -150,6 +155,7 @@ fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
         "windows-libraries" => Ok(AgentScenario::WindowsLibraries),
         "quick-access" => Ok(AgentScenario::QuickAccess),
         "shell-thumbnail" => Ok(AgentScenario::ShellThumbnail),
+        "thumbnail-scheduler" => Ok(AgentScenario::ThumbnailScheduler),
         "folder-size-scheduler" => Ok(AgentScenario::FolderSizeScheduler),
         "quick-menu-search" => Ok(AgentScenario::QuickMenuSearch),
         "quick-menu-popup" => Ok(AgentScenario::QuickMenuPopup),
@@ -227,6 +233,7 @@ pub fn apply_scenario(session: &mut TabSession, scenario: AgentScenario) {
             session.load_state = LoadState::Complete;
         }
         AgentScenario::FolderSizeScheduler
+        | AgentScenario::ThumbnailScheduler
         | AgentScenario::QuickMenuSearch
         | AgentScenario::QuickMenuPopup
         | AgentScenario::NetworkFoundation

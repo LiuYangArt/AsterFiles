@@ -1,5 +1,6 @@
 pub mod file_operations;
 pub mod folder_size_scheduler;
+pub mod thumbnail_scheduler;
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
