@@ -25,6 +25,13 @@ class VerifyTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             verify.parse_args(["--quick", "--release"])
 
+    def test_validation_starts_with_build_cache_maintenance(self) -> None:
+        first_name, first_command = verify.validation_steps(True, False)[0]
+        self.assertEqual(first_name, "build-cache")
+        self.assertEqual(
+            first_command[-1], str(verify.ROOT / "tools" / "maintain-build-cache.ps1")
+        )
+
     def test_validation_modes_build_debug_exactly_once(self) -> None:
         for quick in (True, False):
             steps = verify.validation_steps(quick=quick, include_release=False)

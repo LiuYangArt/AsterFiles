@@ -304,6 +304,16 @@ def scenario_steps() -> list[tuple[str, list[str]]]:
 
 def validation_steps(quick: bool, include_release: bool) -> list[tuple[str, list[str]]]:
     steps = [
+        (
+            "build-cache",
+            [
+                "pwsh",
+                "-NoLogo",
+                "-NoProfile",
+                "-File",
+                str(ROOT / "tools" / "maintain-build-cache.ps1"),
+            ],
+        ),
         ("verify-tests", [sys.executable, str(ROOT / "tools" / "test_verify.py")]),
         (
             "publish-tests",

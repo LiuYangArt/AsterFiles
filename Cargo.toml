@@ -19,6 +19,14 @@ windows-sys = { version = "0.60.2", features = ["Win32_Foundation", "Win32_Netwo
 embed-resource = "3.0.11"
 slint-build = "1.17.1"
 
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+
+[profile.test]
+debug = "line-tables-only"
+incremental = true
+
 [dev-dependencies]
 i-slint-backend-testing = "1.17.1"
 
