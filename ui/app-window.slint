@@ -3,8 +3,8 @@ import { IconMap } from "icons/icon-map.slint";
 export { PopupCommandRow, QuickMenuWindow, QuickSubmenuWindow } from "quick-menu.slint";
 
 export struct HighlightSegment { text: string, highlighted: bool }
-export struct FileRow { id: int, top: length, loaded: bool, group-header: bool, group-label: string, group-detail: string, group-count: int, name: string, name-segments: [HighlightSegment], kind: string, parent-path: string, size: string, modified: string, created: string, is-directory: bool, selected: bool, focused: bool, cut: bool, thumbnail-state: int, icon: image }
-export struct GridRow { top: length, group-header: bool, group-label: string, group-detail: string, group-count: int, entries: [FileRow] }
+export struct FileRow { id: int, loaded: bool, group-header: bool, group-label: string, group-detail: string, group-count: int, name: string, name-segments: [HighlightSegment], kind: string, parent-path: string, size: string, modified: string, created: string, is-directory: bool, selected: bool, focused: bool, cut: bool, thumbnail-state: int, icon: image }
+export struct GridRow { group-header: bool, group-label: string, group-detail: string, group-count: int, entries: [FileRow] }
 export struct HistoryRow { index: int, label: string }
 export struct BreadcrumbRow { index: int, label: string, current: bool }
 export struct TabRow { id: int, title: string, active: bool, loading: bool, icon: image, is-drive: bool, is-home: bool, is-settings: bool }
@@ -887,8 +887,6 @@ export component AppWindow inherits Window {
     in property <string> text-context-empty: "没有匹配的命令";
     in property <[OperationRow]> operations;
     in-out property <length> file-viewport-y: 0px;
-    // 文件区域的内容总高度：一律由 Rust 的精确投影给出，Slint 不再自行估算行高。
-    in property <length> file-content-extent: 0px;
     private property <length> list-viewport-y: 0px;
     private property <length> grid-viewport-y: 0px;
     in property <int> projected-content-revision: 0;
@@ -945,18 +943,6 @@ export component AppWindow inherits Window {
         }
     }
     changed file-viewport-y => { root.sync-active-file-viewport(); }
-    // 内容总高度或视口高度变化时，把滚动位置钳制在精确范围内（搜索模式用逻辑滚动，单独处理）。
-    function clamp-file-scroll() {
-        if root.search-results-mode {
-            return;
-        }
-        root.file-viewport-y = max(
-            -max(0px, root.file-content-extent - root.file-viewport-height),
-            min(0px, root.file-viewport-y)
-        );
-    }
-    changed file-content-extent => { root.clamp-file-scroll(); }
-    changed file-viewport-height => { root.clamp-file-scroll(); }
 
     out property <bool> file-list-keyboard-target: !root.active-is-settings && !root.active-is-home
         && !root.address-editing
@@ -1994,26 +1980,25 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-list := Flickable {
+list := ListView {
                         visible: root.files.length > 0 && !root.is-grid-view-mode(root.view-mode);
-                        interactive: false;
+                        mouse-drag-pan-enabled: false;
                         width: parent.width - 28px;
                         viewport-width: self.width;
-                        viewport-height: root.file-content-extent;
+                        vertical-scrollbar-policy: ScrollBarPolicy.always-off;
                         viewport-y <=> root.list-viewport-y;
 
-                        function sync-file-geometry() { if !root.is-grid-view-mode(root.view-mode) { root.file-list-left = self.absolute-position.x - root.absolute-position.x; root.file-list-top = self.absolute-position.y - root.absolute-position.y; root.rectangle-viewport-top = self.absolute-position.y - content-area.absolute-position.y; root.file-viewport-width = self.width; root.file-viewport-height = self.height; } }
+                        function sync-file-geometry() { if !root.is-grid-view-mode(root.view-mode) { root.file-list-left = self.absolute-position.x - root.absolute-position.x; root.file-list-top = self.absolute-position.y - root.absolute-position.y; root.rectangle-viewport-top = self.absolute-position.y - content-area.absolute-position.y; root.file-viewport-width = self.width; root.file-viewport-height = self.visible-height; } }
                         init => { self.sync-file-geometry(); }
                         private property <int> geometry-revision: root.active-geometry-revision;
                         changed geometry-revision => { self.sync-file-geometry(); }
                         changed absolute-position => { self.sync-file-geometry(); }
                         changed width => { self.sync-file-geometry(); }
-                        changed height => { self.sync-file-geometry(); }
-                        changed viewport-y => { if !root.is-grid-view-mode(root.view-mode) { root.file-viewport-y = self.viewport-y; if !root.search-results-mode { root.request-folder-size-range(self.viewport-y / 1px, self.height / 1px); } } }
+                        changed visible-height => { self.sync-file-geometry(); }
+                        changed viewport-y => { if !root.is-grid-view-mode(root.view-mode) { root.file-viewport-y = self.viewport-y; if !root.search-results-mode { root.request-folder-size-range(self.viewport-y / 1px, self.visible-height / 1px); } } }
                         for entry in root.files: Rectangle {
                             width: root.view-mode == 0 ? max(list.width, root.file-columns-width + 16px) : list.width;
                             x: 0px;
-                            y: entry.top;
                             height: entry.group-header ? (entry.group-detail == "" ? 32px : 48px) : root.view-row-height(root.view-mode);
                             background: VisualStyle.cffffff;
                             opacity: entry.group-header ? 1 : (!entry.loaded ? 0 : (entry.cut ? 0.52 : 1));
@@ -2212,10 +2197,10 @@ accessible-label: entry.name;
                                 scroll-event(event) => {
                                     if root.search-results-mode {
                                         root.request-search-position((root.search-scroll-y + event.delta-y) / 1px);
-                                        return accept;
+                                    } else {
+                                        list.viewport-y = max(-(list.viewport-height - list.visible-height), min(0px, list.viewport-y + event.delta-y));
                                     }
-                                    // 目录模式的滚轮统一交给容器按精确内容高度处理，行本身不再钳制。
-                                    return reject;
+                                    return accept;
                                 }
                                 clicked => { root.activate-entry(entry.id, self.click-control, self.click-shift); }
                             }
@@ -2260,24 +2245,23 @@ accessible-label: entry.name;
                             }
                         }
                     }
-                    grid := Flickable {
+                    grid := ListView {
                         visible: root.grid-rows.length > 0 && root.is-grid-view-mode(root.view-mode);
-                        interactive: false;
+                        mouse-drag-pan-enabled: false;
                         width: parent.width - 28px;
                         viewport-width: self.width;
-                        viewport-height: root.file-content-extent;
+                        vertical-scrollbar-policy: ScrollBarPolicy.always-off;
                         viewport-y <=> root.grid-viewport-y;
 
-                        function sync-file-geometry() { if root.is-grid-view-mode(root.view-mode) { root.file-list-left = self.absolute-position.x - root.absolute-position.x; root.file-list-top = self.absolute-position.y - root.absolute-position.y; root.rectangle-viewport-top = self.absolute-position.y - content-area.absolute-position.y; root.file-viewport-width = self.width; root.file-viewport-height = self.height; } }
+                        function sync-file-geometry() { if root.is-grid-view-mode(root.view-mode) { root.file-list-left = self.absolute-position.x - root.absolute-position.x; root.file-list-top = self.absolute-position.y - root.absolute-position.y; root.rectangle-viewport-top = self.absolute-position.y - content-area.absolute-position.y; root.file-viewport-width = self.width; root.file-viewport-height = self.visible-height; } }
                         init => { self.sync-file-geometry(); }
                         private property <int> geometry-revision: root.active-geometry-revision;
                         changed geometry-revision => { self.sync-file-geometry(); }
                         changed absolute-position => { self.sync-file-geometry(); }
                         changed width => { self.sync-file-geometry(); }
-                        changed height => { self.sync-file-geometry(); }
-                        changed viewport-y => { if root.is-grid-view-mode(root.view-mode) { root.file-viewport-y = self.viewport-y; if !root.search-results-mode { root.request-folder-size-range(self.viewport-y / 1px, self.height / 1px); } } }
+                        changed visible-height => { self.sync-file-geometry(); }
+                        changed viewport-y => { if root.is-grid-view-mode(root.view-mode) { root.file-viewport-y = self.viewport-y; if !root.search-results-mode { root.request-folder-size-range(self.viewport-y / 1px, self.visible-height / 1px); } } }
                         for row in root.grid-rows: HorizontalLayout {
-                            y: row.top;
                             height: row.group-header ? (row.group-detail == "" ? 32px : 48px) : root.view-row-height(root.view-mode);
                             padding-left: 16px;
                             padding-right: 16px;
@@ -2383,11 +2367,9 @@ accessible-label: entry.name;
                         height: parent.height;
                         value: root.search-results-mode ? root.search-scroll-y : root.file-viewport-y;
                         maximum: root.search-results-mode
-                            ? root.search-scroll-maximum(root.is-grid-view-mode(root.view-mode) ? grid.height : list.height)
-                            : max(0px, root.file-content-extent - root.file-viewport-height);
-                        page-size: root.search-results-mode
-                            ? (root.is-grid-view-mode(root.view-mode) ? grid.height : list.height)
-                            : root.file-viewport-height;
+                            ? root.search-scroll-maximum(root.is-grid-view-mode(root.view-mode) ? grid.visible-height : list.visible-height)
+                            : (root.is-grid-view-mode(root.view-mode) ? max(0px, grid.viewport-height - grid.visible-height) : max(0px, list.viewport-height - list.visible-height));
+                        page-size: root.is-grid-view-mode(root.view-mode) ? grid.visible-height : list.visible-height;
                         scrolled(viewport-y) => {
                             if root.search-results-mode {
                                 root.request-search-position(viewport-y / 1px);

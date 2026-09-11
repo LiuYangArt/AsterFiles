@@ -61,6 +61,7 @@ const NETWORK_WORKER_COUNT: usize = 2;
 const ICON_WORKER_COUNT: usize = 2;
 const SHORTCUT_QUEUE_CAPACITY: usize = 128;
 const DIRECTORY_EVENT_INTERVAL: Duration = Duration::from_millis(16);
+const REBUILT_PROJECTION_BATCH_SIZE: usize = 256;
 const THUMBNAIL_CACHE_CAPACITY: usize = 128;
 const THUMBNAIL_RETRY_DELAY: Duration = Duration::from_secs(2);
 const THUMBNAIL_MAX_ATTEMPTS: u8 = 2;
@@ -1256,8 +1257,6 @@ thread_local! {
     static WINDOW_RUNTIMES: RefCell<HashMap<WindowId, WindowRuntime>> = RefCell::new(HashMap::new());
     static GRID_ENTRY_POSITIONS: RefCell<GridEntryPositions> = RefCell::new(HashMap::new());
     static GRID_THUMBNAIL_RESIDENTS: RefCell<HashMap<WindowId, HashSet<EntryId>>> = RefCell::new(HashMap::new());
-    /// 每个窗口当前已物化的文件行窗口范围，用来判断视口是否越出安全带。
-    static FILE_AREA_PROJECTIONS: RefCell<HashMap<WindowId, FileAreaProjection>> = RefCell::new(HashMap::new());
 }
 
 type GridEntryPositions = HashMap<WindowId, HashMap<EntryId, (usize, usize)>>;
@@ -1413,8 +1412,6 @@ fn grid_thumbnail_plan(
 
     let row_height = file_layout_geometry(view_mode).row_height;
     let grid_rows = ui.get_grid_rows();
-    // 模型只包含窗口内的行，行偏移是相对整个内容的绝对坐标：把视口换算到窗口坐标系再取可见行。
-    let window_top = grid_rows.row_data(0).map_or(0.0, |row| row.top);
     let request_rows = grid_thumbnail_request_rows(
         &grid_rows
             .iter()
@@ -1426,7 +1423,7 @@ fn grid_thumbnail_plan(
                 }
             })
             .collect::<Vec<_>>(),
-        ui.get_file_viewport_y() + window_top,
+        ui.get_file_viewport_y(),
         visible_height,
         row_height * 2.0,
     );
@@ -3571,9 +3568,34 @@ fn file_row_height(view_mode: ViewMode) -> f32 {
     file_layout_geometry(view_mode).row_height
 }
 
-/// 文件区域可滚动的最大偏移：内容总高度由 Rust 投影给出，Slint 侧不再按模型行高推断。
-fn file_view_scroll_maximum(ui: &AppWindow, visible_height: f32) -> f32 {
-    (ui.get_file_content_extent() - visible_height).max(0.0)
+fn projected_scroll_maximum(ui: &AppWindow, view_mode: ViewMode, visible_height: f32) -> f32 {
+    if view_mode.uses_grid_layout() {
+        let extent = ui
+            .get_grid_rows()
+            .iter()
+            .map(|row| {
+                if row.group_header {
+                    group_header_height_for_detail(row.group_detail.as_str()) as f32
+                } else {
+                    file_row_height(view_mode)
+                }
+            })
+            .sum::<f32>();
+        (extent - visible_height).max(0.0)
+    } else {
+        let extent = ui
+            .get_files()
+            .iter()
+            .map(|row| {
+                if row.group_header {
+                    group_header_height_for_detail(row.group_detail.as_str()) as f32
+                } else {
+                    file_row_height(view_mode)
+                }
+            })
+            .sum::<f32>();
+        (extent - visible_height).max(0.0)
+    }
 }
 fn file_scroll_maximum(
     item_count: usize,
@@ -3754,44 +3776,17 @@ fn search_window_rows(
     tab: &TabSession,
     app: &AppState,
     window: SearchWindow,
-    view_mode: ViewMode,
-    columns: usize,
     grid_requested_px: Option<u32>,
-) -> (Vec<FileRow>, FileAreaProjection) {
+) -> Vec<FileRow> {
     let texts = Texts::new(app.language);
-    let row_height = file_row_height(view_mode);
-    let columns = columns.max(1);
-    let grid = view_mode.uses_grid_layout();
-    let rows = (0..window.len)
+    (0..window.len)
         .map(|local| {
             let result_index = window.start.saturating_add(local as u32);
-            let mut row = tab
-                .visible_entry(EntryId(result_index.saturating_add(1)))
+            tab.visible_entry(EntryId(result_index.saturating_add(1)))
                 .map(|entry| file_row(entry, tab, texts, app, grid_requested_px))
-                .unwrap_or_else(empty_file_row);
-            // 搜索窗口使用局部坐标，整个窗口都会被物化。
-            row.top = if grid {
-                (local / columns) as f32 * row_height
-            } else {
-                local as f32 * row_height
-            };
-            row
+                .unwrap_or_else(empty_file_row)
         })
-        .collect::<Vec<_>>();
-    (
-        rows,
-        FileAreaProjection::uniform(search_window_extent(window.len, view_mode, columns)),
-    )
-}
-
-/// 搜索窗口的内容高度（局部坐标）。
-fn search_window_extent(len: usize, view_mode: ViewMode, columns: usize) -> f32 {
-    let rows = if view_mode.uses_grid_layout() {
-        len.div_ceil(columns.max(1))
-    } else {
-        len
-    };
-    rows as f32 * file_row_height(view_mode)
+        .collect()
 }
 
 #[derive(Debug)]
@@ -10704,7 +10699,9 @@ fn wire_rectangle_selection(ui: &AppWindow, state: WindowSessions) -> Rc<slint::
                     ui.invoke_request_search_position(ui.get_search_scroll_y() + delta);
                     viewport_changed = true;
                 } else {
-                    let maximum = file_view_scroll_maximum(&ui, ui.get_file_viewport_height());
+                    let mode = view_mode_from_ui(ui.get_view_mode());
+                    let maximum =
+                        projected_scroll_maximum(&ui, mode, ui.get_file_viewport_height());
                     let viewport = (ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0);
                     if viewport != ui.get_file_viewport_y() {
                         ui.set_file_viewport_y(viewport);
@@ -11013,16 +11010,6 @@ fn wire_callbacks(
             (tab.page_source == PageSource::Directory).then_some((tab.id, tab.latest_request))
         });
         if let Some((tab_id, request_id)) = target {
-            if let Some(ui) = weak_for_folder_range.upgrade() {
-                ensure_file_window(
-                    &state_for_folder_range,
-                    &ui,
-                    tab_id,
-                    request_id,
-                    viewport_y,
-                    viewport_height,
-                );
-            }
             submit_visible_folder_sizes(
                 &everything_for_folder_range,
                 &state_for_folder_range.shared,
@@ -14322,7 +14309,8 @@ fn wire_mouse_navigation(
                 if ui.get_search_results_mode() {
                     ui.invoke_request_search_position(ui.get_search_scroll_y() + delta);
                 } else {
-                    let maximum = file_view_scroll_maximum(&ui, ui.get_file_viewport_height());
+                    let maximum =
+                        projected_scroll_maximum(&ui, view_mode, ui.get_file_viewport_height());
                     let viewport = (ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0);
                     ui.set_file_viewport_y(viewport);
                 }
@@ -15038,7 +15026,8 @@ fn auto_scroll_drag_edge(ui: &AppWindow, drag: &platform::windows::drag_drop::Dr
         ui.invoke_request_search_position(ui.get_search_scroll_y() + delta);
         return;
     }
-    let maximum = file_view_scroll_maximum(ui, ui.get_file_viewport_height());
+    let view_mode = view_mode_from_ui(ui.get_view_mode());
+    let maximum = projected_scroll_maximum(ui, view_mode, ui.get_file_viewport_height());
     ui.set_file_viewport_y((ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0));
 }
 
@@ -20598,7 +20587,7 @@ fn reveal_entry(
         return;
     };
     let visible_height = ui.get_file_viewport_height().max(geometry.row_height);
-    let maximum = file_view_scroll_maximum(ui, visible_height);
+    let maximum = projected_scroll_maximum(ui, view_mode, visible_height);
     ui.set_file_viewport_y(reveal_scroll_target(
         ui.get_file_viewport_y(),
         entry_top,
@@ -21717,7 +21706,6 @@ fn start_everything_event_pump(
 fn empty_file_row() -> FileRow {
     FileRow {
         id: 0,
-        top: 0.0,
         loaded: false,
         group_header: false,
         group_label: "".into(),
@@ -21739,9 +21727,8 @@ fn empty_file_row() -> FileRow {
     }
 }
 
-fn group_header_file_row(top: f32, label: &str, detail: &str, entry_count: usize) -> FileRow {
+fn group_header_file_row(label: &str, detail: &str, entry_count: usize) -> FileRow {
     let mut row = empty_file_row();
-    row.top = top;
     row.loaded = true;
     row.group_header = true;
     row.group_label = label.into();
@@ -23488,33 +23475,80 @@ fn classify_error(kind: io::ErrorKind) -> LoadState {
     }
 }
 
-/// 新批次到达时重建文件投影窗口：窗口只覆盖视口附近，重建代价与窗口大小成正比。
+fn should_rebuild_projection(projected_entries: usize, pending_entries: usize) -> bool {
+    projected_entries == 0
+        || pending_entries.saturating_sub(projected_entries) >= REBUILT_PROJECTION_BATCH_SIZE
+}
+
 fn append_active_file_rows(
     ui: &AppWindow,
     state: &SharedSessions,
     tab_id: TabId,
     request_id: RequestId,
 ) {
+    use slint::Model;
     let app = state.lock().expect("app state mutex is not poisoned");
-    let Some(window_id) = app.window_for_tab(tab_id) else {
-        return;
-    };
-    let Some(window) = app.window(window_id) else {
-        return;
-    };
-    if window.active_tab != tab_id {
+    if app.active_window_state().active_tab != tab_id {
         return;
     }
-    let Some(tab) = window.tabs.get(&tab_id) else {
+    let tab = app.active();
+    if tab.latest_request != request_id || tab.load_state != LoadState::Partial {
+        return;
+    }
+    let model = ui.get_files();
+    let Some(model) = model.as_any().downcast_ref::<VecModel<FileRow>>() else {
+        drop(app);
+        refresh_tab_window(state, tab_id);
         return;
     };
-    if tab.latest_request != request_id
-        || !matches!(tab.load_state, LoadState::Loading | LoadState::Partial)
+    if ui.get_projected_file_tab_id() != tab_id.0 as i32
+        || ui.get_projected_file_request_id() != request_id.0 as i32
     {
+        drop(app);
+        refresh_tab_window(state, tab_id);
         return;
     }
     let texts = Texts::new(app.language);
-    project_file_view(ui, &app, window_id, tab, texts);
+    let grouped = matches!(tab.visible_location(), Some(NavigationLocation::Library(_)))
+        || tab
+            .visible_path()
+            .map(|path| app.directory_preference(path).group_field != GroupField::None)
+            .unwrap_or(false);
+    let grid_layout = app.active_view_mode().uses_grid_layout();
+    if grouped || grid_layout {
+        let projected_entries = if grid_layout {
+            ui.get_grid_rows()
+                .iter()
+                .filter(|row| !row.group_header)
+                .map(|row| row.entries.row_count())
+                .sum()
+        } else {
+            (0..model.row_count())
+                .filter_map(|index| model.row_data(index))
+                .filter(|row| row.loaded && !row.group_header)
+                .count()
+        };
+        let pending_entries = tab.pending_entries.len();
+        let should_refresh = should_rebuild_projection(projected_entries, pending_entries);
+        drop(app);
+        if should_refresh {
+            refresh_tab_window(state, tab_id);
+        } else {
+            update_tab_status(ui, state, tab_id);
+        }
+        return;
+    }
+    let start = model.row_count();
+    if start > tab.pending_entries.len() {
+        drop(app);
+        refresh_tab_window(state, tab_id);
+        return;
+    }
+    model.extend(
+        tab.pending_entries[start..]
+            .iter()
+            .map(|entry| file_row(entry, tab, texts, &app, None)),
+    );
     ui.set_status_text(status_text(tab, texts).into());
 }
 
@@ -24489,129 +24523,36 @@ fn library_source_group_projections(
         .collect()
 }
 
-/// 文件区域的物化窗口：只把视口附近的行交给 Slint，其余行由 Rust 的精确几何描述。
-/// 行坐标始终是相对整个内容的绝对偏移，Slint 侧不需要再做任何行高推断。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileViewWindow {
-    start: usize,
-    end: usize,
-}
-
-/// 视口上下各预留一屏，滚动时不必每帧重建投影。
-const FILE_WINDOW_MARGIN_SCREENS: f32 = 1.0;
-
-/// 文件区域投影结果：内容总高度与已物化窗口覆盖的绝对范围。
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct FileAreaProjection {
-    content_extent: f32,
-    window_start: f32,
-    window_end: f32,
-}
-
-impl FileAreaProjection {
-    fn from_offsets(offsets: &group_projection::VisualOffsets, window: FileViewWindow) -> Self {
-        Self {
-            content_extent: offsets.total_extent() as f32,
-            window_start: offsets.row_start(window.start).unwrap_or(0) as f32,
-            window_end: offsets
-                .row_start(window.end)
-                .unwrap_or_else(|| offsets.total_extent()) as f32,
-        }
-    }
-
-    /// 搜索窗口使用局部坐标，整个窗口都已被物化。
-    fn uniform(extent: f32) -> Self {
-        Self {
-            content_extent: extent,
-            window_start: 0.0,
-            window_end: extent,
-        }
-    }
-
-    fn covers_viewport(self, viewport_top: f32, visible_height: f32) -> bool {
-        // 内容比视口短时窗口末端就是内容末端，不因视口更高而反复重建。
-        let bottom = (viewport_top + visible_height.max(1.0)).min(self.content_extent);
-        viewport_top >= self.window_start && bottom <= self.window_end
-    }
-}
-
-/// 一次文件区域投影所需的几何：视图模式、网格列数、视口位置与可见高度。
-#[derive(Debug, Clone, Copy)]
-struct FileProjectionRequest {
-    view_mode: ViewMode,
-    columns: usize,
-    viewport_top: f32,
-    visible_height: f32,
-}
-
-fn file_view_window(
-    offsets: &group_projection::VisualOffsets,
-    viewport_top: f32,
-    visible_height: f32,
-) -> FileViewWindow {
-    let rows = offsets.row_count();
-    if rows == 0 {
-        return FileViewWindow { start: 0, end: 0 };
-    }
-    let visible = visible_height.max(1.0);
-    let margin = visible * FILE_WINDOW_MARGIN_SCREENS;
-    let top = (viewport_top - margin).max(0.0);
-    let bottom = viewport_top + visible + margin;
-    let start = offsets
-        .row_index_at_or_after(top as u64)
-        .saturating_sub(1)
-        .min(rows - 1);
-    let end = offsets
-        .row_index_at_or_after(bottom as u64)
-        .max(start + 1)
-        .min(rows);
-    FileViewWindow { start, end }
-}
-
 fn projected_directory_rows(
     entries: &[FileEntry],
     tab: &TabSession,
     texts: Texts,
     app: &AppState,
-    request: FileProjectionRequest,
-) -> (Vec<FileRow>, FileAreaProjection) {
+) -> Vec<FileRow> {
     let groups = directory_group_projections(app, tab, entries);
     let by_id = entries
         .iter()
         .map(|entry| (entry.id, entry))
         .collect::<HashMap<_, _>>();
-    let projection = ListProjection::from_groups(
+    ListProjection::from_groups(
         &groups,
         group_header_height(&groups),
-        file_row_height(request.view_mode) as u64,
-    );
-    let window = file_view_window(
-        &projection.offsets,
-        request.viewport_top,
-        request.visible_height,
-    );
-    let rows = (window.start..window.end)
-        .filter_map(|index| {
-            let top = projection.offsets.row_start(index)? as f32;
-            match projection.rows.get(index)? {
-                ListVisualRow::GroupHeader {
-                    label,
-                    detail,
-                    entry_count,
-                    ..
-                } => Some(group_header_file_row(top, label, detail, *entry_count)),
-                ListVisualRow::Entry { entry_id } => by_id.get(entry_id).map(|entry| {
-                    let mut row = file_row(entry, tab, texts, app, None);
-                    row.top = top;
-                    row
-                }),
-            }
-        })
-        .collect();
-    (
-        rows,
-        FileAreaProjection::from_offsets(&projection.offsets, window),
+        file_row_height(app.active_view_mode()) as u64,
     )
+    .rows
+    .into_iter()
+    .filter_map(|visual| match visual {
+        ListVisualRow::GroupHeader {
+            label,
+            detail,
+            entry_count,
+            ..
+        } => Some(group_header_file_row(&label, &detail, entry_count)),
+        ListVisualRow::Entry { entry_id } => by_id
+            .get(&entry_id)
+            .map(|entry| file_row(entry, tab, texts, app, None)),
+    })
+    .collect()
 }
 
 fn projected_directory_grid_rows(
@@ -24619,66 +24560,53 @@ fn projected_directory_grid_rows(
     tab: &TabSession,
     texts: Texts,
     app: &AppState,
-    request: FileProjectionRequest,
+    columns: usize,
     requested_px: u32,
-) -> (Vec<GridRow>, FileAreaProjection) {
+) -> Vec<GridRow> {
     let groups = directory_group_projections(app, tab, entries);
     let by_id = entries
         .iter()
         .map(|entry| (entry.id, entry))
         .collect::<HashMap<_, _>>();
-    let projection = IconProjection::from_groups(
+    IconProjection::from_groups(
         &groups,
-        request.columns,
+        columns,
         group_header_height(&groups),
-        file_row_height(request.view_mode) as u64,
-    );
-    let window = file_view_window(
-        &projection.offsets,
-        request.viewport_top,
-        request.visible_height,
-    );
-    let rows = (window.start..window.end)
-        .filter_map(|index| {
-            let top = projection.offsets.row_start(index)? as f32;
-            match projection.rows.get(index)? {
-                IconVisualRow::GroupHeader {
-                    label,
-                    detail,
-                    entry_count,
-                    ..
-                } => Some(GridRow {
-                    top,
-                    group_header: true,
-                    group_label: label.into(),
-                    group_detail: detail.into(),
-                    group_count: (*entry_count).min(i32::MAX as usize) as i32,
-                    entries: ModelRc::new(VecModel::default()),
-                }),
-                IconVisualRow::Entries { entries, .. } => Some(GridRow {
-                    top,
-                    group_header: false,
-                    group_label: "".into(),
-                    group_detail: "".into(),
-                    group_count: 0,
-                    entries: ModelRc::new(VecModel::from(
-                        entries
-                            .iter()
-                            .filter_map(|id| {
-                                by_id.get(id).map(|entry| {
-                                    file_row(entry, tab, texts, app, Some(requested_px))
-                                })
-                            })
-                            .collect::<Vec<_>>(),
-                    )),
-                }),
-            }
-        })
-        .collect();
-    (
-        rows,
-        FileAreaProjection::from_offsets(&projection.offsets, window),
+        file_row_height(app.active_view_mode()) as u64,
     )
+    .rows
+    .into_iter()
+    .map(|visual| match visual {
+        IconVisualRow::GroupHeader {
+            label,
+            detail,
+            entry_count,
+            ..
+        } => GridRow {
+            group_header: true,
+            group_label: label.into(),
+            group_detail: detail.into(),
+            group_count: entry_count.min(i32::MAX as usize) as i32,
+            entries: ModelRc::new(VecModel::default()),
+        },
+        IconVisualRow::Entries { entries, .. } => GridRow {
+            group_header: false,
+            group_label: "".into(),
+            group_detail: "".into(),
+            group_count: 0,
+            entries: ModelRc::new(VecModel::from(
+                entries
+                    .into_iter()
+                    .filter_map(|id| {
+                        by_id
+                            .get(&id)
+                            .map(|entry| file_row(entry, tab, texts, app, Some(requested_px)))
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+        },
+    })
+    .collect()
 }
 fn directory_display_entries(tab: &TabSession) -> &[FileEntry] {
     if matches!(tab.load_state, LoadState::Loading | LoadState::Partial) {
@@ -24749,185 +24677,6 @@ fn shell_integration_projection(
         ),
     }
 }
-/// 文件区域的投影：Rust 计算精确几何（每行的绝对 top 与内容总高度），Slint 只绘制窗口内的行。
-fn project_file_view(
-    ui: &AppWindow,
-    app: &AppState,
-    window_id: WindowId,
-    tab: &TabSession,
-    texts: Texts,
-) {
-    let view_mode = app
-        .view_mode_for_tab(tab.id)
-        .unwrap_or(app.default_directory_view.view_mode);
-    ui.set_view_mode(view_mode_to_ui(view_mode));
-    let projected_tab_id = tab.id.0 as i32;
-    let projected_request_id = tab.latest_request.0 as i32;
-    if ui.get_projected_file_tab_id() != projected_tab_id
-        || ui.get_projected_file_request_id() != projected_request_id
-    {
-        if ui.get_rectangle_selection_pointer_active() {
-            ui.invoke_cancel_rectangle_selection();
-        }
-        ui.set_file_viewport_y(0.0);
-        ui.set_search_scroll_y(0.0);
-        ui.set_projected_file_tab_id(projected_tab_id);
-        ui.set_projected_file_request_id(projected_request_id);
-    }
-    let geometry = file_layout_geometry(view_mode);
-    let grid_columns = (((ui.window().size().width as f32 / ui.window().scale_factor()) - 292.0)
-        / (geometry.card_width + 8.0).max(1.0))
-    .floor()
-    .max(1.0) as usize;
-    let total = tab.search_total.unwrap_or(tab.entries.len() as u32);
-    let search_index =
-        search_result_index_at_scroll(ui.get_search_scroll_y(), total, view_mode, grid_columns);
-    let search_window = search_window_for_index(search_index, total, grid_columns);
-    if tab.page_source == PageSource::Search {
-        ui.set_file_viewport_y(search_window_viewport_y(
-            search_index,
-            search_window,
-            view_mode,
-            grid_columns,
-        ));
-    }
-    let viewport_top = (-ui.get_file_viewport_y()).max(0.0);
-    let request = FileProjectionRequest {
-        view_mode,
-        columns: grid_columns,
-        viewport_top,
-        visible_height: ui.get_file_viewport_height(),
-    };
-    let (file_rows, grid_rows, area) =
-        file_area_models(ui, app, tab, texts, search_window, request);
-    ui.set_files(ModelRc::new(VecModel::from(file_rows)));
-    ui.set_grid_column_count(grid_columns as i32);
-    ui.set_grid_rows(ModelRc::new(VecModel::from(grid_rows)));
-    ui.set_file_content_extent(area.content_extent);
-    FILE_AREA_PROJECTIONS.with_borrow_mut(|by_window| {
-        by_window.insert(window_id, area);
-    });
-    rebuild_grid_entry_positions(ui, window_id);
-    let preference_revision = if tab.page_source == PageSource::Search {
-        0
-    } else {
-        tab.visible_path()
-            .map(|path| app.directory_preference(path).group_field.storage_code() as i32)
-            .unwrap_or(0)
-    };
-    ui.set_projected_content_revision(
-        projected_request_id
-            .wrapping_mul(31)
-            .wrapping_add(preference_revision),
-    );
-    ui.set_search_total_items(total.min(i32::MAX as u32) as i32);
-}
-
-/// 视图模式决定哪个模型承载窗口行，另一个保持空模型。
-fn file_area_models(
-    ui: &AppWindow,
-    app: &AppState,
-    tab: &TabSession,
-    texts: Texts,
-    search_window: SearchWindow,
-    request: FileProjectionRequest,
-) -> (Vec<FileRow>, Vec<GridRow>, FileAreaProjection) {
-    let search = tab.page_source == PageSource::Search;
-    if request.view_mode.uses_grid_layout() {
-        let requested_px = grid_thumbnail_request_px(request.view_mode, ui.window().scale_factor());
-        let (rows, area) = if search {
-            let (rows, area) = search_window_rows(
-                tab,
-                app,
-                search_window,
-                request.view_mode,
-                request.columns,
-                Some(requested_px),
-            );
-            (grid_rows_from_entries(&rows, request.columns), area)
-        } else {
-            projected_directory_grid_rows(
-                directory_display_entries(tab),
-                tab,
-                texts,
-                app,
-                request,
-                requested_px,
-            )
-        };
-        (Vec::new(), rows, area)
-    } else {
-        let (rows, area) = if search {
-            search_window_rows(
-                tab,
-                app,
-                search_window,
-                request.view_mode,
-                request.columns,
-                None,
-            )
-        } else {
-            projected_directory_rows(directory_display_entries(tab), tab, texts, app, request)
-        };
-        (rows, Vec::new(), area)
-    }
-}
-
-/// 搜索窗口按列切片为网格行，行偏移保持窗口局部坐标。
-fn grid_rows_from_entries(rows: &[FileRow], columns: usize) -> Vec<GridRow> {
-    rows.chunks(columns.max(1))
-        .map(|entries| GridRow {
-            top: entries.first().map_or(0.0, |row| row.top),
-            group_header: false,
-            group_label: "".into(),
-            group_detail: "".into(),
-            group_count: 0,
-            entries: ModelRc::new(VecModel::from(entries.to_vec())),
-        })
-        .collect()
-}
-
-/// 视口越出已物化窗口时才重建投影；正常滚动范围内不重建模型。
-fn ensure_file_window(
-    state: &SharedSessions,
-    ui: &AppWindow,
-    tab_id: TabId,
-    request_id: RequestId,
-    viewport_y: f32,
-    visible_height: f32,
-) {
-    let app = state.lock().expect("app state mutex is not poisoned");
-    let Some(window_id) = app.window_for_tab(tab_id) else {
-        return;
-    };
-    let Some(window) = app.window(window_id) else {
-        return;
-    };
-    if window.active_tab != tab_id {
-        return;
-    }
-    let Some(tab) = window.tabs.get(&tab_id) else {
-        return;
-    };
-    if tab.latest_request != request_id
-        || tab.page_source != PageSource::Directory
-        || tab.visible_entries().is_empty()
-    {
-        return;
-    }
-    let viewport_top = (-viewport_y).max(0.0);
-    let covered = FILE_AREA_PROJECTIONS.with_borrow(|by_window| {
-        by_window
-            .get(&window_id)
-            .is_some_and(|area| area.covers_viewport(viewport_top, visible_height))
-    });
-    if covered {
-        return;
-    }
-    let texts = Texts::new(app.language);
-    project_file_view(ui, &app, window_id, tab, texts);
-}
-
 fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId) {
     let app = state.lock().expect("app state mutex is not poisoned");
     let texts = Texts::new(app.language);
@@ -25035,7 +24784,90 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
         home_columns,
     ))));
     ui.set_home_selected_id(home_page.selected.unwrap_or_default().into());
-    project_file_view(ui, &app, window_id, tab, texts);
+    let view_mode = app
+        .view_mode_for_tab(tab.id)
+        .unwrap_or(app.default_directory_view.view_mode);
+    ui.set_view_mode(view_mode_to_ui(view_mode));
+    let projected_tab_id = tab.id.0 as i32;
+    let projected_request_id = tab.latest_request.0 as i32;
+    if ui.get_projected_file_tab_id() != projected_tab_id
+        || ui.get_projected_file_request_id() != projected_request_id
+    {
+        if ui.get_rectangle_selection_pointer_active() {
+            ui.invoke_cancel_rectangle_selection();
+        }
+        ui.set_file_viewport_y(0.0);
+        ui.set_search_scroll_y(0.0);
+        ui.set_projected_file_tab_id(projected_tab_id);
+        ui.set_projected_file_request_id(projected_request_id);
+    }
+    let display_entries = directory_display_entries(tab);
+    let geometry = file_layout_geometry(view_mode);
+    let grid_columns = (((ui.window().size().width as f32 / ui.window().scale_factor()) - 292.0)
+        / (geometry.card_width + 8.0).max(1.0))
+    .floor()
+    .max(1.0) as usize;
+    let total = tab.search_total.unwrap_or(tab.entries.len() as u32);
+    let search_index =
+        search_result_index_at_scroll(ui.get_search_scroll_y(), total, view_mode, grid_columns);
+    let search_window = search_window_for_index(search_index, total, grid_columns);
+    if tab.page_source == PageSource::Search {
+        ui.set_file_viewport_y(search_window_viewport_y(
+            search_index,
+            search_window,
+            view_mode,
+            grid_columns,
+        ));
+    }
+    let (file_rows, grid_rows) = if view_mode.uses_grid_layout() {
+        let requested_px = grid_thumbnail_request_px(view_mode, ui.window().scale_factor());
+        let grid_rows = if tab.page_source == PageSource::Search {
+            search_window_rows(tab, &app, search_window, Some(requested_px))
+                .chunks(grid_columns)
+                .map(|entries| GridRow {
+                    group_header: false,
+                    group_label: "".into(),
+                    group_detail: "".into(),
+                    group_count: 0,
+                    entries: ModelRc::new(VecModel::from(entries.to_vec())),
+                })
+                .collect::<Vec<_>>()
+        } else {
+            projected_directory_grid_rows(
+                display_entries,
+                tab,
+                texts,
+                &app,
+                grid_columns,
+                requested_px,
+            )
+        };
+        (Vec::new(), grid_rows)
+    } else {
+        let file_rows = if tab.page_source == PageSource::Search {
+            search_window_rows(tab, &app, search_window, None)
+        } else {
+            projected_directory_rows(display_entries, tab, texts, &app)
+        };
+        (file_rows, Vec::new())
+    };
+    ui.set_files(ModelRc::new(VecModel::from(file_rows)));
+    ui.set_grid_column_count(grid_columns as i32);
+    ui.set_grid_rows(ModelRc::new(VecModel::from(grid_rows)));
+    rebuild_grid_entry_positions(ui, window_id);
+    let preference_revision = if tab.page_source == PageSource::Search {
+        0
+    } else {
+        tab.visible_path()
+            .map(|path| app.directory_preference(path).group_field.storage_code() as i32)
+            .unwrap_or(0)
+    };
+    ui.set_projected_content_revision(
+        projected_request_id
+            .wrapping_mul(31)
+            .wrapping_add(preference_revision),
+    );
+    ui.set_search_total_items(total.min(i32::MAX as u32) as i32);
     let visible_path = tab
         .visible_location()
         .map(|location| navigation_display_name(location, app.language))
@@ -25519,7 +25351,6 @@ fn file_row(
     });
     FileRow {
         id: entry.id.0 as i32,
-        top: 0.0,
         loaded: true,
         group_header: false,
         group_label: "".into(),
@@ -27923,6 +27754,13 @@ mod tests {
         assert_eq!(details_requests.len(), 1);
         assert!(!details_requests[0].thumbnail);
     }
+    #[test]
+    fn issue_18_rebuilt_projection_is_coalesced_for_large_directories() {
+        assert!(should_rebuild_projection(0, 32));
+        assert!(!should_rebuild_projection(32, 255));
+        assert!(should_rebuild_projection(32, 288));
+    }
+
     #[test]
     fn issue_18_thumbnail_cache_evicts_the_oldest_entry() {
         let mut cache = HashMap::new();
@@ -32063,19 +31901,12 @@ mod tests {
                 GroupField::Kind
             );
             let tab = app.active();
-            let (rows, area) = projected_directory_rows(
+            let rows = projected_directory_rows(
                 tab.visible_entries(),
                 tab,
                 Texts::new(Language::Chinese),
                 &app,
-                FileProjectionRequest {
-                    view_mode: ViewMode::Details,
-                    columns: 1,
-                    viewport_top: 0.0,
-                    visible_height: 4_000.0,
-                },
             );
-            assert_eq!(area.content_extent, 6.0 * 32.0);
             let labels = rows
                 .iter()
                 .filter(|row| row.group_header)
@@ -33601,8 +33432,7 @@ mod tests {
     fn test_grid_rows() -> ModelRc<GridRow> {
         ModelRc::new(VecModel::from(
             (0..12)
-                .map(|index| GridRow {
-                    top: index as f32 * 132.0,
+                .map(|_| GridRow {
                     group_header: false,
                     group_label: "".into(),
                     group_detail: "".into(),
@@ -33612,42 +33442,6 @@ mod tests {
                 .collect::<Vec<_>>(),
         ))
     }
-
-    /// #91 复现用模型：4 个分组标题行(32px) + 8 个内容行(中等图标 132px)，真实内容高度 1184px。
-    fn grouped_test_grid_rows() -> ModelRc<GridRow> {
-        const HEADER_EXTENT: f32 = 32.0;
-        const ENTRY_EXTENT: f32 = 132.0;
-        let mut rows = Vec::new();
-        let mut top = 0.0_f32;
-        for (index, count) in [9usize, 3, 3, 11].into_iter().enumerate() {
-            rows.push(GridRow {
-                top,
-                group_header: true,
-                group_label: format!("group {index}").into(),
-                group_detail: "".into(),
-                group_count: count as i32,
-                entries: ModelRc::new(VecModel::default()),
-            });
-            top += HEADER_EXTENT;
-            for chunk in (0..count).collect::<Vec<_>>().chunks(4) {
-                rows.push(GridRow {
-                    top,
-                    group_header: false,
-                    group_label: "".into(),
-                    group_detail: "".into(),
-                    group_count: 0,
-                    entries: ModelRc::new(VecModel::from(
-                        chunk.iter().map(|_| empty_file_row()).collect::<Vec<_>>(),
-                    )),
-                });
-                top += ENTRY_EXTENT;
-            }
-        }
-        ModelRc::new(VecModel::from(rows))
-    }
-
-    /// #91 复现模型的精确内容高度，与 `grouped_test_grid_rows` 保持一致。
-    const GROUPED_TEST_EXTENT: f32 = 4.0 * 32.0 + 8.0 * 132.0;
 
     fn headless_file_view() -> AppWindow {
         i_slint_backend_testing::init_no_event_loop();
@@ -33667,15 +33461,6 @@ mod tests {
 
         ui.window().request_redraw();
         let _ = ui.root_element().query_descendants().find_all();
-    }
-
-    /// 让布局与变更处理器收敛，等价于真实运行时的连续几帧。
-    fn settle_test_layout(ui: &AppWindow) {
-        for _ in 0..3 {
-            update_test_layout(ui);
-            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
-        }
-        update_test_layout(ui);
     }
 
     #[test]
@@ -33753,185 +33538,6 @@ mod tests {
         ui.set_view_mode(0);
         update_test_layout(&ui);
         assert_eq!(ui.get_file_viewport_y(), 0.0);
-    }
-
-    #[test]
-    fn issue_91_grouped_icon_scroll_keeps_the_exact_content_extent_across_reprojection() {
-        // 分组标题行(32px)与卡片行(132px)不等高时，滚动几何必须完全来自 Rust 的精确投影：
-        // 投影重建（滚动中结果回包）不得改写滚动位置。
-        let ui = headless_file_view();
-        ui.set_view_mode(2);
-        ui.set_grid_column_count(4);
-        ui.set_grid_rows(grouped_test_grid_rows());
-        ui.set_file_content_extent(GROUPED_TEST_EXTENT);
-        settle_test_layout(&ui);
-
-        let bottom = -(GROUPED_TEST_EXTENT - ui.get_file_viewport_height()).max(0.0);
-        ui.set_file_viewport_y(bottom);
-        settle_test_layout(&ui);
-        assert_eq!(
-            ui.get_file_viewport_y(),
-            bottom,
-            "滚到内容末尾后必须停在精确底部"
-        );
-
-        // 滚动过程中结果回包会重建投影模型，等价于真实场景里的持续刷新。
-        ui.set_grid_rows(grouped_test_grid_rows());
-        ui.set_file_content_extent(GROUPED_TEST_EXTENT);
-        settle_test_layout(&ui);
-
-        let after_reproject = ui.get_file_viewport_y();
-        let expected = -(GROUPED_TEST_EXTENT - ui.get_file_viewport_height()).max(0.0);
-        eprintln!(
-            "issue_91 extent={GROUPED_TEST_EXTENT} bottom={bottom} after_reproject={after_reproject} expected={expected}"
-        );
-        assert_eq!(
-            after_reproject, expected,
-            "投影模型重建后必须保留在精确底部，不得被平均行高估算改写"
-        );
-    }
-
-    #[test]
-    fn issue_91_grouped_icon_wheel_reaches_the_exact_bottom() {
-        // 分组图标模式下滚轮滚到底必须停在精确底部，不能停在估算位置或越过内容末尾。
-        use slint::platform::WindowEvent;
-
-        let ui = headless_file_view();
-        ui.set_view_mode(2);
-        ui.set_grid_column_count(4);
-        ui.set_grid_rows(grouped_test_grid_rows());
-        ui.set_file_content_extent(GROUPED_TEST_EXTENT);
-        update_test_layout(&ui);
-
-        let pointer = slint::LogicalPosition::new(500.0, 300.0);
-        ui.window()
-            .dispatch_event(WindowEvent::PointerMoved { position: pointer });
-        for _ in 0..12 {
-            ui.window().dispatch_event(WindowEvent::PointerScrolled {
-                position: pointer,
-                delta_x: 0.0,
-                delta_y: -120.0,
-            });
-            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
-            update_test_layout(&ui);
-        }
-
-        let final_position = ui.get_file_viewport_y();
-        let expected = -(GROUPED_TEST_EXTENT - ui.get_file_viewport_height()).max(0.0);
-        eprintln!(
-            "issue_91 wheel extent={GROUPED_TEST_EXTENT} visible={} final={final_position} expected={expected}",
-            ui.get_file_viewport_height()
-        );
-        assert_eq!(final_position, expected, "滚轮滚到内容末尾必须停在精确底部");
-    }
-
-    #[test]
-    fn issue_91_file_viewport_accepts_both_rust_and_wheel_writers() {
-        // 精确几何改造后：Rust 设置的滚动位置会被容器跟随，滚轮再从该位置继续，两者不互相覆盖。
-        use slint::platform::WindowEvent;
-
-        let ui = headless_file_view();
-        ui.set_view_mode(2);
-        ui.set_grid_column_count(4);
-        ui.set_grid_rows(grouped_test_grid_rows());
-        ui.set_file_content_extent(GROUPED_TEST_EXTENT);
-        settle_test_layout(&ui);
-
-        let pointer = slint::LogicalPosition::new(500.0, 300.0);
-        ui.window()
-            .dispatch_event(WindowEvent::PointerMoved { position: pointer });
-        for _ in 0..12 {
-            ui.window().dispatch_event(WindowEvent::PointerScrolled {
-                position: pointer,
-                delta_x: 0.0,
-                delta_y: -120.0,
-            });
-            settle_test_layout(&ui);
-        }
-        assert_eq!(
-            ui.get_file_viewport_y(),
-            -(GROUPED_TEST_EXTENT - ui.get_file_viewport_height()).max(0.0),
-            "滚轮应停在内容末尾"
-        );
-
-        ui.set_file_viewport_y(0.0);
-        settle_test_layout(&ui);
-        assert_eq!(
-            ui.get_file_viewport_y(),
-            0.0,
-            "Rust 设置的滚动位置必须被容器接受"
-        );
-
-        ui.window().dispatch_event(WindowEvent::PointerScrolled {
-            position: pointer,
-            delta_x: 0.0,
-            delta_y: -10.0,
-        });
-        settle_test_layout(&ui);
-        assert_eq!(
-            ui.get_file_viewport_y(),
-            -10.0,
-            "滚轮必须从 Rust 设置的位置继续"
-        );
-    }
-
-    #[test]
-    fn issue_91_incremental_batches_project_a_window_with_exact_extent() {
-        // 普通目录增量加载：每批到达后重建窗口，行偏移与内容总高度一律来自 Rust 投影。
-        let shared = Arc::new(Mutex::new(AppState::new_for_test(
-            vec![PathBuf::from(r"C:\batch")],
-            0,
-            [0, 1, 2, 3],
-        )));
-        let request_id = {
-            let mut app = shared.lock().unwrap();
-            let tab = app
-                .active_window_state_mut()
-                .tabs
-                .get_mut(&TabId(1))
-                .unwrap();
-            tab.load_state = LoadState::Loading;
-            tab.append_pending(
-                (1..=300)
-                    .map(|index| focus_entry(index, &format!(r"C:\batch\file{index}.obj")))
-                    .collect(),
-            );
-            assert_eq!(tab.load_state, LoadState::Partial);
-            tab.latest_request
-        };
-        let window_id = shared.lock().unwrap().active_window;
-        let state = WindowSessions::new(shared.clone(), window_id);
-        let ui = headless_file_view();
-
-        append_active_file_rows(&ui, &state, TabId(1), request_id);
-
-        let rows = ui.get_files();
-        let extent = ui.get_file_content_extent();
-        let first = rows.row_data(0).expect("窗口首行");
-        let last = rows.row_data(rows.row_count() - 1).expect("窗口末行");
-        eprintln!(
-            "issue_91 batch rows={} extent={extent} first_top={} last_top={}",
-            rows.row_count(),
-            first.top,
-            last.top
-        );
-        assert_eq!(extent, 300.0 * 32.0, "内容总高度必须等于全部行的精确高度");
-        assert!(first.loaded, "首批内容必须立即可见");
-        assert!(
-            rows.row_count() < 300,
-            "只物化视口附近的行，不能一次创建全部节点"
-        );
-        assert_eq!(first.top, 0.0);
-        assert!(last.top + 32.0 <= extent);
-
-        // 大跨度跳转后窗口必须跟着视口移动。
-        ui.set_file_viewport_y(-5_000.0);
-        ensure_file_window(&state, &ui, TabId(1), request_id, -5_000.0, 628.0);
-        let rows = ui.get_files();
-        let first_top = rows.row_data(0).expect("跳转后窗口首行").top;
-        eprintln!("issue_91 batch jumped_first_top={first_top}");
-        assert!(first_top > 0.0 && first_top <= 5_000.0);
-        assert_eq!(ui.get_file_content_extent(), extent);
     }
 
     #[test]

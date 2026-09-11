@@ -71,16 +71,11 @@
 9. Everything 深滚动的逻辑/物理分离方法可以复用，但不能因症状相似就套用数万项精度根因。
 10. 真实桌面滚动与 DPI 行为继续由用户人工验证，自动化只覆盖无界面状态和几何。
 
-## 后续（Issue #91，2026-09）
-
-本记录里的“统一行高与最大滚动距离”只解决了双 `ListView` 互相回写的问题，仍把内容高度交给 Slint 推断。Issue #91 发现 `ListView` 对每张列表只使用一个平均行高来估算内容高度和起始行偏移，分组标题行与图标卡片行不等高时估算值会随可见行组成变化，造成滚到底回弹、滚动条跳动和命中偏移。文件区域因此改为：Rust 投影给出每行绝对 `top` 与内容总高度，Slint 用普通 `Flickable` 只绘制窗口内的行，滚轮由容器统一处理，隐藏视图不再参与。上述防复发规则仍适用，但第 3 条的“行高与最大值”现在由协调层投影统一提供，不再由 Slint 侧推断。
-
 ## 长期排查入口
 
 - 列表、网格和自绘滚动条：`ui/app-window.slint`
-- 窗口输入和统一几何：`src/app.rs`（`FileAreaProjection`、`file_view_window`、`project_file_view`、`ensure_file_window`）
+- 窗口输入和统一几何：`src/app.rs`
 - Slint 依赖的列表边界：`i-slint-core` 中的 `items/flickable.rs` 与 `model/repeater.rs`
 - Everything 深滚动设计：`docs/foundation-plan.md`；任务记录：GitHub Issue #9
 - 本问题记录：GitHub Issue #11
-- 分组图标模式滚动几何：GitHub Issue #91
 - 自动验证汇总：`artifacts/verify/summary.json`

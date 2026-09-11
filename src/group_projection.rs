@@ -133,19 +133,6 @@ impl VisualOffsets {
         self.row_starts.get(row_index).copied()
     }
 
-    pub fn row_count(&self) -> usize {
-        self.row_starts.len()
-    }
-
-    pub fn total_extent(&self) -> u64 {
-        self.total_extent
-    }
-
-    /// 第一个起点不早于 offset 的行号；用于把视口范围切成物化窗口。
-    pub fn row_index_at_or_after(&self, offset: u64) -> usize {
-        self.row_starts.partition_point(|start| *start < offset)
-    }
-
     pub fn locate(&self, offset: u64) -> Option<OffsetLocation> {
         if offset >= self.total_extent || self.row_starts.is_empty() {
             return None;
