@@ -30,8 +30,9 @@ use crate::{
         SearchViewPreference, SortDirection, SortField, TabId, TabKind, TabSession, ViewMode,
         file_operations::{
             FileOperationKind, ItemState, OperationId, OperationItem, OperationManager,
-            OperationResource, OperationResult, OperationState, TransferRateEstimator,
-            UndoBeginError, UndoEntry, UndoHistory, UndoItem, UndoSourceKind,
+            OperationResource, OperationResult, OperationState, PermanentDeletePhase,
+            PermanentDeleteStage, TransferRateEstimator, UndoBeginError, UndoEntry, UndoHistory,
+            UndoItem, UndoSourceKind,
         },
         folder_size_scheduler::{FOLDER_SIZE_QUEUE_CAPACITY, FolderSizeCommit, FolderSizeQuery},
         thumbnail_scheduler::{ThumbnailKey, ThumbnailPlans},
@@ -1039,6 +1040,10 @@ pub fn export_file_operation_center_state(path: &Path) -> io::Result<()> {
         (6, "local", "partially_completed", 0, false, false, true),
         (7, "network", "failed", 0, false, false, true),
     ];
+    let permanent_delete_cleanup = format!(
+        "{{\"phase\":\"releasing_space\",\"status_zh\":\"已从原位置移除，正在释放空间\",\"completed_status_zh\":\"空间已释放\",\"remaining_path\":{:?},\"source_disappearance_is_completion\":false}}",
+        r"C:\Example\.asterfiles-cleanup\task\payload-0"
+    );
     let operations = states.iter().map(|(id, resource, state, queue, prominent, can_cancel, can_retry)| {
         format!("{{\"id\":{id},\"resource\":\"{resource}\",\"state\":\"{state}\",\"queue_position\":{queue},\"prominent\":{prominent},\"can_cancel\":{can_cancel},\"can_retry\":{can_retry},\"retry_item_count\":{},\"failure_summary\":{},\"speed_state\":\"{}\",\"eta_state\":\"{}\"}}",
             usize::from(*can_retry),
@@ -1056,8 +1061,9 @@ pub fn export_file_operation_center_state(path: &Path) -> io::Result<()> {
                 "{{\n  \"schema_version\": 2,\n",
                 "  \"scenario\": \"file-operation-center\",\n",
                 "  \"scope\": \"pure_model_no_ui_no_io\",\n",
-                "  \"close_semantics\": {{\"action\":\"cancel_all_and_close\",\"task_states_unchanged\":false}},\n",
+                "  \"close_semantics\": {{\"action\":\"hide_window\",\"task_states_unchanged\":true}},\n",
                 "  \"undo\": {{\"available\":{},\"history_depth\":{},\"latest_kind\":\"{}\",\"in_progress\":{},\"last_failure\":{},\"source\":\"live_model_projection\"}},\n",
+                "  \"permanent_delete_cleanup\": {},\n",
                 "  \"operations\": [\n    {}\n  ]\n}}\n"
             ),
             undo_available,
@@ -1068,6 +1074,7 @@ pub fn export_file_operation_center_state(path: &Path) -> io::Result<()> {
                 .last_failure()
                 .map(|value| format!("{:?}", value))
                 .unwrap_or_else(|| "null".to_owned()),
+            permanent_delete_cleanup,
             operations
         ),
     )
@@ -2689,7 +2696,7 @@ impl AppState {
         }
         if self.windows.len() > 1 {
             WindowCloseAction::CloseWindow
-        } else if self.operations.has_active_tasks() {
+        } else if self.operations.has_foreground_active_tasks() {
             WindowCloseAction::ConfirmApplicationExit
         } else {
             WindowCloseAction::ExitApplication
@@ -3915,6 +3922,18 @@ enum FileOperationEvent {
         id: OperationId,
         progress: platform::windows::file_operation::RecycleProgress,
     },
+    PermanentDeleteStage {
+        id: OperationId,
+        stage: PermanentDeleteStage,
+        item_updates: Vec<(usize, PathBuf, PathBuf)>,
+        affected_directories: Vec<PathBuf>,
+    },
+    PermanentDeleteCommitted {
+        id: OperationId,
+        cleanup: Option<FileOperationRequest>,
+        result: OperationResult,
+        item_states: Vec<(usize, ItemState, Option<String>)>,
+    },
     RecycleDiscovery {
         id: OperationId,
         discovered_items: usize,
@@ -4618,7 +4637,7 @@ pub fn run(
         network_request_sender.clone(),
         state.clone(),
     );
-    scan_cleanup_diagnostics(&ui, state.clone());
+    scan_cleanup_diagnostics(operation_sender.clone(), state.clone());
     start_sidebar_loader(&ui, state.clone());
     start_library_loader(&ui, state.clone(), request_sender.clone());
     start_network_location_loader(&ui, state.clone());
@@ -4877,6 +4896,9 @@ fn open_external_paths(
     paths: Vec<PathBuf>,
 ) {
     for path in paths {
+        if crate::domain::folder_size_scheduler::is_internal_cleanup_path(&path) {
+            continue;
+        }
         let tab_id = state
             .lock()
             .ok()
@@ -4907,6 +4929,9 @@ fn submit_navigation(
     path: PathBuf,
     kind: NavigationKind,
 ) -> bool {
+    if crate::domain::folder_size_scheduler::is_internal_cleanup_path(&path) {
+        return false;
+    }
     let request = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         app.cancel_column_drag();
@@ -4951,6 +4976,9 @@ fn submit_network_navigation(
     path: PathBuf,
     kind: NavigationKind,
 ) -> bool {
+    if crate::domain::folder_size_scheduler::is_internal_cleanup_path(&path) {
+        return false;
+    }
     let request = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         app.cancel_column_drag();
@@ -5010,6 +5038,11 @@ fn submit_reveal_navigation(
     parent: PathBuf,
     target: PathBuf,
 ) -> Option<TabId> {
+    if crate::domain::folder_size_scheduler::is_internal_cleanup_path(&parent)
+        || crate::domain::folder_size_scheduler::is_internal_cleanup_path(&target)
+    {
+        return None;
+    }
     let (tab_id, request) = {
         let mut app = state.lock().ok()?;
         if app
@@ -5905,6 +5938,17 @@ fn enqueue_operation(
             );
         }
     }
+    if items.iter().any(|item| {
+        item.source
+            .as_deref()
+            .is_some_and(crate::domain::folder_size_scheduler::is_internal_cleanup_path)
+            || item
+                .destination
+                .as_deref()
+                .is_some_and(crate::domain::folder_size_scheduler::is_internal_cleanup_path)
+    }) {
+        return;
+    }
     let resource = operation_resource(&items);
     let request = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
@@ -6056,20 +6100,6 @@ fn cancel_operations(state: &SharedSessions, ids: impl IntoIterator<Item = Opera
         }
     }
     refresh_operation_badges(state);
-}
-
-fn cancel_all_operations(state: &SharedSessions) {
-    let ids = state
-        .lock()
-        .map(|app| {
-            app.operations
-                .iter()
-                .filter(|task| task.state.is_active())
-                .map(|task| task.id)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    cancel_operations(state, ids);
 }
 
 fn operation_resource(items: &[OperationItem]) -> OperationResource {
@@ -6598,19 +6628,25 @@ fn submit_rename(
     Ok(())
 }
 
-fn should_fast_remove(path: &Path) -> bool {
-    if crate::network::is_unc_path(path) {
+fn is_fast_remove_candidate(path: &Path) -> bool {
+    if crate::network::is_unc_path(path) || path.parent().is_none() {
         return false;
     }
-    let protected = path.parent().is_none()
-        || std::env::var_os("USERPROFILE").is_some_and(|home| Path::new(&home) == path)
+    let protected = std::env::var_os("USERPROFILE").is_some_and(|home| Path::new(&home) == path)
         || std::env::current_dir().is_ok_and(|workspace| workspace == path);
-    !protected
-        && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
-        && std::fs::read_dir(path)
-            .ok()
-            .and_then(|mut entries| entries.nth(999))
-            .is_some()
+    if protected {
+        return false;
+    }
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        let file_type = metadata.file_type();
+        file_type.is_dir() && !file_type.is_symlink()
+    })
+}
+
+fn cleanup_record_root() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|root| root.join("AsterFiles").join("cleanup-tasks"))
 }
 
 fn pending_permanent_delete(state: &WindowSessions) -> Option<(TabId, Vec<OperationItem>)> {
@@ -6624,6 +6660,30 @@ fn pending_permanent_delete(state: &WindowSessions) -> Option<(TabId, Vec<Operat
         (!items.is_empty()).then_some((tab.id, items))
     })
 }
+
+fn request_permanent_delete(
+    state: &WindowSessions,
+    ui: &AppWindow,
+    delete_ui: &ConfirmationWindow,
+) {
+    let pending = pending_permanent_delete(state);
+    if pending.is_none() {
+        return;
+    }
+    if let Ok(mut app) = state.lock() {
+        app.pending_permanent_delete = pending;
+    }
+    platform::windows::window_trace::log_diagnostic(
+        "permanent-delete-confirmation-requested",
+        &format!("window={}", state.window_id.0),
+    );
+    show_confirmation_window(ui, None, delete_ui);
+}
+
+fn context_delete_request(command: i32, shift_down: bool) -> Option<bool> {
+    (command == 6).then_some(shift_down)
+}
+
 fn submit_delete_items(
     state: &SharedSessions,
     sender: &mpsc::Sender<FileOperationRequest>,
@@ -6743,6 +6803,7 @@ struct QuickMenuState {
     next_submenu_node: i32,
     active_submenu_token: Option<u64>,
     active_submenu_request: u64,
+    pending_shell_delete_permanent: bool,
 }
 
 type SharedQuickMenu = Arc<Mutex<QuickMenuState>>;
@@ -12979,11 +13040,21 @@ fn wire_callbacks(
             3 => request_clipboard_write(&state_for_context_command, &clipboard_for_context, true),
             4 => request_clipboard_paste(&state_for_context_command, &clipboard_for_context),
             5 => begin_rename_ui(&weak, &state_for_context_command),
-            6 => submit_delete(
-                &state_for_context_command,
-                &sender_for_context_command,
-                false,
-            ),
+            6 => {
+                if context_delete_request(6, platform::windows::shift_key_down()) == Some(true) {
+                    if let (Some(ui), Some(delete_ui)) =
+                        (weak.upgrade(), delete_weak_for_context.upgrade())
+                    {
+                        request_permanent_delete(&state_for_context_command, &ui, &delete_ui);
+                    }
+                } else {
+                    submit_delete(
+                        &state_for_context_command,
+                        &sender_for_context_command,
+                        false,
+                    );
+                }
+            }
             CMD_REFRESH => {
                 if let Some(ui) = weak.upgrade() {
                     ui.invoke_refresh();
@@ -13395,28 +13466,6 @@ fn wire_callbacks(
                     }
                 }
             }
-            7 => {
-                if delete_weak_for_context
-                    .upgrade()
-                    .is_some_and(|window| window.window().is_visible())
-                {
-                    if let (Some(ui), Some(delete_ui)) =
-                        (weak.upgrade(), delete_weak_for_context.upgrade())
-                    {
-                        show_confirmation_window(&ui, None, &delete_ui);
-                    }
-                    return;
-                }
-                let pending = pending_permanent_delete(&state_for_context_command);
-                if let Ok(mut app) = state_for_context_command.lock() {
-                    app.pending_permanent_delete = pending;
-                }
-                if let (Some(ui), Some(delete_ui)) =
-                    (weak.upgrade(), delete_weak_for_context.upgrade())
-                {
-                    show_confirmation_window(&ui, None, &delete_ui);
-                }
-            }
             command if command >= SHELL_CONTEXT_COMMAND_BASE => {
                 let Some(identity) = quick_menu_for_command
                     .lock()
@@ -13427,6 +13476,14 @@ fn wire_callbacks(
                     return;
                 };
                 let command_id = (command - SHELL_CONTEXT_COMMAND_BASE) as u32;
+                let shell_delete_permanent = quick_menu_for_command.lock().ok().is_some_and(|menu| {
+                    menu.all_rows.iter().any(|row| {
+                        row.id == command && row.search_text.as_str().eq_ignore_ascii_case("delete")
+                    })
+                }) && platform::windows::shift_key_down();
+                if let Ok(mut menu) = quick_menu_for_command.lock() {
+                    menu.pending_shell_delete_permanent = shell_delete_permanent;
+                }
                 let creates_item = quick_menu_for_command.lock().ok().is_some_and(|menu| {
                     menu.active_submenu_token
                         .is_some_and(|token| menu.create_submenu_token == Some(token))
@@ -13557,21 +13614,8 @@ fn wire_callbacks(
     let delete_weak = delete_ui.as_weak();
     ui.on_request_delete(move |permanent| {
         if permanent {
-            if delete_weak
-                .upgrade()
-                .is_some_and(|window| window.window().is_visible())
-            {
-                if let (Some(ui), Some(delete_ui)) = (weak.upgrade(), delete_weak.upgrade()) {
-                    show_confirmation_window(&ui, None, &delete_ui);
-                }
-                return;
-            }
-            let pending = pending_permanent_delete(&state_for_delete);
-            if let Ok(mut app) = state_for_delete.lock() {
-                app.pending_permanent_delete = pending;
-            }
             if let (Some(ui), Some(delete_ui)) = (weak.upgrade(), delete_weak.upgrade()) {
-                show_confirmation_window(&ui, None, &delete_ui);
+                request_permanent_delete(&state_for_delete, &ui, &delete_ui);
             }
         } else {
             submit_delete(&state_for_delete, &sender_for_delete, false);
@@ -13651,6 +13695,17 @@ fn should_close_context_menu(event: &winit::event::WindowEvent) -> bool {
 
 fn keyboard_shortcuts_suppressed(rename_editing: bool, context_menu_open: bool) -> bool {
     rename_editing || context_menu_open
+}
+
+fn delete_shortcut_request(
+    is_delete: bool,
+    control: bool,
+    alt: bool,
+    settings_active: bool,
+    editing_address: bool,
+    shift: bool,
+) -> Option<bool> {
+    (is_delete && !control && !alt && !settings_active && !editing_address).then_some(shift)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14026,7 +14081,7 @@ fn wire_mouse_navigation(
                 let modifiers = modifiers.get();
                 let control = modifiers.control_key();
                 let alt = modifiers.alt_key();
-                let shift = modifiers.shift_key();
+                let shift = modifiers.shift_key() || platform::windows::shift_key_down();
                 let super_key = modifiers.super_key();
                 let editing_address = ui.get_address_editing();
                 let settings_active = ui.get_active_is_settings();
@@ -14035,6 +14090,17 @@ fn wire_mouse_navigation(
                     Key::Character(value) => Some(value.as_str()),
                     _ => None,
                 };
+                if let Some(permanent) = delete_shortcut_request(
+                    matches!(&event.logical_key, Key::Named(NamedKey::Delete)),
+                    control,
+                    alt,
+                    settings_active,
+                    editing_address,
+                    shift,
+                ) {
+                    ui.invoke_request_delete(permanent);
+                    return EventResult::PreventDefault;
+                }
                 if editing_address || settings_active {
                     type_select.borrow_mut().clear();
                 }
@@ -14195,12 +14261,6 @@ fn wire_mouse_navigation(
                         if !control && !alt && !shift && !settings_active && !editing_address =>
                     {
                         ui.invoke_begin_rename();
-                        true
-                    }
-                    Key::Named(NamedKey::Delete)
-                        if !control && !alt && !settings_active && !editing_address =>
-                    {
-                        ui.invoke_request_delete(shift);
                         true
                     }
                     Key::Named(NamedKey::F10)
@@ -15397,13 +15457,21 @@ fn show_confirmation_window(
 ) {
     confirmation_ui.set_demo_mode(false);
     if confirmation_ui.window().is_visible() {
+        position_window_centered(ui, operation_ui, confirmation_ui);
         confirmation_ui
             .window()
             .with_winit_window(|window| window.focus_window());
         return;
     }
     position_window_centered(ui, operation_ui, confirmation_ui);
-    let _ = confirmation_ui.show();
+    if let Err(error) = confirmation_ui.show() {
+        platform::windows::window_trace::log_diagnostic(
+            "confirmation-window-show-failed",
+            &error.to_string(),
+        );
+        eprintln!("failed to show confirmation window: {error}");
+        return;
+    }
     confirmation_ui
         .window()
         .with_winit_window(|window| window.focus_window());
@@ -15870,34 +15938,22 @@ fn wire_operation_window(
     use winit::platform::windows::{CornerPreference, WindowExtWindows};
 
     let auto_opened = Rc::new(Cell::new(false));
+
     let operation_weak = operation_ui.as_weak();
-    let auto_opened_for_hide = auto_opened.clone();
-    let state_for_hide = state.clone();
-    operation_ui.on_request_hide(move || {
-        platform::windows::window_trace::log_diagnostic(
-            "operation-window-cancel-all-requested",
-            "source=close-button",
-        );
-        cancel_all_operations(&state_for_hide);
-        auto_opened_for_hide.set(false);
-        if let Some(operation_ui) = operation_weak.upgrade() {
-            let _ = operation_ui.hide();
-        }
-    });
-    let operation_weak = operation_ui.as_weak();
-    let auto_opened_for_native_close = auto_opened.clone();
-    let state_for_native_close = state.clone();
+    let auto_opened_for_close = auto_opened.clone();
     operation_ui.window().on_close_requested(move || {
         platform::windows::window_trace::log_diagnostic(
-            "operation-window-cancel-all-requested",
-            "source=native-close",
+            "operation-window-hide-requested",
+            "source=window-close",
         );
-        cancel_all_operations(&state_for_native_close);
-        auto_opened_for_native_close.set(false);
-        if let Some(operation_ui) = operation_weak.upgrade() {
-            let _ = operation_ui.hide();
+        auto_opened_for_close.set(false);
+        if operation_weak.upgrade().is_none() {
+            platform::windows::window_trace::log_diagnostic(
+                "operation-window-hide-failed",
+                "source=window-close,error=window-unavailable",
+            );
         }
-        slint::CloseRequestResponse::KeepWindowShown
+        slint::CloseRequestResponse::HideWindow
     });
     let operation_weak = operation_ui.as_weak();
     operation_ui.on_drag_window(move || {
@@ -15916,16 +15972,14 @@ fn wire_operation_window(
 
     let state_for_cancel = state.clone();
     let operation_weak = operation_ui.as_weak();
-    let auto_opened_for_cancel = auto_opened.clone();
     operation_ui.on_cancel_operation(move |id| {
         platform::windows::window_trace::log_diagnostic(
             "operation-window-cancel-requested",
             &format!("id={id}"),
         );
         cancel_operations(&state_for_cancel, [OperationId(id as u64)]);
-        auto_opened_for_cancel.set(false);
         if let Some(operation_ui) = operation_weak.upgrade() {
-            let _ = operation_ui.hide();
+            refresh_operation_window(&operation_ui, &state_for_cancel);
         }
     });
 
@@ -15974,7 +16028,12 @@ fn wire_operation_window(
             };
             let removed = state_for_auto_open
                 .lock()
-                .map(|mut app| app.operations.prune_transient(Duration::ZERO))
+                .map(|mut app| {
+                    app.operations.prune_transient_with_retained_cleanup(
+                        Duration::ZERO,
+                        Duration::from_secs(10),
+                    )
+                })
                 .unwrap_or_default();
             if removed > 0 {
                 refresh_operation_badges(&state_for_auto_open);
@@ -16032,10 +16091,12 @@ fn should_close_auto_opened_operation_window(auto_opened: bool, app: &AppState) 
 
 fn should_auto_open_operation_window(app: &AppState) -> bool {
     app.operations.iter().any(|task| {
-        matches!(
-            task.state,
-            OperationState::Preflight | OperationState::Running | OperationState::Paused
-        ) && task.cancellation.active_elapsed(task.started_at) >= Duration::from_millis(800)
+        task.kind != FileOperationKind::PermanentDelete
+            && matches!(
+                task.state,
+                OperationState::Preflight | OperationState::Running | OperationState::Paused
+            )
+            && task.cancellation.active_elapsed(task.started_at) >= Duration::from_millis(800)
     })
 }
 
@@ -16080,33 +16141,30 @@ fn refresh_operation_window(ui: &OperationWindow, state: &SharedSessions) {
     ui.window()
         .set_size(slint::LogicalSize::new(580.0, window_height));
     ui.set_dark_theme(dark_theme);
-    let (title, cancel, retry, pause, resume, pausing, cancelling, empty, minimize, close) =
-        match language {
-            Language::Chinese => (
-                "文件操作",
-                "取消",
-                "重试",
-                "暂停",
-                "继续",
-                "正在暂停",
-                "正在取消",
-                "没有文件操作",
-                "最小化",
-                "关闭",
-            ),
-            Language::English => (
-                "File operations",
-                "Cancel",
-                "Retry",
-                "Pause",
-                "Resume",
-                "Pausing",
-                "Cancelling",
-                "No file operations",
-                "Minimize",
-                "Close",
-            ),
-        };
+    let (title, cancel, retry, pause, resume, pausing, cancelling, empty, close) = match language {
+        Language::Chinese => (
+            "文件操作",
+            "取消",
+            "重试",
+            "暂停",
+            "继续",
+            "正在暂停",
+            "正在取消",
+            "没有文件操作",
+            "关闭",
+        ),
+        Language::English => (
+            "File operations",
+            "Cancel",
+            "Retry",
+            "Pause",
+            "Resume",
+            "Pausing",
+            "Cancelling",
+            "No file operations",
+            "Close",
+        ),
+    };
     ui.set_text_file_operations(title.into());
     ui.set_text_cancel_operation(cancel.into());
     ui.set_text_retry_operation(retry.into());
@@ -16115,7 +16173,7 @@ fn refresh_operation_window(ui: &OperationWindow, state: &SharedSessions) {
     ui.set_text_pausing_operation(pausing.into());
     ui.set_text_cancelling_operation(cancelling.into());
     ui.set_text_no_operations(empty.into());
-    ui.set_text_window_minimize(minimize.into());
+
     ui.set_text_window_close(close.into());
 }
 
@@ -16458,37 +16516,86 @@ fn refresh_confirmation_windows(
     exit_ui.set_primary_text(cancel_exit.into());
     exit_ui.set_secondary_text(wait.into());
 }
-fn scan_cleanup_diagnostics(_ui: &AppWindow, state: SharedSessions) {
-    let roots = state
-        .lock()
-        .map(|app| app.stable_locations())
-        .unwrap_or_default();
-    thread::spawn(move || {
-        let pending = roots
-            .into_iter()
-            .filter_map(|location| location.directory_path().map(Path::to_path_buf))
-            .map(|path| path.join(".asterfiles-cleanup"))
-            .find(|path| {
-                std::fs::read_dir(path)
-                    .ok()
-                    .and_then(|mut entries| entries.next())
-                    .is_some()
-            });
-        if let Some(path) = pending {
-            let state_for_ui = state.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Ok(mut app) = state_for_ui.lock() {
-                    app.operation_errors.push(format!(
-                        "Pending cleanup requires attention: {}",
-                        display_path(&path)
-                    ));
-                }
-                refresh_all_windows(&state_for_ui);
-            });
+fn recovered_cleanup_requests(
+    operations: &mut OperationManager,
+    records: Vec<crate::fs::file_operations::CleanupTaskRecord>,
+) -> Vec<FileOperationRequest> {
+    for record in records {
+        let items = record
+            .items
+            .iter()
+            .filter_map(|item| {
+                let pending = item.remaining_path.clone()?;
+                Some(OperationItem::cleanup_pending(
+                    item.original_path.clone(),
+                    pending,
+                    record.record_path.clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            if let Err(error) = crate::fs::file_operations::discard_empty_cleanup_task(&record) {
+                eprintln!("unable to discard completed cleanup task: {error:?}");
+            }
+        } else {
+            operations.submit_recovered_cleanup(None, items);
         }
-    });
+    }
+    let Some(id) = operations
+        .start_next(OperationResource::Cleanup)
+        .ok()
+        .flatten()
+    else {
+        return Vec::new();
+    };
+    mark_operation_running_if_ready(operations, id);
+    operations
+        .task(id)
+        .map(|task| {
+            vec![FileOperationRequest {
+                id,
+                kind: task.kind,
+                resource: task.resource,
+                items: task.items.clone(),
+                undo_items: task.undo_items.clone(),
+                undo_source_manifests: task.undo_source_manifests.clone(),
+                cancellation: task.cancellation.clone(),
+            }]
+        })
+        .unwrap_or_default()
 }
 
+fn scan_cleanup_diagnostics(
+    operation_sender: mpsc::Sender<FileOperationRequest>,
+    state: SharedSessions,
+) {
+    let Some(record_root) = cleanup_record_root() else {
+        return;
+    };
+    thread::spawn(move || {
+        let discovered = crate::fs::file_operations::discover_cleanup_tasks(&record_root);
+        let state_for_ui = state.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let requests = if let Ok(mut app) = state_for_ui.lock() {
+                match discovered {
+                    Ok(records) => recovered_cleanup_requests(&mut app.operations, records),
+                    Err(error) => {
+                        app.operation_errors.push(format!(
+                            "Unable to read AsterFiles cleanup records: {error:?}"
+                        ));
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            for request in requests {
+                let _ = operation_sender.send(request);
+            }
+            refresh_all_windows(&state_for_ui);
+        });
+    });
+}
 fn spawn_clipboard_worker() -> (
     mpsc::Sender<ClipboardRequest>,
     mpsc::Receiver<ClipboardEvent>,
@@ -16845,7 +16952,15 @@ fn start_shell_menu_event_pump(
                                     "copy" => ui.invoke_copy_selection(false),
                                     "cut" => ui.invoke_copy_selection(true),
                                     "paste" => ui.invoke_paste_files(),
-                                    "delete" => ui.invoke_request_delete(false),
+                                    "delete" => {
+                                        let permanent =
+                                            menu_state.lock().ok().is_some_and(|mut menu| {
+                                                std::mem::take(
+                                                    &mut menu.pending_shell_delete_permanent,
+                                                )
+                                            });
+                                        ui.invoke_request_delete(permanent);
+                                    }
                                     "rename" => ui.invoke_begin_rename(),
                                     _ => {}
                                 }
@@ -17303,6 +17418,7 @@ fn spawn_file_operation_worker() -> (
     let (request_sender, request_receiver) = mpsc::channel::<FileOperationRequest>();
     let (local_sender, local_receiver) = mpsc::channel::<FileOperationRequest>();
     let (network_sender, network_receiver) = mpsc::channel::<FileOperationRequest>();
+    let (cleanup_sender, cleanup_receiver) = mpsc::channel::<FileOperationRequest>();
     let (event_sender, event_receiver) = mpsc::channel::<FileOperationEvent>();
     let conflict_gate = Arc::new(Mutex::new(()));
     let dispatcher_event_sender = event_sender.clone();
@@ -17311,6 +17427,7 @@ fn spawn_file_operation_worker() -> (
             let sender = match request.resource {
                 OperationResource::Local => &local_sender,
                 OperationResource::Network => &network_sender,
+                OperationResource::Cleanup => &cleanup_sender,
             };
             if sender.send(request).is_err() {
                 break;
@@ -17318,7 +17435,12 @@ fn spawn_file_operation_worker() -> (
         }
     });
     run_file_operation_worker(local_receiver, event_sender.clone(), conflict_gate.clone());
-    run_file_operation_worker(network_receiver, dispatcher_event_sender, conflict_gate);
+    run_file_operation_worker(
+        network_receiver,
+        event_sender.clone(),
+        conflict_gate.clone(),
+    );
+    run_file_operation_worker(cleanup_receiver, dispatcher_event_sender, conflict_gate);
     (request_sender, event_receiver)
 }
 
@@ -17342,6 +17464,11 @@ fn mark_operation_running_if_ready(operations: &mut OperationManager, id: Operat
     let Some((kind, resource)) = operations.task(id).map(|task| (task.kind, task.resource)) else {
         return;
     };
+    if resource == OperationResource::Cleanup
+        && let Some(task) = operations.task_mut(id)
+    {
+        task.set_permanent_delete_stage(PermanentDeleteStage::ReleasingSpace);
+    }
     if !uses_local_recycle_batch(kind, resource) {
         let _ = operations.mark_running(id);
     }
@@ -17531,6 +17658,19 @@ fn execute_file_operation_request(
     if uses_local_recycle_batch(request.kind, request.resource) {
         execute_recycle_delete_request(request, event_sender);
         return;
+    }
+    if request.kind == FileOperationKind::PermanentDelete {
+        match request.resource {
+            OperationResource::Local => {
+                commit_permanent_delete_request(request, event_sender);
+                return;
+            }
+            OperationResource::Cleanup => {
+                execute_cleanup_request(request, event_sender);
+                return;
+            }
+            OperationResource::Network => {}
+        }
     }
     let copy_or_move = matches!(
         request.kind,
@@ -17777,6 +17917,281 @@ fn start_recycle_discovery(
         .ok()
 }
 
+fn permanent_delete_cleanup_request(
+    record: &crate::fs::file_operations::CleanupTaskRecord,
+) -> Option<FileOperationRequest> {
+    let items = record
+        .items
+        .iter()
+        .filter_map(|item| {
+            let pending = item.remaining_path.clone()?;
+            Some(OperationItem::cleanup_pending(
+                item.original_path.clone(),
+                pending,
+                record.record_path.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    (!items.is_empty()).then(|| FileOperationRequest {
+        id: OperationId(0),
+        kind: FileOperationKind::PermanentDelete,
+        resource: OperationResource::Cleanup,
+        undo_items: Vec::new(),
+        undo_source_manifests: vec![None; items.len()],
+        cancellation: crate::domain::file_operations::CancellationToken::new(),
+        items,
+    })
+}
+
+fn commit_permanent_delete_request(
+    request: FileOperationRequest,
+    event_sender: &mpsc::Sender<FileOperationEvent>,
+) {
+    let record_root = cleanup_record_root();
+    commit_permanent_delete_request_with_root(request, event_sender, record_root.as_deref());
+}
+
+fn commit_permanent_delete_request_with_root(
+    request: FileOperationRequest,
+    event_sender: &mpsc::Sender<FileOperationEvent>,
+    record_root: Option<&Path>,
+) {
+    let original_indices = request
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            item.state == ItemState::Pending
+                && item.permanent_delete_phase == PermanentDeletePhase::Original
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let candidates = original_indices
+        .iter()
+        .filter_map(|index| {
+            let path = request.items[*index].source.as_ref()?;
+            is_fast_remove_candidate(path).then_some(path.clone())
+        })
+        .collect::<Vec<_>>();
+    let mut succeeded = Vec::new();
+    let mut failed = Vec::new();
+    let mut affected = Vec::new();
+    let mut item_states = Vec::new();
+    let mut moved_indices = HashSet::new();
+    let mut cleanup = None;
+
+    if !candidates.is_empty()
+        && let Some(record_root) = record_root
+    {
+        match crate::fs::file_operations::create_cleanup_task(
+            &candidates,
+            record_root,
+            &request.cancellation,
+        ) {
+            Ok(record) => {
+                let mut updates = Vec::new();
+                for record_item in &record.items {
+                    let Some(index) = original_indices.iter().copied().find(|index| {
+                        request.items[*index].source.as_ref() == Some(&record_item.original_path)
+                    }) else {
+                        continue;
+                    };
+                    if let Some(pending) = record_item.remaining_path.clone()
+                        && pending.exists()
+                    {
+                        moved_indices.insert(index);
+                        succeeded.push(record_item.original_path.clone());
+                        item_states.push((index, ItemState::Succeeded, None));
+                        updates.push((index, pending, record.record_path.clone()));
+                        if let Some(parent) =
+                            record_item.original_path.parent().map(Path::to_path_buf)
+                            && !affected.contains(&parent)
+                        {
+                            affected.push(parent);
+                        }
+                    }
+                }
+                if !updates.is_empty() {
+                    let _ = event_sender.send(FileOperationEvent::PermanentDeleteStage {
+                        id: request.id,
+                        stage: PermanentDeleteStage::SourceRemoved,
+                        item_updates: updates,
+                        affected_directories: affected.clone(),
+                    });
+                    cleanup = permanent_delete_cleanup_request(&record);
+                    if cleanup.is_none()
+                        && let Err(error) =
+                            crate::fs::file_operations::discard_empty_cleanup_task(&record)
+                    {
+                        eprintln!("unable to discard empty cleanup task: {error:?}");
+                    }
+                }
+            }
+            Err(crate::fs::file_operations::OperationError::Cancelled) => {}
+            Err(error) => {
+                eprintln!("fast removal unavailable; using ordinary deletion: {error:?}")
+            }
+        }
+    }
+
+    for index in original_indices {
+        if moved_indices.contains(&index) {
+            continue;
+        }
+        let Some(path) = request.items[index].source.as_ref() else {
+            let message = "missing source".to_owned();
+            failed.push((PathBuf::new(), message.clone()));
+            item_states.push((index, ItemState::Failed, Some(message)));
+            continue;
+        };
+        match crate::fs::file_operations::permanently_delete(path, &request.cancellation) {
+            Ok(report) => {
+                succeeded.push(path.clone());
+                item_states.push((index, ItemState::Succeeded, None));
+                for directory in report.affected_directories {
+                    if !affected.contains(&directory) {
+                        affected.push(directory);
+                    }
+                }
+            }
+            Err(crate::fs::file_operations::OperationError::Cancelled) => {
+                item_states.push((index, ItemState::Cancelled, None));
+            }
+            Err(error) => {
+                let message = format!("{error:?}");
+                failed.push((path.clone(), message.clone()));
+                item_states.push((index, ItemState::Failed, Some(message)));
+            }
+        }
+    }
+
+    let _ = event_sender.send(FileOperationEvent::PermanentDeleteCommitted {
+        id: request.id,
+        cleanup,
+        result: OperationResult {
+            succeeded,
+            skipped: Vec::new(),
+            failed,
+            affected_directories: affected,
+        },
+        item_states,
+    });
+}
+
+fn execute_cleanup_request(
+    request: FileOperationRequest,
+    event_sender: &mpsc::Sender<FileOperationEvent>,
+) {
+    let _ = event_sender.send(FileOperationEvent::PermanentDeleteStage {
+        id: request.id,
+        stage: PermanentDeleteStage::ReleasingSpace,
+        item_updates: Vec::new(),
+        affected_directories: Vec::new(),
+    });
+    let mut succeeded = Vec::new();
+    let mut failed = Vec::new();
+    let mut item_states = Vec::new();
+    let mut groups = HashMap::<(PathBuf, String), Vec<usize>>::new();
+    for (index, item) in request.items.iter().enumerate() {
+        if item.state != ItemState::Pending {
+            continue;
+        }
+        let task_id = item
+            .destination
+            .as_deref()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .map(|value| value.to_string_lossy().into_owned());
+        let record_root = item
+            .cleanup_record
+            .as_deref()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+        if let (Some(record_root), Some(task_id)) = (record_root, task_id) {
+            groups
+                .entry((record_root, task_id))
+                .or_default()
+                .push(index);
+        } else {
+            let original = item.source.clone().unwrap_or_default();
+            let message = "cleanup task identity is missing".to_owned();
+            failed.push((original, message.clone()));
+            item_states.push((index, ItemState::Failed, Some(message)));
+        }
+    }
+    for ((record_root, task_id), indices) in groups {
+        let progress_id = request.id;
+        let events = event_sender.clone();
+        match crate::fs::file_operations::retry_cleanup_task(
+            &record_root,
+            &task_id,
+            &request.cancellation,
+            &mut |snapshot| {
+                let _ = events.send(FileOperationEvent::Progress {
+                    id: progress_id,
+                    completed_items: snapshot.files.saturating_add(snapshot.directories) as usize,
+                    completed_files: snapshot.files as usize,
+                    total_files: None,
+                    discovered_files: 0,
+                    processed_bytes: snapshot.bytes,
+                    total_bytes: None,
+                    discovered_bytes: 0,
+                    scanning_complete: false,
+                    current_item: snapshot.current_path.clone().unwrap_or_default(),
+                    recent_speed_bps: None,
+                });
+            },
+        ) {
+            Ok(record) => {
+                for index in indices {
+                    let original = request.items[index].source.clone().unwrap_or_default();
+                    let record_item = record
+                        .items
+                        .iter()
+                        .find(|item| item.original_path == original);
+                    if record_item
+                        .and_then(|item| item.remaining_path.as_ref())
+                        .is_none()
+                    {
+                        succeeded.push(original);
+                        item_states.push((index, ItemState::Succeeded, None));
+                    } else if request.cancellation.is_cancelled() {
+                        item_states.push((index, ItemState::Cancelled, None));
+                    } else {
+                        let message = record_item
+                            .and_then(|item| item.error.clone())
+                            .or_else(|| record.error.clone())
+                            .unwrap_or_else(|| "cleanup did not finish".to_owned());
+                        failed.push((original, message.clone()));
+                        item_states.push((index, ItemState::Failed, Some(message)));
+                    }
+                }
+            }
+            Err(error) => {
+                let message = format!("{error:?}");
+                for index in indices {
+                    let original = request.items[index].source.clone().unwrap_or_default();
+                    failed.push((original, message.clone()));
+                    item_states.push((index, ItemState::Failed, Some(message.clone())));
+                }
+            }
+        }
+    }
+    let _ = event_sender.send(FileOperationEvent::Finished {
+        id: request.id,
+        result: OperationResult {
+            succeeded,
+            skipped: Vec::new(),
+            failed,
+            affected_directories: Vec::new(),
+        },
+        item_states,
+        completed_targets: Vec::new(),
+        undo_items: None,
+        failed_undo_items: Vec::new(),
+    });
+}
 fn execute_recycle_delete_request(
     request: FileOperationRequest,
     event_sender: &mpsc::Sender<FileOperationEvent>,
@@ -18353,29 +18768,7 @@ fn execute_file_operation_item(
             unreachable!("local recycle delete requests are executed as one Shell batch")
         }
         FileOperationKind::PermanentDelete => {
-            let path = item.source.as_ref().ok_or("missing source")?;
-            if should_fast_remove(path) {
-                let parent = path.parent().ok_or("missing parent")?;
-                let report = crate::fs::file_operations::fast_remove(
-                    path,
-                    &parent.join(".asterfiles-cleanup"),
-                    cancel,
-                )
-                .map_err(ExecuteFileOperationError::failed_debug)?;
-                if let Some(pending) = report.cleanup_pending.as_ref()
-                    && let Err(error) = crate::fs::file_operations::clean_pending(pending, cancel)
-                {
-                    let _ = std::fs::rename(pending, path);
-                    return Err(ExecuteFileOperationError::Failed(format!(
-                        "cleanup pending at {}: {error:?}",
-                        display_path(pending)
-                    )));
-                }
-                Ok(report)
-            } else {
-                crate::fs::file_operations::permanently_delete(path, cancel)
-                    .map_err(ExecuteFileOperationError::failed_debug)
-            }
+            unreachable!("local permanent delete requests use the two-stage batch executor")
         }
         FileOperationKind::FastRemove => {
             let path = item.source.as_ref().ok_or("missing source")?;
@@ -18389,7 +18782,6 @@ fn execute_file_operation_item(
             if let Some(pending) = report.cleanup_pending.as_ref()
                 && let Err(error) = crate::fs::file_operations::clean_pending(pending, cancel)
             {
-                let _ = std::fs::rename(pending, path);
                 return Err(ExecuteFileOperationError::Failed(format!(
                     "cleanup pending at {}: {error:?}",
                     display_path(pending)
@@ -18539,6 +18931,8 @@ fn start_file_operation_event_pump(
                     | FileOperationEvent::Progress { id, .. }
                     | FileOperationEvent::RecycleProgress { id, .. }
                     | FileOperationEvent::RecycleDiscovery { id, .. }
+                    | FileOperationEvent::PermanentDeleteStage { id, .. }
+                    | FileOperationEvent::PermanentDeleteCommitted { id, .. }
                     | FileOperationEvent::Conflict { id, .. }
                     | FileOperationEvent::Finished { id, .. } => *id,
                 };
@@ -18557,6 +18951,40 @@ fn start_file_operation_event_pump(
                     FileOperationEvent::Progress { .. }
                     | FileOperationEvent::RecycleProgress { .. }
                     | FileOperationEvent::RecycleDiscovery { .. } => unreachable!(),
+                    FileOperationEvent::PermanentDeleteStage {
+                        id,
+                        stage,
+                        item_updates,
+                        affected_directories,
+                    } => {
+                        if let Ok(mut app) = state.lock()
+                            && let Some(task) = app.operations.task_mut(id)
+                        {
+                            task.set_permanent_delete_stage(stage);
+                            if stage == PermanentDeleteStage::SourceRemoved {
+                                task.source_removed_at.get_or_insert_with(Instant::now);
+                            }
+                            if stage == PermanentDeleteStage::ReleasingSpace {
+                                task.cleanup_started_at.get_or_insert_with(Instant::now);
+                            }
+                            for (index, pending, record) in item_updates {
+                                if let Some(item) = task.items.get_mut(index) {
+                                    item.destination = Some(pending);
+                                    item.cleanup_record = Some(record);
+                                    item.permanent_delete_phase =
+                                        PermanentDeletePhase::CleanupPending;
+                                }
+                            }
+                        }
+                        if !affected_directories.is_empty() {
+                            refresh_affected_tabs(
+                                &directory_sender,
+                                &network_directory_sender,
+                                &state,
+                                &affected_directories,
+                            );
+                        }
+                    }
                     FileOperationEvent::Conflict {
                         id,
                         conflict,
@@ -18583,6 +19011,129 @@ fn start_file_operation_event_pump(
                                 &conflict_ui,
                             );
                         }
+                    }
+                    FileOperationEvent::PermanentDeleteCommitted {
+                        id,
+                        cleanup,
+                        result,
+                        item_states,
+                    } => {
+                        let (affected, requests) = {
+                            let mut app = state.lock().expect("app state mutex is not poisoned");
+                            if let Some(task) = app.operations.task_mut(id) {
+                                for (index, status, error) in item_states {
+                                    if let Some(item) = task.items.get_mut(index) {
+                                        item.state = status;
+                                        item.error = error;
+                                    }
+                                }
+                            }
+                            let cancelled = app
+                                .operations
+                                .task(id)
+                                .is_some_and(|task| task.cancellation.is_cancelled());
+                            let terminal = if cancelled
+                                && result.succeeded.is_empty()
+                                && result.failed.is_empty()
+                            {
+                                OperationState::Cancelled
+                            } else if cancelled
+                                || (!result.failed.is_empty() && !result.succeeded.is_empty())
+                            {
+                                OperationState::PartiallyCompleted
+                            } else if result.failed.is_empty() {
+                                OperationState::Completed
+                            } else {
+                                OperationState::Failed
+                            };
+                            let (origin_tab, task_items) = app
+                                .operations
+                                .task(id)
+                                .map(|task| (task.origin_tab, task.items.clone()))
+                                .unwrap_or((None, Vec::new()));
+                            let mut affected = result.affected_directories.clone();
+                            let registered = release_operation_directories(
+                                &mut app,
+                                FileOperationKind::PermanentDelete,
+                                &task_items,
+                            );
+                            affected.extend(registered.iter().cloned());
+                            affected.sort();
+                            affected.dedup();
+                            mark_recent_operation_changes(&mut app, &registered, &task_items);
+                            let _ = app.operations.finish(id, terminal, result);
+
+                            if let Some(cleanup) = cleanup {
+                                let cleanup_id = app.operations.submit(
+                                    OperationResource::Cleanup,
+                                    FileOperationKind::PermanentDelete,
+                                    origin_tab,
+                                    cleanup.items,
+                                );
+                                if let Some(task) = app.operations.task_mut(cleanup_id) {
+                                    task.source_removed_at = Some(Instant::now());
+                                    task.set_permanent_delete_stage(
+                                        PermanentDeleteStage::ReleasingSpace,
+                                    );
+                                }
+                            }
+
+                            let mut requests = Vec::new();
+                            for resource in [OperationResource::Cleanup, OperationResource::Local] {
+                                let next =
+                                    app.operations.start_next(resource).ok().flatten().and_then(
+                                        |next_id| {
+                                            mark_operation_running_if_ready(
+                                                &mut app.operations,
+                                                next_id,
+                                            );
+                                            app.operations.task(next_id).cloned().map(|task| {
+                                                let request = FileOperationRequest {
+                                                    id: next_id,
+                                                    kind: task.kind,
+                                                    resource: task.resource,
+                                                    items: task.items.clone(),
+                                                    undo_items: task.undo_items.clone(),
+                                                    undo_source_manifests: task
+                                                        .undo_source_manifests
+                                                        .clone(),
+                                                    cancellation: task.cancellation.clone(),
+                                                };
+                                                if resource != OperationResource::Cleanup {
+                                                    register_operation_directories(
+                                                        &mut app,
+                                                        request.kind,
+                                                        &request.items,
+                                                    );
+                                                }
+                                                request
+                                            })
+                                        },
+                                    );
+                                if let Some(next) = next {
+                                    requests.push(next);
+                                }
+                            }
+                            (affected, requests)
+                        };
+                        for request in requests {
+                            let _ = sender.send(request);
+                        }
+                        refresh_operation_badges(&state);
+                        let affected_roots = affected_drive_roots(&affected);
+                        if !affected_roots.is_empty() {
+                            begin_drive_capacity_refresh(
+                                &state,
+                                Some(&affected_roots),
+                                Duration::ZERO,
+                            );
+                        }
+                        refresh_affected_tabs(
+                            &directory_sender,
+                            &network_directory_sender,
+                            &state,
+                            &affected,
+                        );
                     }
                     FileOperationEvent::Finished {
                         id,
@@ -18660,8 +19211,11 @@ fn start_file_operation_event_pump(
                                     None,
                                 ));
                             let mut affected = result.affected_directories.clone();
-                            let registered =
-                                release_operation_directories(&mut app, kind, &task_items);
+                            let registered = if resource == OperationResource::Cleanup {
+                                HashSet::new()
+                            } else {
+                                release_operation_directories(&mut app, kind, &task_items)
+                            };
                             affected.extend(registered.iter().cloned());
                             let deferred = app
                                 .deferred_watch_directories
@@ -18722,7 +19276,13 @@ fn start_file_operation_event_pump(
                                     None
                                 };
                             let _ = app.operations.finish(id, terminal, result);
-                            if cancelled && kind != FileOperationKind::Undo {
+                            let cleanup_remains = kind == FileOperationKind::PermanentDelete
+                                && task_items.iter().any(|item| {
+                                    item.permanent_delete_phase
+                                        == PermanentDeletePhase::CleanupPending
+                                        && item.state != ItemState::Succeeded
+                                });
+                            if cancelled && kind != FileOperationKind::Undo && !cleanup_remains {
                                 app.operations.remove_terminal(id);
                             }
                             let next = app.operations.start_next(resource).ok().flatten().and_then(
@@ -18740,11 +19300,13 @@ fn start_file_operation_event_pump(
                                                 .clone(),
                                             cancellation: task.cancellation.clone(),
                                         };
-                                        register_operation_directories(
-                                            &mut app,
-                                            request.kind,
-                                            &request.items,
-                                        );
+                                        if request.resource != OperationResource::Cleanup {
+                                            register_operation_directories(
+                                                &mut app,
+                                                request.kind,
+                                                &request.items,
+                                            );
+                                        }
                                         request
                                     })
                                 },
@@ -19130,7 +19692,9 @@ fn prepare_retry(state: &SharedSessions, id: OperationId) -> Option<FileOperatio
         undo_source_manifests: vec![None; task.items.len()],
         cancellation: task.cancellation.clone(),
     };
-    register_operation_directories(&mut app, request.kind, &request.items);
+    if request.resource != OperationResource::Cleanup {
+        register_operation_directories(&mut app, request.kind, &request.items);
+    }
     Some(request)
 }
 fn spawn_directory_workers(
@@ -20317,6 +20881,11 @@ fn spawn_everything_worker(
                             let entries = items
                                 .into_iter()
                                 .enumerate()
+                                .filter(|(_, item)| {
+                                    !crate::domain::folder_size_scheduler::is_internal_cleanup_path(
+                                        &item.path,
+                                    )
+                                })
                                 .map(|(index, item)| FileEntry {
                                     id: EntryId(
                                         offset.saturating_add(index as u32).saturating_add(1),
@@ -20354,8 +20923,7 @@ fn spawn_everything_worker(
                                 })
                                 .collect::<Vec<_>>();
                             if !cancel.load(std::sync::atomic::Ordering::Acquire) {
-                                let response_valid = response_offsets_valid
-                                    && !(offset < total && entries.is_empty());
+                                let response_valid = response_offsets_valid;
                                 let _ = event_sender.send(EverythingEvent::SearchPage {
                                     tab_id,
                                     request_id,
@@ -22040,6 +22608,11 @@ fn start_network_location_loader(_ui: &AppWindow, state: SharedSessions) {
 
 fn normalize_restored_location(location: NavigationLocation) -> NavigationLocation {
     match location {
+        NavigationLocation::Directory(path)
+            if crate::domain::folder_size_scheduler::is_internal_cleanup_path(&path) =>
+        {
+            NavigationLocation::Directory(initial_path())
+        }
         NavigationLocation::Directory(path) => NavigationLocation::Directory(
             platform::windows::network::network_drive_to_unc(&path).unwrap_or(path),
         ),
@@ -22825,7 +23398,16 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
     let mut rows = app
         .operations
         .iter()
-        .filter(|task| operation_has_visible_row(task.state))
+        .filter(|task| {
+            (operation_has_visible_row(task.state) || is_cleanup_completion_receipt(task))
+                && (!task.recovered_cleanup
+                    || matches!(
+                        task.state,
+                        OperationState::Failed
+                            | OperationState::PartiallyCompleted
+                            | OperationState::WaitingConflict
+                    ))
+        })
         .map(|task| {
             let title = match (app.language, task.kind) {
                 (Language::Chinese, FileOperationKind::CreateFolder) => "新建文件夹",
@@ -22863,7 +23445,51 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
                     None => "Undo file operation",
                 },
             };
-            let status = operation_status_text(app.language, task.state);
+            let status = if task.kind == FileOperationKind::PermanentDelete {
+                match (app.language, task.permanent_delete_stage, task.state) {
+                    (
+                        Language::Chinese,
+                        Some(
+                            PermanentDeleteStage::SourceRemoved
+                            | PermanentDeleteStage::ReleasingSpace,
+                        ),
+                        OperationState::Queued | OperationState::Preflight,
+                    ) => "已从原位置移除，等待释放空间",
+                    (
+                        Language::English,
+                        Some(
+                            PermanentDeleteStage::SourceRemoved
+                            | PermanentDeleteStage::ReleasingSpace,
+                        ),
+                        OperationState::Queued | OperationState::Preflight,
+                    ) => "Removed from the original location; waiting to release space",
+                    (
+                        Language::Chinese,
+                        Some(
+                            PermanentDeleteStage::SourceRemoved
+                            | PermanentDeleteStage::ReleasingSpace,
+                        ),
+                        OperationState::Running
+                        | OperationState::Paused
+                        | OperationState::Cancelling,
+                    ) => "已从原位置移除，正在释放空间",
+                    (
+                        Language::English,
+                        Some(
+                            PermanentDeleteStage::SourceRemoved
+                            | PermanentDeleteStage::ReleasingSpace,
+                        ),
+                        OperationState::Running
+                        | OperationState::Paused
+                        | OperationState::Cancelling,
+                    ) => "Removed from the original location; releasing space",
+                    (Language::Chinese, _, OperationState::Completed) => "空间已释放",
+                    (Language::English, _, OperationState::Completed) => "Disk space released",
+                    _ => operation_status_text(app.language, task.state),
+                }
+            } else {
+                operation_status_text(app.language, task.state)
+            };
             let queue = app.operations.queue_position(task.id).map_or_else(
                 String::new,
                 |position| match app.language {
@@ -22872,9 +23498,26 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
                 },
             );
             let recycle_progress = uses_local_recycle_batch(task.kind, task.resource);
-            let progress_known = !recycle_progress && task.progress.scanning_complete;
+            let committed_cleanup = task.kind == FileOperationKind::PermanentDelete
+                && task.resource == OperationResource::Cleanup;
+            let cleanup_in_progress = committed_cleanup
+                && matches!(
+                    task.state,
+                    OperationState::Queued
+                        | OperationState::Preflight
+                        | OperationState::Running
+                        | OperationState::Paused
+                        | OperationState::Cancelling
+                );
+            let progress_known = if committed_cleanup {
+                task.state == OperationState::Completed
+            } else {
+                !recycle_progress && task.progress.scanning_complete
+            };
             let progress = if recycle_progress {
                 0.0
+            } else if committed_cleanup && task.state == OperationState::Completed {
+                1.0
             } else if progress_known {
                 task.progress
                     .total_bytes
@@ -22890,7 +23533,16 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
             } else {
                 0.0
             };
-            let (transferred, speed_text, eta_text) = if recycle_progress {
+            let (transferred, speed_text, eta_text) = if committed_cleanup {
+                (
+                    format!(
+                        "{:.1} MB",
+                        task.progress.processed_bytes as f64 / 1_048_576.0
+                    ),
+                    String::new(),
+                    "—".to_owned(),
+                )
+            } else if recycle_progress {
                 let transferred = String::new();
                 let texts = Texts::new(app.language);
                 let phase = if task.state == OperationState::Preflight {
@@ -22984,8 +23636,21 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
                 .items
                 .first()
                 .and_then(|item| item.destination.as_deref())
-                .and_then(Path::parent)
-                .map(display_path)
+                .map(|path| {
+                    if task.kind == FileOperationKind::PermanentDelete
+                        && task.permanent_delete_stage.is_some_and(|stage| {
+                            matches!(
+                                stage,
+                                PermanentDeleteStage::SourceRemoved
+                                    | PermanentDeleteStage::ReleasingSpace
+                            )
+                        })
+                    {
+                        display_path(path)
+                    } else {
+                        path.parent().map(display_path).unwrap_or_default()
+                    }
+                })
                 .unwrap_or_default();
             let current_item = task
                 .progress
@@ -22999,9 +23664,25 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
                 Language::Chinese => format!("来源：{source}"),
                 Language::English => format!("From: {source}"),
             };
-            let destination_line = match app.language {
-                Language::Chinese => format!("目标：{destination}"),
-                Language::English => format!("To: {destination}"),
+            let destination_line = if is_cleanup_completion_receipt(task) {
+                String::new()
+            } else if task.kind == FileOperationKind::PermanentDelete
+                && task.permanent_delete_stage.is_some_and(|stage| {
+                    matches!(
+                        stage,
+                        PermanentDeleteStage::SourceRemoved | PermanentDeleteStage::ReleasingSpace
+                    )
+                })
+            {
+                match app.language {
+                    Language::Chinese => format!("遗留位置：{destination}"),
+                    Language::English => format!("Remaining at: {destination}"),
+                }
+            } else {
+                match app.language {
+                    Language::Chinese => format!("目标：{destination}"),
+                    Language::English => format!("To: {destination}"),
+                }
             };
             let current_item_line = match app.language {
                 Language::Chinese => format!("当前项：{current_item}"),
@@ -23036,7 +23717,20 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
                     String::new()
                 }
                 .into(),
-                file_progress: if recycle_progress {
+                file_progress: if committed_cleanup {
+                    match (app.language, task.state) {
+                        (Language::Chinese, OperationState::Completed) => "空间已释放".to_owned(),
+                        (Language::English, OperationState::Completed) => {
+                            "Disk space released".to_owned()
+                        }
+                        (Language::Chinese, _) => {
+                            format!("已处理 {} 项", task.progress.completed_items)
+                        }
+                        (Language::English, _) => {
+                            format!("{} processed", task.progress.completed_items)
+                        }
+                    }
+                } else if recycle_progress {
                     let texts = Texts::new(app.language);
                     if task.state == OperationState::Preflight {
                         texts.recycle_preparing(
@@ -23070,21 +23764,24 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
                 speed: speed_text.into(),
                 eta: eta_text.into(),
                 paused: task.state == OperationState::Paused,
-                pause_pending: task.state == OperationState::Paused
+                pause_pending: !committed_cleanup
+                    && task.state == OperationState::Paused
                     && !task.cancellation.is_pause_acknowledged(),
-                cancel_pending: task.state == OperationState::Cancelling,
+                cancel_pending: !committed_cleanup && task.state == OperationState::Cancelling,
                 progress,
                 progress_known,
                 state: operation_state_index(task.state),
-                can_cancel: matches!(
-                    task.state,
-                    OperationState::Queued
-                        | OperationState::Preflight
-                        | OperationState::Running
-                        | OperationState::Paused
-                        | OperationState::WaitingConflict
-                ),
-                can_pause: !recycle_progress
+                can_cancel: !cleanup_in_progress
+                    && matches!(
+                        task.state,
+                        OperationState::Queued
+                            | OperationState::Preflight
+                            | OperationState::Running
+                            | OperationState::Paused
+                            | OperationState::WaitingConflict
+                    ),
+                can_pause: !cleanup_in_progress
+                    && !recycle_progress
                     && matches!(task.state, OperationState::Running | OperationState::Paused),
                 can_retry: task.kind != FileOperationKind::Undo
                     && matches!(
@@ -23106,6 +23803,13 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
 
 fn operation_has_visible_row(state: OperationState) -> bool {
     !matches!(state, OperationState::Completed | OperationState::Cancelled)
+}
+
+fn is_cleanup_completion_receipt(task: &crate::domain::file_operations::OperationTask) -> bool {
+    task.kind == FileOperationKind::PermanentDelete
+        && task.resource == OperationResource::Cleanup
+        && task.state == OperationState::Completed
+        && !task.recovered_cleanup
 }
 
 fn operation_row_rank(state: i32) -> i32 {
@@ -27859,6 +28563,424 @@ mod tests {
     }
 
     #[test]
+    fn issue_82_permanent_delete_never_auto_opens_operation_window() {
+        for stage in [
+            PermanentDeleteStage::RemovingOriginal,
+            PermanentDeleteStage::SourceRemoved,
+            PermanentDeleteStage::ReleasingSpace,
+        ] {
+            let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
+            let id = app.operations.submit(
+                OperationResource::Local,
+                FileOperationKind::PermanentDelete,
+                None,
+                vec![OperationItem::pending(
+                    Some(PathBuf::from("C:/test/large")),
+                    None,
+                )],
+            );
+            app.operations.start_next(OperationResource::Local).unwrap();
+            app.operations.mark_running(id).unwrap();
+            let task = app.operations.task_mut(id).unwrap();
+            task.started_at = Instant::now() - Duration::from_secs(5);
+            task.set_permanent_delete_stage(stage);
+
+            assert!(!should_auto_open_operation_window(&app));
+            assert_eq!(operation_rows(&app).len(), 1);
+        }
+    }
+
+    #[test]
+    fn issue_82_silent_cleanup_does_not_hide_other_slow_operations() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
+        let cleanup_id = app.operations.submit(
+            OperationResource::Cleanup,
+            FileOperationKind::PermanentDelete,
+            None,
+            vec![OperationItem::cleanup_pending(
+                PathBuf::from(r"C:\test\large"),
+                PathBuf::from(r"C:\test\.asterfiles-cleanup\task\payload-0"),
+                PathBuf::from(r"C:\records\task\record.afcleanup"),
+            )],
+        );
+        app.operations
+            .start_next(OperationResource::Cleanup)
+            .unwrap();
+        app.operations.mark_running(cleanup_id).unwrap();
+        let cleanup = app.operations.task_mut(cleanup_id).unwrap();
+        cleanup.started_at = Instant::now() - Duration::from_secs(5);
+        cleanup.set_permanent_delete_stage(PermanentDeleteStage::ReleasingSpace);
+
+        let copy_id = app.operations.submit(
+            OperationResource::Network,
+            FileOperationKind::Copy,
+            None,
+            vec![OperationItem::pending(
+                Some(PathBuf::from("C:/test/source")),
+                Some(PathBuf::from(r"\\server\share\target")),
+            )],
+        );
+        app.operations
+            .start_next(OperationResource::Network)
+            .unwrap();
+        app.operations.mark_running(copy_id).unwrap();
+        app.operations.task_mut(copy_id).unwrap().started_at =
+            Instant::now() - Duration::from_secs(5);
+
+        assert!(should_auto_open_operation_window(&app));
+        assert_eq!(operation_rows(&app).len(), 2);
+    }
+    #[test]
+    fn issue_82_restart_recovery_serializes_multiple_records() {
+        let temp = std::env::temp_dir().join(format!(
+            "asterfiles-issue-82-restart-queue-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _fixture_cleanup = FixtureCleanup(temp.clone());
+        let records = temp.join("records");
+        for name in ["first", "second"] {
+            let source = temp.join(name);
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(source.join("content.txt"), b"content").unwrap();
+            crate::fs::file_operations::create_cleanup_task(
+                std::slice::from_ref(&source),
+                &records,
+                &crate::domain::file_operations::CancellationToken::new(),
+            )
+            .unwrap();
+        }
+        let discovered = crate::fs::file_operations::discover_cleanup_tasks(&records).unwrap();
+        let mut manager = OperationManager::new();
+
+        let requests = recovered_cleanup_requests(&mut manager, discovered);
+
+        assert_eq!(requests.len(), 1);
+        let running = requests[0].id;
+        let queued = manager
+            .iter()
+            .find(|task| task.id != running)
+            .expect("second recovered record remains queued");
+        assert_eq!(queued.state, OperationState::Queued);
+        assert_eq!(manager.queue_position(queued.id), Some(1));
+        let queued_id = queued.id;
+        manager
+            .finish(
+                running,
+                OperationState::Completed,
+                OperationResult {
+                    succeeded: Vec::new(),
+                    skipped: Vec::new(),
+                    failed: Vec::new(),
+                    affected_directories: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            manager.start_next(OperationResource::Cleanup).unwrap(),
+            Some(queued_id)
+        );
+    }
+    #[test]
+    fn issue_82_restart_recovery_discards_completed_record() {
+        let temp = std::env::temp_dir().join(format!(
+            "asterfiles-issue-82-restart-complete-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _fixture_cleanup = FixtureCleanup(temp.clone());
+        let records = temp.join("records");
+        let source = temp.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("content.txt"), b"content").unwrap();
+        let record = crate::fs::file_operations::create_cleanup_task(
+            std::slice::from_ref(&source),
+            &records,
+            &crate::domain::file_operations::CancellationToken::new(),
+        )
+        .unwrap();
+        let mut completed = crate::fs::file_operations::retry_cleanup_task(
+            &records,
+            &record.task_id,
+            &crate::domain::file_operations::CancellationToken::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        let task_root = records.join(&completed.task_id);
+        std::fs::create_dir_all(&task_root).unwrap();
+        completed.record_path = task_root.join("record-after-cleanup.afcleanup");
+        std::fs::write(&completed.record_path, b"completed").unwrap();
+        let mut manager = OperationManager::new();
+
+        let requests = recovered_cleanup_requests(&mut manager, vec![completed]);
+
+        assert!(requests.is_empty());
+        assert!(manager.iter().next().is_none());
+        assert!(!task_root.exists());
+    }
+    #[test]
+    fn issue_82_restart_recovery_runs_cleanup_without_creating_failure_rows() {
+        let temp = std::env::temp_dir().join(format!(
+            "asterfiles-issue-82-restart-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _fixture_cleanup = FixtureCleanup(temp.clone());
+        let records = temp.join("records");
+        let sources = [temp.join("first"), temp.join("second")];
+        for source in &sources {
+            std::fs::create_dir_all(source).unwrap();
+            std::fs::write(source.join("content.txt"), b"content").unwrap();
+        }
+        crate::fs::file_operations::create_cleanup_task(
+            &sources,
+            &records,
+            &crate::domain::file_operations::CancellationToken::new(),
+        )
+        .unwrap();
+        let discovered = crate::fs::file_operations::discover_cleanup_tasks(&records).unwrap();
+        let mut manager = OperationManager::new();
+
+        let requests = recovered_cleanup_requests(&mut manager, discovered);
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].resource, OperationResource::Cleanup);
+        assert_eq!(requests[0].items.len(), 2);
+        let task = manager.task(requests[0].id).unwrap();
+        assert_eq!(task.state, OperationState::Running);
+        assert!(
+            task.items
+                .iter()
+                .all(|item| { item.state == ItemState::Pending && item.error.is_none() })
+        );
+        assert!(task.result.is_none());
+        let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
+        app.operations = manager;
+        assert!(operation_rows(&app).is_empty());
+
+        let (sender, receiver) = mpsc::channel();
+        execute_cleanup_request(requests.into_iter().next().unwrap(), &sender);
+        assert!(matches!(
+            receiver.try_iter().last(),
+            Some(FileOperationEvent::Finished { result, .. }) if result.failed.is_empty()
+        ));
+        assert!(
+            crate::fs::file_operations::discover_cleanup_tasks(&records)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[test]
+    fn issue_82_directory_commit_moves_source_before_cleanup_runs() {
+        let temp = std::env::temp_dir().join(format!(
+            "asterfiles-issue-82-commit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _fixture_cleanup = FixtureCleanup(temp.clone());
+        let source = temp.join("source");
+        let records = temp.join("records");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("one.txt"), b"one").unwrap();
+        let (sender, receiver) = mpsc::channel();
+
+        commit_permanent_delete_request_with_root(
+            FileOperationRequest {
+                id: OperationId(82),
+                kind: FileOperationKind::PermanentDelete,
+                resource: OperationResource::Local,
+                items: vec![OperationItem::pending(Some(source.clone()), None)],
+                undo_items: Vec::new(),
+                undo_source_manifests: vec![None],
+                cancellation: crate::domain::file_operations::CancellationToken::new(),
+            },
+            &sender,
+            Some(&records),
+        );
+
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert!(!source.exists());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            FileOperationEvent::PermanentDeleteStage {
+                stage: PermanentDeleteStage::SourceRemoved,
+                affected_directories,
+                ..
+            } if affected_directories == &vec![temp.clone()]
+        )));
+        let cleanup = events.iter().find_map(|event| match event {
+            FileOperationEvent::PermanentDeleteCommitted {
+                cleanup: Some(cleanup),
+                result,
+                ..
+            } if result.failed.is_empty() => Some(cleanup),
+            _ => None,
+        });
+        let cleanup = cleanup.expect("commit must hand off background cleanup");
+        assert_eq!(cleanup.resource, OperationResource::Cleanup);
+        assert!(cleanup.items[0].destination.as_ref().unwrap().exists());
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, FileOperationEvent::Finished { .. }))
+        );
+    }
+
+    #[test]
+    fn issue_82_consecutive_commits_remove_both_batches_before_cleanup() {
+        let temp = std::env::temp_dir().join(format!(
+            "asterfiles-issue-82-consecutive-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _fixture_cleanup = FixtureCleanup(temp.clone());
+        let records = temp.join("records");
+        let sources = [temp.join("first"), temp.join("second")];
+        for source in &sources {
+            std::fs::create_dir_all(source).unwrap();
+            std::fs::write(source.join("content.txt"), b"content").unwrap();
+        }
+        let (sender, receiver) = mpsc::channel();
+        for (index, source) in sources.iter().enumerate() {
+            commit_permanent_delete_request_with_root(
+                FileOperationRequest {
+                    id: OperationId(82 + index as u64),
+                    kind: FileOperationKind::PermanentDelete,
+                    resource: OperationResource::Local,
+                    items: vec![OperationItem::pending(Some(source.clone()), None)],
+                    undo_items: Vec::new(),
+                    undo_source_manifests: vec![None],
+                    cancellation: crate::domain::file_operations::CancellationToken::new(),
+                },
+                &sender,
+                Some(&records),
+            );
+        }
+
+        assert!(sources.iter().all(|source| !source.exists()));
+        let committed = receiver
+            .try_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    FileOperationEvent::PermanentDeleteCommitted {
+                        cleanup: Some(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(committed, 2);
+    }
+    #[test]
+    fn issue_82_task_center_distinguishes_source_removal_from_space_release() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
+        let id = app.operations.submit(
+            OperationResource::Cleanup,
+            FileOperationKind::PermanentDelete,
+            None,
+            vec![OperationItem::cleanup_pending(
+                PathBuf::from(r"C:\test\large"),
+                PathBuf::from(r"C:\test\.asterfiles-cleanup\task\payload-0"),
+                PathBuf::from(r"C:\records\task\record.afcleanup"),
+            )],
+        );
+        app.operations
+            .start_next(OperationResource::Cleanup)
+            .unwrap();
+        app.operations.mark_running(id).unwrap();
+        app.operations
+            .task_mut(id)
+            .unwrap()
+            .set_permanent_delete_stage(PermanentDeleteStage::ReleasingSpace);
+
+        let row = operation_rows(&app).remove(0);
+        assert_eq!(row.status.as_str(), "已从原位置移除，正在释放空间");
+        assert!(row.destination_line.as_str().starts_with("遗留位置："));
+        assert_eq!(row.file_progress.as_str(), "已处理 0 项");
+        assert!(!row.can_pause);
+        assert!(!row.can_cancel);
+    }
+
+    #[test]
+    fn issue_82_cleanup_completion_receipt_is_visible_without_controls() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
+        let id = app.operations.submit(
+            OperationResource::Cleanup,
+            FileOperationKind::PermanentDelete,
+            None,
+            vec![OperationItem::cleanup_pending(
+                PathBuf::from(r"C:\test\large"),
+                PathBuf::from(r"C:\test\.asterfiles-cleanup\task\payload-0"),
+                PathBuf::from(r"C:\records\task\record.afcleanup"),
+            )],
+        );
+        app.operations
+            .start_next(OperationResource::Cleanup)
+            .unwrap();
+        app.operations.mark_running(id).unwrap();
+        app.operations
+            .finish(
+                id,
+                OperationState::Completed,
+                OperationResult {
+                    succeeded: vec![PathBuf::from(r"C:\test\large")],
+                    skipped: vec![],
+                    failed: vec![],
+                    affected_directories: vec![],
+                },
+            )
+            .unwrap();
+
+        let row = operation_rows(&app).remove(0);
+        assert_eq!(row.status.as_str(), "空间已释放");
+        assert_eq!(row.file_progress.as_str(), "空间已释放");
+        assert!(row.destination_line.is_empty());
+        assert!(row.progress_known);
+        assert_eq!(row.progress, 1.0);
+        assert!(!row.can_pause);
+        assert!(!row.can_cancel);
+        assert_eq!(
+            app.operations
+                .prune_transient_with_retained_cleanup(Duration::ZERO, Duration::from_secs(10),),
+            0
+        );
+    }
+    #[test]
+    fn issue_82_fast_remove_candidates_exclude_files_links_and_protected_roots() {
+        let temp = std::env::temp_dir().join(format!(
+            "asterfiles-issue-82-candidate-{}",
+            std::process::id()
+        ));
+        let _fixture_cleanup = FixtureCleanup(temp.clone());
+        std::fs::create_dir_all(&temp).unwrap();
+        let directory = temp.join("directory");
+        let file = temp.join("file.txt");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        assert!(is_fast_remove_candidate(&directory));
+        assert!(!is_fast_remove_candidate(&file));
+        assert!(!is_fast_remove_candidate(Path::new(r"C:\")));
+        assert!(!is_fast_remove_candidate(Path::new(
+            r"\\server\share\folder"
+        )));
+    }
+    #[test]
     fn issue_76_auto_opened_operation_window_closes_only_after_successful_rows_are_cleared() {
         for (kind, item_count) in [
             (FileOperationKind::RecycleDelete, 1),
@@ -28050,10 +29172,16 @@ mod tests {
     }
 
     #[test]
-    fn issue_62_title_bar_close_routes_to_cancel_and_close() {
+    fn issue_82_operation_window_has_one_hide_control() {
         let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
-        assert!(source.contains("close-requested => { root.request-hide(); }"));
+        assert!(source.contains("close-requested => { root.close(); }"));
+        assert!(!source.contains("show-minimize"));
+        assert!(!source.contains("minimize-requested"));
         assert!(!source.contains("close-requested => { if (root.operations.length"));
+        assert!(
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/app.rs"))
+                .contains("slint::CloseRequestResponse::HideWindow")
+        );
     }
 
     #[test]
@@ -29481,6 +30609,38 @@ mod tests {
             Some(Path::new(r"C:\WindowB\second.txt"))
         );
     }
+
+    #[test]
+    fn issue_82_delete_shortcut_preserves_permanent_intent() {
+        assert_eq!(
+            delete_shortcut_request(true, false, false, false, false, false),
+            Some(false)
+        );
+        assert_eq!(
+            delete_shortcut_request(true, false, false, false, false, true),
+            Some(true)
+        );
+        assert_eq!(
+            delete_shortcut_request(true, true, false, false, false, true),
+            None
+        );
+        assert_eq!(
+            delete_shortcut_request(true, false, false, false, true, true),
+            None
+        );
+        assert_eq!(
+            delete_shortcut_request(false, false, false, false, false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn issue_82_context_delete_preserves_shift_intent() {
+        assert_eq!(context_delete_request(6, false), Some(false));
+        assert_eq!(context_delete_request(6, true), Some(true));
+        assert_eq!(context_delete_request(CMD_REFRESH, true), None);
+    }
+
     #[test]
     fn delayed_paste_keeps_its_original_tab() {
         let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\WindowA")], 0, [0, 1, 2, 3]);

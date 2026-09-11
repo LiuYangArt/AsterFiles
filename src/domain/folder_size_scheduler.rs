@@ -1,10 +1,18 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use super::{EntryId, FileEntry, FolderSizeState, RequestId};
 
+pub(crate) fn is_internal_cleanup_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(".asterfiles-cleanup")
+    })
+}
 pub const FOLDER_SIZE_QUEUE_CAPACITY: usize = 32;
 pub const FOLDER_SIZE_SUBMIT_LIMIT: usize = 24;
 
@@ -102,7 +110,7 @@ impl FolderSizeScheduler {
             .min(entries.len());
         self.visible_snapshot = entries[start..end]
             .iter()
-            .filter(|entry| entry.is_directory())
+            .filter(|entry| entry.is_directory() && !is_internal_cleanup_path(&entry.path))
             .map(key_for_entry)
             .collect();
         self.next_visible_queries(entries)
@@ -138,11 +146,14 @@ impl FolderSizeScheduler {
         self.strategy = FolderSizeStrategy::CompleteForSort;
         self.complete_snapshot = entries
             .iter()
-            .filter(|entry| entry.is_directory())
+            .filter(|entry| entry.is_directory() && !is_internal_cleanup_path(&entry.path))
             .map(key_for_entry)
             .collect();
         for entry in entries.iter() {
-            if entry.is_directory() && entry.folder_size.is_terminal() {
+            if entry.is_directory()
+                && !is_internal_cleanup_path(&entry.path)
+                && entry.folder_size.is_terminal()
+            {
                 self.staged.insert(key_for_entry(entry), entry.folder_size);
             }
         }
@@ -319,6 +330,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn internal_cleanup_path_matching_is_component_exact_and_case_insensitive() {
+        assert!(is_internal_cleanup_path(Path::new(
+            r"C:\files\.asterfiles-cleanup"
+        )));
+        assert!(is_internal_cleanup_path(Path::new(
+            r"C:\files\.ASTERFILES-CLEANUP\task\payload-0"
+        )));
+        assert!(!is_internal_cleanup_path(Path::new(
+            r"C:\files\.asterfiles-cleanup-copy"
+        )));
+        assert!(!is_internal_cleanup_path(Path::new(
+            r"C:\files\my.asterfiles-cleanup"
+        )));
+    }
+
+    #[test]
+    fn internal_cleanup_entries_never_schedule_visible_folder_sizes() {
+        let mut entries = vec![
+            entry(1, "ordinary"),
+            entry(2, ".asterfiles-cleanup"),
+            entry(3, ".asterfiles-cleanup-copy"),
+        ];
+        entries[1].path = PathBuf::from(r"C:\sizes\.ASTERFILES-CLEANUP\task");
+        let mut scheduler = FolderSizeScheduler::new();
+
+        let queries = scheduler.visible_queries(RequestId(12), &mut entries, 0, 3);
+
+        assert_eq!(queries.len(), 2);
+        assert!(queries.iter().all(|query| query.key.entry_id != EntryId(2)));
+        assert_eq!(entries[1].folder_size, FolderSizeState::Unknown);
+    }
+
+    #[test]
+    fn internal_cleanup_entries_never_schedule_complete_sort_folder_sizes() {
+        let mut entries = vec![
+            entry(1, "ordinary"),
+            entry(2, ".asterfiles-cleanup"),
+            entry(3, ".asterfiles-cleanup-copy"),
+        ];
+        entries[1].path = PathBuf::from(r"C:\sizes\.asterfiles-cleanup\task");
+        let mut scheduler = FolderSizeScheduler::new();
+
+        let queries = scheduler.begin_complete_sort(RequestId(13), &mut entries);
+
+        assert_eq!(queries.len(), 2);
+        assert!(queries.iter().all(|query| query.key.entry_id != EntryId(2)));
+        assert_eq!(
+            scheduler.progress(),
+            Some(FolderSizeProgress {
+                completed: 0,
+                total: 2,
+            })
+        );
+        assert_eq!(entries[1].folder_size, FolderSizeState::Unknown);
+    }
     #[test]
     fn visible_range_prefetches_one_screen_and_deduplicates() {
         let mut entries = (0..100)

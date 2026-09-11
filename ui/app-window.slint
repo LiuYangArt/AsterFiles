@@ -92,20 +92,18 @@ component StandaloneActionButton inherits Rectangle {
 component StandaloneTitleBar inherits Rectangle {
     in property <string> title;
     in property <string> close-label: "关闭";
-    in property <string> minimize-label: "最小化";
-    in property <bool> show-minimize: false;
     callback close-requested();
-    callback minimize-requested();
+
     callback drag-window();
     height: 48px;
     background: VisualStyle.cffffff;
     HorizontalLayout {
         padding-left: 16px;
         Text { text: root.title; color: VisualStyle.c30333a; font-size: 16px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
-        Rectangle { visible: root.show-minimize; width: 46px; Text { text: "—"; color: VisualStyle.c303138; horizontal-alignment: center; vertical-alignment: center; } TouchArea { clicked => { root.minimize-requested(); } } accessible-role: button; accessible-label: root.minimize-label; }
+
         Rectangle { width: 46px; Text { text: "×"; color: VisualStyle.c303138; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; } TouchArea { clicked => { root.close-requested(); } } accessible-role: button; accessible-label: root.close-label; }
     }
-    TouchArea { width: parent.width - 46px - (root.show-minimize ? 46px : 0px); pointer-event(event) => { if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) { root.drag-window(); } } }
+    TouchArea { width: parent.width - 46px; pointer-event(event) => { if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) { root.drag-window(); } } }
 }
 
 export component OperationWindow inherits Window {
@@ -130,7 +128,7 @@ export component OperationWindow inherits Window {
     in property <string> text-cancel-operation: "取消";
     in property <string> text-retry-operation: "重试";
     in property <string> text-no-operations: "没有文件操作";
-    in property <string> text-window-minimize: "最小化";
+
     in property <string> text-window-close: "关闭";
     in property <string> text-pause-operation: "暂停";
     in property <string> text-resume-operation: "继续";
@@ -140,13 +138,13 @@ export component OperationWindow inherits Window {
     callback cancel-operation(int);
     callback set-operation-paused(int, bool);
     callback retry-operation(int);
-    callback request-hide();
+
     callback drag-window();
 
     changed dark-theme => { VisualStyle.dark-theme = root.dark-theme; }
 
     VerticalLayout {
-        StandaloneTitleBar { title: root.text-file-operations; close-label: root.text-window-close; minimize-label: root.text-window-minimize; show-minimize: true; minimize-requested => { root.minimized = true; } close-requested => { root.request-hide(); } drag-window => { root.drag-window(); } }
+        StandaloneTitleBar { title: root.text-file-operations; close-label: root.text-window-close; close-requested => { root.close(); } drag-window => { root.drag-window(); } }
         Rectangle {
             vertical-stretch: 1;
             background: VisualStyle.cffffff;

@@ -326,12 +326,20 @@ pub enum ItemState {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermanentDeletePhase {
+    Original,
+    CleanupPending,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationItem {
     pub source: Option<PathBuf>,
     pub destination: Option<PathBuf>,
     pub state: ItemState,
     pub error: Option<String>,
+    pub permanent_delete_phase: PermanentDeletePhase,
+    pub cleanup_record: Option<PathBuf>,
 }
 
 impl OperationItem {
@@ -341,10 +349,29 @@ impl OperationItem {
             destination,
             state: ItemState::Pending,
             error: None,
+            permanent_delete_phase: PermanentDeletePhase::Original,
+            cleanup_record: None,
+        }
+    }
+
+    pub fn cleanup_pending(original: PathBuf, pending: PathBuf, cleanup_record: PathBuf) -> Self {
+        Self {
+            source: Some(original),
+            destination: Some(pending),
+            state: ItemState::Pending,
+            error: None,
+            permanent_delete_phase: PermanentDeletePhase::CleanupPending,
+            cleanup_record: Some(cleanup_record),
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermanentDeleteStage {
+    RemovingOriginal,
+    SourceRemoved,
+    ReleasingSpace,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OperationProgress {
     pub total_items: usize,
@@ -533,6 +560,7 @@ impl CancellationToken {
 pub enum OperationResource {
     Local,
     Network,
+    Cleanup,
 }
 
 impl OperationResource {
@@ -540,6 +568,7 @@ impl OperationResource {
         match self {
             Self::Local => 0,
             Self::Network => 1,
+            Self::Cleanup => 2,
         }
     }
 }
@@ -555,6 +584,10 @@ pub struct OperationTask {
     pub origin_tab: Option<TabId>,
     pub state: OperationState,
     pub execution_round: u32,
+    pub permanent_delete_stage: Option<PermanentDeleteStage>,
+    pub source_removed_at: Option<Instant>,
+    pub cleanup_started_at: Option<Instant>,
+    pub recovered_cleanup: bool,
     pub items: Vec<OperationItem>,
     pub undo_items: Vec<UndoItem>,
     pub undo_source_manifests: Vec<Option<Vec<(PathBuf, FileIdentity)>>>,
@@ -584,6 +617,11 @@ impl OperationTask {
             origin_tab,
             state: OperationState::Queued,
             execution_round: 1,
+            permanent_delete_stage: (kind == FileOperationKind::PermanentDelete)
+                .then_some(PermanentDeleteStage::RemovingOriginal),
+            source_removed_at: None,
+            cleanup_started_at: None,
+            recovered_cleanup: false,
             progress: OperationProgress {
                 total_items: items.len(),
                 discovered_files: 0,
@@ -599,6 +637,11 @@ impl OperationTask {
             result: None,
             cancellation: CancellationToken::new(),
             conflict_defaults: HashMap::new(),
+        }
+    }
+    pub fn set_permanent_delete_stage(&mut self, stage: PermanentDeleteStage) {
+        if self.kind == FileOperationKind::PermanentDelete {
+            self.permanent_delete_stage = Some(stage);
         }
     }
     pub fn transition(&mut self, next: OperationState) -> Result<(), StateTransitionError> {
@@ -685,7 +728,7 @@ impl OperationTask {
         for item in &mut self.items {
             if matches!(
                 item.state,
-                ItemState::Failed | ItemState::Cancelled | ItemState::Pending
+                ItemState::Failed | ItemState::Cancelled | ItemState::Pending | ItemState::Running
             ) {
                 item.state = ItemState::Pending;
                 item.error = None;
@@ -724,16 +767,16 @@ pub struct StateTransitionError {
 pub struct OperationManager {
     next_id: u64,
     tasks: BTreeMap<OperationId, OperationTask>,
-    queues: [VecDeque<OperationId>; 2],
-    active: [Option<OperationId>; 2],
+    queues: [VecDeque<OperationId>; 3],
+    active: [Option<OperationId>; 3],
 }
 
 impl OperationManager {
     pub fn new() -> Self {
         Self {
             next_id: 1,
-            queues: [VecDeque::new(), VecDeque::new()],
-            active: [None, None],
+            queues: [VecDeque::new(), VecDeque::new(), VecDeque::new()],
+            active: [None, None, None],
             ..Default::default()
         }
     }
@@ -746,12 +789,36 @@ impl OperationManager {
     ) -> OperationId {
         let id = OperationId(self.next_id);
         self.next_id += 1;
-        self.tasks.insert(
-            id,
-            OperationTask::new(id, resource, kind, origin_tab, items),
-        );
-        self.queues[resource.index()].push_back(id);
+        self.insert_task(OperationTask::new(id, resource, kind, origin_tab, items));
         id
+    }
+
+    pub fn submit_recovered_cleanup(
+        &mut self,
+        origin_tab: Option<TabId>,
+        items: Vec<OperationItem>,
+    ) -> OperationId {
+        let id = self.submit(
+            OperationResource::Cleanup,
+            FileOperationKind::PermanentDelete,
+            origin_tab,
+            items,
+        );
+        let task = self
+            .tasks
+            .get_mut(&id)
+            .expect("submitted cleanup task exists");
+        task.permanent_delete_stage = Some(PermanentDeleteStage::ReleasingSpace);
+        task.source_removed_at = Some(Instant::now());
+        task.recovered_cleanup = true;
+        id
+    }
+
+    fn insert_task(&mut self, task: OperationTask) {
+        let id = task.id;
+        let resource = task.resource;
+        self.tasks.insert(id, task);
+        self.queues[resource.index()].push_back(id);
     }
     pub fn set_undo_source_manifests(
         &mut self,
@@ -834,6 +901,11 @@ impl OperationManager {
     pub fn has_active_tasks(&self) -> bool {
         self.tasks.values().any(|task| task.state.is_active())
     }
+    pub fn has_foreground_active_tasks(&self) -> bool {
+        self.tasks
+            .values()
+            .any(|task| task.resource != OperationResource::Cleanup && task.state.is_active())
+    }
     pub fn start_next(
         &mut self,
         resource: OperationResource,
@@ -873,14 +945,32 @@ impl OperationManager {
         Ok(())
     }
     pub fn prune_transient(&mut self, minimum_age: Duration) -> usize {
+        self.prune_transient_with_retained_cleanup(minimum_age, minimum_age)
+    }
+    pub fn prune_transient_with_retained_cleanup(
+        &mut self,
+        minimum_age: Duration,
+        cleanup_completed_age: Duration,
+    ) -> usize {
         let before = self.tasks.len();
         self.tasks.retain(|_, task| {
-            !matches!(
+            if !matches!(
                 task.state,
                 OperationState::Completed | OperationState::Cancelled
-            ) || task
-                .finished_at
-                .is_none_or(|finished| finished.elapsed() < minimum_age)
+            ) {
+                return true;
+            }
+            let required_age = if task.resource == OperationResource::Cleanup
+                && task.kind == FileOperationKind::PermanentDelete
+                && task.state == OperationState::Completed
+                && !task.recovered_cleanup
+            {
+                cleanup_completed_age
+            } else {
+                minimum_age
+            };
+            task.finished_at
+                .is_none_or(|finished| finished.elapsed() < required_age)
         });
         before - self.tasks.len()
     }
@@ -1069,6 +1159,44 @@ mod tests {
     }
 
     #[test]
+    fn issue_82_recovered_cleanup_is_retryable_without_using_the_original_path() {
+        let mut manager = OperationManager::new();
+        let original = PathBuf::from(r"C:\source\large");
+        let pending = PathBuf::from(r"C:\.asterfiles-cleanup\task\payload");
+        let record = PathBuf::from(r"C:\records\task");
+        let id = manager.submit_recovered_cleanup(
+            None,
+            vec![OperationItem::cleanup_pending(
+                original.clone(),
+                pending.clone(),
+                record.clone(),
+            )],
+        );
+
+        let task = manager.task(id).unwrap();
+        assert_eq!(task.state, OperationState::Queued);
+        assert_eq!(task.resource, OperationResource::Cleanup);
+        assert_eq!(
+            task.items[0].permanent_delete_phase,
+            PermanentDeletePhase::CleanupPending
+        );
+        assert_eq!(task.items[0].source.as_deref(), Some(original.as_path()));
+        assert_eq!(
+            task.items[0].destination.as_deref(),
+            Some(pending.as_path())
+        );
+        assert_eq!(
+            task.items[0].cleanup_record.as_deref(),
+            Some(record.as_path())
+        );
+        assert_eq!(
+            manager.start_next(OperationResource::Cleanup).unwrap(),
+            Some(id)
+        );
+        manager.mark_running(id).unwrap();
+        assert_eq!(manager.task(id).unwrap().state, OperationState::Running);
+    }
+    #[test]
     fn issue_61_new_task_starts_with_unknown_scan_totals() {
         let task = OperationTask::new(
             OperationId(1),
@@ -1243,6 +1371,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn issue_82_background_cleanup_does_not_block_application_exit() {
+        let mut manager = OperationManager::new();
+        let cleanup = manager.submit(
+            OperationResource::Cleanup,
+            FileOperationKind::PermanentDelete,
+            None,
+            vec![item("cleanup")],
+        );
+        manager.start_next(OperationResource::Cleanup).unwrap();
+        manager.mark_running(cleanup).unwrap();
+
+        assert!(manager.has_active_tasks());
+        assert!(!manager.has_foreground_active_tasks());
+
+        let local = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![item("local")],
+        );
+        manager.start_next(OperationResource::Local).unwrap();
+        manager.mark_running(local).unwrap();
+        assert!(manager.has_foreground_active_tasks());
+    }
+    #[test]
+    fn issue_82_cleanup_runs_beside_local_work_but_remains_serial() {
+        let mut manager = OperationManager::new();
+        let local = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::PermanentDelete,
+            None,
+            vec![item("local")],
+        );
+        let cleanup = manager.submit(
+            OperationResource::Cleanup,
+            FileOperationKind::PermanentDelete,
+            None,
+            vec![item("cleanup")],
+        );
+        let queued_cleanup = manager.submit(
+            OperationResource::Cleanup,
+            FileOperationKind::PermanentDelete,
+            None,
+            vec![item("cleanup-2")],
+        );
+
+        assert_eq!(
+            manager.start_next(OperationResource::Cleanup).unwrap(),
+            Some(cleanup)
+        );
+        assert_eq!(
+            manager.start_next(OperationResource::Local).unwrap(),
+            Some(local)
+        );
+        assert_eq!(manager.active_id(OperationResource::Cleanup), Some(cleanup));
+        assert_eq!(manager.active_id(OperationResource::Local), Some(local));
+        assert_eq!(
+            manager.start_next(OperationResource::Cleanup).unwrap(),
+            None
+        );
+        assert_eq!(manager.queue_position(queued_cleanup), Some(1));
+    }
     #[test]
     fn cancelling_queued_network_task_removes_only_network_queue_entry() {
         let mut manager = OperationManager::new();

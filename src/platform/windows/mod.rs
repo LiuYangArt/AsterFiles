@@ -22,6 +22,33 @@ pub mod window_trace;
 
 use std::io;
 
+pub fn mark_internal_cleanup_directory(path: &std::path::Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM, GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
+        SetFileAttributesW,
+    };
+
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    if attributes == INVALID_FILE_ATTRIBUTES {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe {
+        SetFileAttributesW(
+            wide.as_ptr(),
+            attributes | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
 pub fn cursor_screen_position() -> io::Result<(i32, i32)> {
     let mut cursor = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
     if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut cursor) } == 0 {
@@ -113,6 +140,12 @@ pub fn has_pointer_capture(hwnd: isize) -> bool {
     hwnd != 0
         && unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture() }
             == hwnd as windows_sys::Win32::Foundation::HWND
+}
+
+pub fn shift_key_down() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_SHIFT};
+
+    unsafe { GetAsyncKeyState(VK_SHIFT as i32) < 0 }
 }
 
 pub fn release_pointer_capture() {

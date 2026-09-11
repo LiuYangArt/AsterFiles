@@ -3,6 +3,7 @@ use std::{
     fs, io,
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::domain::file_operations::{
@@ -698,7 +699,7 @@ fn remove_quarantined(
         if let Err(error) = ensure_identity(&entry, identity).and_then(|_| {
             let metadata =
                 fs::symlink_metadata(&entry).map_err(|error| OperationError::io(&entry, error))?;
-            if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+            if is_traversable_directory(&metadata) {
                 fs::remove_dir(&entry).map_err(|error| OperationError::io(&entry, error))?;
                 report.directories += 1;
             } else {
@@ -1138,6 +1139,860 @@ fn remove_source_after_committed_copy(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupTaskStatus {
+    Recorded,
+    Moved,
+    Cleaning,
+    Cancelled,
+    Failed,
+}
+
+impl CleanupTaskStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::Moved => "moved",
+            Self::Cleaning => "cleaning",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "recorded" => Some(Self::Recorded),
+            "moved" => Some(Self::Moved),
+            "cleaning" => Some(Self::Cleaning),
+            "cancelled" => Some(Self::Cancelled),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupTaskItem {
+    pub original_path: PathBuf,
+    pub remaining_path: Option<PathBuf>,
+    pub identity: Option<FileIdentity>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupTaskRecord {
+    pub task_id: String,
+    pub items: Vec<CleanupTaskItem>,
+    pub status: CleanupTaskStatus,
+    pub error: Option<String>,
+    pub files: u64,
+    pub directories: u64,
+    pub bytes: u64,
+    pub record_path: PathBuf,
+    generation: u64,
+}
+
+impl CleanupTaskRecord {
+    #[cfg(test)]
+    pub fn remaining_paths(&self) -> impl Iterator<Item = &Path> {
+        self.items
+            .iter()
+            .filter_map(|item| item.remaining_path.as_deref())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupProgress {
+    pub files: u64,
+    pub directories: u64,
+    pub bytes: u64,
+    pub current_path: Option<PathBuf>,
+}
+
+pub fn discard_empty_cleanup_task(record: &CleanupTaskRecord) -> Result<(), OperationError> {
+    if record
+        .items
+        .iter()
+        .any(|item| item.remaining_path.is_some())
+    {
+        return Ok(());
+    }
+    let task_root = record
+        .record_path
+        .parent()
+        .ok_or_else(|| OperationError::Io {
+            path: record.record_path.clone(),
+            kind: io::ErrorKind::InvalidData,
+            message: "cleanup record has no task directory".to_owned(),
+        })?;
+    for entry in fs::read_dir(task_root).map_err(|error| OperationError::io(task_root, error))? {
+        let path = entry
+            .map_err(|error| OperationError::io(task_root, error))?
+            .path();
+        if path.extension() == Some(OsStr::new("afcleanup")) {
+            fs::remove_file(&path).map_err(|error| OperationError::io(&path, error))?;
+        }
+    }
+    if fs::read_dir(task_root)
+        .map_err(|error| OperationError::io(task_root, error))?
+        .next()
+        .is_none()
+    {
+        fs::remove_dir(task_root).map_err(|error| OperationError::io(task_root, error))?;
+    }
+    Ok(())
+}
+pub fn create_cleanup_task(
+    paths: &[PathBuf],
+    record_root: &Path,
+    cancel: &CancellationToken,
+) -> Result<CleanupTaskRecord, OperationError> {
+    fs::create_dir_all(record_root).map_err(|error| OperationError::io(record_root, error))?;
+    let task_id = format!(
+        "{}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let record_task_root = record_root.join(format!(".asterfiles-cleanup-{task_id}"));
+    fs::create_dir(&record_task_root)
+        .map_err(|error| OperationError::io(&record_task_root, error))?;
+    let mut record = CleanupTaskRecord {
+        task_id: task_id.clone(),
+        items: paths
+            .iter()
+            .map(|path| CleanupTaskItem {
+                original_path: path.clone(),
+                remaining_path: None,
+                identity: None,
+                error: None,
+            })
+            .collect(),
+        status: CleanupTaskStatus::Recorded,
+        error: None,
+        files: 0,
+        directories: 0,
+        bytes: 0,
+        record_path: record_task_root.join("record-0.afcleanup"),
+        generation: 0,
+    };
+    write_cleanup_record(&mut record)?;
+
+    for index in 0..record.items.len() {
+        if let Err(OperationError::Cancelled) = check_cancel(cancel) {
+            record.status = CleanupTaskStatus::Cancelled;
+            write_cleanup_record(&mut record)?;
+            return Ok(record);
+        }
+        let original = record.items[index].original_path.clone();
+        let metadata = match fs::symlink_metadata(&original) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                record.items[index].error = Some(error.to_string());
+                record.status = CleanupTaskStatus::Failed;
+                write_cleanup_record(&mut record)?;
+                continue;
+            }
+        };
+        if !is_traversable_directory(&metadata) {
+            record.items[index].error =
+                Some("fast removal requires a local ordinary directory".to_owned());
+            record.status = CleanupTaskStatus::Failed;
+            write_cleanup_record(&mut record)?;
+            continue;
+        }
+        let identity = match file_identity(&original) {
+            Ok(identity) => identity,
+            Err(error) => {
+                record.items[index].error = Some(format!("{error:?}"));
+                record.status = CleanupTaskStatus::Failed;
+                write_cleanup_record(&mut record)?;
+                continue;
+            }
+        };
+        let Some(parent) = original.parent() else {
+            record.items[index].error = Some("protected filesystem root".to_owned());
+            record.status = CleanupTaskStatus::Failed;
+            write_cleanup_record(&mut record)?;
+            continue;
+        };
+        let cleanup_root = parent.join(".asterfiles-cleanup");
+        let cleanup_root_created = !path_exists(&cleanup_root);
+        if cleanup_root_created {
+            if let Err(error) = fs::create_dir(&cleanup_root) {
+                record.items[index].error = Some(error.to_string());
+                record.status = CleanupTaskStatus::Failed;
+                write_cleanup_record(&mut record)?;
+                continue;
+            }
+        } else if fs::symlink_metadata(&cleanup_root)
+            .map(|metadata| !is_traversable_directory(&metadata))
+            .unwrap_or(true)
+        {
+            record.items[index].error =
+                Some("cleanup root is not an ordinary directory".to_owned());
+            record.status = CleanupTaskStatus::Failed;
+            write_cleanup_record(&mut record)?;
+            continue;
+        }
+        #[cfg(windows)]
+        let _ = crate::platform::windows::mark_internal_cleanup_directory(&cleanup_root);
+        let payload_root = cleanup_root.join(&task_id);
+        if !path_exists(&payload_root) {
+            if let Err(error) = fs::create_dir(&payload_root) {
+                record.items[index].error = Some(error.to_string());
+                record.status = CleanupTaskStatus::Failed;
+                write_cleanup_record(&mut record)?;
+                continue;
+            }
+        } else if fs::symlink_metadata(&payload_root)
+            .map(|metadata| !is_traversable_directory(&metadata))
+            .unwrap_or(true)
+        {
+            record.items[index].error =
+                Some("cleanup payload root is not an ordinary directory".to_owned());
+            record.status = CleanupTaskStatus::Failed;
+            write_cleanup_record(&mut record)?;
+            continue;
+        }
+        if identity.volume_serial != file_identity(&payload_root)?.volume_serial {
+            record.items[index].error =
+                Some("cleanup storage is not on the source volume".to_owned());
+            record.status = CleanupTaskStatus::Failed;
+            write_cleanup_record(&mut record)?;
+            continue;
+        }
+        let pending = payload_root.join(format!("payload-{index}"));
+        record.items[index].remaining_path = Some(pending.clone());
+        record.items[index].identity = Some(identity);
+        write_cleanup_record(&mut record)?;
+        match fs::rename(&original, &pending) {
+            Ok(()) => {
+                if !same_stable_file(identity, file_identity(&pending)?) {
+                    record.items[index].error =
+                        Some("item identity changed during cleanup move".to_owned());
+                    record.status = CleanupTaskStatus::Failed;
+                } else if record.items.iter().all(|item| item.error.is_none()) {
+                    record.status = CleanupTaskStatus::Moved;
+                }
+            }
+            Err(error) => {
+                record.items[index].remaining_path = None;
+                record.items[index].error = Some(error.to_string());
+                record.status = CleanupTaskStatus::Failed;
+                if fs::read_dir(&payload_root).is_ok_and(|mut entries| entries.next().is_none()) {
+                    let _ = fs::remove_dir(&payload_root);
+                }
+                if cleanup_root_created
+                    && fs::read_dir(&cleanup_root).is_ok_and(|mut entries| entries.next().is_none())
+                {
+                    let _ = fs::remove_dir(&cleanup_root);
+                }
+            }
+        }
+        write_cleanup_record(&mut record)?;
+    }
+    Ok(record)
+}
+pub fn discover_cleanup_tasks(
+    record_root: &Path,
+) -> Result<Vec<CleanupTaskRecord>, OperationError> {
+    if !path_exists(record_root) {
+        return Ok(Vec::new());
+    }
+    let mut records = Vec::new();
+    for entry in
+        fs::read_dir(record_root).map_err(|error| OperationError::io(record_root, error))?
+    {
+        let entry = entry.map_err(|error| OperationError::io(record_root, error))?;
+        let task_root = entry.path();
+        let Some(name) = task_root.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        if !name.starts_with(".asterfiles-cleanup-")
+            || !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+        {
+            continue;
+        }
+        let mut candidates = fs::read_dir(&task_root)
+            .map_err(|error| OperationError::io(&task_root, error))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension() == Some(OsStr::new("afcleanup")))
+            .collect::<Vec<_>>();
+        candidates.sort();
+        if let Some(record) = candidates
+            .iter()
+            .rev()
+            .find_map(|path| read_cleanup_record(path).ok())
+        {
+            records.push(record);
+        }
+    }
+    records.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+    Ok(records)
+}
+
+struct CleanupTaskClaim {
+    file: Option<fs::File>,
+    path: PathBuf,
+}
+
+impl CleanupTaskClaim {
+    fn acquire(record_root: &Path, task_id: &str) -> Result<Self, OperationError> {
+        let path = record_root.join(format!(".asterfiles-cleanup-{task_id}.claim"));
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.create(true).share_mode(0);
+        }
+        #[cfg(not(windows))]
+        options.create_new(true);
+        let file = options
+            .open(&path)
+            .map_err(|error| OperationError::io(&path, error))?;
+        Ok(Self {
+            file: Some(file),
+            path,
+        })
+    }
+}
+
+impl Drop for CleanupTaskClaim {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        let _ = fs::remove_file(&self.path);
+    }
+}
+pub fn retry_cleanup_task(
+    record_root: &Path,
+    task_id: &str,
+    cancel: &CancellationToken,
+    progress: &mut dyn FnMut(&CleanupProgress),
+) -> Result<CleanupTaskRecord, OperationError> {
+    let _claim = CleanupTaskClaim::acquire(record_root, task_id)?;
+    let mut record = discover_cleanup_tasks(record_root)?
+        .into_iter()
+        .find(|record| record.task_id == task_id)
+        .ok_or_else(|| OperationError::Io {
+            path: record_root.to_path_buf(),
+            kind: io::ErrorKind::NotFound,
+            message: "cleanup task record was not found".to_owned(),
+        })?;
+    for (index, item) in record.items.iter_mut().enumerate() {
+        let Some(current) = item.remaining_path.clone() else {
+            continue;
+        };
+        if path_exists(&current) {
+            continue;
+        }
+        let expected = item.original_path.parent().map(|parent| {
+            parent
+                .join(".asterfiles-cleanup")
+                .join(&record.task_id)
+                .join(format!("payload-{index}"))
+        });
+        if expected.as_deref() != Some(current.as_path()) {
+            item.error = Some("cleanup path does not match its AsterFiles record".to_owned());
+            continue;
+        }
+        if path_exists(&item.original_path) {
+            let Some(expected_identity) = item.identity else {
+                item.error = Some("cleanup source identity is missing".to_owned());
+                continue;
+            };
+            let actual_identity = match file_identity(&item.original_path) {
+                Ok(actual) => actual,
+                Err(error) => {
+                    item.error = Some(format!("{error:?}"));
+                    continue;
+                }
+            };
+            if !same_stable_file(expected_identity, actual_identity) {
+                item.error = Some(
+                    "cleanup source identity no longer matches its AsterFiles record".to_owned(),
+                );
+                continue;
+            }
+            let parent_ready = current.parent().is_none_or(|parent| {
+                fs::create_dir_all(parent).is_ok()
+                    && file_identity(parent).is_ok_and(|parent_identity| {
+                        parent_identity.volume_serial == expected_identity.volume_serial
+                    })
+            });
+            if !parent_ready {
+                item.error = Some("cleanup storage is not on the source volume".to_owned());
+                continue;
+            }
+            match fs::rename(&item.original_path, &current) {
+                Ok(()) => {
+                    if file_identity(&current)
+                        .is_ok_and(|actual| same_stable_file(expected_identity, actual))
+                    {
+                        item.error = None;
+                    } else {
+                        item.error = Some("item identity changed during cleanup move".to_owned());
+                    }
+                }
+                Err(error) => {
+                    item.error = Some(error.to_string());
+                }
+            }
+            continue;
+        }
+        item.remaining_path = None;
+        item.error = None;
+    }
+    record.status = CleanupTaskStatus::Cleaning;
+    record.error = None;
+    write_cleanup_record(&mut record)?;
+    for index in 0..record.items.len() {
+        let Some(current) = record.items[index].remaining_path.clone() else {
+            continue;
+        };
+        if let Err(OperationError::Cancelled) = check_cancel(cancel) {
+            record.status = CleanupTaskStatus::Cancelled;
+            write_cleanup_record(&mut record)?;
+            return Ok(record);
+        }
+        let expected = record.items[index].original_path.parent().map(|parent| {
+            parent
+                .join(".asterfiles-cleanup")
+                .join(&record.task_id)
+                .join(format!("payload-{index}"))
+        });
+        let identity_matches = record.items[index]
+            .identity
+            .and_then(|expected| {
+                file_identity(&current)
+                    .ok()
+                    .map(|actual| same_stable_file(expected, actual))
+            })
+            .unwrap_or(false);
+        if expected.as_deref() != Some(current.as_path()) || !identity_matches {
+            let message = "cleanup path or stable identity no longer matches its AsterFiles record";
+            record.items[index].error = Some(message.to_owned());
+            record.status = CleanupTaskStatus::Failed;
+            write_cleanup_record(&mut record)?;
+            progress(&cleanup_progress(&record, Some(current)));
+            continue;
+        }
+        let mut report = FileOperationReport::new();
+        let mut deleted_bytes = 0;
+        let mut progress_reporter = CleanupProgressReporter::new(&record);
+        match remove_cleanup_entry(
+            &current,
+            cancel,
+            &mut report,
+            &mut deleted_bytes,
+            &mut |path, report, bytes| {
+                if progress_reporter.should_emit(report, bytes) {
+                    progress_reporter.commit(&mut record, report, bytes);
+                    progress(&cleanup_progress(&record, Some(path.to_path_buf())));
+                }
+            },
+        ) {
+            Ok(()) => {
+                progress_reporter.commit(&mut record, &report, deleted_bytes);
+                record.items[index].remaining_path = None;
+                record.items[index].error = None;
+            }
+            Err(OperationError::Cancelled) => {
+                progress_reporter.commit(&mut record, &report, deleted_bytes);
+                record.status = CleanupTaskStatus::Cancelled;
+                write_cleanup_record(&mut record)?;
+                progress(&cleanup_progress(&record, Some(current)));
+                return Ok(record);
+            }
+            Err(error) => {
+                progress_reporter.commit(&mut record, &report, deleted_bytes);
+                record.items[index].error = Some(format!("{error:?}"));
+                record.status = CleanupTaskStatus::Failed;
+                write_cleanup_record(&mut record)?;
+                progress(&cleanup_progress(&record, Some(current)));
+                continue;
+            }
+        }
+        write_cleanup_record(&mut record)?;
+        progress(&cleanup_progress(&record, Some(current)));
+    }
+    if record
+        .items
+        .iter()
+        .any(|item| item.remaining_path.is_some())
+    {
+        record.status = CleanupTaskStatus::Failed;
+        write_cleanup_record(&mut record)?;
+        return Ok(record);
+    }
+    let record_task_root = record
+        .record_path
+        .parent()
+        .unwrap_or(record_root)
+        .to_path_buf();
+    let cleanup_roots = record
+        .items
+        .iter()
+        .filter_map(|item| {
+            item.original_path
+                .parent()
+                .map(|parent| parent.join(".asterfiles-cleanup"))
+        })
+        .collect::<std::collections::HashSet<_>>();
+    for cleanup_root in cleanup_roots {
+        let payload_root = cleanup_root.join(&record.task_id);
+        if path_exists(&payload_root)
+            && fs::read_dir(&payload_root)
+                .map_err(|error| OperationError::io(&payload_root, error))?
+                .next()
+                .is_none()
+        {
+            fs::remove_dir(&payload_root)
+                .map_err(|error| OperationError::io(&payload_root, error))?;
+        }
+    }
+    for entry in fs::read_dir(&record_task_root)
+        .map_err(|error| OperationError::io(&record_task_root, error))?
+    {
+        let path = entry
+            .map_err(|error| OperationError::io(&record_task_root, error))?
+            .path();
+        if path.extension() == Some(OsStr::new("afcleanup")) {
+            fs::remove_file(&path).map_err(|error| OperationError::io(&path, error))?;
+        }
+    }
+    if fs::read_dir(&record_task_root)
+        .map_err(|error| OperationError::io(&record_task_root, error))?
+        .next()
+        .is_none()
+    {
+        fs::remove_dir(&record_task_root)
+            .map_err(|error| OperationError::io(&record_task_root, error))?;
+    }
+    Ok(record)
+}
+
+struct CleanupProgressReporter {
+    base_files: u64,
+    base_directories: u64,
+    base_bytes: u64,
+    reported_files: u64,
+    reported_directories: u64,
+    reported_bytes: u64,
+    last_sent_at: Instant,
+}
+
+impl CleanupProgressReporter {
+    const INTERVAL: Duration = Duration::from_millis(125);
+    const ITEM_BATCH: u64 = 128;
+    const BYTE_BATCH: u64 = 4 * 1024 * 1024;
+
+    fn new(record: &CleanupTaskRecord) -> Self {
+        Self {
+            base_files: record.files,
+            base_directories: record.directories,
+            base_bytes: record.bytes,
+            reported_files: 0,
+            reported_directories: 0,
+            reported_bytes: 0,
+            last_sent_at: Instant::now(),
+        }
+    }
+
+    fn should_emit(&self, report: &FileOperationReport, bytes: u64) -> bool {
+        let item_delta = report
+            .files
+            .saturating_add(report.directories)
+            .saturating_sub(
+                self.reported_files
+                    .saturating_add(self.reported_directories) as usize,
+            );
+        item_delta >= Self::ITEM_BATCH as usize
+            || bytes.saturating_sub(self.reported_bytes) >= Self::BYTE_BATCH
+            || self.last_sent_at.elapsed() >= Self::INTERVAL
+    }
+
+    fn commit(&mut self, record: &mut CleanupTaskRecord, report: &FileOperationReport, bytes: u64) {
+        record.files = self.base_files.saturating_add(report.files as u64);
+        record.directories = self
+            .base_directories
+            .saturating_add(report.directories as u64);
+        record.bytes = self.base_bytes.saturating_add(bytes);
+        self.reported_files = report.files as u64;
+        self.reported_directories = report.directories as u64;
+        self.reported_bytes = bytes;
+        self.last_sent_at = Instant::now();
+    }
+}
+fn remove_cleanup_entry(
+    path: &Path,
+    cancel: &CancellationToken,
+    report: &mut FileOperationReport,
+    bytes: &mut u64,
+    progress: &mut dyn FnMut(&Path, &FileOperationReport, u64),
+) -> Result<(), OperationError> {
+    check_cancel(cancel)?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| OperationError::io(path, error))?;
+    if !is_traversable_directory(&metadata) {
+        if !metadata.file_type().is_dir() {
+            *bytes = bytes.saturating_add(metadata.len());
+        }
+        fs::remove_file(path).map_err(|error| OperationError::io(path, error))?;
+        report.files += 1;
+        progress(path, report, *bytes);
+        return Ok(());
+    }
+    for entry in fs::read_dir(path).map_err(|error| OperationError::io(path, error))? {
+        let child = entry
+            .map_err(|error| OperationError::io(path, error))?
+            .path();
+        remove_cleanup_entry(&child, cancel, report, bytes, progress)?;
+    }
+    fs::remove_dir(path).map_err(|error| OperationError::io(path, error))?;
+    report.directories += 1;
+    progress(path, report, *bytes);
+    Ok(())
+}
+
+fn cleanup_progress(record: &CleanupTaskRecord, current_path: Option<PathBuf>) -> CleanupProgress {
+    CleanupProgress {
+        files: record.files,
+        directories: record.directories,
+        bytes: record.bytes,
+        current_path,
+    }
+}
+
+fn write_cleanup_record(record: &mut CleanupTaskRecord) -> Result<(), OperationError> {
+    let next_generation = record.generation.saturating_add(1);
+    let path = record
+        .record_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(format!("record-{next_generation:020}.afcleanup"));
+    let mut text = String::from("ASTERFILES_CLEANUP_V2\n");
+    text.push_str(&format!(
+        "task_id={}\nstatus={}\nfiles={}\ndirectories={}\nbytes={}\ngeneration={}\n",
+        record.task_id,
+        record.status.as_str(),
+        record.files,
+        record.directories,
+        record.bytes,
+        next_generation
+    ));
+    if let Some(error) = &record.error {
+        text.push_str(&format!("error={}\n", hex_bytes(error.as_bytes())));
+    }
+    for item in &record.items {
+        let remaining = item
+            .remaining_path
+            .as_ref()
+            .map(|path| encode_path(path))
+            .unwrap_or_default();
+        let identity = item.identity.map(encode_identity).unwrap_or_default();
+        let error = item
+            .error
+            .as_ref()
+            .map(|error| hex_bytes(error.as_bytes()))
+            .unwrap_or_default();
+        text.push_str(&format!(
+            "item={}|{}|{}|{}\n",
+            encode_path(&item.original_path),
+            remaining,
+            identity,
+            error
+        ));
+    }
+    let temporary = path.with_extension("afcleanup.tmp");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| OperationError::io(&temporary, error))?;
+    use std::io::Write;
+    file.write_all(text.as_bytes())
+        .map_err(|error| OperationError::io(&temporary, error))?;
+    file.sync_all()
+        .map_err(|error| OperationError::io(&temporary, error))?;
+    drop(file);
+    fs::rename(&temporary, &path).map_err(|error| OperationError::io(&path, error))?;
+    record.record_path = path;
+    record.generation = next_generation;
+    Ok(())
+}
+
+fn read_cleanup_record(path: &Path) -> Result<CleanupTaskRecord, OperationError> {
+    let text = fs::read_to_string(path).map_err(|error| OperationError::io(path, error))?;
+    let mut lines = text.lines();
+    if lines.next() != Some("ASTERFILES_CLEANUP_V2") {
+        return Err(OperationError::Io {
+            path: path.to_path_buf(),
+            kind: io::ErrorKind::InvalidData,
+            message: "not an AsterFiles cleanup record".to_owned(),
+        });
+    }
+    let mut task_id = None;
+    let mut status = None;
+    let mut files = 0;
+    let mut directories = 0;
+    let mut bytes = 0;
+    let mut generation = 0;
+    let mut error = None;
+    let mut items = Vec::new();
+    for line in lines {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "task_id" => task_id = Some(value.to_owned()),
+            "status" => status = CleanupTaskStatus::parse(value),
+            "files" => files = value.parse().unwrap_or(0),
+            "directories" => directories = value.parse().unwrap_or(0),
+            "bytes" => bytes = value.parse().unwrap_or(0),
+            "generation" => generation = value.parse().unwrap_or(0),
+            "error" => {
+                error = decode_hex_bytes(value).and_then(|bytes| String::from_utf8(bytes).ok())
+            }
+            "item" => {
+                let mut fields = value.splitn(4, '|');
+                let original_path =
+                    fields
+                        .next()
+                        .and_then(decode_path)
+                        .ok_or_else(|| OperationError::Io {
+                            path: path.to_path_buf(),
+                            kind: io::ErrorKind::InvalidData,
+                            message: "invalid cleanup original path".to_owned(),
+                        })?;
+                let remaining_path = fields
+                    .next()
+                    .filter(|value| !value.is_empty())
+                    .and_then(decode_path);
+                let identity = fields
+                    .next()
+                    .filter(|value| !value.is_empty())
+                    .and_then(decode_identity);
+                let item_error = fields
+                    .next()
+                    .filter(|value| !value.is_empty())
+                    .and_then(decode_hex_bytes)
+                    .and_then(|bytes| String::from_utf8(bytes).ok());
+                items.push(CleanupTaskItem {
+                    original_path,
+                    remaining_path,
+                    identity,
+                    error: item_error,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(CleanupTaskRecord {
+        task_id: task_id.ok_or_else(|| OperationError::Io {
+            path: path.to_path_buf(),
+            kind: io::ErrorKind::InvalidData,
+            message: "cleanup record has no task id".to_owned(),
+        })?,
+        items,
+        status: status.ok_or_else(|| OperationError::Io {
+            path: path.to_path_buf(),
+            kind: io::ErrorKind::InvalidData,
+            message: "cleanup record has no status".to_owned(),
+        })?,
+        error,
+        files,
+        directories,
+        bytes,
+        record_path: path.to_path_buf(),
+        generation,
+    })
+}
+
+fn encode_identity(identity: FileIdentity) -> String {
+    format!(
+        "{}:{}:{}",
+        identity.volume_serial,
+        hex_bytes(&identity.file_index),
+        u8::from(identity.is_directory)
+    )
+}
+
+fn decode_identity(value: &str) -> Option<FileIdentity> {
+    let mut fields = value.split(':');
+    let volume_serial = fields.next()?.parse().ok()?;
+    let bytes = decode_hex_bytes(fields.next()?)?;
+    let file_index: [u8; 16] = bytes.try_into().ok()?;
+    let is_directory = fields.next()? == "1";
+    Some(FileIdentity {
+        volume_serial,
+        file_index,
+        is_directory,
+        size_bytes: 0,
+        modified: None,
+        change_time: 0,
+    })
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    output
+}
+
+fn decode_hex_bytes(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            Some((((pair[0] as char).to_digit(16)? << 4) | (pair[1] as char).to_digit(16)?) as u8)
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn encode_path(path: &Path) -> String {
+    use std::os::windows::ffi::OsStrExt;
+    let mut bytes = Vec::new();
+    for unit in path.as_os_str().encode_wide() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    hex_bytes(&bytes)
+}
+#[cfg(windows)]
+fn decode_path(value: &str) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    let bytes = decode_hex_bytes(value)?;
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let wide = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect::<Vec<_>>();
+    Some(PathBuf::from(OsString::from_wide(&wide)))
+}
+#[cfg(not(windows))]
+fn encode_path(path: &Path) -> String {
+    hex_bytes(path.to_string_lossy().as_bytes())
+}
+#[cfg(not(windows))]
+fn decode_path(value: &str) -> Option<PathBuf> {
+    Some(PathBuf::from(
+        String::from_utf8(decode_hex_bytes(value)?).ok()?,
+    ))
+}
 pub fn permanently_delete(
     path: &Path,
     cancel: &CancellationToken,
@@ -1747,6 +2602,437 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
+    #[test]
+    fn issue_82_cleanup_task_moves_immediately_and_is_discoverable() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let records = temp.path().join("records");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("content.txt"), b"content").unwrap();
+        let original_identity = file_identity(&source).unwrap();
+
+        let record = create_cleanup_task(
+            std::slice::from_ref(&source),
+            &records,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(!source.exists());
+        assert_eq!(record.status, CleanupTaskStatus::Moved);
+        assert_eq!(record.remaining_paths().count(), 1);
+        assert!(same_stable_file(
+            original_identity,
+            file_identity(record.remaining_paths().next().unwrap()).unwrap()
+        ));
+        let discovered = discover_cleanup_tasks(&records).unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].task_id, record.task_id);
+        assert_eq!(
+            discovered[0].remaining_paths().next(),
+            record.remaining_paths().next()
+        );
+    }
+
+    #[test]
+    fn issue_82_cleanup_task_moves_multiple_siblings_into_one_payload_root() {
+        let temp = TempDir::new();
+        let records = temp.path().join("records");
+        let sources = [temp.path().join("first"), temp.path().join("second")];
+        for source in &sources {
+            fs::create_dir(source).unwrap();
+            fs::write(source.join("content.txt"), b"content").unwrap();
+        }
+
+        let record = create_cleanup_task(&sources, &records, &CancellationToken::new()).unwrap();
+
+        assert!(sources.iter().all(|source| !source.exists()));
+        assert_eq!(record.remaining_paths().count(), 2);
+        assert!(record.remaining_paths().all(Path::exists));
+    }
+    #[test]
+    fn issue_82_cleanup_reports_progress_inside_one_large_directory() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let records = temp.path().join("records");
+        fs::create_dir(&source).unwrap();
+        for index in 0..300 {
+            fs::write(source.join(format!("item-{index}.txt")), b"progress").unwrap();
+        }
+        let record = create_cleanup_task(
+            std::slice::from_ref(&source),
+            &records,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let mut snapshots = Vec::new();
+
+        retry_cleanup_task(
+            &records,
+            &record.task_id,
+            &CancellationToken::new(),
+            &mut |snapshot| snapshots.push(snapshot.clone()),
+        )
+        .unwrap();
+
+        assert!(snapshots.len() >= 3);
+        assert!(
+            snapshots
+                .windows(2)
+                .all(|pair| pair[0].files <= pair[1].files)
+        );
+        assert!(snapshots.iter().any(|snapshot| snapshot.files >= 128));
+        assert!(
+            snapshots
+                .last()
+                .is_some_and(|snapshot| snapshot.files == 300)
+        );
+    }
+    #[test]
+    fn issue_82_cancelled_cleanup_retains_record_and_retry_finishes() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let records = temp.path().join("records");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("one.txt"), b"one").unwrap();
+        fs::write(source.join("two.txt"), b"two").unwrap();
+        let record = create_cleanup_task(
+            std::slice::from_ref(&source),
+            &records,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let cancelled =
+            retry_cleanup_task(&records, &record.task_id, &cancel, &mut |_| {}).unwrap();
+        assert_eq!(cancelled.status, CleanupTaskStatus::Cancelled);
+        assert!(cancelled.record_path.exists());
+        assert_eq!(cancelled.remaining_paths().count(), 1);
+
+        let mut updates = Vec::new();
+        let completed = retry_cleanup_task(
+            &records,
+            &record.task_id,
+            &CancellationToken::new(),
+            &mut |progress| updates.push(progress.clone()),
+        )
+        .unwrap();
+        assert_eq!(completed.remaining_paths().count(), 0);
+        assert!(!completed.record_path.exists());
+        assert!(records.exists());
+        assert!(!updates.is_empty());
+        assert!(completed.files >= 2);
+    }
+
+    #[test]
+    fn issue_82_cleanup_keeps_shared_root_after_task_finishes() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let records = temp.path().join("records");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("content.txt"), b"content").unwrap();
+        let record = create_cleanup_task(
+            std::slice::from_ref(&source),
+            &records,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let cleanup_root = temp.path().join(".asterfiles-cleanup");
+
+        retry_cleanup_task(
+            &records,
+            &record.task_id,
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert!(cleanup_root.is_dir());
+        assert!(!cleanup_root.join(&record.task_id).exists());
+    }
+
+    #[test]
+    fn issue_82_retry_completes_prepared_move_before_cleanup() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let records = temp.path().join("records");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("content.txt"), b"content").unwrap();
+        let record = create_cleanup_task(
+            std::slice::from_ref(&source),
+            &records,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let pending = record.remaining_paths().next().unwrap().to_path_buf();
+        fs::rename(&pending, &source).unwrap();
+
+        let completed = retry_cleanup_task(
+            &records,
+            &record.task_id,
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert!(!source.exists());
+        assert!(!pending.exists());
+        assert_eq!(completed.remaining_paths().count(), 0);
+    }
+
+    #[test]
+    fn issue_82_retry_rejects_replaced_original_identity() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let records = temp.path().join("records");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("old.txt"), b"old").unwrap();
+        let record = create_cleanup_task(
+            std::slice::from_ref(&source),
+            &records,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let pending = record.remaining_paths().next().unwrap().to_path_buf();
+        fs::remove_dir_all(&pending).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("replacement.txt"), b"replacement").unwrap();
+
+        let failed = retry_cleanup_task(
+            &records,
+            &record.task_id,
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert!(source.join("replacement.txt").exists());
+        assert_eq!(failed.status, CleanupTaskStatus::Failed);
+        assert!(failed.record_path.exists());
+        assert_eq!(failed.remaining_paths().count(), 1);
+        assert!(
+            failed.items[0]
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("identity"))
+        );
+    }
+
+    #[test]
+    fn issue_82_cleanup_claim_is_exclusive() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let records = temp.path().join("records");
+        fs::create_dir(&source).unwrap();
+        let record = create_cleanup_task(
+            std::slice::from_ref(&source),
+            &records,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let claim = CleanupTaskClaim::acquire(&records, &record.task_id).unwrap();
+
+        assert!(CleanupTaskClaim::acquire(&records, &record.task_id).is_err());
+        drop(claim);
+        assert!(CleanupTaskClaim::acquire(&records, &record.task_id).is_ok());
+    }
+    #[test]
+    fn issue_82_retry_reconciles_an_already_cleaned_payload() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let records = temp.path().join("records");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("one.txt"), b"one").unwrap();
+        let record = create_cleanup_task(
+            std::slice::from_ref(&source),
+            &records,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let remaining = record.remaining_paths().next().unwrap().to_path_buf();
+        fs::remove_dir_all(&remaining).unwrap();
+        let completed = retry_cleanup_task(
+            &records,
+            &record.task_id,
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(completed.remaining_paths().count(), 0);
+        assert!(!completed.record_path.exists());
+    }
+    #[test]
+    fn issue_82_discovery_falls_back_from_a_corrupt_latest_record() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let records = temp.path().join("records");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("content.txt"), b"content").unwrap();
+        let record = create_cleanup_task(
+            std::slice::from_ref(&source),
+            &records,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let task_root = record.record_path.parent().unwrap();
+        fs::write(
+            task_root.join("record-99999999999999999999.afcleanup"),
+            b"broken",
+        )
+        .unwrap();
+
+        let discovered = discover_cleanup_tasks(&records).unwrap();
+
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].task_id, record.task_id);
+        assert_eq!(discovered[0].remaining_paths().count(), 1);
+    }
+    #[test]
+    fn issue_82_discovery_ignores_unknown_files_and_preserves_unknown_directory() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source.txt");
+        let records = temp.path().join("records");
+        fs::create_dir(&records).unwrap();
+        fs::write(records.join("unknown.txt"), b"keep").unwrap();
+        fs::create_dir(records.join("unknown-dir")).unwrap();
+        fs::write(&source, b"content").unwrap();
+        let record = create_cleanup_task(
+            std::slice::from_ref(&source),
+            &records,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(discover_cleanup_tasks(&records).unwrap().len(), 1);
+        retry_cleanup_task(
+            &records,
+            &record.task_id,
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(records.join("unknown.txt").exists());
+        assert!(records.join("unknown-dir").exists());
+        assert!(records.exists());
+    }
+
+    #[test]
+    #[ignore = "explicit Issue #82 performance evidence"]
+    fn issue_82_fast_delete_performance_evidence() {
+        let artifact_dir = PathBuf::from("artifacts/perf/file-operations");
+        fs::create_dir_all(&artifact_dir).unwrap();
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let records = temp.path().join("records");
+        fs::create_dir(&source).unwrap();
+        let file_count = 2_000_u64;
+        for index in 0..file_count {
+            fs::write(source.join(format!("{index:04}.tmp")), b"x").unwrap();
+        }
+        let started = std::time::Instant::now();
+        let cpu_started = std::time::Instant::now();
+        let record = create_cleanup_task(
+            std::slice::from_ref(&source),
+            &records,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let source_disappeared_ms = started.elapsed().as_millis();
+        let cleanup_started_ms = started.elapsed().as_millis();
+        let completed = retry_cleanup_task(
+            &records,
+            &record.task_id,
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        let space_released_ms = started.elapsed().as_millis();
+        fs::write(
+            artifact_dir.join("issue-82-fast-delete.json"),
+            format!(
+                concat!(
+                    "{{\n",
+                    "  \"schema_version\": 1,\n",
+                    "  \"issue\": 82,\n",
+                    "  \"fixture_items\": {},\n",
+                    "  \"fixture_bytes\": {},\n",
+                    "  \"source_disappeared_ms\": {},\n",
+                    "  \"cleanup_started_ms\": {},\n",
+                    "  \"space_released_ms\": {},\n",
+                    "  \"cpu_millis\": {},\n",
+                    "  \"cancel_latency_ms\": null,\n",
+                    "  \"remaining_items\": {}\n",
+                    "}}\n"
+                ),
+                file_count + 1,
+                file_count,
+                source_disappeared_ms,
+                cleanup_started_ms,
+                space_released_ms,
+                cpu_started.elapsed().as_millis(),
+                completed.remaining_paths().count(),
+            ),
+        )
+        .unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn issue_82_cleanup_does_not_follow_directory_symlink() {
+        use std::os::windows::fs::symlink_dir;
+        let temp = TempDir::new();
+        let outside = temp.path().join("outside");
+        let source = temp.path().join("source");
+        let records = temp.path().join("records");
+        fs::create_dir(&outside).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::write(outside.join("keep.bin"), [9_u8; 32]).unwrap();
+        if let Err(error) = symlink_dir(&outside, source.join("link")) {
+            eprintln!("directory symlink test skipped: {error}");
+            return;
+        }
+
+        let record = create_cleanup_task(
+            std::slice::from_ref(&source),
+            &records,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        retry_cleanup_task(
+            &records,
+            &record.task_id,
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(fs::read(outside.join("keep.bin")).unwrap(), [9_u8; 32]);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn issue_82_cleanup_does_not_follow_symlink() {
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new();
+        let outside = temp.path().join("outside");
+        let source = temp.path().join("source");
+        let records = temp.path().join("records");
+        fs::create_dir(&outside).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::write(outside.join("keep.bin"), [9_u8; 32]).unwrap();
+        symlink(&outside, source.join("link")).unwrap();
+
+        let record = create_cleanup_task(
+            std::slice::from_ref(&source),
+            &records,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        retry_cleanup_task(
+            &records,
+            &record.task_id,
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(fs::read(outside.join("keep.bin")).unwrap(), [9_u8; 32]);
+    }
     #[test]
     fn issue_81_recycle_discovery_counts_items_bytes_and_skips_reparse_targets() {
         let temp = TempDir::new();

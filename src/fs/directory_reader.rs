@@ -7,6 +7,7 @@ use std::{
     },
 };
 
+use crate::domain::folder_size_scheduler::is_internal_cleanup_path;
 use crate::domain::{EntryId, EntryKind, FileEntry, FileVisibility};
 
 pub const DIRECTORY_FIRST_BATCH_SIZE: usize = 32;
@@ -71,6 +72,10 @@ pub fn read_directory_batches_filtered(
                 continue;
             }
         };
+        let path = directory_entry.path();
+        if is_internal_cleanup_path(&path) {
+            continue;
+        }
         let entry_metadata = match directory_entry.metadata() {
             Ok(metadata) => metadata,
             Err(_) => {
@@ -81,7 +86,6 @@ pub fn read_directory_batches_filtered(
         if !metadata_is_visible(&entry_metadata, visibility) {
             continue;
         }
-        let path = directory_entry.path();
         let metadata = metadata_for_entry(&path, entry_metadata);
         if cancel.load(AtomicOrdering::Acquire) {
             return Ok(ReadOutcome::Cancelled);
@@ -149,6 +153,10 @@ pub fn read_aggregate_directory_batches_filtered(
                     continue;
                 }
             };
+            let path = directory_entry.path();
+            if is_internal_cleanup_path(&path) {
+                continue;
+            }
             let entry_metadata = match directory_entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(_) => {
@@ -159,7 +167,6 @@ pub fn read_aggregate_directory_batches_filtered(
             if !metadata_is_visible(&entry_metadata, visibility) {
                 continue;
             }
-            let path = directory_entry.path();
             let metadata = metadata_for_entry(&path, entry_metadata);
             if cancel.load(AtomicOrdering::Acquire) {
                 source_cancelled = true;
@@ -344,6 +351,84 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+    #[test]
+    fn internal_cleanup_paths_are_filtered_regardless_of_visibility() {
+        let fixture = TempTree::new("internal-cleanup");
+        fs::create_dir(fixture.child(".ASTERFILES-CLEANUP")).unwrap();
+        fs::create_dir(fixture.child(".asterfiles-cleanup-copy")).unwrap();
+        fs::write(fixture.child("kept.txt"), b"").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut entries = Vec::new();
+
+        read_directory_batches_filtered(
+            &fixture.0,
+            &cancel,
+            FileVisibility {
+                show_hidden: true,
+                show_system: true,
+            },
+            |batch| entries.extend(batch),
+        )
+        .unwrap();
+
+        assert!(!entries.iter().any(|entry| {
+            entry
+                .display_name
+                .eq_ignore_ascii_case(".asterfiles-cleanup")
+        }));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.display_name == ".asterfiles-cleanup-copy")
+        );
+        assert!(entries.iter().any(|entry| entry.display_name == "kept.txt"));
+    }
+
+    #[test]
+    fn aggregate_read_filters_internal_cleanup_paths_from_every_source() {
+        let fixture = TempTree::new("aggregate-internal-cleanup");
+        let first = fixture.child("first");
+        let second = fixture.child("second");
+        fs::create_dir_all(first.join(".asterfiles-cleanup")).unwrap();
+        fs::create_dir_all(second.join(".ASTERFILES-CLEANUP")).unwrap();
+        fs::create_dir_all(second.join(".asterfiles-cleanup-copy")).unwrap();
+        fs::write(first.join("first.txt"), b"").unwrap();
+        fs::write(second.join("second.txt"), b"").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut entries = Vec::new();
+
+        let result = read_aggregate_directory_batches_filtered(
+            &[first, second],
+            &cancel,
+            FileVisibility {
+                show_hidden: true,
+                show_system: true,
+            },
+            |batch| entries.extend(batch),
+        );
+
+        assert!(!result.cancelled);
+        assert!(!entries.iter().any(|entry| {
+            entry
+                .display_name
+                .eq_ignore_ascii_case(".asterfiles-cleanup")
+        }));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.display_name == ".asterfiles-cleanup-copy")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.display_name == "first.txt")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.display_name == "second.txt")
+        );
     }
 
     #[test]
