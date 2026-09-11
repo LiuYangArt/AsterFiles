@@ -1261,6 +1261,77 @@ thread_local! {
 
 type GridEntryPositions = HashMap<WindowId, HashMap<EntryId, (usize, usize)>>;
 
+fn rebuild_grouped_grid_layout(ui: &AppWindow, enabled: bool) {
+    let mut extent = 0.0;
+    let layout = if enabled {
+        let entry_height = file_row_height(view_mode_from_ui(ui.get_view_mode()));
+        ui.get_grid_rows()
+            .iter()
+            .map(|row| {
+                let height = if row.group_header {
+                    group_header_height_for_detail(row.group_detail.as_str()) as f32
+                } else {
+                    entry_height
+                };
+                let placed = PositionedGridRow {
+                    row,
+                    offset: extent,
+                    extent: height,
+                };
+                extent += height;
+                placed
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    ui.set_grouped_grid_layout(ModelRc::new(VecModel::from(layout)));
+    ui.set_grouped_grid_extent(extent);
+    ui.set_grouped_grid_enabled(enabled);
+    ui.set_grouped_grid_visible_rows(ModelRc::new(VecModel::default()));
+    refresh_grouped_grid_viewport(ui);
+}
+
+fn refresh_grouped_grid_viewport(ui: &AppWindow) {
+    if !ui.get_grouped_grid_enabled() {
+        ui.set_grouped_grid_visible_rows(ModelRc::new(VecModel::default()));
+        return;
+    }
+    let height = ui.get_file_viewport_height().max(0.0);
+    let maximum = (ui.get_grouped_grid_extent() - height).max(0.0);
+    let viewport = ui.get_file_viewport_y().clamp(-maximum, 0.0);
+    if ui.get_file_viewport_y() != viewport {
+        ui.set_file_viewport_y(viewport);
+    }
+    let layout = ui.get_grouped_grid_layout();
+    let overscan = file_row_height(view_mode_from_ui(ui.get_view_mode())) * 2.0;
+    let start = (-viewport - overscan).max(0.0);
+    let end = -viewport + height + overscan;
+    let mut low = 0;
+    let mut high = layout.row_count();
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let row = layout.row_data(middle).expect("layout row exists");
+        if row.offset + row.extent <= start {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    let rows = (low..layout.row_count())
+        .filter_map(|index| layout.row_data(index))
+        .take_while(|row| row.offset < end)
+        .collect::<Vec<_>>();
+    let current = ui.get_grouped_grid_visible_rows();
+    if current.row_count() == rows.len()
+        && current.row_data(0).map(|row| row.offset) == rows.first().map(|row| row.offset)
+    {
+        return;
+    }
+    // Reuse entry models so thumbnail and selection updates cannot alter geometry.
+    ui.set_grouped_grid_visible_rows(ModelRc::new(VecModel::from(rows)));
+}
+
 fn rebuild_grid_entry_positions(ui: &AppWindow, window_id: WindowId) {
     let positions = ui
         .get_grid_rows()
@@ -3569,6 +3640,9 @@ fn file_row_height(view_mode: ViewMode) -> f32 {
 }
 
 fn projected_scroll_maximum(ui: &AppWindow, view_mode: ViewMode, visible_height: f32) -> f32 {
+    if ui.get_grouped_grid_enabled() && view_mode.uses_grid_layout() {
+        return (ui.get_grouped_grid_extent() - visible_height).max(0.0);
+    }
     if view_mode.uses_grid_layout() {
         let extent = ui
             .get_grid_rows()
@@ -3597,6 +3671,19 @@ fn projected_scroll_maximum(ui: &AppWindow, view_mode: ViewMode, visible_height:
         (extent - visible_height).max(0.0)
     }
 }
+fn apply_file_scroll_delta(ui: &AppWindow, delta: f32) {
+    if ui.get_search_results_mode() {
+        ui.invoke_request_search_position(ui.get_search_scroll_y() + delta);
+        return;
+    }
+    let mode = view_mode_from_ui(ui.get_view_mode());
+    let maximum = projected_scroll_maximum(ui, mode, ui.get_file_viewport_height());
+    ui.set_file_viewport_y((ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0));
+    if ui.get_grouped_grid_enabled() {
+        refresh_grouped_grid_viewport(ui);
+    }
+}
+
 fn file_scroll_maximum(
     item_count: usize,
     view_mode: ViewMode,
@@ -10958,6 +11045,12 @@ fn wire_callbacks(
     let shortcut_for_folder_range = shortcut_sender.clone();
     let thumbnails_for_folder_range = thumbnail_scheduler.clone();
     let weak_for_folder_range = ui.as_weak();
+    let weak_for_grouped_grid = ui.as_weak();
+    ui.on_refresh_grouped_grid_viewport(move || {
+        if let Some(ui) = weak_for_grouped_grid.upgrade() {
+            refresh_grouped_grid_viewport(&ui);
+        }
+    });
     ui.on_request_folder_size_range(move |viewport_y, viewport_height| {
         let target = state_for_folder_range.lock().ok().and_then(|app| {
             let tab = app.active();
@@ -14286,14 +14379,7 @@ fn wire_mouse_navigation(
                 }
                 ctrl_wheel_accumulator.set(0.0);
                 let delta = logical_scroll_delta(delta, view_mode, ui.window().scale_factor());
-                if ui.get_search_results_mode() {
-                    ui.invoke_request_search_position(ui.get_search_scroll_y() + delta);
-                } else {
-                    let maximum =
-                        projected_scroll_maximum(&ui, view_mode, ui.get_file_viewport_height());
-                    let viewport = (ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0);
-                    ui.set_file_viewport_y(viewport);
-                }
+                apply_file_scroll_delta(&ui, delta);
                 if view_mode_from_ui(ui.get_view_mode()).uses_grid_layout() {
                     request_grid_thumbnails(&ui, &shared_state, window_id, &senders.thumbnail);
                 }
@@ -24789,6 +24875,16 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     ui.set_files(ModelRc::new(VecModel::from(file_rows)));
     ui.set_grid_column_count(grid_columns as i32);
     ui.set_grid_rows(ModelRc::new(VecModel::from(grid_rows)));
+    let grouped_grid_enabled = view_mode.uses_grid_layout()
+        && tab.page_source == PageSource::Directory
+        && matches!(
+            tab.visible_location(),
+            Some(NavigationLocation::Directory(_))
+        )
+        && tab
+            .visible_path()
+            .is_some_and(|path| app.directory_preference(path).group_field != GroupField::None);
+    rebuild_grouped_grid_layout(ui, grouped_grid_enabled);
     rebuild_grid_entry_positions(ui, window_id);
     let preference_revision = if tab.page_source == PageSource::Search {
         0
@@ -27363,7 +27459,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(ui.matches(semantic_font_size).count(), 5);
+        assert_eq!(ui.matches(semantic_font_size).count(), 6);
         let details_and_list_name = ui
             .split_once("for segment in entry.name-segments: Text {")
             .expect("details and list must render segmented file names")
@@ -27372,7 +27468,7 @@ mod tests {
         assert_eq!(
             ui.matches("text: entry.name; color: VisualStyle.c24252a; font-size: VisualStyle.file-name-font-size;")
                 .count(),
-            2
+            3
         );
         let rename_editor = ui
             .split_once("rename-editor := TextInput {")
@@ -34364,3 +34460,7 @@ mod tests {
 #[cfg(test)]
 #[path = "drag_safety_tests.rs"]
 mod drag_safety_tests;
+
+#[cfg(test)]
+#[path = "grouped_grid_tests.rs"]
+mod grouped_grid_tests;

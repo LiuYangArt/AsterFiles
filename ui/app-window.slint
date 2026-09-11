@@ -5,6 +5,7 @@ export { PopupCommandRow, QuickMenuWindow, QuickSubmenuWindow } from "quick-menu
 export struct HighlightSegment { text: string, highlighted: bool }
 export struct FileRow { id: int, loaded: bool, group-header: bool, group-label: string, group-detail: string, group-count: int, name: string, name-segments: [HighlightSegment], kind: string, parent-path: string, size: string, modified: string, created: string, is-directory: bool, selected: bool, focused: bool, cut: bool, thumbnail-state: int, icon: image }
 export struct GridRow { group-header: bool, group-label: string, group-detail: string, group-count: int, entries: [FileRow] }
+export struct PositionedGridRow { row: GridRow, offset: float, extent: float }
 export struct HistoryRow { index: int, label: string }
 export struct BreadcrumbRow { index: int, label: string, current: bool }
 export struct TabRow { id: int, title: string, active: bool, loading: bool, icon: image, is-drive: bool, is-home: bool, is-settings: bool }
@@ -849,6 +850,13 @@ export component AppWindow inherits Window {
 
     in property <[FileRow]> files;
     in property <[GridRow]> grid-rows;
+    in property <bool> grouped-grid-enabled: false;
+    in property <[PositionedGridRow]> grouped-grid-layout;
+    in property <[PositionedGridRow]> grouped-grid-visible-rows;
+    in property <float> grouped-grid-extent;
+    private property <length> legacy-grid-extent;
+    private property <length> legacy-grid-visible-height;
+    callback refresh-grouped-grid-viewport();
     in property <[HomeCardRow]> home-quick-access-items;
     in property <[HomeCardRow]> home-drive-items;
     in property <[HomeCardRow]> home-network-locations-items;
@@ -942,7 +950,14 @@ export component AppWindow inherits Window {
             root.list-viewport-y = root.file-viewport-y;
         }
     }
-    changed file-viewport-y => { root.sync-active-file-viewport(); }
+    changed file-viewport-y => {
+        root.sync-active-file-viewport();
+        if root.grouped-grid-enabled {
+            root.refresh-grouped-grid-viewport();
+            root.request-folder-size-range(root.file-viewport-y / 1px, root.file-viewport-height / 1px);
+        }
+    }
+    changed file-viewport-height => { if root.grouped-grid-enabled { root.refresh-grouped-grid-viewport(); } }
 
     out property <bool> file-list-keyboard-target: !root.active-is-settings && !root.active-is-home
         && !root.address-editing
@@ -2222,14 +2237,12 @@ accessible-label: entry.name;
                             }
                         }
                     }
-                    grid := ListView {
+                    grid := Rectangle {
                         visible: root.grid-rows.length > 0 && root.is-grid-view-mode(root.view-mode);
-                        mouse-drag-pan-enabled: false;
                         width: parent.width - 28px;
-                        viewport-width: self.width;
-                        vertical-scrollbar-policy: ScrollBarPolicy.always-off;
-                        viewport-y <=> root.grid-viewport-y;
-
+                        clip: true;
+                        out property <length> visible-height: root.grouped-grid-enabled ? self.height : root.legacy-grid-visible-height;
+                        out property <length> viewport-height: root.grouped-grid-enabled ? root.grouped-grid-extent * 1px : root.legacy-grid-extent;
                         function sync-file-geometry() { if root.is-grid-view-mode(root.view-mode) { root.file-list-left = self.absolute-position.x - root.absolute-position.x; root.file-list-top = self.absolute-position.y - root.absolute-position.y; root.rectangle-viewport-top = self.absolute-position.y - content-area.absolute-position.y; root.file-viewport-width = self.width; root.file-viewport-height = self.visible-height; } }
                         init => { self.sync-file-geometry(); }
                         private property <int> geometry-revision: root.active-geometry-revision;
@@ -2237,22 +2250,103 @@ accessible-label: entry.name;
                         changed absolute-position => { self.sync-file-geometry(); }
                         changed width => { self.sync-file-geometry(); }
                         changed visible-height => { self.sync-file-geometry(); }
-                        changed viewport-y => { if root.is-grid-view-mode(root.view-mode) { root.file-viewport-y = self.viewport-y; if !root.search-results-mode { root.request-folder-size-range(self.viewport-y / 1px, self.visible-height / 1px); } } }
-                        for row in root.grid-rows: HorizontalLayout {
-                            height: row.group-header ? (row.group-detail == "" ? 32px : 48px) : root.view-row-height(root.view-mode);
+                        if !root.grouped-grid-enabled: ListView {
+                            mouse-drag-pan-enabled: false;
+                            viewport-width: self.width;
+                            vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+                            viewport-y <=> root.grid-viewport-y;
+                            init => { root.legacy-grid-extent = self.viewport-height; root.legacy-grid-visible-height = self.visible-height; }
+                            changed viewport-height => { root.legacy-grid-extent = self.viewport-height; }
+                            changed visible-height => { root.legacy-grid-visible-height = self.visible-height; }
+                            changed viewport-y => { if root.is-grid-view-mode(root.view-mode) && !root.grouped-grid-enabled { root.file-viewport-y = self.viewport-y; if !root.search-results-mode { root.request-folder-size-range(self.viewport-y / 1px, self.visible-height / 1px); } } }
+                            for row in root.grid-rows: HorizontalLayout {
+                                height: row.group-header ? (row.group-detail == "" ? 32px : 48px) : root.view-row-height(root.view-mode);
+                                padding-left: 16px;
+                                padding-right: 16px;
+                                spacing: 8px;
+                                if row.group-header: Rectangle {
+                                    width: max(0px, grid.width - 32px); height: parent.height;
+                                    Text { x: 16px; y: 5px; width: parent.width - 110px; height: 20px; text: row.group-label; color: VisualStyle.c30333a; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: elide; }
+                                    Text { x: 16px; y: 25px; width: parent.width - 32px; height: 18px; text: row.group-detail; color: VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; overflow: elide; }
+                                    Text { x: parent.width - 92px; y: 5px; width: 76px; height: 20px; text: row.group-count; color: VisualStyle.c72747d; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+                                }
+                                for entry in row.entries: Rectangle {
+                                    width: root.view-card-width(root.view-mode); height: root.view-row-height(root.view-mode) - 8px;
+                                    border-radius: 7px;
+                                    background: entry.selected ? VisualStyle.cdce6ff : card-touch.has-hover ? VisualStyle.ceff4ff : transparent;
+                                    Image {
+                                        private property <length> fallback-size: root.view-mode == 6 ? 32px : 48px;
+                                        x: entry.icon.width != 0 ? (root.view-mode == 6 ? 8px : (parent.width - root.view-icon-size(root.view-mode)) / 2) : (parent.width - self.width) / 2;
+                                        y: entry.icon.width != 0 ? 8px : (root.view-icon-size(root.view-mode) - self.height) / 2 + 8px;
+                                        width: entry.icon.width != 0 ? root.view-icon-size(root.view-mode) : self.fallback-size;
+                                        height: entry.icon.width != 0 ? root.view-icon-size(root.view-mode) : self.fallback-size;
+                                        source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document);
+                                        image-fit: contain;
+                                        opacity: entry.thumbnail-state == 1 ? 0.5 : 1;
+                                    }
+                                    Text {
+                                        x: root.view-mode == 6 ? 64px : 7px;
+                                        y: root.view-mode == 6 ? 8px : root.view-icon-size(root.view-mode) + 10px;
+                                        width: root.view-mode == 6 ? parent.width - 72px : parent.width - 14px;
+                                        height: root.view-mode == 6 ? 24px : parent.height - root.view-icon-size(root.view-mode) - 12px;
+                                        text: entry.name; color: VisualStyle.c24252a; font-size: VisualStyle.file-name-font-size;
+                                        horizontal-alignment: root.view-mode == 6 ? left : center; vertical-alignment: center; overflow: elide;
+                                    }
+                                    if root.view-mode == 6: Text {
+                                        x: 64px; y: 32px; width: parent.width - 142px; height: 20px;
+                                        text: entry.kind; color: VisualStyle.c6f717a; font-size: 11px; vertical-alignment: center; overflow: elide;
+                                    }
+                                    if root.view-mode == 6: Text {
+                                        x: parent.width - 72px; y: 32px; width: 64px; height: 20px;
+                                        text: entry.size; color: VisualStyle.c6f717a; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; overflow: elide;
+                                    }
+                                    card-touch := TouchArea {
+                                        enabled: entry.loaded;
+                                        mouse-cursor: pointer;
+                                        private property <bool> click-control: false;
+                                        private property <bool> click-shift: false;
+                                        pointer-event(event) => {
+                                            if event.kind == PointerEventKind.down {
+                                                self.click-control = event.modifiers.control;
+                                                self.click-shift = event.modifiers.shift;
+                                                if event.button == PointerEventButton.right {
+                                                    root.show-entry-menu(
+                                                        entry.id,
+                                                        (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
+                                                        (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px
+                                                    );
+                                                }
+                                                if event.button == PointerEventButton.left {
+                                                    root.begin-internal-drag(entry.id);
+                                                }
+                                            }
+                                            if event.kind == PointerEventKind.up && event.button == PointerEventButton.left {
+                                                root.cancel-internal-drag();
+                                            }
+                                        }
+                                        clicked => { root.activate-entry(entry.id, self.click-control, self.click-shift); }
+                                    }
+                                }
+                            }
+                        }
+                        if root.grouped-grid-enabled: Rectangle {
+                        for placed in root.grouped-grid-visible-rows: HorizontalLayout {
+                            x: 0px; y: placed.offset * 1px + root.file-viewport-y;
+                            width: grid.width;
+                            height: placed.extent * 1px;
                             padding-left: 16px;
                             padding-right: 16px;
                             spacing: 8px;
-                            if row.group-header: Rectangle {
+                            if placed.row.group-header: Rectangle {
                                 width: max(0px, grid.width - 32px); height: parent.height;
-                                Text { x: 16px; y: 5px; width: parent.width - 110px; height: 20px; text: row.group-label; color: VisualStyle.c30333a; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: elide; }
-                                Text { x: 16px; y: 25px; width: parent.width - 32px; height: 18px; text: row.group-detail; color: VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; overflow: elide; }
-                                Text { x: parent.width - 92px; y: 5px; width: 76px; height: 20px; text: row.group-count; color: VisualStyle.c72747d; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+                                Text { x: 16px; y: 5px; width: parent.width - 110px; height: 20px; text: placed.row.group-label; color: VisualStyle.c30333a; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: elide; }
+                                Text { x: 16px; y: 25px; width: parent.width - 32px; height: 18px; text: placed.row.group-detail; color: VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; overflow: elide; }
+                                Text { x: parent.width - 92px; y: 5px; width: 76px; height: 20px; text: placed.row.group-count; color: VisualStyle.c72747d; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
                             }
-                            for entry in row.entries: Rectangle {
+                            for entry in placed.row.entries: Rectangle {
                                 width: root.view-card-width(root.view-mode); height: root.view-row-height(root.view-mode) - 8px;
                                 border-radius: 7px;
-                                background: entry.selected ? VisualStyle.cdce6ff : card-touch.has-hover ? VisualStyle.ceff4ff : transparent;
+                                background: entry.selected ? VisualStyle.cdce6ff : grouped-card-touch.has-hover ? VisualStyle.ceff4ff : transparent;
                                 Image {
                                     private property <length> fallback-size: root.view-mode == 6 ? 32px : 48px;
                                     x: entry.icon.width != 0 ? (root.view-mode == 6 ? 8px : (parent.width - root.view-icon-size(root.view-mode)) / 2) : (parent.width - self.width) / 2;
@@ -2279,7 +2373,7 @@ accessible-label: entry.name;
                                     x: parent.width - 72px; y: 32px; width: 64px; height: 20px;
                                     text: entry.size; color: VisualStyle.c6f717a; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; overflow: elide;
                                 }
-                                card-touch := TouchArea {
+                                grouped-card-touch := TouchArea {
                                     enabled: entry.loaded;
                                     mouse-cursor: pointer;
                                     private property <bool> click-control: false;
@@ -2306,6 +2400,7 @@ accessible-label: entry.name;
                                     clicked => { root.activate-entry(entry.id, self.click-control, self.click-shift); }
                                 }
                             }
+                        }
                         }
                     }
                     if root.rectangle-selection-visible: Rectangle {

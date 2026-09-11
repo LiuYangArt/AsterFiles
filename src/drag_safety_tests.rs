@@ -162,7 +162,7 @@ fn set_probe_rows(ui: &AppWindow) {
     }])));
 }
 
-fn actual_file_view_release_cancels_after_model_rebuild(mode: i32) {
+fn actual_file_view_release_cancels_after_model_rebuild(mode: i32, grouped: bool) {
     i_slint_backend_testing::init_no_event_loop();
     let ui = AppWindow::new().expect("in-memory testing backend");
     ui.window().set_size(slint::LogicalSize::new(1180.0, 760.0));
@@ -170,7 +170,16 @@ fn actual_file_view_release_cancels_after_model_rebuild(mode: i32) {
     ui.set_page_state(4);
     ui.set_active_is_home(false);
     ui.set_grid_column_count(1);
+    let weak = ui.as_weak();
+    ui.on_refresh_grouped_grid_viewport(move || {
+        if let Some(ui) = weak.upgrade() {
+            refresh_grouped_grid_viewport(&ui);
+        }
+    });
     set_probe_rows(&ui);
+    if grouped {
+        rebuild_grouped_grid_layout(&ui, true);
+    }
     let app = Rc::new(RefCell::new(memory_app()));
     let gesture = Rc::new(RefCell::new(FileDragGesture::default()));
     let events = Rc::new(RefCell::new(Vec::<&'static str>::new()));
@@ -215,6 +224,9 @@ fn actual_file_view_release_cancels_after_model_rebuild(mode: i32) {
         app.tab_mut(source).unwrap().latest_request.0 += 1;
         if let Some(ui) = weak.upgrade() {
             set_probe_rows(&ui);
+            if grouped {
+                rebuild_grouped_grid_layout(&ui, true);
+            }
         }
     });
     ui.show()
@@ -225,7 +237,9 @@ fn actual_file_view_release_cancels_after_model_rebuild(mode: i32) {
         let item = ui
             .root_element()
             .query_descendants()
-            .match_id(if mode == 2 {
+            .match_id(if grouped {
+                "AppWindow::grouped-card-touch"
+            } else if mode == 2 {
                 "AppWindow::card-touch"
             } else {
                 "AppWindow::mouse"
@@ -268,10 +282,15 @@ fn actual_file_view_release_cancels_after_model_rebuild(mode: i32) {
 
 #[test]
 fn issue_93_actual_list_release_cancels_after_clicked_rebuilds_model() {
-    actual_file_view_release_cancels_after_model_rebuild(1);
+    actual_file_view_release_cancels_after_model_rebuild(1, false);
 }
 
 #[test]
 fn issue_93_actual_grid_release_cancels_after_clicked_rebuilds_model() {
-    actual_file_view_release_cancels_after_model_rebuild(2);
+    actual_file_view_release_cancels_after_model_rebuild(2, false);
+}
+
+#[test]
+fn issue_91_grouped_grid_release_cancels_after_clicked_rebuilds_model() {
+    actual_file_view_release_cancels_after_model_rebuild(2, true);
 }

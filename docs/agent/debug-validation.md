@@ -234,3 +234,16 @@ Slint testing 后端验证真实 clicked/pressed/Up 顺序、释放期间布局�
 人工验收仅用新建临时目录：创建 Bridge、Whitebox 与测试文件；在列表和网格分别连续单击、双击 Bridge 后侧键返回，确认目录位置不变；再验证主动拖动、Ctrl 复制、Shift 移动和 Escape 取消，并在 Explorer 核对结果。用户确认前保持 Issue 打开和 Project In review，不构建 Release。
 
 事件顺序证据与长期排查入口见 [#93 postmortem](../postmortem/postmortem-2026-09-11-file-drag-safety.md)。
+
+## Issue #91 普通目录分组网格
+
+```powershell
+cargo test --bin asterfiles issue_91 -- --nocapture
+python tools/verify.py
+```
+
+仅普通目录分组的小、中、大、超大图标与平铺使用精确布局。完整轻量网格模型保留，显示节点限于可见区域及上下两行；布局包装复用文件内容模型，选择和图标更新不重置位置。未分组、内容、详情、列表、搜索与库使用原路径。
+
+专项测试使用内存数据和 Slint 无窗口后端，覆盖精确底部、重建、缩放、局部更新、坐标命中、范围切换与短内容钳制。实际滚轮使用现有 winit 入口；专项测试调用其共用滚动处理，不能替代真实设备与 DPI 验收。日志 `artifacts/logs/issue-91-tests.log`，完整验证汇总 `artifacts/verify/summary.json`。
+
+用户手动验收请使用临时目录：启用类型分组，逐个图标尺寸及平铺滚到底并拖动滑块；滚动后选择、全选、等待图标和大小回包；改变窗口宽度并切换分组；双击进入再侧键返回；确认普通点击没有移动文件，正常拖放及取消仍有效。内容模式原有分组滚动问题不属于此次修复。
