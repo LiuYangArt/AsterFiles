@@ -315,3 +315,7 @@ cargo test issue_111_ -- --nocapture
 拆分对照证据位于 `artifacts/issue-107/`：`baseline-summary.json`、`baseline-state/` 保存拆分前完整验证；各切片的 `*-tests.log` / `*-build.log` 保存测试和 Debug 构建输出。最终汇总仍使用 `artifacts/verify/summary.json`，场景状态仍使用 `artifacts/state/`。比较无界面输出时仅排除明确随运行变化的时间、临时夹具路径等字段；身份、取消和终态等业务字段必须保留并比较。
 
 模块拆分不授权自动操作 AsterFiles UI。如需人工回归，使用临时目录：复制或重命名一个小文件并撤销；目录加载时切换标签；将标签移至另一窗口再关闭原窗口，确认文件内容、活动标签和目录展示正常。真实窗口结果由用户反馈。
+
+## 临时联接测试的启动环境对照（Issue #109）
+
+用户 Temp 下的联接创建失败时，应使用同一个探针对比自动启动与用户独立终端，并核对实际目标存在性；独立小程序仍可能继承启动环境。不能仅凭183或命令返回成功判断产品行为。已确认本机存在启动环境差异，未修改产品创建逻辑，具体环境机制未定。详见 [联接创建调查](../postmortem/postmortem-2026-09-12-junction-launch-environment.md)。
