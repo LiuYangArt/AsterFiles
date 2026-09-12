@@ -2148,7 +2148,7 @@ accessible-label: entry.name;
                                 }
                             }
                             }
-                            if root.view-mode == 7: Rectangle {
+                            if root.view-mode == 7 && !entry.group-header: Rectangle {
                                 x: 12px; width: parent.width - 24px; height: parent.height; clip: true;
                                 InlineIcon {
                                     x: 4px; y: 8px; width: 48px; height: 48px;
@@ -2276,7 +2276,7 @@ accessible-label: entry.name;
                                     background: entry.selected ? VisualStyle.cdce6ff : card-touch.has-hover ? VisualStyle.ceff4ff : transparent;
                                     Image {
                                         private property <length> fallback-size: root.view-mode == 6 ? 32px : 48px;
-                                        x: entry.icon.width != 0 ? (root.view-mode == 6 ? 8px : (parent.width - root.view-icon-size(root.view-mode)) / 2) : (parent.width - self.width) / 2;
+                                        x: root.view-mode == 6 ? 8px + (root.view-icon-size(root.view-mode) - self.width) / 2 : (parent.width - self.width) / 2;
                                         y: entry.icon.width != 0 ? 8px : (root.view-icon-size(root.view-mode) - self.height) / 2 + 8px;
                                         width: entry.icon.width != 0 ? root.view-icon-size(root.view-mode) : self.fallback-size;
                                         height: entry.icon.width != 0 ? root.view-icon-size(root.view-mode) : self.fallback-size;
@@ -2349,7 +2349,7 @@ accessible-label: entry.name;
                                 background: entry.selected ? VisualStyle.cdce6ff : grouped-card-touch.has-hover ? VisualStyle.ceff4ff : transparent;
                                 Image {
                                     private property <length> fallback-size: root.view-mode == 6 ? 32px : 48px;
-                                    x: entry.icon.width != 0 ? (root.view-mode == 6 ? 8px : (parent.width - root.view-icon-size(root.view-mode)) / 2) : (parent.width - self.width) / 2;
+                                    x: root.view-mode == 6 ? 8px + (root.view-icon-size(root.view-mode) - self.width) / 2 : (parent.width - self.width) / 2;
                                     y: entry.icon.width != 0 ? 8px : (root.view-icon-size(root.view-mode) - self.height) / 2 + 8px;
                                     width: entry.icon.width != 0 ? root.view-icon-size(root.view-mode) : self.fallback-size;
                                     height: entry.icon.width != 0 ? root.view-icon-size(root.view-mode) : self.fallback-size;
