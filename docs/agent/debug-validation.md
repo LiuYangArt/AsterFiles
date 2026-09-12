@@ -247,3 +247,11 @@ python tools/verify.py
 专项测试使用内存数据和 Slint 无窗口后端，覆盖精确底部、重建、缩放、局部更新、坐标命中、范围切换与短内容钳制。实际滚轮使用现有 winit 入口；专项测试调用其共用滚动处理，不能替代真实设备与 DPI 验收。日志 `artifacts/logs/issue-91-tests.log`，完整验证汇总 `artifacts/verify/summary.json`。
 
 用户手动验收请使用临时目录：启用类型分组，逐个图标尺寸及平铺滚到底并拖动滑块；滚动后选择、全选、等待图标和大小回包；改变窗口宽度并切换分组；双击进入再侧键返回；确认普通点击没有移动文件，正常拖放及取消仍有效。内容模式原有分组滚动问题不属于此次修复。
+
+## Issue #98 无缩略图文件的系统图标
+
+完整验证：`python tools/verify.py`；专项测试：`cargo test issue_98 -- --nocapture`。已有 `shell-thumbnail --no-ui` 场景扩展为 Windows 实际图像提取证据，覆盖临时 PNG、MTL、未知扩展名和文件夹的图片来源、请求/返回尺寸及失败原因。指定 `ASTERFILES_THUMBNAIL_PROBE_PATH` 可只读验证用户样例，禁止修改该文件。结果写入 `artifacts/state/thumbnails/shell-png.json`，统一日志位于 `artifacts/logs/`，汇总为 `artifacts/verify/summary.json`。
+
+应用异步审计日志中的 `grid_image_extracted` 和 `grid_image_failed` 区分真实缩略图、系统图标和两者均失败，携带原始路径、标签/请求身份和尺寸；系统图标成功不会进入缩略图失败重试。
+
+人工验收：在 Debug 程序打开原截图目录，对照 Explorer 检查 MTL 与未知扩展名图标、PNG/文件夹缩略图；滚动离开再返回、切换图标大小、快速导航与关闭标签后，确认图片类型正确且不长期停留占位。Codex 不操作窗口，用户确认前不关闭 Issue 或执行本地 Release 构建。

@@ -225,3 +225,12 @@ Windows 单文件复制统一由 `platform/windows` 的 `CopyFile2` 适配层执
 导航、拖拽候选/取消、OLE 起止、原生投放、任务入队与结果持续写入异步审计日志；UI 只排队，不访问日志文件。Debug 路径为 artifacts/logs/file-operation-audit.jsonl，Release 路径为 %LOCALAPPDATA%/AsterFiles/logs/file-operation-audit.jsonl。应用正常退出排空日志并结束写入线程。
 
 #93 的事件顺序证据与预防原则见 [文件拖放安全复盘](postmortem/postmortem-2026-09-11-file-drag-safety.md)。
+
+
+## Issue #98 网格图片来源
+
+本地网格在已有后台缩略图队列中依次请求真实缩略图、目标像素尺寸的 Windows Shell 系统图标；两者均失败才显示应用占位。系统图标使用原始路径和请求尺寸作为缓存身份，保留可执行文件、快捷方式及自定义文件夹图标的独立性；不按扩展名猜测可共享的本地图标。真实缩略图与系统图标分开使用现有容量上限的有界缓存，同尺寸真实缩略图始终优先。成功取得系统图标即为该缓存项的完成状态，清除失败记录且不再自动重试缩略图；两者都失败仍沿用延迟及次数上限。图标尺寸预设和滚轮行为保持独立的 #97 边界。
+
+提取继续复用后台工作线程与可见范围调度，按 TabId、RequestId、EntryId、原始路径和当前视口计划校验回填。离屏模型释放图片，滚回时从缓存恢复；目标尺寸改变后重新提取。Shell/COM 图像实现统一位于 `src/platform/windows/shell_icons.rs`。UNC 继续只使用已有的共享类型图标链路，不为图像提取访问远端路径。
+
+无界面 Shell 探针与单元测试记录图片来源、请求和返回尺寸、失败原因及过期结果拒收；运行期 `grid_image_extracted` / `grid_image_failed` 事件进入既有异步审计日志。真实文件关联及视觉效果由用户对照 Explorer 验收。

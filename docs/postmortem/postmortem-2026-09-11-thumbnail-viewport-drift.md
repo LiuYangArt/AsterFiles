@@ -69,6 +69,6 @@
 - 视口计划与结果投放：`src/app.rs`
 - 有界缩略图计划：`src/domain/thumbnail_scheduler.rs`
 - 网格真实布局：`ui/app-window.slint`
-- Windows Shell 提取：`src/platform/windows_shell_icons.rs`
+- Windows Shell 提取：`src/platform/windows/shell_icons.rs`
 - 无界面验证说明：`docs/agent/debug-validation.md`
 - 本问题记录：GitHub Issue #88

@@ -13,6 +13,7 @@ pub mod libraries;
 pub mod network;
 pub mod quick_access;
 pub mod quick_menu_window;
+pub mod shell_icons;
 pub mod shell_integration;
 pub mod shortcut;
 pub mod single_instance;

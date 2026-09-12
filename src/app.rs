@@ -122,7 +122,7 @@ pub fn export_thumbnail_scheduler_state(path: &Path) -> io::Result<()> {
 fn entry_type_icon_key(
     path: &Path,
     kind: crate::domain::EntryKind,
-) -> Option<platform::windows_shell_icons::ShellTypeIconKey> {
+) -> Option<platform::windows::shell_icons::ShellTypeIconKey> {
     let network = crate::network::is_unc_path(path);
     if kind == crate::domain::EntryKind::Directory && !network {
         return None;
@@ -135,7 +135,7 @@ fn entry_type_icon_key(
             )
         });
     (!path_specific_local_file).then(|| {
-        platform::windows_shell_icons::ShellTypeIconKey::for_entry(
+        platform::windows::shell_icons::ShellTypeIconKey::for_entry(
             path,
             kind == crate::domain::EntryKind::Directory,
         )
@@ -1377,7 +1377,7 @@ fn update_grid_thumbnail_residents(ui: &AppWindow, window_id: WindowId, wanted: 
         };
         if entry.id == entry_id.0 as i32 {
             entry.icon = Image::default();
-            if entry.thumbnail_state == 2 {
+            if matches!(entry.thumbnail_state, 2 | 4) {
                 entry.thumbnail_state = 1;
             }
             entries.set_row_data(entry_index, entry);
@@ -1545,6 +1545,9 @@ fn grid_thumbnail_plan(
         if !app
             .thumbnail_cache
             .contains_key(&(entry.path.clone(), requested_px))
+            && !app
+                .grid_icon_cache
+                .contains_key(&(entry.path.clone(), requested_px))
             && thumbnail_retry_due(
                 app.thumbnail_failures
                     .get(&(tab_id, request_id, entry.path.clone(), requested_px)),
@@ -2265,25 +2268,27 @@ struct AppState {
     quick_menu_backdrop_opacity: u8,
     sidebar_visibility: session_store::SidebarVisibility,
     system_dark_theme: bool,
-    icons: HashMap<(TabId, RequestId, EntryId), platform::windows_shell_icons::ShellIconRgba>,
-    icon_cache: HashMap<PathBuf, platform::windows_shell_icons::ShellIconRgba>,
+    icons: HashMap<(TabId, RequestId, EntryId), platform::windows::shell_icons::ShellIconRgba>,
+    icon_cache: HashMap<PathBuf, platform::windows::shell_icons::ShellIconRgba>,
     type_icon_cache: HashMap<
-        platform::windows_shell_icons::ShellTypeIconKey,
-        platform::windows_shell_icons::ShellIconRgba,
+        platform::windows::shell_icons::ShellTypeIconKey,
+        platform::windows::shell_icons::ShellIconRgba,
     >,
     type_icon_requests: HashSet<(
         TabId,
         RequestId,
-        platform::windows_shell_icons::ShellTypeIconKey,
+        platform::windows::shell_icons::ShellTypeIconKey,
     )>,
-    sidebar_icons: HashMap<PathBuf, platform::windows_shell_icons::ShellIconRgba>,
+    sidebar_icons: HashMap<PathBuf, platform::windows::shell_icons::ShellIconRgba>,
     libraries: Vec<platform::windows::libraries::WindowsLibrary>,
     library_failures: Vec<platform::windows::libraries::LibraryFailure>,
-    library_icons: HashMap<std::ffi::OsString, platform::windows_shell_icons::ShellIconRgba>,
+    library_icons: HashMap<std::ffi::OsString, platform::windows::shell_icons::ShellIconRgba>,
     library_generation: u64,
     network_location_generation: u64,
-    thumbnail_cache: HashMap<(PathBuf, u32), platform::windows_shell_icons::ShellIconRgba>,
+    thumbnail_cache: HashMap<(PathBuf, u32), platform::windows::shell_icons::ShellIconRgba>,
     thumbnail_cache_order: VecDeque<(PathBuf, u32)>,
+    grid_icon_cache: HashMap<(PathBuf, u32), platform::windows::shell_icons::ShellIconRgba>,
+    grid_icon_cache_order: VecDeque<(PathBuf, u32)>,
     thumbnail_failures: HashMap<(TabId, RequestId, PathBuf, u32), (u8, Instant)>,
     shortcut_requests: HashSet<ShortcutRequest>,
     shortcut_completed: HashSet<ShortcutRequest>,
@@ -2545,6 +2550,8 @@ impl AppState {
             network_location_generation: 0,
             thumbnail_cache: HashMap::new(),
             thumbnail_cache_order: VecDeque::new(),
+            grid_icon_cache: HashMap::new(),
+            grid_icon_cache_order: VecDeque::new(),
             thumbnail_failures: HashMap::new(),
             shortcut_requests: HashSet::new(),
             shortcut_completed: HashSet::new(),
@@ -3961,7 +3968,7 @@ struct IconRequest {
     path: PathBuf,
     thumbnail: bool,
     requested_px: u32,
-    type_key: Option<platform::windows_shell_icons::ShellTypeIconKey>,
+    type_key: Option<platform::windows::shell_icons::ShellTypeIconKey>,
 }
 
 #[derive(Clone)]
@@ -4445,10 +4452,10 @@ struct IconEvent {
     request_id: RequestId,
     target: IconTarget,
     path: PathBuf,
-    icon: platform::windows_shell_icons::ShellIconRgba,
+    icon: platform::windows::shell_icons::ShellIconRgba,
     actual_thumbnail: bool,
     requested_px: u32,
-    type_key: Option<platform::windows_shell_icons::ShellTypeIconKey>,
+    type_key: Option<platform::windows::shell_icons::ShellTypeIconKey>,
     thumbnail_failed: bool,
     thumbnail_plan: Option<(u64, ThumbnailKey)>,
 }
@@ -20655,7 +20662,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                             target: IconTarget::Entry(entry.id),
                             path: type_key
                                 .as_ref()
-                                .map(platform::windows_shell_icons::ShellTypeIconKey::query_path)
+                                .map(platform::windows::shell_icons::ShellTypeIconKey::query_path)
                                 .unwrap_or_else(|| entry.path.clone()),
                             thumbnail: false,
                             requested_px: 0,
@@ -22257,7 +22264,7 @@ fn spawn_icon_workers(
         let events = event_sender.clone();
         let state = state.clone();
         thread::spawn(move || {
-            let _shell_apartment = platform::windows_shell_icons::initialize_shell_worker().ok();
+            let _shell_apartment = platform::windows::shell_icons::initialize_shell_worker().ok();
             loop {
                 let (generation, key) = thumbnails.recv();
                 let request = IconRequest {
@@ -22285,7 +22292,7 @@ fn spawn_icon_workers(
         let events = event_sender;
         let state = state.clone();
         thread::spawn(move || {
-            let _shell_apartment = platform::windows_shell_icons::initialize_shell_worker().ok();
+            let _shell_apartment = platform::windows::shell_icons::initialize_shell_worker().ok();
             loop {
                 let request = requests
                     .lock()
@@ -22327,52 +22334,78 @@ fn run_icon_request(
     }
     let cached = state.lock().ok().and_then(|app| {
         if request.thumbnail {
+            let key = (request.path.clone(), request.requested_px);
             app.thumbnail_cache
-                .get(&(request.path.clone(), request.requested_px))
-                .cloned()
+                .get(&key)
+                .map(|image| (image.clone(), true))
+                .or_else(|| {
+                    app.grid_icon_cache
+                        .get(&key)
+                        .map(|image| (image.clone(), false))
+                })
         } else if let Some(key) = request.type_key.as_ref() {
-            app.type_icon_cache.get(key).cloned()
+            app.type_icon_cache
+                .get(key)
+                .map(|image| (image.clone(), false))
         } else {
-            app.icon_cache.get(&request.path).cloned()
+            app.icon_cache
+                .get(&request.path)
+                .map(|image| (image.clone(), false))
         }
     });
     let (icon, actual_thumbnail) = if request.thumbnail {
-        if let Some(cached) = cached {
-            let actual = state.lock().is_ok_and(|app| {
-                app.thumbnail_cache
-                    .contains_key(&(request.path.clone(), request.requested_px))
-            });
+        if let Some((cached, actual)) = cached {
             (Some(cached), actual)
-        } else if let Some(thumbnail) = platform::windows_shell_icons::shell_thumbnail_rgba(
-            &request.path,
-            request.requested_px,
-            true,
-        )
-        .ok()
-        .filter(|thumbnail| {
-            thumbnail.image.width.max(thumbnail.image.height) >= request.requested_px
-        })
-        .or_else(|| {
-            platform::windows_shell_icons::shell_thumbnail_rgba(
+        } else {
+            match platform::windows::shell_icons::shell_grid_image_rgba(
                 &request.path,
                 request.requested_px,
-                false,
-            )
-            .ok()
-        }) {
-            let _source = thumbnail.source;
-            (Some(thumbnail.image), true)
-        } else {
-            (None, false)
+            ) {
+                Ok(result) => {
+                    crate::operation_audit::record(
+                        "grid_image_extracted",
+                        format!(
+                            "tab={:?} request={:?} path={:?} requested_px={} returned_px={}x{} source={:?} thumbnail_error={:?}",
+                            request.tab_id,
+                            request.request_id,
+                            request.path,
+                            request.requested_px,
+                            result.image.width,
+                            result.image.height,
+                            result.source,
+                            result.thumbnail_error,
+                        ),
+                    );
+                    let actual = matches!(
+                        result.source,
+                        platform::windows::shell_icons::GridImageSource::Thumbnail(_)
+                    );
+                    (Some(result.image), actual)
+                }
+                Err(error) => {
+                    crate::operation_audit::record(
+                        "grid_image_failed",
+                        format!(
+                            "tab={:?} request={:?} path={:?} requested_px={} error={error}",
+                            request.tab_id, request.request_id, request.path, request.requested_px,
+                        ),
+                    );
+                    (None, false)
+                }
+            }
         }
     } else if let Some(key) = request.type_key.as_ref() {
         (
-            cached.or_else(|| platform::windows_shell_icons::shell_type_icon_rgba(key).ok()),
+            cached
+                .map(|(image, _)| image)
+                .or_else(|| platform::windows::shell_icons::shell_type_icon_rgba(key).ok()),
             false,
         )
     } else {
         (
-            cached.or_else(|| platform::windows_shell_icons::shell_icon_rgba(&request.path).ok()),
+            cached
+                .map(|(image, _)| image)
+                .or_else(|| platform::windows::shell_icons::shell_icon_rgba(&request.path).ok()),
             false,
         )
     };
@@ -22402,7 +22435,7 @@ fn run_icon_request(
             request_id: request.request_id,
             target: request.target,
             path: request.path,
-            icon: platform::windows_shell_icons::ShellIconRgba {
+            icon: platform::windows::shell_icons::ShellIconRgba {
                 width: 0,
                 height: 0,
                 pixels: Vec::new(),
@@ -22458,12 +22491,12 @@ fn start_sidebar_icon_loader(ui: &AppWindow, state: SharedSessions) {
     };
     let weak = ui.as_weak();
     thread::spawn(move || {
-        let _shell_apartment = platform::windows_shell_icons::initialize_shell_worker().ok();
+        let _shell_apartment = platform::windows::shell_icons::initialize_shell_worker().ok();
         for path in locations {
             if crate::network::is_unc_path(&path) {
                 continue;
             }
-            let Ok(icon) = platform::windows_shell_icons::shell_icon_rgba(&path) else {
+            let Ok(icon) = platform::windows::shell_icons::shell_icon_rgba(&path) else {
                 continue;
             };
             let state = state.clone();
@@ -22926,12 +22959,12 @@ fn reload_libraries(
         let result = platform::windows::libraries::enumerate();
         let mut icons = HashMap::new();
         if let Ok(enumeration) = result.as_ref() {
-            let _shell_apartment = platform::windows_shell_icons::initialize_shell_worker().ok();
+            let _shell_apartment = platform::windows::shell_icons::initialize_shell_worker().ok();
             for library in &enumeration.libraries {
                 let Some(definition_path) = library.definition_path.as_ref() else {
                     continue;
                 };
-                if let Ok(icon) = platform::windows_shell_icons::shell_icon_rgba(definition_path) {
+                if let Ok(icon) = platform::windows::shell_icons::shell_icon_rgba(definition_path) {
                     icons.insert(library.id.as_os_str().to_owned(), icon);
                 }
             }
@@ -23368,14 +23401,14 @@ fn start_icon_event_pump(
 struct IconUpdate {
     tab_id: TabId,
     entry_id: Option<EntryId>,
-    type_key: Option<platform::windows_shell_icons::ShellTypeIconKey>,
+    type_key: Option<platform::windows::shell_icons::ShellTypeIconKey>,
 }
 
 fn insert_bounded_image(
-    cache: &mut HashMap<(PathBuf, u32), platform::windows_shell_icons::ShellIconRgba>,
+    cache: &mut HashMap<(PathBuf, u32), platform::windows::shell_icons::ShellIconRgba>,
     order: &mut VecDeque<(PathBuf, u32)>,
     key: (PathBuf, u32),
-    image: platform::windows_shell_icons::ShellIconRgba,
+    image: platform::windows::shell_icons::ShellIconRgba,
     capacity: usize,
 ) {
     if let std::collections::hash_map::Entry::Occupied(mut existing) = cache.entry(key.clone()) {
@@ -23441,7 +23474,7 @@ fn apply_icon_event(state: &SharedSessions, event: IconEvent) -> Option<IconUpda
         }
         IconTarget::Location => None,
     };
-    if event.actual_thumbnail {
+    if event.requested_px > 0 {
         app.thumbnail_failures.remove(&(
             event.tab_id,
             event.request_id,
@@ -23449,11 +23482,16 @@ fn apply_icon_event(state: &SharedSessions, event: IconEvent) -> Option<IconUpda
             event.requested_px,
         ));
         let app = &mut *app;
+        let (cache, order) = if event.actual_thumbnail {
+            (&mut app.thumbnail_cache, &mut app.thumbnail_cache_order)
+        } else {
+            (&mut app.grid_icon_cache, &mut app.grid_icon_cache_order)
+        };
         insert_bounded_image(
-            &mut app.thumbnail_cache,
-            &mut app.thumbnail_cache_order,
+            cache,
+            order,
             (event.path.clone(), event.requested_px),
-            event.icon.clone(),
+            event.icon,
             THUMBNAIL_CACHE_CAPACITY,
         );
     } else if let Some(key) = event.type_key.as_ref() {
@@ -25366,9 +25404,10 @@ fn file_row(
     };
     let grid_image = grid_requested_px
         .and_then(|requested_px| app.thumbnail_cache.get(&(entry.path.clone(), requested_px)));
-    let image = grid_image.or_else(|| {
-        grid_requested_px
-            .is_none()
+    let grid_icon = grid_requested_px
+        .and_then(|requested_px| app.grid_icon_cache.get(&(entry.path.clone(), requested_px)));
+    let image = grid_image.or(grid_icon).or_else(|| {
+        (grid_requested_px.is_none() || crate::network::is_unc_path(&entry.path))
             .then(|| {
                 app.icons
                     .get(&(tab.id, tab.latest_request, entry.id))
@@ -25416,6 +25455,10 @@ fn file_row(
         thumbnail_state: grid_requested_px.map_or(0, |requested_px| {
             if grid_image.is_some() {
                 2
+            } else if grid_icon.is_some()
+                || (image.is_some() && crate::network::is_unc_path(&entry.path))
+            {
+                4
             } else if app.thumbnail_failures.contains_key(&(
                 tab.id,
                 tab.latest_request,
@@ -25431,7 +25474,7 @@ fn file_row(
     }
 }
 
-fn shell_icon_image(icon: &platform::windows_shell_icons::ShellIconRgba) -> Image {
+fn shell_icon_image(icon: &platform::windows::shell_icons::ShellIconRgba) -> Image {
     let buffer =
         SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&icon.pixels, icon.width, icon.height);
     Image::from_rgba8(buffer)
@@ -27657,8 +27700,8 @@ mod tests {
         assert!(coordinator.current.is_none());
     }
 
-    fn test_image(size: u32) -> platform::windows_shell_icons::ShellIconRgba {
-        platform::windows_shell_icons::ShellIconRgba {
+    fn test_image(size: u32) -> platform::windows::shell_icons::ShellIconRgba {
+        platform::windows::shell_icons::ShellIconRgba {
             width: size,
             height: size,
             pixels: vec![0; size as usize * size as usize * 4],
@@ -29107,6 +29150,132 @@ mod tests {
         );
     }
 
+    fn issue_98_icon_event(path: &str) -> IconEvent {
+        IconEvent {
+            tab_id: TabId(1),
+            request_id: RequestId(12),
+            target: IconTarget::Entry(EntryId(1)),
+            path: PathBuf::from(path),
+            icon: test_image(128),
+            actual_thumbnail: false,
+            requested_px: 128,
+            type_key: None,
+            thumbnail_failed: false,
+            thumbnail_plan: None,
+        }
+    }
+
+    fn issue_98_state() -> SharedSessions {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\grid")], 0, [0, 1, 2, 3]);
+        let tab = app.tab_mut(TabId(1)).unwrap();
+        tab.latest_request = RequestId(12);
+        tab.replace_entries(vec![focus_entry(1, r"C:\grid\model.mtl")]);
+        Arc::new(Mutex::new(app))
+    }
+
+    #[test]
+    fn issue_98_system_icon_is_terminal_cached_and_thumbnail_still_wins() {
+        let state = issue_98_state();
+        let event = issue_98_icon_event(r"C:\grid\model.mtl");
+        let mut failed = event.clone();
+        failed.thumbnail_failed = true;
+        assert!(apply_icon_event(&state, failed).is_some());
+        assert!(apply_icon_event(&state, event.clone()).is_some());
+        {
+            let app = state.lock().unwrap();
+            assert!(app.thumbnail_cache.is_empty());
+            assert!(app.thumbnail_failures.is_empty());
+            assert_eq!(app.grid_icon_cache.len(), 1);
+            let tab = app.active();
+            let entry = tab.visible_entry(EntryId(1)).unwrap();
+            let row = file_row(entry, tab, Texts::new(Language::Chinese), &app, Some(128));
+            assert_eq!(row.thumbnail_state, 4);
+            assert_eq!(row.icon.size().width, 128);
+            let larger = file_row(entry, tab, Texts::new(Language::Chinese), &app, Some(256));
+            assert_eq!(larger.icon.size().width, 0);
+            let other = focus_entry(2, r"C:\grid\other.mtl");
+            assert_eq!(
+                file_row(&other, tab, Texts::new(Language::Chinese), &app, Some(128))
+                    .icon
+                    .size()
+                    .width,
+                0
+            );
+        }
+        let (sender, receiver) = mpsc::channel();
+        let (requests, _) = mpsc::channel();
+        let scheduler = ThumbnailScheduler::new(requests);
+        // A cache hit must not access the nonexistent fixture path or report thumbnail failure.
+        run_icon_request(
+            IconRequest {
+                tab_id: event.tab_id,
+                request_id: event.request_id,
+                target: event.target,
+                path: event.path.clone(),
+                thumbnail: true,
+                requested_px: 128,
+                type_key: None,
+            },
+            None,
+            &state,
+            &sender,
+            &scheduler,
+        );
+        let cached = receiver.try_recv().unwrap();
+        assert!(!cached.actual_thumbnail);
+        assert!(!cached.thumbnail_failed);
+        assert_eq!(cached.icon.width, 128);
+        let mut thumbnail = event;
+        thumbnail.actual_thumbnail = true;
+        thumbnail.icon = test_image(160);
+        assert!(apply_icon_event(&state, thumbnail).is_some());
+        let app = state.lock().unwrap();
+        let tab = app.active();
+        let row = file_row(
+            tab.visible_entry(EntryId(1)).unwrap(),
+            tab,
+            Texts::new(Language::Chinese),
+            &app,
+            Some(128),
+        );
+        assert_eq!(row.thumbnail_state, 2);
+        assert_eq!(row.icon.size().width, 160);
+    }
+
+    #[test]
+    fn issue_98_failed_and_stale_results_cannot_populate_image_caches() {
+        let state = issue_98_state();
+        let event = issue_98_icon_event(r"C:\grid\model.mtl");
+        let mut stale = event.clone();
+        stale.request_id = RequestId(11);
+        assert!(apply_icon_event(&state, stale).is_none());
+        let mut wrong_path = event.clone();
+        wrong_path.path = PathBuf::from(r"C:\grid\other.mtl");
+        assert!(apply_icon_event(&state, wrong_path).is_none());
+        let mut failed = event.clone();
+        failed.thumbnail_failed = true;
+        failed.icon = test_image(0);
+        assert!(apply_icon_event(&state, failed).is_some());
+        {
+            let mut app = state.lock().unwrap();
+            assert!(app.grid_icon_cache.is_empty());
+            assert!(app.thumbnail_cache.is_empty());
+            let tab = app.active();
+            let row = file_row(
+                tab.visible_entry(EntryId(1)).unwrap(),
+                tab,
+                Texts::new(Language::Chinese),
+                &app,
+                Some(128),
+            );
+            assert_eq!(row.thumbnail_state, 3);
+            assert_eq!(row.icon.size().width, 0);
+            app.active_window_state_mut().tabs.remove(&TabId(1));
+        }
+        assert!(apply_icon_event(&state, event).is_none());
+        assert!(state.lock().unwrap().grid_icon_cache.is_empty());
+    }
+
     #[test]
     fn grid_rows_never_reuse_a_thumbnail_smaller_than_the_active_view() {
         let path = PathBuf::from(r"C:\grid\photo.png");
@@ -29116,7 +29285,7 @@ mod tests {
         });
         app.thumbnail_cache.insert(
             (path.clone(), 100),
-            platform::windows_shell_icons::ShellIconRgba {
+            platform::windows::shell_icons::ShellIconRgba {
                 width: 100,
                 height: 100,
                 pixels: vec![0; 100 * 100 * 4],
@@ -29134,7 +29303,7 @@ mod tests {
 
         app.thumbnail_cache.insert(
             (path, 148),
-            platform::windows_shell_icons::ShellIconRgba {
+            platform::windows::shell_icons::ShellIconRgba {
                 width: 148,
                 height: 148,
                 pixels: vec![0; 148 * 148 * 4],
@@ -29236,7 +29405,7 @@ mod tests {
         );
         assert_eq!(
             batch[3].type_key,
-            Some(platform::windows_shell_icons::ShellTypeIconKey::GenericFile)
+            Some(platform::windows::shell_icons::ShellTypeIconKey::GenericFile)
         );
         assert!(
             batch
@@ -29297,7 +29466,7 @@ mod tests {
             request_id: RequestId(12),
             target: IconTarget::Entry(EntryId(1)),
             path: key.query_path(),
-            icon: platform::windows_shell_icons::ShellIconRgba {
+            icon: platform::windows::shell_icons::ShellIconRgba {
                 width: 1,
                 height: 1,
                 pixels: vec![0, 0, 0, 0],
@@ -30774,7 +30943,7 @@ mod tests {
             request_id,
             target: IconTarget::Entry(EntryId(1)),
             path: search_entry.path,
-            icon: platform::windows_shell_icons::ShellIconRgba {
+            icon: platform::windows::shell_icons::ShellIconRgba {
                 width: 1,
                 height: 1,
                 pixels: vec![0, 0, 0, 0],
@@ -32096,7 +32265,7 @@ mod tests {
             request_id: RequestId(7),
             target: IconTarget::Entry(EntryId(3)),
             path: PathBuf::from("same/file.txt"),
-            icon: platform::windows_shell_icons::ShellIconRgba {
+            icon: platform::windows::shell_icons::ShellIconRgba {
                 width: 1,
                 height: 1,
                 pixels: vec![0, 0, 0, 0],

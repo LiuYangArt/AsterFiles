@@ -92,6 +92,18 @@ pub struct ShellThumbnailRgba {
     pub source: ThumbnailSource,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridImageSource {
+    Thumbnail(ThumbnailSource),
+    SystemIcon,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShellGridImage {
+    pub image: ShellIconRgba,
+    pub source: GridImageSource,
+    pub thumbnail_error: Option<String>,
+}
 impl ShellIconRgba {
     fn from_bgra(width: u32, height: u32, pixels: Vec<u8>) -> io::Result<Self> {
         let expected_len = width
@@ -138,7 +150,7 @@ mod windows_impl {
                 Shell::{
                     IShellItemImageFactory, SHCreateItemFromParsingName, SHFILEINFOW, SHGFI_ICON,
                     SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SIIGBF_BIGGERSIZEOK,
-                    SIIGBF_INCACHEONLY, SIIGBF_SCALEUP, SIIGBF_THUMBNAILONLY,
+                    SIIGBF_ICONONLY, SIIGBF_INCACHEONLY, SIIGBF_SCALEUP, SIIGBF_THUMBNAILONLY,
                 },
                 WindowsAndMessaging::{
                     DI_NORMAL, DestroyIcon, DrawIconEx, GetSystemMetrics, HICON, SM_CXICON,
@@ -149,7 +161,10 @@ mod windows_impl {
         core::PCWSTR,
     };
 
-    use super::{Path, ShellIconRgba, ShellThumbnailRgba, ShellTypeIconKey, ThumbnailSource, io};
+    use super::{
+        GridImageSource, Path, ShellGridImage, ShellIconRgba, ShellThumbnailRgba, ShellTypeIconKey,
+        ThumbnailSource, io,
+    };
 
     pub struct ShellWorkerApartment {
         _com: ComInitialization,
@@ -164,6 +179,56 @@ mod windows_impl {
         icon.to_rgba()
     }
 
+    pub fn shell_icon_rgba_at_size(path: &Path, size: u32) -> io::Result<ShellIconRgba> {
+        use windows::Win32::Foundation::SIZE;
+        let size = i32::try_from(size)
+            .ok()
+            .filter(|size| *size > 0)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid Shell icon size")
+            })?;
+        let wide = wide_null(path.as_os_str());
+        let factory: IShellItemImageFactory = unsafe {
+            SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).map_err(windows_error)?
+        };
+        // Ask Shell for the file's own image at the requested size without enlarging a small icon.
+        let bitmap = unsafe {
+            factory
+                .GetImage(
+                    SIZE { cx: size, cy: size },
+                    SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
+                )
+                .map_err(windows_error)?
+        };
+        owned_bitmap_to_rgba(bitmap)
+    }
+
+    pub fn shell_grid_image_rgba(path: &Path, size: u32) -> io::Result<ShellGridImage> {
+        let thumbnail = shell_thumbnail_rgba(path, size, true)
+            .ok()
+            .filter(|thumbnail| thumbnail.image.width.max(thumbnail.image.height) >= size)
+            .map(Ok)
+            .unwrap_or_else(|| shell_thumbnail_rgba(path, size, false));
+        match thumbnail {
+            Ok(thumbnail) => Ok(ShellGridImage {
+                image: thumbnail.image,
+                source: GridImageSource::Thumbnail(thumbnail.source),
+                thumbnail_error: None,
+            }),
+            Err(thumbnail_error) => {
+                let image = shell_icon_rgba_at_size(path, size).map_err(|icon_error| {
+                    io::Error::other(format!(
+                        "Shell thumbnail unavailable: {thumbnail_error}; system icon unavailable: {icon_error}"
+                    ))
+                })?;
+                Ok(ShellGridImage {
+                    image,
+                    source: GridImageSource::SystemIcon,
+                    thumbnail_error: Some(thumbnail_error.to_string()),
+                })
+            }
+        }
+    }
     pub fn shell_type_icon_rgba(key: &ShellTypeIconKey) -> io::Result<ShellIconRgba> {
         let (lookup_name, attributes) = key.lookup();
         let wide_name = wide_null(&lookup_name);
@@ -481,7 +546,8 @@ mod windows_impl {
 
 #[cfg(windows)]
 pub use windows_impl::{
-    initialize_shell_worker, shell_icon_rgba, shell_thumbnail_rgba, shell_type_icon_rgba,
+    initialize_shell_worker, shell_grid_image_rgba, shell_icon_rgba, shell_icon_rgba_at_size,
+    shell_type_icon_rgba,
 };
 
 #[cfg(test)]
@@ -518,6 +584,14 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn issue_98_sized_icon_rejects_invalid_dimensions_before_shell_access() {
+        for size in [0, i32::MAX as u32 + 1, u32::MAX] {
+            let error = super::shell_icon_rgba_at_size(Path::new("nonexistent"), size).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
     #[test]
     fn converts_bgra_pixels_to_rgba() {
         let icon = ShellIconRgba::from_bgra(2, 1, vec![1, 2, 3, 4, 10, 20, 30, 40]).unwrap();
