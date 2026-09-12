@@ -20,7 +20,7 @@ use crate::{
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-const MAGIC: &[u8; 6] = b"ASTF16";
+const MAGIC: &[u8; 6] = b"ASTF17";
 pub const DEFAULT_QUICK_MENU_BACKDROP_OPACITY: u8 = 85;
 const MAX_TABS: usize = 1_024;
 const MAX_WINDOWS: usize = 128;
@@ -588,6 +588,7 @@ fn validate_everything_config(config: &EverythingConfig) -> io::Result<()> {
 
 fn write_directory_preference(bytes: &mut Vec<u8>, value: DirectoryViewPreference) {
     bytes.push(value.view_mode.storage_code());
+    bytes.extend_from_slice(&value.view_mode.icon_size().to_le_bytes());
     bytes.push(value.sort_field.storage_code());
     bytes.push(value.sort_direction.storage_code());
     bytes.push(value.group_field.storage_code());
@@ -597,6 +598,7 @@ fn write_directory_preference(bytes: &mut Vec<u8>, value: DirectoryViewPreferenc
 
 fn write_search_preference(bytes: &mut Vec<u8>, value: SearchViewPreference) {
     bytes.push(value.view_mode.storage_code());
+    bytes.extend_from_slice(&value.view_mode.icon_size().to_le_bytes());
     bytes.push(value.sort_field.storage_code());
     bytes.push(value.sort_direction.storage_code());
     write_column_layout(bytes, value.columns);
@@ -612,13 +614,28 @@ fn write_column_layout(bytes: &mut Vec<u8>, value: ColumnLayout) {
     }
 }
 
+fn read_view_mode(bytes: &[u8], offset: &mut usize) -> io::Result<ViewMode> {
+    let code = read_u8(bytes, offset)?;
+    let preset =
+        ViewMode::from_storage_code(code).ok_or_else(|| invalid_data("invalid view mode"))?;
+    let size = u16::from_le_bytes(read_array::<2>(bytes, offset)?);
+    let mode = match preset {
+        ViewMode::Icons(_) => ViewMode::Icons(size),
+        _ if size == 0 => preset,
+        _ => return Err(invalid_data("non-icon view has an icon size")),
+    };
+    if !mode.is_valid() || mode.storage_code() != code {
+        return Err(invalid_data("invalid icon view size"));
+    }
+    Ok(mode)
+}
+
 fn read_directory_preference(
     bytes: &[u8],
     offset: &mut usize,
 ) -> io::Result<DirectoryViewPreference> {
     let value = DirectoryViewPreference {
-        view_mode: ViewMode::from_storage_code(read_u8(bytes, offset)?)
-            .ok_or_else(|| invalid_data("invalid view mode"))?,
+        view_mode: read_view_mode(bytes, offset)?,
         sort_field: SortField::from_storage_code(read_u8(bytes, offset)?)
             .ok_or_else(|| invalid_data("invalid sort field"))?,
         sort_direction: SortDirection::from_storage_code(read_u8(bytes, offset)?)
@@ -635,8 +652,7 @@ fn read_directory_preference(
 
 fn read_search_preference(bytes: &[u8], offset: &mut usize) -> io::Result<SearchViewPreference> {
     let value = SearchViewPreference {
-        view_mode: ViewMode::from_storage_code(read_u8(bytes, offset)?)
-            .ok_or_else(|| invalid_data("invalid view mode"))?,
+        view_mode: read_view_mode(bytes, offset)?,
         sort_field: SortField::from_storage_code(read_u8(bytes, offset)?)
             .ok_or_else(|| invalid_data("invalid sort field"))?,
         sort_direction: SortDirection::from_storage_code(read_u8(bytes, offset)?)
@@ -1079,8 +1095,58 @@ mod tests {
         );
     }
     #[test]
+    fn issue_97_restores_intermediate_icon_sizes() {
+        let mut state = sample_state();
+        state.default_directory_view.view_mode = ViewMode::Icons(72);
+        state.search_view.view_mode = ViewMode::Icons(120);
+        state.directory_views[0].1.view_mode = ViewMode::Icons(184);
+        let bytes = encode(&state).unwrap();
+        assert_eq!(&bytes[..6], b"ASTF17");
+        assert_eq!(decode(&bytes).unwrap(), state);
+    }
+
+    #[test]
+    fn issue_97_rejects_invalid_or_inconsistent_stored_icon_sizes() {
+        for (code, size) in [
+            (0, 16u16),
+            (1, 48),
+            (2, 0),
+            (2, 15),
+            (2, 96),
+            (3, 24),
+            (4, 48),
+            (4, 256),
+            (5, 255),
+            (5, 257),
+            (6, 16),
+            (7, 16),
+        ] {
+            let mut bytes = vec![code];
+            bytes.extend_from_slice(&size.to_le_bytes());
+            assert_eq!(
+                read_view_mode(&bytes, &mut 0).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        for size in [0, 15, 257, u16::MAX] {
+            let mut state = sample_state();
+            state.default_directory_view.view_mode = ViewMode::Icons(size);
+            assert_eq!(
+                encode(&state).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            state.default_directory_view = DirectoryViewPreference::default();
+            state.search_view.view_mode = ViewMode::Icons(size);
+            assert_eq!(
+                encode(&state).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[test]
     fn issue_86_rejects_old_formats() {
-        for version in 1..=15 {
+        for version in 1..=16 {
             let bytes = format!("ASTF{version}\0\0\0\0");
             assert_eq!(
                 decode(bytes.as_bytes()).unwrap_err().kind(),

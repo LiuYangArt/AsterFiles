@@ -166,6 +166,7 @@ fn actual_file_view_release_cancels_after_model_rebuild(mode: i32, grouped: bool
     i_slint_backend_testing::init_no_event_loop();
     let ui = AppWindow::new().expect("in-memory testing backend");
     ui.window().set_size(slint::LogicalSize::new(1180.0, 760.0));
+    project_file_geometry(&ui, view_mode_from_ui(mode));
     ui.set_view_mode(mode);
     ui.set_page_state(4);
     ui.set_active_is_home(false);

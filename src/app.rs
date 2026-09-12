@@ -1264,7 +1264,7 @@ type GridEntryPositions = HashMap<WindowId, HashMap<EntryId, (usize, usize)>>;
 fn rebuild_grouped_grid_layout(ui: &AppWindow, enabled: bool) {
     let mut extent = 0.0;
     let layout = if enabled {
-        let entry_height = file_row_height(view_mode_from_ui(ui.get_view_mode()));
+        let entry_height = file_row_height(projected_view_mode(ui));
         ui.get_grid_rows()
             .iter()
             .map(|row| {
@@ -1304,7 +1304,7 @@ fn refresh_grouped_grid_viewport(ui: &AppWindow) {
         ui.set_file_viewport_y(viewport);
     }
     let layout = ui.get_grouped_grid_layout();
-    let overscan = file_row_height(view_mode_from_ui(ui.get_view_mode())) * 2.0;
+    let overscan = file_row_height(projected_view_mode(ui)) * 2.0;
     let start = (-viewport - overscan).max(0.0);
     let end = -viewport + height + overscan;
     let mut low = 0;
@@ -1426,14 +1426,14 @@ fn screen_to_client_physical(screen_x: i32, screen_y: i32, left: i32, top: i32) 
 }
 
 fn grid_thumbnail_request_px(view_mode: ViewMode, scale: f32) -> u32 {
-    const STANDARD_SIZES: [u32; 8] = [16, 24, 32, 48, 64, 96, 128, 256];
-    let requested = (file_layout_geometry(view_mode).icon_request_px as f32 * scale)
+    const STANDARD_SIZES: [u32; 12] = [16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1024];
+    let requested = (file_layout_geometry(view_mode).icon_size as f32 * scale)
         .round()
-        .max(32.0) as u32;
+        .clamp(16.0, 1024.0) as u32;
     STANDARD_SIZES
         .into_iter()
         .find(|size| *size >= requested)
-        .unwrap_or(requested)
+        .unwrap_or(1024)
 }
 
 fn grid_thumbnail_request_rows(
@@ -3610,6 +3610,20 @@ fn view_mode_from_ui(mode: i32) -> ViewMode {
     ViewMode::from_storage_code(mode.clamp(0, u8::MAX as i32) as u8).unwrap_or(ViewMode::Details)
 }
 
+fn projected_view_mode(ui: &AppWindow) -> ViewMode {
+    match view_mode_from_ui(ui.get_view_mode()) {
+        ViewMode::Icons(_) => ViewMode::Icons((ui.get_layout_icon_size() as u16).clamp(16, 256)),
+        mode => mode,
+    }
+}
+
+fn project_file_geometry(ui: &AppWindow, mode: ViewMode) {
+    let geometry = file_layout_geometry(mode);
+    ui.set_layout_row_height(geometry.row_height);
+    ui.set_layout_card_width(geometry.card_width);
+    ui.set_layout_icon_size(geometry.icon_size as f32);
+}
+
 fn view_mode_to_ui(mode: ViewMode) -> i32 {
     i32::from(mode.storage_code())
 }
@@ -3619,7 +3633,7 @@ struct FileLayoutGeometry {
     row_height: f32,
     card_width: f32,
     card_height: f32,
-    icon_request_px: u32,
+    icon_size: u32,
     grid: bool,
 }
 
@@ -3629,56 +3643,44 @@ fn file_layout_geometry(view_mode: ViewMode) -> FileLayoutGeometry {
             row_height: 32.0,
             card_width: 0.0,
             card_height: 32.0,
-            icon_request_px: 32,
+            icon_size: 32,
             grid: false,
         },
         ViewMode::List => FileLayoutGeometry {
             row_height: 30.0,
             card_width: 0.0,
             card_height: 30.0,
-            icon_request_px: 32,
+            icon_size: 32,
             grid: false,
         },
-        ViewMode::SmallIcons => FileLayoutGeometry {
-            row_height: 78.0,
-            card_width: 88.0,
-            card_height: 70.0,
-            icon_request_px: 32,
-            grid: true,
-        },
-        ViewMode::MediumIcons => FileLayoutGeometry {
-            row_height: 132.0,
-            card_width: 140.0,
-            card_height: 124.0,
-            icon_request_px: 100,
-            grid: true,
-        },
-        ViewMode::LargeIcons => FileLayoutGeometry {
-            row_height: 180.0,
-            card_width: 188.0,
-            card_height: 172.0,
-            icon_request_px: 148,
-            grid: true,
-        },
-        ViewMode::ExtraLargeIcons => FileLayoutGeometry {
-            row_height: 204.0,
-            card_width: 196.0,
-            card_height: 196.0,
-            icon_request_px: 168,
-            grid: true,
-        },
+        ViewMode::Icons(size) => {
+            let logical_size = f32::from(size);
+            let compact = size <= 16;
+            let card_height = if compact { 24.0 } else { logical_size + 44.0 };
+            FileLayoutGeometry {
+                row_height: card_height + 8.0,
+                card_width: if compact {
+                    180.0
+                } else {
+                    (logical_size + 16.0).max(88.0)
+                },
+                card_height,
+                icon_size: u32::from(size),
+                grid: true,
+            }
+        }
         ViewMode::Tiles => FileLayoutGeometry {
             row_height: 78.0,
             card_width: 292.0,
             card_height: 70.0,
-            icon_request_px: 48,
+            icon_size: 48,
             grid: true,
         },
         ViewMode::Content => FileLayoutGeometry {
             row_height: 68.0,
             card_width: 0.0,
             card_height: 68.0,
-            icon_request_px: 48,
+            icon_size: 32,
             grid: false,
         },
     }
@@ -3745,7 +3747,7 @@ fn apply_file_scroll_delta(ui: &AppWindow, delta: f32) {
         ui.invoke_request_search_position(ui.get_search_scroll_y() + delta);
         return;
     }
-    let mode = view_mode_from_ui(ui.get_view_mode());
+    let mode = projected_view_mode(ui);
     let maximum = projected_scroll_maximum(ui, mode, ui.get_file_viewport_height());
     ui.set_file_viewport_y((ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0));
     if ui.get_grouped_grid_enabled() {
@@ -3769,68 +3771,151 @@ fn file_scroll_maximum(
 
 const CTRL_WHEEL_PIXEL_THRESHOLD: f32 = 80.0;
 
-fn ctrl_wheel_step(
-    delta: &MouseScrollDelta,
-    scale_factor: f32,
-    accumulator: &mut f32,
-) -> Option<bool> {
-    match delta {
-        MouseScrollDelta::LineDelta(_, y) if *y != 0.0 => {
-            *accumulator = 0.0;
-            Some(*y > 0.0)
-        }
+fn ctrl_wheel_step(delta: &MouseScrollDelta, scale_factor: f32, accumulator: &mut f32) -> i32 {
+    let value = match delta {
+        MouseScrollDelta::LineDelta(_, y) => *y,
         MouseScrollDelta::PixelDelta(position) => {
-            let value = position.y as f32 / scale_factor.max(f32::EPSILON);
-            if value == 0.0 {
-                return None;
-            }
-            if accumulator.signum() != value.signum() {
-                *accumulator = 0.0;
-            }
-            *accumulator += value;
-            if accumulator.abs() >= CTRL_WHEEL_PIXEL_THRESHOLD {
-                let toward_larger = *accumulator > 0.0;
-                *accumulator -= CTRL_WHEEL_PIXEL_THRESHOLD.copysign(*accumulator);
-                Some(toward_larger)
-            } else {
-                None
-            }
+            position.y as f32 / scale_factor.max(f32::EPSILON) / CTRL_WHEEL_PIXEL_THRESHOLD
         }
-        _ => None,
+    };
+    if !value.is_finite() || value == 0.0 {
+        return 0;
+    }
+    if accumulator.signum() != value.signum() {
+        *accumulator = 0.0;
+    }
+    *accumulator += value;
+    let steps = accumulator.trunc().clamp(-64.0, 64.0) as i32;
+    *accumulator -= steps as f32;
+    steps
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ZoomAnchor {
+    entry_id: i32,
+    screen_y: f32,
+}
+
+fn projected_entry_top(ui: &AppWindow, entry_id: i32) -> Option<f32> {
+    let mode = projected_view_mode(ui);
+    let mut top = 0.0;
+    if mode.uses_grid_layout() {
+        for row in ui.get_grid_rows().iter() {
+            if row.entries.iter().any(|entry| entry.id == entry_id) {
+                return Some(top);
+            }
+            top += if row.group_header {
+                group_header_height_for_detail(row.group_detail.as_str()) as f32
+            } else {
+                file_row_height(mode)
+            };
+        }
+    } else {
+        for row in ui.get_files().iter() {
+            if !row.group_header && row.id == entry_id {
+                return Some(top);
+            }
+            top += if row.group_header {
+                group_header_height_for_detail(row.group_detail.as_str()) as f32
+            } else {
+                file_row_height(mode)
+            };
+        }
+    }
+    None
+}
+
+fn capture_zoom_anchor(ui: &AppWindow, pointer_x: f32, pointer_y: f32) -> Option<ZoomAnchor> {
+    let mode = projected_view_mode(ui);
+    let geometry = file_layout_geometry(mode);
+    let columns = ui.get_grid_column_count().max(1) as usize;
+    let column = (((pointer_x - 16.0).max(0.0) / (geometry.card_width + 8.0)).floor() as usize)
+        .min(columns - 1);
+    if ui.get_search_results_mode() {
+        let total = ui.get_search_total_items().max(0) as usize;
+        if total == 0 {
+            return None;
+        }
+        let row = ((-ui.get_search_scroll_y() + pointer_y).max(0.0) / geometry.row_height).floor()
+            as usize;
+        let index = if geometry.grid {
+            row * columns + column
+        } else {
+            row
+        }
+        .min(total - 1);
+        let top = -search_scroll_for_index(index as u32, mode, columns);
+        return Some(ZoomAnchor {
+            entry_id: (index + 1) as i32,
+            screen_y: top + ui.get_search_scroll_y(),
+        });
+    }
+    let content_y = -ui.get_file_viewport_y() + pointer_y;
+    let mut top = 0.0;
+    let mut nearest = None;
+    let mut distance = f32::MAX;
+    let mut consider = |id, top: f32| {
+        let d = if content_y < top {
+            top - content_y
+        } else {
+            (content_y - top - geometry.row_height).max(0.0)
+        };
+        if id > 0 && d < distance {
+            distance = d;
+            nearest = Some(ZoomAnchor {
+                entry_id: id,
+                screen_y: top + ui.get_file_viewport_y(),
+            });
+        }
+    };
+    if geometry.grid {
+        for row in ui.get_grid_rows().iter() {
+            if row.group_header {
+                top += group_header_height_for_detail(row.group_detail.as_str()) as f32;
+                continue;
+            }
+            if let Some(entry) = row
+                .entries
+                .row_data(column.min(row.entries.row_count().saturating_sub(1)))
+            {
+                consider(entry.id, top);
+            }
+            top += geometry.row_height;
+        }
+    } else {
+        for row in ui.get_files().iter() {
+            if row.group_header {
+                top += group_header_height_for_detail(row.group_detail.as_str()) as f32;
+                continue;
+            }
+            consider(row.id, top);
+            top += geometry.row_height;
+        }
+    }
+    nearest
+}
+
+fn restore_zoom_anchor(ui: &AppWindow, anchor: Option<ZoomAnchor>) {
+    let Some(anchor) = anchor else {
+        return;
+    };
+    let mode = projected_view_mode(ui);
+    if ui.get_search_results_mode() {
+        let position = search_scroll_for_index(
+            anchor.entry_id.saturating_sub(1) as u32,
+            mode,
+            ui.get_grid_column_count().max(1) as usize,
+        ) + anchor.screen_y;
+        ui.invoke_request_search_position(position);
+    } else if let Some(top) = projected_entry_top(ui, anchor.entry_id) {
+        let maximum = projected_scroll_maximum(ui, mode, ui.get_file_viewport_height());
+        ui.set_file_viewport_y((anchor.screen_y - top).clamp(-maximum, 0.0));
+        if ui.get_grouped_grid_enabled() {
+            refresh_grouped_grid_viewport(ui);
+        }
     }
 }
 
-fn anchored_viewport(
-    old_viewport: f32,
-    pointer_y: f32,
-    old_mode: ViewMode,
-    new_mode: ViewMode,
-    columns: usize,
-    item_count: usize,
-    visible_height: f32,
-) -> f32 {
-    if item_count == 0 {
-        return 0.0;
-    }
-    let old = file_layout_geometry(old_mode);
-    let old_row = ((-old_viewport + pointer_y).max(0.0) / old.row_height).floor() as usize;
-    let anchor_index = if old.grid {
-        old_row.saturating_mul(columns.max(1))
-    } else {
-        old_row
-    }
-    .min(item_count - 1);
-    let new = file_layout_geometry(new_mode);
-    let new_row = if new.grid {
-        anchor_index / columns.max(1)
-    } else {
-        anchor_index
-    };
-    let relative = (-old_viewport + pointer_y) - old_row as f32 * old.row_height;
-    let candidate = -(new_row as f32 * new.row_height + relative - pointer_y);
-    let maximum = file_scroll_maximum(item_count, new_mode, columns, visible_height);
-    candidate.clamp(-maximum, 0.0)
-}
 fn logical_scroll_delta(delta: &MouseScrollDelta, view_mode: ViewMode, scale_factor: f32) -> f32 {
     match delta {
         MouseScrollDelta::LineDelta(_, y) => *y * file_row_height(view_mode) * 3.0,
@@ -3906,18 +3991,12 @@ fn search_window_for_scroll(
 }
 
 fn search_window_viewport_y(
-    index: u32,
+    scroll_y: f32,
     window: SearchWindow,
     view_mode: ViewMode,
     columns: usize,
 ) -> f32 {
-    let local = index.saturating_sub(window.start) as usize;
-    let row = if file_layout_geometry(view_mode).grid {
-        local / columns.max(1)
-    } else {
-        local
-    };
-    -(row as f32 * file_row_height(view_mode))
+    scroll_y - search_scroll_for_index(window.start, view_mode, columns)
 }
 fn search_scroll_for_index(index: u32, view_mode: ViewMode, columns: usize) -> f32 {
     let row = if file_layout_geometry(view_mode).grid {
@@ -8200,7 +8279,7 @@ fn built_in_context_rows(
                         0,
                         zh(chinese, english),
                         true,
-                        view == mode,
+                        view.storage_code() == mode.storage_code(),
                         false,
                     )
                 })
@@ -10810,7 +10889,7 @@ fn wire_rectangle_selection(ui: &AppWindow, state: WindowSessions) -> Rc<slint::
                     ui.invoke_request_search_position(ui.get_search_scroll_y() + delta);
                     viewport_changed = true;
                 } else {
-                    let mode = view_mode_from_ui(ui.get_view_mode());
+                    let mode = projected_view_mode(&ui);
                     let maximum =
                         projected_scroll_maximum(&ui, mode, ui.get_file_viewport_height());
                     let viewport = (ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0);
@@ -11272,7 +11351,7 @@ fn wire_callbacks(
         ui.set_search_scroll_y(scroll);
         let index = search_result_index_at_scroll(scroll, total, view_mode, columns);
         let window = search_window_for_index(index, total, columns);
-        ui.set_file_viewport_y(search_window_viewport_y(index, window, view_mode, columns));
+        ui.set_file_viewport_y(search_window_viewport_y(scroll, window, view_mode, columns));
         submit_search_page(
             &everything_for_next_search_page,
             &state_for_next_search_page,
@@ -11736,42 +11815,13 @@ fn wire_callbacks(
             ui.invoke_cancel_column_drag();
         }
         let mode = view_mode_from_ui(mode);
-        let mut preserved_search_index = None;
-        if let Ok(mut app) = state_for_view.lock() {
-            let path = app.active().visible_path().map(Path::to_path_buf);
-            if app.active().page_source == PageSource::Search {
-                let previous_mode = app.search_view.view_mode;
-                let total = app.active().search_total.unwrap_or(0);
-                preserved_search_index = weak.upgrade().map(|ui| {
-                    search_result_index_at_scroll(
-                        ui.get_search_scroll_y(),
-                        total,
-                        previous_mode,
-                        ui.get_grid_column_count().max(1) as usize,
-                    )
-                });
-            }
-            let tab_id = app.active_window_state().active_tab;
-            if app.active().page_source == PageSource::Search {
-                app.search_view.view_mode = mode;
-            } else if let Some(path) = path {
-                app.update_directory_preference(path, |preference| preference.view_mode = mode);
-            }
-            app.thumbnail_failures
-                .retain(|(request_tab, _, _, _), _| *request_tab != tab_id);
-        }
+        let anchor = weak
+            .upgrade()
+            .and_then(|ui| capture_zoom_anchor(&ui, 16.0, 0.0));
+        set_view_mode(&state_for_view, mode);
         if let Some(ui) = weak.upgrade() {
-            if let Some(index) = preserved_search_index {
-                ui.set_search_scroll_y(search_scroll_for_index(
-                    index,
-                    mode,
-                    ui.get_grid_column_count().max(1) as usize,
-                ));
-            }
             refresh_ui(&ui, &state_for_view);
-            if preserved_search_index.is_none() {
-                ui.set_file_viewport_y(0.0);
-            }
+            restore_zoom_anchor(&ui, anchor);
             request_visible_file_images(
                 &ui,
                 &state_for_view.shared,
@@ -13719,9 +13769,11 @@ fn wire_callbacks(
             }
             command if (CMD_VIEW_BASE..CMD_VIEW_BASE + 8).contains(&command) => {
                 if let Some(mode) = ViewMode::from_storage_code((command - CMD_VIEW_BASE) as u8) {
+                    let anchor = weak.upgrade().and_then(|ui| capture_zoom_anchor(&ui, 16.0, 0.0));
                     set_view_mode(&state_for_context_command, mode);
                     refresh_all_windows(&state_for_context_command.shared);
                     if let Some(ui) = weak.upgrade() {
+                        restore_zoom_anchor(&ui, anchor);
                         request_visible_file_images(
                             &ui,
                             &state_for_context_command.shared,
@@ -14116,6 +14168,7 @@ fn wire_mouse_navigation(
     let type_select = Rc::new(RefCell::new(TypeSelectState::default()));
     let cursor_position = Cell::new(winit::dpi::PhysicalPosition::new(0.0, 0.0));
     let ctrl_wheel_accumulator = Cell::new(0.0_f32);
+    let ctrl_wheel_context = Cell::new((0, 0));
     ui.window().on_winit_window_event(move |_, event| {
         if let Some(ui) = weak.upgrade() {
             match event {
@@ -14251,6 +14304,9 @@ fn wire_mouse_navigation(
         }
         if let WindowEvent::ModifiersChanged(changed) = event {
             modifiers.set(changed.state());
+            if !changed.state().control_key() {
+                ctrl_wheel_accumulator.set(0.0);
+            }
             return EventResult::Propagate;
         }
         if let WindowEvent::KeyboardInput { event, .. } = event
@@ -14300,6 +14356,17 @@ fn wire_mouse_navigation(
             event,
             WindowEvent::ScaleFactorChanged { .. } | WindowEvent::Moved(_)
         ) {
+            if matches!(event, WindowEvent::ScaleFactorChanged { .. }) {
+                let weak = ui.as_weak();
+                let state = state.clone();
+                let scheduler = senders.thumbnail.clone();
+                slint::Timer::single_shot(Duration::ZERO, move || {
+                    if let Some(ui) = weak.upgrade() {
+                        refresh_ui(&ui, &state);
+                        request_visible_file_images(&ui, &state.shared, window_id, &scheduler);
+                    }
+                });
+            }
             reposition_quick_menu_root_and_submenus(window_id);
             return EventResult::Propagate;
         }
@@ -14406,7 +14473,7 @@ fn wire_mouse_navigation(
                     ctrl_wheel_accumulator.set(0.0);
                     return EventResult::Propagate;
                 }
-                let view_mode = view_mode_from_ui(ui.get_view_mode());
+                let view_mode = projected_view_mode(&ui);
                 let control = modifiers.get().control_key();
                 if control {
                     if ui.get_context_menu_open()
@@ -14420,28 +14487,30 @@ fn wire_mouse_navigation(
                         ctrl_wheel_accumulator.set(0.0);
                         return EventResult::Propagate;
                     }
+                    let context = (
+                        ui.get_projected_file_tab_id(),
+                        ui.get_projected_file_request_id(),
+                    );
+                    if ctrl_wheel_context.replace(context) != context {
+                        ctrl_wheel_accumulator.set(0.0);
+                    }
                     let mut accumulated = ctrl_wheel_accumulator.get();
                     let step = ctrl_wheel_step(delta, ui.window().scale_factor(), &mut accumulated);
                     ctrl_wheel_accumulator.set(accumulated);
-                    if let Some(toward_larger) = step {
-                        let next = view_mode.step_ctrl_wheel(toward_larger);
+                    if step != 0 {
+                        let mut next = view_mode;
+                        for _ in 0..step.unsigned_abs() {
+                            next = next.step_ctrl_wheel(step > 0);
+                        }
                         if next != view_mode {
-                            let viewport = anchored_viewport(
-                                ui.get_file_viewport_y(),
+                            let anchor = capture_zoom_anchor(
+                                &ui,
+                                logical.x - ui.get_file_list_left(),
                                 logical.y - ui.get_file_list_top(),
-                                view_mode,
-                                next,
-                                ui.get_grid_column_count().max(1) as usize,
-                                state
-                                    .lock()
-                                    .ok()
-                                    .map(|app| app.active().visible_entries().len())
-                                    .unwrap_or(0),
-                                ui.get_file_viewport_height(),
                             );
                             set_view_mode(&state, next);
                             refresh_all_windows(&shared_state);
-                            ui.set_file_viewport_y(viewport);
+                            restore_zoom_anchor(&ui, anchor);
                             request_visible_file_images(
                                 &ui,
                                 &shared_state,
@@ -15171,7 +15240,7 @@ fn auto_scroll_drag_edge(ui: &AppWindow, drag: &platform::windows::drag_drop::Dr
         ui.invoke_request_search_position(ui.get_search_scroll_y() + delta);
         return;
     }
-    let view_mode = view_mode_from_ui(ui.get_view_mode());
+    let view_mode = projected_view_mode(ui);
     let maximum = projected_scroll_maximum(ui, view_mode, ui.get_file_viewport_height());
     ui.set_file_viewport_y((ui.get_file_viewport_y() + delta).clamp(-maximum, 0.0));
 }
@@ -15192,7 +15261,7 @@ fn drop_target_snapshot(
     let list_top = (ui.get_file_list_top() * scale).round() as i32;
     let list_left = (ui.get_file_list_left() * scale).round() as i32;
     let viewport = (-ui.get_file_viewport_y() * scale).max(0.0);
-    let view_mode = view_mode_from_ui(ui.get_view_mode());
+    let view_mode = projected_view_mode(ui);
     let row_height = file_row_height(view_mode) * scale;
     let (target_left, target_right) = if view_mode == ViewMode::Details {
         let geometry = FileHitGeometry {
@@ -20657,7 +20726,12 @@ fn reveal_entry(
             search_scroll_for_index(index, view_mode, columns).clamp(-maximum, 0.0);
         ui.set_search_scroll_y(logical_scroll);
         let window = search_window_for_index(index, search_total.unwrap_or(0), columns);
-        ui.set_file_viewport_y(search_window_viewport_y(index, window, view_mode, columns));
+        ui.set_file_viewport_y(search_window_viewport_y(
+            logical_scroll,
+            window,
+            view_mode,
+            columns,
+        ));
         refresh_tab_window(state, tab_id);
         return;
     }
@@ -24899,6 +24973,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     let view_mode = app
         .view_mode_for_tab(tab.id)
         .unwrap_or(app.default_directory_view.view_mode);
+    project_file_geometry(ui, view_mode);
     ui.set_view_mode(view_mode_to_ui(view_mode));
     let projected_tab_id = tab.id.0 as i32;
     let projected_request_id = tab.latest_request.0 as i32;
@@ -24925,7 +25000,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     let search_window = search_window_for_index(search_index, total, grid_columns);
     if tab.page_source == PageSource::Search {
         ui.set_file_viewport_y(search_window_viewport_y(
-            search_index,
+            ui.get_search_scroll_y(),
             search_window,
             view_mode,
             grid_columns,
@@ -27800,12 +27875,37 @@ mod tests {
 
     #[test]
     fn issue_18_thumbnail_sizes_use_files_style_standard_buckets() {
-        assert_eq!(grid_thumbnail_request_px(ViewMode::MediumIcons, 1.0), 128);
-        assert_eq!(grid_thumbnail_request_px(ViewMode::LargeIcons, 1.5), 256);
+        assert_eq!(grid_thumbnail_request_px(ViewMode::MediumIcons, 1.0), 48);
+        assert_eq!(grid_thumbnail_request_px(ViewMode::LargeIcons, 1.5), 192);
         assert_eq!(
             grid_thumbnail_request_px(ViewMode::ExtraLargeIcons, 1.5),
-            256
+            384
         );
+    }
+
+    #[test]
+    fn issue_97_image_requests_use_finite_dpi_buckets() {
+        for (size, scale, expected) in [
+            (16, 1.0, 16),
+            (48, 1.25, 64),
+            (72, 1.0, 96),
+            (72, 1.5, 128),
+            (104, 2.0, 256),
+            (256, 1.5, 384),
+            (256, 2.0, 512),
+        ] {
+            assert_eq!(
+                grid_thumbnail_request_px(ViewMode::Icons(size), scale),
+                expected
+            );
+        }
+        let buckets = (16..=256)
+            .flat_map(|size| {
+                [1.0, 1.25, 1.5, 2.0]
+                    .map(|scale| grid_thumbnail_request_px(ViewMode::Icons(size), scale))
+            })
+            .collect::<HashSet<_>>();
+        assert!(buckets.len() <= 12);
     }
 
     #[test]
@@ -27813,10 +27913,10 @@ mod tests {
         for (mode, row_height, card_width, card_height) in [
             (ViewMode::Details, 32.0, 0.0, 32.0),
             (ViewMode::List, 30.0, 0.0, 30.0),
-            (ViewMode::SmallIcons, 78.0, 88.0, 70.0),
-            (ViewMode::MediumIcons, 132.0, 140.0, 124.0),
-            (ViewMode::LargeIcons, 180.0, 188.0, 172.0),
-            (ViewMode::ExtraLargeIcons, 204.0, 196.0, 196.0),
+            (ViewMode::SmallIcons, 32.0, 180.0, 24.0),
+            (ViewMode::MediumIcons, 100.0, 88.0, 92.0),
+            (ViewMode::LargeIcons, 148.0, 112.0, 140.0),
+            (ViewMode::ExtraLargeIcons, 308.0, 272.0, 300.0),
             (ViewMode::Tiles, 78.0, 292.0, 70.0),
             (ViewMode::Content, 68.0, 0.0, 68.0),
         ] {
@@ -27824,23 +27924,6 @@ mod tests {
             assert_eq!(geometry.row_height, row_height, "{mode:?}");
             assert_eq!(geometry.card_width, card_width, "{mode:?}");
             assert_eq!(geometry.card_height, card_height, "{mode:?}");
-        }
-
-        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
-        for literal in [
-            "mode == 1 ? 30px",
-            "mode == 7 ? 68px",
-            "mode == 3 ? 78px",
-            "mode == 4 ? 180px",
-            "mode == 5 ? 204px",
-            "mode == 6 ? 78px",
-            "mode == 2 ? 132px",
-            ": 32px;",
-        ] {
-            assert!(
-                source.contains(literal),
-                "missing Slint geometry: {literal}"
-            );
         }
     }
 
@@ -29160,14 +29243,19 @@ mod tests {
     fn search_window_preserves_position_inside_the_loaded_window() {
         let window = search_window_for_index(65_536, 133_796, 1);
         assert_eq!(
-            search_window_viewport_y(65_536, window, ViewMode::Details, 1),
+            search_window_viewport_y(-65_536.0 * 32.0, window, ViewMode::Details, 1),
             -256.0 * 32.0
         );
         let grid_window = search_window_for_index(65_536, 133_796, 4);
         assert_eq!(grid_window.start % 4, 0);
         assert_eq!(
-            search_window_viewport_y(65_536, grid_window, ViewMode::MediumIcons, 4),
-            -64.0 * 132.0
+            search_window_viewport_y(
+                -16_384.0 * 100.0 - 17.5,
+                grid_window,
+                ViewMode::MediumIcons,
+                4
+            ),
+            -64.0 * 100.0 - 17.5
         );
     }
     #[test]
@@ -29181,7 +29269,7 @@ mod tests {
             65_536
         );
         assert_eq!(
-            search_result_index_at_scroll(-16_384.0 * 132.0, 133_796, ViewMode::MediumIcons, 4),
+            search_result_index_at_scroll(-16_384.0 * 100.0, 133_796, ViewMode::MediumIcons, 4),
             65_536
         );
         assert_eq!(
@@ -29195,11 +29283,11 @@ mod tests {
             screen_to_client_physical(800, 400, 640, 250),
             (160.0, 150.0)
         );
-        assert_eq!(grid_thumbnail_request_px(ViewMode::MediumIcons, 1.0), 128);
-        assert_eq!(grid_thumbnail_request_px(ViewMode::LargeIcons, 1.5), 256);
+        assert_eq!(grid_thumbnail_request_px(ViewMode::MediumIcons, 1.0), 48);
+        assert_eq!(grid_thumbnail_request_px(ViewMode::LargeIcons, 1.5), 192);
         assert_eq!(
             grid_thumbnail_request_px(ViewMode::ExtraLargeIcons, 1.5),
-            256
+            384
         );
     }
 
@@ -34353,7 +34441,7 @@ mod tests {
         for (mode, expected) in [
             (ViewMode::Details, -96.0),
             (ViewMode::List, -90.0),
-            (ViewMode::MediumIcons, -396.0),
+            (ViewMode::MediumIcons, -300.0),
         ] {
             assert_eq!(
                 logical_scroll_delta(&MouseScrollDelta::LineDelta(0.0, -1.0), mode, 1.0),
@@ -34370,45 +34458,17 @@ mod tests {
         }
     }
     #[test]
-    fn ctrl_wheel_steps_once_accumulates_pixels_and_clamps_views() {
+    fn ctrl_wheel_steps_accumulate_fractional_lines_and_pixels() {
         let mut accumulated = 0.0;
-        assert_eq!(
-            ctrl_wheel_step(
-                &MouseScrollDelta::LineDelta(0.0, 1.0),
-                1.0,
-                &mut accumulated
-            ),
-            Some(true)
-        );
-        assert_eq!(
-            ViewMode::ExtraLargeIcons.step_ctrl_wheel(true),
-            ViewMode::ExtraLargeIcons
-        );
-        assert_eq!(ViewMode::Content.step_ctrl_wheel(false), ViewMode::Content);
-
-        let pixels = MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, 60.0));
-        assert_eq!(ctrl_wheel_step(&pixels, 1.0, &mut accumulated), None);
-        assert_eq!(ctrl_wheel_step(&pixels, 1.0, &mut accumulated), Some(true));
-        let reverse = MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, -80.0));
-        assert_eq!(
-            ctrl_wheel_step(&reverse, 1.0, &mut accumulated),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn ctrl_wheel_anchor_preserves_visible_item_without_resetting_to_top() {
-        let viewport = anchored_viewport(
-            -400.0,
-            100.0,
-            ViewMode::Details,
-            ViewMode::MediumIcons,
-            4,
-            100,
-            500.0,
-        );
-        assert!(viewport < 0.0);
-        assert!(viewport >= -file_scroll_maximum(100, ViewMode::MediumIcons, 4, 500.0));
+        let lines = |y| MouseScrollDelta::LineDelta(0.0, y);
+        assert_eq!(ctrl_wheel_step(&lines(0.25), 1.0, &mut accumulated), 0);
+        assert_eq!(ctrl_wheel_step(&lines(0.75), 1.0, &mut accumulated), 1);
+        assert_eq!(ctrl_wheel_step(&lines(3.0), 1.0, &mut accumulated), 3);
+        let pixels = |y| MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, y));
+        assert_eq!(ctrl_wheel_step(&pixels(60.0), 1.0, &mut accumulated), 0);
+        assert_eq!(ctrl_wheel_step(&pixels(60.0), 1.0, &mut accumulated), 1);
+        assert_eq!(ctrl_wheel_step(&pixels(-80.0), 1.0, &mut accumulated), -1);
+        assert_eq!(ctrl_wheel_step(&pixels(320.0), 2.0, &mut accumulated), 2);
     }
 
     #[test]
@@ -34420,11 +34480,11 @@ mod tests {
         assert_eq!(file_scroll_maximum(67, ViewMode::List, 6, 590.0), 1_420.0);
         assert_eq!(
             file_scroll_maximum(67, ViewMode::MediumIcons, 6, 590.0),
-            994.0
+            610.0
         );
         assert_eq!(
             file_scroll_maximum(66, ViewMode::MediumIcons, 6, 590.0),
-            862.0
+            510.0
         );
         assert_eq!(file_scroll_maximum(2, ViewMode::MediumIcons, 6, 590.0), 0.0);
         assert_eq!(
@@ -34446,7 +34506,7 @@ mod tests {
         assert_eq!(file_scroll_maximum(100, ViewMode::List, 1, 400.0), 2_600.0);
         assert_eq!(
             file_scroll_maximum(10, ViewMode::MediumIcons, 3, 400.0),
-            128.0
+            0.0
         );
         assert_eq!(file_scroll_maximum(2, ViewMode::MediumIcons, 3, 400.0), 0.0);
     }

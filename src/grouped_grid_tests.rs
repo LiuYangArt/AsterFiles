@@ -62,7 +62,13 @@ fn issue_91_scoped_grid_keeps_exact_bottom_after_reprojection_and_resize() {
     let expected = ui
         .get_grid_rows()
         .iter()
-        .map(|row| if row.group_header { 32.0 } else { 132.0 })
+        .map(|row| {
+            if row.group_header {
+                32.0
+            } else {
+                file_row_height(ViewMode::MediumIcons)
+            }
+        })
         .sum::<f32>();
     assert_eq!(ui.get_grouped_grid_extent(), expected);
     ui.set_file_viewport_y(-1000000.0);
@@ -270,5 +276,83 @@ fn issue_91_batches_and_shorter_content_keep_full_data_and_bounded_nodes() {
     refresh_ui(&ui, &state);
     settle(&ui);
     assert!(ui.get_file_viewport_width() > 0.0);
-    assert_eq!(ui.get_grid_column_count(), 4);
+    assert_eq!(ui.get_grid_column_count(), 6);
+}
+
+#[test]
+fn issue_97_intermediate_zoom_preserves_grouped_anchor_and_selection() {
+    let (ui, state) = fixture(ViewMode::Icons(72));
+    ui.set_file_viewport_y(-5000.0);
+    settle(&ui);
+    let placed = ui
+        .get_grouped_grid_visible_rows()
+        .iter()
+        .find(|row| !row.row.group_header && row.offset > 5120.0)
+        .unwrap();
+    let id = EntryId(placed.row.entries.row_data(0).unwrap().id as u32);
+    let request_id = {
+        let mut app = state.lock().unwrap();
+        let tab = app.tab_mut(TabId(1)).unwrap();
+        tab.select_entry(id, false, false);
+        tab.latest_request
+    };
+    update_file_rows(&ui, &state.shared, TabId(1), &HashSet::from([id]));
+    let original_screen_y =
+        projected_entry_top(&ui, id.0 as i32).unwrap() + ui.get_file_viewport_y();
+    let mut observed_columns = HashSet::new();
+    for (size, width) in [
+        (120, 940.0),
+        (184, 1180.0),
+        (56, 1020.0),
+        (96, 1180.0),
+        (72, 1180.0),
+    ] {
+        let mode = projected_view_mode(&ui);
+        let column = ui
+            .get_grid_rows()
+            .iter()
+            .find_map(|row| row.entries.iter().position(|entry| entry.id == id.0 as i32))
+            .unwrap();
+        let anchor = capture_zoom_anchor(
+            &ui,
+            20.0 + column as f32 * (file_layout_geometry(mode).card_width + 8.0),
+            original_screen_y + 8.0,
+        )
+        .unwrap();
+        assert_eq!(anchor.entry_id, id.0 as i32);
+        set_view_mode(&state, ViewMode::Icons(size));
+        ui.window().set_size(slint::LogicalSize::new(width, 760.0));
+        refresh_ui(&ui, &state);
+        restore_zoom_anchor(&ui, Some(anchor));
+        settle(&ui);
+
+        assert_eq!(projected_view_mode(&ui), ViewMode::Icons(size));
+        assert!(ui.get_grouped_grid_enabled());
+        observed_columns.insert(ui.get_grid_column_count());
+        let screen_y = projected_entry_top(&ui, id.0 as i32).unwrap() + ui.get_file_viewport_y();
+        assert!(
+            (screen_y - original_screen_y).abs() < 0.1,
+            "size={size}: {screen_y} != {original_screen_y}"
+        );
+        let maximum =
+            projected_scroll_maximum(&ui, ViewMode::Icons(size), ui.get_file_viewport_height());
+        assert!(ui.get_file_viewport_y() < 0.0 && ui.get_file_viewport_y() > -maximum);
+        let app = state.lock().unwrap();
+        let tab = app.active();
+        assert_eq!(tab.id, TabId(1));
+        assert_eq!(tab.latest_request, request_id);
+        assert_eq!(tab.selected, vec![id]);
+        assert_eq!(tab.focused, Some(id));
+        assert_eq!(tab.visible_entries().len(), 1200);
+        let visible = ui.get_grouped_grid_visible_rows();
+        assert!(visible.row_count() > 0 && visible.row_count() < 30);
+        assert!(visible.row_count() < ui.get_grid_rows().row_count());
+        assert!(visible.iter().any(|row| {
+            row.row
+                .entries
+                .iter()
+                .any(|entry| entry.id == id.0 as i32 && entry.selected)
+        }));
+    }
+    assert!(observed_columns.len() >= 3);
 }

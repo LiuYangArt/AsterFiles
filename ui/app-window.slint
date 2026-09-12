@@ -898,7 +898,7 @@ export component AppWindow inherits Window {
     private property <length> list-viewport-y: 0px;
     private property <length> grid-viewport-y: 0px;
     in property <int> projected-content-revision: 0;
-    private property <int> active-geometry-revision: root.view-mode * 1000003 + root.projected-content-revision;
+    private property <int> active-geometry-revision: root.view-mode * 1000003 + root.projected-content-revision + root.layout-icon-size / 1px;
     in-out property <length> search-scroll-y: 0px;
     in property <int> search-total-items: 0;
     in-out property <length> sidebar-viewport-y: 0px;
@@ -919,30 +919,9 @@ export component AppWindow inherits Window {
     public pure function is-icon-view-mode(mode: int) -> bool {
         return mode == 2 || mode == 3 || mode == 4 || mode == 5;
     }
-    public pure function view-row-height(mode: int) -> length {
-        return mode == 1 ? 30px
-            : mode == 7 ? 68px
-            : mode == 3 ? 78px
-            : mode == 4 ? 180px
-            : mode == 5 ? 204px
-            : mode == 6 ? 78px
-            : mode == 2 ? 132px
-            : 32px;
-    }
-    public pure function view-card-width(mode: int) -> length {
-        return mode == 3 ? 88px
-            : mode == 4 ? 188px
-            : mode == 5 ? 196px
-            : mode == 6 ? 292px
-            : 140px;
-    }
-    public pure function view-icon-size(mode: int) -> length {
-        return mode == 3 ? 32px
-            : mode == 4 ? 148px
-            : mode == 5 ? 168px
-            : mode == 6 ? 48px
-            : 100px;
-    }
+    in property <length> layout-row-height: 32px;
+    in property <length> layout-card-width: 0px;
+    in property <length> layout-icon-size: 32px;
     function sync-active-file-viewport() {
         if root.is-grid-view-mode(root.view-mode) {
             root.grid-viewport-y = root.file-viewport-y;
@@ -1335,7 +1314,7 @@ export component AppWindow inherits Window {
     function clamp-file-viewport(available: length) {
         root.file-viewport-x = max(min(0px, available - root.file-columns-width), min(0px, root.file-viewport-x));
     }
-    pure function search-row-height() -> length { return root.view-row-height(root.view-mode); }
+    pure function search-row-height() -> length { return root.layout-row-height; }
     pure function search-scroll-maximum(visible-height: length) -> length {
         let rows = root.is-grid-view-mode(root.view-mode)
             ? ceil(root.search-total-items / max(1, root.grid-column-count))
@@ -2016,7 +1995,7 @@ list := ListView {
                         for entry in root.files: Rectangle {
                             width: root.view-mode == 0 ? max(list.width, root.file-columns-width + 16px) : list.width;
                             x: 0px;
-                            height: entry.group-header ? (entry.group-detail == "" ? 32px : 48px) : root.view-row-height(root.view-mode);
+                            height: entry.group-header ? (entry.group-detail == "" ? 32px : 48px) : root.layout-row-height;
                             background: VisualStyle.cffffff;
                             opacity: entry.group-header ? 1 : (!entry.loaded ? 0 : (entry.cut ? 0.52 : 1));
                             if entry.group-header: Rectangle {
@@ -2151,9 +2130,11 @@ accessible-label: entry.name;
                             }
                             }
                             if root.view-mode == 7 && !entry.group-header: Rectangle {
-                                x: 12px; width: parent.width - 24px; height: parent.height; clip: true;
+                                x: 24px; width: max(0px, parent.width - 48px); height: parent.height; clip: true;
                                 InlineIcon {
-                                    x: 4px; y: 8px; width: 48px; height: 48px;
+                                    x: 4px; y: (parent.height - self.height) / 2;
+                                    width: root.layout-icon-size; height: root.layout-icon-size;
+                                    icon-size: root.layout-icon-size;
                                     icon-source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document);
                                 }
                                 Text { x: 64px; y: 8px; width: parent.width - 76px; height: 24px; text: entry.name; color: VisualStyle.c24252a; font-size: VisualStyle.file-name-font-size; font-weight: 500; vertical-alignment: center; overflow: elide; }
@@ -2262,7 +2243,7 @@ accessible-label: entry.name;
                             changed visible-height => { root.legacy-grid-visible-height = self.visible-height; }
                             changed viewport-y => { if root.is-grid-view-mode(root.view-mode) && !root.grouped-grid-enabled { root.file-viewport-y = self.viewport-y; if !root.search-results-mode { root.request-folder-size-range(self.viewport-y / 1px, self.visible-height / 1px); } } }
                             for row in root.grid-rows: HorizontalLayout {
-                                height: row.group-header ? (row.group-detail == "" ? 32px : 48px) : root.view-row-height(root.view-mode);
+                                height: row.group-header ? (row.group-detail == "" ? 32px : 48px) : root.layout-row-height;
                                 padding-left: 16px;
                                 padding-right: 16px;
                                 spacing: 8px;
@@ -2273,26 +2254,26 @@ accessible-label: entry.name;
                                     Text { x: parent.width - 92px; y: 5px; width: 76px; height: 20px; text: row.group-count; color: VisualStyle.c72747d; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
                                 }
                                 for entry in row.entries: Rectangle {
-                                    width: root.view-card-width(root.view-mode); height: root.view-row-height(root.view-mode) - 8px;
+                                    width: root.layout-card-width; height: root.layout-row-height - 8px;
                                     border-radius: 7px;
                                     background: entry.selected ? VisualStyle.cdce6ff : card-touch.has-hover ? VisualStyle.ceff4ff : transparent;
                                     Image {
-                                        private property <length> fallback-size: root.view-mode == 6 ? 32px : 48px;
-                                        x: root.view-mode == 6 ? 8px + (root.view-icon-size(root.view-mode) - self.width) / 2 : (parent.width - self.width) / 2;
-                                        y: entry.icon.width != 0 ? 8px : (root.view-icon-size(root.view-mode) - self.height) / 2 + 8px;
-                                        width: entry.icon.width != 0 ? root.view-icon-size(root.view-mode) : self.fallback-size;
-                                        height: entry.icon.width != 0 ? root.view-icon-size(root.view-mode) : self.fallback-size;
+                                        private property <length> fallback-size: min(root.layout-icon-size, 48px);
+                                        x: root.view-mode == 3 ? 4px : root.view-mode == 6 ? 8px + (root.layout-icon-size - self.width) / 2 : (parent.width - self.width) / 2;
+                                        y: root.view-mode == 3 ? 4px : entry.icon.width != 0 ? 8px : (root.layout-icon-size - self.height) / 2 + 8px;
+                                        width: entry.icon.width != 0 ? root.layout-icon-size : self.fallback-size;
+                                        height: entry.icon.width != 0 ? root.layout-icon-size : self.fallback-size;
                                         source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document);
                                         image-fit: contain;
                                         opacity: entry.thumbnail-state == 1 ? 0.5 : 1;
                                     }
                                     Text {
-                                        x: root.view-mode == 6 ? 64px : 7px;
-                                        y: root.view-mode == 6 ? 8px : root.view-icon-size(root.view-mode) + 10px;
-                                        width: root.view-mode == 6 ? parent.width - 72px : parent.width - 14px;
-                                        height: root.view-mode == 6 ? 24px : parent.height - root.view-icon-size(root.view-mode) - 12px;
+                                        x: root.view-mode == 3 ? 26px : root.view-mode == 6 ? 64px : 7px;
+                                        y: root.view-mode == 3 ? 0px : root.view-mode == 6 ? 8px : root.layout-icon-size + 10px;
+                                        width: root.view-mode == 3 ? parent.width - 30px : root.view-mode == 6 ? parent.width - 72px : parent.width - 14px;
+                                        height: root.view-mode == 3 ? parent.height : root.view-mode == 6 ? 24px : parent.height - root.layout-icon-size - 12px;
                                         text: entry.name; color: VisualStyle.c24252a; font-size: VisualStyle.file-name-font-size;
-                                        horizontal-alignment: root.view-mode == 6 ? left : center; vertical-alignment: center; overflow: elide;
+                                        horizontal-alignment: root.view-mode == 3 || root.view-mode == 6 ? left : center; vertical-alignment: center; overflow: elide;
                                     }
                                     if root.view-mode == 6: Text {
                                         x: 64px; y: 32px; width: parent.width - 142px; height: 20px;
@@ -2346,26 +2327,26 @@ accessible-label: entry.name;
                                 Text { x: parent.width - 92px; y: 5px; width: 76px; height: 20px; text: placed.row.group-count; color: VisualStyle.c72747d; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
                             }
                             for entry in placed.row.entries: Rectangle {
-                                width: root.view-card-width(root.view-mode); height: root.view-row-height(root.view-mode) - 8px;
+                                width: root.layout-card-width; height: root.layout-row-height - 8px;
                                 border-radius: 7px;
                                 background: entry.selected ? VisualStyle.cdce6ff : grouped-card-touch.has-hover ? VisualStyle.ceff4ff : transparent;
                                 Image {
-                                    private property <length> fallback-size: root.view-mode == 6 ? 32px : 48px;
-                                    x: root.view-mode == 6 ? 8px + (root.view-icon-size(root.view-mode) - self.width) / 2 : (parent.width - self.width) / 2;
-                                    y: entry.icon.width != 0 ? 8px : (root.view-icon-size(root.view-mode) - self.height) / 2 + 8px;
-                                    width: entry.icon.width != 0 ? root.view-icon-size(root.view-mode) : self.fallback-size;
-                                    height: entry.icon.width != 0 ? root.view-icon-size(root.view-mode) : self.fallback-size;
+                                    private property <length> fallback-size: min(root.layout-icon-size, 48px);
+                                    x: root.view-mode == 3 ? 4px : root.view-mode == 6 ? 8px + (root.layout-icon-size - self.width) / 2 : (parent.width - self.width) / 2;
+                                    y: root.view-mode == 3 ? 4px : entry.icon.width != 0 ? 8px : (root.layout-icon-size - self.height) / 2 + 8px;
+                                    width: entry.icon.width != 0 ? root.layout-icon-size : self.fallback-size;
+                                    height: entry.icon.width != 0 ? root.layout-icon-size : self.fallback-size;
                                     source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document);
                                     image-fit: contain;
                                     opacity: entry.thumbnail-state == 1 ? 0.5 : 1;
                                 }
                                 Text {
-                                    x: root.view-mode == 6 ? 64px : 7px;
-                                    y: root.view-mode == 6 ? 8px : root.view-icon-size(root.view-mode) + 10px;
-                                    width: root.view-mode == 6 ? parent.width - 72px : parent.width - 14px;
-                                    height: root.view-mode == 6 ? 24px : parent.height - root.view-icon-size(root.view-mode) - 12px;
+                                    x: root.view-mode == 3 ? 26px : root.view-mode == 6 ? 64px : 7px;
+                                    y: root.view-mode == 3 ? 0px : root.view-mode == 6 ? 8px : root.layout-icon-size + 10px;
+                                    width: root.view-mode == 3 ? parent.width - 30px : root.view-mode == 6 ? parent.width - 72px : parent.width - 14px;
+                                    height: root.view-mode == 3 ? parent.height : root.view-mode == 6 ? 24px : parent.height - root.layout-icon-size - 12px;
                                     text: entry.name; color: VisualStyle.c24252a; font-size: VisualStyle.file-name-font-size;
-                                    horizontal-alignment: root.view-mode == 6 ? left : center; vertical-alignment: center; overflow: elide;
+                                    horizontal-alignment: root.view-mode == 3 || root.view-mode == 6 ? left : center; vertical-alignment: center; overflow: elide;
                                 }
                                 if root.view-mode == 6: Text {
                                     x: 64px; y: 32px; width: parent.width - 142px; height: 20px;

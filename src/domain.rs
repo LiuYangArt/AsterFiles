@@ -274,24 +274,37 @@ impl SortDirection {
 pub enum ViewMode {
     Details,
     List,
-    MediumIcons,
-    SmallIcons,
-    LargeIcons,
-    ExtraLargeIcons,
+    Icons(u16),
     Tiles,
     Content,
 }
 
 impl ViewMode {
+    #[allow(non_upper_case_globals)]
+    pub const SmallIcons: Self = Self::Icons(16);
+    #[allow(non_upper_case_globals)]
+    pub const MediumIcons: Self = Self::Icons(48);
+    #[allow(non_upper_case_globals)]
+    pub const LargeIcons: Self = Self::Icons(96);
+    #[allow(non_upper_case_globals)]
+    pub const ExtraLargeIcons: Self = Self::Icons(256);
+
+    pub const fn icon_size(self) -> u16 {
+        match self {
+            Self::Icons(size) => size,
+            _ => 0,
+        }
+    }
+
+    pub const fn is_valid(self) -> bool {
+        match self {
+            Self::Icons(size) => size >= 16 && size <= 256,
+            _ => true,
+        }
+    }
+
     pub const fn uses_grid_layout(self) -> bool {
-        matches!(
-            self,
-            Self::MediumIcons
-                | Self::SmallIcons
-                | Self::LargeIcons
-                | Self::ExtraLargeIcons
-                | Self::Tiles
-        )
+        matches!(self, Self::Icons(_) | Self::Tiles)
     }
     pub const CTRL_WHEEL_ORDER: [Self; 8] = [
         Self::Content,
@@ -308,10 +321,10 @@ impl ViewMode {
         match self {
             Self::Details => 0,
             Self::List => 1,
-            Self::MediumIcons => 2,
-            Self::SmallIcons => 3,
-            Self::LargeIcons => 4,
-            Self::ExtraLargeIcons => 5,
+            Self::Icons(16) => 3,
+            Self::Icons(17..=95) => 2,
+            Self::Icons(96..=255) => 4,
+            Self::Icons(_) => 5,
             Self::Tiles => 6,
             Self::Content => 7,
         }
@@ -332,6 +345,16 @@ impl ViewMode {
     }
 
     pub fn step_ctrl_wheel(self, toward_larger: bool) -> Self {
+        if let Self::Icons(size) = self {
+            let size = size.clamp(16, 256);
+            return if toward_larger {
+                Self::Icons(size.saturating_add(8).min(256))
+            } else if size == 16 {
+                Self::List
+            } else {
+                Self::Icons(size.saturating_sub(8).max(16))
+            };
+        }
         let index = Self::CTRL_WHEEL_ORDER
             .iter()
             .position(|mode| *mode == self)
@@ -486,7 +509,7 @@ impl Default for DirectoryViewPreference {
 
 impl DirectoryViewPreference {
     pub fn is_valid(&self) -> bool {
-        self.columns.is_valid()
+        self.view_mode.is_valid() && self.columns.is_valid()
     }
 }
 
@@ -511,7 +534,7 @@ impl Default for SearchViewPreference {
 
 impl SearchViewPreference {
     pub fn is_valid(&self) -> bool {
-        self.columns.is_valid()
+        self.view_mode.is_valid() && self.columns.is_valid()
     }
 }
 
@@ -1656,12 +1679,56 @@ mod tests {
         assert_eq!(ViewMode::Content.step_ctrl_wheel(true), ViewMode::Tiles);
         assert_eq!(
             ViewMode::LargeIcons.step_ctrl_wheel(true),
-            ViewMode::ExtraLargeIcons
+            ViewMode::Icons(104)
         );
         assert_eq!(
             ViewMode::ExtraLargeIcons.step_ctrl_wheel(true),
             ViewMode::ExtraLargeIcons
         );
+    }
+
+    #[test]
+    fn issue_97_ctrl_wheel_visits_intermediate_sizes_and_clamps() {
+        let mut mode = ViewMode::List;
+        for size in (16..=256).step_by(8) {
+            mode = mode.step_ctrl_wheel(true);
+            assert_eq!(mode, ViewMode::Icons(size));
+        }
+        assert_eq!(mode.step_ctrl_wheel(true), ViewMode::ExtraLargeIcons);
+        for size in (16..=248).step_by(8).rev() {
+            mode = mode.step_ctrl_wheel(false);
+            assert_eq!(mode, ViewMode::Icons(size));
+        }
+        assert_eq!(mode.step_ctrl_wheel(false), ViewMode::List);
+        assert_eq!(
+            ViewMode::Icons(19).step_ctrl_wheel(false),
+            ViewMode::SmallIcons
+        );
+        assert_eq!(
+            ViewMode::Icons(253).step_ctrl_wheel(true),
+            ViewMode::ExtraLargeIcons
+        );
+        assert_eq!(ViewMode::Icons(80).storage_code(), 2);
+        assert_eq!(ViewMode::Icons(128).storage_code(), 4);
+        assert_eq!(ViewMode::Details.icon_size(), 0);
+        for size in [0, 15, 257, u16::MAX] {
+            let mode = ViewMode::Icons(size);
+            assert!(!mode.is_valid());
+            assert!(
+                !DirectoryViewPreference {
+                    view_mode: mode,
+                    ..Default::default()
+                }
+                .is_valid()
+            );
+            assert!(
+                !SearchViewPreference {
+                    view_mode: mode,
+                    ..Default::default()
+                }
+                .is_valid()
+            );
+        }
     }
 
     #[test]
