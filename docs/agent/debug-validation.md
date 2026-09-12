@@ -255,3 +255,10 @@ python tools/verify.py
 应用异步审计日志中的 `grid_image_extracted` 和 `grid_image_failed` 区分真实缩略图、系统图标和两者均失败，携带原始路径、标签/请求身份和尺寸；系统图标成功不会进入缩略图失败重试。
 
 人工验收：在 Debug 程序打开原截图目录，对照 Explorer 检查 MTL 与未知扩展名图标、PNG/文件夹缩略图；滚动离开再返回、切换图标大小、快速导航与关闭标签后，确认图片类型正确且不长期停留占位。Codex 不操作窗口，用户确认前不关闭 Issue 或执行本地 Release 构建。
+
+
+## Issue #99 网格切换列表后的图标
+
+专项测试：`cargo test issue_99 -- --nocapture`；统一验证：`python tools/verify.py --quick`，包含 Debug 构建。测试使用内存数据和 Slint 无窗口后端，验证网格切换到 List/Details 后补取普通图标、分组标题与搜索占位过滤、可见范围、缓存和在途去重，以及过期结果隔离。证据位于 `artifacts/logs/verify-test.log` 和 `artifacts/verify/summary.json`。
+
+用户手动验收：打开原目录，先选网格再切 List，检查文件夹、MTL、OBJ 等系统图标；分别在分组和未分组下滚动、切换 Details、返回网格，再检查搜索结果切换 List。快速导航和关闭标签后，不应出现旧目录图标。Codex 不操作窗口；用户确认前仅更新 Debug 程序。
