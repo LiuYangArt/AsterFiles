@@ -1,7 +1,7 @@
 use std::{
     ffi::{OsStr, OsString},
     fs, io,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -93,7 +93,7 @@ impl OperationError {
         }
     }
 
-    fn io(path: &Path, error: io::Error) -> Self {
+    pub(crate) fn io(path: &Path, error: io::Error) -> Self {
         Self::Io {
             path: path.to_path_buf(),
             kind: error.kind(),
@@ -975,10 +975,10 @@ pub fn copy_path_with_progress(
     progress: &mut FileProgressCallback<'_>,
     destination_created: &mut DestinationCreatedCallback<'_>,
 ) -> Result<FileOperationReport, OperationError> {
-    let same_location = source == destination;
-    let kept_destination = same_location.then(|| keep_both_path(destination));
+    check_cancel(cancel)?;
+    let kept_destination = (source == destination).then(|| keep_both_path(destination));
     let destination = kept_destination.as_deref().unwrap_or(destination);
-    reject_destination_inside_source(source, destination)?;
+    reject_destination_inside_source(source, destination, cancel)?;
     let source_metadata =
         fs::symlink_metadata(source).map_err(|error| OperationError::io(source, error))?;
     let destination_existed = path_exists(destination);
@@ -987,6 +987,7 @@ pub fn copy_path_with_progress(
         && fs::symlink_metadata(destination).is_ok_and(|metadata| metadata.file_type().is_dir());
     let mut report = FileOperationReport::new();
     copy_entry(
+        source,
         source,
         destination,
         cancel,
@@ -1028,6 +1029,7 @@ pub fn move_path_with_progress(
 ) -> Result<FileOperationReport, OperationError> {
     move_path_with_progress_inner(
         source,
+        source,
         destination,
         cancel,
         resolve_conflict,
@@ -1039,6 +1041,7 @@ pub fn move_path_with_progress(
 
 #[allow(clippy::too_many_arguments)]
 fn move_path_with_progress_inner(
+    source_root: &Path,
     source: &Path,
     destination: &Path,
     cancel: &CancellationToken,
@@ -1047,12 +1050,13 @@ fn move_path_with_progress_inner(
     progress: &mut FileProgressCallback<'_>,
     discover_source: bool,
 ) -> Result<FileOperationReport, OperationError> {
+    check_cancel(cancel)?;
     if source == destination {
         let mut report = FileOperationReport::new();
         report.affect(source);
         return Ok(report);
     }
-    reject_destination_inside_source(source, destination)?;
+    reject_destination_inside_source(source_root, destination, cancel)?;
     check_cancel(cancel)?;
     if !path_exists(destination) {
         match fs::rename(source, destination) {
@@ -1081,6 +1085,7 @@ fn move_path_with_progress_inner(
     {
         let mut report = FileOperationReport::new();
         move_directory_merged(
+            source_root,
             source,
             destination,
             cancel,
@@ -1103,6 +1108,7 @@ fn move_path_with_progress_inner(
             }
             Err(error) => return Err(error),
         };
+    reject_destination_inside_source(source_root, &resolution.path, cancel)?;
     if !resolution.replace_existing {
         match fs::rename(source, &resolution.path) {
             Ok(()) => {
@@ -1119,6 +1125,7 @@ fn move_path_with_progress_inner(
     }
     let mut report = FileOperationReport::new();
     copy_resolved_entry(
+        source_root,
         source,
         &resolution,
         cancel,
@@ -2084,6 +2091,7 @@ struct DestinationResolution {
 
 #[allow(clippy::too_many_arguments)]
 fn copy_entry(
+    source_root: &Path,
     source: &Path,
     destination: &Path,
     cancel: &CancellationToken,
@@ -2110,6 +2118,7 @@ fn copy_entry(
             Err(error) => return Err(error),
         };
     copy_resolved_entry(
+        source_root,
         source,
         &resolution,
         cancel,
@@ -2124,6 +2133,7 @@ fn copy_entry(
 
 #[allow(clippy::too_many_arguments)]
 fn copy_resolved_entry(
+    source_root: &Path,
     source: &Path,
     resolution: &DestinationResolution,
     cancel: &CancellationToken,
@@ -2134,6 +2144,7 @@ fn copy_resolved_entry(
     report: &mut FileOperationReport,
     remove_source: bool,
 ) -> Result<(), OperationError> {
+    reject_destination_inside_source(source_root, &resolution.path, cancel)?;
     let source_metadata =
         fs::symlink_metadata(source).map_err(|error| OperationError::io(source, error))?;
     let file_type = source_metadata.file_type();
@@ -2164,6 +2175,7 @@ fn copy_resolved_entry(
                 .is_ok_and(|metadata| !metadata.file_type().is_dir())
         {
             return replace_directory_safely(
+                source_root,
                 source,
                 &resolution.path,
                 cancel,
@@ -2176,6 +2188,7 @@ fn copy_resolved_entry(
             );
         }
         copy_directory(
+            source_root,
             source,
             &resolution.path,
             cancel,
@@ -2204,6 +2217,7 @@ fn copy_resolved_entry(
 
 #[allow(clippy::too_many_arguments)]
 fn copy_directory(
+    source_root: &Path,
     source: &Path,
     destination: &Path,
     cancel: &CancellationToken,
@@ -2229,6 +2243,7 @@ fn copy_directory(
             check_cancel(cancel)?;
             let entry = entry.map_err(|error| OperationError::io(source, error))?;
             copy_entry(
+                source_root,
                 &entry.path(),
                 &destination.join(entry.file_name()),
                 cancel,
@@ -2257,6 +2272,7 @@ fn copy_directory(
 
 #[allow(clippy::too_many_arguments)]
 fn replace_directory_safely(
+    source_root: &Path,
     source: &Path,
     destination: &Path,
     cancel: &CancellationToken,
@@ -2270,6 +2286,7 @@ fn replace_directory_safely(
     let temporary = unique_sibling(destination, ".asterfiles-copy");
     let manifest_start = report.undo_identities.len();
     copy_directory(
+        source_root,
         source,
         &temporary,
         cancel,
@@ -2302,7 +2319,9 @@ fn replace_directory_safely(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn move_directory_merged(
+    source_root: &Path,
     source: &Path,
     destination: &Path,
     cancel: &CancellationToken,
@@ -2311,6 +2330,7 @@ fn move_directory_merged(
     progress: &mut FileProgressCallback<'_>,
     report: &mut FileOperationReport,
 ) -> Result<(), OperationError> {
+    reject_destination_inside_source(source_root, destination, cancel)?;
     let traversal = (|| {
         for entry in fs::read_dir(source).map_err(|error| OperationError::io(source, error))? {
             check_cancel(cancel)?;
@@ -2328,6 +2348,7 @@ fn move_directory_merged(
                     .is_ok_and(|item| item.file_type().is_dir())
             {
                 move_directory_merged(
+                    source_root,
                     &source_child,
                     &destination_child,
                     cancel,
@@ -2339,6 +2360,7 @@ fn move_directory_merged(
                 continue;
             }
             match move_path_with_progress_inner(
+                source_root,
                 &source_child,
                 &destination_child,
                 cancel,
@@ -2584,34 +2606,16 @@ fn remove_entry(
 fn reject_destination_inside_source(
     source: &Path,
     destination: &Path,
+    cancel: &CancellationToken,
 ) -> Result<(), OperationError> {
-    let normalized_source = lexical_absolute(source)?;
-    let normalized_destination = lexical_absolute(destination)?;
-    if normalized_destination.starts_with(&normalized_source) {
+    if crate::platform::windows::path_relation::destination_is_within_source(
+        source,
+        destination,
+        cancel,
+    )? {
         return Err(OperationError::SourceInsideDestination);
     }
     Ok(())
-}
-
-fn lexical_absolute(path: &Path) -> Result<PathBuf, OperationError> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|error| OperationError::io(path, error))?
-            .join(path)
-    };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            _ => normalized.push(component.as_os_str()),
-        }
-    }
-    Ok(normalized)
 }
 
 fn split_name(name: &OsStr) -> (OsString, Option<OsString>) {
@@ -3285,6 +3289,7 @@ mod tests {
     ) -> Result<FileOperationReport, OperationError> {
         let mut report = FileOperationReport::new();
         copy_resolved_entry(
+            source,
             source,
             &DestinationResolution {
                 path: destination.to_path_buf(),
@@ -4603,3 +4608,7 @@ mod tests {
         assert_eq!(fs::read(outside.join("keep.txt")).unwrap(), b"keep");
     }
 }
+
+#[cfg(all(test, windows))]
+#[path = "file_operations/issue_102_tests.rs"]
+mod issue_102_tests;

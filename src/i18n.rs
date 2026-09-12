@@ -128,6 +128,17 @@ impl Texts {
         self.choose("此项目没有可打开的父目录", "This item has no parent folder")
     }
 
+    pub fn self_containment_title(self) -> &'static str {
+        self.choose("无法复制或移动文件夹", "Cannot copy or move folder")
+    }
+
+    pub fn self_containment_message(self) -> &'static str {
+        self.choose(
+            "目标文件夹是源文件夹或其子文件夹，不能复制或移动到此位置。请选择其他目标文件夹。",
+            "The destination is the source folder or one of its subfolders. Choose a different destination to copy or move this folder.",
+        )
+    }
+
     pub fn move_source_retained(self, count: usize, detail: &str) -> String {
         match self.language {
             Language::Chinese => format!("未完成 {count} 项；已完成目标保留，源有遗留：{detail}"),

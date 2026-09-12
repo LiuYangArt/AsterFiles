@@ -12,6 +12,7 @@ pub mod everything_file_picker;
 pub mod file_operation;
 pub mod libraries;
 pub mod network;
+pub mod path_relation;
 pub mod quick_access;
 pub mod quick_menu_window;
 pub mod shell_icons;

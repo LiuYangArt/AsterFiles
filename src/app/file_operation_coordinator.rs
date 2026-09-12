@@ -4,7 +4,7 @@ use super::file_operation_worker::{
     FileOperationEvent, FileOperationRequest, undo_source_kind, uses_local_recycle_batch,
 };
 use super::{
-    AppState, RecentOperationChanges, SharedSessions, queue_completed_focus,
+    AppState, RecentOperationChanges, SharedSessions, WindowId, queue_completed_focus,
     queue_completed_rename, refresh_all_windows, refresh_operation_badges, undo_failure_message,
 };
 use crate::{
@@ -16,7 +16,7 @@ use crate::{
             UndoBeginError, UndoEntry, UndoHistory, UndoItem,
         },
     },
-    i18n::Texts,
+    i18n::{Language, Texts},
     platform,
 };
 use std::{
@@ -498,7 +498,32 @@ pub(super) struct OperationCompletion {
     pub(super) next: Option<FileOperationRequest>,
     pub(super) clear_completed_cut: Vec<PathBuf>,
     pub(super) undo_failure: Option<String>,
+    pub(super) containment_notice: Option<(WindowId, Language, &'static str)>,
 }
+
+pub(super) fn self_containment_notice(
+    app: &AppState,
+    id: OperationId,
+    result: &OperationResult,
+) -> Option<(WindowId, Language, &'static str)> {
+    let task = app.operations.task(id)?;
+    if !matches!(task.kind, FileOperationKind::Copy | FileOperationKind::Move)
+        || !result
+            .failed
+            .iter()
+            .any(|(_, error)| error == super::file_operation_worker::SELF_CONTAINMENT_ERROR)
+    {
+        return None;
+    }
+    // Follow the originating tab after a detach; never show in an unrelated active window.
+    let window = app.window_for_tab(task.origin_tab?)?;
+    Some((
+        window,
+        app.language,
+        Texts::new(app.language).self_containment_message(),
+    ))
+}
+
 fn file_operation_terminal_state(
     cancelled: bool,
     result: &OperationResult,
@@ -536,7 +561,7 @@ pub(super) fn finish_file_operation(
         "operation_finished",
         format!("id={id:?} result={result:?} items={item_states:?}"),
     );
-    let (affected, next, clear_completed_cut, undo_failure) = {
+    let (affected, next, clear_completed_cut, undo_failure, containment_notice) = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         if let Some(task) = app.operations.task_mut(id) {
             for (index, status, error) in item_states {
@@ -655,6 +680,7 @@ pub(super) fn finish_file_operation(
         } else {
             None
         };
+        let containment_notice = self_containment_notice(&app, id, &result);
         let _ = app.operations.finish(id, terminal, result);
         let next = app
             .operations
@@ -685,13 +711,14 @@ pub(super) fn finish_file_operation(
             Vec::new()
         };
 
-        (affected, next, clear_completed_cut, undo_failure)
+        (affected, next, clear_completed_cut, undo_failure, containment_notice)
     };
     Some(OperationCompletion {
         affected,
         next,
         clear_completed_cut,
         undo_failure,
+        containment_notice,
     })
 }
 

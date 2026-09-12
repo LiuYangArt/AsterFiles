@@ -1346,8 +1346,10 @@ fn file_snapshot(path: &Path) -> crate::domain::file_operations::FileSnapshot {
     }
 }
 
+pub(super) const SELF_CONTAINMENT_ERROR: &str = "SourceInsideDestination";
+
 #[derive(Debug)]
-enum ExecuteFileOperationError {
+pub(super) enum ExecuteFileOperationError {
     Failed(String),
     DestinationCommittedSourceRetained {
         destination: PathBuf,
@@ -1356,7 +1358,10 @@ enum ExecuteFileOperationError {
 }
 
 impl ExecuteFileOperationError {
-    fn into_item_result(self, cancelled: bool) -> (ItemState, Option<String>, Option<PathBuf>) {
+    pub(super) fn into_item_result(
+        self,
+        cancelled: bool,
+    ) -> (ItemState, Option<String>, Option<PathBuf>) {
         match self {
             Self::DestinationCommittedSourceRetained {
                 destination,
@@ -1371,8 +1376,11 @@ impl ExecuteFileOperationError {
         Self::Failed(format!("{error:?}"))
     }
 
-    fn from_operation(error: crate::fs::file_operations::OperationError) -> Self {
+    pub(super) fn from_operation(error: crate::fs::file_operations::OperationError) -> Self {
         match error {
+            crate::fs::file_operations::OperationError::SourceInsideDestination => {
+                Self::Failed(SELF_CONTAINMENT_ERROR.to_owned())
+            }
             crate::fs::file_operations::OperationError::DestinationCommittedSourceRetained {
                 destination,
                 message,

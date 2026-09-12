@@ -14098,10 +14098,7 @@ fn prepare_drop_operation(
             .file_name()
             .ok_or_else(|| "拖放来源没有可用名称".to_owned())?;
         let destination = target.join(name);
-        if target.starts_with(&source)
-            || (source == destination
-                && intent.effect == platform::windows::drag_drop::DropEffect::Move)
-        {
+        if kind.is_none() && target.starts_with(&source) {
             return Err("不能把项目移动到自身或把项目拖放到自身子目录".to_owned());
         }
         items.push(OperationItem::pending(Some(source), Some(destination)));
@@ -16868,10 +16865,20 @@ fn start_file_operation_event_pump(
                             next,
                             clear_completed_cut,
                             undo_failure,
+                            containment_notice,
                         }) = finish_file_operation(&state, event)
                         else {
                             return;
                         };
+                        if let Some((window_id, language, message)) = containment_notice
+                            && let Some(ui) = window_ui(window_id)
+                        {
+                            platform::windows::show_error_dialog(
+                                native_window_handle(&ui),
+                                Texts::new(language).self_containment_title(),
+                                message,
+                            );
+                        }
                         if let (Some(ui), Some(message)) = (weak.upgrade(), undo_failure) {
                             show_undo_failure_dialog(
                                 &ui,
@@ -21243,6 +21250,14 @@ fn estimating_text(language: Language) -> &'static str {
     }
 }
 
+fn operation_error_text(language: Language, error: &str) -> &str {
+    if error == file_operation_worker::SELF_CONTAINMENT_ERROR {
+        Texts::new(language).self_containment_message()
+    } else {
+        error
+    }
+}
+
 fn operation_failure_summary(
     language: Language,
     task: &crate::domain::file_operations::OperationTask,
@@ -21251,6 +21266,7 @@ fn operation_failure_summary(
         .items
         .iter()
         .filter_map(|item| item.error.as_deref())
+        .map(|error| operation_error_text(language, error))
         .collect::<Vec<_>>();
     if failures.is_empty() {
         return String::new();
@@ -27801,6 +27817,121 @@ mod tests {
         assert_eq!(context_delete_request(6, false), Some(false));
         assert_eq!(context_delete_request(6, true), Some(true));
         assert_eq!(context_delete_request(CMD_REFRESH, true), None);
+    }
+
+    #[test]
+    fn issue_102_rejection_notice_is_localized_once_and_follows_origin_tab() {
+        use super::file_operation_coordinator::self_containment_notice;
+        use super::file_operation_worker::{ExecuteFileOperationError, SELF_CONTAINMENT_ERROR};
+
+        for language in [Language::Chinese, Language::English] {
+            for kind in [FileOperationKind::Copy, FileOperationKind::Move] {
+                let mut app =
+                    AppState::new_for_test(vec![PathBuf::from(r"C:\Source")], 0, [0, 1, 2, 3]);
+                app.language = language;
+                let origin_window = app.active_window;
+                let origin_tab = app.active_window_state().active_tab;
+                let other_window = app.register_window(
+                    vec![NavigationLocation::Directory(PathBuf::from(r"C:\Other"))],
+                    0,
+                    test_window_placement(160),
+                );
+                app.active_window = other_window;
+                let (_, error, _) = ExecuteFileOperationError::from_operation(
+                    crate::fs::file_operations::OperationError::SourceInsideDestination,
+                )
+                .into_item_result(false);
+                let error = error.unwrap();
+                let mut item = OperationItem::pending(Some(PathBuf::from(r"C:\Source")), None);
+                item.state = ItemState::Failed;
+                item.error = Some(error.clone());
+                let id = app.operations.submit(
+                    OperationResource::Local,
+                    kind,
+                    Some(origin_tab),
+                    vec![item],
+                );
+                let mut result = OperationResult {
+                    succeeded: vec![],
+                    skipped: vec![],
+                    failed: vec![
+                        (PathBuf::from(r"C:\Source"), error.clone()),
+                        (PathBuf::from(r"C:\Source2"), error),
+                    ],
+                    affected_directories: vec![],
+                };
+                let notice = self_containment_notice(&app, id, &result).unwrap();
+                assert_eq!(notice.0, origin_window);
+                assert_eq!(notice.2, Texts::new(language).self_containment_message());
+                assert!(!notice.2.contains(SELF_CONTAINMENT_ERROR));
+                assert!(
+                    operation_failure_summary(language, app.operations.task(id).unwrap())
+                        .contains(notice.2)
+                );
+                let tab = app
+                    .window_mut(origin_window)
+                    .unwrap()
+                    .tabs
+                    .remove(&origin_tab)
+                    .unwrap();
+                app.window_mut(other_window)
+                    .unwrap()
+                    .tabs
+                    .insert(origin_tab, tab);
+                assert_eq!(
+                    self_containment_notice(&app, id, &result).unwrap().0,
+                    other_window
+                );
+                result.failed.clear();
+                assert!(self_containment_notice(&app, id, &result).is_none());
+                result
+                    .failed
+                    .push((PathBuf::new(), "some other error".to_owned()));
+                assert!(self_containment_notice(&app, id, &result).is_none());
+                result.failed[0].1 = SELF_CONTAINMENT_ERROR.to_owned();
+                app.window_mut(other_window)
+                    .unwrap()
+                    .tabs
+                    .remove(&origin_tab);
+                assert!(self_containment_notice(&app, id, &result).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn issue_102_drop_preparation_defers_copy_move_rejection_to_worker() {
+        use platform::windows::drag_drop::{
+            ALLOW_COPY, ALLOW_LINK, ALLOW_MOVE, DropEffect, DropIntent, DropTarget,
+        };
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("artifacts")
+            .join(format!("issue-102-drop-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let _cleanup = FixtureCleanup(root.clone());
+        let source = root.join("source");
+        let target = source.join("child");
+        std::fs::create_dir_all(&target).unwrap();
+        for effect in [DropEffect::Copy, DropEffect::Move, DropEffect::Link] {
+            let prepared = prepare_drop_operation(DropIntent {
+                paths: vec![source.clone()],
+                target: DropTarget::Directory(target.clone()),
+                effect,
+                right_button: false,
+                screen_x: 0,
+                screen_y: 0,
+                allowed_effects: ALLOW_COPY | ALLOW_MOVE | ALLOW_LINK,
+            });
+            if effect == DropEffect::Link {
+                assert!(prepared.is_err());
+            } else {
+                let PreparedDrop::Operation(_, items) = prepared.unwrap() else {
+                    panic!("expected operation")
+                };
+                assert_eq!(items[0].source.as_ref(), Some(&source));
+                assert_eq!(items[0].destination.as_ref(), Some(&target.join("source")));
+                assert!(!target.join("source").exists());
+            }
+        }
     }
 
     #[test]
