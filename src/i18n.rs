@@ -128,6 +128,15 @@ impl Texts {
         self.choose("此项目没有可打开的父目录", "This item has no parent folder")
     }
 
+    pub fn move_source_retained(self, count: usize, detail: &str) -> String {
+        match self.language {
+            Language::Chinese => format!("未完成 {count} 项；已完成目标保留，源有遗留：{detail}"),
+            Language::English => {
+                format!("{count} incomplete; completed targets kept, source retained: {detail}")
+            }
+        }
+    }
+
     pub fn undo_empty(self) -> &'static str {
         self.choose("没有可撤销的文件操作", "There is no file operation to undo")
     }

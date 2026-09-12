@@ -499,6 +499,24 @@ pub(super) struct OperationCompletion {
     pub(super) clear_completed_cut: Vec<PathBuf>,
     pub(super) undo_failure: Option<String>,
 }
+fn file_operation_terminal_state(
+    cancelled: bool,
+    result: &OperationResult,
+    has_retained_source: bool,
+) -> OperationState {
+    if has_retained_source {
+        OperationState::PartiallyCompleted
+    } else if cancelled && result.succeeded.is_empty() && result.failed.is_empty() {
+        OperationState::Cancelled
+    } else if cancelled || (!result.failed.is_empty() && !result.succeeded.is_empty()) {
+        OperationState::PartiallyCompleted
+    } else if result.failed.is_empty() {
+        OperationState::Completed
+    } else {
+        OperationState::Failed
+    }
+}
+
 pub(super) fn finish_file_operation(
     state: &SharedSessions,
     event: FileOperationEvent,
@@ -532,15 +550,16 @@ pub(super) fn finish_file_operation(
             .operations
             .task(id)
             .is_some_and(|task| task.cancellation.is_cancelled());
-        let terminal = if cancelled && result.succeeded.is_empty() && result.failed.is_empty() {
-            OperationState::Cancelled
-        } else if cancelled || (!result.failed.is_empty() && !result.succeeded.is_empty()) {
-            OperationState::PartiallyCompleted
-        } else if result.failed.is_empty() {
-            OperationState::Completed
-        } else {
-            OperationState::Failed
-        };
+        let has_retained_source = app.operations.task(id).is_some_and(|task| {
+            task.items.iter().any(|item| {
+                item.state == ItemState::Succeeded && item.error.is_some()
+            })
+        });
+        let terminal = file_operation_terminal_state(
+            cancelled,
+            &result,
+            has_retained_source,
+        );
         let (resource, kind, origin_tab, task_items, undo_cut_paths, undo_task_source_kind) = app
             .operations
             .task(id)
@@ -720,6 +739,27 @@ pub(super) fn mark_operation_running_if_ready(operations: &mut OperationManager,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue_101_source_retained_is_partial_and_not_an_undoable_completion() {
+        let result = OperationResult {
+            succeeded: vec![PathBuf::from("committed-target")],
+            skipped: Vec::new(),
+            failed: Vec::new(),
+            affected_directories: Vec::new(),
+        };
+        for cancelled in [false, true] {
+            assert_eq!(
+                file_operation_terminal_state(cancelled, &result, true),
+                OperationState::PartiallyCompleted,
+            );
+        }
+        assert_eq!(
+            file_operation_terminal_state(false, &result, false),
+            OperationState::Completed,
+        );
+    }
+
     #[test]
     fn file_operations_use_network_resource_when_either_endpoint_is_unc() {
         let local = OperationItem::pending(

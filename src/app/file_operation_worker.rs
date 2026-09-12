@@ -698,24 +698,16 @@ fn execute_file_operation_request(
                     .clone()
                     .or_else(|| item.destination.clone())
                     .unwrap_or_default();
-                if request.cancellation.is_cancelled() {
-                    indexed_states.push((item_index, ItemState::Cancelled, None));
-                } else {
-                    match error {
-                        ExecuteFileOperationError::DestinationCommittedSourceRetained {
-                            destination,
-                            message,
-                        } => {
-                            succeeded.push(destination.clone());
-                            completed_targets.push(destination);
-                            indexed_states.push((item_index, ItemState::Succeeded, Some(message)));
-                        }
-                        ExecuteFileOperationError::Failed(message) => {
-                            failed.push((identity.clone(), message.clone()));
-                            indexed_states.push((item_index, ItemState::Failed, Some(message)));
-                        }
-                    }
+                let (state, message, committed_target) =
+                    error.into_item_result(request.cancellation.is_cancelled());
+                if let Some(destination) = committed_target {
+                    succeeded.push(destination.clone());
+                    completed_targets.push(destination);
                 }
+                if state == ItemState::Failed {
+                    failed.push((identity, message.clone().unwrap_or_default()));
+                }
+                indexed_states.push((item_index, state, message));
             }
         }
     }
@@ -1364,6 +1356,17 @@ enum ExecuteFileOperationError {
 }
 
 impl ExecuteFileOperationError {
+    fn into_item_result(self, cancelled: bool) -> (ItemState, Option<String>, Option<PathBuf>) {
+        match self {
+            Self::DestinationCommittedSourceRetained {
+                destination,
+                message,
+            } => (ItemState::Succeeded, Some(message), Some(destination)),
+            Self::Failed(_) if cancelled => (ItemState::Cancelled, None, None),
+            Self::Failed(message) => (ItemState::Failed, Some(message), None),
+        }
+    }
+
     fn failed_debug(error: impl std::fmt::Debug) -> Self {
         Self::Failed(format!("{error:?}"))
     }
@@ -1705,6 +1708,33 @@ pub(super) fn completed_target_for_item(
 mod tests {
     use super::*;
     use crate::app::test_support::{FixtureCleanup, process_cpu_millis};
+
+    #[test]
+    fn issue_101_source_retained_keeps_committed_target_even_when_cancelled() {
+        for cancelled in [false, true] {
+            let destination = PathBuf::from("committed-target");
+            let error = ExecuteFileOperationError::from_operation(
+                crate::fs::file_operations::OperationError::DestinationCommittedSourceRetained {
+                    source: PathBuf::from("retained-source"),
+                    destination: destination.clone(),
+                    message: "source retained".to_owned(),
+                },
+            );
+            assert_eq!(
+                error.into_item_result(cancelled),
+                (
+                    ItemState::Succeeded,
+                    Some("source retained".to_owned()),
+                    Some(destination),
+                ),
+            );
+        }
+        assert_eq!(
+            ExecuteFileOperationError::Failed("cancelled copy".to_owned()).into_item_result(true),
+            (ItemState::Cancelled, None, None),
+        );
+    }
+
     #[test]
     fn issue_81_recycle_progress_is_time_coalesced_but_phase_changes_flush() {
         use platform::windows::file_operation::RecycleProgress;

@@ -21255,6 +21255,13 @@ fn operation_failure_summary(
     if failures.is_empty() {
         return String::new();
     }
+    if task
+        .items
+        .iter()
+        .any(|item| item.state == ItemState::Succeeded && item.error.is_some())
+    {
+        return Texts::new(language).move_source_retained(failures.len(), failures[0]);
+    }
     match language {
         Language::Chinese => format!("失败 {} 项：{}", failures.len(), failures[0]),
         Language::English => format!("{} failed: {}", failures.len(), failures[0]),

@@ -85,6 +85,14 @@ pub enum OperationError {
 }
 
 impl OperationError {
+    fn source_retained(source: &Path, destination: &Path, error: impl std::fmt::Debug) -> Self {
+        Self::DestinationCommittedSourceRetained {
+            source: source.to_path_buf(),
+            destination: destination.to_path_buf(),
+            message: format!("{error:?}"),
+        }
+    }
+
     fn io(path: &Path, error: io::Error) -> Self {
         Self::Io {
             path: path.to_path_buf(),
@@ -987,6 +995,7 @@ pub fn copy_path_with_progress(
         progress,
         destination_created,
         &mut report,
+        false,
     )?;
     let actual_root = if copy_into_existing_directory {
         None
@@ -1118,25 +1127,59 @@ fn move_path_with_progress_inner(
         progress,
         &mut |_| {},
         &mut report,
+        true,
     )?;
-    remove_source_after_committed_copy(source, &resolution.path, &mut report)?;
     Ok(report)
 }
 
 fn remove_source_after_committed_copy(
     source: &Path,
     destination: &Path,
+    cancel: &CancellationToken,
     report: &mut FileOperationReport,
 ) -> Result<(), OperationError> {
-    if let Err(error) = remove_entry(source, &CancellationToken::new(), report) {
-        return Err(OperationError::DestinationCommittedSourceRetained {
-            source: source.to_path_buf(),
-            destination: destination.to_path_buf(),
-            message: format!("目标已完成，源仍存在：{error:?}"),
-        });
-    }
+    // Source cleanup must never enumerate or recursively delete un-copied entries.
+    let removed = if cancel.is_cancelled() {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "cancelled after copy commit",
+        ))
+    } else {
+        fs::symlink_metadata(source).and_then(|metadata| {
+            if metadata.is_dir() {
+                fs::remove_dir(source)
+            } else {
+                fs::remove_file(source)
+            }
+        })
+    };
+    removed.map_err(|error| OperationError::source_retained(source, destination, error))?;
     report.affect(source);
     Ok(())
+}
+
+fn partial_directory_move_error(
+    error: OperationError,
+    source: &Path,
+    destination: &Path,
+    report: &FileOperationReport,
+) -> OperationError {
+    if matches!(
+        error,
+        OperationError::DestinationCommittedSourceRetained { .. }
+    ) {
+        return error;
+    }
+    let moved_any = report.completed_paths.iter().any(|path| {
+        path.strip_prefix(source)
+            .is_ok_and(|relative| !relative.as_os_str().is_empty())
+    });
+    if moved_any {
+        // The batch may contain KeepBoth renames; do not infer a committed filename.
+        OperationError::source_retained(source, destination, error)
+    } else {
+        error
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2049,6 +2092,7 @@ fn copy_entry(
     progress: &mut FileProgressCallback<'_>,
     destination_created: &mut DestinationCreatedCallback<'_>,
     report: &mut FileOperationReport,
+    remove_source: bool,
 ) -> Result<(), OperationError> {
     check_cancel(cancel)?;
     let source_metadata =
@@ -2074,6 +2118,7 @@ fn copy_entry(
         progress,
         destination_created,
         report,
+        remove_source,
     )
 }
 
@@ -2087,6 +2132,7 @@ fn copy_resolved_entry(
     progress: &mut FileProgressCallback<'_>,
     destination_created: &mut DestinationCreatedCallback<'_>,
     report: &mut FileOperationReport,
+    remove_source: bool,
 ) -> Result<(), OperationError> {
     let source_metadata =
         fs::symlink_metadata(source).map_err(|error| OperationError::io(source, error))?;
@@ -2126,6 +2172,7 @@ fn copy_resolved_entry(
                 progress,
                 destination_created,
                 report,
+                remove_source,
             );
         }
         copy_directory(
@@ -2137,6 +2184,7 @@ fn copy_resolved_entry(
             progress,
             destination_created,
             report,
+            remove_source,
         )?;
     } else {
         copy_file_safely(
@@ -2147,6 +2195,9 @@ fn copy_resolved_entry(
             progress,
             report,
         )?;
+    }
+    if remove_source && !file_type.is_dir() {
+        remove_source_after_committed_copy(source, &resolution.path, cancel, report)?;
     }
     Ok(())
 }
@@ -2161,6 +2212,7 @@ fn copy_directory(
     progress: &mut FileProgressCallback<'_>,
     destination_created: &mut DestinationCreatedCallback<'_>,
     report: &mut FileOperationReport,
+    remove_source: bool,
 ) -> Result<(), OperationError> {
     if !path_exists(destination) {
         fs::create_dir(destination).map_err(|error| OperationError::io(destination, error))?;
@@ -2172,19 +2224,33 @@ fn copy_directory(
             .push((destination.to_path_buf(), identity));
         destination_created(destination);
     }
-    for entry in fs::read_dir(source).map_err(|error| OperationError::io(source, error))? {
-        check_cancel(cancel)?;
-        let entry = entry.map_err(|error| OperationError::io(source, error))?;
-        copy_entry(
-            &entry.path(),
-            &destination.join(entry.file_name()),
-            cancel,
-            resolve_conflict,
-            discovered,
-            progress,
-            destination_created,
-            report,
-        )?;
+    let traversal = (|| {
+        for entry in fs::read_dir(source).map_err(|error| OperationError::io(source, error))? {
+            check_cancel(cancel)?;
+            let entry = entry.map_err(|error| OperationError::io(source, error))?;
+            copy_entry(
+                &entry.path(),
+                &destination.join(entry.file_name()),
+                cancel,
+                resolve_conflict,
+                discovered,
+                progress,
+                destination_created,
+                report,
+                remove_source,
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = traversal {
+        return Err(if remove_source {
+            partial_directory_move_error(error, source, destination, report)
+        } else {
+            error
+        });
+    }
+    if remove_source {
+        remove_source_after_committed_copy(source, destination, cancel, report)?;
     }
     Ok(())
 }
@@ -2199,9 +2265,11 @@ fn replace_directory_safely(
     progress: &mut FileProgressCallback<'_>,
     destination_created: &mut DestinationCreatedCallback<'_>,
     report: &mut FileOperationReport,
+    remove_source: bool,
 ) -> Result<(), OperationError> {
     let temporary = unique_sibling(destination, ".asterfiles-copy");
-    let result = copy_directory(
+    let manifest_start = report.undo_identities.len();
+    copy_directory(
         source,
         &temporary,
         cancel,
@@ -2210,9 +2278,28 @@ fn replace_directory_safely(
         progress,
         destination_created,
         report,
-    );
-    result?;
-    replace_with_temporary(&temporary, destination)
+        false,
+    )?;
+    replace_with_temporary(&temporary, destination)?;
+    if remove_source {
+        // Preserve the staged replacement transaction; only copied entries may be cleaned.
+        let copied_sources = report.undo_identities[manifest_start..]
+            .iter()
+            .map(|(path, _)| {
+                path.strip_prefix(&temporary)
+                    .map(|relative| source.join(relative))
+                    .map_err(|error| OperationError::Io {
+                        path: path.clone(),
+                        kind: io::ErrorKind::InvalidData,
+                        message: error.to_string(),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for copied_source in copied_sources.into_iter().rev() {
+            remove_source_after_committed_copy(&copied_source, destination, cancel, report)?;
+        }
+    }
+    Ok(())
 }
 
 fn move_directory_merged(
@@ -2224,52 +2311,65 @@ fn move_directory_merged(
     progress: &mut FileProgressCallback<'_>,
     report: &mut FileOperationReport,
 ) -> Result<(), OperationError> {
-    for entry in fs::read_dir(source).map_err(|error| OperationError::io(source, error))? {
-        check_cancel(cancel)?;
-        let entry = entry.map_err(|error| OperationError::io(source, error))?;
-        let source_child = entry.path();
-        let destination_child = destination.join(entry.file_name());
-        let source_metadata = fs::symlink_metadata(&source_child)
-            .map_err(|error| OperationError::io(&source_child, error))?;
-        if !source_metadata.file_type().is_dir() {
-            discovered(discovered_size(&source_metadata), &source_child);
-        }
-        if path_exists(&destination_child)
-            && source_metadata.file_type().is_dir()
-            && fs::symlink_metadata(&destination_child).is_ok_and(|item| item.file_type().is_dir())
-        {
-            move_directory_merged(
+    let traversal = (|| {
+        for entry in fs::read_dir(source).map_err(|error| OperationError::io(source, error))? {
+            check_cancel(cancel)?;
+            let entry = entry.map_err(|error| OperationError::io(source, error))?;
+            let source_child = entry.path();
+            let destination_child = destination.join(entry.file_name());
+            let source_metadata = fs::symlink_metadata(&source_child)
+                .map_err(|error| OperationError::io(&source_child, error))?;
+            if !source_metadata.file_type().is_dir() {
+                discovered(discovered_size(&source_metadata), &source_child);
+            }
+            if path_exists(&destination_child)
+                && source_metadata.file_type().is_dir()
+                && fs::symlink_metadata(&destination_child)
+                    .is_ok_and(|item| item.file_type().is_dir())
+            {
+                move_directory_merged(
+                    &source_child,
+                    &destination_child,
+                    cancel,
+                    resolve_conflict,
+                    discovered,
+                    progress,
+                    report,
+                )?;
+                continue;
+            }
+            match move_path_with_progress_inner(
                 &source_child,
                 &destination_child,
                 cancel,
                 resolve_conflict,
                 discovered,
                 progress,
-                report,
-            )?;
-            continue;
+                false,
+            ) {
+                Ok(child_report) => merge_report(report, child_report),
+                Err(OperationError::ConflictSkipped(_)) => report.skipped.push(source_child),
+                Err(error) => return Err(error),
+            }
         }
-        match move_path_with_progress_inner(
-            &source_child,
-            &destination_child,
-            cancel,
-            resolve_conflict,
-            discovered,
-            progress,
-            false,
-        ) {
-            Ok(child_report) => merge_report(report, child_report),
-            Err(OperationError::ConflictSkipped(_)) => report.skipped.push(source_child),
-            Err(error) => return Err(error),
-        }
+        Ok(())
+    })();
+    if let Err(error) = traversal {
+        return Err(partial_directory_move_error(
+            error,
+            source,
+            destination,
+            report,
+        ));
     }
-    if fs::read_dir(source)
-        .map_err(|error| OperationError::io(source, error))?
-        .next()
-        .is_none()
-    {
-        fs::remove_dir(source).map_err(|error| OperationError::io(source, error))?;
-        report.directories += 1;
+    match fs::remove_dir(source) {
+        Ok(()) => report.directories += 1,
+        Err(error)
+            if error.kind() == io::ErrorKind::DirectoryNotEmpty
+                && report.skipped.iter().any(|path| path.starts_with(source)) => {}
+        Err(error) => {
+            return Err(OperationError::source_retained(source, destination, error));
+        }
     }
     Ok(())
 }
@@ -3146,6 +3246,423 @@ mod tests {
             &mut |_, _, _| {},
         )
     }
+    #[test]
+    fn issue_101_source_cleanup_never_recursively_deletes_uncopied_entries() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        write(&source.join("copied.txt"), b"copied");
+        let mut report = copy_path(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut replace,
+        )
+        .unwrap();
+        fs::remove_file(source.join("copied.txt")).unwrap();
+        write(&source.join("new.txt"), b"uncopied");
+        let result = remove_source_after_committed_copy(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut report,
+        );
+        assert!(matches!(
+            result,
+            Err(OperationError::DestinationCommittedSourceRetained { .. })
+        ));
+        assert_eq!(fs::read(source.join("new.txt")).unwrap(), b"uncopied");
+        assert_eq!(fs::read(destination.join("copied.txt")).unwrap(), b"copied");
+    }
+
+    fn issue_101_copy_move(
+        source: &Path,
+        destination: &Path,
+        cancel: &CancellationToken,
+        discovered: &mut FileDiscoveredCallback<'_>,
+        progress: &mut FileProgressCallback<'_>,
+    ) -> Result<FileOperationReport, OperationError> {
+        let mut report = FileOperationReport::new();
+        copy_resolved_entry(
+            source,
+            &DestinationResolution {
+                path: destination.to_path_buf(),
+                replace_existing: false,
+            },
+            cancel,
+            &mut replace,
+            discovered,
+            progress,
+            &mut |_| {},
+            &mut report,
+            true,
+        )?;
+        Ok(report)
+    }
+
+    #[test]
+    fn issue_101_directory_moves_each_file_before_copying_the_next() {
+        use std::cell::RefCell;
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("target");
+        fs::create_dir(&source).unwrap();
+        for name in ["one", "two", "three"] {
+            write(&source.join(name), name.as_bytes());
+        }
+        let completed = RefCell::new(Vec::<PathBuf>::new());
+        issue_101_copy_move(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut |_, _| {
+                for previous in completed.borrow().iter() {
+                    assert!(
+                        !previous.exists(),
+                        "previous source must be removed before next discovery"
+                    );
+                    assert!(destination.join(previous.file_name().unwrap()).exists());
+                }
+            },
+            &mut |_, done, path| {
+                if done {
+                    completed.borrow_mut().push(path.to_path_buf());
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(completed.borrow().len(), 3);
+        assert!(!source.exists());
+        for name in ["one", "two", "three"] {
+            assert_eq!(fs::read(destination.join(name)).unwrap(), name.as_bytes());
+        }
+    }
+
+    #[test]
+    fn issue_101_cancel_after_a_completed_file_reports_partial_move() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("target");
+        fs::create_dir(&source).unwrap();
+        for name in ["one", "two"] {
+            write(&source.join(name), name.as_bytes());
+        }
+        let cancel = CancellationToken::new();
+        let mut discovered_count = 0;
+        let result = issue_101_copy_move(
+            &source,
+            &destination,
+            &cancel,
+            &mut |_, _| {
+                discovered_count += 1;
+                if discovered_count == 2 {
+                    cancel.cancel();
+                }
+            },
+            &mut |_, _, _| {},
+        );
+        assert!(matches!(
+            result,
+            Err(OperationError::DestinationCommittedSourceRetained { .. })
+        ));
+        let remaining = fs::read_dir(&source)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining.len(), 1);
+        assert!(!destination.join(&remaining[0]).exists());
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
+        assert!(temporary_siblings(&destination).is_empty());
+    }
+
+    #[test]
+    fn issue_101_cancel_after_copy_commit_retains_source_and_target() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("target");
+        write(&source, b"complete");
+        let cancel = CancellationToken::new();
+        let result = issue_101_copy_move(
+            &source,
+            &destination,
+            &cancel,
+            &mut |_, _| {},
+            &mut |_, done, _| {
+                if done {
+                    cancel.cancel();
+                }
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(OperationError::DestinationCommittedSourceRetained { .. })
+        ));
+        assert_eq!(fs::read(&source).unwrap(), b"complete");
+        assert_eq!(fs::read(&destination).unwrap(), b"complete");
+    }
+
+    #[test]
+    fn issue_101_directory_replaces_file_after_full_copy() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("target");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(source.join("nested")).unwrap();
+        write(&source.join("nested/file"), b"new");
+        write(&destination, b"old");
+        move_path_with_progress(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut replace,
+            &mut |_, _| {},
+            &mut |_, done, path| {
+                if done {
+                    assert!(path.exists());
+                    assert_eq!(fs::read(&destination).unwrap(), b"old");
+                }
+            },
+        )
+        .unwrap();
+        assert!(!source.exists());
+        assert_eq!(fs::read(destination.join("nested/file")).unwrap(), b"new");
+        assert!(temporary_siblings(temp.path()).is_empty());
+    }
+
+    #[test]
+    fn issue_101_cancelled_directory_replacement_preserves_source_and_old_target() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("target");
+        fs::create_dir(&source).unwrap();
+        write(&source.join("file"), &vec![8; COPY_TEST_CHUNK_SIZE * 2]);
+        write(&destination, b"old");
+        let cancel = CancellationToken::new();
+        let result = move_path_with_progress(
+            &source,
+            &destination,
+            &cancel,
+            &mut replace,
+            &mut |_, _| {},
+            &mut |_, _, _| {
+                cancel.cancel();
+            },
+        );
+        assert_eq!(result, Err(OperationError::Cancelled));
+        assert_eq!(fs::read(&destination).unwrap(), b"old");
+        assert_eq!(
+            fs::read(source.join("file")).unwrap(),
+            vec![8; COPY_TEST_CHUNK_SIZE * 2]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn issue_101_source_delete_failure_preserves_both_copies() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("target");
+        write(&source, b"complete");
+        let mut held = None;
+        let result = issue_101_copy_move(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut |_, _| {},
+            &mut |_, done, _| {
+                if done {
+                    held = Some(
+                        fs::OpenOptions::new()
+                            .read(true)
+                            .share_mode(3)
+                            .open(&source)
+                            .unwrap(),
+                    );
+                }
+            },
+        );
+        drop(held);
+        assert!(matches!(
+            result,
+            Err(OperationError::DestinationCommittedSourceRetained { .. })
+        ));
+        assert_eq!(fs::read(&source).unwrap(), b"complete");
+        assert_eq!(fs::read(&destination).unwrap(), b"complete");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn issue_101_copy_failure_does_not_remove_source() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("target");
+        write(&source, b"complete");
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&source)
+            .unwrap();
+        let result = issue_101_copy_move(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut |_, _| {},
+            &mut |_, _, _| {},
+        );
+        drop(held);
+        assert!(matches!(result, Err(OperationError::Io { .. })));
+        assert_eq!(fs::read(&source).unwrap(), b"complete");
+        assert!(!destination.exists());
+        assert!(temporary_siblings(temp.path()).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn issue_101_later_copy_failure_keeps_partial_move_and_remaining_source() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("target");
+        fs::create_dir(&source).unwrap();
+        for name in ["one", "two"] {
+            write(&source.join(name), name.as_bytes());
+        }
+        let mut discovered_count = 0;
+        let mut held = None;
+        let result = issue_101_copy_move(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut |_, path| {
+                discovered_count += 1;
+                if discovered_count == 2 {
+                    held = Some(
+                        fs::OpenOptions::new()
+                            .read(true)
+                            .share_mode(0)
+                            .open(path)
+                            .unwrap(),
+                    );
+                }
+            },
+            &mut |_, _, _| {},
+        );
+        drop(held);
+        assert!(matches!(
+            result,
+            Err(OperationError::DestinationCommittedSourceRetained { .. })
+        ));
+        let remaining = fs::read_dir(&source)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining.len(), 1);
+        assert!(!destination.join(&remaining[0]).exists());
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
+        assert!(temporary_siblings(&destination).is_empty());
+    }
+
+    #[test]
+    fn issue_101_partial_keep_both_move_reports_destination_directory() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("target");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        for name in ["one", "two"] {
+            write(&source.join(name), b"new");
+            write(&destination.join(name), b"old");
+        }
+        let cancel = CancellationToken::new();
+        let mut count = 0;
+        let result = move_path_with_progress(
+            &source,
+            &destination,
+            &cancel,
+            &mut |_, _, _| ConflictAction::KeepBoth,
+            &mut |_, _| {
+                count += 1;
+                if count == 2 {
+                    cancel.cancel();
+                }
+            },
+            &mut |_, _, _| {},
+        );
+        match result {
+            Err(OperationError::DestinationCommittedSourceRetained {
+                destination: completed,
+                ..
+            }) => assert_eq!(completed, destination),
+            other => panic!("expected partial move: {other:?}"),
+        }
+        assert_eq!(fs::read_dir(&source).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 3);
+        for name in ["one", "two"] {
+            assert_eq!(fs::read(destination.join(name)).unwrap(), b"old");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn issue_101_real_cross_volume_directory_move() {
+        use std::cell::RefCell;
+        let source_parent = TempDir::new();
+        let artifacts = std::env::current_dir().unwrap().join("artifacts");
+        fs::create_dir_all(&artifacts).unwrap();
+        let destination_parent = artifacts.join(format!(
+            "issue-101-cross-volume-{}-{}",
+            std::process::id(),
+            UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&destination_parent).unwrap();
+        let destination_parent = TempDir(destination_parent);
+        let source_volume = file_identity(source_parent.path()).unwrap().volume_serial;
+        let destination_volume = file_identity(destination_parent.path())
+            .unwrap()
+            .volume_serial;
+        if source_volume == destination_volume {
+            println!(
+                "#101 actual cross-volume unavailable: temp and workspace have same volume; deterministic copy-path tests still run"
+            );
+            return;
+        }
+        let source = source_parent.path().join("source");
+        let destination = destination_parent.path().join("target");
+        fs::create_dir(&source).unwrap();
+        for name in ["one", "two"] {
+            write(&source.join(name), name.as_bytes());
+        }
+        let completed = RefCell::new(Vec::<PathBuf>::new());
+        move_path_with_progress(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut replace,
+            &mut |_, _| {
+                for prior in completed.borrow().iter() {
+                    assert!(!prior.exists());
+                }
+            },
+            &mut |_, done, path| {
+                if done {
+                    completed.borrow_mut().push(path.to_path_buf());
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(completed.borrow().len(), 2);
+        assert!(!source.exists());
+        for name in ["one", "two"] {
+            assert_eq!(fs::read(destination.join(name)).unwrap(), name.as_bytes());
+        }
+        println!(
+            "#101 actual cross-volume passed: {source_volume} -> {destination_volume}; each source removed before next copy"
+        );
+    }
+
     fn temporary_siblings(parent: &Path) -> Vec<PathBuf> {
         fs::read_dir(parent)
             .unwrap()
