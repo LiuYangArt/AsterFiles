@@ -1040,6 +1040,8 @@ enum NetworkOperationEvent {
 mod directory;
 #[cfg(windows)]
 pub use directory::isolated_directory;
+#[cfg(all(windows, test))]
+pub(crate) use directory::test_directory_stream_started;
 
 #[cfg(windows)]
 struct KillOnCloseJob(windows_sys::Win32::Foundation::HANDLE);

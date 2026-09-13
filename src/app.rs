@@ -51,6 +51,8 @@ use crate::{
 pub(crate) mod action_scenario;
 mod actions;
 mod directory_loading;
+#[path = "library_loading.rs"]
+mod library_loading;
 mod file_operation_coordinator;
 mod file_operation_worker;
 #[cfg(test)]
@@ -4498,7 +4500,8 @@ fn submit_library_navigation(
         let library_sources = definition
             .sources
             .iter()
-            .filter_map(|source| source.path.clone())
+            .enumerate()
+            .filter_map(|(index, source)| source.path.clone().map(|path| (index, path)))
             .collect::<Vec<_>>();
         DirectoryRequest {
             tab_id,
@@ -23564,6 +23567,48 @@ mod tests {
             default_save_path,
         }
     }
+
+    #[test]
+    fn issue_104_library_navigation_keeps_unavailable_source_slots_and_cancels_previous_request() {
+        let first = PathBuf::from(r"C:\First");
+        let second = PathBuf::from(r"D:\Second");
+        let definition = test_library(
+            "shell:library:sparse",
+            "Sparse",
+            vec![None, Some(first.clone()), None, Some(second.clone())],
+            None,
+        );
+        let library = LibraryLocationId::new("shell:library:sparse".into(), "Sparse".into());
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\local")], 0, [0, 1, 2, 3]);
+        app.libraries.push(definition);
+        let state = Arc::new(Mutex::new(app));
+        let (sender, receiver) = mpsc::channel();
+        assert!(submit_library_navigation(
+            &sender,
+            &state,
+            TabId(1),
+            library.clone(),
+            NavigationKind::Normal
+        ));
+        let first_request = receiver.recv().unwrap();
+        assert_eq!(
+            first_request.library_sources,
+            Some(vec![(1, first), (3, second)])
+        );
+        assert_eq!(first_request.unavailable_library_sources, 2);
+        assert!(submit_library_navigation(
+            &sender,
+            &state,
+            TabId(1),
+            library,
+            NavigationKind::Refresh
+        ));
+        let refreshed = receiver.recv().unwrap();
+        assert!(first_request.cancelled());
+        assert!(!refreshed.cancelled());
+        assert_eq!(refreshed.unavailable_library_sources, 2);
+    }
+
     fn type_select_test_context(window: u32, request: u64) -> TypeSelectContext {
         TypeSelectContext {
             tab_id: TabId(window),

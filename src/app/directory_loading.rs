@@ -1,10 +1,7 @@
 //! Directory workers own local/network queues; results retain tab/request identity.
 use crate::{
     domain::{EntryId, FileEntry, FolderSizeState, LibraryLocationId, RequestId, TabId},
-    fs::{
-        ReadOutcome, SourceReadState, read_aggregate_directory_batches_filtered,
-        read_directory_batches_filtered,
-    },
+    fs::{ReadOutcome, read_directory_batches_filtered},
     network::NetworkExecutionKey,
     platform,
 };
@@ -22,7 +19,7 @@ pub(super) struct DirectoryRequest {
     pub(super) request_id: RequestId,
     pub(super) path: PathBuf,
     pub(super) library: Option<LibraryLocationId>,
-    pub(super) library_sources: Option<Vec<PathBuf>>,
+    pub(super) library_sources: Option<Vec<(usize, PathBuf)>>,
     pub(super) unavailable_library_sources: usize,
     pub(super) visibility: crate::domain::FileVisibility,
     pub(super) cancel: Arc<std::sync::atomic::AtomicBool>,
@@ -73,7 +70,7 @@ impl NetworkDirectoryScheduler {
 }
 
 impl DirectoryRequest {
-    fn cancelled(&self) -> bool {
+    pub(super) fn cancelled(&self) -> bool {
         self.cancel.load(std::sync::atomic::Ordering::Acquire)
     }
 }
@@ -157,12 +154,42 @@ pub(super) fn spawn_directory_workers(
     mpsc::SyncSender<DirectoryRequest>,
     mpsc::Receiver<DirectoryEvent>,
 ) {
+    spawn_directory_workers_with_library_reader(
+        worker_count,
+        network_worker_count,
+        super::library_loading::read_source,
+    )
+}
+
+pub(super) fn spawn_directory_workers_with_library_reader(
+    worker_count: usize,
+    network_worker_count: usize,
+    library_reader: super::library_loading::SourceReader,
+) -> (
+    mpsc::Sender<DirectoryRequest>,
+    mpsc::SyncSender<DirectoryRequest>,
+    mpsc::Receiver<DirectoryEvent>,
+) {
     let network_worker_count = network_worker_count.max(1);
     let (request_sender, request_receiver) = mpsc::channel::<DirectoryRequest>();
     let (network_request_sender, network_request_receiver) =
         mpsc::sync_channel::<DirectoryRequest>(network_worker_count.saturating_mul(32));
-    let request_receiver = Arc::new(Mutex::new(request_receiver));
     let (event_sender, event_receiver) = mpsc::channel::<DirectoryEvent>();
+    let (local_sender, local_receiver) = mpsc::channel();
+    let library_sender = super::library_loading::start(event_sender.clone(), library_reader).0;
+    thread::spawn(move || {
+        while let Ok(request) = request_receiver.recv() {
+            let sender = if request.library_sources.is_some() {
+                &library_sender
+            } else {
+                &local_sender
+            };
+            if sender.send(request).is_err() {
+                break;
+            }
+        }
+    });
+    let request_receiver = Arc::new(Mutex::new(local_receiver));
     for _ in 0..worker_count {
         let requests = request_receiver.clone();
         let events = event_sender.clone();
@@ -409,82 +436,6 @@ fn read_network_directory_batches(
     result.map(|skipped| ReadOutcome::Complete { skipped })
 }
 pub(super) fn run_directory_request(request: DirectoryRequest, events: &mpsc::Sender<DirectoryEvent>) {
-    if let Some(sources) = request.library_sources.as_ref() {
-        let outcome = read_aggregate_directory_batches_filtered(
-            sources,
-            &request.cancel,
-            request.visibility,
-            |entries| {
-                let _ = events.send(DirectoryEvent::Batch {
-                    tab_id: request.tab_id,
-                    request_id: request.request_id,
-                    entries,
-                });
-            },
-        );
-        let event = if outcome.cancelled {
-            DirectoryEvent::Cancelled {
-                tab_id: request.tab_id,
-                request_id: request.request_id,
-            }
-        } else {
-            let successful_sources = outcome
-                .sources
-                .iter()
-                .filter(|source| matches!(source.state, SourceReadState::Complete { .. }))
-                .count();
-            let total_sources = outcome.sources.len() + request.unavailable_library_sources;
-            if total_sources > 0 && successful_sources == 0 {
-                let kind = if outcome
-                    .sources
-                    .iter()
-                    .any(|source| source.state == SourceReadState::PermissionDenied)
-                {
-                    io::ErrorKind::PermissionDenied
-                } else if outcome
-                    .sources
-                    .iter()
-                    .all(|source| source.state == SourceReadState::NotFound)
-                {
-                    io::ErrorKind::NotFound
-                } else {
-                    io::ErrorKind::Other
-                };
-                DirectoryEvent::Failed {
-                    tab_id: request.tab_id,
-                    request_id: request.request_id,
-                    kind,
-                    message: "all library sources failed".to_owned(),
-                }
-            } else {
-                let skipped = outcome
-                    .sources
-                    .iter()
-                    .filter_map(|source| match source.state {
-                        SourceReadState::Complete { skipped } => Some(skipped),
-                        _ => None,
-                    })
-                    .sum();
-                let source_failures = request.unavailable_library_sources
-                    + outcome
-                        .sources
-                        .iter()
-                        .filter(|source| !matches!(source.state, SourceReadState::Complete { .. }))
-                        .count();
-                DirectoryEvent::Finished {
-                    tab_id: request.tab_id,
-                    request_id: request.request_id,
-                    path: PathBuf::new(),
-                    skipped,
-                    source_failures,
-                    library: request.library,
-                }
-            }
-        };
-        let _ = events.send(event);
-        return;
-    }
-
     if crate::network::is_unc_server_root(&request.path) {
         platform::windows::network::record_runtime_event("network_root_request_started");
     }

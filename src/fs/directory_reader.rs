@@ -19,29 +19,6 @@ pub enum ReadOutcome {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceReadState {
-    Complete { skipped: usize },
-    NotFound,
-    PermissionDenied,
-    Disconnected,
-    Failed,
-    Cancelled,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceReadOutcome {
-    pub source: PathBuf,
-    pub state: SourceReadState,
-    pub message: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AggregateReadOutcome {
-    pub sources: Vec<SourceReadOutcome>,
-    pub cancelled: bool,
-}
-
 #[cfg(test)]
 fn read_directory_batches(
     path: &Path,
@@ -72,30 +49,18 @@ pub fn read_directory_batches_filtered(
                 continue;
             }
         };
-        let path = directory_entry.path();
-        if is_internal_cleanup_path(&path) {
-            continue;
-        }
-        let entry_metadata = match directory_entry.metadata() {
-            Ok(metadata) => metadata,
+        let entry = match read_directory_entry(directory_entry, visibility, next_id) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => continue,
             Err(_) => {
                 skipped += 1;
                 continue;
             }
         };
-        if !metadata_is_visible(&entry_metadata, visibility) {
-            continue;
-        }
-        let metadata = metadata_for_entry(&path, entry_metadata);
         if cancel.load(AtomicOrdering::Acquire) {
             return Ok(ReadOutcome::Cancelled);
         }
-        batch.push(file_entry(
-            directory_entry.file_name(),
-            path,
-            metadata,
-            next_id,
-        ));
+        batch.push(entry);
         next_id = next_id.checked_add(1).expect("directory entry ID overflow");
 
         if batch.len() == batch_limit {
@@ -110,99 +75,21 @@ pub fn read_directory_batches_filtered(
     Ok(ReadOutcome::Complete { skipped })
 }
 
-pub fn read_aggregate_directory_batches_filtered(
-    sources: &[PathBuf],
-    cancel: &Arc<AtomicBool>,
+pub(crate) fn read_directory_entry(
+    entry: fs::DirEntry,
     visibility: FileVisibility,
-    mut on_batch: impl FnMut(Vec<FileEntry>),
-) -> AggregateReadOutcome {
-    let mut aggregate = AggregateReadOutcome::default();
-    let mut batch_limit = DIRECTORY_FIRST_BATCH_SIZE;
-    let mut batch = Vec::with_capacity(batch_limit);
-    let mut next_id = 1_u32;
-
-    for (source_index, source) in sources.iter().enumerate() {
-        if cancel.load(AtomicOrdering::Acquire) {
-            aggregate.cancelled = true;
-            aggregate.sources.push(SourceReadOutcome {
-                source: source.clone(),
-                state: SourceReadState::Cancelled,
-                message: None,
-            });
-            break;
-        }
-
-        let entries = match fs::read_dir(source) {
-            Ok(entries) => entries,
-            Err(error) => {
-                aggregate.sources.push(source_error(source, error));
-                continue;
-            }
-        };
-        let mut skipped = 0;
-        let mut source_cancelled = false;
-        for result in entries {
-            if cancel.load(AtomicOrdering::Acquire) {
-                source_cancelled = true;
-                break;
-            }
-            let directory_entry = match result {
-                Ok(entry) => entry,
-                Err(_) => {
-                    skipped += 1;
-                    continue;
-                }
-            };
-            let path = directory_entry.path();
-            if is_internal_cleanup_path(&path) {
-                continue;
-            }
-            let entry_metadata = match directory_entry.metadata() {
-                Ok(metadata) => metadata,
-                Err(_) => {
-                    skipped += 1;
-                    continue;
-                }
-            };
-            if !metadata_is_visible(&entry_metadata, visibility) {
-                continue;
-            }
-            let metadata = metadata_for_entry(&path, entry_metadata);
-            if cancel.load(AtomicOrdering::Acquire) {
-                source_cancelled = true;
-                break;
-            }
-            let mut entry = file_entry(directory_entry.file_name(), path, metadata, next_id);
-            entry.library_source_index = Some(source_index);
-            batch.push(entry);
-            next_id = next_id.checked_add(1).expect("directory entry ID overflow");
-
-            if batch.len() == batch_limit {
-                on_batch(std::mem::take(&mut batch));
-                batch_limit = DIRECTORY_BATCH_SIZE;
-                batch = Vec::with_capacity(batch_limit);
-            }
-        }
-        if source_cancelled {
-            aggregate.cancelled = true;
-            aggregate.sources.push(SourceReadOutcome {
-                source: source.clone(),
-                state: SourceReadState::Cancelled,
-                message: None,
-            });
-            break;
-        }
-        aggregate.sources.push(SourceReadOutcome {
-            source: source.clone(),
-            state: SourceReadState::Complete { skipped },
-            message: None,
-        });
+    id: u32,
+) -> io::Result<Option<FileEntry>> {
+    let path = entry.path();
+    if is_internal_cleanup_path(&path) {
+        return Ok(None);
     }
-
-    if !batch.is_empty() {
-        on_batch(batch);
+    let metadata = entry.metadata()?;
+    if !metadata_is_visible(&metadata, visibility) {
+        return Ok(None);
     }
-    aggregate
+    let metadata = metadata_for_entry(&path, metadata);
+    Ok(Some(file_entry(entry.file_name(), path, metadata, id)))
 }
 
 fn file_entry(
@@ -255,26 +142,6 @@ fn attributes_need_followup_metadata(attributes: u32) -> bool {
     attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
-fn source_error(source: &Path, error: io::Error) -> SourceReadOutcome {
-    let state = match error.kind() {
-        io::ErrorKind::NotFound => SourceReadState::NotFound,
-        io::ErrorKind::PermissionDenied => SourceReadState::PermissionDenied,
-        io::ErrorKind::ConnectionAborted
-        | io::ErrorKind::ConnectionRefused
-        | io::ErrorKind::ConnectionReset
-        | io::ErrorKind::HostUnreachable
-        | io::ErrorKind::NetworkDown
-        | io::ErrorKind::NetworkUnreachable
-        | io::ErrorKind::NotConnected
-        | io::ErrorKind::TimedOut => SourceReadState::Disconnected,
-        _ => SourceReadState::Failed,
-    };
-    SourceReadOutcome {
-        source: source.to_path_buf(),
-        state,
-        message: Some(error.to_string()),
-    }
-}
 #[cfg(windows)]
 fn metadata_is_visible(metadata: &fs::Metadata, visibility: FileVisibility) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -385,207 +252,6 @@ mod tests {
         assert!(entries.iter().any(|entry| entry.display_name == "kept.txt"));
     }
 
-    #[test]
-    fn aggregate_read_filters_internal_cleanup_paths_from_every_source() {
-        let fixture = TempTree::new("aggregate-internal-cleanup");
-        let first = fixture.child("first");
-        let second = fixture.child("second");
-        fs::create_dir_all(first.join(".asterfiles-cleanup")).unwrap();
-        fs::create_dir_all(second.join(".ASTERFILES-CLEANUP")).unwrap();
-        fs::create_dir_all(second.join(".asterfiles-cleanup-copy")).unwrap();
-        fs::write(first.join("first.txt"), b"").unwrap();
-        fs::write(second.join("second.txt"), b"").unwrap();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let mut entries = Vec::new();
-
-        let result = read_aggregate_directory_batches_filtered(
-            &[first, second],
-            &cancel,
-            FileVisibility {
-                show_hidden: true,
-                show_system: true,
-            },
-            |batch| entries.extend(batch),
-        );
-
-        assert!(!result.cancelled);
-        assert!(!entries.iter().any(|entry| {
-            entry
-                .display_name
-                .eq_ignore_ascii_case(".asterfiles-cleanup")
-        }));
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.display_name == ".asterfiles-cleanup-copy")
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.display_name == "first.txt")
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.display_name == "second.txt")
-        );
-    }
-
-    #[test]
-    fn aggregate_read_keeps_real_paths_same_names_and_global_ids() {
-        let fixture = TempTree::new("identity");
-        let first = fixture.child("first");
-        let second = fixture.child("second");
-        fs::create_dir_all(&first).unwrap();
-        fs::create_dir_all(&second).unwrap();
-        fs::write(first.join("same.txt"), b"first").unwrap();
-        fs::write(second.join("same.txt"), b"second").unwrap();
-
-        let cancel = Arc::new(AtomicBool::new(false));
-        let mut entries = Vec::new();
-        let result = read_aggregate_directory_batches_filtered(
-            &[first.clone(), second.clone()],
-            &cancel,
-            FileVisibility::default(),
-            |batch| entries.extend(batch),
-        );
-
-        assert!(!result.cancelled);
-        assert_eq!(result.sources.len(), 2);
-        assert!(
-            result
-                .sources
-                .iter()
-                .all(|source| source.state == SourceReadState::Complete { skipped: 0 })
-        );
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].id, EntryId(1));
-        assert_eq!(entries[1].id, EntryId(2));
-        assert_eq!(entries[0].display_name, "same.txt");
-        assert_eq!(entries[1].display_name, "same.txt");
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.path == first.join("same.txt"))
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.path == second.join("same.txt"))
-        );
-        assert_eq!(entries[0].library_source_index, Some(0));
-        assert_eq!(entries[1].library_source_index, Some(1));
-    }
-
-    #[test]
-    fn aggregate_read_batches_across_source_boundaries() {
-        let fixture = TempTree::new("batches");
-        let first = fixture.child("first");
-        let second = fixture.child("second");
-        fs::create_dir_all(&first).unwrap();
-        fs::create_dir_all(&second).unwrap();
-        for index in 0..16 {
-            fs::write(first.join(format!("first-{index:03}.txt")), b"").unwrap();
-        }
-        for index in 0..284 {
-            fs::write(second.join(format!("second-{index:03}.txt")), b"").unwrap();
-        }
-
-        let cancel = Arc::new(AtomicBool::new(false));
-        let mut batch_sizes = Vec::new();
-        let mut ids = Vec::new();
-        let result = read_aggregate_directory_batches_filtered(
-            &[first, second],
-            &cancel,
-            FileVisibility::default(),
-            |batch| {
-                batch_sizes.push(batch.len());
-                ids.extend(batch.into_iter().map(|entry| entry.id.0));
-            },
-        );
-
-        assert!(!result.cancelled);
-        assert_eq!(batch_sizes, vec![32, 256, 12]);
-        assert_eq!(ids, (1..=300).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn aggregate_read_continues_after_missing_source_and_accepts_empty_library() {
-        let fixture = TempTree::new("partial");
-        let missing = fixture.child("missing");
-        let available = fixture.child("available");
-        fs::create_dir_all(&available).unwrap();
-        fs::write(available.join("kept.txt"), b"").unwrap();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let mut entries = Vec::new();
-
-        let result = read_aggregate_directory_batches_filtered(
-            &[missing.clone(), available],
-            &cancel,
-            FileVisibility::default(),
-            |batch| entries.extend(batch),
-        );
-
-        assert_eq!(result.sources.len(), 2);
-        assert_eq!(result.sources[0].source, missing);
-        assert_eq!(result.sources[0].state, SourceReadState::NotFound);
-        assert_eq!(
-            result.sources[1].state,
-            SourceReadState::Complete { skipped: 0 }
-        );
-        assert_eq!(entries.len(), 1);
-
-        let empty = read_aggregate_directory_batches_filtered(
-            &[],
-            &cancel,
-            FileVisibility::default(),
-            |_| panic!("empty library must not emit a batch"),
-        );
-        assert_eq!(empty, AggregateReadOutcome::default());
-    }
-
-    #[test]
-    fn aggregate_read_cancels_between_batches() {
-        let fixture = TempTree::new("cancel");
-        for index in 0..64 {
-            fs::write(fixture.child(&format!("item-{index:03}.txt")), b"").unwrap();
-        }
-        let cancel = Arc::new(AtomicBool::new(false));
-        let cancel_after_first = cancel.clone();
-        let mut batches = 0;
-
-        let result = read_aggregate_directory_batches_filtered(
-            std::slice::from_ref(&fixture.0),
-            &cancel,
-            FileVisibility::default(),
-            |_| {
-                batches += 1;
-                cancel_after_first.store(true, AtomicOrdering::Release);
-            },
-        );
-
-        assert!(result.cancelled);
-        assert_eq!(batches, 1);
-        assert_eq!(result.sources[0].state, SourceReadState::Cancelled);
-    }
-
-    #[test]
-    fn source_errors_are_classified_for_the_coordinator() {
-        let path = Path::new("source");
-        assert_eq!(
-            source_error(path, io::Error::from(io::ErrorKind::PermissionDenied)).state,
-            SourceReadState::PermissionDenied
-        );
-        assert_eq!(
-            source_error(path, io::Error::from(io::ErrorKind::TimedOut)).state,
-            SourceReadState::Disconnected
-        );
-        assert_eq!(
-            source_error(path, io::Error::from(io::ErrorKind::InvalidData)).state,
-            SourceReadState::Failed
-        );
-    }
-    #[cfg(windows)]
     #[test]
     fn hidden_and_system_attributes_are_filtered_independently() {
         const HIDDEN: u32 = 0x2;

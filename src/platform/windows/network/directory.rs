@@ -171,28 +171,70 @@ fn receive_stream(
     result
 }
 
+#[cfg(test)]
 fn publish_batch(
     output: &Path,
     entries: &[FileEntry],
     skipped: usize,
     done: bool,
 ) -> io::Result<()> {
+    publish_frame(output, &encode_batch(entries, skipped, done)?)
+}
+
+fn publish_frame(output: &Path, bytes: &[u8]) -> io::Result<()> {
     let pending = output.with_extension("pending");
-    std::fs::write(&pending, encode_batch(entries, skipped, done)?)?;
+    std::fs::write(&pending, bytes)?;
     std::fs::rename(&pending, output)?;
-    loop {
-        match std::fs::metadata(output) {
-            Ok(_) => std::thread::sleep(POLL_INTERVAL),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
-        }
+    while frame_slot_exists(output)? {
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    Ok(())
+}
+
+fn frame_slot_exists(output: &Path) -> io::Result<bool> {
+    use windows_sys::Win32::{
+        Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND},
+        Storage::FileSystem::{GetFileAttributesW, INVALID_FILE_ATTRIBUTES},
+    };
+
+    let path = output
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // Metadata opens a handle and can report access denied while the parent deletes the slot.
+    // A handle-free lookup observes the acknowledgement even while an old handle is still open.
+    if unsafe { GetFileAttributesW(path.as_ptr()) } != INVALID_FILE_ATTRIBUTES {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error().map(|code| code as u32) {
+        Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => Ok(false),
+        _ => Err(error),
     }
 }
 
 pub(super) fn run_child(path: &Path, visibility: FileVisibility, output: &Path) -> io::Result<()> {
-    enumerate_directory(path, visibility, |entries, skipped, done| {
-        publish_batch(output, entries, skipped, done)
-    })
+    stream_directory(path, visibility, |bytes| publish_frame(output, bytes))
+}
+
+fn stream_directory(
+    path: &Path,
+    visibility: FileVisibility,
+    mut emit: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut transport_failed = false;
+    let result = enumerate_directory(path, visibility, |entries, skipped, done| {
+        let result = encode_batch(entries, skipped, done).and_then(|bytes| emit(&bytes));
+        transport_failed = result.is_err();
+        result
+    });
+    match result {
+        Ok(()) => Ok(()),
+        // A broken transport cannot carry another frame, especially after completion was sent.
+        Err(error) if transport_failed => Err(error),
+        Err(error) => emit(&encode_error(&error)),
+    }
 }
 
 fn enumerate_directory(
@@ -200,8 +242,6 @@ fn enumerate_directory(
     visibility: FileVisibility,
     mut emit: impl FnMut(&[FileEntry], usize, bool) -> io::Result<()>,
 ) -> io::Result<()> {
-    use std::os::windows::fs::MetadataExt;
-
     let mut entries = Vec::with_capacity(MAX_BATCH_ITEMS);
     let mut batch_bytes = 13_usize;
     let mut skipped = 0_usize;
@@ -222,24 +262,17 @@ fn enumerate_directory(
                 continue;
             }
         };
-        let metadata = match directory_entry.metadata() {
-            Ok(metadata) => metadata,
+        let entry = match crate::fs::read_directory_entry(directory_entry, visibility, next_id) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => continue,
             Err(_) => {
                 skipped = skipped.saturating_add(1);
                 continue;
             }
         };
-        let attributes = metadata.file_attributes();
-        if (!visibility.show_hidden && attributes & 0x2 != 0)
-            || (!visibility.show_system && attributes & 0x4 != 0)
-        {
-            continue;
-        }
-        let entry_path = directory_entry.path();
-        let original_name = directory_entry.file_name();
         let estimated_bytes = 64
-            + 2 * (original_name.encode_wide().count()
-                + entry_path.as_os_str().encode_wide().count());
+            + 2 * (entry.original_name.encode_wide().count()
+                + entry.path.as_os_str().encode_wide().count());
         if batch_bytes + estimated_bytes > MAX_BATCH_BYTES && !entries.is_empty() {
             emit(&entries, skipped, false)?;
             entries.clear();
@@ -247,31 +280,7 @@ fn enumerate_directory(
             skipped = 0;
             last_batch = Instant::now();
         }
-        let kind = if metadata.is_dir() {
-            EntryKind::Directory
-        } else if metadata.is_file() {
-            EntryKind::File
-        } else {
-            EntryKind::Other
-        };
-        entries.push(FileEntry {
-            id: EntryId(next_id),
-            display_name: original_name.to_string_lossy().into_owned(),
-            name_highlights: Vec::new(),
-            original_name,
-            path: entry_path.clone(),
-            kind,
-            open_target: None,
-            library_source_index: None,
-            parent_display: entry_path
-                .parent()
-                .map(|value| value.as_os_str().to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            size_bytes: metadata.is_file().then_some(metadata.len()),
-            folder_size: FolderSizeState::NotIndexed,
-            modified: metadata.modified().ok(),
-            created: metadata.created().ok(),
-        });
+        entries.push(entry);
         batch_bytes += estimated_bytes;
         let first = next_id == 1;
         next_id = next_id.checked_add(1).ok_or_else(|| {
@@ -336,6 +345,49 @@ fn encode_batch(entries: &[FileEntry], skipped: usize, done: bool) -> io::Result
     Ok(bytes)
 }
 
+fn encode_error(error: &io::Error) -> Vec<u8> {
+    let mut bytes = vec![0; 13];
+    bytes[12] = 2;
+    if let Some(code) = error.raw_os_error() {
+        bytes.push(0);
+        bytes.extend_from_slice(&code.to_le_bytes());
+    } else {
+        bytes.push(match error.kind() {
+            io::ErrorKind::NotFound => 1,
+            io::ErrorKind::PermissionDenied => 2,
+            io::ErrorKind::Interrupted => 3,
+            io::ErrorKind::TimedOut => 4,
+            io::ErrorKind::InvalidData => 5,
+            _ => 6,
+        });
+    }
+    bytes
+}
+
+fn decode_error(bytes: &[u8], offset: &mut usize) -> io::Result<io::Error> {
+    let tag = read_byte(bytes, offset)?;
+    let error = match tag {
+        0 => {
+            let code = read_u32(bytes, offset)? as i32;
+            if code == 0 {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            io::Error::from_raw_os_error(code)
+        }
+        1 => io::ErrorKind::NotFound.into(),
+        2 => io::ErrorKind::PermissionDenied.into(),
+        3 => io::ErrorKind::Interrupted.into(),
+        4 => io::ErrorKind::TimedOut.into(),
+        5 => io::ErrorKind::InvalidData.into(),
+        6 => io::ErrorKind::Other.into(),
+        _ => return Err(io::ErrorKind::InvalidData.into()),
+    };
+    if *offset != bytes.len() {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    Ok(error)
+}
+
 fn read_batch(reader: impl Read) -> io::Result<(Vec<FileEntry>, usize, bool)> {
     let mut bytes = Vec::new();
     reader
@@ -360,6 +412,7 @@ fn read_batch(reader: impl Read) -> io::Result<(Vec<FileEntry>, usize, bool)> {
     let done = match read_byte(&bytes, &mut offset)? {
         0 => false,
         1 if count == 0 && skipped == 0 => true,
+        2 if count == 0 && skipped == 0 => return Err(decode_error(&bytes, &mut offset)?),
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -400,7 +453,11 @@ fn read_batch(reader: impl Read) -> io::Result<(Vec<FileEntry>, usize, bool)> {
                 .map(|value| value.as_os_str().to_string_lossy().into_owned())
                 .unwrap_or_default(),
             size_bytes,
-            folder_size: FolderSizeState::NotIndexed,
+            folder_size: if crate::network::is_unc_path(&entry_path) {
+                FolderSizeState::NotIndexed
+            } else {
+                FolderSizeState::Unknown
+            },
             modified,
             created,
         });
@@ -413,6 +470,9 @@ fn read_batch(reader: impl Read) -> io::Result<(Vec<FileEntry>, usize, bool)> {
     }
     Ok((entries, skipped, done))
 }
+
+#[cfg(test)]
+pub(crate) use tests::test_directory_stream_started;
 
 #[cfg(test)]
 mod tests {
@@ -456,6 +516,56 @@ mod tests {
         command
     }
 
+    pub(crate) fn test_directory_stream_started(
+        path: &Path,
+        cancel: &AtomicBool,
+        started: &AtomicBool,
+        on_batch: impl FnMut(Vec<FileEntry>) -> io::Result<()>,
+    ) -> io::Result<usize> {
+        let files = StreamFiles::create()?;
+        write_directory_input(&files.input(), path, FileVisibility::default())?;
+        let mode = if path.file_name() == Some(std::ffi::OsStr::new("hang")) {
+            "hang"
+        } else {
+            "enumerate"
+        };
+        let ready = files.0.join("ready");
+        struct FinishOnDrop<'a>(&'a AtomicBool);
+        impl Drop for FinishOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let finished = AtomicBool::new(false);
+        let mut command = child_command(&files, mode);
+        command.env("ASTERFILES_DIRECTORY_TEST_READY", &ready);
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !finished.load(Ordering::Acquire) {
+                    if ready.is_file() {
+                        started.store(true, Ordering::Release);
+                        break;
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+            });
+            let completion = FinishOnDrop(&finished);
+            let result = receive_stream(
+                command,
+                &files.output(),
+                cancel,
+                Duration::from_secs(30),
+                on_batch,
+            );
+            drop(completion);
+            result
+        });
+        let _ = std::fs::remove_file(ready);
+        eprintln!(
+            "#104 directory_source={path:?} fixture={mode} stream_returned=true result={result:?}"
+        );
+        result
+    }
     #[test]
     fn issue_103_child_entry() {
         let Some(output) = std::env::var_os("ASTERFILES_TEST_DIRECTORY_OUTPUT") else {
@@ -463,6 +573,9 @@ mod tests {
         };
         let output = PathBuf::from(output);
         let mode = std::env::var("ASTERFILES_TEST_DIRECTORY_MODE").unwrap();
+        if let Some(ready) = std::env::var_os("ASTERFILES_DIRECTORY_TEST_READY") {
+            std::fs::write(ready, std::process::id().to_string()).unwrap();
+        }
         match mode.as_str() {
             "hang" => std::thread::sleep(Duration::from_secs(60)),
             "crash" => std::process::exit(17),
@@ -484,6 +597,160 @@ mod tests {
             }
             _ => panic!("unknown fixture"),
         }
+    }
+
+    #[test]
+    fn issue_104_completion_transport_failure_does_not_publish_another_terminal_frame() {
+        let fixture = StreamFiles::create().unwrap();
+        let mut frames = Vec::new();
+        let error = stream_directory(&fixture.0, FileVisibility::default(), |bytes| {
+            frames.push(bytes.to_vec());
+            Err(io::ErrorKind::BrokenPipe.into())
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(frames.len(), 1);
+        let (entries, skipped, done) = read_batch(frames[0].as_slice()).unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(skipped, 0);
+        assert!(done);
+    }
+
+    #[test]
+    fn issue_104_deleted_slot_is_acknowledged_while_a_shared_delete_handle_remains_open() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let files = StreamFiles::create().unwrap();
+        let output = files.output();
+        std::fs::write(&output, encode_batch(&[], 0, true).unwrap()).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .access_mode(0)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&output)
+            .unwrap();
+        assert!(frame_slot_exists(&output).unwrap());
+        std::fs::remove_file(&output).unwrap();
+        assert!(!frame_slot_exists(&output).unwrap());
+        // Querying this handle proves acknowledgement did not require its release.
+        assert_eq!(held.metadata().unwrap().len(), 13);
+        drop(held);
+    }
+    #[test]
+    fn issue_104_missing_source_preserves_error_kind_and_reaps_real_child() {
+        let fixture = StreamFiles::create().unwrap();
+        let started = AtomicBool::new(false);
+        let error = test_directory_stream_started(
+            &fixture.0.join("missing"),
+            &AtomicBool::new(false),
+            &started,
+            |_| panic!("missing source must not produce entries"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.raw_os_error().is_some());
+    }
+
+    #[test]
+    fn issue_104_error_frames_preserve_permissions_and_reject_corruption() {
+        for error in [
+            io::Error::from_raw_os_error(5),
+            io::Error::from(io::ErrorKind::PermissionDenied),
+        ] {
+            let encoded = encode_error(&error);
+            let decoded = read_batch(encoded.as_slice()).unwrap_err();
+            assert_eq!(decoded.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(decoded.raw_os_error(), error.raw_os_error());
+            for length in 0..encoded.len() {
+                assert!(matches!(
+                    read_batch(&encoded[..length]).unwrap_err().kind(),
+                    io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+                ));
+            }
+            let mut trailing = encoded.clone();
+            trailing.push(0);
+            assert_eq!(
+                read_batch(trailing.as_slice()).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            let mut with_entries = encoded;
+            with_entries[0] = 1;
+            assert_eq!(
+                read_batch(with_entries.as_slice()).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        let mut invalid = vec![0; 14];
+        invalid[12] = 2;
+        invalid[13] = 255;
+        assert_eq!(
+            read_batch(invalid.as_slice()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            read_batch(encode_error(&io::Error::from_raw_os_error(0)).as_slice())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn issue_104_library_stream_preserves_cleanup_filter_and_local_folder_size_queries() {
+        let fixture = StreamFiles::create().unwrap();
+        let data = fixture.0.join("data");
+        std::fs::create_dir(&data).unwrap();
+        for name in [".asterfiles-cleanup", ".ASTERFILES-CLEANUP-copy", "folder"] {
+            std::fs::create_dir(data.join(name)).unwrap();
+        }
+        std::fs::write(data.join("kept.txt"), b"fixture").unwrap();
+        let files = StreamFiles::create().unwrap();
+        write_directory_input(
+            &files.input(),
+            &data,
+            FileVisibility {
+                show_hidden: true,
+                show_system: true,
+            },
+        )
+        .unwrap();
+        let mut entries = Vec::new();
+        receive_stream(
+            child_command(&files, "enumerate"),
+            &files.output(),
+            &AtomicBool::new(false),
+            Duration::from_secs(10),
+            |batch| {
+                entries.extend(batch);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.display_name == ".asterfiles-cleanup")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.display_name == ".ASTERFILES-CLEANUP-copy")
+        );
+        let folder = entries
+            .iter()
+            .find(|entry| entry.display_name == "folder")
+            .unwrap();
+        assert_eq!(folder.kind, EntryKind::Directory);
+        assert_eq!(folder.folder_size, FolderSizeState::Unknown);
+        assert_eq!(folder.path, data.join("folder"));
+        for name in [".asterfiles-cleanup", ".ASTERFILES-CLEANUP-copy", "folder"] {
+            std::fs::remove_dir(data.join(name)).unwrap();
+        }
+        std::fs::remove_file(data.join("kept.txt")).unwrap();
+        std::fs::remove_dir(data).unwrap();
     }
 
     #[test]
