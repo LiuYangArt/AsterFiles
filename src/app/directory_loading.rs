@@ -79,7 +79,7 @@ impl DirectoryRequest {
 }
 
 #[cfg(test)]
-fn network_directory_request(path: &str) -> DirectoryRequest {
+pub(super) fn network_directory_request(path: &str) -> DirectoryRequest {
     DirectoryRequest {
         tab_id: TabId(1),
         request_id: RequestId(1),
@@ -94,6 +94,12 @@ fn network_directory_request(path: &str) -> DirectoryRequest {
 
 #[derive(Debug)]
 pub(super) enum DirectoryEvent {
+    NetworkBatch {
+        tab_id: TabId,
+        request_id: RequestId,
+        entries: Vec<FileEntry>,
+        acknowledgement: mpsc::Sender<()>,
+    },
     Batch {
         tab_id: TabId,
         request_id: RequestId,
@@ -126,7 +132,10 @@ pub(super) enum DirectoryEvent {
 impl DirectoryEvent {
     pub(super) fn request_identity(&self) -> (TabId, RequestId) {
         match self {
-            Self::Batch {
+            Self::NetworkBatch {
+                tab_id, request_id, ..
+            }
+            | Self::Batch {
                 tab_id, request_id, ..
             }
             | Self::Finished {
@@ -350,44 +359,56 @@ fn read_network_root_batches(
     Ok(ReadOutcome::Complete { skipped: 0 })
 }
 
+pub(super) fn deliver_network_directory_batch(
+    request: &DirectoryRequest,
+    events: &mpsc::Sender<DirectoryEvent>,
+    entries: Vec<FileEntry>,
+) -> io::Result<()> {
+    if request.cancelled() {
+        return Err(io::ErrorKind::Interrupted.into());
+    }
+    let (acknowledgement, applied) = mpsc::channel();
+    events
+        .send(DirectoryEvent::NetworkBatch {
+            tab_id: request.tab_id,
+            request_id: request.request_id,
+            entries,
+            acknowledgement,
+        })
+        .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+    loop {
+        if request.cancelled() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        match applied.recv_timeout(Duration::from_millis(20)) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+        }
+    }
+}
+
 fn read_network_directory_batches(
     request: &DirectoryRequest,
     events: &mpsc::Sender<DirectoryEvent>,
 ) -> io::Result<ReadOutcome> {
-    use std::sync::atomic::Ordering;
-
-    if request.cancel.load(Ordering::Acquire) {
+    if request.cancelled() {
         return Ok(ReadOutcome::Cancelled);
     }
-    let (entries, skipped) = platform::windows::network::isolated_directory(
+    let result = platform::windows::network::isolated_directory(
         &request.path,
         request.visibility,
         &request.cancel,
-    )?;
-    if request.cancel.load(Ordering::Acquire) {
+        |entries| deliver_network_directory_batch(request, events, entries),
+    );
+    if request.cancelled() {
         return Ok(ReadOutcome::Cancelled);
     }
-    let first = entries.len().min(32);
-    if first > 0 {
-        let _ = events.send(DirectoryEvent::Batch {
-            tab_id: request.tab_id,
-            request_id: request.request_id,
-            entries: entries[..first].to_vec(),
-        });
-    }
-    for batch in entries[first..].chunks(256) {
-        if request.cancel.load(Ordering::Acquire) {
-            return Ok(ReadOutcome::Cancelled);
-        }
-        let _ = events.send(DirectoryEvent::Batch {
-            tab_id: request.tab_id,
-            request_id: request.request_id,
-            entries: batch.to_vec(),
-        });
-    }
-    Ok(ReadOutcome::Complete { skipped })
+    result.map(|skipped| ReadOutcome::Complete { skipped })
 }
-fn run_directory_request(request: DirectoryRequest, events: &mpsc::Sender<DirectoryEvent>) {
+pub(super) fn run_directory_request(request: DirectoryRequest, events: &mpsc::Sender<DirectoryEvent>) {
     if let Some(sources) = request.library_sources.as_ref() {
         let outcome = read_aggregate_directory_batches_filtered(
             sources,
@@ -550,5 +571,32 @@ mod tests {
         let cancelled = scheduler.take_cancelled();
         assert_eq!(cancelled.len(), 1);
         assert!(scheduler.next_ready().is_none());
+    }
+
+    #[test]
+    fn issue_103_network_backpressure_stops_on_cancellation_or_dropped_event() {
+        for cancel_request in [false, true] {
+            let request = network_directory_request(r"\\server\share");
+            let cancel = request.cancel.clone();
+            let (sender, receiver) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                deliver_network_directory_batch(&request, &sender, Vec::new())
+            });
+            let event = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+            if cancel_request {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+            } else {
+                drop(event);
+            }
+            let error = worker.join().unwrap().unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if cancel_request {
+                    io::ErrorKind::Interrupted
+                } else {
+                    io::ErrorKind::BrokenPipe
+                }
+            );
+        }
     }
 }

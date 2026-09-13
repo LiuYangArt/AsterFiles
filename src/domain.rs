@@ -985,7 +985,7 @@ impl TabSession {
     }
 
     pub fn cancel_pending(&mut self) {
-        if let Some(cancel) = self.cancel.take() {
+        if let Some(cancel) = self.cancel.as_ref() {
             cancel.store(true, AtomicOrdering::Release);
             if self.page_source == PageSource::Search
                 && matches!(

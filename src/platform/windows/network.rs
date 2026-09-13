@@ -1037,25 +1037,9 @@ enum NetworkOperationEvent {
     },
 }
 #[cfg(windows)]
-pub fn isolated_directory(
-    path: &Path,
-    visibility: FileVisibility,
-    cancel: &AtomicBool,
-) -> io::Result<(Vec<FileEntry>, usize)> {
-    let (entries, skipped, truncated) = run_isolated(
-        "directory",
-        |input| write_directory_input(input, path, visibility),
-        cancel,
-        read_directory_result,
-    )?;
-    if truncated {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "network directory exceeds the 4096 item safety limit",
-        ));
-    }
-    Ok((entries, skipped))
-}
+mod directory;
+#[cfg(windows)]
+pub use directory::isolated_directory;
 
 #[cfg(windows)]
 struct KillOnCloseJob(windows_sys::Win32::Foundation::HANDLE);
@@ -1215,8 +1199,7 @@ pub fn try_run_child_from_args() -> io::Result<bool> {
     let output = PathBuf::from(&args[4]);
     if mode == "directory" {
         let (path, visibility) = read_directory_input(&input)?;
-        let result = enumerate_directory(&path, visibility)?;
-        write_directory_result(&output, &result)?;
+        directory::run_child(&path, visibility, &output)?;
         return Ok(true);
     }
     if mode == "connect" {
@@ -2104,181 +2087,6 @@ fn read_optional_path(bytes: &[u8], offset: &mut usize) -> io::Result<Option<Pat
 }
 
 #[cfg(windows)]
-fn enumerate_directory(
-    path: &Path,
-    visibility: FileVisibility,
-) -> io::Result<(Vec<FileEntry>, usize, bool)> {
-    use std::os::windows::fs::MetadataExt;
-
-    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
-    const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
-
-    let mut entries = Vec::new();
-    let mut skipped = 0_usize;
-    let mut truncated = false;
-    for result in std::fs::read_dir(path)? {
-        if entries.len() >= MAX_HELPER_ITEMS {
-            truncated = true;
-            break;
-        }
-        let directory_entry = match result {
-            Ok(entry) => entry,
-            Err(_) => {
-                skipped = skipped.saturating_add(1);
-                continue;
-            }
-        };
-        let metadata = match directory_entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(_) => {
-                skipped = skipped.saturating_add(1);
-                continue;
-            }
-        };
-        let attributes = metadata.file_attributes();
-        if (!visibility.show_hidden && attributes & FILE_ATTRIBUTE_HIDDEN != 0)
-            || (!visibility.show_system && attributes & FILE_ATTRIBUTE_SYSTEM != 0)
-        {
-            continue;
-        }
-        let entry_path = directory_entry.path();
-        let original_name = directory_entry.file_name();
-        let kind = if metadata.is_dir() {
-            EntryKind::Directory
-        } else if metadata.is_file() {
-            EntryKind::File
-        } else {
-            EntryKind::Other
-        };
-        entries.push(FileEntry {
-            id: EntryId(entries.len().saturating_add(1).min(u32::MAX as usize) as u32),
-            display_name: original_name.to_string_lossy().into_owned(),
-            name_highlights: Vec::new(),
-            original_name,
-            path: entry_path.clone(),
-            kind,
-            open_target: None,
-            library_source_index: None,
-            parent_display: entry_path
-                .parent()
-                .map(|value| value.as_os_str().to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            size_bytes: metadata.is_file().then_some(metadata.len()),
-            folder_size: FolderSizeState::NotIndexed,
-            modified: metadata.modified().ok(),
-            created: metadata.created().ok(),
-        });
-    }
-    Ok((entries, skipped, truncated))
-}
-
-#[cfg(windows)]
-fn write_directory_result(path: &Path, result: &(Vec<FileEntry>, usize, bool)) -> io::Result<()> {
-    let (entries, skipped, truncated) = result;
-    if entries.len() > MAX_HELPER_ITEMS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "too many helper items",
-        ));
-    }
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(&u64::try_from(*skipped).unwrap_or(u64::MAX).to_le_bytes());
-    bytes.push(u8::from(*truncated));
-    for entry in entries {
-        write_units(
-            &mut bytes,
-            &entry.original_name.encode_wide().collect::<Vec<_>>(),
-        )?;
-        write_units(
-            &mut bytes,
-            &entry.path.as_os_str().encode_wide().collect::<Vec<_>>(),
-        )?;
-        bytes.push(match entry.kind {
-            EntryKind::Directory => 0,
-            EntryKind::File => 1,
-            EntryKind::Other => 2,
-        });
-        write_optional_u64(&mut bytes, entry.size_bytes);
-        write_system_time(&mut bytes, entry.modified)?;
-        write_system_time(&mut bytes, entry.created)?;
-        if bytes.len() > MAX_HELPER_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "helper result too large",
-            ));
-        }
-    }
-    std::fs::write(path, bytes)
-}
-
-#[cfg(windows)]
-fn read_directory_result(path: &Path) -> io::Result<(Vec<FileEntry>, usize, bool)> {
-    let bytes = std::fs::read(path)?;
-    if bytes.len() > MAX_HELPER_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "helper result too large",
-        ));
-    }
-    let mut offset = 0;
-    let count = read_u32(&bytes, &mut offset)? as usize;
-    if count > MAX_HELPER_ITEMS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "too many helper items",
-        ));
-    }
-    let skipped = usize::try_from(read_u64(&bytes, &mut offset)?)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid skipped count"))?;
-    let truncated = read_byte(&bytes, &mut offset)? != 0;
-    let mut entries = Vec::with_capacity(count);
-    for index in 0..count {
-        let original_name = OsString::from_wide(&read_units_at(&bytes, &mut offset)?);
-        let entry_path = PathBuf::from(OsString::from_wide(&read_units_at(&bytes, &mut offset)?));
-        let kind = match read_byte(&bytes, &mut offset)? {
-            0 => EntryKind::Directory,
-            1 => EntryKind::File,
-            2 => EntryKind::Other,
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid entry kind",
-                ));
-            }
-        };
-        let size_bytes = read_optional_u64(&bytes, &mut offset)?;
-        let modified = read_system_time(&bytes, &mut offset)?;
-        let created = read_system_time(&bytes, &mut offset)?;
-        entries.push(FileEntry {
-            id: EntryId(index.saturating_add(1).min(u32::MAX as usize) as u32),
-            display_name: original_name.to_string_lossy().into_owned(),
-            name_highlights: Vec::new(),
-            original_name,
-            path: entry_path.clone(),
-            kind,
-            open_target: None,
-            library_source_index: None,
-            parent_display: entry_path
-                .parent()
-                .map(|value| value.as_os_str().to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            size_bytes,
-            folder_size: FolderSizeState::NotIndexed,
-            modified,
-            created,
-        });
-    }
-    if offset != bytes.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "trailing directory helper data",
-        ));
-    }
-    Ok((entries, skipped, truncated))
-}
-
-#[cfg(windows)]
 fn write_units(bytes: &mut Vec<u8>, units: &[u16]) -> io::Result<()> {
     if units.len() > MAX_HELPER_UTF16_UNITS {
         return Err(io::Error::new(
@@ -2346,8 +2154,6 @@ fn read_system_time(bytes: &[u8], offset: &mut usize) -> io::Result<Option<Syste
 const MAX_HELPER_ITEMS: usize = 4096;
 #[cfg(windows)]
 const MAX_HELPER_UTF16_UNITS: usize = 32767;
-#[cfg(windows)]
-const MAX_HELPER_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(windows)]
 fn write_utf16_path(path: &Path, value: &Path) -> io::Result<()> {
     let units: Vec<u16> = value.as_os_str().encode_wide().collect();
@@ -2766,62 +2572,6 @@ mod isolated_codec_tests {
             super::read_directory_input(&file).unwrap(),
             (path, visibility)
         );
-        let _ = std::fs::remove_file(file);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn directory_result_preserves_explicit_truncation() {
-        let file = std::env::temp_dir().join(format!(
-            "asterfiles-directory-truncated-{}",
-            std::process::id()
-        ));
-        super::write_directory_result(&file, &(Vec::new(), 0, true)).unwrap();
-        let (entries, skipped, truncated) = super::read_directory_result(&file).unwrap();
-        assert!(entries.is_empty());
-        assert_eq!(skipped, 0);
-        assert!(truncated);
-        let _ = std::fs::remove_file(file);
-    }
-    #[cfg(windows)]
-    #[test]
-    fn directory_result_preserves_non_unicode_identity_and_metadata() {
-        use std::os::windows::ffi::OsStringExt;
-
-        let original_name = std::ffi::OsString::from_wide(&[b'a' as u16, 0xd800]);
-        let entry_path = std::path::PathBuf::from(r"\\server\share").join(&original_name);
-        let modified = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::new(42, 7);
-        let entries = vec![crate::domain::FileEntry {
-            id: crate::domain::EntryId(99),
-            original_name: original_name.clone(),
-            display_name: "ignored presentation".into(),
-            name_highlights: vec![],
-            path: entry_path.clone(),
-            kind: crate::domain::EntryKind::File,
-            open_target: None,
-            library_source_index: None,
-            parent_display: String::new(),
-            size_bytes: Some(123),
-            folder_size: crate::domain::FolderSizeState::Unknown,
-            modified: Some(modified),
-            created: None,
-        }];
-        let file = std::env::temp_dir().join(format!(
-            "asterfiles-directory-result-{}",
-            std::process::id()
-        ));
-        super::write_directory_result(&file, &(entries, 5, false)).unwrap();
-        let (decoded, skipped, truncated) = super::read_directory_result(&file).unwrap();
-        assert!(!truncated);
-        assert_eq!(skipped, 5);
-        assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].id, crate::domain::EntryId(1));
-        assert_eq!(decoded[0].original_name, original_name);
-        assert_eq!(decoded[0].path, entry_path);
-        assert_eq!(decoded[0].kind, crate::domain::EntryKind::File);
-        assert_eq!(decoded[0].size_bytes, Some(123));
-        assert_eq!(decoded[0].modified, Some(modified));
-        assert_eq!(decoded[0].created, None);
         let _ = std::fs::remove_file(file);
     }
 }

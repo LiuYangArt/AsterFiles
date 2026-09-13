@@ -265,6 +265,18 @@ impl AppState {
         self.windows.get_mut(&id)
     }
 
+    pub(super) fn cancel_directory_work_for_exit(&mut self) {
+        for window in self.windows.values_mut() {
+            for tab in window.tabs.values_mut() {
+                cancel_folder_sizes(tab);
+                tab.cancel_pending();
+            }
+        }
+        for discovery in self.network_discovery.values_mut() {
+            discovery.cancel_current();
+        }
+    }
+
     pub(super) fn close_window(&mut self, id: WindowId) -> Option<WindowCloseDecision> {
         let mut window = self.windows.remove(&id)?;
         for tab in window.tabs.values_mut() {

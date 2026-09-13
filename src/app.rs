@@ -4041,6 +4041,9 @@ pub fn run(
     platform::windows::network::record_runtime_event("event_loop_started");
     let result = slint::run_event_loop();
     platform::windows::network::record_runtime_event("event_loop_returned");
+    if let Ok(mut app) = state.lock() {
+        app.cancel_directory_work_for_exit();
+    }
     if let Ok(mut coordinator) = network_login.lock() {
         coordinator.cancel();
     }
@@ -17274,7 +17277,10 @@ fn start_event_pump(
                 .upgrade_in_event_loop(move |ui| {
                     let routed_tab = Some(event.request_identity().0);
                     let batch = match &event {
-                        DirectoryEvent::Batch {
+                        DirectoryEvent::NetworkBatch {
+                            tab_id, request_id, ..
+                        }
+                        | DirectoryEvent::Batch {
                             tab_id, request_id, ..
                         } => Some((*tab_id, *request_id)),
                         _ => None,
@@ -17518,10 +17524,22 @@ fn reveal_entry(
 }
 
 fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest> {
+    let acknowledgement = match &event {
+        DirectoryEvent::NetworkBatch {
+            acknowledgement, ..
+        } => Some(acknowledgement.clone()),
+        _ => None,
+    };
     let mut app = state.lock().expect("app state mutex is not poisoned");
     let mut icon_requests = Vec::new();
     match event {
-        DirectoryEvent::Batch {
+        DirectoryEvent::NetworkBatch {
+            tab_id,
+            request_id,
+            entries,
+            ..
+        }
+        | DirectoryEvent::Batch {
             tab_id,
             request_id,
             entries,
@@ -17732,6 +17750,10 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                 tab.error = Some("network_slow".to_owned());
             }
         }
+    }
+    // Release network backpressure only after the batch was applied or rejected.
+    if let Some(acknowledgement) = acknowledgement {
+        let _ = acknowledgement.send(());
     }
     icon_requests
 }
@@ -27817,6 +27839,171 @@ mod tests {
         assert_eq!(context_delete_request(6, false), Some(false));
         assert_eq!(context_delete_request(6, true), Some(true));
         assert_eq!(context_delete_request(CMD_REFRESH, true), None);
+    }
+
+    #[test]
+    fn issue_103_exit_cancels_all_windows_without_losing_session_paths() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\One")], 0, [0, 1, 2, 3]);
+        app.register_window(
+            vec![NavigationLocation::Directory(PathBuf::from(
+                r"C:\Two",
+            ))],
+            0,
+            test_window_placement(240),
+        );
+        let mut tokens = Vec::new();
+        for window in app.windows.values_mut() {
+            for tab in window.tabs.values_mut() {
+                let path = tab.visible_path().unwrap().to_path_buf();
+                let (_, cancel) = tab.begin_directory_navigation(path, NavigationKind::Refresh);
+                tokens.push(cancel);
+            }
+        }
+        for window_id in app.windows.keys().copied().collect::<Vec<_>>() {
+            let (_, cancel) = app.network_discovery.entry(window_id).or_default().begin();
+            tokens.push(cancel);
+        }
+        app.cancel_directory_work_for_exit();
+        assert_eq!(app.windows.len(), 2);
+        assert_eq!(tokens.len(), 4);
+        assert!(
+            tokens
+                .iter()
+                .all(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire))
+        );
+        assert!(
+            app.windows
+                .values()
+                .flat_map(|window| window.tabs.values())
+                .all(|tab| tab.visible_path().is_some() && !tab.accepts(tab.latest_request))
+        );
+    }
+
+    #[test]
+    fn issue_103_network_backpressure_waits_for_application_and_preserves_local_loading() {
+        use super::directory_loading::{
+            deliver_network_directory_batch, network_directory_request, run_directory_request,
+        };
+
+        let request = network_directory_request(r"\\server\share");
+        let (sender, receiver) = mpsc::channel();
+        let worker_sender = sender.clone();
+        let worker = thread::spawn(move || {
+            for id in 1..=2 {
+                deliver_network_directory_batch(
+                    &request,
+                    &worker_sender,
+                    vec![focus_entry(id, r"\\server\share\item")],
+                )?;
+            }
+            Ok::<(), io::Error>(())
+        });
+        let first = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(receiver.recv_timeout(Duration::from_millis(60)).is_err());
+
+        let local_path =
+            std::env::temp_dir().join(format!("asterfiles-issue-103-local-{}", std::process::id()));
+        std::fs::create_dir_all(&local_path).unwrap();
+        let mut local = network_directory_request("");
+        local.path = local_path.clone();
+        local.tab_id = TabId(2);
+        run_directory_request(local, &sender);
+        loop {
+            let event = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(event.request_identity().0, TabId(2));
+            if matches!(event, DirectoryEvent::Finished { .. }) {
+                break;
+            }
+        }
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\local")], 0, [0, 1, 2, 3]);
+        app.tab_mut(TabId(1)).unwrap().latest_request = RequestId(2);
+        let state = Arc::new(Mutex::new(app));
+        apply_event(&state, first);
+        let second = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        apply_event(&state, second);
+        worker.join().unwrap().unwrap();
+        std::fs::remove_dir(local_path).unwrap();
+        assert!(state.lock().unwrap().active().pending_entries.is_empty());
+    }
+
+    #[test]
+    fn issue_103_network_batch_is_visible_before_completion_and_closed_tab_rejects_late_batch() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\local")], 0, [0, 1, 2, 3]);
+        let (request_id, _) = app
+            .tab_mut(TabId(1))
+            .unwrap()
+            .begin_directory_navigation(PathBuf::from(r"\\server\share"), NavigationKind::Normal);
+        let state = Arc::new(Mutex::new(app));
+        let (acknowledgement, applied) = mpsc::channel();
+        apply_event(
+            &state,
+            DirectoryEvent::NetworkBatch {
+                tab_id: TabId(1),
+                request_id,
+                entries: vec![focus_entry(1, r"\\server\share\first")],
+                acknowledgement,
+            },
+        );
+        applied.recv_timeout(Duration::from_secs(1)).unwrap();
+        {
+            let mut app = state.lock().unwrap();
+            let tab = app.tab(TabId(1)).unwrap();
+            assert_eq!(tab.load_state, LoadState::Partial);
+            assert_eq!(tab.pending_entries.len(), 1);
+            let window_id = app.active_window;
+            app.close_window(window_id).unwrap();
+        }
+        let (acknowledgement, applied) = mpsc::channel();
+        apply_event(
+            &state,
+            DirectoryEvent::NetworkBatch {
+                tab_id: TabId(1),
+                request_id,
+                entries: vec![focus_entry(2, r"\\server\share\late")],
+                acknowledgement,
+            },
+        );
+        applied.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(state.lock().unwrap().tab(TabId(1)).is_none());
+    }
+
+    #[test]
+    fn issue_103_cancelled_navigation_rejects_late_batches_and_terminal_events() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\local")], 0, [0, 1, 2, 3]);
+        let (request_id, cancel) = app
+            .tab_mut(TabId(1))
+            .unwrap()
+            .begin_directory_navigation(PathBuf::from(r"\\server\share"), NavigationKind::Normal);
+        app.tab_mut(TabId(1)).unwrap().cancel_pending();
+        assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+        let state = Arc::new(Mutex::new(app));
+        for event in [
+            DirectoryEvent::Batch {
+                tab_id: TabId(1),
+                request_id,
+                entries: vec![focus_entry(1, r"\\server\share\late")],
+            },
+            DirectoryEvent::Finished {
+                tab_id: TabId(1),
+                request_id,
+                path: PathBuf::from(r"\\server\share"),
+                skipped: 0,
+                source_failures: 0,
+                library: None,
+            },
+            DirectoryEvent::Failed {
+                tab_id: TabId(1),
+                request_id,
+                kind: io::ErrorKind::Other,
+                message: "late failure".to_owned(),
+            },
+        ] {
+            apply_event(&state, event);
+            let app = state.lock().unwrap();
+            assert_eq!(app.active().load_state, LoadState::Cancelled);
+            assert!(app.active().pending_entries.is_empty());
+            assert!(app.active().error.is_none());
+        }
     }
 
     #[test]
