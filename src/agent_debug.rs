@@ -43,6 +43,7 @@ pub enum AgentScenario {
     DriveCapacity,
     Home,
     FileListTypeSelect,
+    AgentActions,
 }
 
 impl AgentScenario {
@@ -67,11 +68,15 @@ impl AgentScenario {
             Self::DriveCapacity => "drive-capacity",
             Self::Home => "home",
             Self::FileListTypeSelect => "file-list-type-select",
+            Self::AgentActions => "agent-actions",
         }
     }
 
     fn default_path(self) -> PathBuf {
         match self {
+            Self::AgentActions => Path::new(DEFAULT_STATE_DIR)
+                .join("agent-actions")
+                .join("sequence.json"),
             Self::WindowsLibraries => Path::new(DEFAULT_STATE_DIR)
                 .join("windows-libraries")
                 .join("foundation.json"),
@@ -166,6 +171,7 @@ fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
         "drive-capacity" => Ok(AgentScenario::DriveCapacity),
         "home" => Ok(AgentScenario::Home),
         "file-list-type-select" => Ok(AgentScenario::FileListTypeSelect),
+        "agent-actions" => Ok(AgentScenario::AgentActions),
         _ => Err(format!("unknown agent scenario: {value}")),
     }
 }
@@ -243,6 +249,7 @@ pub fn apply_scenario(session: &mut TabSession, scenario: AgentScenario) {
         | AgentScenario::NetworkFoundation
         | AgentScenario::DriveCapacity
         | AgentScenario::Home
+        | AgentScenario::AgentActions
         | AgentScenario::FileListTypeSelect => {
             session.current_location = if scenario == AgentScenario::Home {
                 Some(crate::domain::NavigationLocation::Home)

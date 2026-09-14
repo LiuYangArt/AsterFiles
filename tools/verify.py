@@ -26,6 +26,7 @@ RELEASE = ROOT / "target" / "release" / "asterfiles.exe"
 VALIDATION_STAMP = VERIFY_DIR / "full-debug-success.json"
 
 SCENARIOS = [
+    ("agent-actions", "agent-actions", STATE_DIR / "agent-actions" / "sequence.json"),
     ("agent-state", "permission-denied", STATE_DIR / "permission-denied.json"),
     (
         "agent-file-operation-center",

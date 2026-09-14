@@ -36,6 +36,74 @@ impl Texts {
         Self { language }
     }
 
+    pub fn rename_validation(
+        self,
+        error: crate::fs::file_operations::NameValidationError,
+    ) -> String {
+        use crate::fs::file_operations::NameValidationError;
+        match error {
+            NameValidationError::Empty => self
+                .choose("名称不能为空。", "The name cannot be empty.")
+                .to_owned(),
+            NameValidationError::DotName => self
+                .choose("不能使用这个名称。", "This name cannot be used.")
+                .to_owned(),
+            NameValidationError::InvalidCharacter(character) => match self.language {
+                Language::Chinese => format!("名称不能包含字符“{character}”。"),
+                Language::English => format!("The name cannot contain '{character}'."),
+            },
+            NameValidationError::TrailingSpaceOrDot => self
+                .choose(
+                    "名称不能以空格或句点结尾。",
+                    "The name cannot end with a space or period.",
+                )
+                .to_owned(),
+            NameValidationError::ReservedName => self
+                .choose(
+                    "这是 Windows 保留名称，不能使用。",
+                    "This name is reserved by Windows.",
+                )
+                .to_owned(),
+        }
+    }
+
+    pub fn action_error(self, code: &str) -> &'static str {
+        match code {
+            "window-closed" => self.choose("目标窗口已关闭。", "The target window is closed."),
+            "tab-closed" => self.choose(
+                "目标标签已关闭或移至其他窗口。",
+                "The target tab was closed or moved to another window.",
+            ),
+            "stale-request" => self.choose(
+                "页面已更新，请重新选择目标。",
+                "The page changed. Select the target again.",
+            ),
+            "entry-unavailable" => self.choose(
+                "目标文件已不在当前页面。",
+                "The target item is no longer on this page.",
+            ),
+            "busy" => self.choose(
+                "当前操作尚未完成，请稍后重试。",
+                "An operation is still in progress. Try again shortly.",
+            ),
+            "invalid-name" => self.choose("文件名无效。", "The file name is invalid."),
+            "task-unavailable" => {
+                self.choose("文件任务已不存在。", "The file task no longer exists.")
+            }
+            "not_cancellable" => self.choose(
+                "此文件任务当前无法取消。",
+                "This file task cannot be cancelled now.",
+            ),
+            "queue-unavailable" => self.choose(
+                "后台工作线程不可用。",
+                "The background worker is unavailable.",
+            ),
+            _ => self.choose(
+                "当前无法执行此操作。",
+                "This action is unavailable in the current state.",
+            ),
+        }
+    }
     pub fn loading(self) -> &'static str {
         self.choose("正在加载…", "Loading…")
     }

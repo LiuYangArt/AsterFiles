@@ -90,6 +90,7 @@ component StandaloneActionButton inherits Rectangle {
     accessible-role: button;
     accessible-label: root.label;
     accessible-enabled: root.enabled;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
 }
 
 component StandaloneTitleBar inherits Rectangle {
@@ -104,7 +105,7 @@ component StandaloneTitleBar inherits Rectangle {
         padding-left: 16px;
         Text { text: root.title; color: VisualStyle.c30333a; font-size: 16px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
 
-        Rectangle { width: 46px; Text { text: "×"; color: VisualStyle.c303138; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; } TouchArea { clicked => { root.close-requested(); } } accessible-role: button; accessible-label: root.close-label; }
+        Rectangle { width: 46px; Text { text: "×"; color: VisualStyle.c303138; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; } TouchArea { clicked => { root.close-requested(); } } accessible-role: button; accessible-id: "dialog-close"; accessible-label: root.close-label; accessible-action-default => { root.close-requested(); } }
     }
     TouchArea { width: parent.width - 46px; pointer-event(event) => { if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) { root.drag-window(); } } }
 }
@@ -167,6 +168,7 @@ export component OperationWindow inherits Window {
                     height: 230px;
                     background: VisualStyle.cffffff;
                     accessible-role: groupbox;
+                    accessible-id: "operation/" + operation.id;
                     accessible-label: operation.accessible-label;
                     Text { x: 20px; y: 8px; width: parent.width - 40px; height: 22px; text: operation.title; color: VisualStyle.c30333a; font-size: 14px; font-weight: operation.state == 2 ? 700 : 600; overflow: elide; vertical-alignment: center; }
                     Text { x: 20px; y: 30px; width: parent.width - 40px; height: 18px; text: operation.status + (operation.queue != "" ? " · " + operation.queue : ""); color: VisualStyle.c62656f; font-size: 12px; overflow: elide; vertical-alignment: center; }
@@ -206,9 +208,9 @@ export component OperationWindow inherits Window {
                             width: 176px;
                             height: 34px;
                             spacing: 8px;
-                            StandaloneActionButton { visible: operation.can-pause || operation.pause-pending; enabled: !operation.pause-pending; width: 84px; label: operation.pause-pending ? root.text-pausing-operation : operation.paused ? root.text-resume-operation : root.text-pause-operation; clicked => { if (!root.demo-mode) { root.set-operation-paused(operation.id, !operation.paused); } } }
-                            StandaloneActionButton { visible: operation.can-cancel || operation.cancel-pending; enabled: operation.can-cancel && !operation.cancel-pending; width: 84px; label: operation.cancel-pending ? root.text-cancelling-operation : root.text-cancel-operation; clicked => { if (!root.demo-mode) { root.cancel-operation(operation.id); } } }
-                            StandaloneActionButton { visible: operation.can-retry; width: 76px; label: root.text-retry-operation; clicked => { if (!root.demo-mode) { root.retry-operation(operation.id); } } }
+                            StandaloneActionButton { accessible-id: "operation/" + operation.id + "/pause"; visible: operation.can-pause || operation.pause-pending; enabled: !operation.pause-pending; width: 84px; label: operation.pause-pending ? root.text-pausing-operation : operation.paused ? root.text-resume-operation : root.text-pause-operation; clicked => { if (!root.demo-mode) { root.set-operation-paused(operation.id, !operation.paused); } } }
+                            StandaloneActionButton { accessible-id: "operation/" + operation.id + "/cancel"; visible: operation.can-cancel || operation.cancel-pending; enabled: operation.can-cancel && !operation.cancel-pending; width: 84px; label: operation.cancel-pending ? root.text-cancelling-operation : root.text-cancel-operation; clicked => { if (!root.demo-mode) { root.cancel-operation(operation.id); } } }
+                            StandaloneActionButton { accessible-id: "operation/" + operation.id + "/retry"; visible: operation.can-retry; width: 76px; label: root.text-retry-operation; clicked => { if (!root.demo-mode) { root.retry-operation(operation.id); } } }
                     }
                     Rectangle { visible: index + 1 < root.operations.length; x: 20px; y: parent.height - 1px; width: parent.width - 40px; height: 1px; background: VisualStyle.ce0e2e7; }
                 }
@@ -266,15 +268,15 @@ export component ConfirmationWindow inherits Window {
                 Text { text: root.detail-text; color: VisualStyle.c62656f; font-size: 13px; wrap: word-wrap; }
                 if root.kind == 1: Text { text: root.source-label + root.source-text; color: VisualStyle.c30333a; font-size: 12px; overflow: elide; }
                 if root.kind == 1: Text { text: root.destination-label + root.destination-text; color: VisualStyle.c62656f; font-size: 12px; overflow: elide; }
-                if root.kind == 1: StandaloneActionButton { width: 280px; label: (root.apply-all ? "☑ " : "☐ ") + root.apply-all-text; clicked => { root.apply-all = !root.apply-all; } }
+                if root.kind == 1: StandaloneActionButton { accessible-id: "confirmation-apply-all"; accessible-role: checkbox; accessible-checkable: true; accessible-checked: root.apply-all; width: 280px; label: (root.apply-all ? "☑ " : "☐ ") + root.apply-all-text; clicked => { root.apply-all = !root.apply-all; } }
                 Rectangle { vertical-stretch: 1; }
                 HorizontalLayout {
                     alignment: end; spacing: 8px;
-                    if root.kind == 0: StandaloneActionButton { width: 96px; label: root.cancel-text; clicked => { root.safe-cancel(); } }
-                    if root.kind == 1: StandaloneActionButton { width: 108px; label: root.tertiary-text; clicked => { root.tertiary-action(); } }
-                    if root.kind == 1: StandaloneActionButton { width: 96px; label: root.secondary-text; clicked => { root.secondary-action(); } }
-                    if root.kind == 2: StandaloneActionButton { width: 120px; label: root.secondary-text; clicked => { root.secondary-action(); } }
-                    StandaloneActionButton { width: root.kind == 2 ? 150px : 96px; label: root.primary-text; dangerous: root.kind == 0; clicked => { root.primary-action(); } }
+                    if root.kind == 0: StandaloneActionButton { width: 96px; accessible-id: "dialog-cancel"; label: root.cancel-text; clicked => { root.safe-cancel(); } }
+                    if root.kind == 1: StandaloneActionButton { width: 108px; accessible-id: "confirmation-tertiary"; label: root.tertiary-text; clicked => { root.tertiary-action(); } }
+                    if root.kind == 1: StandaloneActionButton { width: 96px; accessible-id: "confirmation-secondary"; label: root.secondary-text; clicked => { root.secondary-action(); } }
+                    if root.kind == 2: StandaloneActionButton { width: 120px; accessible-id: "confirmation-secondary"; label: root.secondary-text; clicked => { root.secondary-action(); } }
+                    StandaloneActionButton { width: root.kind == 2 ? 150px : 96px; accessible-id: "confirmation-primary"; label: root.primary-text; dangerous: root.kind == 0; clicked => { root.primary-action(); } }
                 }
             }
         }
@@ -328,19 +330,19 @@ export component NetworkLoginWindow inherits Window {
                 Text { text: root.detail-text; color: VisualStyle.c62656f; font-size: 13px; wrap: word-wrap; }
                 Text { text: root.target-text; color: VisualStyle.c30333a; font-size: 12px; overflow: elide; }
                 Text { text: root.user-label; color: VisualStyle.c62656f; font-size: 12px; }
-                LineEdit { text <=> root.username; enabled: !root.busy; }
+                LineEdit { accessible-id: "network-login-username"; accessible-label: root.user-label; text <=> root.username; enabled: !root.busy; }
                 Text { text: root.password-label; color: VisualStyle.c62656f; font-size: 12px; }
                 Rectangle {
                     height: 34px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cffffff;
-                    TextInput { x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.password; single-line: true; input-type: InputType.password; enabled: !root.busy; accepted => { if (root.username != "" && root.password != "") { root.login(root.username, root.password, root.remember, root.conflict); } } }
+                    TextInput { accessible-id: "network-login-password"; accessible-label: root.password-label; x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.password; single-line: true; input-type: InputType.password; enabled: !root.busy; accepted => { if (root.username != "" && root.password != "") { root.login(root.username, root.password, root.remember, root.conflict); } } }
                 }
-                CheckBox { text: root.remember-label; checked <=> root.remember; enabled: !root.busy; }
+                CheckBox { accessible-id: "network-login-remember"; text: root.remember-label; checked <=> root.remember; enabled: !root.busy; }
                 if root.conflict: Text { text: root.conflict-text; color: VisualStyle.cc42b1c; font-size: 12px; wrap: word-wrap; }
                 Rectangle { vertical-stretch: 1; }
                 HorizontalLayout {
                     alignment: end; spacing: 8px;
-                    StandaloneActionButton { width: 96px; label: root.cancel-text; enabled: !root.busy; clicked => { root.safe-cancel(); } }
-                    StandaloneActionButton { width: root.conflict ? 170px : 96px; label: root.conflict ? root.reconnect-text : root.login-text; enabled: !root.busy && root.username != "" && root.password != ""; dangerous: root.conflict; clicked => { root.login(root.username, root.password, root.remember, root.conflict); } }
+                    StandaloneActionButton { width: 96px; accessible-id: "dialog-cancel"; label: root.cancel-text; enabled: !root.busy; clicked => { root.safe-cancel(); } }
+                    StandaloneActionButton { width: root.conflict ? 170px : 96px; accessible-id: "network-login-submit"; label: root.conflict ? root.reconnect-text : root.login-text; enabled: !root.busy && root.username != "" && root.password != ""; dangerous: root.conflict; clicked => { root.login(root.username, root.password, root.remember, root.conflict); } }
                 }
             }
         }
@@ -383,12 +385,12 @@ export component NetworkLocationRenameWindow inherits Window {
             VerticalLayout {
                 padding-left: 20px; padding-right: 20px; padding-top: 12px; padding-bottom: 20px; spacing: 10px;
                 Text { text: root.detail-text; color: VisualStyle.c62656f; font-size: 13px; }
-                LineEdit { text <=> root.name; accepted => { if (root.name != "") { root.save(root.name); } } }
+                LineEdit { accessible-id: "network-location-rename-input"; accessible-label: root.title-text; text <=> root.name; accepted => { if (root.name != "") { root.save(root.name); } } }
                 Rectangle { vertical-stretch: 1; }
                 HorizontalLayout {
                     alignment: end; spacing: 8px;
-                    StandaloneActionButton { width: 96px; label: root.cancel-text; clicked => { root.safe-cancel(); } }
-                    StandaloneActionButton { width: 96px; label: root.save-text; enabled: root.name != ""; clicked => { root.save(root.name); } }
+                    StandaloneActionButton { width: 96px; accessible-id: "dialog-cancel"; label: root.cancel-text; clicked => { root.safe-cancel(); } }
+                    StandaloneActionButton { width: 96px; accessible-id: "network-location-rename-save"; label: root.save-text; enabled: root.name != ""; clicked => { root.save(root.name); } }
                 }
             }
         }
@@ -465,6 +467,7 @@ component IconButton inherits Rectangle {
     accessible-role: button;
     accessible-label: root.button-label;
     accessible-enabled: root.enabled;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
     Tooltip { text: @markdown("\{root.tip}"); }
 }
 
@@ -488,6 +491,10 @@ component SidebarGroupHeader inherits Rectangle {
         }
         Text { text: root.label; color: VisualStyle.c777a84; font-size: 12px; font-weight: 700; vertical-alignment: center; }
     }
+    accessible-expandable: true;
+    accessible-expanded: root.expanded;
+    accessible-action-default => { root.toggled(); }
+    accessible-action-expand => { if !root.expanded { root.toggled(); } }
     group-touch := TouchArea { mouse-cursor: pointer; clicked => { root.toggled(); } }
     accessible-role: button;
     accessible-label: root.label;
@@ -525,6 +532,7 @@ component WindowButton inherits Rectangle {
     button-touch := TouchArea { clicked => { root.clicked(); } }
     accessible-role: button;
     accessible-label: root.label;
+    accessible-action-default => { root.clicked(); }
 }
 
 component LightScrollBar inherits Rectangle {
@@ -602,6 +610,7 @@ component BreadcrumbButton inherits Rectangle {
     accessible-role: button;
     accessible-label: root.label;
     accessible-enabled: true;
+    accessible-action-default => { root.clicked(); }
 }
 
 component AddressEditor inherits Rectangle {
@@ -647,8 +656,12 @@ component AddressEditor inherits Rectangle {
             clicked => { root.toggle-depth(); }
         }
         accessible-role: button;
+        accessible-id: "search-depth";
+        accessible-checkable: true;
+        accessible-checked: root.recursive;
         accessible-label: root.depth-label;
         accessible-enabled: root.depth-enabled;
+        accessible-action-default => { if root.depth-enabled { root.toggle-depth(); } }
     }
 
     editor := TextInput {
@@ -663,6 +676,7 @@ component AddressEditor inherits Rectangle {
         single-line: true;
         vertical-alignment: center;
         accessible-role: text-input;
+        accessible-id: "address-input";
         accessible-label: root.address-label;
         edited => { root.changed(root.text); }
         accepted => { root.accepted(root.text); }
@@ -702,6 +716,8 @@ component AddressEditor inherits Rectangle {
             clicked => { root.cancelled(); }
         }
         accessible-role: button;
+        accessible-id: "address-cancel";
+        accessible-action-default => { root.cancelled(); }
         accessible-label: root.cancel-label;
     }
 }
@@ -759,7 +775,11 @@ component HomeCard inherits Rectangle {
         clicked => { root.selected(root.item.stable-id); }
         double-clicked => { root.activated(root.item.stable-id); }
     }
-    accessible-role: button;
+    accessible-role: list-item;
+    accessible-id: "home/" + root.item.stable-id;
+    accessible-item-selectable: true;
+    accessible-item-selected: root.item.selected;
+    accessible-action-default => { root.selected(root.item.stable-id); }
     accessible-label: root.item.status == "" ? root.item.label + ", " + root.item.detail : root.item.label + ", " + root.item.detail + ", " + root.item.status;
 }
 
@@ -810,6 +830,8 @@ component HomeSection inherits Rectangle {
     }
 }
 export component AppWindow inherits Window {
+    in property <string> accessibility-window-id: "";
+    in property <string> accessibility-context: "";
     title: "AsterFiles";
     icon: @image-url("../assets/app-icon.png");
     no-frame: true;
@@ -1502,6 +1524,12 @@ export component AppWindow inherits Window {
                     Rectangle {
                         width: max(root.tab-content-width, tab-strip.width); height: 34px;
                         for tab[index] in root.tabs: Rectangle {
+                            accessible-role: AccessibleRole.tab;
+                            accessible-id: root.accessibility-window-id + "/tab/" + tab.id;
+                            accessible-label: tab.title;
+                            accessible-item-selectable: true;
+                            accessible-item-selected: tab.active;
+                            accessible-action-default => { root.activate-tab(tab.id); root.reveal-tab(index); }
                             x: root.tab-dragging
                                 ? (index < root.tab-drag-source-index ? index : index > root.tab-drag-source-index ? index - 1 : index) * (root.tab-width + 5px)
                                 : index * (root.tab-width + 5px);
@@ -1565,7 +1593,7 @@ export component AppWindow inherits Window {
                                         Image { width: 12px; height: 12px; x: 6px; y: 6px; source: IconMap.action-close; colorize: VisualStyle.c303138; }
                                     }
                                     close-touch := TouchArea { mouse-cursor: pointer; clicked => { root.close-tab(tab.id); } }
-                                    accessible-role: button; accessible-label: root.text-close-tab;
+                                    accessible-role: button; accessible-id: root.accessibility-window-id + "/tab/" + tab.id + "/close"; accessible-label: root.text-close-tab; accessible-enabled: root.can-close-tab; accessible-action-default => { if root.can-close-tab { root.close-tab(tab.id); } }
                                 }
                             }
                             Tooltip { text: @markdown("\{tab.title}"); }
@@ -1579,10 +1607,10 @@ export component AppWindow inherits Window {
                     background: all-tabs-touch.pressed ? VisualStyle.cd9dce2 : all-tabs-touch.has-hover ? VisualStyle.ce8eaf0 : transparent;
                     Text { text: "⌄"; color: VisualStyle.c303138; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; }
                     all-tabs-touch := TouchArea { mouse-cursor: pointer; clicked => { root.tabs-menu-open = !root.tabs-menu-open; } }
-                    accessible-role: button; accessible-label: root.text-all-tabs;
+                    accessible-role: button; accessible-id: "tabs-menu"; accessible-label: root.text-all-tabs; accessible-expandable: true; accessible-expanded: root.tabs-menu-open; accessible-action-default => { root.tabs-menu-open = !root.tabs-menu-open; } accessible-action-expand => { root.tabs-menu-open = true; }
                     Tooltip { text: @markdown("\{root.text-all-tabs}"); }
                 }
-                Rectangle { width: 34px; height: 34px; border-radius: 6px; background: add-touch.pressed ? VisualStyle.cd9dce2 : add-touch.has-hover ? VisualStyle.ce8eaf0 : transparent; Image { width: 20px; height: 20px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; source: IconMap.action-add; colorize: VisualStyle.c303138; } add-touch := TouchArea { mouse-cursor: pointer; clicked => { root.new-tab(); } } accessible-role: button; accessible-label: root.text-new-tab; Tooltip { text: @markdown("\{root.text-new-tab} (Ctrl+T)"); } }
+                Rectangle { width: 34px; height: 34px; border-radius: 6px; background: add-touch.pressed ? VisualStyle.cd9dce2 : add-touch.has-hover ? VisualStyle.ce8eaf0 : transparent; Image { width: 20px; height: 20px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; source: IconMap.action-add; colorize: VisualStyle.c303138; } add-touch := TouchArea { mouse-cursor: pointer; clicked => { root.new-tab(); } } accessible-role: button; accessible-id: "tab-new"; accessible-label: root.text-new-tab; accessible-action-default => { root.new-tab(); } Tooltip { text: @markdown("\{root.text-new-tab} (Ctrl+T)"); } }
                 Rectangle {
                     horizontal-stretch: 1;
                     drag-touch := TouchArea {
@@ -1593,9 +1621,9 @@ export component AppWindow inherits Window {
             }
             HorizontalLayout {
                 x: parent.width - 3 * 46px; y: 0px; width: 3 * 46px; height: 40px; spacing: 0px;
-                WindowButton { kind: 0; label: root.text-window-minimize; clicked => { root.context-menu-open = false; root.dismiss-context-menu(); root.minimized = true; } }
-                WindowButton { kind: 1; label: root.maximized ? root.text-window-restore : root.text-window-maximize; clicked => { root.maximized = !root.maximized; } }
-                WindowButton { kind: 2; label: root.text-window-close; clicked => { root.request-close(); } }
+                WindowButton { accessible-id: "window-minimize"; kind: 0; label: root.text-window-minimize; clicked => { root.context-menu-open = false; root.dismiss-context-menu(); root.minimized = true; } }
+                WindowButton { accessible-id: "window-maximize"; kind: 1; label: root.maximized ? root.text-window-restore : root.text-window-maximize; clicked => { root.maximized = !root.maximized; } }
+                WindowButton { accessible-id: "window-close"; kind: 2; label: root.text-window-close; clicked => { root.request-close(); } }
             }
         }
 
@@ -1604,10 +1632,10 @@ export component AppWindow inherits Window {
             height: self.visible ? 56px : 0px; background: VisualStyle.navigation-surface-background; border-width: 0px;
             HorizontalLayout {
                 padding-top: 9px; padding-bottom: 9px; padding-left: 14px; padding-right: 14px; spacing: 7px;
-                ContextMenuArea { width: 38px; height: 38px; IconButton { icon-source: IconMap.action-back; tip: root.text-back + " (Alt+Left)"; enabled: root.can-navigate-back; button-label: root.text-back; clicked => { root.navigate-back(); } } Menu { for history in root.back-history: MenuItem { title: history.label; activated => { root.navigate-history(true, history.index); } } } }
-                if !root.minimal: ContextMenuArea { width: 38px; height: 38px; IconButton { icon-source: IconMap.action-forward; tip: root.text-forward + " (Alt+Right)"; enabled: root.can-navigate-forward; button-label: root.text-forward; clicked => { root.navigate-forward(); } } Menu { for history in root.forward-history: MenuItem { title: history.label; activated => { root.navigate-history(false, history.index); } } } }
-                if !root.compact: IconButton { icon-source: IconMap.action-up; tip: root.text-up + " (Alt+Up)"; enabled: root.can-navigate-up; button-label: root.text-up; clicked => { root.navigate-up(); } }
-                if !root.compact: IconButton { icon-source: IconMap.action-refresh; tip: root.text-refresh + " (F5)"; enabled: root.can-refresh; button-label: root.text-refresh; clicked => { root.refresh(); } }
+                ContextMenuArea { width: 38px; height: 38px; IconButton { accessible-id: "navigation-back"; icon-source: IconMap.action-back; tip: root.text-back + " (Alt+Left)"; enabled: root.can-navigate-back; button-label: root.text-back; clicked => { root.navigate-back(); } } Menu { for history in root.back-history: MenuItem { title: history.label; activated => { root.navigate-history(true, history.index); } } } }
+                if !root.minimal: ContextMenuArea { width: 38px; height: 38px; IconButton { accessible-id: "navigation-forward"; icon-source: IconMap.action-forward; tip: root.text-forward + " (Alt+Right)"; enabled: root.can-navigate-forward; button-label: root.text-forward; clicked => { root.navigate-forward(); } } Menu { for history in root.forward-history: MenuItem { title: history.label; activated => { root.navigate-history(false, history.index); } } } }
+                if !root.compact: IconButton { accessible-id: "navigation-up"; icon-source: IconMap.action-up; tip: root.text-up + " (Alt+Up)"; enabled: root.can-navigate-up; button-label: root.text-up; clicked => { root.navigate-up(); } }
+                if !root.compact: IconButton { accessible-id: "navigation-refresh"; icon-source: IconMap.action-refresh; tip: root.text-refresh + " (F5)"; enabled: root.can-refresh; button-label: root.text-refresh; clicked => { root.refresh(); } }
                 Rectangle {
                     height: 38px; horizontal-stretch: 1; background: VisualStyle.dark-theme && address-hover.has-hover ? #282828 : VisualStyle.cffffff; border-width: root.address-editing ? 1px : 0px; border-color: VisualStyle.c4f6bed; border-radius: 5px;
                     address-hover := TouchArea {
@@ -1662,24 +1690,24 @@ export component AppWindow inherits Window {
                 sidebar-content := VerticalLayout {
                     width: sidebar-scroll.width;
                     padding-top: 4px; padding-bottom: 12px; padding-left: 10px; padding-right: 10px; spacing: 0px;
-                    quick-access-header := SidebarGroupHeader { visible: root.quick-access-visible; height: self.visible ? 30px : 0px; label: root.text-quick-access; expanded: root.quick-access-expanded; toggled => { root.quick-access-expanded = !root.quick-access-expanded; sidebar-scroll.clamp-viewport(); } changed absolute-position => { root.quick-access-drop-left = self.absolute-position.x - root.absolute-position.x; root.quick-access-drop-top = self.absolute-position.y - root.absolute-position.y; } changed width => { root.quick-access-drop-width = self.width; } changed height => { root.quick-access-drop-height = self.height; } init => { root.quick-access-drop-left = self.absolute-position.x - root.absolute-position.x; root.quick-access-drop-top = self.absolute-position.y - root.absolute-position.y; root.quick-access-drop-width = self.width; root.quick-access-drop-height = self.height; } }
+                    quick-access-header := SidebarGroupHeader { accessible-id: "sidebar-group-quick-access"; visible: root.quick-access-visible; height: self.visible ? 30px : 0px; label: root.text-quick-access; expanded: root.quick-access-expanded; toggled => { root.quick-access-expanded = !root.quick-access-expanded; sidebar-scroll.clamp-viewport(); } changed absolute-position => { root.quick-access-drop-left = self.absolute-position.x - root.absolute-position.x; root.quick-access-drop-top = self.absolute-position.y - root.absolute-position.y; } changed width => { root.quick-access-drop-width = self.width; } changed height => { root.quick-access-drop-height = self.height; } init => { root.quick-access-drop-left = self.absolute-position.x - root.absolute-position.x; root.quick-access-drop-top = self.absolute-position.y - root.absolute-position.y; root.quick-access-drop-width = self.width; root.quick-access-drop-height = self.height; } }
 
                     for location in root.sidebar-items: Rectangle {
                         visible: root.quick-access-visible && location.group-kind == 0 && root.quick-access-expanded;
                         height: self.visible ? 30px : 0px; border-radius: 5px; background: side-touch.pressed ? VisualStyle.cdde3ed : side-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
                         HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : (location.icon-kind == 0 ? IconMap.location-home : location.icon-kind == 1 ? IconMap.location-desktop : location.icon-kind == 2 ? IconMap.location-downloads : location.icon-kind == 3 ? IconMap.location-documents : location.icon-kind == 4 ? IconMap.location-pictures : location.icon-kind == 5 ? IconMap.location-music : IconMap.location-videos); } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         side-touch := TouchArea { mouse-cursor: pointer; clicked => { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.width - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.height - root.absolute-position.y) / 1px; root.navigate-sidebar(location.index); } pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.stable-id != "" { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px; root.show-sidebar-menu(location.group-kind, location.stable-id, root.sidebar-keyboard-anchor-x, root.sidebar-keyboard-anchor-y); } } }
-                        accessible-role: button; accessible-label: location.label;
+                        accessible-role: button; accessible-id: "sidebar/" + location.group-kind + "/" + location.stable-id; accessible-label: location.label;
                     }
-                    SidebarGroupHeader { visible: root.libraries-visible; height: self.visible ? 30px : 0px; label: root.text-libraries; expanded: root.libraries-expanded; toggled => { root.libraries-expanded = !root.libraries-expanded; sidebar-scroll.clamp-viewport(); } }
+                    SidebarGroupHeader { accessible-id: "sidebar-group-libraries"; visible: root.libraries-visible; height: self.visible ? 30px : 0px; label: root.text-libraries; expanded: root.libraries-expanded; toggled => { root.libraries-expanded = !root.libraries-expanded; sidebar-scroll.clamp-viewport(); } }
                     for location in root.sidebar-items: Rectangle {
                         visible: root.libraries-visible && location.group-kind == 4 && root.libraries-expanded;
                         height: self.visible ? 30px : 0px; border-radius: 5px; background: library-touch.pressed ? VisualStyle.cdde3ed : library-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
                         HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.file-folder; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         library-touch := TouchArea { mouse-cursor: pointer; clicked => { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.width - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.height - root.absolute-position.y) / 1px; root.navigate-library(location.stable-id); } pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.stable-id != "" { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px; root.show-sidebar-menu(location.group-kind, location.stable-id, root.sidebar-keyboard-anchor-x, root.sidebar-keyboard-anchor-y); } } }
-                        accessible-role: button; accessible-label: location.label;
+                        accessible-role: button; accessible-id: "sidebar/" + location.group-kind + "/" + location.stable-id; accessible-label: location.label;
                     }
-                    SidebarGroupHeader { visible: root.drives-visible; height: self.visible ? 30px : 0px; label: root.text-drives; expanded: root.drives-expanded; toggled => { root.drives-expanded = !root.drives-expanded; sidebar-scroll.clamp-viewport(); } }
+                    SidebarGroupHeader { accessible-id: "sidebar-group-drives"; visible: root.drives-visible; height: self.visible ? 30px : 0px; label: root.text-drives; expanded: root.drives-expanded; toggled => { root.drives-expanded = !root.drives-expanded; sidebar-scroll.clamp-viewport(); } }
                     for location in root.sidebar-items: drive-row := Rectangle {
                         visible: root.drives-visible && location.group-kind == 1 && root.drives-expanded;
                         height: self.visible ? 40px : 0px;
@@ -1707,10 +1735,11 @@ export component AppWindow inherits Window {
                         }
                         drive-touch := TouchArea { mouse-cursor: pointer; clicked => { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.width - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.height - root.absolute-position.y) / 1px; root.navigate-sidebar(location.index); } pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.stable-id != "" { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px; root.show-sidebar-menu(location.group-kind, location.stable-id, root.sidebar-keyboard-anchor-x, root.sidebar-keyboard-anchor-y); } } }
                         accessible-role: button;
+                        accessible-id: "sidebar/" + location.group-kind + "/" + location.stable-id;
                         accessible-label: location.drive-status == "" ? location.label : location.label + ", " + location.drive-status;
                         if location.drive-status != "": Tooltip { text: @markdown("\{location.drive-status}"); }
                     }
-                    SidebarGroupHeader { visible: root.network-locations-visible; height: self.visible ? 30px : 0px; label: root.text-network-locations; expanded: root.network-locations-expanded; toggled => { root.network-locations-expanded = !root.network-locations-expanded; sidebar-scroll.clamp-viewport(); } }
+                    SidebarGroupHeader { accessible-id: "sidebar-group-network-locations"; visible: root.network-locations-visible; height: self.visible ? 30px : 0px; label: root.text-network-locations; expanded: root.network-locations-expanded; toggled => { root.network-locations-expanded = !root.network-locations-expanded; sidebar-scroll.clamp-viewport(); } }
                     for location in root.sidebar-items: Rectangle {
                         visible: root.network-locations-visible && location.group-kind == 2 && root.network-locations-expanded;
                         height: self.visible ? 30px : 0px; border-radius: 5px; background: network-location-touch.pressed ? VisualStyle.cdde3ed : network-location-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
@@ -1725,9 +1754,9 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
-                        accessible-role: button; accessible-label: location.label;
+                        accessible-role: button; accessible-id: "sidebar/" + location.group-kind + "/" + location.stable-id; accessible-label: location.label;
                     }
-                    SidebarGroupHeader { visible: root.network-visible; height: self.visible ? 30px : 0px; label: root.text-network; expanded: root.network-expanded; toggled => { root.network-expanded = !root.network-expanded; root.toggle-network(); sidebar-scroll.clamp-viewport(); } }
+                    SidebarGroupHeader { accessible-id: "sidebar-group-network"; visible: root.network-visible; height: self.visible ? 30px : 0px; label: root.text-network; expanded: root.network-expanded; toggled => { root.network-expanded = !root.network-expanded; root.toggle-network(); sidebar-scroll.clamp-viewport(); } }
                     if root.network-visible && root.network-expanded: Rectangle {
                         height: root.network-discovery-loading || root.network-discovery-empty || root.network-discovery-error != "" ? 28px : 0px;
                         status-text := Text { x: 8px; width: parent.width - 16px; text: root.network-discovery-error != "" ? root.network-discovery-error : root.network-discovery-loading ? root.text-network-discovery-loading : root.network-discovery-empty ? root.text-network-discovery-empty : ""; color: VisualStyle.c777a84; font-size: 11px; vertical-alignment: center; overflow: elide; }
@@ -1741,7 +1770,7 @@ export component AppWindow inherits Window {
                         height: self.visible ? 30px : 0px; border-radius: 5px; background: network-touch.pressed ? VisualStyle.cdde3ed : network-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
                         HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.location-drive; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         network-touch := TouchArea { mouse-cursor: pointer; clicked => { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.width - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.height - root.absolute-position.y) / 1px; root.navigate-sidebar(location.index); } pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.stable-id != "" { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px; root.show-sidebar-menu(location.group-kind, location.stable-id, root.sidebar-keyboard-anchor-x, root.sidebar-keyboard-anchor-y); } } }
-                        accessible-role: button; accessible-label: location.label;
+                        accessible-role: button; accessible-id: "sidebar/" + location.group-kind + "/" + location.stable-id; accessible-label: location.label;
                     }
                     Rectangle { vertical-stretch: 1; }
                 }
@@ -1977,6 +2006,7 @@ export component AppWindow inherits Window {
                         }
                     }
 list := ListView {
+                        accessible-id: "file-list";
                         visible: root.files.length > 0 && !root.is-grid-view-mode(root.view-mode);
                         mouse-drag-pan-enabled: false;
                         width: parent.width - 28px;
@@ -2111,6 +2141,8 @@ key-pressed(event) => {
     return reject;
 }
 accessible-role: text-input;
+accessible-id: root.accessibility-context + "/entry/" + entry.id + "/rename";
+accessible-enabled: !root.rename-submitting;
 accessible-label: entry.name;
                                             }
                                         }
@@ -2186,7 +2218,16 @@ accessible-label: entry.name;
                                 }
                             }
                             Tooltip { text: @markdown("\{entry.name}"); }
-                            accessible-role: list-item; accessible-label: entry.name;
+                            if entry.loaded && !entry.group-header: Rectangle {
+                                width: parent.width; height: parent.height;
+                                accessible-role: list-item;
+                                accessible-id: root.accessibility-context + "/entry/" + entry.id;
+                                accessible-label: entry.name;
+                                accessible-enabled: !(root.rename-editing && root.rename-entry-id == entry.id);
+                                accessible-item-selectable: true;
+                                accessible-item-selected: entry.selected;
+                                accessible-action-default => { if !(root.rename-editing && root.rename-entry-id == entry.id) { root.activate-entry(entry.id, false, false); } }
+                            }
                         }
                     }
                     horizontal-scroll := Rectangle {
@@ -2221,6 +2262,8 @@ accessible-label: entry.name;
                         }
                     }
                     grid := Rectangle {
+                        accessible-role: AccessibleRole.list;
+                        accessible-id: "file-grid";
                         visible: root.grid-rows.length > 0 && root.is-grid-view-mode(root.view-mode);
                         width: parent.width - 28px;
                         clip: true;
@@ -2254,6 +2297,16 @@ accessible-label: entry.name;
                                     Text { x: parent.width - 92px; y: 5px; width: 76px; height: 20px; text: row.group-count; color: VisualStyle.c72747d; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
                                 }
                                 for entry in row.entries: Rectangle {
+                                    if entry.loaded && !entry.group-header: Rectangle {
+                                width: parent.width; height: parent.height;
+                                accessible-role: list-item;
+                                accessible-id: root.accessibility-context + "/entry/" + entry.id;
+                                accessible-label: entry.name;
+                                accessible-enabled: !(root.rename-editing && root.rename-entry-id == entry.id);
+                                accessible-item-selectable: true;
+                                accessible-item-selected: entry.selected;
+                                accessible-action-default => { if !(root.rename-editing && root.rename-entry-id == entry.id) { root.activate-entry(entry.id, false, false); } }
+                            }
                                     width: root.layout-card-width; height: root.layout-row-height - 8px;
                                     border-radius: 7px;
                                     background: entry.selected ? VisualStyle.cdce6ff : card-touch.has-hover ? VisualStyle.ceff4ff : transparent;
@@ -2327,6 +2380,16 @@ accessible-label: entry.name;
                                 Text { x: parent.width - 92px; y: 5px; width: 76px; height: 20px; text: placed.row.group-count; color: VisualStyle.c72747d; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
                             }
                             for entry in placed.row.entries: Rectangle {
+                                    if entry.loaded && !entry.group-header: Rectangle {
+                                width: parent.width; height: parent.height;
+                                accessible-role: list-item;
+                                accessible-id: root.accessibility-context + "/entry/" + entry.id;
+                                accessible-label: entry.name;
+                                accessible-enabled: !(root.rename-editing && root.rename-entry-id == entry.id);
+                                accessible-item-selectable: true;
+                                accessible-item-selected: entry.selected;
+                                accessible-action-default => { if !(root.rename-editing && root.rename-entry-id == entry.id) { root.activate-entry(entry.id, false, false); } }
+                            }
                                 width: root.layout-card-width; height: root.layout-row-height - 8px;
                                 border-radius: 7px;
                                 background: entry.selected ? VisualStyle.cdce6ff : grouped-card-touch.has-hover ? VisualStyle.ceff4ff : transparent;
@@ -2459,7 +2522,7 @@ accessible-label: entry.name;
                         background: task-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
                         Text { text: root.operations.length + " " + root.text-task-count; color: VisualStyle.c30333a; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
                         task-touch := TouchArea { clicked => { root.open-operation-window(); } mouse-cursor: pointer; }
-                        accessible-role: button; accessible-label: root.text-file-operations;
+                        accessible-role: button; accessible-id: "operations-open"; accessible-label: root.text-file-operations; accessible-action-default => { root.open-operation-window(); }
                     }
                 }
                 }
@@ -2837,7 +2900,8 @@ if root.tabs-menu-open: TouchArea {
                     mouse-cursor: pointer;
                     clicked => { root.tabs-menu-open = false; root.activate-tab(tab.id); root.reveal-tab(index); }
                 }
-                accessible-role: button; accessible-label: tab.title;
+                accessible-role: AccessibleRole.tab; accessible-id: root.accessibility-window-id + "/tabs-menu/" + tab.id; accessible-label: tab.title; accessible-item-selectable: true; accessible-item-selected: tab.active;
+                accessible-action-default => { root.tabs-menu-open = false; root.activate-tab(tab.id); root.reveal-tab(index); }
             }
         }
     }

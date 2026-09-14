@@ -793,6 +793,49 @@ impl OperationManager {
         id
     }
 
+    // Preparation cannot occupy a resource queue before mapped paths identify that resource.
+    pub fn submit_preparing(
+        &mut self,
+        origin_tab: TabId,
+        items: Vec<OperationItem>,
+    ) -> OperationId {
+        let id = OperationId(self.next_id);
+        self.next_id += 1;
+        self.tasks.insert(
+            id,
+            OperationTask::new(
+                id,
+                OperationResource::Local,
+                FileOperationKind::Rename,
+                Some(origin_tab),
+                items,
+            ),
+        );
+        id
+    }
+    pub fn complete_preparation(
+        &mut self,
+        id: OperationId,
+        resource: OperationResource,
+        items: Vec<OperationItem>,
+        manifests: Vec<Option<Vec<(PathBuf, FileIdentity)>>>,
+    ) -> bool {
+        if self.queues.iter().any(|queue| queue.contains(&id)) {
+            return false;
+        }
+        let Some(task) = self.tasks.get_mut(&id) else {
+            return false;
+        };
+        if task.state != OperationState::Queued || task.cancellation.is_cancelled() {
+            return false;
+        }
+        task.resource = resource;
+        task.items = items;
+        task.undo_source_manifests = manifests;
+        self.queues[resource.index()].push_back(id);
+        true
+    }
+
     pub fn submit_recovered_cleanup(
         &mut self,
         origin_tab: Option<TabId>,
@@ -1091,6 +1134,35 @@ mod tests {
                     .collect(),
             }],
         }
+    }
+
+    #[test]
+    fn rename_preparation_enters_only_the_resolved_resource_queue() {
+        let mut manager = OperationManager::new();
+        let id = manager.submit_preparing(
+            TabId(1),
+            vec![OperationItem::pending(Some(PathBuf::from("Z:\\old")), None)],
+        );
+        assert_eq!(manager.start_next(OperationResource::Local).unwrap(), None);
+        assert!(manager.complete_preparation(id, OperationResource::Network, vec![], vec![]));
+        assert!(!manager.complete_preparation(id, OperationResource::Network, vec![], vec![]));
+        assert_eq!(manager.start_next(OperationResource::Local).unwrap(), None);
+        assert_eq!(
+            manager.start_next(OperationResource::Network).unwrap(),
+            Some(id)
+        );
+    }
+    #[test]
+    fn cancellation_during_rename_preparation_never_requeues_the_task() {
+        let mut manager = OperationManager::new();
+        let id = manager.submit_preparing(TabId(1), vec![]);
+        manager.cancel(id).unwrap();
+        assert_eq!(manager.task(id).unwrap().state, OperationState::Cancelled);
+        assert!(!manager.complete_preparation(id, OperationResource::Network, vec![], vec![]));
+        assert_eq!(
+            manager.start_next(OperationResource::Network).unwrap(),
+            None
+        );
     }
 
     #[test]

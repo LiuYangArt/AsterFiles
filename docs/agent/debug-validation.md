@@ -268,3 +268,16 @@ python tools/verify.py
 专项测试：`cargo test issue_99 -- --nocapture`；统一验证：`python tools/verify.py --quick`，包含 Debug 构建。测试使用内存数据和 Slint 无窗口后端，验证网格切换到 List/Details 后补取普通图标、分组标题与搜索占位过滤、可见范围、缓存和在途去重，以及过期结果隔离。证据位于 `artifacts/logs/verify-test.log` 和 `artifacts/verify/summary.json`。
 
 用户手动验收：打开原目录，先选网格再切 List，检查文件夹、MTL、OBJ 等系统图标；分别在分组和未分组下滚动、切换 Details、返回网格，再检查搜索结果切换 List。快速导航和关闭标签后，不应出现旧目录图标。Codex 不操作窗口；用户确认前仅更新 Debug 程序。
+
+## 常用操作命令序列（#111）
+
+```powershell
+./target/debug/asterfiles.exe --agent-scenario agent-actions --no-ui --agent-state-out artifacts/state/agent-actions/sequence.json
+cargo test issue_111_ -- --nocapture
+```
+
+场景在本次独占的临时目录创建中文同名文件，复用真实应用状态、统一操作入口、后台目录及文件工作线程，贯通查询、打开目录、等待、选择、重命名、刷新、切换标签和取消。包含失效请求、关闭窗口/标签、重名冲突、缺失源文件与目录、加载中拒绝操作以及迟到结果隔离。取消场景暂缓通道交付以稳定验证“接受取消”与“后台完成取消”的差异，文件操作仍由真实工作线程执行。场景结束清理自己的临时目录；失败也写出检查与轨迹。
+
+完整 `python tools/verify.py` 已包含该场景。证据位于 `artifacts/state/agent-actions/sequence.json`、`artifacts/logs/verify-agent-actions.log` 和 `artifacts/verify/summary.json`。`src/accessibility_tests.rs` 使用 Slint 无窗口后端读取控件身份及状态，不操作桌面窗口。
+
+人工验收：启动 Debug 程序，分别在列表与网格选择同一文件，切换语言；使用无障碍检查工具核对名称、角色、选中、禁用、勾选及子菜单实际展开状态。再打开两个包含同名文件的窗口，分别重命名，确认只修改所选窗口的目标。加载占位和菜单分隔线不能被识别为可执行按钮。用户确认前 Issue 保持待审查；本地 Release 构建在确认后执行。

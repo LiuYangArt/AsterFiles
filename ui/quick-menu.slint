@@ -1,6 +1,6 @@
 import { IconMap } from "icons/icon-map.slint";
 
-export struct PopupCommandRow { label: string, hint: string, enabled: bool, separator: bool, checked: bool, default: bool, submenu: bool, loading: bool, placeholder: bool, icon-kind: int }
+export struct PopupCommandRow { stable-id: string, checkable: bool, expanded: bool, label: string, hint: string, enabled: bool, separator: bool, checked: bool, default: bool, submenu: bool, loading: bool, placeholder: bool, icon-kind: int }
 
 component PopupCommandList inherits Rectangle {
     in property <[PopupCommandRow]> rows;
@@ -62,9 +62,21 @@ component PopupCommandList inherits Rectangle {
                         }
                     }
                 }
-                accessible-role: button;
-                accessible-label: command.label;
-                accessible-enabled: command.enabled && !command-loading;
+                if !command.separator && !command-loading: Rectangle {
+                    width: parent.width; height: parent.height;
+                    accessible-role: button;
+                    accessible-id: command.stable-id;
+                    accessible-checkable: command.checkable;
+                    accessible-checked: command.checked;
+                    accessible-expandable: command.submenu;
+                    accessible-expanded: command.expanded;
+                    accessible-item-selectable: true;
+                    accessible-item-selected: command-active;
+                    accessible-action-default => { if command.enabled { if command.submenu { root.open-submenu(index, command-row.absolute-position.y); } else { root.activate(index); } } }
+                    accessible-action-expand => { if command.enabled && command.submenu && !command.expanded { root.open-submenu(index, command-row.absolute-position.y); } }
+                    accessible-label: command.label;
+                    accessible-enabled: command.enabled;
+                }
             }
         }
     }
@@ -106,7 +118,7 @@ export component QuickMenuWindow inherits Window {
                 Text { x: 8px; width: parent.width - 16px; text: root.search == "" ? root.search-text : ""; color: root.dark-theme ? #8a8a8a : #9a9da3; font-size: 12px; vertical-alignment: center; }
                 search-editor := TextInput {
                     x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.search; single-line: true; color: root.dark-theme ? #f2f2f2 : #30333a; font-size: 12px; vertical-alignment: center;
-                    accessible-role: text-input; accessible-label: root.search-text;
+                    accessible-role: text-input; accessible-id: "menu-search"; accessible-label: root.search-text;
                     edited => { root.filter(root.search); }
                     accepted => { root.activate(root.active-index); }
                     key-pressed(event) => {

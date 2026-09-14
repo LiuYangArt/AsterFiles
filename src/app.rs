@@ -54,6 +54,9 @@ use crate::{
     session_store,
 };
 
+pub(crate) mod action_scenario;
+mod actions;
+
 slint::include_modules!();
 
 const WORKER_COUNT: usize = 4;
@@ -1244,6 +1247,7 @@ struct QuickMenuPopupRuntime {
 }
 
 struct QuickSubmenuPopupRuntime {
+    parent_row_index: i32,
     window: QuickSubmenuWindow,
     event: Option<crate::quick_menu_popup::MenuEventIdentity>,
     rows: Vec<ContextCommandRow>,
@@ -2376,7 +2380,7 @@ struct AppState {
     operation_errors: Vec<String>,
     operation_notice: Option<(u64, String)>,
     operation_notice_generation: u64,
-    rename_targets: HashMap<WindowId, (TabId, EntryId)>,
+    rename_targets: HashMap<WindowId, actions::EntryTarget>,
     focus_after_refresh: HashMap<TabId, PendingFocus>,
     pending_rename_ui: HashMap<WindowId, PendingRenameUi>,
     active_operation_directories: HashMap<PathBuf, usize>,
@@ -3320,7 +3324,7 @@ impl AppState {
         self.pending_rename_ui
             .retain(|_, pending| pending.tab_id != closing);
         self.rename_targets
-            .retain(|_, (tab_id, _)| *tab_id != closing);
+            .retain(|_, target| target.tab.tab_id != closing);
         self.active_window_state_mut().tab_order.remove(index);
         if closing_was_active {
             let window = self.active_window_state_mut();
@@ -5264,6 +5268,17 @@ fn open_external_paths(
         platform::windows::restore_and_focus_window(native_window_handle(&ui));
     }
 }
+fn fail_directory_dispatch(state: &SharedSessions, request: &DirectoryRequest) {
+    if let Ok(mut app) = state.lock()
+        && let Some(tab) = app.tab_mut(request.tab_id)
+        && tab.latest_request == request.request_id
+    {
+        tab.cancel_pending();
+        tab.discard_pending();
+        tab.load_state = LoadState::Failed;
+        tab.error = Some("queue-unavailable".to_owned());
+    }
+}
 fn submit_navigation(
     sender: &mpsc::Sender<DirectoryRequest>,
     state: &SharedSessions,
@@ -5308,7 +5323,13 @@ fn submit_navigation(
             cancel,
         }
     };
-    sender.send(request).is_ok()
+    match sender.send(request) {
+        Ok(()) => true,
+        Err(error) => {
+            fail_directory_dispatch(state, &error.0);
+            false
+        }
+    }
 }
 
 fn submit_network_navigation(
@@ -5367,7 +5388,10 @@ fn submit_network_navigation(
             }
             false
         }
-        Err(mpsc::TrySendError::Disconnected(_)) => false,
+        Err(mpsc::TrySendError::Disconnected(request)) => {
+            fail_directory_dispatch(state, &request);
+            false
+        }
     }
 }
 
@@ -5512,7 +5536,13 @@ fn submit_library_navigation(
             cancel,
         }
     };
-    sender.send(request).is_ok()
+    match sender.send(request) {
+        Ok(()) => true,
+        Err(error) => {
+            fail_directory_dispatch(state, &error.0);
+            false
+        }
+    }
 }
 fn submit_location_navigation(
     local_sender: &mpsc::Sender<DirectoryRequest>,
@@ -6255,15 +6285,136 @@ fn capture_undo_source_manifests(
         .collect()
 }
 
+fn fail_operation_dispatch(state: &SharedSessions, first: OperationId) {
+    let Ok(mut app) = state.lock() else {
+        return;
+    };
+    let Some(resource) = app.operations.task(first).map(|task| task.resource) else {
+        return;
+    };
+    let mut next = Some(first);
+    while let Some(id) = next {
+        let mut result = OperationResult {
+            succeeded: Vec::new(),
+            skipped: Vec::new(),
+            failed: Vec::new(),
+            affected_directories: Vec::new(),
+        };
+        if let Some(task) = app.operations.task_mut(id) {
+            for item in &mut task.items {
+                item.state = ItemState::Failed;
+                item.error = Some("queue-unavailable".to_owned());
+                if let Some(path) = item.source.clone().or_else(|| item.destination.clone()) {
+                    result.failed.push((path, "queue-unavailable".to_owned()));
+                }
+            }
+        }
+        // Only the first request reached dispatch; queued followers never registered directories.
+        if id == first
+            && let Some(task) = app.operations.task(id)
+        {
+            let kind = task.kind;
+            let items = task.items.clone();
+            release_operation_directories(&mut app, kind, &items);
+        }
+        let _ = app.operations.finish(id, OperationState::Failed, result);
+        next = app.operations.start_next(resource).ok().flatten();
+    }
+}
+
+fn enqueue_rename_preparation(
+    state: &SharedSessions,
+    sender: &mpsc::Sender<FileOperationRequest>,
+    origin_tab: TabId,
+    mut items: Vec<OperationItem>,
+) -> Option<OperationId> {
+    if items.iter().any(|item| {
+        item.source
+            .as_deref()
+            .is_some_and(crate::domain::folder_size_scheduler::is_internal_cleanup_path)
+            || item
+                .destination
+                .as_deref()
+                .is_some_and(crate::domain::folder_size_scheduler::is_internal_cleanup_path)
+    }) {
+        return None;
+    }
+    let id = {
+        let mut app = state.lock().ok()?;
+        app.tab(origin_tab)?;
+        app.operations.submit_preparing(origin_tab, items.clone())
+    };
+    let state = state.clone();
+    let sender = sender.clone();
+    thread::spawn(move || {
+        for item in &mut items {
+            if let Some(source) = item.source.take() {
+                item.source = Some(
+                    platform::windows::network::network_drive_to_unc(&source).unwrap_or(source),
+                );
+            }
+            if let Some(destination) = item.destination.take() {
+                item.destination = Some(
+                    platform::windows::network::network_drive_to_unc(&destination)
+                        .unwrap_or(destination),
+                );
+            }
+        }
+        let resource = operation_resource(&items);
+        let manifests = capture_undo_source_manifests(FileOperationKind::Rename, resource, &items);
+        let request = {
+            let Ok(mut app) = state.lock() else {
+                return;
+            };
+            if !app
+                .operations
+                .complete_preparation(id, resource, items, manifests)
+            {
+                return;
+            }
+            app.operations
+                .start_next(resource)
+                .ok()
+                .flatten()
+                .and_then(|next| {
+                    mark_operation_running_if_ready(&mut app.operations, next);
+                    let task = app.operations.task(next)?;
+                    let request = FileOperationRequest {
+                        id: next,
+                        kind: task.kind,
+                        resource: task.resource,
+                        items: task.items.clone(),
+                        undo_items: task.undo_items.clone(),
+                        undo_source_manifests: task.undo_source_manifests.clone(),
+                        cancellation: task.cancellation.clone(),
+                    };
+                    register_operation_directories(&mut app, request.kind, &request.items);
+                    Some(request)
+                })
+        };
+        if let Some(request) = request {
+            let request_id = request.id;
+            if sender.send(request).is_err() {
+                fail_operation_dispatch(&state, request_id);
+            }
+        }
+        refresh_operation_badges(&state);
+    });
+    Some(id)
+}
+
 fn enqueue_operation(
     state: &SharedSessions,
     sender: &mpsc::Sender<FileOperationRequest>,
     origin_tab: TabId,
     kind: FileOperationKind,
     mut items: Vec<OperationItem>,
-) {
+) -> Option<OperationId> {
     if items.is_empty() {
-        return;
+        return None;
+    }
+    if kind == FileOperationKind::Rename {
+        return enqueue_rename_preparation(state, sender, origin_tab, items);
     }
     for item in &mut items {
         if let Some(source) = item.source.take() {
@@ -6286,14 +6437,12 @@ fn enqueue_operation(
                 .as_deref()
                 .is_some_and(crate::domain::folder_size_scheduler::is_internal_cleanup_path)
     }) {
-        return;
+        return None;
     }
     let resource = operation_resource(&items);
-    let request = {
+    let (operation_id, request) = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
-        if app.tab(origin_tab).is_none() {
-            return;
-        }
+        app.tab(origin_tab)?;
         let undo_source_manifests = capture_undo_source_manifests(kind, resource, &items);
         crate::operation_audit::record(
             "operation_enqueued",
@@ -6305,9 +6454,10 @@ fn enqueue_operation(
         app.operations
             .set_undo_source_manifests(operation_id, undo_source_manifests);
         if app.operations.active_id(resource).is_some() {
-            return;
+            return Some(operation_id);
         }
-        app.operations
+        let request = app
+            .operations
             .start_next(resource)
             .ok()
             .flatten()
@@ -6325,12 +6475,17 @@ fn enqueue_operation(
                 };
                 register_operation_directories(&mut app, request.kind, &request.items);
                 Some(request)
-            })
+            });
+        (operation_id, request)
     };
     refresh_operation_badges(state);
-    if let Some(request) = request {
-        let _ = sender.send(request);
+    if let Some(request) = request
+        && sender.send(request).is_err()
+    {
+        fail_operation_dispatch(state, operation_id);
+        return None;
     }
+    Some(operation_id)
 }
 
 fn schedule_operation_notice_clear(state: SharedSessions, generation: u64) {
@@ -6431,15 +6586,10 @@ fn request_undo(
 }
 
 fn cancel_operations(state: &SharedSessions, ids: impl IntoIterator<Item = OperationId>) {
-    if let Ok(mut app) = state.lock() {
+    let window_id = state.lock().ok().map(|app| app.active_window);
+    if let Some(window_id) = window_id {
         for id in ids {
-            let _ = app.operations.cancel(id);
-            if let Some(response) = app.conflict_responses.remove(&id) {
-                let _ = response.send(crate::domain::file_operations::ConflictDecision {
-                    action: crate::domain::file_operations::ConflictAction::Skip,
-                    apply_to_all: false,
-                });
-            }
+            let _ = actions::cancel(state, window_id, id);
         }
     }
     refresh_operation_badges(state);
@@ -6632,7 +6782,7 @@ fn create_default_folder(state: &WindowSessions, sender: &mpsc::Sender<FileOpera
         }
     });
     if let Some((tab_id, path)) = target {
-        enqueue_operation(
+        let _ = enqueue_operation(
             &state.shared,
             sender,
             tab_id,
@@ -6890,7 +7040,18 @@ fn begin_rename_ui(weak: &slint::Weak<AppWindow>, state: &WindowSessions) {
         let entry = app.active().visible_entry(id).cloned();
         let rename = entry.as_ref().map(rename_input_for_entry);
         let tab_id = app.active_window_state().active_tab;
-        app.rename_targets.insert(state.window_id, (tab_id, id));
+        let request_id = app.active().latest_request;
+        app.rename_targets.insert(
+            state.window_id,
+            actions::EntryTarget {
+                tab: actions::ActionTarget {
+                    window_id: state.window_id,
+                    tab_id,
+                    request_id,
+                },
+                entry_id: id,
+            },
+        );
         rename.map(|(input, selection_end)| (id, input, selection_end))
     };
     if let Some((id, input, selection_end)) = target
@@ -6907,31 +7068,7 @@ fn rename_validation_message(
     language: Language,
     error: crate::fs::file_operations::NameValidationError,
 ) -> String {
-    use crate::fs::file_operations::NameValidationError;
-    match (language, error) {
-        (Language::Chinese, NameValidationError::Empty) => "名称不能为空。".to_owned(),
-        (Language::English, NameValidationError::Empty) => "The name cannot be empty.".to_owned(),
-        (Language::Chinese, NameValidationError::DotName) => "不能使用这个名称。".to_owned(),
-        (Language::English, NameValidationError::DotName) => "This name cannot be used.".to_owned(),
-        (Language::Chinese, NameValidationError::InvalidCharacter(character)) => {
-            format!("名称不能包含字符“{character}”。")
-        }
-        (Language::English, NameValidationError::InvalidCharacter(character)) => {
-            format!("The name cannot contain '{character}'.")
-        }
-        (Language::Chinese, NameValidationError::TrailingSpaceOrDot) => {
-            "名称不能以空格或句点结尾。".to_owned()
-        }
-        (Language::English, NameValidationError::TrailingSpaceOrDot) => {
-            "The name cannot end with a space or period.".to_owned()
-        }
-        (Language::Chinese, NameValidationError::ReservedName) => {
-            "这是 Windows 保留名称，不能使用。".to_owned()
-        }
-        (Language::English, NameValidationError::ReservedName) => {
-            "This name is reserved by Windows.".to_owned()
-        }
-    }
+    Texts::new(language).rename_validation(error)
 }
 
 fn submit_rename(
@@ -6939,40 +7076,26 @@ fn submit_rename(
     sender: &mpsc::Sender<FileOperationRequest>,
     name: &str,
 ) -> Result<(), String> {
-    let target = {
-        let app = state.lock().expect("app state mutex is not poisoned");
+    let (target, language) = {
+        let app = state
+            .shared
+            .lock()
+            .expect("app state mutex is not poisoned");
         crate::fs::file_operations::validate_name(std::ffi::OsStr::new(name))
             .map_err(|error| rename_validation_message(app.language, error))?;
-        app.rename_targets
-            .get(&state.window_id)
-            .and_then(|(tab_id, id)| {
-                app.window(state.window_id)?
-                    .tabs
-                    .get(tab_id)?
-                    .visible_entry(*id)
-                    .and_then(|entry| {
-                        entry.path.parent().map(|parent| {
-                            (
-                                *tab_id,
-                                OperationItem::pending(
-                                    Some(entry.path.clone()),
-                                    Some(parent.join(name)),
-                                ),
-                            )
-                        })
-                    })
-            })
+        (
+            app.rename_targets.get(&state.window_id).copied(),
+            app.language,
+        )
     };
-    let (tab_id, item) =
-        target.ok_or_else(|| "Rename target is no longer available.".to_owned())?;
-    enqueue_operation(
-        &state.shared,
-        sender,
-        tab_id,
-        FileOperationKind::Rename,
-        vec![item],
-    );
-    Ok(())
+    let target = target.ok_or_else(|| {
+        Texts::new(language)
+            .action_error("entry-unavailable")
+            .to_owned()
+    })?;
+    actions::rename(&state.shared, sender, target, name.into())
+        .map(|_| ())
+        .map_err(|error| Texts::new(language).action_error(error.code()).to_owned())
 }
 
 fn is_fast_remove_candidate(path: &Path) -> bool {
@@ -7043,7 +7166,7 @@ fn submit_delete_items(
     } else {
         FileOperationKind::RecycleDelete
     };
-    enqueue_operation(state, sender, origin_tab, kind, items);
+    let _ = enqueue_operation(state, sender, origin_tab, kind, items);
 }
 
 fn submit_delete(
@@ -8576,11 +8699,41 @@ fn trace_quick_menu(event: &str, detail: impl AsRef<str>) {
 fn popup_rows(rows: &[ContextCommandRow]) -> Vec<PopupCommandRow> {
     rows.iter()
         .map(|row| PopupCommandRow {
+            stable_id: if row.shell && row.submenu {
+                format!("shell-session/node/{}", row.node_id)
+            } else if row.shell {
+                format!("shell-session/command/{}", row.id)
+            } else if row.submenu {
+                format!("app-menu/{}", row.node_id)
+            } else if row.separator || row.placeholder || row.loading {
+                "menu-decoration".to_owned()
+            } else {
+                format!("app-command/{}", row.id)
+            }
+            .into(),
             label: row.label.clone(),
             hint: row.hint.clone(),
             enabled: row.enabled,
             separator: row.separator,
             checked: row.checked,
+            checkable: !row.separator
+                && !row.loading
+                && !row.placeholder
+                && (row.checked
+                    || (!row.shell
+                        && ((CMD_VIEW_BASE..CMD_VIEW_BASE + 8).contains(&row.id)
+                            || (CMD_SORT_BASE..CMD_SORT_BASE + 5).contains(&row.id)
+                            || matches!(
+                                row.id,
+                                CMD_SORT_ASC | CMD_SORT_DESC | CMD_GROUP_ASC | CMD_GROUP_DESC
+                            )
+                            || (CMD_GROUP_BASE..CMD_GROUP_BASE + 6).contains(&row.id)
+                            || (CMD_COLUMN_TOGGLE_BASE
+                                ..CMD_COLUMN_TOGGLE_BASE + ColumnKind::COUNT as i32)
+                                .contains(&row.id)
+                            || (CMD_SIDEBAR_VISIBILITY_BASE..CMD_SIDEBAR_VISIBILITY_BASE + 5)
+                                .contains(&row.id)))),
+            expanded: false,
             default: row.default,
             submenu: row.submenu,
             loading: row.loading,
@@ -8588,6 +8741,56 @@ fn popup_rows(rows: &[ContextCommandRow]) -> Vec<PopupCommandRow> {
             icon_kind: row.icon_kind,
         })
         .collect()
+}
+
+fn sync_popup_semantics(popup: &QuickMenuPopupRuntime) {
+    let Some(session) = popup.session.identity() else {
+        return;
+    };
+    let project = |rows: ModelRc<PopupCommandRow>, branch: usize, expanded_index: Option<i32>| {
+        (0..rows.row_count())
+            .filter_map(|index| {
+                rows.row_data(index).map(|mut row| {
+                    let base = row.stable_id.as_str().split('@').next().unwrap_or_default();
+                    row.stable_id = if base.starts_with("app-") {
+                        format!("{base}@window/{}/branch/{branch}", session.owner_window.0)
+                    } else {
+                        format!(
+                            "{base}@window/{}/menu/{}/branch/{branch}",
+                            session.owner_window.0, session.generation
+                        )
+                    }
+                    .into();
+                    row.expanded = row.submenu && expanded_index == Some(index as i32);
+                    row
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let open_child = |index: usize| {
+        popup
+            .branches
+            .get(index)
+            .filter(|slot| slot.event.is_some())
+            .map(|slot| slot.parent_row_index)
+    };
+    popup.root.set_rows(ModelRc::new(VecModel::from(project(
+        popup.root.get_rows(),
+        0,
+        open_child(0),
+    ))));
+    for (index, slot) in popup
+        .branches
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| slot.event.is_some())
+    {
+        slot.window.set_rows(ModelRc::new(VecModel::from(project(
+            slot.window.get_rows(),
+            index + 1,
+            open_child(index + 1),
+        ))));
+    }
 }
 
 fn create_quick_menu_popup(
@@ -8683,6 +8886,7 @@ fn update_root_popup_projection(window_id: WindowId) {
         popup.set_search_text(ui.get_text_context_search());
         popup.set_loading_text(ui.get_text_context_loading());
         popup.set_empty_text(ui.get_text_context_empty());
+        sync_popup_semantics(&runtime.quick_menu_popup);
     });
     resize_quick_menu_root_and_reposition_submenus(window_id);
 }
@@ -8799,6 +9003,11 @@ fn update_open_submenu_projection(window_id: WindowId) {
         ),
     );
     submenu.set_rows(ModelRc::new(VecModel::from(popup_rows(&rows))));
+    WINDOW_RUNTIMES.with_borrow(|runtimes| {
+        if let Some(runtime) = runtimes.get(&window_id) {
+            sync_popup_semantics(&runtime.quick_menu_popup);
+        }
+    });
     submenu.set_content_height(content_height);
     submenu.set_loading(loading);
     submenu.set_active_index(active_index);
@@ -9087,6 +9296,7 @@ fn hide_quick_submenu_slots_from(popup: &mut QuickMenuPopupRuntime, depth: usize
         slot.cloak_event = None;
         slot.presentation = PopupPresentation::Hidden;
     }
+    sync_popup_semantics(popup);
 }
 
 fn close_quick_submenu_windows(popup: &mut QuickMenuPopupRuntime) {
@@ -9245,6 +9455,7 @@ fn open_quick_submenu_popup_attempt(
             };
             wire_submenu_popup_callbacks(&window, window_id, depth);
             popup.branches.push(QuickSubmenuPopupRuntime {
+                parent_row_index: -1,
                 window,
                 event: None,
                 rows: Vec::new(),
@@ -9254,7 +9465,16 @@ fn open_quick_submenu_popup_attempt(
                 cloak_event: None,
             });
         }
+        let parent_row_index = if depth == 0 {
+            ui.get_context_active_index()
+        } else {
+            popup
+                .branches
+                .get(depth - 1)
+                .map_or(-1, |parent| parent.active_index)
+        };
         let slot = popup.branches.get_mut(depth)?;
+        slot.parent_row_index = parent_row_index;
         let already_visible = slot.event.is_some();
         slot.event = Some(event);
         slot.rows = rows.clone();
@@ -9331,6 +9551,7 @@ fn open_quick_submenu_popup_attempt(
             slot.cloak_event = (!loading).then_some(event);
             slot.window.window().request_redraw();
         }
+        sync_popup_semantics(popup);
         Some((
             depth,
             event,
@@ -11097,6 +11318,11 @@ fn wire_callbacks(
     quick_menu: SharedQuickMenu,
     state: WindowSessions,
 ) {
+    let action_workers = actions::ActionWorkers {
+        directory: sender.clone(),
+        network_directory: network_sender.clone(),
+        operation: operation_sender.clone(),
+    };
     wire_system_integration(ui, &state);
     let weak_for_network = ui.as_weak();
     let discovery_sender_for_ui = network_discovery_sender.clone();
@@ -11123,11 +11349,13 @@ fn wire_callbacks(
         );
     });
     let weak = ui.as_weak();
-    let sender_for_path = sender.clone();
-    let network_sender_for_path = network_sender.clone();
     let state_for_path = state.clone();
     let everything_for_accept = everything_sender.clone();
+    let path_workers = action_workers.clone();
     ui.on_navigate_path(move |path| {
+        let Ok(action_target) = actions::target(&state_for_path) else {
+            return;
+        };
         let input = path.to_string();
         let (tab_id, mode) = {
             let app = state_for_path
@@ -11155,21 +11383,20 @@ fn wire_callbacks(
         };
         let target = platform::windows::address_path::normalize_address_path(path.as_str());
         let state_for_validation = state_for_path.clone();
-        let sender_for_validation = sender_for_path.clone();
-        let network_sender_for_validation = network_sender_for_path.clone();
+        let workers_for_validation = path_workers.clone();
         let everything_for_validation = everything_for_accept.clone();
         thread::spawn(move || {
             let target =
                 platform::windows::network::network_drive_to_unc(&target).unwrap_or(target);
             if crate::network::is_unc_path(&target) || target.is_dir() {
                 let _ = slint::invoke_from_event_loop(move || {
-                    submit_path_navigation(
-                        &sender_for_validation,
-                        &network_sender_for_validation,
-                        &state_for_validation,
-                        tab_id,
-                        target,
-                        NavigationKind::Normal,
+                    let _ = actions::execute(
+                        &state_for_validation.shared,
+                        &workers_for_validation,
+                        actions::Action::OpenDirectory {
+                            target: action_target,
+                            path: target,
+                        },
                     );
                 });
             } else {
@@ -11669,28 +11896,48 @@ fn wire_callbacks(
     });
     let weak = ui.as_weak();
     let state_for_select = state.clone();
+    let selection_workers = action_workers.clone();
     ui.on_select_entry(move |entry_id, toggle, extend| {
-        let (tab_id, changed_rows) = {
-            let mut app = state_for_select
-                .lock()
-                .expect("app state mutex is not poisoned");
-            let tab_id = app.active_window_state().active_tab;
-            let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) else {
-                return;
-            };
-            let previous_selected = tab.selected.clone();
-            let previous_focused = tab.focused;
-            tab.select_entry(EntryId(entry_id as u32), toggle, extend);
-            let changed = previous_selected
-                .into_iter()
-                .chain(tab.selected.iter().copied())
-                .chain(previous_focused)
-                .chain(tab.focused)
-                .collect::<std::collections::HashSet<_>>();
-            (tab_id, changed)
+        let Ok(target) = actions::target(&state_for_select) else {
+            return;
         };
+        let previous = state_for_select.shared.lock().ok().and_then(|app| {
+            app.tab(target.tab_id)
+                .map(|tab| (tab.selected.clone(), tab.focused))
+        });
+        if actions::execute(
+            &state_for_select.shared,
+            &selection_workers,
+            actions::Action::Select {
+                target: actions::EntryTarget {
+                    tab: target,
+                    entry_id: EntryId(entry_id as u32),
+                },
+                toggle,
+                extend,
+            },
+        )
+        .is_err()
+        {
+            return;
+        }
+        let changed = state_for_select
+            .shared
+            .lock()
+            .ok()
+            .and_then(|app| {
+                app.tab(target.tab_id).map(|tab| {
+                    previous
+                        .into_iter()
+                        .flat_map(|(selected, focused)| selected.into_iter().chain(focused))
+                        .chain(tab.selected.iter().copied())
+                        .chain(tab.focused)
+                        .collect::<HashSet<_>>()
+                })
+            })
+            .unwrap_or_default();
         if let Some(ui) = weak.upgrade() {
-            update_file_rows(&ui, &state_for_select, tab_id, &changed_rows);
+            update_file_rows(&ui, &state_for_select, target.tab_id, &changed);
             update_selection_summary(&ui, &state_for_select);
         }
     });
@@ -12051,31 +12298,21 @@ fn wire_callbacks(
 
     let weak = ui.as_weak();
     let state_for_activate = state.clone();
+    let switch_workers = action_workers.clone();
     ui.on_activate_tab(move |tab_id| {
         if let Some(ui) = weak.upgrade()
             && ui.get_column_dragging()
         {
             ui.invoke_cancel_column_drag();
         }
-        let id = TabId(tab_id as u32);
-        let mut app = state_for_activate
-            .lock()
-            .expect("app state mutex is not poisoned");
-        if app.active_window_state().tabs.contains_key(&id) {
-            let window_id = app.active_window;
-            app.pending_shell_creates.remove(&window_id);
-            app.pending_rename_ui.remove(&window_id);
-            app.focus_after_refresh.retain(|_, pending| {
-                !matches!(
-                    pending.action,
-                    PendingFocusAction::Reveal { window_id: owner }
-                        | PendingFocusAction::Rename { window_id: owner }
-                        if owner == window_id
-                )
-            });
-            app.active_window_state_mut().active_tab = id;
-        }
-        drop(app);
+        let _ = actions::execute(
+            &state_for_activate.shared,
+            &switch_workers,
+            actions::Action::SwitchTab {
+                window_id: state_for_activate.window_id,
+                tab_id: TabId(tab_id as u32),
+            },
+        );
         if let Some(ui) = weak.upgrade() {
             refresh_ui(&ui, &state_for_activate);
         }
@@ -12327,47 +12564,27 @@ fn wire_callbacks(
     });
 
     let weak = ui.as_weak();
-    let sender_for_refresh = sender.clone();
-    let network_sender_for_refresh = network_sender.clone();
     let state_for_refresh = state.clone();
+    let refresh_workers = action_workers.clone();
     ui.on_refresh(move || {
-        let home = state_for_refresh.lock().is_ok_and(|app| {
-            matches!(
-                app.active().visible_location(),
-                Some(NavigationLocation::Home)
-            )
-        });
-        if home {
-            reload_quick_access(weak.clone(), state_for_refresh.shared.clone());
-            reload_drives(weak.clone(), state_for_refresh.shared.clone());
+        let Ok(target) = actions::target(&state_for_refresh) else {
             return;
-        }
-        let target = {
-            let app = state_for_refresh
-                .lock()
-                .expect("app state mutex is not poisoned");
-            if matches!(
-                app.active().load_state,
-                LoadState::Loading | LoadState::Partial
-            ) {
-                None
-            } else {
-                app.active()
-                    .requested_location
-                    .clone()
-                    .or_else(|| app.active().current_location.clone())
-                    .map(|path| (app.active_window_state().active_tab, path))
-            }
         };
-        if let Some((tab_id, path)) = target {
-            submit_location_navigation(
-                &sender_for_refresh,
-                &network_sender_for_refresh,
-                &state_for_refresh,
-                tab_id,
-                path,
-                NavigationKind::Refresh,
-            );
+        let home = state_for_refresh.shared.lock().is_ok_and(|app| {
+            app.tab(target.tab_id)
+                .is_some_and(|tab| matches!(tab.visible_location(), Some(NavigationLocation::Home)))
+        });
+        if actions::execute(
+            &state_for_refresh.shared,
+            &refresh_workers,
+            actions::Action::Refresh { target },
+        )
+        .is_ok()
+        {
+            if home {
+                reload_quick_access(weak.clone(), state_for_refresh.shared.clone());
+                reload_drives(weak.clone(), state_for_refresh.shared.clone());
+            }
             if let Some(ui) = weak.upgrade() {
                 refresh_ui(&ui, &state_for_refresh);
             }
@@ -13168,6 +13385,7 @@ fn wire_callbacks(
             );
             return;
         }
+        if encoded_index >= 0 { ui.set_context_active_index(index as i32); }
         if row.node_id != NODE_CREATE
             && let Ok(mut menu) = quick_menu_for_submenu.lock()
         {
@@ -14039,16 +14257,11 @@ fn wire_callbacks(
     let weak = ui.as_weak();
     let state_for_cancel_operation = state.clone();
     ui.on_cancel_operation(move |id| {
-        if let Ok(mut app) = state_for_cancel_operation.lock() {
-            let operation_id = OperationId(id as u64);
-            let _ = app.operations.cancel(operation_id);
-            if let Some(response) = app.conflict_responses.remove(&operation_id) {
-                let _ = response.send(crate::domain::file_operations::ConflictDecision {
-                    action: crate::domain::file_operations::ConflictAction::Skip,
-                    apply_to_all: false,
-                });
-            }
-        }
+        let _ = actions::cancel(
+            &state_for_cancel_operation.shared,
+            state_for_cancel_operation.window_id,
+            OperationId(id as u64),
+        );
         if let Some(ui) = weak.upgrade() {
             refresh_ui(&ui, &state_for_cancel_operation);
         }
@@ -14944,7 +15157,7 @@ fn dispatch_drop_operation(
     thread::spawn(move || match prepare_drop_operation(intent) {
         Ok(PreparedDrop::Operation(kind, items)) => {
             let _ = slint::invoke_from_event_loop(move || {
-                enqueue_operation(&state, &operation_sender, origin_tab, kind, items);
+                let _ = enqueue_operation(&state, &operation_sender, origin_tab, kind, items);
             });
         }
         Ok(PreparedDrop::Shortcuts(shortcuts)) => {
@@ -16526,6 +16739,14 @@ fn wire_operation_window_opener(
     });
 }
 
+fn should_close_conflict_window(operation_id: &str, app: &AppState) -> bool {
+    operation_id.parse::<u64>().ok().is_some_and(|id| {
+        app.operations.task(OperationId(id)).is_none_or(|task| {
+            task.state != OperationState::WaitingConflict || task.cancellation.is_cancelled()
+        })
+    })
+}
+
 fn should_close_auto_opened_operation_window(auto_opened: bool, app: &AppState) -> bool {
     auto_opened
         && !app
@@ -17585,7 +17806,10 @@ fn start_clipboard_event_pump(
                     ClipboardEvent::Paste {
                         origin_tab,
                         result: Ok(Some((kind, items))),
-                    } => enqueue_operation(&state, &operation_sender, origin_tab, kind, items),
+                    } => {
+                        let _ =
+                            enqueue_operation(&state, &operation_sender, origin_tab, kind, items);
+                    }
                     ClipboardEvent::Written {
                         result: Ok(()),
                         paths,
@@ -19217,6 +19441,189 @@ fn execute_file_operation_item(
     }
 }
 
+struct OperationCompletion {
+    affected: Vec<PathBuf>,
+    next: Option<FileOperationRequest>,
+    clear_completed_cut: Vec<PathBuf>,
+    undo_failure: Option<String>,
+}
+fn finish_file_operation(
+    state: &SharedSessions,
+    event: FileOperationEvent,
+) -> Option<OperationCompletion> {
+    let FileOperationEvent::Finished {
+        id,
+        result,
+        item_states,
+        completed_targets,
+        undo_items,
+        failed_undo_items,
+    } = event
+    else {
+        return None;
+    };
+    crate::operation_audit::record(
+        "operation_finished",
+        format!("id={id:?} result={result:?} items={item_states:?}"),
+    );
+    let (affected, next, clear_completed_cut, undo_failure) = {
+        let mut app = state.lock().expect("app state mutex is not poisoned");
+        if let Some(task) = app.operations.task_mut(id) {
+            for (index, status, error) in item_states {
+                if let Some(item) = task.items.get_mut(index) {
+                    item.state = status;
+                    item.error = error;
+                }
+            }
+        }
+        let cancelled = app
+            .operations
+            .task(id)
+            .is_some_and(|task| task.cancellation.is_cancelled());
+        let terminal = if cancelled && result.succeeded.is_empty() && result.failed.is_empty() {
+            OperationState::Cancelled
+        } else if cancelled || (!result.failed.is_empty() && !result.succeeded.is_empty()) {
+            OperationState::PartiallyCompleted
+        } else if result.failed.is_empty() {
+            OperationState::Completed
+        } else {
+            OperationState::Failed
+        };
+        let (resource, kind, origin_tab, task_items, undo_cut_paths, undo_task_source_kind) = app
+            .operations
+            .task(id)
+            .map(|task| {
+                (
+                    task.resource,
+                    task.kind,
+                    task.origin_tab,
+                    task.items.clone(),
+                    task.undo_items
+                        .iter()
+                        .zip(task.items.iter())
+                        .filter_map(|(item, task_item)| match item {
+                            UndoItem::MoveBack { original, .. }
+                                if task_item.state == ItemState::Succeeded =>
+                            {
+                                Some(original.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                    task.undo_source_kind,
+                )
+            })
+            .unwrap_or((
+                OperationResource::Local,
+                FileOperationKind::Copy,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+            ));
+        let mut affected = result.affected_directories.clone();
+        let registered = if resource == OperationResource::Cleanup {
+            HashSet::new()
+        } else {
+            release_operation_directories(&mut app, kind, &task_items)
+        };
+        affected.extend(registered.iter().cloned());
+        let deferred = app
+            .deferred_watch_directories
+            .iter()
+            .filter(|path| registered.contains(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in deferred {
+            app.deferred_watch_directories.remove(&path);
+            affected.push(path);
+        }
+        affected.sort();
+        affected.dedup();
+        mark_recent_operation_changes(&mut app, &registered, &task_items);
+        app.conflict_responses.remove(&id);
+        if kind == FileOperationKind::CreateFolder {
+            if let (Some(origin_tab), Some(target)) =
+                (origin_tab, completed_targets.first().cloned())
+            {
+                queue_completed_rename(&mut app, origin_tab, target);
+            }
+        } else {
+            queue_completed_focus(&mut app, &completed_targets);
+        }
+        if kind == FileOperationKind::Undo {
+            let failure = failed_undo_items
+                .first()
+                .map(|_| Texts::new(app.language).undo_partial().to_owned());
+            let notice = failure.clone();
+            app.undo_history.finish(failed_undo_items, failure);
+            if let Some(message) = notice {
+                app.operation_notice_generation =
+                    app.operation_notice_generation.wrapping_add(1).max(1);
+                let generation = app.operation_notice_generation;
+                app.operation_notice = Some((generation, message));
+                schedule_operation_notice_clear(state.clone(), generation);
+            }
+        } else if terminal == OperationState::Completed
+            && result.failed.is_empty()
+            && result.skipped.is_empty()
+            && task_items
+                .iter()
+                .all(|item| item.state == ItemState::Succeeded && item.error.is_none())
+            && let (Some(source_kind), Some(items)) = (undo_source_kind(kind), undo_items)
+            && !items.is_empty()
+        {
+            app.undo_history.push(UndoEntry { source_kind, items });
+        }
+        let undo_failure = if kind == FileOperationKind::Undo && !result.failed.is_empty() {
+            Some(undo_failure_message(
+                app.language,
+                undo_task_source_kind,
+                &result.failed[0].1,
+            ))
+        } else {
+            None
+        };
+        let _ = app.operations.finish(id, terminal, result);
+        let next = app
+            .operations
+            .start_next(resource)
+            .ok()
+            .flatten()
+            .and_then(|next_id| {
+                mark_operation_running_if_ready(&mut app.operations, next_id);
+                app.operations.task(next_id).cloned().map(|task| {
+                    let request = FileOperationRequest {
+                        id: next_id,
+                        kind: task.kind,
+                        resource: task.resource,
+                        items: task.items.clone(),
+                        undo_items: task.undo_items.clone(),
+                        undo_source_manifests: task.undo_source_manifests.clone(),
+                        cancellation: task.cancellation.clone(),
+                    };
+                    if request.resource != OperationResource::Cleanup {
+                        register_operation_directories(&mut app, request.kind, &request.items);
+                    }
+                    request
+                })
+            });
+        let clear_completed_cut = if kind == FileOperationKind::Undo {
+            undo_cut_paths
+        } else {
+            Vec::new()
+        };
+
+        (affected, next, clear_completed_cut, undo_failure)
+    };
+    Some(OperationCompletion {
+        affected,
+        next,
+        clear_completed_cut,
+        undo_failure,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn start_file_operation_event_pump(
     ui: &AppWindow,
@@ -19560,193 +19967,15 @@ fn start_file_operation_event_pump(
                             &affected,
                         );
                     }
-                    FileOperationEvent::Finished {
-                        id,
-                        result,
-                        item_states,
-                        completed_targets,
-                        undo_items,
-                        failed_undo_items,
-                    } => {
-                        crate::operation_audit::record(
-                            "operation_finished",
-                            format!("id={id:?} result={result:?} items={item_states:?}"),
-                        );
-                        let (affected, next, clear_completed_cut, undo_failure) = {
-                            let mut app = state.lock().expect("app state mutex is not poisoned");
-                            if let Some(task) = app.operations.task_mut(id) {
-                                for (index, status, error) in item_states {
-                                    if let Some(item) = task.items.get_mut(index) {
-                                        item.state = status;
-                                        item.error = error;
-                                    }
-                                }
-                            }
-                            let cancelled = app
-                                .operations
-                                .task(id)
-                                .is_some_and(|task| task.cancellation.is_cancelled());
-                            let terminal = if cancelled
-                                && result.succeeded.is_empty()
-                                && result.failed.is_empty()
-                            {
-                                OperationState::Cancelled
-                            } else if cancelled
-                                || (!result.failed.is_empty() && !result.succeeded.is_empty())
-                            {
-                                OperationState::PartiallyCompleted
-                            } else if result.failed.is_empty() {
-                                OperationState::Completed
-                            } else {
-                                OperationState::Failed
-                            };
-                            let (
-                                resource,
-                                kind,
-                                origin_tab,
-                                task_items,
-                                undo_cut_paths,
-                                undo_task_source_kind,
-                            ) = app
-                                .operations
-                                .task(id)
-                                .map(|task| {
-                                    (
-                                        task.resource,
-                                        task.kind,
-                                        task.origin_tab,
-                                        task.items.clone(),
-                                        task.undo_items
-                                            .iter()
-                                            .zip(task.items.iter())
-                                            .filter_map(|(item, task_item)| match item {
-                                                UndoItem::MoveBack { original, .. }
-                                                    if task_item.state == ItemState::Succeeded =>
-                                                {
-                                                    Some(original.clone())
-                                                }
-                                                _ => None,
-                                            })
-                                            .collect::<Vec<_>>(),
-                                        task.undo_source_kind,
-                                    )
-                                })
-                                .unwrap_or((
-                                    OperationResource::Local,
-                                    FileOperationKind::Copy,
-                                    None,
-                                    Vec::new(),
-                                    Vec::new(),
-                                    None,
-                                ));
-                            let mut affected = result.affected_directories.clone();
-                            let registered = if resource == OperationResource::Cleanup {
-                                HashSet::new()
-                            } else {
-                                release_operation_directories(&mut app, kind, &task_items)
-                            };
-                            affected.extend(registered.iter().cloned());
-                            let deferred = app
-                                .deferred_watch_directories
-                                .iter()
-                                .filter(|path| registered.contains(*path))
-                                .cloned()
-                                .collect::<Vec<_>>();
-                            for path in deferred {
-                                app.deferred_watch_directories.remove(&path);
-                                affected.push(path);
-                            }
-                            affected.sort();
-                            affected.dedup();
-                            mark_recent_operation_changes(&mut app, &registered, &task_items);
-                            app.conflict_responses.remove(&id);
-                            if kind == FileOperationKind::CreateFolder {
-                                if let (Some(origin_tab), Some(target)) =
-                                    (origin_tab, completed_targets.first().cloned())
-                                {
-                                    queue_completed_rename(&mut app, origin_tab, target);
-                                }
-                            } else {
-                                queue_completed_focus(&mut app, &completed_targets);
-                            }
-                            if kind == FileOperationKind::Undo {
-                                let failure = failed_undo_items
-                                    .first()
-                                    .map(|_| Texts::new(app.language).undo_partial().to_owned());
-                                let notice = failure.clone();
-                                app.undo_history.finish(failed_undo_items, failure);
-                                if let Some(message) = notice {
-                                    app.operation_notice_generation =
-                                        app.operation_notice_generation.wrapping_add(1).max(1);
-                                    let generation = app.operation_notice_generation;
-                                    app.operation_notice = Some((generation, message));
-                                    schedule_operation_notice_clear(state.clone(), generation);
-                                }
-                            } else if terminal == OperationState::Completed
-                                && result.failed.is_empty()
-                                && result.skipped.is_empty()
-                                && task_items.iter().all(|item| {
-                                    item.state == ItemState::Succeeded && item.error.is_none()
-                                })
-                                && let (Some(source_kind), Some(items)) =
-                                    (undo_source_kind(kind), undo_items)
-                                && !items.is_empty()
-                            {
-                                app.undo_history.push(UndoEntry { source_kind, items });
-                            }
-                            let undo_failure =
-                                if kind == FileOperationKind::Undo && !result.failed.is_empty() {
-                                    Some(undo_failure_message(
-                                        app.language,
-                                        undo_task_source_kind,
-                                        &result.failed[0].1,
-                                    ))
-                                } else {
-                                    None
-                                };
-                            let _ = app.operations.finish(id, terminal, result);
-                            let cleanup_remains = kind == FileOperationKind::PermanentDelete
-                                && task_items.iter().any(|item| {
-                                    item.permanent_delete_phase
-                                        == PermanentDeletePhase::CleanupPending
-                                        && item.state != ItemState::Succeeded
-                                });
-                            if cancelled && kind != FileOperationKind::Undo && !cleanup_remains {
-                                app.operations.remove_terminal(id);
-                            }
-                            let next = app.operations.start_next(resource).ok().flatten().and_then(
-                                |next_id| {
-                                    mark_operation_running_if_ready(&mut app.operations, next_id);
-                                    app.operations.task(next_id).cloned().map(|task| {
-                                        let request = FileOperationRequest {
-                                            id: next_id,
-                                            kind: task.kind,
-                                            resource: task.resource,
-                                            items: task.items.clone(),
-                                            undo_items: task.undo_items.clone(),
-                                            undo_source_manifests: task
-                                                .undo_source_manifests
-                                                .clone(),
-                                            cancellation: task.cancellation.clone(),
-                                        };
-                                        if request.resource != OperationResource::Cleanup {
-                                            register_operation_directories(
-                                                &mut app,
-                                                request.kind,
-                                                &request.items,
-                                            );
-                                        }
-                                        request
-                                    })
-                                },
-                            );
-                            let clear_completed_cut = if kind == FileOperationKind::Undo {
-                                undo_cut_paths
-                            } else {
-                                Vec::new()
-                            };
-
-                            (affected, next, clear_completed_cut, undo_failure)
+                    event @ FileOperationEvent::Finished { .. } => {
+                        let Some(OperationCompletion {
+                            affected,
+                            next,
+                            clear_completed_cut,
+                            undo_failure,
+                        }) = finish_file_operation(&state, event)
+                        else {
+                            return;
                         };
                         if let (Some(ui), Some(message)) = (weak.upgrade(), undo_failure) {
                             show_undo_failure_dialog(
@@ -19786,6 +20015,16 @@ fn start_file_operation_event_pump(
                             &affected,
                         );
                     }
+                }
+                if let Some(conflict_ui) = conflict_weak.upgrade()
+                    && !conflict_ui.get_demo_mode()
+                    && state.lock().is_ok_and(|app| {
+                        should_close_conflict_window(conflict_ui.get_operation_id().as_str(), &app)
+                    })
+                {
+                    conflict_ui.set_operation_id("".into());
+                    conflict_ui.set_apply_all(false);
+                    let _ = conflict_ui.hide();
                 }
                 let rename_update = state.lock().ok().and_then(|app| {
                     let task = app.operations.task(event_operation_id)?;
@@ -24426,15 +24665,7 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
                 progress,
                 progress_known,
                 state: operation_state_index(task.state),
-                can_cancel: !cleanup_in_progress
-                    && matches!(
-                        task.state,
-                        OperationState::Queued
-                            | OperationState::Preflight
-                            | OperationState::Running
-                            | OperationState::Paused
-                            | OperationState::WaitingConflict
-                    ),
+                can_cancel: actions::cancellation_reason(task).is_none(),
                 can_pause: !cleanup_in_progress
                     && !recycle_progress
                     && matches!(task.state, OperationState::Running | OperationState::Paused),
@@ -24574,9 +24805,18 @@ fn apply_pending_rename_ui(ui: &AppWindow, state: &SharedSessions, window_id: Wi
         app.pending_rename_ui.remove(&window_id)
     });
     if let Some(pending) = pending {
-        if let Ok(mut app) = state.lock() {
-            app.rename_targets
-                .insert(window_id, (pending.tab_id, pending.entry_id));
+        if let Ok(mut app) = state.lock()
+            && let Some(tab) = app.tab(pending.tab_id)
+        {
+            let target = actions::EntryTarget {
+                tab: actions::ActionTarget {
+                    window_id,
+                    tab_id: pending.tab_id,
+                    request_id: tab.latest_request,
+                },
+                entry_id: pending.entry_id,
+            };
+            app.rename_targets.insert(window_id, target);
         }
         ui.set_rename_entry_id(pending.entry_id.0 as i32);
         ui.set_rename_input(pending.input.into());
@@ -24872,6 +25112,14 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     let Some(tab) = window.tabs.get(&window.active_tab) else {
         return;
     };
+    ui.set_accessibility_window_id(format!("window/{}", window_id.0).into());
+    ui.set_accessibility_context(
+        format!(
+            "window/{}/tab/{}/request/{}",
+            window_id.0, tab.id.0, tab.latest_request.0
+        )
+        .into(),
+    );
     if let Some(window_id) = window_id_for_ui(ui) {
         let request_id = tab.latest_request;
         let invalidated = WINDOW_RUNTIMES.with_borrow_mut(|runtimes| {
@@ -28040,6 +28288,25 @@ mod tests {
     }
 
     #[test]
+    fn issue_111_shell_popup_actions_have_distinct_stable_identities() {
+        let first = context_test_row(SHELL_CONTEXT_COMMAND_BASE + 1, "Open", "open", false);
+        let second = context_test_row(SHELL_CONTEXT_COMMAND_BASE + 2, "Copy", "copy", false);
+        let mut submenu = first.clone();
+        submenu.submenu = true;
+        submenu.node_id = first.id;
+        let rows = popup_rows(&[first.clone(), second, submenu]);
+
+        assert_ne!(rows[0].stable_id, rows[1].stable_id);
+        assert_ne!(rows[0].stable_id, rows[2].stable_id);
+        assert_eq!(
+            rows[2].stable_id.as_str(),
+            format!("shell-session/node/{}", first.id)
+        );
+        let mut translated = first.clone();
+        translated.label = "打开".into();
+        assert_eq!(popup_rows(&[translated])[0].stable_id, rows[0].stable_id);
+    }
+    #[test]
     fn issue_18_builtin_menu_rows_expose_only_their_own_icons() {
         let app = AppState::new_for_test(vec![PathBuf::from(r"C:\menu")], 0, [0, 1, 2, 3]);
         let (rows, submenus) = built_in_context_rows(&app, false, true);
@@ -30321,6 +30588,35 @@ mod tests {
     }
 
     #[test]
+    fn issue_111_conflict_window_tracks_its_task_after_cancellation() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
+        let waiting = app.operations.submit(
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![],
+        );
+        app.operations.task_mut(waiting).unwrap().state = OperationState::WaitingConflict;
+        let other = app.operations.submit(
+            OperationResource::Network,
+            FileOperationKind::Copy,
+            None,
+            vec![],
+        );
+        app.operations.cancel(other).unwrap();
+        let waiting_id = waiting.0.to_string();
+        assert!(!should_close_conflict_window(&waiting_id, &app));
+        assert!(should_close_conflict_window(&other.0.to_string(), &app));
+
+        app.operations.cancel(waiting).unwrap();
+        assert!(should_close_conflict_window(&waiting_id, &app));
+        app.operations.task_mut(waiting).unwrap().state = OperationState::Cancelled;
+        assert!(should_close_conflict_window(&waiting_id, &app));
+        assert!(should_close_conflict_window("999", &app));
+        assert!(!should_close_conflict_window("", &app));
+    }
+
+    #[test]
     fn issue_76_auto_opened_operation_window_keeps_active_and_attention_rows() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
         let id = app.operations.submit(
@@ -31966,7 +32262,7 @@ mod tests {
             result: Ok(Some((kind, items))),
         } = event
         {
-            enqueue_operation(&shared, &sender, origin_tab, kind, items);
+            let _ = enqueue_operation(&shared, &sender, origin_tab, kind, items);
         }
 
         let app = shared.lock().unwrap();
@@ -33282,15 +33578,27 @@ mod tests {
             let tab_id = app.active_window_state().active_tab;
             let tab = app.tab_mut(tab_id).unwrap();
             tab.replace_entries(vec![focus_entry(1, source)]);
+            tab.load_state = LoadState::Complete;
             tab.selected = vec![EntryId(1)];
-            app.rename_targets.insert(window_id, (tab_id, EntryId(1)));
+            let request_id = app.tab(tab_id).unwrap().latest_request;
+            app.rename_targets.insert(
+                window_id,
+                actions::EntryTarget {
+                    tab: actions::ActionTarget {
+                        window_id,
+                        tab_id,
+                        request_id,
+                    },
+                    entry_id: EntryId(1),
+                },
+            );
             let shared = Arc::new(Mutex::new(app));
             let state = WindowSessions::new(shared.clone(), window_id);
             let (sender, receiver) = mpsc::channel();
 
             submit_rename(&state, &sender, "new.md").unwrap();
 
-            let request = receiver.try_recv().unwrap();
+            let request = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
             assert_eq!(
                 request.items[0].destination.as_deref(),
                 Some(Path::new(expected))

@@ -1,5 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+#[cfg(test)]
+mod accessibility_tests;
 mod agent_debug;
 mod app;
 mod domain;
@@ -52,6 +54,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let external_paths = agent_options.take_external_paths();
 
     if let Some(scenario) = agent_options.scenario {
+        if scenario == agent_debug::AgentScenario::AgentActions {
+            let output = agent_options
+                .state_output()
+                .expect("scenario has a default state output");
+            app::action_scenario::export(&output)?;
+            return Ok(());
+        }
         if scenario == agent_debug::AgentScenario::Home {
             let output = agent_options
                 .state_output()
