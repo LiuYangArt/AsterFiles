@@ -1,8 +1,11 @@
 use std::{
     collections::HashSet,
     ffi::{OsStr, OsString},
-    fs, io,
+    fmt::Write as _,
+    fs::{self, OpenOptions},
+    io::{self, Write},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -244,15 +247,203 @@ pub fn default_path() -> Option<PathBuf> {
 }
 
 pub fn load(path: &Path) -> io::Result<SessionState> {
-    let bytes = fs::read(path)?;
-    decode(&bytes)
+    let bytes = fs::read(path).map_err(|error| session_error("read", path, error))?;
+    decode(&bytes).map_err(|error| session_error("decode", path, error))
+}
+
+pub fn load_with_diagnostics(path: &Path) -> io::Result<SessionState> {
+    load_with_diagnostics_at(path, &diagnostic_path())
+}
+
+fn load_with_diagnostics_at(path: &Path, diagnostics: &Path) -> io::Result<SessionState> {
+    let result = load(path);
+    let event = match &result {
+        Ok(_) => "session_load_succeeded",
+        Err(error) if error.kind() == io::ErrorKind::NotFound => "session_load_missing",
+        Err(_) => "session_load_failed",
+    };
+    record_result_at(diagnostics, event, path, result.as_ref().err());
+    result
 }
 
 pub fn save(path: &Path, state: &SessionState) -> io::Result<()> {
+    let bytes = encode(state).map_err(|error| session_error("encode", path, error))?;
     if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| session_error("directory-create", parent, error))?;
+    }
+    crate::platform::windows::atomic_file::write(path, &bytes)
+}
+
+pub(crate) fn record_save_validation_failure(path: &Path, error: &io::Error) {
+    record_save_validation_failure_at(path, error, &diagnostic_path());
+}
+
+fn record_save_validation_failure_at(path: &Path, error: &io::Error, diagnostics: &Path) {
+    let error = session_error(
+        "validate",
+        path,
+        io::Error::new(error.kind(), error.to_string()),
+    );
+    record_result_at(
+        diagnostics,
+        "session_save_validation_failed",
+        path,
+        Some(&error),
+    );
+}
+pub fn save_with_diagnostics(path: &Path, state: &SessionState) -> io::Result<()> {
+    save_with_diagnostics_at(path, state, &diagnostic_path())
+}
+
+fn save_with_diagnostics_at(
+    path: &Path,
+    state: &SessionState,
+    diagnostics: &Path,
+) -> io::Result<()> {
+    let result = save(path, state);
+    record_result_at(
+        diagnostics,
+        if result.is_ok() {
+            "session_save_succeeded"
+        } else {
+            "session_save_failed"
+        },
+        path,
+        result.as_ref().err(),
+    );
+    result
+}
+
+fn record_result_at(diagnostics: &Path, event: &str, path: &Path, error: Option<&io::Error>) {
+    if let Err(diagnostic_error) = append_diagnostic(diagnostics, event, path, error) {
+        eprintln!(
+            "session persistence diagnostic failed: {diagnostic_error}; event={event}; path={path:?}; result={error:?}"
+        );
+    }
+}
+
+fn diagnostic_path() -> PathBuf {
+    if cfg!(debug_assertions) {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("artifacts/logs/session-persistence.jsonl")
+    } else {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("AsterFiles/logs/session-persistence.jsonl")
+    }
+}
+
+fn append_diagnostic(
+    diagnostic_path: &Path,
+    event: &str,
+    session_path: &Path,
+    error: Option<&io::Error>,
+) -> io::Result<()> {
+    if let Some(parent) = diagnostic_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, encode(state)?)
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(diagnostic_path)?;
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let error_kind = error
+        .map(|value| format!("{:?}", value.kind()))
+        .unwrap_or_default();
+    let stage = error.and_then(diagnostic_stage).unwrap_or_else(|| {
+        if event.ends_with("_succeeded") {
+            "complete"
+        } else {
+            "unknown"
+        }
+    });
+    let raw_os_error = error
+        .and_then(diagnostic_raw_os_error)
+        .map_or_else(|| "null".to_owned(), |value| value.to_string());
+    let cleanup_raw_os_error = error
+        .and_then(crate::platform::windows::atomic_file::cleanup_raw_os_error)
+        .map_or_else(|| "null".to_owned(), |value| value.to_string());
+    let message = error.map(ToString::to_string).unwrap_or_default();
+    writeln!(
+        file,
+        "{{\"timestamp_ms\":{timestamp_ms},\"pid\":{},\"event\":\"{}\",\"stage\":\"{}\",\"path\":\"{}\",\"error_kind\":\"{}\",\"raw_os_error\":{raw_os_error},\"cleanup_raw_os_error\":{cleanup_raw_os_error},\"message\":\"{}\"}}",
+        std::process::id(),
+        json_escape(event),
+        json_escape(stage),
+        json_escape(&session_path.to_string_lossy()),
+        json_escape(&error_kind),
+        json_escape(&message),
+    )?;
+    file.flush()
+}
+
+fn json_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character <= '\u{1f}' => {
+                let _ = write!(escaped, "\\u{:04x}", character as u32);
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn diagnostic_stage(error: &io::Error) -> Option<&'static str> {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<SessionPersistenceError>())
+        .map(|inner| inner.stage)
+        .or_else(|| crate::platform::windows::atomic_file::stage(error))
+}
+fn diagnostic_raw_os_error(error: &io::Error) -> Option<i32> {
+    error
+        .raw_os_error()
+        .or_else(|| {
+            error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<SessionPersistenceError>())
+                .and_then(|inner| inner.raw_os_error)
+        })
+        .or_else(|| crate::platform::windows::atomic_file::raw_os_error(error))
+}
+
+#[derive(Debug)]
+struct SessionPersistenceError {
+    message: String,
+    stage: &'static str,
+    raw_os_error: Option<i32>,
+}
+
+impl std::fmt::Display for SessionPersistenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SessionPersistenceError {}
+
+fn session_error(stage: &'static str, path: &Path, error: io::Error) -> io::Error {
+    let kind = error.kind();
+    let raw_os_error = diagnostic_raw_os_error(&error);
+    io::Error::new(
+        kind,
+        SessionPersistenceError {
+            message: format!("session {stage} failed for {path:?}: {error}"),
+            stage,
+            raw_os_error,
+        },
+    )
 }
 
 fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
@@ -1281,6 +1472,170 @@ mod tests {
         );
     }
 
+    fn issue_105_temporary_directory(case: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "asterfiles-issue-105-{case}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn issue_105_save_with_failure(
+        path: &Path,
+        state: &SessionState,
+        failure: crate::platform::windows::atomic_file::AtomicWriteFailure,
+    ) -> io::Result<()> {
+        let bytes = encode(state)?;
+        fs::create_dir_all(path.parent().unwrap())?;
+        crate::platform::windows::atomic_file::write_with_failure(path, &bytes, failure)
+    }
+
+    fn issue_105_assert_no_temporary_file_remains(directory: &Path) {
+        let temporary = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".asterfiles-writing-"))
+            .collect::<Vec<_>>();
+        assert!(
+            temporary.is_empty(),
+            "temporary files remained: {temporary:?}"
+        );
+    }
+
+    #[test]
+    fn issue_105_first_save_and_atomic_overwrite_are_complete_and_readable() {
+        let directory = issue_105_temporary_directory("success");
+        let path = directory.join("session.bin");
+        let diagnostics = directory.join("session-persistence.jsonl");
+        let old_state = sample_state();
+        save_with_diagnostics_at(&path, &old_state, &diagnostics).unwrap();
+        assert_eq!(
+            load_with_diagnostics_at(&path, &diagnostics).unwrap(),
+            old_state
+        );
+
+        let mut new_state = sample_state();
+        new_state.theme_mode = ThemeMode::Light;
+        new_state.language = Language::Chinese;
+        save_with_diagnostics_at(&path, &new_state, &diagnostics).unwrap();
+        assert_eq!(
+            load_with_diagnostics_at(&path, &diagnostics).unwrap(),
+            new_state
+        );
+        let diagnostic = fs::read_to_string(&diagnostics).unwrap();
+        assert_eq!(diagnostic.matches("session_save_succeeded").count(), 2);
+        assert_eq!(diagnostic.matches("session_load_succeeded").count(), 2);
+        assert_eq!(diagnostic.matches("\"stage\":\"complete\"").count(), 4);
+        issue_105_assert_no_temporary_file_remains(&directory);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn issue_105_write_sync_and_real_replace_failures_preserve_old_session_and_clean_temporary_file()
+     {
+        use crate::platform::windows::atomic_file::AtomicWriteFailure;
+
+        for (case, failure) in [
+            ("disk-full", AtomicWriteFailure::TemporaryWrite),
+            ("sync", AtomicWriteFailure::Sync),
+        ] {
+            let directory = issue_105_temporary_directory(case);
+            let path = directory.join("session.bin");
+            let old_state = sample_state();
+            save(&path, &old_state).unwrap();
+            let old_bytes = fs::read(&path).unwrap();
+
+            let mut replacement = sample_state();
+            replacement.theme_mode = ThemeMode::Light;
+            let error = issue_105_save_with_failure(&path, &replacement, failure).unwrap_err();
+            let expected_stage = match failure {
+                AtomicWriteFailure::TemporaryWrite => "temporary-write",
+                AtomicWriteFailure::Sync => "temporary-sync",
+            };
+            assert!(error.to_string().contains(expected_stage));
+            if matches!(failure, AtomicWriteFailure::TemporaryWrite) {
+                assert_eq!(diagnostic_raw_os_error(&error), Some(112));
+            }
+            let diagnostics = directory.join("session-persistence.jsonl");
+            record_result_at(&diagnostics, "session_save_failed", &path, Some(&error));
+            let diagnostic = fs::read_to_string(&diagnostics).unwrap();
+            assert!(diagnostic.contains(&format!("\"stage\":\"{expected_stage}\"")));
+            assert_eq!(fs::read(&path).unwrap(), old_bytes);
+            assert_eq!(load(&path).unwrap(), old_state);
+            issue_105_assert_no_temporary_file_remains(&directory);
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let directory = issue_105_temporary_directory("replace");
+        let path = directory.join("session.bin");
+        let old_state = sample_state();
+        save(&path, &old_state).unwrap();
+        let old_bytes = fs::read(&path).unwrap();
+        let lock = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .unwrap();
+        let diagnostics = directory.join("session-persistence.jsonl");
+        let mut replacement = sample_state();
+        replacement.theme_mode = ThemeMode::Light;
+        let error = save_with_diagnostics_at(&path, &replacement, &diagnostics).unwrap_err();
+        assert!(error.to_string().contains("replace"));
+        let raw_os_error = diagnostic_raw_os_error(&error).expect("Windows error code is retained");
+        assert!(matches!(raw_os_error, 5 | 32));
+        let diagnostic = fs::read_to_string(&diagnostics).unwrap();
+        assert!(diagnostic.contains("\"event\":\"session_save_failed\""));
+        assert!(diagnostic.contains("\"stage\":\"replace\""));
+        assert!(diagnostic.contains(&format!("\"raw_os_error\":{raw_os_error}")));
+        assert_eq!(fs::read(&path).unwrap(), old_bytes);
+        drop(lock);
+        assert_eq!(load(&path).unwrap(), old_state);
+        issue_105_assert_no_temporary_file_remains(&directory);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn issue_105_corrupt_session_and_persistence_result_have_readable_diagnostics() {
+        let directory = issue_105_temporary_directory("diagnostics");
+        fs::create_dir_all(&directory).unwrap();
+        let session_path = directory.join("session.bin");
+        let diagnostic_path = directory.join("session-persistence.jsonl");
+        fs::write(&session_path, b"ASTF17").unwrap();
+        let error = load_with_diagnostics_at(&session_path, &diagnostic_path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("session decode failed"));
+        assert!(error.to_string().contains("truncated session data"));
+
+        let missing_path = directory.join("missing.bin");
+        assert_eq!(
+            load_with_diagnostics_at(&missing_path, &diagnostic_path)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        record_save_validation_failure_at(
+            &session_path,
+            &invalid_data("invalid session window count"),
+            &diagnostic_path,
+        );
+        let diagnostic = fs::read_to_string(&diagnostic_path).unwrap();
+        assert!(diagnostic.contains("\"event\":\"session_load_failed\""));
+        assert!(diagnostic.contains("\"stage\":\"decode\""));
+        assert!(diagnostic.contains("\"error_kind\":\"InvalidData\""));
+        assert!(diagnostic.contains("truncated session data"));
+        assert!(diagnostic.contains("\"event\":\"session_load_missing\""));
+        assert!(diagnostic.contains("\"stage\":\"read\""));
+        assert!(diagnostic.contains("\"error_kind\":\"NotFound\""));
+        assert!(diagnostic.contains("\"event\":\"session_save_validation_failed\""));
+        assert!(diagnostic.contains("\"stage\":\"validate\""));
+        fs::remove_dir_all(directory).unwrap();
+    }
     #[test]
     fn rejects_truncated_or_trailing_data() {
         let bytes = encode(&sample_state()).unwrap();

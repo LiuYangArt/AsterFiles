@@ -269,6 +269,11 @@ python tools/verify.py
 
 用户手动验收：打开原目录，先选网格再切 List，检查文件夹、MTL、OBJ 等系统图标；分别在分组和未分组下滚动、切换 Details、返回网格，再检查搜索结果切换 List。快速导航和关闭标签后，不应出现旧目录图标。Codex 不操作窗口；用户确认前仅更新 Debug 程序。
 
+## Issue #105 会话与偏好原子保存
+
+专项测试：`cargo test issue_105_ -- --nocapture`；统一验证：`python tools/verify.py`。测试在独立临时目录中覆盖首次保存、已有文件覆盖、截断解码，以及临时写入、落盘和 Windows 原子替换的确定性失败；失败后断言旧字节和旧会话仍可读取，且本次临时文件已清理；成功覆盖和首次保存都实际调用同目录 Windows `MoveFileExW`，覆盖额外使用 `MOVEFILE_REPLACE_EXISTING`。
+
+Debug 诊断写入 `artifacts/logs/session-persistence.jsonl`，本地 Release 写入 `%LOCALAPPDATA%/AsterFiles/logs/session-persistence.jsonl`。事件区分无旧会话、读取成功、读取/解码失败、保存前校验失败、保存成功与分阶段保存失败，并记录错误类型、Windows 错误码和可读消息。会话及诊断文件访问都由启动/退出专用后台线程执行，不操作 AsterFiles 窗口。
 ## 常用操作命令序列（#111）
 
 ```powershell

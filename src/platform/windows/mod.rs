@@ -1,4 +1,5 @@
 pub mod address_path;
+pub(crate) mod atomic_file;
 pub mod clipboard;
 pub mod context_menu;
 pub mod copy_file;

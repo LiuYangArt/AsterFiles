@@ -4620,11 +4620,61 @@ fn startup_locations(
     let active_index = locations.len().saturating_sub(1);
     (locations, active_index)
 }
+fn restore_session_in_background(
+    scenario: Option<AgentScenario>,
+) -> Option<session_store::SessionState> {
+    if scenario.is_some() {
+        return None;
+    }
+    let path = session_store::default_path()?;
+    let worker = thread::Builder::new()
+        .name("session-load".into())
+        .spawn(move || session_store::load_with_diagnostics(&path));
+    match worker {
+        Ok(worker) => match worker.join() {
+            Ok(Ok(session)) => Some(session),
+            Ok(Err(error)) if error.kind() == io::ErrorKind::NotFound => None,
+            Ok(Err(error)) => {
+                eprintln!("session restore failed: {error}");
+                None
+            }
+            Err(_) => {
+                eprintln!("session restore worker panicked");
+                None
+            }
+        },
+        Err(error) => {
+            eprintln!("session restore worker could not start: {error}");
+            None
+        }
+    }
+}
+
+fn persist_session_in_background(path: PathBuf, session: io::Result<session_store::SessionState>) {
+    let worker = thread::Builder::new()
+        .name("session-save".into())
+        .spawn(move || match session {
+            Ok(session) => session_store::save_with_diagnostics(&path, &session),
+            Err(error) => {
+                session_store::record_save_validation_failure(&path, &error);
+                Err(error)
+            }
+        });
+    match worker {
+        Ok(worker) => match worker.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("session save failed: {error}"),
+            Err(_) => eprintln!("session save worker panicked"),
+        },
+        Err(error) => eprintln!("session save worker could not start: {error}"),
+    }
+}
 pub fn run(
     scenario: Option<AgentScenario>,
     initial_external_paths: Vec<PathBuf>,
     external_path_receiver: Option<mpsc::Receiver<Vec<PathBuf>>>,
 ) -> Result<(), slint::PlatformError> {
+    let restored = restore_session_in_background(scenario);
     let ui = AppWindow::new()?;
     let network_login_ui = NetworkLoginWindow::new()?;
     let network_location_rename_ui = NetworkLocationRenameWindow::new()?;
@@ -4635,10 +4685,7 @@ pub fn run(
     let delete_weak = delete_ui.as_weak();
     let conflict_weak = conflict_ui.as_weak();
     let exit_weak = exit_ui.as_weak();
-    let restored = scenario
-        .is_none()
-        .then(|| session_store::default_path().and_then(|path| session_store::load(&path).ok()))
-        .flatten();
+
     let default_window = session_store::WindowPlacement {
         x: 80,
         y: 80,
@@ -5182,25 +5229,27 @@ pub fn run(
     };
     if scenario.is_none()
         && let Some(path) = session_store::default_path()
-        && let Ok(session) = session_store::SessionState::with_windows_and_settings(
-            windows,
-            default_directory_view,
-            search_view,
-            directory_views,
-            theme_mode,
-            language,
-            everything_config,
-            file_visibility,
-            file_list_quick_search,
-            new_tab_opens_home,
-            quick_menu_backdrop,
-            quick_menu_backdrop_opacity,
-            sidebar_visibility,
-            network_locations,
-            network_devices,
-        )
     {
-        let _ = session_store::save(&path, &session);
+        persist_session_in_background(
+            path,
+            session_store::SessionState::with_windows_and_settings(
+                windows,
+                default_directory_view,
+                search_view,
+                directory_views,
+                theme_mode,
+                language,
+                everything_config,
+                file_visibility,
+                file_list_quick_search,
+                new_tab_opens_home,
+                quick_menu_backdrop,
+                quick_menu_backdrop_opacity,
+                sidebar_visibility,
+                network_locations,
+                network_devices,
+            ),
+        );
     }
     clear_window_runtimes();
     clipboard_listener.shutdown();
