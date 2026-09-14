@@ -32,6 +32,20 @@ class VerifyTests(unittest.TestCase):
             first_command[-1], str(verify.ROOT / "tools" / "maintain-build-cache.ps1")
         )
 
+    def test_finish_issue_tests_are_part_of_every_validation_mode(self) -> None:
+        for quick in (True, False):
+            steps = dict(verify.validation_steps(quick=quick, include_release=False))
+            self.assertEqual(
+                steps["finish-issue-tests"],
+                [
+                    "pwsh",
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-Command",
+                    "Invoke-Pester -Script '.\\tools\\test_finish_issue.ps1' -EnableExit",
+                ],
+            )
+
     def test_validation_modes_build_debug_exactly_once(self) -> None:
         for quick in (True, False):
             steps = verify.validation_steps(quick=quick, include_release=False)

@@ -17,14 +17,20 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+. (Join-Path $PSScriptRoot 'finish-issue-support.ps1')
+
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repositoryRoot
-$repository = ([string](& gh repo view --json nameWithOwner --jq '.nameWithOwner')).Trim()
-if ($LASTEXITCODE -ne 0 -or -not $repository) { throw 'Unable to resolve the GitHub repository.' }
+$repository = Invoke-GhText -Arguments @('repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner') `
+    -FailureContext 'Unable to resolve the GitHub repository.'
+if (-not $repository) { throw 'Unable to resolve the GitHub repository.' }
 
-$issueState = ([string](& gh issue view $Issue --repo $repository --json state --jq '.state')).Trim()
-if ($LASTEXITCODE -ne 0) { throw "Unable to read Issue #$Issue." }
+$issueState = Invoke-GhText -Arguments @(
+    'issue', 'view', [string]$Issue, '--repo', $repository, '--json', 'state', '--jq', '.state'
+) -FailureContext "Unable to read Issue #$Issue."
 if ($issueState -ne 'OPEN') { throw "Issue #$Issue is not open." }
+
+$projectContext = Get-FinishIssueProjectContext -Owner 'LiuYangArt' -Repository $repository -Issue $Issue
 
 & git diff --cached --quiet
 if ($LASTEXITCODE -eq 1) { throw 'Staged changes already exist; finish or unstage them first.' }
@@ -61,27 +67,8 @@ $comment = @"
 - Release 程序：``target/release/asterfiles.exe``
 - Commit：``$commit``
 "@
-& gh issue comment $Issue --repo $repository --body $comment
-if ($LASTEXITCODE -ne 0) { throw 'Unable to write the Issue verification comment.' }
-
-$project = & gh project list --owner LiuYangArt --format json | ConvertFrom-Json |
-    Select-Object -ExpandProperty projects |
-    Where-Object title -eq 'AsterFiles Development' |
-    Select-Object -First 1
-if (-not $project) { throw 'AsterFiles Development project was not found.' }
-$itemList = & gh project item-list $project.number --owner LiuYangArt --format json --limit 100 | ConvertFrom-Json
-$item = $itemList.items |
-    Where-Object { $_.content.number -eq $Issue -and $_.content.repository -eq $repository } |
-    Select-Object -First 1
-if (-not $item) { throw "Issue #$Issue is not in AsterFiles Development." }
-$fieldList = & gh project field-list $project.number --owner LiuYangArt --format json | ConvertFrom-Json
-$statusField = $fieldList.fields | Where-Object name -eq 'Status' | Select-Object -First 1
-$done = $statusField.options | Where-Object name -eq 'Done' | Select-Object -First 1
-if (-not $statusField -or -not $done) { throw 'Project Done status was not found.' }
-& gh project item-edit --id $item.id --project-id $project.id --field-id $statusField.id --single-select-option-id $done.id
-if ($LASTEXITCODE -ne 0) { throw 'Unable to set the project item to Done.' }
-& gh issue close $Issue --repo $repository --reason completed
-if ($LASTEXITCODE -ne 0) { throw "Unable to close Issue #$Issue." }
+Complete-GitHubIssue -Issue $Issue -Repository $repository -Comment $comment `
+    -ProjectContext $projectContext -Commit $commit
 
 [PSCustomObject]@{
     issue = $Issue

@@ -327,6 +327,16 @@ def validation_steps(quick: bool, include_release: bool) -> list[tuple[str, list
                 "Invoke-Pester -Script '.\\tools\\test_publish.ps1' -EnableExit",
             ],
         ),
+        (
+            "finish-issue-tests",
+            [
+                "pwsh",
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "Invoke-Pester -Script '.\\tools\\test_finish_issue.ps1' -EnableExit",
+            ],
+        ),
         ("format", ["cargo", "fmt", "--check"]),
         (
             "clippy",
