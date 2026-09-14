@@ -19,9 +19,9 @@ use windows_sys::Win32::{
     },
     System::{
         Pipes::{
-            ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
-            PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
-            WaitNamedPipeW,
+            ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeServerProcessId,
+            PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE,
+            PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
         },
         Threading::CreateMutexW,
     },
@@ -110,7 +110,42 @@ fn create_pipe(pipe_name: &str) -> io::Result<OwnedHandle> {
     }
 }
 
+fn pipe_server_process_id(handle: HANDLE) -> io::Result<u32> {
+    let mut process_id = 0;
+    if unsafe { GetNamedPipeServerProcessId(handle, &mut process_id) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if process_id == 0 || process_id == u32::MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid pipe server PID",
+        ));
+    }
+    Ok(process_id)
+}
+
+fn grant_foreground_permission(handle: HANDLE) -> io::Result<u32> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
+
+    let process_id = pipe_server_process_id(handle)?;
+    if unsafe { AllowSetForegroundWindow(process_id) } == 0 {
+        return Err(io::Error::other(format!(
+            "server_pid={process_id} permission denied: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    Ok(process_id)
+}
+
 fn forward_to(pipe_name: &str, paths: &[PathBuf]) -> io::Result<()> {
+    forward_to_with_authorizer(pipe_name, paths, grant_foreground_permission)
+}
+
+fn forward_to_with_authorizer(
+    pipe_name: &str,
+    paths: &[PathBuf],
+    authorize: impl FnOnce(HANDLE) -> io::Result<u32>,
+) -> io::Result<()> {
     let bytes = encode_paths(paths)?;
     let name = wide(pipe_name);
     let mut last_error = io::Error::from_raw_os_error(ERROR_PIPE_BUSY as i32);
@@ -128,6 +163,13 @@ fn forward_to(pipe_name: &str, paths: &[PathBuf]) -> io::Result<()> {
         };
         if handle != INVALID_HANDLE_VALUE {
             let handle = OwnedHandle(handle);
+            // Grant before publishing paths: the receiver can handle them immediately.
+            // Windows may deny focus, but that must never prevent opening the folder.
+            let permission = authorize(handle.0);
+            crate::operation_audit::record(
+                "external-open-foreground-permission",
+                format!("result={permission:?}"),
+            );
             let mut written = 0;
             if unsafe {
                 WriteFile(
@@ -140,6 +182,10 @@ fn forward_to(pipe_name: &str, paths: &[PathBuf]) -> io::Result<()> {
             } != 0
                 && written as usize == bytes.len()
             {
+                crate::operation_audit::record(
+                    "external-open-forwarded",
+                    format!("path_count={}", paths.len()),
+                );
                 return Ok(());
             }
             return Err(io::Error::last_os_error());
@@ -326,6 +372,55 @@ mod tests {
             expected
         );
     }
+    #[test]
+    fn issue_110_authorizes_actual_server_before_delivery_even_when_permission_is_denied() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        for denied in [false, true] {
+            let pipe_name = format!(
+                r"\\.\pipe\AsterFiles.Foreground.Test.{}.{}",
+                std::process::id(),
+                denied,
+            );
+            let authorization_attempted = Arc::new(AtomicBool::new(false));
+            let server_authorization_attempted = authorization_attempted.clone();
+            let server_name = pipe_name.clone();
+            let server = thread::spawn(move || {
+                let pipe = create_pipe(&server_name)?;
+                let connected = unsafe { ConnectNamedPipe(pipe.0, ptr::null_mut()) } != 0
+                    || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
+                if !connected {
+                    return Err(io::Error::last_os_error());
+                }
+                let paths = read_message(pipe.0)?;
+                assert!(
+                    server_authorization_attempted.load(Ordering::SeqCst),
+                    "authorization must precede delivery"
+                );
+                Ok(paths)
+            });
+            let expected = vec![
+                PathBuf::from(r"C:\中文 folder"),
+                PathBuf::from(r"\\server\share"),
+            ];
+            forward_to_with_authorizer(&pipe_name, &expected, |handle| {
+                let process_id = pipe_server_process_id(handle)?;
+                assert_eq!(process_id, std::process::id());
+                authorization_attempted.store(true, Ordering::SeqCst);
+                if denied {
+                    Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                } else {
+                    Ok(process_id)
+                }
+            })
+            .expect("denied focus must not lose the request or launch an extra instance");
+            assert_eq!(server.join().unwrap().unwrap(), expected);
+        }
+    }
+
     #[test]
     fn malformed_payload_is_rejected() {
         assert!(decode_paths(&[1, 0, 0, 0, 5, 0, 0, 0, 1, 0]).is_err());

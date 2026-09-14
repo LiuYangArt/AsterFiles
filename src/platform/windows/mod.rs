@@ -89,15 +89,30 @@ pub fn move_window(hwnd: isize, x: i32, y: i32) -> io::Result<()> {
 
 pub fn restore_and_focus_window(hwnd: isize) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        SW_RESTORE, SetForegroundWindow, ShowWindow,
+        GetForegroundWindow, IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow,
     };
 
-    if hwnd != 0 {
-        unsafe {
-            ShowWindow(hwnd as windows_sys::Win32::Foundation::HWND, SW_RESTORE);
-            SetForegroundWindow(hwnd as windows_sys::Win32::Foundation::HWND);
-        }
+    if hwnd == 0 {
+        crate::operation_audit::record("external-open-activation", "target_hwnd=0 unavailable");
+        return;
     }
+    let target = hwnd as windows_sys::Win32::Foundation::HWND;
+    let minimized = unsafe { IsIconic(target) } != 0;
+    // Restoring an already maximized window would discard the user's window state.
+    if minimized {
+        unsafe { ShowWindow(target, SW_RESTORE) };
+    }
+    let accepted = unsafe { SetForegroundWindow(target) } != 0;
+    let foreground = unsafe { GetForegroundWindow() };
+    // SetForegroundWindow does not provide a reliable GetLastError failure reason.
+    crate::operation_audit::record(
+        "external-open-activation",
+        format!(
+            "target_hwnd={hwnd} minimized={minimized} accepted={accepted} foreground_hwnd={} active={}",
+            foreground as isize,
+            foreground == target,
+        ),
+    );
 }
 pub fn show_error_dialog(owner: isize, title: &str, message: &str) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
