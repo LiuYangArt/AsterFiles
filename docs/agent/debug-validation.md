@@ -307,3 +307,11 @@ cargo test issue_111_ -- --nocapture
 完整 `python tools/verify.py` 已包含该场景。证据位于 `artifacts/state/agent-actions/sequence.json`、`artifacts/logs/verify-agent-actions.log` 和 `artifacts/verify/summary.json`。`src/accessibility_tests.rs` 使用 Slint 无窗口后端读取控件身份及状态，不操作桌面窗口。
 
 人工验收：启动 Debug 程序，分别在列表与网格选择同一文件，切换语言；使用无障碍检查工具核对名称、角色、选中、禁用、勾选及子菜单实际展开状态。再打开两个包含同名文件的窗口，分别重命名，确认只修改所选窗口的目标。加载占位和菜单分隔线不能被识别为可执行按钮。用户确认前 Issue 保持待审查；本地 Release 构建在确认后执行。
+
+## 职责拆分的回归入口（#107）
+
+目录队列测试：`cargo test --locked app::directory_loading`；文件执行测试：`cargo test --locked app::file_operation_worker`；任务协调测试：`cargo test --locked app::file_operation_coordinator`；窗口会话测试：`cargo test --locked app::window_sessions`。跨职责、应用动作及界面模型回归使用 `cargo test --locked app::`。每个切片接着运行 `cargo build --locked`，最终统一运行 `python tools/verify.py`。
+
+拆分对照证据位于 `artifacts/issue-107/`：`baseline-summary.json`、`baseline-state/` 保存拆分前完整验证；各切片的 `*-tests.log` / `*-build.log` 保存测试和 Debug 构建输出。最终汇总仍使用 `artifacts/verify/summary.json`，场景状态仍使用 `artifacts/state/`。比较无界面输出时仅排除明确随运行变化的时间、临时夹具路径等字段；身份、取消和终态等业务字段必须保留并比较。
+
+模块拆分不授权自动操作 AsterFiles UI。如需人工回归，使用临时目录：复制或重命名一个小文件并撤销；目录加载时切换标签；将标签移至另一窗口再关闭原窗口，确认文件内容、活动标签和目录展示正常。真实窗口结果由用户反馈。

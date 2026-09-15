@@ -715,7 +715,7 @@ mod tests {
             );
             (first, queued)
         };
-        fail_operation_dispatch(&state, first);
+        super::file_operation_coordinator::fail_operation_dispatch(&state, first);
         let mut app = state.lock().unwrap();
         assert_eq!(
             app.operations.task(first).unwrap().state,
