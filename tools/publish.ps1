@@ -202,6 +202,9 @@ try {
     [System.IO.File]::WriteAllText($manifestPath, $updatedManifest, [System.Text.UTF8Encoding]::new($false))
     $versionChanged = $true
 
+    & cargo metadata --offline --no-deps --format-version 1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to synchronize Cargo.lock with the release version.' }
+
     & python tools/verify.py
     if ($LASTEXITCODE -ne 0) { throw 'Project verification failed. Release was cancelled.' }
 
