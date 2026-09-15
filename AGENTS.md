@@ -17,7 +17,7 @@ python tools/verify.py --release # 用户确认 Issue 后的本地 Release 构�
 
 ## Windows 持续验证（#106）
 
-主线 push、面向 main 的 PR 和手动运行触发 `.github/workflows/ci.yml`，在 Windows Server 2022 / PowerShell 7 上运行完整 `python tools/verify.py`。本地、CI 和标签打包共同读取 `rust-toolchain.toml`；Rust 版本只在该文件维护。首次本地验证需安装 Python 3.13、Rustup、Visual Studio C++/Windows SDK，以及 `Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser -Force -SkipPublisherCheck`。验证显式导入该 Pester 版本；Cargo 检查、测试和构建均使用 `--locked`。
+主线 push、面向 main 的 PR 和手动运行触发 `.github/workflows/ci.yml`，在 Windows Server 2025 / PowerShell 7 上运行完整 `python tools/verify.py`。本地、CI 和标签打包共同读取 `rust-toolchain.toml`；Rust 版本只在该文件维护。首次本地验证需安装 Python 3.13、Rustup、Visual Studio C++/Windows SDK，以及 `Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser -Force -SkipPublisherCheck`。验证显式导入该 Pester 版本；Cargo 检查、测试和构建均使用 `--locked`。
 
 CI 只有仓库读取权限，不发布、不创建标签；同一 PR/引用的新运行取消旧运行，单次超时 60 分钟。日志、状态和汇总上传到 `windows-verification-<run-id>-<attempt>`，保存 14 天。成功与失败路径的云端复验命令及下载入口见 `docs/agent/debug-validation.md`；受控失败只修改 runner 的临时 checkout。
 
