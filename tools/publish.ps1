@@ -202,7 +202,7 @@ try {
     [System.IO.File]::WriteAllText($manifestPath, $updatedManifest, [System.Text.UTF8Encoding]::new($false))
     $versionChanged = $true
 
-    & cargo metadata --offline --no-deps --format-version 1 | Out-Null
+    & cargo update --offline --package asterfiles
     if ($LASTEXITCODE -ne 0) { throw 'Unable to synchronize Cargo.lock with the release version.' }
 
     & python tools/verify.py
