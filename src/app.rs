@@ -29660,6 +29660,31 @@ mod tests {
     }
 
     #[test]
+    fn issue_113_home_fills_content_to_window_bottom() {
+        use i_slint_backend_testing::ElementRoot;
+
+        let ui = headless_file_view();
+        ui.set_page_state(3);
+        ui.set_active_is_home(true);
+        update_test_layout(&ui);
+        let home = ui
+            .root_element()
+            .query_descendants()
+            .match_id("AppWindow::home-area")
+            .find_all()
+            .into_iter()
+            .next()
+            .expect("home area exists");
+        let bottom = home.absolute_position().y + home.size().height;
+        let window_height = ui
+            .window()
+            .size()
+            .to_logical(ui.window().scale_factor())
+            .height;
+        assert!((bottom - window_height).abs() <= 1.0);
+    }
+
+    #[test]
     fn short_window_keeps_file_status_bar_above_the_bottom_edge() {
         use i_slint_backend_testing::ElementRoot;
 

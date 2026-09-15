@@ -1928,7 +1928,7 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                if root.active-is-home: Rectangle {
+                if root.active-is-home: home-area := Rectangle {
                     vertical-stretch: 1;
                     background: VisualStyle.cffffff;
                     home-scroll := ScrollView {
@@ -1974,6 +1974,8 @@ export component AppWindow inherits Window {
 
                 content-area := Rectangle {
                     visible: !root.active-is-home;
+                    min-height: 0px;
+                    max-height: root.active-is-home ? 0px : root.height;
                     vertical-stretch: root.active-is-home ? 0 : 1; background: VisualStyle.cffffff;
                     background-touch := TouchArea {
                         pointer-event(event) => {
