@@ -15,6 +15,12 @@ python tools/verify.py --release # 用户确认 Issue 后的本地 Release 构�
 
 本地正式发布默认使用 `./tools/publish.ps1`：它读取上一个 GitHub Release 之后关闭且恰好带一个 `type: *` 标签的 Issue；只要包含 `type: feature` 就升级 feature 版本，否则升级 bugfix 版本，并把这些 Issue 按类型写入中文 Release Note。没有已完成 Issue 或 Issue 类型标签不合规时停止发布。确需人工覆盖时才使用 `./tools/publish.ps1 major|feature|bugfix`；`-DryRun` 仅预演。脚本负责递增 `Cargo.toml` 版本、验证、提交、将 Release Note 写入标签并原子推送。用户只要求“更新版本并让 GitHub Action 打 Release 包”时，运行脚本并确认其成功触发 Action 后立即结束，不等待 Action 构建完成，也不重复执行脚本已覆盖的检查；只有用户明确要求确认云端发布结果时才等待。发布包可使用 `./tools/release.ps1 -Tag v<版本>` 在本地生成，输出位于 `artifacts/release/`；GitHub Release 由 `.github/workflows/release.yml` 读取标签说明并发布。版本唯一来源是 `Cargo.toml`。
 
+## Windows 持续验证（#106）
+
+主线 push、面向 main 的 PR 和手动运行触发 `.github/workflows/ci.yml`，在 Windows Server 2022 / PowerShell 7 上运行完整 `python tools/verify.py`。本地、CI 和标签打包共同读取 `rust-toolchain.toml`；Rust 版本只在该文件维护。首次本地验证需安装 Python 3.13、Rustup、Visual Studio C++/Windows SDK，以及 `Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser -Force -SkipPublisherCheck`。验证显式导入该 Pester 版本；Cargo 检查、测试和构建均使用 `--locked`。
+
+CI 只有仓库读取权限，不发布、不创建标签；同一 PR/引用的新运行取消旧运行，单次超时 60 分钟。日志、状态和汇总上传到 `windows-verification-<run-id>-<attempt>`，保存 14 天。成功与失败路径的云端复验命令及下载入口见 `docs/agent/debug-validation.md`；受控失败只修改 runner 的临时 checkout。
+
 ## UI 操作与验证
 
 - 禁止 Codex 操作、自动化或尝试控制 AsterFiles 的 UI，包括通过内置浏览器、Chrome、Computer Use、Playwright、agent-browser、截图点击或键鼠模拟等方式。

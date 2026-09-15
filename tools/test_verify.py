@@ -21,6 +21,50 @@ SPEC.loader.exec_module(verify)
 
 
 class VerifyTests(unittest.TestCase):
+    def test_real_failure_writes_log_summary_and_returns_nonzero(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            summary_path = root / "summary.json"
+            steps = [
+                ("failure-probe", [verify.sys.executable, "-c", "print('probe evidence'); raise SystemExit(7)"]),
+                ("must-not-run", [verify.sys.executable, "-c", "raise SystemExit(0)"]),
+            ]
+            with patch.multiple(verify, VERIFY_DIR=root, LOG_DIR=root, STATE_DIR=root, SUMMARY=summary_path), patch.object(
+                verify, "worktree_fingerprint", return_value="probe"
+            ), patch.object(verify, "validation_steps", return_value=steps), patch.object(verify, "emit"):
+                self.assertEqual(verify.main(["--skip-process-check"]), 1)
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(summary["steps"][0]["exit_code"], 7)
+            self.assertEqual(summary["steps"][1]["status"], "skipped")
+            self.assertIn("probe evidence", (root / "verify-failure-probe.log").read_text(encoding="utf-8"))
+
+    def test_missing_executable_is_a_logged_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(verify, "LOG_DIR", root), patch.object(verify, "emit"):
+                result = verify.run_step("missing", [str(root / "missing.exe")])
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("Unable to start", Path(result["log"]).read_text(encoding="utf-8"))
+
+    def test_setup_failure_writes_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            summary_path = root / "summary.json"
+            with patch.multiple(verify, VERIFY_DIR=root, LOG_DIR=root, STATE_DIR=root, SUMMARY=summary_path), patch.object(
+                verify, "stop_repository_processes", side_effect=RuntimeError("process inspection failed")
+            ), patch.object(verify, "emit"):
+                self.assertEqual(verify.main([]), 1)
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(summary["steps"][0]["name"], "setup")
+            self.assertEqual(summary["status"], "failed")
+            self.assertIn("process inspection failed", (root / "verify-setup.log").read_text(encoding="utf-8"))
+
+    def test_dependency_checks_and_builds_use_lockfile(self) -> None:
+        for name, command in verify.validation_steps(False, True):
+            if name in {"clippy", "test", "debug", "release"}:
+                self.assertIn("--locked", command)
+
     def test_modes_are_mutually_exclusive(self) -> None:
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             verify.parse_args(["--quick", "--release"])
@@ -42,14 +86,14 @@ class VerifyTests(unittest.TestCase):
                     "-NoLogo",
                     "-NoProfile",
                     "-Command",
-                    "Invoke-Pester -Script '.\\tools\\test_finish_issue.ps1' -EnableExit",
+                    "Import-Module Pester -RequiredVersion 4.10.1 -ErrorAction Stop; Invoke-Pester -Script '.\\tools\\test_finish_issue.ps1' -EnableExit",
                 ],
             )
 
     def test_validation_modes_build_debug_exactly_once(self) -> None:
         for quick in (True, False):
             steps = verify.validation_steps(quick=quick, include_release=False)
-            self.assertEqual(sum(command == ["cargo", "build"] for _, command in steps), 1)
+            self.assertEqual(sum(command == ["cargo", "build", "--locked"] for _, command in steps), 1)
 
     def test_full_validation_reuses_debug_for_scenarios(self) -> None:
         steps = verify.validation_steps(quick=False, include_release=False)

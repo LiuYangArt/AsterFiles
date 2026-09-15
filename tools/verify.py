@@ -246,21 +246,26 @@ def run_step(name: str, command: list[str]) -> dict[str, object]:
     log_path = LOG_DIR / f"verify-{name}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8", newline="") as log:
-        process = subprocess.run(
-            command,
-            cwd=ROOT,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
+        try:
+            process = subprocess.run(
+                command,
+                cwd=ROOT,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+            exit_code = process.returncode
+        except OSError as error:
+            log.write(f"Unable to start {command[0]}: {error}\n")
+            exit_code = 1
     result = {
         "name": name,
         "command": command,
-        "exit_code": process.returncode,
+        "exit_code": exit_code,
         "duration_seconds": round(time.monotonic() - started, 3),
         "log": str(log_path),
-        "status": "passed" if process.returncode == 0 else "failed",
+        "status": "passed" if exit_code == 0 else "failed",
     }
     emit({"event": "validation_step", **result})
     return result
@@ -324,7 +329,7 @@ def validation_steps(quick: bool, include_release: bool) -> list[tuple[str, list
                 "-NoLogo",
                 "-NoProfile",
                 "-Command",
-                "Invoke-Pester -Script '.\\tools\\test_publish.ps1' -EnableExit",
+                "Import-Module Pester -RequiredVersion 4.10.1 -ErrorAction Stop; Invoke-Pester -Script '.\\tools\\test_publish.ps1' -EnableExit",
             ],
         ),
         (
@@ -334,21 +339,21 @@ def validation_steps(quick: bool, include_release: bool) -> list[tuple[str, list
                 "-NoLogo",
                 "-NoProfile",
                 "-Command",
-                "Invoke-Pester -Script '.\\tools\\test_finish_issue.ps1' -EnableExit",
+                "Import-Module Pester -RequiredVersion 4.10.1 -ErrorAction Stop; Invoke-Pester -Script '.\\tools\\test_finish_issue.ps1' -EnableExit",
             ],
         ),
         ("format", ["cargo", "fmt", "--check"]),
         (
             "clippy",
-            ["cargo", "clippy", "--all-targets", "--all-features", "--", "-D", "warnings"],
+            ["cargo", "clippy", "--locked", "--all-targets", "--all-features", "--", "-D", "warnings"],
         ),
-        ("test", ["cargo", "test"]),
+        ("test", ["cargo", "test", "--locked"]),
+        ("debug", ["cargo", "build", "--locked"]),
     ]
-    steps.append(("debug", ["cargo", "build"]))
     if not quick:
         steps.extend(scenario_steps())
     if include_release:
-        steps.append(("release", ["cargo", "build", "--release"]))
+        steps.append(("release", ["cargo", "build", "--release", "--locked"]))
     return steps
 
 
@@ -421,20 +426,34 @@ def main(arguments: Sequence[str] | None = None) -> int:
     for directory in (VERIFY_DIR, LOG_DIR, STATE_DIR):
         directory.mkdir(parents=True, exist_ok=True)
 
-    if not args.skip_process_check:
-        try:
+    if args.release:
+        mode = "release"
+    elif args.quick:
+        mode = "quick"
+    else:
+        mode = "full-debug"
+    try:
+        if not args.skip_process_check:
             stop_repository_processes()
-        except RuntimeError as error:
-            emit({"event": "validation_setup_failed", "error": str(error)})
-            return 1
-
-    fingerprint = worktree_fingerprint()
+        fingerprint = worktree_fingerprint()
+    except (OSError, RuntimeError) as error:
+        log_path = LOG_DIR / "verify-setup.log"
+        log_path.write_text(f"{error}\n", encoding="utf-8")
+        failed_setup = {
+            "name": "setup",
+            "command": [],
+            "exit_code": 1,
+            "duration_seconds": 0,
+            "log": str(log_path),
+            "status": "failed",
+        }
+        write_summary([failed_setup], mode, False)
+        return 1
     reuse = (
         args.release
         and not args.no_reuse
         and reusable_full_validation(VALIDATION_STAMP, fingerprint, DEBUG)
     )
-    mode = "release" if args.release else "quick" if args.quick else "full-debug"
     if reuse:
         reused = {
             "name": "full-debug",
@@ -446,7 +465,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         }
         emit({"event": "validation_step", **reused})
         results = [reused]
-        results.extend(execute_steps([("release", ["cargo", "build", "--release"])], False))
+        results.extend(execute_steps([("release", ["cargo", "build", "--release", "--locked"])], False))
     else:
         results = execute_steps(
             validation_steps(args.quick, args.release),
