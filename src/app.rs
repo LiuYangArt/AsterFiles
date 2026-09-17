@@ -29952,6 +29952,17 @@ mod tests {
         let _ = ui.root_element().query_descendants().find_all();
     }
 
+    fn named_element(ui: &AppWindow, id: &str) -> Option<i_slint_backend_testing::ElementHandle> {
+        use i_slint_backend_testing::ElementRoot;
+
+        ui.root_element()
+            .query_descendants()
+            .match_id(id)
+            .find_all()
+            .into_iter()
+            .next()
+    }
+
     #[test]
     fn issue_83_ctrl_z_routes_only_from_the_file_list_focus_domain() {
         let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
@@ -30031,26 +30042,19 @@ mod tests {
 
     #[test]
     fn issue_113_home_fills_content_to_window_bottom() {
-        use i_slint_backend_testing::ElementRoot;
-
         let ui = headless_file_view();
         ui.set_page_state(3);
         ui.set_active_is_home(true);
         update_test_layout(&ui);
-        let home = ui
-            .root_element()
-            .query_descendants()
-            .match_id("AppWindow::home-area")
-            .find_all()
-            .into_iter()
-            .next()
-            .expect("home area exists");
-        let bottom = home.absolute_position().y + home.size().height;
+        let home = named_element(&ui, "AppWindow::home-area").expect("home area exists");
+        let top = home.absolute_position().y;
+        let bottom = top + home.size().height;
         let window_height = ui
             .window()
             .size()
             .to_logical(ui.window().scale_factor())
             .height;
+        assert!(top > 80.0 && top < 130.0);
         assert!((bottom - window_height).abs() <= 1.0);
     }
 
@@ -30096,6 +30100,49 @@ mod tests {
         let size = status.size();
         assert_eq!(size.height, 30.0);
         assert!(position.y + size.height <= 520.0);
+    }
+
+    #[test]
+    fn issue_115_content_area_does_not_publish_window_height_as_max() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
+        assert!(!source.contains("max-height: root.height"));
+        assert!(!source.contains("Rectangle { min-height: 0px; }"));
+        assert!(source.contains("content-pane := Rectangle"));
+        assert!(source.contains("if !root.active-is-home: content-area := Rectangle"));
+        assert!(source.contains("if !root.active-is-home: status-bar := Rectangle"));
+        assert!(source.contains("if root.active-is-home: home-area := Rectangle"));
+    }
+
+    #[test]
+    fn issue_115_switching_home_keeps_window_height_and_fills_bottom() {
+        let ui = headless_file_view();
+        ui.window()
+            .set_size(slint::LogicalSize::new(1_180.0, 960.0));
+        update_test_layout(&ui);
+        let scale = ui.window().scale_factor();
+        let height = || ui.window().size().to_logical(scale).height;
+        assert!((height() - 960.0).abs() < 0.5);
+
+        ui.set_active_is_home(true);
+        update_test_layout(&ui);
+        assert!((height() - 960.0).abs() < 0.5);
+        let home = named_element(&ui, "AppWindow::home-area").expect("home area exists");
+        let home_top = home.absolute_position().y;
+        assert!(home_top > 80.0 && home_top < 130.0);
+        assert!((home_top + home.size().height - 960.0).abs() <= 1.0);
+        assert!(named_element(&ui, "AppWindow::content-area").is_none());
+        assert!(named_element(&ui, "AppWindow::status-bar").is_none());
+
+        ui.set_active_is_home(false);
+        update_test_layout(&ui);
+        assert!((height() - 960.0).abs() < 0.5);
+        assert!(named_element(&ui, "AppWindow::home-area").is_none());
+        let files =
+            named_element(&ui, "AppWindow::content-area").expect("file content area exists");
+        assert!(files.absolute_position().y > 80.0 && files.absolute_position().y < 180.0);
+        let status = named_element(&ui, "AppWindow::status-bar").expect("file status bar exists");
+        assert_eq!(status.size().height, 30.0);
+        assert!((status.absolute_position().y + status.size().height - 960.0).abs() <= 1.0);
     }
 
     #[test]

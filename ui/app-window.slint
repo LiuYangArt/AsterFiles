@@ -1928,8 +1928,17 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                if root.active-is-home: home-area := Rectangle {
+                // Overlay home/file panes so neither publishes a finite window max-height.
+                content-pane := Rectangle {
                     vertical-stretch: 1;
+                    min-height: 0px;
+                    clip: true;
+
+                if root.active-is-home: home-area := Rectangle {
+                    x: 0px;
+                    y: 0px;
+                    width: parent.width;
+                    height: parent.height;
                     background: VisualStyle.cffffff;
                     home-scroll := ScrollView {
                         width: parent.width; height: parent.height;
@@ -1972,11 +1981,12 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                content-area := Rectangle {
-                    visible: !root.active-is-home;
-                    min-height: 0px;
-                    max-height: root.active-is-home ? 0px : root.height;
-                    vertical-stretch: root.active-is-home ? 0 : 1; background: VisualStyle.cffffff;
+                if !root.active-is-home: content-area := Rectangle {
+                    x: 0px;
+                    y: 0px;
+                    width: parent.width;
+                    height: parent.height;
+                    background: VisualStyle.cffffff;
                     background-touch := TouchArea {
                         pointer-event(event) => {
                             if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
@@ -2503,9 +2513,10 @@ accessible-label: entry.name;
 
                 }
 
-                status-bar := Rectangle {
-                    visible: !root.active-is-home;
-                    height: root.active-is-home ? 0px : 30px; background: VisualStyle.cfafbfc;
+                }
+
+                if !root.active-is-home: status-bar := Rectangle {
+                    height: 30px; background: VisualStyle.cfafbfc;
                     Text { x: 14px; text: root.operation-error != "" ? root.operation-error : root.status-text; color: root.operation-error != "" ? VisualStyle.cc42b1c : VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; }
                     Rectangle {
                         x: parent.width - 220px; width: 84px; height: 26px; y: 2px;
