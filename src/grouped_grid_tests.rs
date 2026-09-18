@@ -272,9 +272,7 @@ fn issue_91_batches_and_shorter_content_keep_full_data_and_bounded_nodes() {
     );
     assert!(ui.get_grouped_grid_visible_rows().row_count() < ui.get_grid_rows().row_count());
     assert!(ui.get_file_viewport_height() > 0.0);
-    ui.window().set_size(slint::LogicalSize::new(900.0, 760.0));
-    refresh_ui(&ui, &state);
-    settle(&ui);
+    resize_window(&ui, &state, 900.0, 760.0);
     assert!(ui.get_file_viewport_width() > 0.0);
     assert_eq!(ui.get_grid_column_count(), 6);
 }
@@ -355,4 +353,115 @@ fn issue_97_intermediate_zoom_preserves_grouped_anchor_and_selection() {
         }));
     }
     assert!(observed_columns.len() >= 3);
+}
+
+fn resize_window(ui: &AppWindow, state: &WindowSessions, width: f32, height: f32) {
+    ui.window().set_size(slint::LogicalSize::new(width, height));
+    reflow_after_window_resize(ui, &state.shared, state.window_id, logical_window_width(ui));
+    settle(ui);
+}
+
+fn latest_request(state: &WindowSessions) -> RequestId {
+    state.lock().unwrap().active().latest_request
+}
+
+fn assert_grid_reflow(ui: &AppWindow, state: &WindowSessions, width: f32, mode: ViewMode) {
+    let request_id = latest_request(state);
+    resize_window(ui, state, width, 760.0);
+    let expected = grid_column_count_for_width(
+        estimated_file_viewport_width(width),
+        file_layout_geometry(mode).card_width,
+    ) as i32;
+    assert_eq!(ui.get_grid_column_count(), expected, "width={width}");
+    assert!(
+        (ui.get_file_viewport_width() - estimated_file_viewport_width(width)).abs()
+            <= FILE_GRID_VIEWPORT_MATCH_SLACK,
+        "width={width}: viewport {} != estimated {}",
+        ui.get_file_viewport_width(),
+        estimated_file_viewport_width(width)
+    );
+    let last_len = ui
+        .get_grid_rows()
+        .iter()
+        .filter(|row| !row.group_header)
+        .last()
+        .map_or(0, |row| row.entries.row_count());
+    assert!(
+        last_len > 0 && last_len <= expected.max(1) as usize,
+        "width={width}"
+    );
+    refresh_ui(ui, state);
+    settle(ui);
+    assert_eq!(
+        ui.get_grid_column_count(),
+        expected,
+        "refresh changed columns at {width}"
+    );
+    assert_eq!(latest_request(state), request_id);
+}
+
+#[test]
+fn issue_116_grouped_resize_hook_reflows_columns_without_directory_reload() {
+    let (ui, state) = fixture(ViewMode::MediumIcons);
+    ui.set_file_viewport_y(-5000.0);
+    settle(&ui);
+    let request_id = latest_request(&state);
+    let mut observed = HashSet::new();
+    for width in [900.0, 1180.0, 1400.0] {
+        assert_grid_reflow(&ui, &state, width, ViewMode::MediumIcons);
+        observed.insert(ui.get_grid_column_count());
+        assert!(ui.get_grouped_grid_enabled());
+        assert!(ui.get_file_viewport_y() < 0.0);
+        let maximum =
+            projected_scroll_maximum(&ui, ViewMode::MediumIcons, ui.get_file_viewport_height());
+        assert!(ui.get_file_viewport_y() >= -maximum);
+        let visible = ui.get_grouped_grid_visible_rows();
+        assert!(visible.row_count() > 0 && visible.row_count() < 30);
+        assert!(visible.row_count() < ui.get_grid_rows().row_count());
+    }
+    assert!(observed.len() >= 3);
+    assert_eq!(latest_request(&state), request_id);
+}
+
+#[test]
+fn issue_116_ungrouped_resize_hook_reflows_columns_without_directory_reload() {
+    let (ui, state) = fixture(ViewMode::LargeIcons);
+    state
+        .lock()
+        .unwrap()
+        .update_directory_preference(PathBuf::from(r"C:\group"), |preference| {
+            preference.group_field = GroupField::None;
+        });
+    refresh_ui(&ui, &state);
+    settle(&ui);
+    assert!(!ui.get_grouped_grid_enabled());
+    let mut observed = HashSet::new();
+    for width in [900.0, 1180.0, 1600.0] {
+        assert_grid_reflow(&ui, &state, width, ViewMode::LargeIcons);
+        observed.insert(ui.get_grid_column_count());
+        assert!(!ui.get_grouped_grid_enabled());
+        assert_eq!(ui.get_grouped_grid_visible_rows().row_count(), 0);
+    }
+    assert!(observed.len() >= 3);
+}
+
+#[test]
+fn issue_116_search_resize_hook_reflows_columns_without_directory_reload() {
+    let (ui, state) = fixture(ViewMode::Tiles);
+    {
+        let mut app = state.lock().unwrap();
+        app.search_view.view_mode = ViewMode::Tiles;
+        let tab = app.tab_mut(TabId(1)).unwrap();
+        tab.page_source = PageSource::Search;
+        tab.search_total = Some(1200);
+    }
+    refresh_ui(&ui, &state);
+    settle(&ui);
+    assert!(!ui.get_grouped_grid_enabled());
+    let mut observed = HashSet::new();
+    for width in [900.0, 1180.0, 1600.0] {
+        assert_grid_reflow(&ui, &state, width, ViewMode::Tiles);
+        observed.insert(ui.get_grid_column_count());
+    }
+    assert!(observed.len() >= 3);
 }

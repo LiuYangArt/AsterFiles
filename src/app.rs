@@ -2832,6 +2832,62 @@ struct FileLayoutGeometry {
     grid: bool,
 }
 
+// Match Slint file-grid chrome: sidebar breakpoints, reserved scrollbar, and row padding/gap.
+const WINDOW_MINIMAL_WIDTH: f32 = 900.0;
+const WINDOW_COMPACT_WIDTH: f32 = 1000.0;
+const NAVIGATION_SIDEBAR_COMPACT_WIDTH: f32 = 184.0;
+const NAVIGATION_SIDEBAR_FULL_WIDTH: f32 = 218.0;
+const FILE_GRID_SCROLLBAR_RESERVE: f32 = 28.0;
+const FILE_GRID_COLUMN_GAP: f32 = 8.0;
+const FILE_GRID_HORIZONTAL_INSET: f32 = 24.0;
+const FILE_GRID_VIEWPORT_MATCH_SLACK: f32 = 2.0;
+
+fn logical_window_width(ui: &AppWindow) -> f32 {
+    ui.window().size().width as f32 / ui.window().scale_factor()
+}
+
+fn navigation_sidebar_width(window_width: f32) -> f32 {
+    if window_width < WINDOW_MINIMAL_WIDTH {
+        0.0
+    } else if window_width < WINDOW_COMPACT_WIDTH {
+        NAVIGATION_SIDEBAR_COMPACT_WIDTH
+    } else {
+        NAVIGATION_SIDEBAR_FULL_WIDTH
+    }
+}
+
+fn estimated_file_viewport_width(window_width: f32) -> f32 {
+    (window_width - navigation_sidebar_width(window_width) - FILE_GRID_SCROLLBAR_RESERVE).max(0.0)
+}
+
+fn grid_available_width(ui: &AppWindow) -> f32 {
+    let estimated = estimated_file_viewport_width(logical_window_width(ui));
+    let measured = ui.get_file_viewport_width();
+    if measured > 1.0 && (measured - estimated).abs() <= FILE_GRID_VIEWPORT_MATCH_SLACK {
+        measured
+    } else if estimated > 1.0 {
+        estimated
+    } else {
+        measured.max(1.0)
+    }
+}
+
+fn grid_column_count_for_width(available_width: f32, card_width: f32) -> usize {
+    let slot = (card_width + FILE_GRID_COLUMN_GAP).max(1.0);
+    ((available_width - FILE_GRID_HORIZONTAL_INSET) / slot)
+        .floor()
+        .max(1.0) as usize
+}
+
+fn grid_column_count_for_view(ui: &AppWindow, view_mode: ViewMode) -> usize {
+    let geometry = file_layout_geometry(view_mode);
+    if !geometry.grid {
+        1
+    } else {
+        grid_column_count_for_width(grid_available_width(ui), geometry.card_width)
+    }
+}
+
 fn file_layout_geometry(view_mode: ViewMode) -> FileLayoutGeometry {
     match view_mode {
         ViewMode::Details => FileLayoutGeometry {
@@ -13047,11 +13103,7 @@ fn wire_mouse_navigation(
                 "winit-resized",
             );
             let logical_width = size.width as f32 / ui.window().scale_factor();
-            ui.set_window_width(logical_width);
-            ui.set_home_content_width(home_content_width_for_window(logical_width));
-            if ui.get_active_is_home() {
-                refresh_window_ui(&ui, &shared_state, window_id);
-            }
+            reflow_after_window_resize(&ui, &shared_state, window_id, logical_width);
             request_visible_file_images(&ui, &shared_state, window_id, &senders.thumbnail);
             return EventResult::Propagate;
         }
@@ -13065,7 +13117,12 @@ fn wire_mouse_navigation(
                 let scheduler = senders.thumbnail.clone();
                 slint::Timer::single_shot(Duration::ZERO, move || {
                     if let Some(ui) = weak.upgrade() {
-                        refresh_ui(&ui, &state);
+                        reflow_after_window_resize(
+                            &ui,
+                            &state.shared,
+                            window_id,
+                            logical_window_width(&ui),
+                        );
                         request_visible_file_images(&ui, &state.shared, window_id, &scheduler);
                     }
                 });
@@ -19521,15 +19578,12 @@ fn home_item_rows(
 }
 
 fn home_content_width_for_window(window_width: f32) -> f32 {
-    let sidebar_width = if window_width < 900.0 {
-        0.0
-    } else if window_width < 1000.0 {
-        184.0
+    let horizontal_padding = if window_width < WINDOW_MINIMAL_WIDTH {
+        36.0
     } else {
-        218.0
+        60.0
     };
-    let horizontal_padding = if window_width < 900.0 { 36.0 } else { 60.0 };
-    (window_width - sidebar_width - horizontal_padding).max(264.0)
+    (window_width - navigation_sidebar_width(window_width) - horizontal_padding).max(264.0)
 }
 
 fn sorted_network_locations(app: &AppState) -> Vec<&NetworkLocation> {
@@ -21335,6 +21389,23 @@ fn refresh_window_ui(ui: &AppWindow, state: &SharedSessions, window_id: WindowId
     apply_pending_rename_ui(ui, state, window_id);
 }
 
+fn reflow_after_window_resize(
+    ui: &AppWindow,
+    state: &SharedSessions,
+    window_id: WindowId,
+    logical_width: f32,
+) {
+    ui.set_window_width(logical_width);
+    ui.set_home_content_width(home_content_width_for_window(logical_width));
+    let anchor = if ui.get_active_is_home() || !projected_view_mode(ui).uses_grid_layout() {
+        None
+    } else {
+        capture_zoom_anchor(ui, 16.0, 0.0)
+    };
+    refresh_window_ui(ui, state, window_id);
+    restore_zoom_anchor(ui, anchor);
+}
+
 fn apply_pending_rename_ui(ui: &AppWindow, state: &SharedSessions, window_id: WindowId) {
     let pending = state.lock().ok().and_then(|mut app| {
         let pending = app.pending_rename_ui.get(&window_id)?.clone();
@@ -21715,7 +21786,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
             .unwrap_or_default()
             .into(),
     );
-    let logical_width = ui.window().size().width as f32 / ui.window().scale_factor();
+    let logical_width = logical_window_width(ui);
     ui.set_window_width(logical_width);
     ui.set_home_content_width(home_content_width_for_window(logical_width));
     let active_is_settings = tab.kind == TabKind::Settings;
@@ -21782,11 +21853,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
         ui.set_projected_file_request_id(projected_request_id);
     }
     let display_entries = directory_display_entries(tab);
-    let geometry = file_layout_geometry(view_mode);
-    let grid_columns = (((ui.window().size().width as f32 / ui.window().scale_factor()) - 292.0)
-        / (geometry.card_width + 8.0).max(1.0))
-    .floor()
-    .max(1.0) as usize;
+    let grid_columns = grid_column_count_for_view(ui, view_mode);
     let total = tab.search_total.unwrap_or(tab.entries.len() as u32);
     let search_index =
         search_result_index_at_scroll(ui.get_search_scroll_y(), total, view_mode, grid_columns);
@@ -24448,6 +24515,29 @@ mod tests {
             assert_eq!(geometry.card_width, card_width, "{mode:?}");
             assert_eq!(geometry.card_height, card_height, "{mode:?}");
         }
+    }
+
+    #[test]
+    fn issue_116_grid_columns_use_content_width_instead_of_window_minus_292() {
+        assert_eq!(navigation_sidebar_width(1180.0), 218.0);
+        assert_eq!(navigation_sidebar_width(950.0), 184.0);
+        assert_eq!(navigation_sidebar_width(800.0), 0.0);
+        assert_eq!(estimated_file_viewport_width(1180.0), 934.0);
+        for (width, card_width, columns) in
+            [(1180.0, 88.0, 9), (900.0, 88.0, 6), (1180.0, 292.0, 3)]
+        {
+            assert_eq!(
+                grid_column_count_for_width(estimated_file_viewport_width(width), card_width),
+                columns,
+                "width={width} card={card_width}"
+            );
+        }
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
+        assert!(source.contains("width: parent.width - 28px;"));
+        assert!(source.contains("padding-left: 16px;"));
+        assert!(source.contains("padding-right: 16px;"));
+        assert!(source.contains("spacing: 8px;"));
+        assert!(source.contains("width: root.compact ? 184px : 218px;"));
     }
 
     #[test]

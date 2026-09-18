@@ -19,6 +19,7 @@ __pycache__/
 # Editors and local tooling
 /.idea/
 /.vscode/
+/.codex/
 *.suo
 *.user
 *.userosscache
