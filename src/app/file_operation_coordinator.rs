@@ -576,15 +576,11 @@ pub(super) fn finish_file_operation(
             .task(id)
             .is_some_and(|task| task.cancellation.is_cancelled());
         let has_retained_source = app.operations.task(id).is_some_and(|task| {
-            task.items.iter().any(|item| {
-                item.state == ItemState::Succeeded && item.error.is_some()
-            })
+            task.items
+                .iter()
+                .any(|item| item.state == ItemState::Succeeded && item.error.is_some())
         });
-        let terminal = file_operation_terminal_state(
-            cancelled,
-            &result,
-            has_retained_source,
-        );
+        let terminal = file_operation_terminal_state(cancelled, &result, has_retained_source);
         let (resource, kind, origin_tab, task_items, undo_cut_paths, undo_task_source_kind) = app
             .operations
             .task(id)
@@ -711,7 +707,13 @@ pub(super) fn finish_file_operation(
             Vec::new()
         };
 
-        (affected, next, clear_completed_cut, undo_failure, containment_notice)
+        (
+            affected,
+            next,
+            clear_completed_cut,
+            undo_failure,
+            containment_notice,
+        )
     };
     Some(OperationCompletion {
         affected,

@@ -435,7 +435,10 @@ fn read_network_directory_batches(
     }
     result.map(|skipped| ReadOutcome::Complete { skipped })
 }
-pub(super) fn run_directory_request(request: DirectoryRequest, events: &mpsc::Sender<DirectoryEvent>) {
+pub(super) fn run_directory_request(
+    request: DirectoryRequest,
+    events: &mpsc::Sender<DirectoryEvent>,
+) {
     if crate::network::is_unc_server_root(&request.path) {
         platform::windows::network::record_runtime_event("network_root_request_started");
     }

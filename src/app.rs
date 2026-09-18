@@ -51,10 +51,10 @@ use crate::{
 pub(crate) mod action_scenario;
 mod actions;
 mod directory_loading;
-#[path = "library_loading.rs"]
-mod library_loading;
 mod file_operation_coordinator;
 mod file_operation_worker;
+#[path = "library_loading.rs"]
+mod library_loading;
 #[cfg(test)]
 mod test_support;
 mod window_sessions;
@@ -27890,9 +27890,7 @@ mod tests {
     fn issue_103_exit_cancels_all_windows_without_losing_session_paths() {
         let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\One")], 0, [0, 1, 2, 3]);
         app.register_window(
-            vec![NavigationLocation::Directory(PathBuf::from(
-                r"C:\Two",
-            ))],
+            vec![NavigationLocation::Directory(PathBuf::from(r"C:\Two"))],
             0,
             test_window_placement(240),
         );
