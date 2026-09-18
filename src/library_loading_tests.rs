@@ -2,9 +2,10 @@ use super::super::directory_loading::{
     DirectoryEvent, DirectoryRequest, network_directory_request,
     spawn_directory_workers_with_library_reader,
 };
-use super::{POLL, start};
+use super::super::library_source_group_projections;
+use super::{POLL, SOURCE_SLOTS, SourceReader, start};
 use crate::{
-    domain::{EntryId, FileEntry, RequestId, TabId},
+    domain::{EntryId, FileEntry, FolderSizeState, LibraryLocationId, TabId},
     platform,
 };
 use std::{
