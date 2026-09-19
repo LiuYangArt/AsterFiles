@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::domain::{LoadState, TabSession};
+use crate::platform::windows::address_path::normalize_external_launch_path;
 
 const DEFAULT_STATE_DIR: &str = "artifacts/state";
 
@@ -126,7 +127,9 @@ impl AgentOptions {
                 _ if argument.to_string_lossy().starts_with('-') => {
                     return Err(format!("unknown argument: {}", argument.to_string_lossy()));
                 }
-                _ => options.external_paths.push(PathBuf::from(argument)),
+                _ => options
+                    .external_paths
+                    .push(normalize_external_launch_path(PathBuf::from(argument))),
             }
         }
         if options.no_ui && options.scenario.is_none() {
@@ -459,6 +462,25 @@ mod tests {
             vec![
                 PathBuf::from(r"C:\Folder With Spaces"),
                 PathBuf::from(r"C:\中文"),
+            ]
+        );
+    }
+
+    #[test]
+    fn external_paths_repair_drive_root_argv_corruption_before_identity() {
+        let options = AgentOptions::from_arguments([
+            OsString::from(r#"D:""#),
+            OsString::from(r"E:\."),
+            OsString::from("f:"),
+        ])
+        .expect("drive roots are accepted after repair");
+
+        assert_eq!(
+            options.external_paths,
+            vec![
+                PathBuf::from(r"D:\"),
+                PathBuf::from(r"E:\"),
+                PathBuf::from(r"f:\"),
             ]
         );
     }

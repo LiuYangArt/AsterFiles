@@ -33,9 +33,11 @@ const BOUND_EXECUTABLE: &str = "BoundExecutable";
 const BACKUP_COMPLETE: &str = "BackupComplete";
 
 // Folder is the Windows Shell class shared by filesystem folders and drive roots.
+// "%1\." keeps a non-backslash character before the closing quote so CommandLineToArgvW does not
+// turn drive roots like D:\ into D:".
 const FOLDER_TARGETS: &[Target] = &[
-    Target::new("Open", r"Folder\shell\open\command", Some("%1")),
-    Target::new("Explore", r"Folder\shell\explore\command", Some("%1")),
+    Target::new("Open", r"Folder\shell\open\command", Some(r"%1\.")),
+    Target::new("Explore", r"Folder\shell\explore\command", Some(r"%1\.")),
 ];
 const WIN_E_TARGETS: &[Target] = &[Target::new(
     "OpenNewWindow",
@@ -776,7 +778,7 @@ mod tests {
             test.executable.as_os_str(),
         )?;
         write_dword(&test.registry.state_key(FOLDER_STATE), BACKUP_COMPLETE, 1)?;
-        write_string(&key, "", command_for(&test.executable, Some("%1")))?;
+        write_string(&key, "", command_for(&test.executable, Some(r"%1\.")))?;
         write_string(&key, "DelegateExecute", "")?;
 
         assert!(matches!(
@@ -817,10 +819,11 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn command_preserves_unicode_path() {
+    fn command_preserves_unicode_path_and_drive_root_safe_argument() {
         assert_eq!(
-            command_for(Path::new(r"C:\便携 应用\AsterFiles.exe"), Some("%1")),
-            OsString::from(r#""C:\便携 应用\AsterFiles.exe" "%1""#)
+            command_for(Path::new(r"C:\便携 应用\AsterFiles.exe"), FOLDER_TARGETS[0].argument),
+            OsString::from(r#""C:\便携 应用\AsterFiles.exe" "%1\.""#)
         );
+        assert_eq!(FOLDER_TARGETS[1].argument, FOLDER_TARGETS[0].argument);
     }
 }

@@ -19,10 +19,36 @@ pub fn normalize_address_path(input: &str) -> PathBuf {
             *unit = u16::from(b'\\');
         }
     }
-    if wide.len() == 2 && (wide[0] as u8).is_ascii_alphabetic() && wide[1] == u16::from(b':') {
-        wide.push(u16::from(b'\\'));
-    }
+    repair_drive_root_argv(&mut wide);
     PathBuf::from(OsString::from_wide(&wide))
+}
+
+/// Normalize folder paths from Windows Shell / `CommandLineToArgvW` before they become navigation
+/// identity: repair `D:"`, bare `D:`, and the `"%1\."` template suffix.
+pub fn normalize_external_launch_path(path: PathBuf) -> PathBuf {
+    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if wide.len() >= 2
+        && wide[wide.len() - 2] == u16::from(b'\\')
+        && wide[wide.len() - 1] == u16::from(b'.')
+    {
+        wide.truncate(wide.len() - 2);
+    }
+    repair_drive_root_argv(&mut wide);
+    PathBuf::from(OsString::from_wide(&wide))
+}
+
+fn repair_drive_root_argv(wide: &mut Vec<u16>) {
+    if wide.len() < 2
+        || !(wide[0] as u8).is_ascii_alphabetic()
+        || wide[1] != u16::from(b':')
+    {
+        return;
+    }
+    match wide.len() {
+        2 => wide.push(u16::from(b'\\')),
+        3 if wide[2] == u16::from(b'"') => wide[2] = u16::from(b'\\'),
+        _ => {}
+    }
 }
 
 fn expand_environment_strings(input: &OsStr) -> OsString {
@@ -54,6 +80,7 @@ mod tests {
     #[test]
     fn normalizes_drive_root_slashes_unc_and_outer_quotes() {
         assert_eq!(normalize_address_path("F:"), PathBuf::from(r"F:\"));
+        assert_eq!(normalize_address_path(r#"D:""#), PathBuf::from(r"D:\"));
         assert_eq!(
             normalize_address_path(r#""F:/Assets/Mixed\Child""#),
             PathBuf::from(r"F:\Assets\Mixed\Child")
@@ -61,6 +88,30 @@ mod tests {
         assert_eq!(
             normalize_address_path("//server/share/folder"),
             PathBuf::from(r"\\server\share\folder")
+        );
+    }
+
+    #[test]
+    fn external_launch_repairs_drive_root_quote_and_dot_suffix() {
+        assert_eq!(
+            normalize_external_launch_path(PathBuf::from(r#"D:""#)),
+            PathBuf::from(r"D:\")
+        );
+        assert_eq!(
+            normalize_external_launch_path(PathBuf::from("c:")),
+            PathBuf::from(r"c:\")
+        );
+        assert_eq!(
+            normalize_external_launch_path(PathBuf::from(r"D:\.")),
+            PathBuf::from(r"D:\")
+        );
+        assert_eq!(
+            normalize_external_launch_path(PathBuf::from(r"D:\Folder With Spaces\.")),
+            PathBuf::from(r"D:\Folder With Spaces")
+        );
+        assert_eq!(
+            normalize_external_launch_path(PathBuf::from(r"D:\中文")),
+            PathBuf::from(r"D:\中文")
         );
     }
 
