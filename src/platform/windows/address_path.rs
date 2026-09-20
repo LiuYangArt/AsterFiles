@@ -38,10 +38,7 @@ pub fn normalize_external_launch_path(path: PathBuf) -> PathBuf {
 }
 
 fn repair_drive_root_argv(wide: &mut Vec<u16>) {
-    if wide.len() < 2
-        || !(wide[0] as u8).is_ascii_alphabetic()
-        || wide[1] != u16::from(b':')
-    {
+    if wide.len() < 2 || !(wide[0] as u8).is_ascii_alphabetic() || wide[1] != u16::from(b':') {
         return;
     }
     match wide.len() {

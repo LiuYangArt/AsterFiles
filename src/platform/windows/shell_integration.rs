@@ -821,7 +821,10 @@ mod tests {
     #[test]
     fn command_preserves_unicode_path_and_drive_root_safe_argument() {
         assert_eq!(
-            command_for(Path::new(r"C:\便携 应用\AsterFiles.exe"), FOLDER_TARGETS[0].argument),
+            command_for(
+                Path::new(r"C:\便携 应用\AsterFiles.exe"),
+                FOLDER_TARGETS[0].argument
+            ),
             OsString::from(r#""C:\便携 应用\AsterFiles.exe" "%1\.""#)
         );
         assert_eq!(FOLDER_TARGETS[1].argument, FOLDER_TARGETS[0].argument);
