@@ -100,83 +100,6 @@ pub fn parse_external_argument(argument: &OsStr) -> ParsedExternalArgument {
     ParsedExternalArgument::Launch(ExternalLaunchPath::open(PathBuf::from(argument)))
 }
 
-pub fn command_line_arguments(command: &OsStr) -> Vec<OsString> {
-    let wide = command.encode_wide().chain(Some(0)).collect::<Vec<_>>();
-    let mut argc = 0;
-    let argv =
-        unsafe { windows_sys::Win32::UI::Shell::CommandLineToArgvW(wide.as_ptr(), &mut argc) };
-    if argv.is_null() || argc <= 0 {
-        return Vec::new();
-    }
-    let mut arguments = Vec::with_capacity(argc as usize);
-    for index in 0..argc as usize {
-        let ptr = unsafe { *argv.add(index) };
-        if ptr.is_null() {
-            continue;
-        }
-        let mut length = 0;
-        unsafe {
-            while *ptr.add(length) != 0 {
-                length += 1;
-            }
-        }
-        arguments.push(OsString::from_wide(unsafe {
-            std::slice::from_raw_parts(ptr, length)
-        }));
-    }
-    unsafe { windows_sys::Win32::Foundation::LocalFree(argv.cast()) };
-    arguments
-}
-
-pub fn select_target_from_command_line(command: &OsStr) -> Option<PathBuf> {
-    let wide = command.encode_wide().collect::<Vec<_>>();
-    for prefix in [b"/select,".as_slice(), b"-select,".as_slice()] {
-        if let Some(offset) = find_ascii_ignore_case(&wide, prefix) {
-            let mut path = OsString::from_wide(&wide[offset + prefix.len()..]);
-            path = strip_outer_quotes(trim_os(path));
-            let launch = ExternalLaunchPath::select(PathBuf::from(path));
-            if !launch.path.as_os_str().is_empty() {
-                return Some(launch.path);
-            }
-        }
-    }
-    let arguments = command_line_arguments(command);
-    let mut index = 0;
-    while index < arguments.len() {
-        match parse_external_argument(&arguments[index]) {
-            ParsedExternalArgument::SelectNext => {
-                let path = arguments.get(index + 1)?;
-                return Some(ExternalLaunchPath::select(PathBuf::from(path)).path);
-            }
-            ParsedExternalArgument::Launch(_) => index += 1,
-        }
-    }
-    None
-}
-
-fn find_ascii_ignore_case(wide: &[u16], ascii: &[u8]) -> Option<usize> {
-    wide.windows(ascii.len())
-        .position(|window| ascii_eq_ignore_case(window, ascii))
-}
-
-fn trim_os(value: OsString) -> OsString {
-    let wide = value.encode_wide().collect::<Vec<_>>();
-    let start = wide
-        .iter()
-        .position(|unit| *unit != u16::from(b' ') && *unit != u16::from(b'\t'))
-        .unwrap_or(wide.len());
-    let end = wide
-        .iter()
-        .rposition(|unit| *unit != u16::from(b' ') && *unit != u16::from(b'\t'))
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    if start >= end {
-        OsString::new()
-    } else {
-        OsString::from_wide(&wide[start..end])
-    }
-}
-
 pub fn classify_external_launch_path(item: &ExternalLaunchPath) -> ClassifiedExternalLaunch {
     let is_directory = std::fs::metadata(&item.path)
         .ok()
@@ -398,22 +321,6 @@ mod tests {
             ParsedExternalArgument::Launch(ExternalLaunchPath::open(PathBuf::from(
                 r"//server/share/file.txt"
             )))
-        );
-        assert_eq!(
-            select_target_from_command_line(OsStr::new(
-                r#"C:\Windows\explorer.exe /select,"D:\Downloads\中文 file.zip""#
-            )),
-            Some(PathBuf::from(r"D:\Downloads\中文 file.zip"))
-        );
-        assert_eq!(
-            select_target_from_command_line(OsStr::new(
-                r"explorer.exe /select,C:\Folder With Spaces\a.csv"
-            )),
-            Some(PathBuf::from(r"C:\Folder With Spaces\a.csv"))
-        );
-        assert_eq!(
-            select_target_from_command_line(OsStr::new(r"fdm.exe --background")),
-            None
         );
     }
 

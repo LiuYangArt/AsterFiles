@@ -16,7 +16,7 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS},
     System::Registry::{
-        HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_BINARY, REG_DWORD,
+        HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_BINARY, REG_DWORD, REG_EXPAND_SZ,
         REG_OPEN_CREATE_OPTIONS, REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE, RegCloseKey,
         RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
         RegSetValueExW,
@@ -470,7 +470,8 @@ fn read_string(path: &str, name: &str) -> io::Result<Option<OsString>> {
     let Some(value) = read_value(path, name)? else {
         return Ok(None);
     };
-    if value.value_type != REG_SZ || value.data.len() % 2 != 0 {
+    // Shell commands can contain environment variables; preserve the unexpanded original for restore.
+    if !matches!(value.value_type, REG_SZ | REG_EXPAND_SZ) || value.data.len() % 2 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid registry string {path}\\{name}"),
@@ -693,6 +694,92 @@ mod tests {
             let _ = delete_tree(HKEY_CURRENT_USER, &self.root, true);
             let _ = fs::remove_file(&self.executable);
         }
+    }
+
+    #[test]
+    fn issue_123_expandable_commands_enable_and_restore_original_type_and_bytes() -> io::Result<()>
+    {
+        for (integration, targets, command) in [
+            (FOLDER_STATE, FOLDER_TARGETS, r"%SystemRoot%\Explorer.exe"),
+            (
+                FOLDER_STATE,
+                FOLDER_TARGETS,
+                r#""%LOCALAPPDATA%\Files\Files.App.Launcher.exe" "%1""#,
+            ),
+            (
+                WIN_E_STATE,
+                WIN_E_TARGETS,
+                r#""%LOCALAPPDATA%\Files\Files.App.Launcher.exe""#,
+            ),
+        ] {
+            let test = TestScope::new()?;
+            let original = RegistryValue {
+                value_type: REG_EXPAND_SZ,
+                data: string_value(command).data,
+            };
+            let delegate = string_value("{11dbb47c-a525-400b-9e80-a54615a090c0}");
+            for target in targets {
+                let key = test.registry.class_key(target.key);
+                write_raw(&key, "", original.value_type, &original.data)?;
+                write_raw(&key, "DelegateExecute", delegate.value_type, &delegate.data)?;
+            }
+            assert_eq!(
+                status(&test.registry, integration, targets, &test.executable)?,
+                ShellIntegrationStatus::Disabled,
+            );
+            enable(&test.registry, integration, targets, &test.executable)?;
+            enable(&test.registry, integration, targets, &test.executable)?;
+            assert_eq!(
+                status(&test.registry, integration, targets, &test.executable)?,
+                ShellIntegrationStatus::Enabled {
+                    executable: test.executable.clone()
+                },
+            );
+            restore(&test.registry, integration, targets)?;
+            for target in targets {
+                let key = test.registry.class_key(target.key);
+                assert_eq!(read_value(&key, "")?, Some(original.clone()));
+                assert_eq!(read_value(&key, "DelegateExecute")?, Some(delegate.clone()));
+            }
+            assert_eq!(
+                status(&test.registry, integration, targets, &test.executable)?,
+                ShellIntegrationStatus::Disabled,
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn issue_123_restore_preserves_another_app_expandable_command() -> io::Result<()> {
+        let test = TestScope::new()?;
+        enable(
+            &test.registry,
+            FOLDER_STATE,
+            FOLDER_TARGETS,
+            &test.executable,
+        )?;
+        let other = RegistryValue {
+            value_type: REG_EXPAND_SZ,
+            data: string_value(r#""%LOCALAPPDATA%\Files\Files.App.Launcher.exe" "%1""#).data,
+        };
+        let key = test.registry.class_key(FOLDER_TARGETS[0].key);
+        write_raw(&key, "", other.value_type, &other.data)?;
+        assert!(matches!(
+            status(
+                &test.registry,
+                FOLDER_STATE,
+                FOLDER_TARGETS,
+                &test.executable
+            )?,
+            ShellIntegrationStatus::NeedsRepair {
+                reason: ShellIntegrationRepairReason::RegistryChanged,
+                ..
+            },
+        ));
+        restore(&test.registry, FOLDER_STATE, FOLDER_TARGETS)?;
+        assert_eq!(read_value(&key, "")?, Some(other));
+        assert_eq!(read_value(&key, "DelegateExecute")?, Some(string_value("")));
+        Ok(())
     }
 
     #[test]

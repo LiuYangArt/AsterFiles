@@ -38,12 +38,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    #[cfg(windows)]
+    if platform::windows::shell_select_trap::probe::try_run()? {
+        return Ok(());
+    }
+
     let mut agent_options = agent_debug::AgentOptions::from_env()
         .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
     let external_paths = agent_options.take_external_paths();
-    #[cfg(windows)]
-    let select_followup =
-        platform::windows::shell_select_trap::begin_select_followup(&external_paths);
 
     // The application owns its colors; keep native popup styling aligned with the startup system theme.
     unsafe {
@@ -342,34 +344,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     #[cfg(windows)]
-    let (external_paths, mut primary_instance) =
-        match platform::windows::single_instance::coordinate(&external_paths)? {
-            platform::windows::single_instance::InstanceOutcome::Primary(primary) => (
-                platform::windows::shell_select_trap::enrich_folder_open_selects(external_paths),
-                Some(primary),
-            ),
-            platform::windows::single_instance::InstanceOutcome::Forwarded => {
-                if !external_paths.iter().any(|path| path.select)
-                    && let Some(target) = select_followup.and_then(|followup| followup.wait())
-                {
-                    let _ = platform::windows::single_instance::forward_paths(&[
-                        platform::windows::address_path::ExternalLaunchPath::select(target),
-                    ]);
-                }
+    if !external_paths.is_empty() {
+        platform::windows::launch_probe::record(
+            &platform::windows::launch_probe::collect(),
+            &external_paths,
+        );
+    }
+
+    #[cfg(windows)]
+    if !agent_options.shell_ui
+        && platform::windows::shell_select_trap::run_launcher(&external_paths)?
+    {
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    let (external_paths, primary_instance, external_path_receiver, late_shell_select) = {
+        use platform::windows::single_instance::{self, InstanceOutcome};
+        if agent_options.shell_ui {
+            let Some(mut primary) = single_instance::claim_primary()? else {
                 return Ok(());
+            };
+            let receiver = primary.take_receiver();
+            let request = receiver.recv_timeout(std::time::Duration::from_secs(10))?;
+            (request.paths, primary, receiver, request.selection)
+        } else {
+            match single_instance::coordinate(&external_paths)? {
+                InstanceOutcome::Primary(mut primary) => {
+                    let receiver = primary.take_receiver();
+                    (external_paths, primary, receiver, None)
+                }
+                InstanceOutcome::Forwarded => return Ok(()),
             }
-            platform::windows::single_instance::InstanceOutcome::Fallback => {
-                eprintln!(
-                    "AsterFiles could not contact the running instance; starting a fallback window."
-                );
-                (
-                    platform::windows::shell_select_trap::enrich_folder_open_selects(
-                        external_paths,
-                    ),
-                    None,
-                )
-            }
-        };
+        }
+    };
     #[cfg(windows)]
     {
         use slint::winit_030::winit::platform::windows::{
@@ -414,18 +422,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .select()?;
     }
 
-    let external_path_receiver = primary_instance
-        .as_mut()
-        .map(platform::windows::single_instance::PrimaryInstance::take_receiver);
-    let late_shell_select = if external_paths.iter().any(|path| path.select) {
-        None
-    } else {
-        select_followup.map(|followup| followup.into_receiver())
-    };
     app::run(
         agent_options.scenario,
         external_paths,
-        external_path_receiver,
+        Some(external_path_receiver),
         late_shell_select,
     )?;
     drop(primary_instance);

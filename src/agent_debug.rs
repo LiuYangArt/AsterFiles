@@ -100,6 +100,7 @@ pub struct AgentOptions {
     pub scenario: Option<AgentScenario>,
     pub state_output: Option<PathBuf>,
     pub no_ui: bool,
+    pub shell_ui: bool,
     pub external_paths: Vec<ExternalLaunchPath>,
 }
 
@@ -127,6 +128,7 @@ impl AgentOptions {
                         })?));
                 }
                 "--no-ui" => options.no_ui = true,
+                "--shell-ui" => options.shell_ui = true,
                 _ => match parse_external_argument(&argument) {
                     ParsedExternalArgument::SelectNext => {
                         let value = arguments
@@ -151,6 +153,14 @@ impl AgentOptions {
                     }
                 },
             }
+        }
+        if options.shell_ui
+            && (options.scenario.is_some()
+                || !options.external_paths.is_empty()
+                || options.no_ui
+                || options.state_output.is_some())
+        {
+            return Err("--shell-ui cannot be combined with other arguments".to_owned());
         }
         if options.no_ui && options.scenario.is_none() {
             return Err("--no-ui requires --agent-scenario".to_owned());

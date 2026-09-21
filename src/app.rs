@@ -3681,7 +3681,9 @@ fn persist_session_in_background(path: PathBuf, session: io::Result<session_stor
 pub fn run(
     scenario: Option<AgentScenario>,
     initial_external_paths: Vec<ExternalLaunchPath>,
-    external_path_receiver: Option<mpsc::Receiver<Vec<ExternalLaunchPath>>>,
+    external_path_receiver: Option<
+        mpsc::Receiver<platform::windows::single_instance::ExternalOpenRequest>,
+    >,
     mut late_shell_select: Option<mpsc::Receiver<Option<PathBuf>>>,
 ) -> Result<(), slint::PlatformError> {
     let restored = restore_session_in_background(scenario);
@@ -4106,12 +4108,13 @@ pub fn run(
         );
     }
     if let Some(receiver) = late_shell_select {
-        start_late_shell_select_pump(
-            receiver,
-            state.clone(),
-            request_sender.clone(),
-            network_request_sender.clone(),
-        );
+        let tab_id = state
+            .lock()
+            .ok()
+            .map(|app| app.active_window_state().active_tab);
+        if let Some(context) = tab_id.and_then(|tab_id| external_reveal_context(&state, tab_id)) {
+            start_late_shell_select_pump(receiver, state.clone(), context);
+        }
     }
     let drag_drop_target_timer =
         wire_native_drag_drop(&ui, operation_sender.clone(), scoped_state.clone());
@@ -4304,28 +4307,20 @@ pub fn run(
 }
 
 fn start_external_path_pump(
-    receiver: mpsc::Receiver<Vec<ExternalLaunchPath>>,
+    receiver: mpsc::Receiver<platform::windows::single_instance::ExternalOpenRequest>,
     state: SharedSessions,
     local_sender: mpsc::Sender<DirectoryRequest>,
     network_sender: mpsc::SyncSender<DirectoryRequest>,
 ) {
     thread::spawn(move || {
-        while let Ok(paths) = receiver.recv() {
+        while let Ok(request) = receiver.recv() {
+            let paths = request.paths;
             let paths = if paths.is_empty() {
                 vec![ExternalLaunchPath::open(initial_path())]
             } else {
                 paths
             };
-            let followup =
-                platform::windows::shell_select_trap::begin_select_followup_for_ipc(&paths);
-            if let Some(followup) = followup {
-                start_late_shell_select_pump(
-                    followup.into_receiver(),
-                    state.clone(),
-                    local_sender.clone(),
-                    network_sender.clone(),
-                );
-            }
+            let followup = request.selection;
             let launches = classify_external_launches(&paths);
             let state_for_ui = state.clone();
             let local_for_ui = local_sender.clone();
@@ -4336,17 +4331,34 @@ fn start_external_path_pump(
                     &local_for_ui,
                     &network_for_ui,
                     launches,
+                    followup,
                 );
             });
         }
     });
 }
 
+#[derive(Clone)]
+struct ExternalRevealContext {
+    tab_id: TabId,
+    request_id: RequestId,
+    directory: PathBuf,
+}
+
+fn external_reveal_context(state: &SharedSessions, tab_id: TabId) -> Option<ExternalRevealContext> {
+    let app = state.lock().ok()?;
+    let tab = app.tab(tab_id)?;
+    Some(ExternalRevealContext {
+        tab_id,
+        request_id: tab.latest_request,
+        directory: tab.visible_path()?.to_path_buf(),
+    })
+}
+
 fn start_late_shell_select_pump(
     receiver: mpsc::Receiver<Option<PathBuf>>,
     state: SharedSessions,
-    local_sender: mpsc::Sender<DirectoryRequest>,
-    network_sender: mpsc::SyncSender<DirectoryRequest>,
+    context: ExternalRevealContext,
 ) {
     thread::spawn(move || {
         let Ok(Some(target)) = receiver.recv() else {
@@ -4354,16 +4366,10 @@ fn start_late_shell_select_pump(
         };
         for _ in 0..100 {
             let state_for_ui = state.clone();
-            let local_for_ui = local_sender.clone();
-            let network_for_ui = network_sender.clone();
+            let context = context.clone();
             let target = target.clone();
             if slint::invoke_from_event_loop(move || {
-                apply_late_shell_select_reveal(
-                    &state_for_ui,
-                    &local_for_ui,
-                    &network_for_ui,
-                    target,
-                );
+                apply_late_shell_select_reveal(&state_for_ui, &context, target);
             })
             .is_ok()
             {
@@ -4376,50 +4382,37 @@ fn start_late_shell_select_pump(
 
 fn apply_late_shell_select_reveal(
     state: &SharedSessions,
-    local_sender: &mpsc::Sender<DirectoryRequest>,
-    network_sender: &mpsc::SyncSender<DirectoryRequest>,
+    context: &ExternalRevealContext,
     target: PathBuf,
 ) {
-    let Some(directory) = target.parent().map(Path::to_path_buf) else {
+    if target.parent() != Some(context.directory.as_path()) {
         return;
-    };
+    }
     let scroll_target = {
         let mut app = match state.lock() {
             Ok(app) => app,
             Err(_) => return,
         };
-        let window_id = app.active_window;
-        let tab_ids = app
-            .window(window_id)
-            .map(|window| window.tab_order.clone())
-            .unwrap_or_default();
-        let tab_id = tab_ids.into_iter().rev().find(|tab_id| {
-            app.tab(*tab_id).and_then(TabSession::visible_path) == Some(directory.as_path())
-        });
-        let Some(tab_id) = tab_id else {
-            drop(app);
-            open_classified_external_launches(
-                state,
-                local_sender,
-                network_sender,
-                vec![ClassifiedExternalLaunch::Reveal {
-                    parent: directory,
-                    target,
-                }],
-            );
+        let tab_id = context.tab_id;
+        let request_id = context.request_id;
+        let Some(tab) = app.tab(tab_id) else {
             return;
         };
-        app.active_window_state_mut().active_tab = tab_id;
-        let request_id = app.tab(tab_id).map(|tab| tab.latest_request);
-        let loaded = app.tab(tab_id).is_some_and(|tab| {
-            tab.load_state == LoadState::Complete && tab.visible_path() == Some(directory.as_path())
-        });
-        if !loaded {
-            if let Some(request_id) = request_id {
-                queue_external_reveal(&mut app, tab_id, directory, request_id, target);
-            }
+        if !tab.accepts(request_id) || tab.visible_path() != Some(context.directory.as_path()) {
+            return;
+        }
+        // A late Shell reply belongs to the original navigation, not today's active tab.
+        let is_active = app.active_window_state().active_tab == tab_id;
+        if tab.load_state != LoadState::Complete {
+            queue_external_reveal(
+                &mut app,
+                tab_id,
+                context.directory.clone(),
+                request_id,
+                target,
+            );
             None
-        } else if let Some(request_id) = request_id {
+        } else {
             let language = app.language;
             let tab = app.tab_mut(tab_id).expect("matched tab exists");
             if let Some(entry) = tab
@@ -4429,7 +4422,7 @@ fn apply_late_shell_select_reveal(
                 .cloned()
             {
                 tab.select_entry(entry.id, false, false);
-                Some((tab_id, request_id, entry.id))
+                is_active.then_some((tab_id, request_id, entry.id))
             } else {
                 tab.error = Some(format!(
                     "reveal_target_missing:{}",
@@ -4437,12 +4430,10 @@ fn apply_late_shell_select_reveal(
                 ));
                 None
             }
-        } else {
-            None
         }
     };
+    refresh_all_windows(state);
     if let Some((tab_id, request_id, entry_id)) = scroll_target {
-        refresh_all_windows(state);
         reveal_late_shell_select(state, tab_id, request_id, entry_id);
     }
 }
@@ -4469,6 +4460,7 @@ fn open_classified_external_launches(
     local_sender: &mpsc::Sender<DirectoryRequest>,
     network_sender: &mpsc::SyncSender<DirectoryRequest>,
     launches: Vec<ClassifiedExternalLaunch>,
+    mut followup: Option<mpsc::Receiver<Option<PathBuf>>>,
 ) {
     for launch in launches {
         let directory = launch.directory().to_path_buf();
@@ -4492,6 +4484,11 @@ fn open_classified_external_launches(
             NavigationKind::Refresh,
             reveal,
         );
+        if let Some(receiver) = followup.take()
+            && let Some(context) = external_reveal_context(state, tab_id)
+        {
+            start_late_shell_select_pump(receiver, state.clone(), context);
+        }
     }
     refresh_all_windows(state);
     let active_window = state.lock().ok().map(|app| app.active_window);
@@ -23910,12 +23907,10 @@ mod tests {
             tab.load_state = LoadState::Complete;
         }
         let state = Arc::new(Mutex::new(app));
-        let (local_sender, local_receiver) = mpsc::channel();
-        let (network_sender, _network_receiver) = mpsc::sync_channel(1);
 
-        apply_late_shell_select_reveal(&state, &local_sender, &network_sender, target);
+        let context = external_reveal_context(&state, tab_id).unwrap();
+        apply_late_shell_select_reveal(&state, &context, target);
 
-        assert!(local_receiver.try_recv().is_err());
         let app = state.lock().unwrap();
         let tab = app.tab(tab_id).unwrap();
         assert_eq!(tab.selected, vec![EntryId(1)]);
@@ -23937,18 +23932,81 @@ mod tests {
             request_id
         };
         let state = Arc::new(Mutex::new(app));
-        let (local_sender, local_receiver) = mpsc::channel();
-        let (network_sender, _network_receiver) = mpsc::sync_channel(1);
 
-        apply_late_shell_select_reveal(&state, &local_sender, &network_sender, target.clone());
+        let context = external_reveal_context(&state, tab_id).unwrap();
+        apply_late_shell_select_reveal(&state, &context, target.clone());
 
-        assert!(local_receiver.try_recv().is_err());
         let app = state.lock().unwrap();
         let pending = app.focus_after_refresh.get(&tab_id).unwrap();
         assert_eq!(pending.request_id, Some(request_id));
         assert_eq!(pending.directory, parent);
         assert_eq!(pending.paths, vec![target]);
         assert_eq!(pending.action, PendingFocusAction::Reveal { window_id });
+    }
+
+    #[test]
+    fn issue_122_late_shell_select_stays_with_the_original_tab() {
+        let parent = PathBuf::from(r"D:\Downloads");
+        let target = parent.join("file.zip");
+        let mut app = AppState::new_for_test(vec![parent.clone(), parent.clone()], 0, [0, 1, 2, 3]);
+        let original = app.active_window_state().tab_order[0];
+        let other = app.active_window_state().tab_order[1];
+        for tab_id in [original, other] {
+            let tab = app.tab_mut(tab_id).unwrap();
+            tab.replace_entries(vec![focus_entry(1, target.to_str().unwrap())]);
+            tab.load_state = LoadState::Complete;
+        }
+        app.active_window_state_mut().active_tab = other;
+        let state = Arc::new(Mutex::new(app));
+        let context = external_reveal_context(&state, original).unwrap();
+
+        apply_late_shell_select_reveal(&state, &context, target);
+
+        let app = state.lock().unwrap();
+        assert_eq!(app.tab(original).unwrap().selected, vec![EntryId(1)]);
+        assert!(app.tab(other).unwrap().selected.is_empty());
+        assert_eq!(app.active_window_state().active_tab, other);
+        assert_eq!(app.active_window_state().tab_order.len(), 2);
+    }
+
+    #[test]
+    fn issue_122_late_shell_select_does_not_reopen_a_closed_tab() {
+        let parent = PathBuf::from(r"D:\Downloads");
+        let target = parent.join("file.zip");
+        let app = AppState::new_for_test(vec![parent.clone(), parent], 0, [0, 1, 2, 3]);
+        let original = app.active_window_state().active_tab;
+        let state = Arc::new(Mutex::new(app));
+        let context = external_reveal_context(&state, original).unwrap();
+        state.lock().unwrap().close_tab(original).unwrap();
+
+        apply_late_shell_select_reveal(&state, &context, target);
+
+        let app = state.lock().unwrap();
+        assert!(app.tab(original).is_none());
+        assert_eq!(app.active_window_state().tab_order.len(), 1);
+        assert!(app.focus_after_refresh.is_empty());
+    }
+
+    #[test]
+    fn issue_122_late_shell_select_rejects_an_old_navigation_to_the_same_folder() {
+        let parent = PathBuf::from(r"D:\Downloads");
+        let target = parent.join("file.zip");
+        let app = AppState::new_for_test(vec![parent.clone()], 0, [0, 1, 2, 3]);
+        let original = app.active_window_state().active_tab;
+        let state = Arc::new(Mutex::new(app));
+        let context = external_reveal_context(&state, original).unwrap();
+        state
+            .lock()
+            .unwrap()
+            .tab_mut(original)
+            .unwrap()
+            .begin_directory_navigation(parent, NavigationKind::Refresh);
+
+        apply_late_shell_select_reveal(&state, &context, target);
+
+        let app = state.lock().unwrap();
+        assert!(app.tab(original).unwrap().selected.is_empty());
+        assert!(app.focus_after_refresh.is_empty());
     }
 
     #[test]
@@ -23985,6 +24043,7 @@ mod tests {
                 parent: parent.clone(),
                 target: target.clone(),
             }],
+            None,
         );
 
         let request = local_receiver.try_recv().expect("parent directory queued");

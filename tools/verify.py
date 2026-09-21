@@ -352,6 +352,10 @@ def validation_steps(quick: bool, include_release: bool) -> list[tuple[str, list
     ]
     if not quick:
         steps.extend(scenario_steps())
+        steps.append((
+            "agent-shell-launcher",
+            [str(DEBUG), "--agent-shell-launch-probe", str(STATE_DIR / "shell-launcher" / "state.json")],
+        ))
     if include_release:
         steps.append(("release", ["cargo", "build", "--release", "--locked"]))
     return steps

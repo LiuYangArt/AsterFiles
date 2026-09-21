@@ -1,11 +1,8 @@
-//! Catch `SHOpenFolderAndSelectItems` after Folder Open only received the parent directory.
+//! Receive Folder Open and the subsequent Shell selection in the launched process.
 //!
-//! Apps that follow Explorer's pattern ShellExecute the Folder verb, then `SelectItem` on
-//! `IShellWindows`. This module registers a short-lived shell window so that request can be
-//! rewritten as an #118 reveal. The trap never blocks Folder Open or window startup: the folder
-//! opens immediately, and a matching `SelectItem` is applied afterwards. Desktop Explorer folder
-//! opens do not send `SelectItem` and skip the trap. The main window is never published.
-//! Downloaders that never send `SelectItem` (for example FDM) are out of scope here.
+//! Match Files' launcher: the original STA owns the shell window for both the first
+//! 500 ms and the 10-second late-selection period. IPC delivery runs separately so
+//! starting the UI never prevents this thread from servicing COM calls.
 
 use std::{
     cell::{Cell, RefCell},
@@ -16,7 +13,7 @@ use std::{
     ptr,
     rc::Rc,
     sync::mpsc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use windows::{
@@ -29,29 +26,27 @@ use windows::{
         System::{
             Com::{
                 CLSCTX_ALL, CoCreateInstance, CoTaskMemFree, DISPPARAMS, EXCEPINFO, IDispatch,
-                IDispatch_Impl, IServiceProvider, IServiceProvider_Impl, IStream, ITypeInfo,
+                IDispatch_Impl, IServiceProvider, IServiceProvider_Impl, ITypeInfo,
             },
-            Ole::{
-                IOleWindow, IOleWindow_Impl, OLEMENUGROUPWIDTHS, OleInitialize, OleUninitialize,
-            },
+            Ole::{IOleWindow_Impl, OleInitialize, OleUninitialize},
             Threading::GetCurrentThreadId,
             Variant::{InitVariantFromBuffer, VARIANT, VariantClear},
         },
         UI::{
-            Controls::{LPFNSVADDPROPSHEETPAGE, TBBUTTON},
+            Controls::LPFNSVADDPROPSHEETPAGE,
             Shell::{
                 _SVGIO, Common::ITEMIDLIST, FOLDERSETTINGS, ILCombine, ILGetSize, IShellBrowser,
-                IShellBrowser_Impl, IShellItem, IShellView, IShellView_Impl, IShellWindows,
-                IWebBrowser_Impl, IWebBrowserApp, IWebBrowserApp_Impl, SHCreateItemFromIDList,
-                SHParseDisplayName, SID_STopLevelBrowser, SIGDN_DESKTOPABSOLUTEPARSING,
-                SWC_BROWSER, SWC_EXPLORER, ShellWindows,
+                IShellItem, IShellView, IShellView_Impl, IShellWindows, IWebBrowser_Impl,
+                IWebBrowserApp, IWebBrowserApp_Impl, SHCreateItemFromIDList, SHGetDesktopFolder,
+                SIGDN_DESKTOPABSOLUTEPARSING, SVSI_EDIT, SVSI_ENSUREVISIBLE, SVSI_FOCUSED,
+                SVSI_SELECT, SWC_BROWSER, ShellWindows,
             },
             WindowsAndMessaging::{
                 CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
-                DispatchMessageW, GetMessageW, HMENU, KillTimer, MSG, PostQuitMessage,
-                RegisterClassExW, SW_HIDE, SetTimer, ShowWindow, TranslateMessage,
-                UnregisterClassW, WM_DESTROY, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
-                WS_EX_TOOLWINDOW, WS_POPUP,
+                DispatchMessageW, GetMessageW, IsWindow, KillTimer, MSG, PostMessageW,
+                PostQuitMessage, RegisterClassExW, SetTimer, TranslateMessage, UnregisterClassW,
+                WINDOW_STYLE, WM_CLOSE, WM_DESTROY, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
+                WS_EX_TOOLWINDOW,
             },
         },
     },
@@ -61,158 +56,178 @@ use windows_sys::Win32::{
     Storage::FileSystem::GetLongPathNameW, System::LibraryLoader::GetModuleHandleW,
 };
 
-use crate::platform::windows::{
-    address_path::ExternalLaunchPath,
-    launch_probe::{self, LaunchProbe},
-};
+use crate::platform::windows::address_path::ExternalLaunchPath;
 
-const TRAP_TIMEOUT: Duration = Duration::from_millis(3_000);
+#[path = "shell_select_probe.rs"]
+pub mod probe;
+
+const INITIAL_SELECTION_WAIT: Duration = Duration::from_millis(500);
+const LATE_SELECTION_WAIT: Duration = Duration::from_secs(10);
 const TIMER_ID: usize = 1;
 const CLASS_NAME: &str = "AsterFiles.ShellSelectTrap.v1";
 
-pub struct SelectFollowup {
-    receiver: mpsc::Receiver<Option<PathBuf>>,
+/// This runs before the UI and single-instance forwarding, on the launched main thread.
+pub fn run_launcher(paths: &[ExternalLaunchPath]) -> std::io::Result<bool> {
+    if paths.len() != 1 || paths[0].select || !paths[0].path.is_dir() {
+        return Ok(false);
+    }
+    run_launch_request(&paths[0].path, |request| {
+        super::single_instance::deliver_shell_open(request.paths, request.selection)
+    })?;
+    Ok(true)
 }
 
-impl SelectFollowup {
-    pub fn wait(self) -> Option<PathBuf> {
-        self.receiver.recv().ok().flatten()
-    }
-
-    pub fn into_receiver(self) -> mpsc::Receiver<Option<PathBuf>> {
-        self.receiver
-    }
-}
-
-pub fn enrich_folder_open_selects(paths: Vec<ExternalLaunchPath>) -> Vec<ExternalLaunchPath> {
-    let probe = launch_probe::collect();
-    launch_probe::record(&probe, &paths);
-    let Some(folder) = trap_candidate(&paths) else {
-        return paths;
+fn run_launch_request(
+    folder: &Path,
+    deliver: impl FnOnce(super::single_instance::ExternalOpenRequest) -> std::io::Result<()>
+    + Send
+    + 'static,
+) -> std::io::Result<()> {
+    let started = Instant::now();
+    let trap = ShellSelectTrap::new(folder);
+    let (paths, selection, late_sender) = match trap.as_ref() {
+        Some(trap) => {
+            trap.pump(INITIAL_SELECTION_WAIT);
+            match trap.selected() {
+                Some(target) => (vec![ExternalLaunchPath::select(target)], None, None),
+                None => {
+                    let (sender, receiver) = mpsc::channel();
+                    (
+                        vec![ExternalLaunchPath::open(folder.to_path_buf())],
+                        Some(receiver),
+                        Some(sender),
+                    )
+                }
+            }
+        }
+        None => (
+            vec![ExternalLaunchPath::open(folder.to_path_buf())],
+            None,
+            None,
+        ),
     };
-    rewrite_explorer_select(folder, &probe, "result=explorer-select-command").unwrap_or(paths)
-}
-
-pub fn begin_select_followup(paths: &[ExternalLaunchPath]) -> Option<SelectFollowup> {
-    spawn_select_followup(paths, true)
-}
-
-pub fn begin_select_followup_for_ipc(paths: &[ExternalLaunchPath]) -> Option<SelectFollowup> {
-    spawn_select_followup(paths, false)
-}
-
-fn spawn_select_followup(
-    paths: &[ExternalLaunchPath],
-    skip_desktop_parent: bool,
-) -> Option<SelectFollowup> {
-    if paths.len() != 1 || paths[0].select {
-        return None;
-    }
-    if skip_desktop_parent && launch_probe::parent_is_desktop_shell() {
-        crate::operation_audit::record("shell-select-trap", "result=skip-shell-parent");
-        return None;
-    }
-    let folder = paths[0].path.clone();
-    let (sender, receiver) = mpsc::channel();
-    std::thread::Builder::new()
-        .name("shell-select-followup".into())
+    let request = super::single_instance::ExternalOpenRequest { paths, selection };
+    // The Shell caller can still be waiting for an RPC on this STA while IPC starts the UI.
+    let receiver_hwnd = trap.as_ref().map(|trap| trap.inner.hwnd.get().0 as isize);
+    let delivery = std::thread::Builder::new()
+        .name("shell-open-delivery".into())
         .spawn(move || {
-            let selected = capture_shell_select(&folder, TRAP_TIMEOUT, None);
+            let result = deliver(request);
+            if result.is_err()
+                && let Some(hwnd) = receiver_hwnd
+            {
+                unsafe {
+                    let _ = PostMessageW(Some(HWND(hwnd as _)), WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+            }
+            result
+        })?;
+    if let Some(sender) = late_sender
+        && let Some(trap) = trap.as_ref()
+    {
+        trap.pump(LATE_SELECTION_WAIT);
+        let _ = sender.send(trap.selected());
+    }
+    crate::operation_audit::record(
+        "shell-select-trap",
+        format!(
+            "role=launcher result={} elapsed_ms={}",
+            if trap.as_ref().and_then(ShellSelectTrap::selected).is_some() {
+                "selected"
+            } else {
+                "timeout-or-unregistered"
+            },
+            started.elapsed().as_millis()
+        ),
+    );
+    drop(trap);
+    delivery
+        .join()
+        .map_err(|_| std::io::Error::other("shell delivery worker panicked"))?
+}
+
+struct ShellSelectTrap {
+    inner: Rc<Inner>,
+    _dispatch: IDispatch,
+    _shell: ShellWindowGuard,
+    _window: WindowGuard,
+    _ole: OleGuard,
+}
+
+impl ShellSelectTrap {
+    fn new(folder: &Path) -> Option<Self> {
+        let ole = OleGuard::new()?;
+        let inner = Rc::new(Inner {
+            hwnd: Cell::new(HWND(ptr::null_mut())),
+            owner_thread: unsafe { GetCurrentThreadId() },
+            started: Instant::now(),
+            folder: folder.to_path_buf(),
+            folder_pidl: Cell::new(ptr::null_mut()),
+            selected: RefCell::new(None),
+            pending_cookie: Cell::new(0),
+            register_cookie: Cell::new(0),
+            pending_registered: Cell::new(false),
+            window_registered: Cell::new(false),
+            shell_windows: RefCell::new(None),
+        });
+        let class = register_class()?;
+        let hwnd = create_trap_window(&class)?;
+        inner.hwnd.set(hwnd);
+        let window = WindowGuard { hwnd, class };
+        let shell = ShellWindowGuard {
+            inner: inner.clone(),
+        };
+        let app: IWebBrowserApp = ShellSelectHost {
+            inner: inner.clone(),
+        }
+        .into();
+        let dispatch: IDispatch = app.cast().ok()?;
+        if let Err(detail) = register_pending_shell_window(&inner, folder)
+            .and_then(|()| complete_shell_window_register(&inner, &dispatch))
+        {
             crate::operation_audit::record(
                 "shell-select-trap",
-                if selected.is_some() {
-                    "result=selected"
-                } else {
-                    "result=timeout-or-unregistered"
-                },
+                format!("register-failed={detail}"),
             );
-            let _ = sender.send(selected);
+            return None;
+        }
+        crate::operation_audit::record(
+            "shell-select-registered",
+            format!(
+                "owner_thread={} hwnd={} folder={folder:?}",
+                inner.owner_thread, hwnd.0 as isize
+            ),
+        );
+        Some(Self {
+            inner,
+            _dispatch: dispatch,
+            _shell: shell,
+            _window: window,
+            _ole: ole,
         })
-        .ok()?;
-    Some(SelectFollowup { receiver })
-}
-
-fn rewrite_explorer_select(
-    folder: &Path,
-    probe: &LaunchProbe,
-    event: &str,
-) -> Option<Vec<ExternalLaunchPath>> {
-    let target = launch_probe::reveal_from_explorer_select(folder, probe)?;
-    crate::operation_audit::record("shell-select-trap", event);
-    launch_probe::close_explorer_select_windows(folder, probe);
-    Some(vec![ExternalLaunchPath::select(target)])
-}
-
-fn trap_candidate(paths: &[ExternalLaunchPath]) -> Option<&Path> {
-    if paths.len() != 1 {
-        return None;
     }
-    let item = &paths[0];
-    if item.select {
-        return None;
+
+    fn pump(&self, timeout: Duration) {
+        if self.selected().is_none() && unsafe { IsWindow(Some(self.inner.hwnd.get())) }.as_bool() {
+            pump_until_select_or_timeout(self.inner.hwnd.get(), timeout);
+        }
     }
-    match std::fs::metadata(&item.path) {
-        Ok(metadata) if metadata.is_dir() => Some(item.path.as_path()),
-        _ => None,
+
+    fn selected(&self) -> Option<PathBuf> {
+        self.inner.selected.borrow().clone()
     }
 }
 
+#[cfg(test)]
 fn capture_shell_select(
     folder: &Path,
     timeout: Duration,
-    ready: Option<mpsc::Sender<()>>,
+    ready: mpsc::Sender<()>,
 ) -> Option<PathBuf> {
-    let _ole = OleGuard::new()?;
-    let inner = Rc::new(Inner {
-        hwnd: Cell::new(HWND(ptr::null_mut())),
-        folder: folder.to_path_buf(),
-        folder_pidl: Cell::new(ptr::null_mut()),
-        selected: RefCell::new(None),
-        browser: RefCell::new(None),
-        pending_cookie: Cell::new(0),
-        register_cookie: Cell::new(0),
-        explorer_cookie: Cell::new(0),
-        pending_registered: Cell::new(false),
-        window_registered: Cell::new(false),
-        explorer_registered: Cell::new(false),
-        shell_windows: RefCell::new(None),
-    });
-    if let Err(detail) = register_pending_shell_window(&inner, folder) {
-        crate::operation_audit::record("shell-select-trap", format!("register-failed={detail}"));
-        return None;
-    }
-    let _shell = ShellWindowGuard {
-        inner: inner.clone(),
-    };
-
-    let host = ShellSelectHost {
-        inner: inner.clone(),
-    };
-    let app: IWebBrowserApp = host.into();
-    let dispatch: IDispatch = app.cast().ok()?;
-    let view: IShellView = dispatch.cast().ok()?;
-    let browser: IShellBrowser = ShellSelectBrowser {
-        inner: inner.clone(),
-        view,
-    }
-    .into();
-    *inner.browser.borrow_mut() = Some(browser);
-
-    let class = register_class()?;
-    let hwnd = create_trap_window(&class)?;
-    inner.hwnd.set(hwnd);
-    let _window = WindowGuard { hwnd, class };
-
-    if let Err(detail) = complete_shell_window_register(&inner, &dispatch) {
-        crate::operation_audit::record("shell-select-trap", format!("register-failed={detail}"));
-        return None;
-    }
-    if let Some(ready) = ready {
-        let _ = ready.send(());
-    }
-
-    pump_until_select_or_timeout(hwnd, timeout);
-    inner.selected.borrow().clone()
+    let trap = ShellSelectTrap::new(folder)?;
+    let _ = ready.send(());
+    trap.pump(timeout);
+    trap.selected()
 }
 
 fn register_pending_shell_window(inner: &Rc<Inner>, folder: &Path) -> Result<(), String> {
@@ -253,19 +268,6 @@ fn complete_shell_window_register(inner: &Rc<Inner>, dispatch: &IDispatch) -> Re
     inner.register_cookie.set(cookie);
     inner.window_registered.set(true);
     unsafe { shell_windows.OnNavigate(cookie, &location) }.map_err(|error| error.to_string())?;
-    match unsafe { shell_windows.Register(dispatch, hwnd, SWC_EXPLORER) } {
-        Ok(explorer_cookie) => {
-            inner.explorer_cookie.set(explorer_cookie);
-            inner.explorer_registered.set(true);
-            let _ = unsafe { shell_windows.OnNavigate(explorer_cookie, &location) };
-        }
-        Err(error) => {
-            crate::operation_audit::record(
-                "shell-select-trap",
-                format!("explorer-register-failed={error}"),
-            );
-        }
-    }
     unsafe {
         let _ = VariantClear(&mut location);
     }
@@ -278,8 +280,23 @@ fn parse_pidl(path: &Path) -> Option<*mut ITEMIDLIST> {
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
+    let desktop = unsafe { SHGetDesktopFolder() }.ok()?;
     let mut pidl = ptr::null_mut();
-    unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut pidl, 0, None) }.ok()?;
+    let mut attributes = 0;
+    // Files uses the desktop IShellFolder parser. It preserves filesystem PIDLs
+    // for known folders, which lets IShellWindows match the caller's folder.
+    unsafe {
+        desktop
+            .ParseDisplayName(
+                HWND::default(),
+                None,
+                PCWSTR(wide.as_ptr()),
+                None,
+                &mut pidl,
+                &mut attributes,
+            )
+            .ok()?;
+    }
     if pidl.is_null() { None } else { Some(pidl) }
 }
 
@@ -376,9 +393,12 @@ fn rebase_selected_onto_folder(folder: &Path, selected: &Path) -> PathBuf {
 fn pump_until_select_or_timeout(hwnd: HWND, timeout: Duration) {
     let millis = timeout.as_millis().min(u32::MAX as u128) as u32;
     unsafe {
-        let _ = SetTimer(Some(hwnd), TIMER_ID, millis, None);
+        if SetTimer(Some(hwnd), TIMER_ID, millis, None) == 0 {
+            crate::operation_audit::record("shell-select-trap", "timer-failed");
+            return;
+        }
         let mut message = MSG::default();
-        while GetMessageW(&mut message, None, 0, 0).as_bool() {
+        while GetMessageW(&mut message, None, 0, 0).0 > 0 {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
@@ -413,7 +433,7 @@ fn create_trap_window(class: &[u16]) -> Option<HWND> {
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             PCWSTR(class.as_ptr()),
             PCWSTR(title.as_ptr()),
-            WS_POPUP,
+            WINDOW_STYLE::default(),
             0,
             0,
             0,
@@ -429,7 +449,13 @@ fn create_trap_window(class: &[u16]) -> Option<HWND> {
         None
     } else {
         unsafe {
-            let _ = ShowWindow(hwnd, SW_HIDE);
+            let cloak: i32 = 1;
+            let _ = windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+                hwnd.0,
+                windows_sys::Win32::Graphics::Dwm::DWMWA_CLOAK as u32,
+                (&cloak as *const i32).cast(),
+                mem::size_of::<i32>() as u32,
+            );
         }
         Some(hwnd)
     }
@@ -442,6 +468,12 @@ extern "system" fn trap_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
+        WM_CLOSE => {
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
         WM_TIMER if wparam.0 == TIMER_ID => {
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
@@ -460,16 +492,15 @@ fn wide(value: &str) -> Vec<u16> {
 
 struct Inner {
     hwnd: Cell<HWND>,
+    owner_thread: u32,
+    started: Instant,
     folder: PathBuf,
     folder_pidl: Cell<*mut ITEMIDLIST>,
     selected: RefCell<Option<PathBuf>>,
-    browser: RefCell<Option<IShellBrowser>>,
     pending_cookie: Cell<i32>,
     register_cookie: Cell<i32>,
-    explorer_cookie: Cell<i32>,
     pending_registered: Cell<bool>,
     window_registered: Cell<bool>,
-    explorer_registered: Cell<bool>,
     shell_windows: RefCell<Option<IShellWindows>>,
 }
 
@@ -535,19 +566,15 @@ struct ShellWindowGuard {
 impl Drop for ShellWindowGuard {
     fn drop(&mut self) {
         let shell_windows = self.inner.shell_windows.borrow();
-        let Some(shell_windows) = shell_windows.as_ref() else {
-            return;
-        };
-        if self.inner.window_registered.replace(false) {
-            let _ = unsafe { shell_windows.Revoke(self.inner.register_cookie.get()) };
-        }
-        if self.inner.explorer_registered.replace(false) {
-            let _ = unsafe { shell_windows.Revoke(self.inner.explorer_cookie.get()) };
-        }
-        if self.inner.pending_registered.replace(false)
-            && self.inner.pending_cookie.get() != self.inner.register_cookie.get()
-        {
-            let _ = unsafe { shell_windows.Revoke(self.inner.pending_cookie.get()) };
+        if let Some(shell_windows) = shell_windows.as_ref() {
+            if self.inner.window_registered.replace(false) {
+                let _ = unsafe { shell_windows.Revoke(self.inner.register_cookie.get()) };
+            }
+            if self.inner.pending_registered.replace(false)
+                && self.inner.pending_cookie.get() != self.inner.register_cookie.get()
+            {
+                let _ = unsafe { shell_windows.Revoke(self.inner.pending_cookie.get()) };
+            }
         }
         let pidl = self.inner.folder_pidl.replace(ptr::null_mut());
         if !pidl.is_null() {
@@ -556,15 +583,10 @@ impl Drop for ShellWindowGuard {
     }
 }
 
-#[implement(IWebBrowserApp, IServiceProvider, IShellView)]
+// Files keeps this object in its STA: Rc/RefCell and the hidden HWND share one owner.
+#[implement(IWebBrowserApp, IServiceProvider, IShellView, Agile = false)]
 struct ShellSelectHost {
     inner: Rc<Inner>,
-}
-
-#[implement(IShellBrowser)]
-struct ShellSelectBrowser {
-    inner: Rc<Inner>,
-    view: IShellView,
 }
 
 #[allow(non_snake_case)]
@@ -692,8 +714,7 @@ impl IWebBrowser_Impl for ShellSelectHost_Impl {
 #[allow(non_snake_case)]
 impl IWebBrowserApp_Impl for ShellSelectHost_Impl {
     fn Quit(&self) -> windows::core::Result<()> {
-        unsafe { PostQuitMessage(0) };
-        Ok(())
+        unsafe { PostMessageW(Some(self.inner.hwnd.get()), WM_CLOSE, WPARAM(0), LPARAM(0)) }
     }
     fn ClientToWindow(&self, pcx: *mut i32, pcy: *mut i32) -> windows::core::Result<()> {
         if pcx.is_null() || pcy.is_null() {
@@ -715,10 +736,12 @@ impl IWebBrowserApp_Impl for ShellSelectHost_Impl {
         Ok(SHANDLE_PTR(self.inner.hwnd.get().0 as isize))
     }
     fn FullName(&self) -> windows::core::Result<BSTR> {
-        Ok(BSTR::from("AsterFiles"))
+        let path = std::env::current_exe().map_err(|_| windows::core::Error::from(E_FAIL))?;
+        let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        Ok(BSTR::from_wide(&wide))
     }
     fn Path(&self) -> windows::core::Result<BSTR> {
-        Ok(BSTR::from("AsterFiles"))
+        self.FullName()
     }
     fn Visible(&self) -> windows::core::Result<VARIANT_BOOL> {
         Ok(VARIANT_FALSE)
@@ -762,7 +785,7 @@ impl IWebBrowserApp_Impl for ShellSelectHost_Impl {
 impl IServiceProvider_Impl for ShellSelectHost_Impl {
     fn QueryService(
         &self,
-        guid_service: *const GUID,
+        _guid_service: *const GUID,
         riid: *const GUID,
         ppvobject: *mut *mut c_void,
     ) -> windows::core::Result<()> {
@@ -771,28 +794,7 @@ impl IServiceProvider_Impl for ShellSelectHost_Impl {
                 return Err(E_POINTER.into());
             }
             *ppvobject = ptr::null_mut();
-            let hr = IUnknownImpl::QueryInterface(self, riid, ppvobject);
-            if hr.is_ok() {
-                return Ok(());
-            }
-            let requested = *riid;
-            let service = *guid_service;
-            let browser = self.inner.browser.borrow().clone();
-            let Some(browser) = browser else {
-                return hr.ok();
-            };
-            if requested == IShellBrowser::IID
-                || (service == SID_STopLevelBrowser && requested == IOleWindow::IID)
-            {
-                if requested == IShellBrowser::IID {
-                    *ppvobject = Interface::into_raw(browser);
-                } else {
-                    let window: IOleWindow = browser.cast()?;
-                    *ppvobject = Interface::into_raw(window);
-                }
-                return Ok(());
-            }
-            hr.ok()
+            IUnknownImpl::QueryInterface(self, riid, ppvobject).ok()
         }
     }
 }
@@ -862,10 +864,26 @@ impl IShellView_Impl for ShellSelectHost_Impl {
         Ok(())
     }
 
-    fn SelectItem(&self, pidlitem: *const ITEMIDLIST, _uflags: u32) -> windows::core::Result<()> {
+    fn SelectItem(&self, pidlitem: *const ITEMIDLIST, uflags: u32) -> windows::core::Result<()> {
+        if uflags & (SVSI_SELECT.0 | SVSI_FOCUSED.0 | SVSI_ENSUREVISIBLE.0 | SVSI_EDIT.0) as u32
+            == 0
+        {
+            return Ok(());
+        }
         if let Some(path) = self.inner.take_selected_item(pidlitem) {
+            crate::operation_audit::record(
+                "shell-select-received",
+                format!(
+                    "owner_thread={} callback_thread={} elapsed_ms={} target={path:?}",
+                    self.inner.owner_thread,
+                    unsafe { GetCurrentThreadId() },
+                    self.inner.started.elapsed().as_millis()
+                ),
+            );
+            debug_assert_eq!(self.inner.owner_thread, unsafe { GetCurrentThreadId() });
             *self.inner.selected.borrow_mut() = Some(path);
-            unsafe { PostQuitMessage(0) };
+            // Match Files: wake the HWND owner, never a COM caller's message queue.
+            unsafe { PostMessageW(Some(self.inner.hwnd.get()), WM_CLOSE, WPARAM(0), LPARAM(0)) }?;
         }
         Ok(())
     }
@@ -883,109 +901,13 @@ impl IShellView_Impl for ShellSelectHost_Impl {
     }
 }
 
-#[allow(non_snake_case)]
-impl IOleWindow_Impl for ShellSelectBrowser_Impl {
-    fn GetWindow(&self) -> windows::core::Result<HWND> {
-        let hwnd = self.inner.hwnd.get();
-        if hwnd.0.is_null() {
-            Err(E_FAIL.into())
-        } else {
-            Ok(hwnd)
-        }
-    }
-
-    fn ContextSensitiveHelp(&self, _fentermode: BOOL) -> windows::core::Result<()> {
-        Err(E_NOTIMPL.into())
-    }
-}
-
-#[allow(non_snake_case)]
-impl IShellBrowser_Impl for ShellSelectBrowser_Impl {
-    fn InsertMenusSB(
-        &self,
-        _hmenushared: HMENU,
-        _lpmenuwidths: *mut OLEMENUGROUPWIDTHS,
-    ) -> windows::core::Result<()> {
-        Err(E_NOTIMPL.into())
-    }
-
-    fn SetMenuSB(
-        &self,
-        _hmenushared: HMENU,
-        _holemenures: isize,
-        _hwndactiveobject: HWND,
-    ) -> windows::core::Result<()> {
-        Err(E_NOTIMPL.into())
-    }
-
-    fn RemoveMenusSB(&self, _hmenushared: HMENU) -> windows::core::Result<()> {
-        Err(E_NOTIMPL.into())
-    }
-
-    fn SetStatusTextSB(&self, _pszstatustext: &PCWSTR) -> windows::core::Result<()> {
-        Ok(())
-    }
-
-    fn EnableModelessSB(&self, _fenable: BOOL) -> windows::core::Result<()> {
-        Ok(())
-    }
-
-    fn TranslateAcceleratorSB(&self, _pmsg: *const MSG, _wid: u16) -> windows::core::Result<()> {
-        Err(E_NOTIMPL.into())
-    }
-
-    fn BrowseObject(&self, _pidl: *const ITEMIDLIST, _wflags: u32) -> windows::core::Result<()> {
-        Err(E_NOTIMPL.into())
-    }
-
-    fn GetViewStateStream(&self, _grfmode: u32) -> windows::core::Result<IStream> {
-        Err(E_NOTIMPL.into())
-    }
-
-    fn GetControlWindow(&self, _id: u32) -> windows::core::Result<HWND> {
-        Err(E_NOTIMPL.into())
-    }
-
-    fn SendControlMsg(
-        &self,
-        _id: u32,
-        _umsg: u32,
-        _wparam: WPARAM,
-        _lparam: LPARAM,
-        _pret: *mut LRESULT,
-    ) -> windows::core::Result<()> {
-        Err(E_NOTIMPL.into())
-    }
-
-    fn QueryActiveShellView(&self) -> windows::core::Result<IShellView> {
-        Ok(self.view.clone())
-    }
-
-    fn OnViewWindowActive(&self, _pshv: Ref<IShellView>) -> windows::core::Result<()> {
-        Ok(())
-    }
-
-    fn SetToolbarItems(
-        &self,
-        _lpbuttons: *const TBBUTTON,
-        _nbuttons: u32,
-        _uflags: u32,
-    ) -> windows::core::Result<()> {
-        Err(E_NOTIMPL.into())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::UI::Shell::SHOpenFolderAndSelectItems;
-
-    fn launch(path: &Path, select: bool) -> ExternalLaunchPath {
-        ExternalLaunchPath {
-            path: path.to_path_buf(),
-            select,
-        }
-    }
+    use windows::Win32::UI::Shell::{
+        FOLDERID_Downloads, ILCreateFromPathW, ILFindLastID, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
+        SHOpenFolderAndSelectItems,
+    };
 
     fn unique_dir() -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -998,28 +920,23 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn issue_118_trap_ignores_explicit_select_and_files() {
-        let root = unique_dir();
-        std::fs::create_dir_all(&root).unwrap();
-        let file = root.join("target.txt");
-        std::fs::write(&file, b"issue-118").unwrap();
-        assert!(trap_candidate(&[launch(&root, true)]).is_none());
-        assert!(trap_candidate(&[launch(&file, false)]).is_none());
-        assert_eq!(
-            trap_candidate(&[launch(&root, false)]),
-            Some(root.as_path())
-        );
-        let started = std::time::Instant::now();
-        assert_eq!(
-            enrich_folder_open_selects(vec![launch(&root, false)]),
-            vec![launch(&root, false)]
-        );
-        assert!(
-            started.elapsed() < Duration::from_millis(400),
-            "Folder Open must not wait for IShellWindows SelectItem"
-        );
-        std::fs::remove_dir_all(&root).unwrap();
+    fn caller_pidl(path: &Path) -> *mut ITEMIDLIST {
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let pidl = unsafe { ILCreateFromPathW(PCWSTR(wide.as_ptr())) };
+        assert!(!pidl.is_null(), "caller could not create a filesystem PIDL");
+        pidl
+    }
+
+    fn downloads_dir() -> PathBuf {
+        let path = unsafe {
+            SHGetKnownFolderPath(&FOLDERID_Downloads, KF_FLAG_DEFAULT, None)
+                .expect("Downloads known folder is available")
+        };
+        take_shell_path(path)
     }
 
     #[test]
@@ -1034,7 +951,33 @@ mod tests {
 
     #[test]
     fn issue_118_shell_windows_select_item_from_shopenfolderandselectitems() {
+        assert_shell_select_returns_promptly(false);
+    }
+
+    #[test]
+    fn issue_122_shell_select_with_folder_and_child_returns_promptly() {
+        assert_shell_select_returns_promptly(true);
+    }
+
+    #[test]
+    fn issue_122_known_folder_shell_select_with_independent_caller_returns_promptly() {
+        let root = downloads_dir().join(format!(
+            "asterfiles-issue-122-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert_shell_select_returns_promptly_at(root, true);
+    }
+
+    fn assert_shell_select_returns_promptly(with_child_array: bool) {
         let root = unique_dir();
+        assert_shell_select_returns_promptly_at(root, with_child_array);
+    }
+
+    fn assert_shell_select_returns_promptly_at(root: PathBuf, with_child_array: bool) {
         std::fs::create_dir_all(&root).unwrap();
         let file = root.join("选中文件.txt");
         std::fs::write(&file, b"issue-118").unwrap();
@@ -1042,19 +985,28 @@ mod tests {
         let (ready_tx, ready_rx) = mpsc::channel();
         let worker = std::thread::Builder::new()
             .name("shell-select-trap-test".into())
-            .spawn(move || capture_shell_select(&trap_root, Duration::from_secs(4), Some(ready_tx)))
+            .spawn(move || capture_shell_select(&trap_root, Duration::from_secs(4), ready_tx))
             .expect("trap thread starts");
         ready_rx
             .recv_timeout(Duration::from_secs(3))
             .expect("shell window registered before SHOpenFolderAndSelectItems");
 
+        let started = Instant::now();
         let opener_file = file.clone();
         let opener = std::thread::Builder::new()
             .name("shell-select-trap-open".into())
             .spawn(move || {
                 let _ole = OleGuard::new().expect("opener can initialize OLE");
-                let pidl = parse_pidl(&opener_file).expect("file pidl");
-                let opened = unsafe { SHOpenFolderAndSelectItems(pidl, None, 0) };
+                let pidl = caller_pidl(&opener_file);
+                let opened = if with_child_array {
+                    let parent = caller_pidl(opener_file.parent().unwrap());
+                    let child = unsafe { ILFindLastID(pidl) };
+                    let result = unsafe { SHOpenFolderAndSelectItems(parent, Some(&[child]), 0) };
+                    unsafe { CoTaskMemFree(Some(parent.cast())) };
+                    result
+                } else {
+                    unsafe { SHOpenFolderAndSelectItems(pidl, None, 0) }
+                };
                 unsafe { CoTaskMemFree(Some(pidl.cast())) };
                 opened
             })
@@ -1065,5 +1017,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         opened.expect("SHOpenFolderAndSelectItems reaches the registered trap");
         assert_eq!(selected.as_deref(), Some(file.as_path()));
+        let elapsed = started.elapsed();
+        eprintln!(
+            "issue_122_shell_select child_array={with_child_array} elapsed_ms={}",
+            elapsed.as_millis()
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "selection waited for the four-second expiry: {elapsed:?}"
+        );
     }
 }
