@@ -51,13 +51,13 @@ python tools/verify.py --release     # 收尾：复用未过期的完整验证�
 
 该入口只暂存 `-Paths` 明确列出的文件；存在其他未暂存或未跟踪内容时拒绝继续。随后按顺序执行 Release 收尾验证、差异检查、提交、证据回写、Project `Done` 和关闭 Issue；任一步失败都立即停止，不自动推送、打标签或发布。
 
-## 外部文件夹打开与前台激活（#110 / #117）
+## 外部文件夹打开与前台激活（#110 / #117 / #118 / #119）
 
-无界面回归包含 `issue_110_authorizes_actual_server_before_delivery_even_when_permission_is_denied`：使用真实本机命名管道核对接收 PID，模拟授权成功与拒绝，确认调用授权且拒绝不丢失含中文、空格与 UNC 的请求；发送前授权的严格顺序另由源码审查确认，接收线程中的标志检查不作为确定性的时序证明。既有 `external_tabs_are_created_in_the_most_recent_window` 与 `external_paths_open_as_new_tabs_in_the_active_window` 覆盖多窗口路由及连续新标签语义；`normalize_external_launch_path` / 启动参数测试覆盖盘符根 `D:"`、裸盘符与 `"%1\."` 尾缀修复；统一运行 `python tools/verify.py --quick`。
+无界面回归包含 `issue_110_authorizes_actual_server_before_delivery_even_when_permission_is_denied`：使用真实本机命名管道核对接收 PID，模拟授权成功与拒绝，确认调用授权且拒绝不丢失含中文、空格与 UNC 的请求；发送前授权的严格顺序另由源码审查确认，接收线程中的标志检查不作为确定性的时序证明。既有 `external_tabs_are_created_in_the_most_recent_window` 与 `external_paths_open_as_new_tabs_in_the_active_window` 覆盖多窗口路由及连续新标签语义；`normalize_external_launch_path` / 启动参数测试覆盖盘符根 `D:"`、裸盘符与 `"%1\."` 尾缀修复。#118 覆盖 `/select` 与 `-select` 解析、文件路径分类为父目录 reveal、select 标志经命名管道保留，目录完成提交后按完整原始路径选中，以及 `SHOpenFolderAndSelectItems` 经短暂 `IShellWindows` 注册把子项改写为 reveal。下载器若启动时已有 `explorer.exe /select` 命令行，`external-launch-probe` 立即改写为 reveal。Free Download Manager 等不发送 `SelectItem` 的入口不在 #118。#119 覆盖状态键丢失但 HKCU Folder 命令仍指向 AsterFiles 时的修复/恢复，不得把残留 AsterFiles 命令备份成「原先的资源管理器」。统一运行 `python tools/verify.py --quick`。
 
 前台权限和窗口状态需要用户手动验收，无界面测试不能证明桌面激活成功。关闭旧实例后启动本仓库 Debug 程序，确认设置中的默认文件夹关联指向当前程序（若仍为旧 `"%1"` 模板，使用设置页修复/重新启用）；分别在普通窗口遮挡、最小化、最大化被遮挡、最大化后最小化时，从资源管理器双击文件夹与“此电脑”中的磁盘根。磁盘根应打开为 `X:\`（标签与地址栏不得出现 `X:"`），并显示并激活承载新标签的窗口，保持原有普通或最大化布局。再检查带空格/中文文件夹、多个 AsterFiles 窗口、连续打开多个目录和慢 UNC 目录；窗口应立即激活，加载完成不再次抢焦点，随后可正常切换其他应用。
 
-诊断复用异步审计日志：Debug 为 `artifacts/logs/file-operation-audit.jsonl`，本地 Release 构建运行时为 `%LOCALAPPDATA%/AsterFiles/logs/file-operation-audit.jsonl`。筛选 `external-open-foreground-permission`、`external-open-forwarded`、`external-open-activation`：前两项记录转交进程的授权与路径发送结果，最后一项记录接收进程的目标 HWND、是否从最小化恢复、系统调用返回值与实际前台 HWND。用 PID 和时间关联一次打开；`active=false` 表示此次尝试后目标未成为前台，不能把路径发送成功误当成激活成功。日志不新增原始目录路径。
+诊断复用异步审计日志：Debug 为 `artifacts/logs/file-operation-audit.jsonl`，本地 Release 构建运行时为 `%LOCALAPPDATA%/AsterFiles/logs/file-operation-audit.jsonl`。筛选 `external-open-foreground-permission`、`external-open-forwarded`、`external-open-activation`、`shell-select-trap`、`external-launch-probe`：前两项记录转交进程的授权与路径发送结果，第三项记录接收进程的目标 HWND、是否从最小化恢复、系统调用返回值与实际前台 HWND，`shell-select-trap` 记录 Folder Open 是否接到 `SelectItem` 或 Explorer `/select` 命令行；`external-launch-probe` 记录父进程映像、本进程与 Explorer `/select` 命令行以便对照外部启动入口。用 PID 和时间关联一次打开；`active=false` 表示此次尝试后目标未成为前台，不能把路径发送成功误当成激活成功。`external-launch-probe` 为定位外部启动入口而包含命令行。
 
 ## Debug 优化配置（#100）
 

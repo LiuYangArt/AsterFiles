@@ -337,6 +337,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    #[cfg(windows)]
+    let external_paths =
+        platform::windows::shell_select_trap::enrich_folder_open_selects(external_paths);
+
     let (external_paths, mut primary_instance) =
         match platform::windows::single_instance::coordinate(&external_paths)? {
             platform::windows::single_instance::InstanceOutcome::Primary(primary) => {

@@ -10,6 +10,7 @@ pub mod drives;
 pub mod everything;
 pub mod everything_file_picker;
 pub mod file_operation;
+pub mod launch_probe;
 pub mod libraries;
 pub mod network;
 pub mod path_relation;
@@ -17,6 +18,7 @@ pub mod quick_access;
 pub mod quick_menu_window;
 pub mod shell_icons;
 pub mod shell_integration;
+pub mod shell_select_trap;
 pub mod shortcut;
 pub mod single_instance;
 

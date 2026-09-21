@@ -48,6 +48,11 @@ use crate::{
     session_store,
 };
 
+use crate::platform::windows::address_path::{
+    ClassifiedExternalLaunch, ExternalLaunchPath, classify_external_launches,
+    classify_external_launches_off_thread,
+};
+
 pub(crate) mod action_scenario;
 mod actions;
 mod directory_loading;
@@ -3589,17 +3594,21 @@ struct IconEvent {
 fn startup_locations(
     restored_locations: Vec<NavigationLocation>,
     active_index: usize,
-    external_paths: Vec<PathBuf>,
-) -> (Vec<NavigationLocation>, usize) {
-    if external_paths.is_empty() {
-        return (restored_locations, active_index);
+    launches: Vec<ClassifiedExternalLaunch>,
+) -> (Vec<NavigationLocation>, usize, Vec<Option<PathBuf>>) {
+    if launches.is_empty() {
+        return (restored_locations, active_index, Vec::new());
     }
-    let locations = external_paths
+    let reveals = launches
+        .iter()
+        .map(|launch| launch.reveal_target().map(Path::to_path_buf))
+        .collect::<Vec<_>>();
+    let locations = launches
         .into_iter()
-        .map(NavigationLocation::Directory)
+        .map(|launch| NavigationLocation::Directory(launch.directory().to_path_buf()))
         .collect::<Vec<_>>();
     let active_index = locations.len().saturating_sub(1);
-    (locations, active_index)
+    (locations, active_index, reveals)
 }
 fn restore_session_in_background(
     scenario: Option<AgentScenario>,
@@ -3652,10 +3661,11 @@ fn persist_session_in_background(path: PathBuf, session: io::Result<session_stor
 }
 pub fn run(
     scenario: Option<AgentScenario>,
-    initial_external_paths: Vec<PathBuf>,
-    external_path_receiver: Option<mpsc::Receiver<Vec<PathBuf>>>,
+    initial_external_paths: Vec<ExternalLaunchPath>,
+    external_path_receiver: Option<mpsc::Receiver<Vec<ExternalLaunchPath>>>,
 ) -> Result<(), slint::PlatformError> {
     let restored = restore_session_in_background(scenario);
+    let classified_external = classify_external_launches_off_thread(initial_external_paths);
     let ui = AppWindow::new()?;
     let network_login_ui = NetworkLoginWindow::new()?;
     let network_location_rename_ui = NetworkLocationRenameWindow::new()?;
@@ -3748,13 +3758,13 @@ pub fn run(
                 Vec::new(),
             )
         });
-    let additional_windows = if initial_external_paths.is_empty() {
+    let additional_windows = if classified_external.is_empty() {
         additional_windows
     } else {
         Vec::new()
     };
-    let (restored_locations, active_index) =
-        startup_locations(restored_locations, active_index, initial_external_paths);
+    let (restored_locations, active_index, startup_reveals) =
+        startup_locations(restored_locations, active_index, classified_external);
     ui.window()
         .set_position(slint::PhysicalPosition::new(window.x, window.y));
     ui.window().set_size(slint::LogicalSize::new(
@@ -4033,15 +4043,16 @@ pub fn run(
             .collect::<Vec<_>>()
     };
     if scenario.is_none() {
-        for (tab_id, location) in initial_tabs {
-            if matches!(location, NavigationLocation::Directory(_)) {
-                submit_location_navigation(
+        for (index, (tab_id, location)) in initial_tabs.into_iter().enumerate() {
+            if let NavigationLocation::Directory(path) = location {
+                submit_path_navigation_with_reveal(
                     &request_sender,
                     &network_request_sender,
                     &state,
                     tab_id,
-                    location,
+                    path,
                     NavigationKind::Refresh,
+                    startup_reveals.get(index).cloned().flatten(),
                 );
             }
         }
@@ -4246,7 +4257,7 @@ pub fn run(
 }
 
 fn start_external_path_pump(
-    receiver: mpsc::Receiver<Vec<PathBuf>>,
+    receiver: mpsc::Receiver<Vec<ExternalLaunchPath>>,
     state: SharedSessions,
     local_sender: mpsc::Sender<DirectoryRequest>,
     network_sender: mpsc::SyncSender<DirectoryRequest>,
@@ -4254,44 +4265,53 @@ fn start_external_path_pump(
     thread::spawn(move || {
         while let Ok(paths) = receiver.recv() {
             let paths = if paths.is_empty() {
-                vec![initial_path()]
+                vec![ExternalLaunchPath::open(initial_path())]
             } else {
                 paths
             };
+            let launches = classify_external_launches(&paths);
             let state_for_ui = state.clone();
             let local_for_ui = local_sender.clone();
             let network_for_ui = network_sender.clone();
             let _ = slint::invoke_from_event_loop(move || {
-                open_external_paths(&state_for_ui, &local_for_ui, &network_for_ui, paths);
+                open_classified_external_launches(
+                    &state_for_ui,
+                    &local_for_ui,
+                    &network_for_ui,
+                    launches,
+                );
             });
         }
     });
 }
 
-fn open_external_paths(
+fn open_classified_external_launches(
     state: &SharedSessions,
     local_sender: &mpsc::Sender<DirectoryRequest>,
     network_sender: &mpsc::SyncSender<DirectoryRequest>,
-    paths: Vec<PathBuf>,
+    launches: Vec<ClassifiedExternalLaunch>,
 ) {
-    for path in paths {
-        if crate::domain::folder_size_scheduler::is_internal_cleanup_path(&path) {
+    for launch in launches {
+        let directory = launch.directory().to_path_buf();
+        if crate::domain::folder_size_scheduler::is_internal_cleanup_path(&directory) {
             continue;
         }
+        let reveal = launch.reveal_target().map(Path::to_path_buf);
         let tab_id = state
             .lock()
             .ok()
-            .map(|mut app| app.create_tab(NavigationLocation::Directory(path.clone())));
+            .map(|mut app| app.create_tab(NavigationLocation::Directory(directory.clone())));
         let Some(tab_id) = tab_id else {
             continue;
         };
-        submit_path_navigation(
+        submit_path_navigation_with_reveal(
             local_sender,
             network_sender,
             state,
             tab_id,
-            path,
+            directory,
             NavigationKind::Refresh,
+            reveal,
         );
     }
     refresh_all_windows(state);
@@ -4302,14 +4322,19 @@ fn open_external_paths(
     }
 }
 fn fail_directory_dispatch(state: &SharedSessions, request: &DirectoryRequest) {
-    if let Ok(mut app) = state.lock()
-        && let Some(tab) = app.tab_mut(request.tab_id)
-        && tab.latest_request == request.request_id
-    {
-        tab.cancel_pending();
-        tab.discard_pending();
-        tab.load_state = LoadState::Failed;
-        tab.error = Some("queue-unavailable".to_owned());
+    if let Ok(mut app) = state.lock() {
+        let accepted = app
+            .tab(request.tab_id)
+            .is_some_and(|tab| tab.latest_request == request.request_id);
+        if accepted && let Some(tab) = app.tab_mut(request.tab_id) {
+            tab.cancel_pending();
+            tab.discard_pending();
+            tab.load_state = LoadState::Failed;
+            tab.error = Some("queue-unavailable".to_owned());
+        }
+        if accepted {
+            app.focus_after_refresh.remove(&request.tab_id);
+        }
     }
 }
 fn submit_navigation(
@@ -4318,6 +4343,7 @@ fn submit_navigation(
     tab_id: TabId,
     path: PathBuf,
     kind: NavigationKind,
+    reveal: Option<PathBuf>,
 ) -> bool {
     if crate::domain::folder_size_scheduler::is_internal_cleanup_path(&path) {
         return false;
@@ -4334,17 +4360,23 @@ fn submit_navigation(
         app.ordinary_icon_requests
             .retain(|(request_tab, _, _)| *request_tab != tab_id);
         app.focus_after_refresh.remove(&tab_id);
-        let Some(tab) = app.tab_mut(tab_id) else {
-            return false;
+        let visibility = app.file_visibility;
+        let (request_id, cancel) = {
+            let Some(tab) = app.tab_mut(tab_id) else {
+                return false;
+            };
+            if tab.kind != TabKind::Files {
+                return false;
+            }
+            if kind == NavigationKind::Normal && tab.visible_path() == Some(path.as_path()) {
+                tab.cancel_address_edit();
+                return false;
+            }
+            tab.begin_directory_navigation(path.clone(), kind)
         };
-        if tab.kind != TabKind::Files {
-            return false;
+        if let Some(target) = reveal {
+            queue_external_reveal(&mut app, tab_id, path.clone(), request_id, target);
         }
-        if kind == NavigationKind::Normal && tab.visible_path() == Some(path.as_path()) {
-            tab.cancel_address_edit();
-            return false;
-        }
-        let (request_id, cancel) = tab.begin_directory_navigation(path.clone(), kind);
         DirectoryRequest {
             tab_id,
             request_id,
@@ -4352,7 +4384,7 @@ fn submit_navigation(
             library: None,
             library_sources: None,
             unavailable_library_sources: 0,
-            visibility: app.file_visibility,
+            visibility,
             cancel,
         }
     };
@@ -4371,6 +4403,7 @@ fn submit_network_navigation(
     tab_id: TabId,
     path: PathBuf,
     kind: NavigationKind,
+    reveal: Option<PathBuf>,
 ) -> bool {
     if crate::domain::folder_size_scheduler::is_internal_cleanup_path(&path) {
         return false;
@@ -4387,17 +4420,23 @@ fn submit_network_navigation(
         app.ordinary_icon_requests
             .retain(|(request_tab, _, _)| *request_tab != tab_id);
         app.focus_after_refresh.remove(&tab_id);
-        let Some(tab) = app.tab_mut(tab_id) else {
-            return false;
+        let visibility = app.file_visibility;
+        let (request_id, cancel) = {
+            let Some(tab) = app.tab_mut(tab_id) else {
+                return false;
+            };
+            if tab.kind != TabKind::Files {
+                return false;
+            }
+            if kind == NavigationKind::Normal && tab.visible_path() == Some(path.as_path()) {
+                tab.cancel_address_edit();
+                return false;
+            }
+            tab.begin_directory_navigation(path.clone(), kind)
         };
-        if tab.kind != TabKind::Files {
-            return false;
+        if let Some(target) = reveal {
+            queue_external_reveal(&mut app, tab_id, path.clone(), request_id, target);
         }
-        if kind == NavigationKind::Normal && tab.visible_path() == Some(path.as_path()) {
-            tab.cancel_address_edit();
-            return false;
-        }
-        let (request_id, cancel) = tab.begin_directory_navigation(path.clone(), kind);
         DirectoryRequest {
             tab_id,
             request_id,
@@ -4405,19 +4444,24 @@ fn submit_network_navigation(
             library: None,
             library_sources: None,
             unavailable_library_sources: 0,
-            visibility: app.file_visibility,
+            visibility,
             cancel,
         }
     };
     match sender.try_send(request) {
         Ok(()) => true,
         Err(mpsc::TrySendError::Full(request)) => {
-            if let Ok(mut app) = state.lock()
-                && let Some(tab) = app.tab_mut(request.tab_id)
-                && tab.latest_request == request.request_id
-            {
-                tab.load_state = LoadState::Failed;
-                tab.error = Some("network directory queue is busy".to_owned());
+            if let Ok(mut app) = state.lock() {
+                let accepted = app
+                    .tab(request.tab_id)
+                    .is_some_and(|tab| tab.latest_request == request.request_id);
+                if accepted && let Some(tab) = app.tab_mut(request.tab_id) {
+                    tab.load_state = LoadState::Failed;
+                    tab.error = Some("network directory queue is busy".to_owned());
+                }
+                if accepted {
+                    app.focus_after_refresh.remove(&request.tab_id);
+                }
             }
             false
         }
@@ -4501,11 +4545,52 @@ fn submit_path_navigation(
     path: PathBuf,
     kind: NavigationKind,
 ) -> bool {
+    submit_path_navigation_with_reveal(
+        local_sender,
+        network_sender,
+        state,
+        tab_id,
+        path,
+        kind,
+        None,
+    )
+}
+
+fn submit_path_navigation_with_reveal(
+    local_sender: &mpsc::Sender<DirectoryRequest>,
+    network_sender: &mpsc::SyncSender<DirectoryRequest>,
+    state: &SharedSessions,
+    tab_id: TabId,
+    path: PathBuf,
+    kind: NavigationKind,
+    reveal: Option<PathBuf>,
+) -> bool {
     if crate::network::is_unc_path(&path) {
-        submit_network_navigation(network_sender, state, tab_id, path, kind)
+        submit_network_navigation(network_sender, state, tab_id, path, kind, reveal)
     } else {
-        submit_navigation(local_sender, state, tab_id, path, kind)
+        submit_navigation(local_sender, state, tab_id, path, kind, reveal)
     }
+}
+
+fn queue_external_reveal(
+    app: &mut AppState,
+    tab_id: TabId,
+    directory: PathBuf,
+    request_id: RequestId,
+    target: PathBuf,
+) {
+    let Some(window_id) = app.window_for_tab(tab_id) else {
+        return;
+    };
+    app.focus_after_refresh.insert(
+        tab_id,
+        PendingFocus {
+            directory,
+            request_id: Some(request_id),
+            paths: vec![target],
+            action: PendingFocusAction::Reveal { window_id },
+        },
+    );
 }
 
 fn submit_library_navigation(
@@ -17162,6 +17247,7 @@ fn start_directory_watchers(
                             tab,
                             path,
                             NavigationKind::Refresh,
+                            None,
                         );
                     }
                 }
@@ -23538,20 +23624,162 @@ mod tests {
     fn external_startup_paths_replace_restored_session_and_activate_last_path() {
         let restored = vec![NavigationLocation::Directory(PathBuf::from(r"C:\Restored"))];
         let external = vec![
-            PathBuf::from(r"C:\Folder With Spaces"),
-            PathBuf::from(r"C:\中文"),
+            ClassifiedExternalLaunch::Directory(PathBuf::from(r"C:\Folder With Spaces")),
+            ClassifiedExternalLaunch::Directory(PathBuf::from(r"C:\中文")),
         ];
 
-        let (locations, active) = startup_locations(restored, 0, external.clone());
+        let (locations, active, reveals) = startup_locations(restored, 0, external);
 
         assert_eq!(active, 1);
         assert_eq!(
             locations,
-            external
-                .into_iter()
-                .map(NavigationLocation::Directory)
-                .collect::<Vec<_>>()
+            vec![
+                NavigationLocation::Directory(PathBuf::from(r"C:\Folder With Spaces")),
+                NavigationLocation::Directory(PathBuf::from(r"C:\中文")),
+            ]
         );
+        assert_eq!(reveals, [None, None]);
+    }
+
+    #[test]
+    fn issue_118_external_startup_files_open_the_parent_and_keep_reveal_targets() {
+        let restored = vec![NavigationLocation::Directory(PathBuf::from(r"C:\Restored"))];
+        let file = PathBuf::from(r"D:\Downloads\file.zip");
+        let parent = PathBuf::from(r"D:\Downloads");
+        let folder = PathBuf::from(r"C:\JustAFolder");
+        let (locations, active, reveals) = startup_locations(
+            restored,
+            0,
+            vec![
+                ClassifiedExternalLaunch::Reveal {
+                    parent: parent.clone(),
+                    target: file.clone(),
+                },
+                ClassifiedExternalLaunch::Directory(folder.clone()),
+            ],
+        );
+
+        assert_eq!(active, 1);
+        assert_eq!(
+            locations,
+            vec![
+                NavigationLocation::Directory(parent),
+                NavigationLocation::Directory(folder),
+            ]
+        );
+        assert_eq!(reveals, [Some(file), None]);
+    }
+
+    #[test]
+    fn issue_118_external_file_navigation_registers_reveal_before_worker_delivery() {
+        let parent = PathBuf::from(r"D:\Downloads");
+        let target = parent.join("file.zip");
+        let app = AppState::new_for_test(vec![parent.clone()], 0, [0, 1, 2, 3]);
+        let tab_id = app.active_window_state().active_tab;
+        let window_id = app.active_window;
+        let state = Arc::new(Mutex::new(app));
+        let (local_sender, local_receiver) = mpsc::channel();
+        let (network_sender, _network_receiver) = mpsc::sync_channel(1);
+
+        assert!(submit_path_navigation_with_reveal(
+            &local_sender,
+            &network_sender,
+            &state,
+            tab_id,
+            parent.clone(),
+            NavigationKind::Refresh,
+            Some(target.clone()),
+        ));
+        let request = local_receiver.try_recv().expect("directory request queued");
+        let app = state.lock().unwrap();
+        let pending = app.focus_after_refresh.get(&tab_id).unwrap();
+        assert_eq!(pending.request_id, Some(request.request_id));
+        assert_eq!(pending.directory, parent);
+        assert_eq!(pending.paths, vec![target]);
+        assert_eq!(pending.action, PendingFocusAction::Reveal { window_id });
+    }
+
+    #[test]
+    fn issue_118_classified_external_file_opens_a_new_tab_on_the_parent() {
+        let parent = PathBuf::from(r"D:\Downloads");
+        let target = parent.join("file.zip");
+        let app = AppState::new_for_test(vec![PathBuf::from(r"C:\Existing")], 0, [0, 1, 2, 3]);
+        let existing = app.active_window_state().active_tab;
+        let state = Arc::new(Mutex::new(app));
+        let (local_sender, local_receiver) = mpsc::channel();
+        let (network_sender, _network_receiver) = mpsc::sync_channel(1);
+
+        open_classified_external_launches(
+            &state,
+            &local_sender,
+            &network_sender,
+            vec![ClassifiedExternalLaunch::Reveal {
+                parent: parent.clone(),
+                target: target.clone(),
+            }],
+        );
+
+        let request = local_receiver.try_recv().expect("parent directory queued");
+        let app = state.lock().unwrap();
+        let tab_id = app.active_window_state().active_tab;
+        assert_ne!(tab_id, existing);
+        assert_eq!(request.path, parent);
+        let pending = app.focus_after_refresh.get(&tab_id).unwrap();
+        assert_eq!(pending.paths, vec![target]);
+        assert_eq!(pending.directory, parent);
+    }
+
+    #[test]
+    fn issue_118_external_reveal_selects_the_complete_original_path() {
+        let parent = PathBuf::from(r"D:\second");
+        let target = parent.join("same.txt");
+        let mut app = AppState::new_for_test(vec![parent.clone()], 0, [0, 1, 2, 3]);
+        let window_id = app.active_window;
+        let tab_id = app.active_window_state().active_tab;
+        let request_id = {
+            let tab = app.tab_mut(tab_id).unwrap();
+            tab.begin_directory_navigation(parent.clone(), NavigationKind::Refresh)
+                .0
+        };
+        app.focus_after_refresh.insert(
+            tab_id,
+            PendingFocus {
+                directory: parent.clone(),
+                request_id: Some(request_id),
+                paths: vec![target.clone()],
+                action: PendingFocusAction::Reveal { window_id },
+            },
+        );
+        let state = Arc::new(Mutex::new(app));
+        apply_event(
+            &state,
+            DirectoryEvent::Batch {
+                tab_id,
+                request_id,
+                entries: vec![
+                    focus_entry(1, r"D:\first\same.txt"),
+                    focus_entry(2, r"D:\second\same.txt"),
+                ],
+            },
+        );
+        apply_event(
+            &state,
+            DirectoryEvent::Finished {
+                tab_id,
+                request_id,
+                path: parent,
+                skipped: 0,
+                source_failures: 0,
+                library: None,
+            },
+        );
+
+        let app = state.lock().unwrap();
+        let tab = app.tab(tab_id).unwrap();
+        assert_eq!(tab.selected, vec![EntryId(2)]);
+        assert_eq!(tab.focused, Some(EntryId(2)));
+        assert_eq!(tab.selection_anchor, Some(EntryId(2)));
+        assert!(!app.focus_after_refresh.contains_key(&tab_id));
     }
 
     #[test]
@@ -28499,6 +28727,7 @@ mod tests {
             settings,
             PathBuf::from("ignored"),
             NavigationKind::Refresh,
+            None,
         ));
         assert!(receiver.try_recv().is_err());
     }
@@ -28518,6 +28747,7 @@ mod tests {
             TabId(1),
             PathBuf::from("same"),
             NavigationKind::Normal,
+            None,
         ));
         assert!(receiver.try_recv().is_err());
         let app = state.lock().expect("app state mutex is not poisoned");

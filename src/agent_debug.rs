@@ -6,7 +6,9 @@ use std::{
 };
 
 use crate::domain::{LoadState, TabSession};
-use crate::platform::windows::address_path::normalize_external_launch_path;
+use crate::platform::windows::address_path::{
+    ExternalLaunchPath, ParsedExternalArgument, parse_external_argument,
+};
 
 const DEFAULT_STATE_DIR: &str = "artifacts/state";
 
@@ -98,7 +100,7 @@ pub struct AgentOptions {
     pub scenario: Option<AgentScenario>,
     pub state_output: Option<PathBuf>,
     pub no_ui: bool,
-    pub external_paths: Vec<PathBuf>,
+    pub external_paths: Vec<ExternalLaunchPath>,
 }
 
 impl AgentOptions {
@@ -110,7 +112,8 @@ impl AgentOptions {
         let mut options = Self::default();
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
-            match argument.to_string_lossy().as_ref() {
+            let displayed = argument.to_string_lossy();
+            match displayed.as_ref() {
                 "--agent-scenario" => {
                     let value = arguments
                         .next()
@@ -124,12 +127,29 @@ impl AgentOptions {
                         })?));
                 }
                 "--no-ui" => options.no_ui = true,
-                _ if argument.to_string_lossy().starts_with('-') => {
-                    return Err(format!("unknown argument: {}", argument.to_string_lossy()));
-                }
-                _ => options
-                    .external_paths
-                    .push(normalize_external_launch_path(PathBuf::from(argument))),
+                _ => match parse_external_argument(&argument) {
+                    ParsedExternalArgument::SelectNext => {
+                        let value = arguments
+                            .next()
+                            .ok_or_else(|| format!("{displayed} requires a path"))?;
+                        let launch = ExternalLaunchPath::select(PathBuf::from(value));
+                        if launch.path.as_os_str().is_empty() {
+                            return Err("select requires a path".to_owned());
+                        }
+                        options.external_paths.push(launch);
+                    }
+                    ParsedExternalArgument::Launch(launch)
+                        if launch.select && launch.path.as_os_str().is_empty() =>
+                    {
+                        return Err("select requires a path".to_owned());
+                    }
+                    ParsedExternalArgument::Launch(launch) => {
+                        if displayed.starts_with('-') && !launch.select {
+                            return Err(format!("unknown argument: {displayed}"));
+                        }
+                        options.external_paths.push(launch);
+                    }
+                },
             }
         }
         if options.no_ui && options.scenario.is_none() {
@@ -141,7 +161,7 @@ impl AgentOptions {
         Ok(options)
     }
 
-    pub fn take_external_paths(&mut self) -> Vec<PathBuf> {
+    pub fn take_external_paths(&mut self) -> Vec<ExternalLaunchPath> {
         std::mem::take(&mut self.external_paths)
     }
     pub fn state_output(&self) -> Option<PathBuf> {
@@ -460,8 +480,8 @@ mod tests {
         assert_eq!(
             options.external_paths,
             vec![
-                PathBuf::from(r"C:\Folder With Spaces"),
-                PathBuf::from(r"C:\中文"),
+                ExternalLaunchPath::open(PathBuf::from(r"C:\Folder With Spaces")),
+                ExternalLaunchPath::open(PathBuf::from(r"C:\中文")),
             ]
         );
     }
@@ -478,9 +498,9 @@ mod tests {
         assert_eq!(
             options.external_paths,
             vec![
-                PathBuf::from(r"D:\"),
-                PathBuf::from(r"E:\"),
-                PathBuf::from(r"f:\"),
+                ExternalLaunchPath::open(PathBuf::from(r"D:\")),
+                ExternalLaunchPath::open(PathBuf::from(r"E:\")),
+                ExternalLaunchPath::open(PathBuf::from(r"f:\")),
             ]
         );
     }
@@ -491,8 +511,29 @@ mod tests {
         let options = AgentOptions::from_arguments([long.clone().into_os_string()])
             .expect("path validity is checked by navigation, not argument parsing");
 
-        assert_eq!(options.external_paths, [long]);
+        assert_eq!(options.external_paths, [ExternalLaunchPath::open(long)]);
     }
+
+    #[test]
+    fn issue_118_accepts_select_switches_without_treating_them_as_unknown() {
+        let options = AgentOptions::from_arguments([
+            OsString::from("/select"),
+            OsString::from(r"D:\Downloads\file.zip"),
+            OsString::from(r"-select,C:\Folder With Spaces\a.csv"),
+            OsString::from(r"C:\JustAFolder"),
+        ])
+        .expect("select switches are accepted");
+
+        assert_eq!(
+            options.external_paths,
+            vec![
+                ExternalLaunchPath::select(PathBuf::from(r"D:\Downloads\file.zip")),
+                ExternalLaunchPath::select(PathBuf::from(r"C:\Folder With Spaces\a.csv")),
+                ExternalLaunchPath::open(PathBuf::from(r"C:\JustAFolder")),
+            ]
+        );
+    }
+
     #[test]
     fn unknown_options_still_fail() {
         let error = AgentOptions::from_arguments([OsString::from("--unknown")])

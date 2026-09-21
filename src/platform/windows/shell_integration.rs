@@ -194,6 +194,12 @@ fn status(
     if read_dword(&state_path, ACTIVE)? != Some(1)
         && read_dword(&state_path, BACKUP_COMPLETE)? != Some(1)
     {
+        if leftover_asterfiles_command(scope, targets)? {
+            return Ok(ShellIntegrationStatus::NeedsRepair {
+                bound_executable: current_executable.to_owned(),
+                reason: ShellIntegrationRepairReason::RegistryChanged,
+            });
+        }
         return Ok(ShellIntegrationStatus::Disabled);
     }
     let Some(bound_executable) = read_string(&state_path, BOUND_EXECUTABLE)? else {
@@ -233,18 +239,7 @@ fn enable(
     if !has_backup {
         let backup_result = (|| {
             for target in targets {
-                backup_value(
-                    &state_path,
-                    target.backup_prefix,
-                    "Default",
-                    read_value(&scope.class_key(target.key), "")?,
-                )?;
-                backup_value(
-                    &state_path,
-                    target.backup_prefix,
-                    "DelegateExecute",
-                    read_value(&scope.class_key(target.key), "DelegateExecute")?,
-                )?;
+                backup_target_values(scope, &state_path, *target)?;
             }
             write_string(&state_path, BOUND_EXECUTABLE, executable.as_os_str())?;
             write_dword(&state_path, BACKUP_COMPLETE, 1)
@@ -287,20 +282,18 @@ fn restore_backups(scope: &RegistryScope, state_path: &str, targets: &[Target]) 
 }
 fn restore(scope: &RegistryScope, integration: &str, targets: &[Target]) -> io::Result<()> {
     let state_path = scope.state_key(integration);
-    if read_dword(&state_path, ACTIVE)? != Some(1)
-        && read_dword(&state_path, BACKUP_COMPLETE)? != Some(1)
-    {
-        return Ok(());
-    }
-    let bound_executable = read_string(&state_path, BOUND_EXECUTABLE)?
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing bound executable"))?;
+    let has_state = read_dword(&state_path, ACTIVE)? == Some(1)
+        || read_dword(&state_path, BACKUP_COMPLETE)? == Some(1);
+    let bound_executable = read_string(&state_path, BOUND_EXECUTABLE)?.map(PathBuf::from);
 
-    for target in targets {
-        let key = scope.class_key(target.key);
-        if target_is_owned(scope, *target, &bound_executable)? {
-            restore_value(&state_path, target.backup_prefix, "Default", &key, "")?;
-            restore_value(
+    if has_state {
+        for target in targets {
+            if !should_revert_target(scope, *target, bound_executable.as_deref())? {
+                continue;
+            }
+            let key = scope.class_key(target.key);
+            restore_or_delete(&state_path, target.backup_prefix, "Default", &key, "")?;
+            restore_or_delete(
                 &state_path,
                 target.backup_prefix,
                 "DelegateExecute",
@@ -308,8 +301,9 @@ fn restore(scope: &RegistryScope, integration: &str, targets: &[Target]) -> io::
                 "DelegateExecute",
             )?;
         }
+        delete_tree(HKEY_CURRENT_USER, &state_path, true)?;
     }
-    delete_tree(HKEY_CURRENT_USER, &state_path, true)
+    clear_leftover_asterfiles_commands(scope, targets)
 }
 
 fn target_is_owned(scope: &RegistryScope, target: Target, executable: &Path) -> io::Result<bool> {
@@ -318,6 +312,95 @@ fn target_is_owned(scope: &RegistryScope, target: Target, executable: &Path) -> 
         read_value(&key, "")? == Some(string_value(command_for(executable, target.argument)))
             && read_value(&key, "DelegateExecute")? == Some(string_value("")),
     )
+}
+
+fn should_revert_target(
+    scope: &RegistryScope,
+    target: Target,
+    bound_executable: Option<&Path>,
+) -> io::Result<bool> {
+    if let Some(executable) = bound_executable
+        && target_is_owned(scope, target, executable)?
+    {
+        return Ok(true);
+    }
+    target_command_invokes_asterfiles(scope, target)
+}
+
+fn backup_target_values(scope: &RegistryScope, state_path: &str, target: Target) -> io::Result<()> {
+    let key = scope.class_key(target.key);
+    let leftover = command_invokes_asterfiles(read_string(&key, "")?.as_deref());
+    let (default, delegate) = if leftover {
+        (None, None)
+    } else {
+        (read_value(&key, "")?, read_value(&key, "DelegateExecute")?)
+    };
+    backup_value(state_path, target.backup_prefix, "Default", default)?;
+    backup_value(
+        state_path,
+        target.backup_prefix,
+        "DelegateExecute",
+        delegate,
+    )
+}
+
+fn restore_or_delete(
+    state_path: &str,
+    prefix: &str,
+    field: &str,
+    target_path: &str,
+    target_name: &str,
+) -> io::Result<()> {
+    if restore_value(state_path, prefix, field, target_path, target_name).is_err() {
+        delete_value(target_path, target_name)?;
+    }
+    Ok(())
+}
+
+fn leftover_asterfiles_command(scope: &RegistryScope, targets: &[Target]) -> io::Result<bool> {
+    for target in targets {
+        if target_command_invokes_asterfiles(scope, *target)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn target_command_invokes_asterfiles(scope: &RegistryScope, target: Target) -> io::Result<bool> {
+    Ok(command_invokes_asterfiles(
+        read_string(&scope.class_key(target.key), "")?.as_deref(),
+    ))
+}
+
+fn clear_leftover_asterfiles_commands(scope: &RegistryScope, targets: &[Target]) -> io::Result<()> {
+    for target in targets {
+        if target_command_invokes_asterfiles(scope, *target)? {
+            let key = scope.class_key(target.key);
+            delete_value(&key, "")?;
+            delete_value(&key, "DelegateExecute")?;
+        }
+    }
+    Ok(())
+}
+
+fn command_invokes_asterfiles(command: Option<&OsStr>) -> bool {
+    let Some(command) = command else {
+        return false;
+    };
+    let needle = "asterfiles.exe".encode_utf16().collect::<Vec<_>>();
+    let haystack = command
+        .encode_wide()
+        .map(|unit| {
+            if unit <= 0x7f {
+                u16::from((unit as u8).to_ascii_lowercase())
+            } else {
+                unit
+            }
+        })
+        .collect::<Vec<_>>();
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle.as_slice())
 }
 
 fn command_for(executable: &Path, argument: Option<&str>) -> OsString {
@@ -828,5 +911,64 @@ mod tests {
             OsString::from(r#""C:\便携 应用\AsterFiles.exe" "%1\.""#)
         );
         assert_eq!(FOLDER_TARGETS[1].argument, FOLDER_TARGETS[0].argument);
+    }
+
+    #[test]
+    fn leftover_asterfiles_command_without_state_is_repairable_and_restorable() -> io::Result<()> {
+        let test = TestScope::new()?;
+        let key = test.registry.class_key(FOLDER_TARGETS[0].key);
+        write_string(
+            &key,
+            "",
+            r#""F:\CodeProjects\AsterFiles\target\debug\asterfiles.exe" "%1\.""#,
+        )?;
+        write_string(&key, "DelegateExecute", "")?;
+        assert_eq!(
+            status(
+                &test.registry,
+                FOLDER_STATE,
+                FOLDER_TARGETS,
+                &test.executable
+            )?,
+            ShellIntegrationStatus::NeedsRepair {
+                bound_executable: test.executable.clone(),
+                reason: ShellIntegrationRepairReason::RegistryChanged,
+            }
+        );
+        restore(&test.registry, FOLDER_STATE, FOLDER_TARGETS)?;
+        assert_eq!(read_value(&key, "")?, None);
+        assert_eq!(read_value(&key, "DelegateExecute")?, None);
+        assert_eq!(
+            status(
+                &test.registry,
+                FOLDER_STATE,
+                FOLDER_TARGETS,
+                &test.executable
+            )?,
+            ShellIntegrationStatus::Disabled
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enable_does_not_backup_leftover_asterfiles_command_as_original() -> io::Result<()> {
+        let test = TestScope::new()?;
+        let key = test.registry.class_key(FOLDER_TARGETS[0].key);
+        write_string(
+            &key,
+            "",
+            r#""F:\CodeProjects\AsterFiles\target\debug\asterfiles.exe" "%1\.""#,
+        )?;
+        write_string(&key, "DelegateExecute", "")?;
+        enable(
+            &test.registry,
+            FOLDER_STATE,
+            FOLDER_TARGETS,
+            &test.executable,
+        )?;
+        restore(&test.registry, FOLDER_STATE, FOLDER_TARGETS)?;
+        assert_eq!(read_value(&key, "")?, None);
+        assert_eq!(read_value(&key, "DelegateExecute")?, None);
+        Ok(())
     }
 }
