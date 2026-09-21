@@ -57,7 +57,9 @@ use windows::{
     },
     core::{BOOL, BSTR, GUID, HRESULT, IUnknownImpl, Interface, PCWSTR, PWSTR, Ref, implement},
 };
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::{
+    Storage::FileSystem::GetLongPathNameW, System::LibraryLoader::GetModuleHandleW,
+};
 
 use crate::platform::windows::{
     address_path::ExternalLaunchPath,
@@ -163,6 +165,7 @@ fn capture_shell_select(
     let _ole = OleGuard::new()?;
     let inner = Rc::new(Inner {
         hwnd: Cell::new(HWND(ptr::null_mut())),
+        folder: folder.to_path_buf(),
         folder_pidl: Cell::new(ptr::null_mut()),
         selected: RefCell::new(None),
         browser: RefCell::new(None),
@@ -311,6 +314,65 @@ fn take_shell_path(value: PWSTR) -> PathBuf {
     path
 }
 
+fn long_path(path: &Path) -> PathBuf {
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let needed = unsafe { GetLongPathNameW(wide.as_ptr(), ptr::null_mut(), 0) };
+    if needed == 0 {
+        return path.to_path_buf();
+    }
+    let mut buffer = vec![0; needed as usize];
+    let written = unsafe { GetLongPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), needed) };
+    if written == 0 || written >= needed {
+        return path.to_path_buf();
+    }
+    buffer.truncate(written as usize);
+    PathBuf::from(OsString::from_wide(&buffer))
+}
+
+fn relative_from_prefix(path: &Path, prefix: &Path) -> Option<PathBuf> {
+    if let Ok(relative) = path.strip_prefix(prefix) {
+        return Some(relative.to_path_buf());
+    }
+    let path_wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let prefix_wide = prefix.as_os_str().encode_wide().collect::<Vec<_>>();
+    if prefix_wide.is_empty() || path_wide.len() < prefix_wide.len() {
+        return None;
+    }
+    let matched = path_wide
+        .iter()
+        .zip(&prefix_wide)
+        .all(|(unit, expected)| path_units_equal(*unit, *expected));
+    if !matched {
+        return None;
+    }
+    let rest = match path_wide.get(prefix_wide.len()) {
+        None => return Some(PathBuf::new()),
+        Some(&unit) if unit == u16::from(b'\\') || unit == u16::from(b'/') => {
+            &path_wide[prefix_wide.len() + 1..]
+        }
+        Some(_) => return None,
+    };
+    Some(PathBuf::from(OsString::from_wide(rest)))
+}
+
+fn path_units_equal(left: u16, right: u16) -> bool {
+    (left <= 0x7f && right <= 0x7f && (left as u8).eq_ignore_ascii_case(&(right as u8)))
+        || left == right
+}
+
+fn rebase_selected_onto_folder(folder: &Path, selected: &Path) -> PathBuf {
+    let long_folder = long_path(folder);
+    let long_selected = long_path(selected);
+    match relative_from_prefix(&long_selected, &long_folder) {
+        Some(relative) if !relative.as_os_str().is_empty() => folder.join(relative),
+        _ => long_selected,
+    }
+}
+
 fn pump_until_select_or_timeout(hwnd: HWND, timeout: Duration) {
     let millis = timeout.as_millis().min(u32::MAX as u128) as u32;
     unsafe {
@@ -398,6 +460,7 @@ fn wide(value: &str) -> Vec<u16> {
 
 struct Inner {
     hwnd: Cell<HWND>,
+    folder: PathBuf,
     folder_pidl: Cell<*mut ITEMIDLIST>,
     selected: RefCell<Option<PathBuf>>,
     browser: RefCell<Option<IShellBrowser>>,
@@ -425,7 +488,9 @@ impl Inner {
         }
         let path = pidl_to_path(combined.cast_const());
         unsafe { CoTaskMemFree(Some(combined.cast())) };
+        // Shell parsing names expand 8.3 components; keep the Folder Open identity.
         path.filter(|path| !path.as_os_str().is_empty())
+            .map(|path| rebase_selected_onto_folder(&self.folder, &path))
     }
 }
 
@@ -954,6 +1019,16 @@ mod tests {
             started.elapsed() < Duration::from_millis(400),
             "Folder Open must not wait for IShellWindows SelectItem"
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn issue_118_select_display_name_keeps_the_opened_folder_identity() {
+        let root = unique_dir();
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("选中文件.txt");
+        std::fs::write(&file, b"issue-118").unwrap();
+        assert_eq!(rebase_selected_onto_folder(&root, &long_path(&file)), file);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
