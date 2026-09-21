@@ -3610,6 +3610,25 @@ fn startup_locations(
     let active_index = locations.len().saturating_sub(1);
     (locations, active_index, reveals)
 }
+
+fn overlay_startup_shell_select(
+    tabs: &[(TabId, NavigationLocation)],
+    reveals: &mut [Option<PathBuf>],
+    target: PathBuf,
+) -> bool {
+    let Some(parent) = target.parent() else {
+        return false;
+    };
+    for (index, (_, location)) in tabs.iter().enumerate() {
+        if location.directory_path() == Some(parent)
+            && let Some(slot) = reveals.get_mut(index)
+        {
+            *slot = Some(target);
+            return true;
+        }
+    }
+    false
+}
 fn restore_session_in_background(
     scenario: Option<AgentScenario>,
 ) -> Option<session_store::SessionState> {
@@ -3663,6 +3682,7 @@ pub fn run(
     scenario: Option<AgentScenario>,
     initial_external_paths: Vec<ExternalLaunchPath>,
     external_path_receiver: Option<mpsc::Receiver<Vec<ExternalLaunchPath>>>,
+    mut late_shell_select: Option<mpsc::Receiver<Option<PathBuf>>>,
 ) -> Result<(), slint::PlatformError> {
     let restored = restore_session_in_background(scenario);
     let classified_external = classify_external_launches_off_thread(initial_external_paths);
@@ -3763,7 +3783,7 @@ pub fn run(
     } else {
         Vec::new()
     };
-    let (restored_locations, active_index, startup_reveals) =
+    let (restored_locations, active_index, mut startup_reveals) =
         startup_locations(restored_locations, active_index, classified_external);
     ui.window()
         .set_position(slint::PhysicalPosition::new(window.x, window.y));
@@ -4043,6 +4063,25 @@ pub fn run(
             .collect::<Vec<_>>()
     };
     if scenario.is_none() {
+        if let Some(receiver) = late_shell_select.as_mut() {
+            match receiver.try_recv() {
+                Ok(Some(target)) => {
+                    if overlay_startup_shell_select(
+                        &initial_tabs,
+                        &mut startup_reveals,
+                        target.clone(),
+                    ) {
+                        late_shell_select = None;
+                    } else {
+                        let (sender, receiver) = mpsc::channel();
+                        let _ = sender.send(Some(target));
+                        late_shell_select = Some(receiver);
+                    }
+                }
+                Ok(None) | Err(mpsc::TryRecvError::Disconnected) => late_shell_select = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         for (index, (tab_id, location)) in initial_tabs.into_iter().enumerate() {
             if let NavigationLocation::Directory(path) = location {
                 submit_path_navigation_with_reveal(
@@ -4060,6 +4099,14 @@ pub fn run(
 
     if let Some(receiver) = external_path_receiver {
         start_external_path_pump(
+            receiver,
+            state.clone(),
+            request_sender.clone(),
+            network_request_sender.clone(),
+        );
+    }
+    if let Some(receiver) = late_shell_select {
+        start_late_shell_select_pump(
             receiver,
             state.clone(),
             request_sender.clone(),
@@ -4269,6 +4316,16 @@ fn start_external_path_pump(
             } else {
                 paths
             };
+            let followup =
+                platform::windows::shell_select_trap::begin_select_followup_for_ipc(&paths);
+            if let Some(followup) = followup {
+                start_late_shell_select_pump(
+                    followup.into_receiver(),
+                    state.clone(),
+                    local_sender.clone(),
+                    network_sender.clone(),
+                );
+            }
             let launches = classify_external_launches(&paths);
             let state_for_ui = state.clone();
             let local_for_ui = local_sender.clone();
@@ -4283,6 +4340,128 @@ fn start_external_path_pump(
             });
         }
     });
+}
+
+fn start_late_shell_select_pump(
+    receiver: mpsc::Receiver<Option<PathBuf>>,
+    state: SharedSessions,
+    local_sender: mpsc::Sender<DirectoryRequest>,
+    network_sender: mpsc::SyncSender<DirectoryRequest>,
+) {
+    thread::spawn(move || {
+        let Ok(Some(target)) = receiver.recv() else {
+            return;
+        };
+        for _ in 0..100 {
+            let state_for_ui = state.clone();
+            let local_for_ui = local_sender.clone();
+            let network_for_ui = network_sender.clone();
+            let target = target.clone();
+            if slint::invoke_from_event_loop(move || {
+                apply_late_shell_select_reveal(
+                    &state_for_ui,
+                    &local_for_ui,
+                    &network_for_ui,
+                    target,
+                );
+            })
+            .is_ok()
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    });
+}
+
+fn apply_late_shell_select_reveal(
+    state: &SharedSessions,
+    local_sender: &mpsc::Sender<DirectoryRequest>,
+    network_sender: &mpsc::SyncSender<DirectoryRequest>,
+    target: PathBuf,
+) {
+    let Some(directory) = target.parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let scroll_target = {
+        let mut app = match state.lock() {
+            Ok(app) => app,
+            Err(_) => return,
+        };
+        let window_id = app.active_window;
+        let tab_ids = app
+            .window(window_id)
+            .map(|window| window.tab_order.clone())
+            .unwrap_or_default();
+        let tab_id = tab_ids.into_iter().rev().find(|tab_id| {
+            app.tab(*tab_id).and_then(TabSession::visible_path) == Some(directory.as_path())
+        });
+        let Some(tab_id) = tab_id else {
+            drop(app);
+            open_classified_external_launches(
+                state,
+                local_sender,
+                network_sender,
+                vec![ClassifiedExternalLaunch::Reveal {
+                    parent: directory,
+                    target,
+                }],
+            );
+            return;
+        };
+        app.active_window_state_mut().active_tab = tab_id;
+        let request_id = app.tab(tab_id).map(|tab| tab.latest_request);
+        let loaded = app.tab(tab_id).is_some_and(|tab| {
+            tab.load_state == LoadState::Complete && tab.visible_path() == Some(directory.as_path())
+        });
+        if !loaded {
+            if let Some(request_id) = request_id {
+                queue_external_reveal(&mut app, tab_id, directory, request_id, target);
+            }
+            None
+        } else if let Some(request_id) = request_id {
+            let language = app.language;
+            let tab = app.tab_mut(tab_id).expect("matched tab exists");
+            if let Some(entry) = tab
+                .entries
+                .iter()
+                .find(|entry| entry.path == target)
+                .cloned()
+            {
+                tab.select_entry(entry.id, false, false);
+                Some((tab_id, request_id, entry.id))
+            } else {
+                tab.error = Some(format!(
+                    "reveal_target_missing:{}",
+                    Texts::new(language).reveal_target_missing()
+                ));
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if let Some((tab_id, request_id, entry_id)) = scroll_target {
+        refresh_all_windows(state);
+        reveal_late_shell_select(state, tab_id, request_id, entry_id);
+    }
+}
+
+fn reveal_late_shell_select(
+    state: &SharedSessions,
+    tab_id: TabId,
+    request_id: RequestId,
+    entry_id: EntryId,
+) {
+    let Some(window_id) = state.lock().ok().and_then(|app| app.window_for_tab(tab_id)) else {
+        return;
+    };
+    let Some(ui) = window_ui(window_id) else {
+        return;
+    };
+    reveal_entry(&ui, state, tab_id, request_id, entry_id);
+    ui.window().request_redraw();
+    platform::windows::restore_and_focus_window(native_window_handle(&ui));
 }
 
 fn open_classified_external_launches(
@@ -23642,6 +23821,26 @@ mod tests {
     }
 
     #[test]
+    fn issue_118_startup_shell_select_overlays_the_matching_folder_tab() {
+        let parent = PathBuf::from(r"D:\Depot");
+        let target = parent.join("file.cpp");
+        let tabs = vec![
+            (
+                TabId(1),
+                NavigationLocation::Directory(PathBuf::from(r"C:\Other")),
+            ),
+            (TabId(2), NavigationLocation::Directory(parent.clone())),
+        ];
+        let mut reveals = vec![None, None];
+        assert!(overlay_startup_shell_select(
+            &tabs,
+            &mut reveals,
+            target.clone()
+        ));
+        assert_eq!(reveals, [None, Some(target)]);
+    }
+
+    #[test]
     fn issue_118_external_startup_files_open_the_parent_and_keep_reveal_targets() {
         let restored = vec![NavigationLocation::Directory(PathBuf::from(r"C:\Restored"))];
         let file = PathBuf::from(r"D:\Downloads\file.zip");
@@ -23697,6 +23896,75 @@ mod tests {
         assert_eq!(pending.directory, parent);
         assert_eq!(pending.paths, vec![target]);
         assert_eq!(pending.action, PendingFocusAction::Reveal { window_id });
+    }
+
+    #[test]
+    fn issue_118_late_shell_select_reveals_the_already_open_folder_tab() {
+        let parent = PathBuf::from(r"D:\Downloads");
+        let target = parent.join("file.zip");
+        let mut app = AppState::new_for_test(vec![parent.clone()], 0, [0, 1, 2, 3]);
+        let tab_id = app.active_window_state().active_tab;
+        {
+            let tab = app.tab_mut(tab_id).unwrap();
+            tab.replace_entries(vec![focus_entry(1, target.to_str().unwrap())]);
+            tab.load_state = LoadState::Complete;
+        }
+        let state = Arc::new(Mutex::new(app));
+        let (local_sender, local_receiver) = mpsc::channel();
+        let (network_sender, _network_receiver) = mpsc::sync_channel(1);
+
+        apply_late_shell_select_reveal(&state, &local_sender, &network_sender, target);
+
+        assert!(local_receiver.try_recv().is_err());
+        let app = state.lock().unwrap();
+        let tab = app.tab(tab_id).unwrap();
+        assert_eq!(tab.selected, vec![EntryId(1)]);
+        assert_eq!(tab.focused, Some(EntryId(1)));
+        assert!(!app.focus_after_refresh.contains_key(&tab_id));
+    }
+
+    #[test]
+    fn issue_118_late_shell_select_queues_reveal_while_the_folder_is_loading() {
+        let parent = PathBuf::from(r"D:\Downloads");
+        let target = parent.join("file.zip");
+        let mut app = AppState::new_for_test(vec![parent.clone()], 0, [0, 1, 2, 3]);
+        let tab_id = app.active_window_state().active_tab;
+        let window_id = app.active_window;
+        let request_id = {
+            let tab = app.tab_mut(tab_id).unwrap();
+            let (request_id, _) =
+                tab.begin_directory_navigation(parent.clone(), NavigationKind::Refresh);
+            request_id
+        };
+        let state = Arc::new(Mutex::new(app));
+        let (local_sender, local_receiver) = mpsc::channel();
+        let (network_sender, _network_receiver) = mpsc::sync_channel(1);
+
+        apply_late_shell_select_reveal(&state, &local_sender, &network_sender, target.clone());
+
+        assert!(local_receiver.try_recv().is_err());
+        let app = state.lock().unwrap();
+        let pending = app.focus_after_refresh.get(&tab_id).unwrap();
+        assert_eq!(pending.request_id, Some(request_id));
+        assert_eq!(pending.directory, parent);
+        assert_eq!(pending.paths, vec![target]);
+        assert_eq!(pending.action, PendingFocusAction::Reveal { window_id });
+    }
+
+    #[test]
+    fn issue_118_late_shell_select_scrolls_the_focused_file_into_view() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/app.rs"));
+        let function = source
+            .split("fn apply_late_shell_select_reveal(")
+            .nth(1)
+            .expect("late select function")
+            .split("\nfn open_classified_external_launches(")
+            .next()
+            .expect("late select function boundary");
+        assert!(
+            function.contains("reveal_entry("),
+            "P4V SelectItem after the folder is visible must reuse reveal_entry to scroll"
+        );
     }
 
     #[test]

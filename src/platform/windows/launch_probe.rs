@@ -21,8 +21,8 @@ use windows_sys::{
             },
             Environment::GetCommandLineW,
             Threading::{
-                GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-                QueryFullProcessImageNameW,
+                GetCurrentProcess, GetCurrentProcessId, OpenProcess,
+                PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
             },
         },
         UI::WindowsAndMessaging::{
@@ -50,6 +50,11 @@ pub struct ExplorerSelectProcess {
     pub is_shell: bool,
     pub command: OsString,
     pub target: PathBuf,
+}
+
+pub fn parent_is_desktop_shell() -> bool {
+    let parent = parent_process_id();
+    parent.is_some() && parent == shell_process_id()
 }
 
 pub fn collect() -> LaunchProbe {
@@ -274,6 +279,36 @@ fn shell_process_id() -> Option<u32> {
 }
 
 fn parent_process_id() -> Option<u32> {
+    #[repr(C)]
+    struct ProcessBasicInformation {
+        exit_status: i32,
+        _pad0: u32,
+        peb_base_address: usize,
+        affinity_mask: usize,
+        base_priority: i32,
+        _pad1: u32,
+        unique_process_id: usize,
+        inherited_from_unique_process_id: usize,
+    }
+
+    let mut info = unsafe { std::mem::zeroed::<ProcessBasicInformation>() };
+    let mut needed = 0;
+    let status = unsafe {
+        NtQueryInformationProcess(
+            GetCurrentProcess(),
+            0,
+            std::ptr::from_mut(&mut info).cast(),
+            std::mem::size_of::<ProcessBasicInformation>() as u32,
+            &mut needed,
+        )
+    };
+    if status >= 0 {
+        let pid = info.inherited_from_unique_process_id as u32;
+        if pid != 0 {
+            return Some(pid);
+        }
+    }
+
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
         return None;
@@ -298,7 +333,7 @@ fn parent_process_id() -> Option<u32> {
         }
         CloseHandle(snapshot);
     }
-    parent
+    parent.filter(|pid| *pid != 0)
 }
 
 fn wide_string(ptr: *const u16) -> Option<OsString> {

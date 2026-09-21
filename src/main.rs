@@ -37,6 +37,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if main_network_child()? {
         return Ok(());
     }
+
+    let mut agent_options = agent_debug::AgentOptions::from_env()
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+    let external_paths = agent_options.take_external_paths();
+    #[cfg(windows)]
+    let select_followup =
+        platform::windows::shell_select_trap::begin_select_followup(&external_paths);
+
     // The application owns its colors; keep native popup styling aligned with the startup system theme.
     unsafe {
         std::env::set_var(
@@ -48,10 +56,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
     };
-
-    let mut agent_options = agent_debug::AgentOptions::from_env()
-        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
-    let external_paths = agent_options.take_external_paths();
 
     if let Some(scenario) = agent_options.scenario {
         if scenario == agent_debug::AgentScenario::AgentActions {
@@ -338,20 +342,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     #[cfg(windows)]
-    let external_paths =
-        platform::windows::shell_select_trap::enrich_folder_open_selects(external_paths);
-
     let (external_paths, mut primary_instance) =
         match platform::windows::single_instance::coordinate(&external_paths)? {
-            platform::windows::single_instance::InstanceOutcome::Primary(primary) => {
-                (external_paths, Some(primary))
+            platform::windows::single_instance::InstanceOutcome::Primary(primary) => (
+                platform::windows::shell_select_trap::enrich_folder_open_selects(external_paths),
+                Some(primary),
+            ),
+            platform::windows::single_instance::InstanceOutcome::Forwarded => {
+                if !external_paths.iter().any(|path| path.select)
+                    && let Some(target) = select_followup.and_then(|followup| followup.wait())
+                {
+                    let _ = platform::windows::single_instance::forward_paths(&[
+                        platform::windows::address_path::ExternalLaunchPath::select(target),
+                    ]);
+                }
+                return Ok(());
             }
-            platform::windows::single_instance::InstanceOutcome::Forwarded => return Ok(()),
             platform::windows::single_instance::InstanceOutcome::Fallback => {
                 eprintln!(
                     "AsterFiles could not contact the running instance; starting a fallback window."
                 );
-                (external_paths, None)
+                (
+                    platform::windows::shell_select_trap::enrich_folder_open_selects(
+                        external_paths,
+                    ),
+                    None,
+                )
             }
         };
     #[cfg(windows)]
@@ -401,10 +417,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let external_path_receiver = primary_instance
         .as_mut()
         .map(platform::windows::single_instance::PrimaryInstance::take_receiver);
+    let late_shell_select = if external_paths.iter().any(|path| path.select) {
+        None
+    } else {
+        select_followup.map(|followup| followup.into_receiver())
+    };
     app::run(
         agent_options.scenario,
         external_paths,
         external_path_receiver,
+        late_shell_select,
     )?;
     drop(primary_instance);
     Ok(())

@@ -54,6 +54,10 @@ impl PrimaryInstance {
     }
 }
 
+pub fn forward_paths(paths: &[ExternalLaunchPath]) -> io::Result<()> {
+    forward_to(PIPE_NAME, paths)
+}
+
 pub fn coordinate(paths: &[ExternalLaunchPath]) -> io::Result<InstanceOutcome> {
     let name = wide(INSTANCE_NAME);
     let mutex = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };

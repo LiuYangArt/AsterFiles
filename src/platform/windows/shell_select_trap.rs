@@ -2,8 +2,10 @@
 //!
 //! Apps that follow Explorer's pattern ShellExecute the Folder verb, then `SelectItem` on
 //! `IShellWindows`. This module registers a short-lived shell window so that request can be
-//! rewritten as an #118 reveal. It is not a full Explorer replacement: the main window is never
-//! published. Downloaders that never send `SelectItem` (for example FDM) are out of scope here.
+//! rewritten as an #118 reveal. The trap never blocks Folder Open or window startup: the folder
+//! opens immediately, and a matching `SelectItem` is applied afterwards. Desktop Explorer folder
+//! opens do not send `SelectItem` and skip the trap. The main window is never published.
+//! Downloaders that never send `SelectItem` (for example FDM) are out of scope here.
 
 use std::{
     cell::{Cell, RefCell},
@@ -66,40 +68,66 @@ const TRAP_TIMEOUT: Duration = Duration::from_millis(3_000);
 const TIMER_ID: usize = 1;
 const CLASS_NAME: &str = "AsterFiles.ShellSelectTrap.v1";
 
+pub struct SelectFollowup {
+    receiver: mpsc::Receiver<Option<PathBuf>>,
+}
+
+impl SelectFollowup {
+    pub fn wait(self) -> Option<PathBuf> {
+        self.receiver.recv().ok().flatten()
+    }
+
+    pub fn into_receiver(self) -> mpsc::Receiver<Option<PathBuf>> {
+        self.receiver
+    }
+}
+
 pub fn enrich_folder_open_selects(paths: Vec<ExternalLaunchPath>) -> Vec<ExternalLaunchPath> {
     let probe = launch_probe::collect();
     launch_probe::record(&probe, &paths);
     let Some(folder) = trap_candidate(&paths) else {
         return paths;
     };
-    if let Some(rewritten) =
-        rewrite_explorer_select(folder, &probe, "result=explorer-select-command")
-    {
-        return rewritten;
+    rewrite_explorer_select(folder, &probe, "result=explorer-select-command").unwrap_or(paths)
+}
+
+pub fn begin_select_followup(paths: &[ExternalLaunchPath]) -> Option<SelectFollowup> {
+    spawn_select_followup(paths, true)
+}
+
+pub fn begin_select_followup_for_ipc(paths: &[ExternalLaunchPath]) -> Option<SelectFollowup> {
+    spawn_select_followup(paths, false)
+}
+
+fn spawn_select_followup(
+    paths: &[ExternalLaunchPath],
+    skip_desktop_parent: bool,
+) -> Option<SelectFollowup> {
+    if paths.len() != 1 || paths[0].select {
+        return None;
     }
-    let timeout = if probe.parent_is_shell {
-        Duration::from_millis(800)
-    } else {
-        TRAP_TIMEOUT
-    };
-    match capture_shell_select(folder, timeout, None) {
-        Some(target) => {
-            crate::operation_audit::record("shell-select-trap", "result=selected");
-            vec![ExternalLaunchPath::select(target)]
-        }
-        None => {
-            let late = launch_probe::collect();
-            launch_probe::record(&late, &paths);
-            rewrite_explorer_select(folder, &late, "result=explorer-select-command-late")
-                .unwrap_or_else(|| {
-                    crate::operation_audit::record(
-                        "shell-select-trap",
-                        "result=timeout-or-unregistered",
-                    );
-                    paths
-                })
-        }
+    if skip_desktop_parent && launch_probe::parent_is_desktop_shell() {
+        crate::operation_audit::record("shell-select-trap", "result=skip-shell-parent");
+        return None;
     }
+    let folder = paths[0].path.clone();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("shell-select-followup".into())
+        .spawn(move || {
+            let selected = capture_shell_select(&folder, TRAP_TIMEOUT, None);
+            crate::operation_audit::record(
+                "shell-select-trap",
+                if selected.is_some() {
+                    "result=selected"
+                } else {
+                    "result=timeout-or-unregistered"
+                },
+            );
+            let _ = sender.send(selected);
+        })
+        .ok()?;
+    Some(SelectFollowup { receiver })
 }
 
 fn rewrite_explorer_select(
@@ -146,6 +174,14 @@ fn capture_shell_select(
         explorer_registered: Cell::new(false),
         shell_windows: RefCell::new(None),
     });
+    if let Err(detail) = register_pending_shell_window(&inner, folder) {
+        crate::operation_audit::record("shell-select-trap", format!("register-failed={detail}"));
+        return None;
+    }
+    let _shell = ShellWindowGuard {
+        inner: inner.clone(),
+    };
+
     let host = ShellSelectHost {
         inner: inner.clone(),
     };
@@ -164,13 +200,10 @@ fn capture_shell_select(
     inner.hwnd.set(hwnd);
     let _window = WindowGuard { hwnd, class };
 
-    if let Err(detail) = register_shell_window(&inner, &dispatch, folder) {
+    if let Err(detail) = complete_shell_window_register(&inner, &dispatch) {
         crate::operation_audit::record("shell-select-trap", format!("register-failed={detail}"));
         return None;
     }
-    let _shell = ShellWindowGuard {
-        inner: inner.clone(),
-    };
     if let Some(ready) = ready {
         let _ = ready.send(());
     }
@@ -179,11 +212,7 @@ fn capture_shell_select(
     inner.selected.borrow().clone()
 }
 
-fn register_shell_window(
-    inner: &Rc<Inner>,
-    dispatch: &IDispatch,
-    folder: &Path,
-) -> Result<(), String> {
+fn register_pending_shell_window(inner: &Rc<Inner>, folder: &Path) -> Result<(), String> {
     let shell_windows: IShellWindows = unsafe { CoCreateInstance(&ShellWindows, None, CLSCTX_ALL) }
         .map_err(|error| error.to_string())?;
     let pidl = parse_pidl(folder).ok_or_else(|| "folder-pidl".to_owned())?;
@@ -197,7 +226,24 @@ fn register_shell_window(
             .map_err(|error| error.to_string())?;
     inner.pending_cookie.set(pending);
     inner.pending_registered.set(true);
+    *inner.shell_windows.borrow_mut() = Some(shell_windows);
+    unsafe {
+        let _ = VariantClear(&mut location);
+        let _ = VariantClear(&mut unused);
+    }
+    Ok(())
+}
 
+fn complete_shell_window_register(inner: &Rc<Inner>, dispatch: &IDispatch) -> Result<(), String> {
+    let shell_windows = inner.shell_windows.borrow();
+    let shell_windows = shell_windows
+        .as_ref()
+        .ok_or_else(|| "shell-windows".to_owned())?;
+    let pidl = inner.folder_pidl.get();
+    if pidl.is_null() {
+        return Err("folder-pidl".to_owned());
+    }
+    let mut location = pidl_variant(pidl).map_err(|error| error.to_string())?;
     let hwnd = inner.hwnd.get().0 as i32;
     let cookie = unsafe { shell_windows.Register(dispatch, hwnd, SWC_BROWSER) }
         .map_err(|error| error.to_string())?;
@@ -217,10 +263,8 @@ fn register_shell_window(
             );
         }
     }
-    *inner.shell_windows.borrow_mut() = Some(shell_windows);
     unsafe {
         let _ = VariantClear(&mut location);
-        let _ = VariantClear(&mut unused);
     }
     Ok(())
 }
@@ -900,6 +944,15 @@ mod tests {
         assert_eq!(
             trap_candidate(&[launch(&root, false)]),
             Some(root.as_path())
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(
+            enrich_folder_open_selects(vec![launch(&root, false)]),
+            vec![launch(&root, false)]
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "Folder Open must not wait for IShellWindows SelectItem"
         );
         std::fs::remove_dir_all(&root).unwrap();
     }
