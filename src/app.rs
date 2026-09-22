@@ -7696,6 +7696,32 @@ fn update_root_popup_projection(window_id: WindowId) {
         sync_popup_semantics(&runtime.quick_menu_popup);
     });
     resize_quick_menu_root_and_reposition_submenus(window_id);
+    schedule_root_popup_presentation(window_id);
+}
+
+fn schedule_root_popup_presentation(window_id: WindowId) {
+    let event = WINDOW_RUNTIMES.with_borrow(|runtimes| {
+        let runtime = runtimes.get(&window_id)?;
+        let popup = &runtime.quick_menu_popup;
+        if !root_popup_presentation_ready(
+            popup.presentation,
+            runtime.ui.get_context_shell_loading(),
+        ) {
+            return None;
+        }
+        let session = popup.session.identity()?;
+        let branch = popup.session.branches().first()?.id;
+        popup.root.window().request_redraw();
+        Some(crate::quick_menu_popup::MenuEventIdentity { session, branch })
+    });
+    let Some(event) = event else { return };
+    slint::Timer::single_shot(Duration::from_millis(16), move || {
+        finish_root_popup_presentation(window_id, event);
+    });
+}
+
+fn root_popup_presentation_ready(presentation: PopupPresentation, shell_loading: bool) -> bool {
+    presentation == PopupPresentation::ShownCloaked && !shell_loading
 }
 
 fn submenu_slot_is_current(
@@ -8954,7 +8980,10 @@ fn finish_root_popup_presentation(
         let runtime = runtimes.get(&window_id)?;
         let popup = &runtime.quick_menu_popup;
         (popup.cloak_generation == Some(event.session.generation)
-            && popup.presentation == PopupPresentation::ShownCloaked
+            && root_popup_presentation_ready(
+                popup.presentation,
+                runtime.ui.get_context_shell_loading(),
+            )
             && popup.session.matches_event(event))
         .then(|| component_window_handle(&popup.root))
     });
@@ -25509,6 +25538,23 @@ mod tests {
                 > root_popup_height_for_content(placeholder_height, true, 1.0)
         );
     }
+
+    #[test]
+    fn root_popup_waits_for_shell_before_presentation() {
+        assert!(!root_popup_presentation_ready(
+            PopupPresentation::ShownCloaked,
+            true,
+        ));
+        assert!(root_popup_presentation_ready(
+            PopupPresentation::ShownCloaked,
+            false,
+        ));
+        assert!(!root_popup_presentation_ready(
+            PopupPresentation::Presented,
+            false,
+        ));
+    }
+
     #[test]
     fn quick_menu_placeholder_and_pending_snapshot_are_not_interactive() {
         let placeholder = quick_menu_placeholder();
