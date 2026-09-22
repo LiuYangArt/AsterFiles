@@ -6974,7 +6974,17 @@ fn shell_menu_invocation_refresh_target(
     state: &SharedSessions,
     tab_id: TabId,
     target: Option<&platform::windows::context_menu::ShellMenuBackgroundTarget>,
+    invocation: &platform::windows::context_menu::ClassicMenuInvocation,
 ) -> Option<NavigationLocation> {
+    if !matches!(
+        invocation,
+        platform::windows::context_menu::ClassicMenuInvocation::Shell {
+            refresh_directory: true,
+            ..
+        }
+    ) {
+        return None;
+    }
     match target? {
         platform::windows::context_menu::ShellMenuBackgroundTarget::FileSystem(path) => {
             Some(NavigationLocation::Directory(path.clone()))
@@ -16449,6 +16459,7 @@ fn start_shell_menu_event_pump(
                                         &state,
                                         identity.key.tab_id,
                                         location.as_ref(),
+                                        &invocation,
                                     ) {
                                         let _ = submit_location_navigation(
                                             &directory_sender,
@@ -30697,6 +30708,81 @@ mod tests {
             Color::from_argb_u8(0xff, 0x32, 0x34, 0x37)
         );
     }
+    #[test]
+    fn issue_125_open_with_completion_keeps_list_position_and_selection() {
+        use platform::windows::context_menu::{ClassicMenuInvocation, ShellMenuBackgroundTarget};
+
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().expect("headless model");
+        let path = PathBuf::from(r"C:\files");
+        let mut app = AppState::new_for_test(vec![path.clone()], 0, [0, 1, 2, 3]);
+        let tab_id = app.active_window_state().active_tab;
+        let window_id = app.active_window;
+        let tab = app.tab_mut(tab_id).unwrap();
+        tab.replace_entries(
+            (1..=200)
+                .map(|id| focus_entry(id, &format!(r"C:\files\file{id:03}.txt")))
+                .collect(),
+        );
+        tab.load_state = LoadState::Complete;
+        tab.select_entry(EntryId(80), false, false);
+        let request_id = tab.latest_request;
+        let state = Arc::new(Mutex::new(app));
+        refresh_ui_inner(&ui, &state, window_id);
+        ui.set_file_viewport_y(-1_500.0);
+        let target = ShellMenuBackgroundTarget::FileSystem(path.clone());
+        let (local, requests) = mpsc::channel();
+        let (network, network_requests) = mpsc::sync_channel(1);
+
+        for verb in [None, Some("openwith"), Some("openas"), Some("program")] {
+            let invocation = ClassicMenuInvocation::Shell {
+                verb: verb.map(str::to_owned),
+                refresh_directory: false,
+            };
+            if let Some(location) =
+                shell_menu_invocation_refresh_target(&state, tab_id, Some(&target), &invocation)
+            {
+                submit_location_navigation(
+                    &local,
+                    &network,
+                    &state,
+                    tab_id,
+                    location,
+                    NavigationKind::Refresh,
+                );
+            }
+            assert!(matches!(
+                requests.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            assert!(matches!(
+                network_requests.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            refresh_ui_inner(&ui, &state, window_id);
+            assert_eq!(ui.get_file_viewport_y(), -1_500.0);
+            let app = state.lock().unwrap();
+            let tab = app.tab(tab_id).unwrap();
+            assert_eq!(tab.latest_request, request_id);
+            assert_eq!(tab.selected, vec![EntryId(80)]);
+            assert_eq!(tab.focused, Some(EntryId(80)));
+            assert_eq!(tab.entries.len(), 200);
+        }
+        let changed = ClassicMenuInvocation::Shell {
+            verb: None,
+            refresh_directory: true,
+        };
+        assert_eq!(
+            shell_menu_invocation_refresh_target(&state, tab_id, Some(&target), &changed),
+            Some(NavigationLocation::Directory(path))
+        );
+        let network_target = ShellMenuBackgroundTarget::FileSystem(PathBuf::from(r"\\nas\share"));
+        assert_eq!(
+            shell_menu_invocation_refresh_target(&state, tab_id, Some(&network_target), &changed),
+            Some(NavigationLocation::Directory(PathBuf::from(r"\\nas\share")))
+        );
+    }
+
     #[test]
     fn inactive_grid_model_updates_do_not_rewind_the_details_viewport() {
         let ui = headless_file_view();

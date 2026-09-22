@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ffi::{OsStr, OsString},
     io,
     marker::PhantomData,
@@ -70,13 +70,62 @@ pub enum ClassicMenuItemKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClassicMenuInvocation {
-    BuiltIn { verb: String },
-    Shell { verb: Option<String> },
+    BuiltIn {
+        verb: String,
+    },
+    Shell {
+        verb: Option<String>,
+        refresh_directory: bool,
+    },
 }
 
 pub type ShellMenuSessionId = u64;
 pub type ShellMenuRequestId = u64;
 pub type ShellMenuSubmenuToken = u64;
+
+#[derive(Default)]
+struct OpenWithCommands {
+    commands: HashSet<u32>,
+    submenus: HashSet<ShellMenuSubmenuToken>,
+}
+
+impl OpenWithCommands {
+    fn record(&mut self, items: &[ClassicMenuItem], parent: Option<ShellMenuSubmenuToken>) {
+        let inherited = parent.is_some_and(|token| self.submenus.contains(&token));
+        for item in items {
+            let open_with = inherited || is_open_with_verb(item.verb.as_deref());
+            if let Some(command_id) = item.command_id {
+                if open_with {
+                    self.commands.insert(command_id);
+                } else {
+                    self.commands.remove(&command_id);
+                }
+            }
+            if let ClassicMenuItemKind::Submenu { token, items } = &item.kind {
+                if open_with {
+                    self.submenus.insert(*token);
+                } else {
+                    self.submenus.remove(token);
+                }
+                self.record(items, Some(*token));
+            }
+        }
+    }
+
+    fn invocation(&self, command_id: u32, verb: Option<String>) -> ClassicMenuInvocation {
+        ClassicMenuInvocation::Shell {
+            refresh_directory: !self.commands.contains(&command_id)
+                && !is_open_with_verb(verb.as_deref()),
+            verb,
+        }
+    }
+}
+
+fn is_open_with_verb(verb: Option<&str>) -> bool {
+    verb.is_some_and(|verb| {
+        verb.eq_ignore_ascii_case("openwith") || verb.eq_ignore_ascii_case("openas")
+    })
+}
 
 const MAX_SHELL_MENU_SESSIONS: usize = 8;
 
@@ -490,6 +539,7 @@ pub struct ClassicMenuSession {
     context_menu3: Option<IContextMenu3>,
     com_initialized: bool,
     submenus: Vec<SubmenuRegistration>,
+    open_with: OpenWithCommands,
     powershell_commands: HashMap<u32, PowerShellBackgroundCommand>,
     background: bool,
     working_directory: Option<PathBuf>,
@@ -624,6 +674,7 @@ impl ClassicMenuSession {
             context_menu3,
             com_initialized: true,
             submenus: Vec::new(),
+            open_with: OpenWithCommands::default(),
             powershell_commands: HashMap::new(),
             background,
             working_directory,
@@ -638,11 +689,19 @@ impl ClassicMenuSession {
 
     fn items_top_level(&mut self) -> io::Result<Vec<ClassicMenuItem>> {
         let menu = self.menu;
-        self.read_menu_level(menu)
+        self.read_menu_level(menu, None)
     }
 
-    fn read_menu_level(&mut self, menu: HMENU) -> io::Result<Vec<ClassicMenuItem>> {
-        read_menu_level(menu, self)
+    fn read_menu_level(
+        &mut self,
+        menu: HMENU,
+        parent: Option<ShellMenuSubmenuToken>,
+    ) -> io::Result<Vec<ClassicMenuItem>> {
+        let items = read_menu_level(menu, self)?;
+        // Dynamic program items may omit their verb or replace HMENU; the stable
+        // submenu token retains the Open with intent throughout the session.
+        self.open_with.record(&items, parent);
+        Ok(items)
     }
 
     fn register_submenu(&mut self, menu: HMENU, parent: HMENU) -> ShellMenuSubmenuToken {
@@ -700,7 +759,7 @@ impl ClassicMenuSession {
         pump_sta_messages();
         let mut submenu = submenu_at_position(registration.parent, position)?;
         self.submenus[index].menu = submenu;
-        let items = self.read_menu_level(submenu)?;
+        let items = self.read_menu_level(submenu, Some(token))?;
         if !items.is_empty() {
             return Ok(items);
         }
@@ -713,7 +772,7 @@ impl ClassicMenuSession {
             pump_sta_messages();
             submenu = submenu_at_position(registration.parent, position)?;
             self.submenus[index].menu = submenu;
-            let items = self.read_menu_level(submenu)?;
+            let items = self.read_menu_level(submenu, Some(token))?;
             if !items.is_empty() {
                 return Ok(items);
             }
@@ -740,6 +799,7 @@ impl ClassicMenuSession {
             launch_powershell_background_command(command, owner_window)?;
             return Ok(ClassicMenuInvocation::Shell {
                 verb: Some(format!("{POWERSHELL_COMMAND_VERB_PREFIX}{command_id}")),
+                refresh_directory: true,
             });
         }
         let offset = command_id
@@ -778,7 +838,7 @@ impl ClassicMenuSession {
         };
         let base = (&invocation as *const CMINVOKECOMMANDINFOEX).cast();
         unsafe { context_menu.InvokeCommand(&*base) }.map_err(windows_error)?;
-        Ok(ClassicMenuInvocation::Shell { verb })
+        Ok(self.open_with.invocation(command_id, verb))
     }
 
     fn initialize_submenu(&self, parent: HMENU, submenu: HMENU, position: u32) {
@@ -1629,6 +1689,71 @@ mod tests {
         }
         assert!(!is_builtin_verb("openwith"));
     }
+    #[test]
+    fn issue_125_open_with_dynamic_descendants_do_not_refresh() {
+        fn item(id: u32, verb: Option<&str>, token: Option<u64>) -> ClassicMenuItem {
+            ClassicMenuItem {
+                command_id: Some(id),
+                title: "Arbitrary localized title".into(),
+                verb: verb.map(str::to_owned),
+                enabled: true,
+                checked: false,
+                default: false,
+                kind: token.map_or(ClassicMenuItemKind::Command, |token| {
+                    ClassicMenuItemKind::Submenu {
+                        token,
+                        items: Vec::new(),
+                    }
+                }),
+            }
+        }
+        fn refreshes(commands: &OpenWithCommands, id: u32, verb: Option<&str>) -> bool {
+            matches!(
+                commands.invocation(id, verb.map(str::to_owned)),
+                ClassicMenuInvocation::Shell {
+                    refresh_directory: true,
+                    ..
+                }
+            )
+        }
+
+        let mut commands = OpenWithCommands::default();
+        commands.record(
+            &[
+                item(1, Some("OpenWith"), Some(10)),
+                item(2, Some("new"), Some(20)),
+                item(3, None, None),
+            ],
+            None,
+        );
+        commands.record(&[item(4, None, None), item(5, None, Some(30))], Some(10));
+        commands.record(
+            &[item(6, Some("application-specific-verb"), None)],
+            Some(30),
+        );
+        commands.record(&[item(7, None, None)], Some(20));
+        for id in [1, 4, 5, 6] {
+            assert!(!refreshes(&commands, id, None), "Open with item {id}");
+        }
+        for id in [2, 3, 7] {
+            assert!(refreshes(&commands, id, None), "ordinary item {id}");
+        }
+        for verb in ["openwith", "OpenWith", "openas", "OpenAs"] {
+            assert!(!refreshes(&commands, 100, Some(verb)));
+        }
+        for verb in [None, Some("extract"), Some("new"), Some("properties")] {
+            assert!(refreshes(&commands, 100, verb));
+        }
+
+        // Rebuilt native menus retain the session token, even with new command IDs.
+        commands.record(&[item(8, None, None)], Some(10));
+        assert!(!refreshes(&commands, 8, None));
+        // Reused IDs outside Open with must regain normal refresh behavior.
+        commands.record(&[item(8, None, None)], Some(20));
+        assert!(refreshes(&commands, 8, None));
+        assert!(refreshes(&OpenWithCommands::default(), 4, None));
+    }
+
     #[test]
     fn only_shell_dynamic_menu_messages_are_forwarded() {
         for message in [

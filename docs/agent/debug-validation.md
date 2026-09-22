@@ -352,3 +352,9 @@ python tools/verify.py
 真实库补验：使用含健康本地目录与离线共享目录的测试库，确认健康来源先显示；读取中切换到普通本地目录、关闭库标签并退出，确认不被离线来源拖住。按 Shell 来源顺序检查分组与部分失败提示。真实库检查可作为实际环境补验；用户授权以无界面功能验证作为验收依据时，在自动验证通过后按仓库收尾流程执行本地 Release 构建、提交并关闭 Issue，不将可自动验证的后台功能再次转交用户。
 
 目录流确认竞争的症状、根因与确定性回归见 [#104 目录流消费确认排查](../postmortem/postmortem-2026-09-13-library-stream-acknowledgement.md)。
+
+## Issue #125 打开方式保留列表位置
+
+专项无界面回归：`cargo test --locked issue_125_ -- --nocapture`。测试使用内存菜单数据与 Slint testing backend，不显示桌面窗口、不调用真实 Shell 命令；覆盖打开方式直接命令、无动词和多级动态子项、菜单重建后的稳定 token、未知命令继续刷新，以及完成后的请求、选择和滚动位置保留。
+
+完整验证运行 `python tools/verify.py`，结果见 `artifacts/verify/summary.json` 与 `artifacts/logs/verify-test.log`。人工验收：打开文件较多的目录，滚动到中后部并选中文件，右键 → Open with → 任意程序；回到 AsterFiles 确认列表和选择保持原位。再从“选择其他应用”进入选择器后取消，确认仍保持原位。
