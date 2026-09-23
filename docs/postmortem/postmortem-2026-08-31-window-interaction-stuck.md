@@ -50,11 +50,17 @@ winit 0.30.13 在发送非客户区按下消息前先把内部 `dragging` 标记
 - Release 首次构建发现旧版程序仍在运行并占用目标文件；关闭该进程后 `cargo build --release` 通过。
 - 用户在真实 Windows 窗口确认修复可用并同意完成 Issue。
 
+## 2026-09-23 复发（#126）
+
+最大化时把缩放边宽设为 0 之后，症状仍会出现一次。Slint 把缩放方向记在最近一次鼠标移动上，按下时不再重算。光标停在边缘时用 Win+↑ 或拖到屏幕顶部最大化，下一次左键仍会调用 `drag_resize_window`。Windows 拒绝后同样没有 `WM_EXITSIZEMOVE`。
+
+补救放在窗口子类，不替换 Slint/winit 的命中和模态循环：`WM_NCLBUTTONDOWN` 返回时如果没有看到 `WM_ENTERSIZEMOVE`，补发 `WM_EXITSIZEMOVE`，让 winit 清除 `dragging`。已经进入循环的请求不补发。
+
 ## 防复发规则
 
-1. 最大化、全屏和固定尺寸窗口不得发起边缘缩放。
+1. 最大化、全屏和固定尺寸窗口不得发起边缘缩放。最大化前缓存的缩放方向也算一次发起。
 2. 无边框窗口的移动/缩放故障先记录请求和 `WM_NCLBUTTONDOWN / WM_ENTERSIZEMOVE / WM_EXITSIZEMOVE`，不先替换系统交互链。
-3. 修复优先阻止无效请求，避免复制 Slint/winit 已经承担的命中、捕获和渲染时序。
+3. 修复优先阻止无效请求；系统未进入循环时，只补系统本来会发送的 `WM_EXITSIZEMOVE`。
 4. 自动测试不能证明真实 Windows 模态移动与缩放；完成状态必须包含用户手动验证。
 5. 验证缩放时必须观察客户区是否逐帧重绘，不能只确认最终窗口大小正确。
 
@@ -62,6 +68,7 @@ winit 0.30.13 在发送非客户区按下消息前先把内部 `dragging` 标记
 
 - 窗口声明与最大化状态：`ui/app-window.slint`
 - 标题栏移动入口：`src/app.rs`
+- 卡住恢复：`src/platform/windows/window_drag_recovery.rs`
 - Windows 消息诊断：`src/platform/windows/window_trace.rs`
 - 诊断日志：`artifacts/logs/window-interaction-diagnostic.jsonl`
 - 任务记录：GitHub Issue #2

@@ -7485,6 +7485,14 @@ fn native_window_handle(ui: &AppWindow) -> isize {
     component_window_handle(ui)
 }
 
+fn install_window_drag_recovery<T: slint::ComponentHandle>(ui: &T) {
+    if let Err(error) =
+        platform::windows::window_drag_recovery::install(component_window_handle(ui))
+    {
+        eprintln!("failed to install window drag recovery: {error}");
+    }
+}
+
 fn component_window_handle<T: slint::ComponentHandle>(ui: &T) -> isize {
     use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     ui.window()
@@ -14538,6 +14546,7 @@ fn wire_window_controls(ui: &AppWindow) {
     });
 
     wire_window_trace(ui);
+    install_window_drag_recovery(ui);
 
     let weak = ui.as_weak();
     ui.on_drag_window(move || {
@@ -14576,6 +14585,7 @@ fn configure_secondary_dialog_window<T: slint::ComponentHandle>(ui: &T) {
             window.set_undecorated_shadow(true);
         }
     });
+    install_window_drag_recovery(ui);
 }
 
 fn configure_confirmation_window(ui: &ConfirmationWindow) {
@@ -15471,6 +15481,7 @@ fn wire_operation_window(
         window.set_undecorated_shadow(true);
         window.set_resizable(false);
     });
+    install_window_drag_recovery(operation_ui);
 
     let state_for_cancel = state.clone();
     let operation_weak = operation_ui.as_weak();

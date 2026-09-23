@@ -835,8 +835,9 @@ export component AppWindow inherits Window {
     title: "AsterFiles";
     icon: @image-url("../assets/app-icon.png");
     no-frame: true;
-    // Windows cannot start an edge resize while maximized. Keeping the hit area active there can
-    // leave winit waiting forever for a system resize loop that never began.
+    // Windows cannot start an edge resize while maximized. Slint also keeps the last resize
+    // direction until the pointer moves, so a click after maximize can still request one.
+    // window_drag_recovery posts WM_EXITSIZEMOVE when that request never enters the system loop.
     resize-border-width: root.maximized ? 0px : 14px;
     preferred-width: 1180px;
     preferred-height: 760px;

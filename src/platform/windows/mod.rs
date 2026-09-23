@@ -23,6 +23,7 @@ pub mod shortcut;
 pub mod single_instance;
 
 pub mod tab_insertion_indicator;
+pub mod window_drag_recovery;
 pub mod window_trace;
 
 use std::io;
