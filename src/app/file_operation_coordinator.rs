@@ -20,12 +20,31 @@ use crate::{
     platform,
 };
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{Mutex, OnceLock, mpsc},
     thread,
     time::{Duration, Instant},
 };
+
+fn drop_staging_roots() -> &'static Mutex<HashMap<OperationId, PathBuf>> {
+    static ROOTS: OnceLock<Mutex<HashMap<OperationId, PathBuf>>> = OnceLock::new();
+    ROOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remember_drop_staging(id: OperationId, root: PathBuf) {
+    if let Ok(mut roots) = drop_staging_roots().lock() {
+        roots.insert(id, root);
+    }
+}
+
+fn release_drop_staging(id: OperationId) {
+    let root = drop_staging_roots()
+        .lock()
+        .ok()
+        .and_then(|mut roots| roots.remove(&id));
+    platform::windows::drag_drop::discard_drop_staging(root);
+}
 fn capture_undo_source_manifests(
     kind: FileOperationKind,
     resource: OperationResource,
@@ -82,6 +101,7 @@ pub(super) fn fail_operation_dispatch(state: &SharedSessions, first: OperationId
             release_operation_directories(&mut app, kind, &items);
         }
         let _ = app.operations.finish(id, OperationState::Failed, result);
+        release_drop_staging(id);
         next = app.operations.start_next(resource).ok().flatten();
     }
 }
@@ -173,11 +193,14 @@ pub(super) fn enqueue_operation(
     origin_tab: TabId,
     kind: FileOperationKind,
     mut items: Vec<OperationItem>,
+    staging_root: Option<PathBuf>,
 ) -> Option<OperationId> {
     if items.is_empty() {
+        platform::windows::drag_drop::discard_drop_staging(staging_root);
         return None;
     }
     if kind == FileOperationKind::Rename {
+        platform::windows::drag_drop::discard_drop_staging(staging_root);
         return enqueue_rename_preparation(state, sender, origin_tab, items);
     }
     for item in &mut items {
@@ -201,12 +224,17 @@ pub(super) fn enqueue_operation(
                 .as_deref()
                 .is_some_and(crate::domain::folder_size_scheduler::is_internal_cleanup_path)
     }) {
+        platform::windows::drag_drop::discard_drop_staging(staging_root);
         return None;
     }
     let resource = operation_resource(&items);
     let (operation_id, request) = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
-        app.tab(origin_tab)?;
+        if app.tab(origin_tab).is_none() {
+            drop(app);
+            platform::windows::drag_drop::discard_drop_staging(staging_root);
+            return None;
+        }
         let undo_source_manifests = capture_undo_source_manifests(kind, resource, &items);
         crate::operation_audit::record(
             "operation_enqueued",
@@ -215,6 +243,9 @@ pub(super) fn enqueue_operation(
         let operation_id = app
             .operations
             .submit(resource, kind, Some(origin_tab), items);
+        if let Some(root) = staging_root {
+            remember_drop_staging(operation_id, root);
+        }
         app.operations
             .set_undo_source_manifests(operation_id, undo_source_manifests);
         if app.operations.active_id(resource).is_some() {
@@ -546,6 +577,11 @@ pub(super) fn finish_file_operation(
     state: &SharedSessions,
     event: FileOperationEvent,
 ) -> Option<OperationCompletion> {
+    let id = match &event {
+        FileOperationEvent::Finished { id, .. } => *id,
+        _ => return None,
+    };
+    release_drop_staging(id);
     let FileOperationEvent::Finished {
         id,
         result,

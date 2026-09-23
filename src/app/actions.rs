@@ -484,6 +484,7 @@ pub(super) fn rename(
         target.tab.tab_id,
         FileOperationKind::Rename,
         vec![item],
+        None,
     )
     .map(|id| ActionReceipt::OperationAccepted { id })
     .ok_or(ActionError::QueueUnavailable)

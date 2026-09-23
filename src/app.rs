@@ -5616,6 +5616,7 @@ fn create_default_folder(state: &WindowSessions, sender: &mpsc::Sender<FileOpera
             tab_id,
             FileOperationKind::CreateFolder,
             vec![OperationItem::pending(None, Some(path))],
+            None,
         );
     }
 }
@@ -5973,7 +5974,7 @@ fn submit_delete_items(
     } else {
         FileOperationKind::RecycleDelete
     };
-    let _ = enqueue_operation(state, sender, origin_tab, kind, items);
+    let _ = enqueue_operation(state, sender, origin_tab, kind, items, None);
 }
 
 fn submit_delete(
@@ -14009,13 +14010,22 @@ fn dispatch_drop_operation(
         "drop_dispatch",
         format!("tab={origin_tab:?} intent={intent:?}"),
     );
+    let staging_root = intent.staging_root.clone();
     thread::spawn(move || match prepare_drop_operation(intent) {
         Ok(PreparedDrop::Operation(kind, items)) => {
             let _ = slint::invoke_from_event_loop(move || {
-                let _ = enqueue_operation(&state, &operation_sender, origin_tab, kind, items);
+                let _ = enqueue_operation(
+                    &state,
+                    &operation_sender,
+                    origin_tab,
+                    kind,
+                    items,
+                    staging_root,
+                );
             });
         }
         Ok(PreparedDrop::Shortcuts(shortcuts)) => {
+            platform::windows::drag_drop::discard_drop_staging(staging_root);
             let result = create_drop_shortcuts(shortcuts);
             let _ = slint::invoke_from_event_loop(move || {
                 if let Err(error) = result
@@ -14026,6 +14036,7 @@ fn dispatch_drop_operation(
             });
         }
         Err(error) => {
+            platform::windows::drag_drop::discard_drop_staging(staging_root);
             let _ = slint::invoke_from_event_loop(move || {
                 if let Ok(mut app) = state.lock() {
                     app.operation_errors.push(error);
@@ -14178,6 +14189,7 @@ fn wire_native_drag_drop(
         let Some((origin_tab, intent)) = pending else {
             return;
         };
+        let staging_root = intent.staging_root.clone();
         match selected_right_drop(intent, choice) {
             Ok(Some(intent)) => dispatch_drop_operation(
                 intent,
@@ -14185,8 +14197,9 @@ fn wire_native_drag_drop(
                 state_for_choice.shared.clone(),
                 operation_for_choice.clone(),
             ),
-            Ok(None) => {}
+            Ok(None) => platform::windows::drag_drop::discard_drop_staging(staging_root),
             Err(error) => {
+                platform::windows::drag_drop::discard_drop_staging(staging_root);
                 if let Ok(mut app) = state_for_choice.lock() {
                     app.operation_errors.push(error);
                 }
@@ -14221,12 +14234,15 @@ fn wire_native_drag_drop(
                 let state_for_ui = state.clone();
                 let weak_for_ui = weak_for_intents.clone();
                 let _ = slint::invoke_from_event_loop(move || {
+                    let staging_root = intent.staging_root.clone();
                     let Some(ui) = weak_for_ui.upgrade() else {
+                        platform::windows::drag_drop::discard_drop_staging(staging_root);
                         return;
                     };
                     let Ok((client_left, client_top, _, _)) =
                         platform::windows::drag_drop::client_screen_rect(native_window_handle(&ui))
                     else {
+                        platform::windows::drag_drop::discard_drop_staging(staging_root);
                         return;
                     };
                     let scale = ui.window().scale_factor();
@@ -14248,17 +14264,25 @@ fn wire_native_drag_drop(
                         else {
                             return false;
                         };
-                        app.pending_right_drops
-                            .insert(state_for_ui.window_id, (origin_tab, intent));
+                        if let Some((_, previous)) = app
+                            .pending_right_drops
+                            .insert(state_for_ui.window_id, (origin_tab, intent))
+                        {
+                            platform::windows::drag_drop::discard_drop_staging(
+                                previous.staging_root,
+                            );
+                        }
                         true
                     });
                     if !pending_saved {
+                        platform::windows::drag_drop::discard_drop_staging(staging_root);
                         return;
                     }
                     eprintln!("drag-drop: showing right-drop menu x={x} y={y}");
                     ui.invoke_show_drop_menu(x, y);
                 });
             } else {
+                let staging_root = intent.staging_root.clone();
                 let origin_tab = state
                     .lock()
                     .ok()
@@ -14270,6 +14294,8 @@ fn wire_native_drag_drop(
                         state.shared.clone(),
                         operation_sender.clone(),
                     );
+                } else {
+                    platform::windows::drag_drop::discard_drop_staging(staging_root);
                 }
             }
         }
@@ -16663,8 +16689,14 @@ fn start_clipboard_event_pump(
                         origin_tab,
                         result: Ok(Some((kind, items))),
                     } => {
-                        let _ =
-                            enqueue_operation(&state, &operation_sender, origin_tab, kind, items);
+                        let _ = enqueue_operation(
+                            &state,
+                            &operation_sender,
+                            origin_tab,
+                            kind,
+                            items,
+                            None,
+                        );
                     }
                     ClipboardEvent::Written {
                         result: Ok(()),
@@ -28863,6 +28895,7 @@ mod tests {
                 screen_x: 0,
                 screen_y: 0,
                 allowed_effects: ALLOW_COPY | ALLOW_MOVE | ALLOW_LINK,
+                staging_root: None,
             });
             if effect == DropEffect::Link {
                 assert!(prepared.is_err());
@@ -28906,7 +28939,7 @@ mod tests {
             result: Ok(Some((kind, items))),
         } = event
         {
-            let _ = enqueue_operation(&shared, &sender, origin_tab, kind, items);
+            let _ = enqueue_operation(&shared, &sender, origin_tab, kind, items, None);
         }
 
         let app = shared.lock().unwrap();
@@ -30318,6 +30351,7 @@ mod tests {
                 allowed_effects: platform::windows::drag_drop::ALLOW_COPY
                     | platform::windows::drag_drop::ALLOW_MOVE
                     | platform::windows::drag_drop::ALLOW_LINK,
+                staging_root: None,
             })
             .unwrap()
         else {
@@ -30359,6 +30393,7 @@ mod tests {
                 allowed_effects: platform::windows::drag_drop::ALLOW_COPY
                     | platform::windows::drag_drop::ALLOW_MOVE
                     | platform::windows::drag_drop::ALLOW_LINK,
+                staging_root: None,
             })
             .unwrap()
         else {
@@ -30397,6 +30432,7 @@ mod tests {
                 allowed_effects: platform::windows::drag_drop::ALLOW_COPY
                     | platform::windows::drag_drop::ALLOW_MOVE
                     | platform::windows::drag_drop::ALLOW_LINK,
+                staging_root: None,
             })
             .unwrap()
         else {
@@ -31400,6 +31436,7 @@ mod tests {
             screen_x: 25,
             screen_y: 40,
             allowed_effects,
+            staging_root: None,
         }
     }
 

@@ -1,12 +1,16 @@
 use std::{
     cell::RefCell,
     ffi::{OsString, c_void},
-    io,
-    mem::{ManuallyDrop, size_of},
+    io::{self, Write},
+    mem::ManuallyDrop,
     os::windows::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
     ptr,
-    sync::{Arc, Mutex, OnceLock, Weak, mpsc},
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
 };
 
 use windows_sys::Win32::{
@@ -15,6 +19,10 @@ use windows_sys::Win32::{
     UI::WindowsAndMessaging::GetClientRect,
 };
 
+#[cfg(test)]
+use windows::Win32::System::Com::{
+    ISequentialStream_Impl, IStream_Impl, LOCKTYPE, STATFLAG, STATSTG, STGC, STREAM_SEEK,
+};
 use windows::{
     Win32::{
         Foundation::{
@@ -31,8 +39,8 @@ use windows::{
         System::{
             Com::{
                 CLSCTX_INPROC_SERVER, CoCreateInstance, DATADIR_GET, DVASPECT_CONTENT, FORMATETC,
-                IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA,
-                STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL, Urlmon::CopyStgMedium,
+                IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, IStream,
+                STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL, TYMED_ISTREAM, Urlmon::CopyStgMedium,
             },
             DataExchange::RegisterClipboardFormatW,
             Memory::{
@@ -61,6 +69,11 @@ const CF_HDROP: u16 = 15;
 const MK_ALT: u32 = 0x20;
 const TAB_DRAG_FORMAT: &str = "AsterFiles.TabDrag.v1";
 const TAB_DRAG_MAGIC: [u8; 8] = *b"ASTFTAB1";
+const FD_ATTRIBUTES: u32 = 0x4;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+const DESCRIPTOR_NAME_OFFSET: usize = 72;
+const WIDE_DESCRIPTOR_SIZE: usize = 592;
+const ANSI_DESCRIPTOR_SIZE: usize = 332;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TabDragPayload {
@@ -178,6 +191,9 @@ pub struct DropIntent {
     pub screen_x: i32,
     pub screen_y: i32,
     pub allowed_effects: u32,
+    /// Scratch directory owned by a virtual or temporary drop. The file task
+    /// deletes it after the copy finishes, including when the user skips a conflict.
+    pub staging_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,10 +371,27 @@ pub fn current_state(hwnd: isize) -> DragDropState {
         .unwrap_or_default()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncomingKind {
+    /// Real filesystem paths. Copy or move them after Drop returns.
+    Files,
+    /// Every HDROP path is under the user temp directory. The source may delete
+    /// that directory as soon as Drop returns, so the files are snapshotted first.
+    Ephemeral,
+    /// `FileGroupDescriptor` + `FileContents`. The streams are only valid during Drop.
+    Virtual,
+}
+
 struct DragContext {
     paths: Vec<PathBuf>,
     allowed_effects: u32,
     right_button: bool,
+    incoming: IncomingKind,
+}
+
+struct StagedDrop {
+    root: PathBuf,
+    paths: Vec<PathBuf>,
 }
 
 #[implement(IDropTarget)]
@@ -393,6 +426,160 @@ impl NativeDropTarget {
             state.rejection_reason = reason;
             state.cursor_y = point.map(|point| point.y);
         }
+    }
+
+    fn accept_staged_drop(
+        &self,
+        staged: StagedDrop,
+        context: &DragContext,
+        point: &POINTL,
+        native_effect: *mut DROPEFFECT,
+        shown: DropEffect,
+        target: DropTarget,
+    ) {
+        let directory = drop_target_directory(&target).map(Path::to_path_buf);
+        let Some(directory) = directory else {
+            discard_drop_staging(Some(staged.root));
+            self.reject_drop("target_unavailable", native_effect);
+            return;
+        };
+        let allowed_effects =
+            allowed_effects_for_target(&staged.paths, &directory, context.allowed_effects)
+                & (ALLOW_COPY | ALLOW_MOVE);
+        set_native_effect(native_effect, shown);
+        crate::operation_audit::record(
+            "native_drag_drop",
+            format!(
+                "hwnd={} incoming={:?} staged={:?} target={target:?} effect=copy count={}",
+                self.hwnd,
+                context.incoming,
+                staged.paths,
+                staged.paths.len()
+            ),
+        );
+        let _ = self.intents.send(DropIntent {
+            paths: staged.paths.clone(),
+            target,
+            effect: DropEffect::Copy,
+            right_button: context.right_button,
+            screen_x: point.x,
+            screen_y: point.y,
+            allowed_effects,
+            staging_root: Some(staged.root),
+        });
+        self.update(
+            DragDropEvent::Dropped,
+            &staged.paths,
+            Some(&DropTarget::Directory(directory)),
+            DropEffect::Copy,
+            None,
+            Some(point),
+        );
+    }
+
+    fn staged_copy_target(
+        &self,
+        context: &DragContext,
+        point: &POINTL,
+        native_effect: *mut DROPEFFECT,
+    ) -> Option<(DropEffect, DropTarget)> {
+        let target = self.target(point);
+        let (shown, reason) = incoming_copy_effect(target.as_ref(), context.allowed_effects);
+        let Some(target) = target.filter(|_| reason.is_none()) else {
+            set_native_effect(native_effect, DropEffect::None);
+            self.update(
+                DragDropEvent::Dropped,
+                &context.paths,
+                None,
+                DropEffect::None,
+                reason.or(Some("target_unavailable")),
+                Some(point),
+            );
+            return None;
+        };
+        Some((shown, target))
+    }
+
+    fn publish_staged_drop(
+        &self,
+        staged: io::Result<StagedDrop>,
+        context: &DragContext,
+        point: &POINTL,
+        native_effect: *mut DROPEFFECT,
+        destination: (DropEffect, DropTarget),
+        incoming: &'static str,
+    ) {
+        let (shown, target) = destination;
+        match staged {
+            Ok(staged) => {
+                self.accept_staged_drop(staged, context, point, native_effect, shown, target)
+            }
+            Err(error) => {
+                crate::operation_audit::record(
+                    "native_drag_reject",
+                    format!("hwnd={} incoming={incoming} error={error}", self.hwnd),
+                );
+                self.reject_drop("unreadable_drop_data", native_effect);
+            }
+        }
+    }
+
+    fn finish_virtual_drop(
+        &self,
+        data: Option<&IDataObject>,
+        context: &DragContext,
+        point: &POINTL,
+        native_effect: *mut DROPEFFECT,
+    ) {
+        let Some(destination) = self.staged_copy_target(context, point, native_effect) else {
+            return;
+        };
+        // File contents streams are only valid on this drop thread, and only until Drop returns.
+        let Some(data) = data else {
+            self.reject_drop("unreadable_drop_data", native_effect);
+            return;
+        };
+        self.publish_staged_drop(
+            materialize_virtual(data),
+            context,
+            point,
+            native_effect,
+            destination,
+            "virtual",
+        );
+    }
+
+    fn finish_ephemeral_drop(
+        &self,
+        data: Option<&IDataObject>,
+        context: &DragContext,
+        point: &POINTL,
+        native_effect: *mut DROPEFFECT,
+    ) {
+        let Some(destination) = self.staged_copy_target(context, point, native_effect) else {
+            return;
+        };
+        // Re-reading CF_HDROP is what makes archive tools extract into their temp directory.
+        let paths = data
+            .and_then(|data| read_drop_paths(data).ok())
+            .filter(|paths| !paths.is_empty())
+            .unwrap_or_else(|| context.paths.clone());
+        if !is_ephemeral_drop(&paths) {
+            self.reject_drop("source_paths_changed", native_effect);
+            return;
+        }
+        // The source can delete these files when Drop returns, so the snapshot joins before that.
+        let staged = std::thread::spawn(move || snapshot_ephemeral(&paths))
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("temporary drop snapshot panicked")));
+        self.publish_staged_drop(
+            staged,
+            context,
+            point,
+            native_effect,
+            destination,
+            "ephemeral",
+        );
     }
 
     fn reject_drop(&self, reason: &'static str, output: *mut DROPEFFECT) {
@@ -460,29 +647,47 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
             set_native_effect(native_effect, DropEffect::Move);
             return Ok(());
         }
-        let paths = data
-            .as_ref()
-            .map(read_drop_paths)
-            .transpose()
-            .map_err(windows::core::Error::from)?
-            .unwrap_or_default();
+        let virtual_names = data.as_ref().and_then(virtual_file_names);
+        let (paths, incoming) = if let Some(names) = virtual_names {
+            (names, IncomingKind::Virtual)
+        } else {
+            let paths = data
+                .as_ref()
+                .map(read_drop_paths)
+                .transpose()
+                .map_err(windows::core::Error::from)?
+                .unwrap_or_default();
+            let incoming = if is_ephemeral_drop(&paths) {
+                IncomingKind::Ephemeral
+            } else {
+                IncomingKind::Files
+            };
+            (paths, incoming)
+        };
         let target = self.target(_point);
         let offered = unsafe { native_effect.as_ref() }
             .copied()
             .unwrap_or(DROPEFFECT_NONE);
-        let (effect, reason) = negotiate_target_effect(&paths, target.as_ref(), key_state.0);
+        let allowed = allowed_effects(offered);
+        let (effect, reason) = match incoming {
+            IncomingKind::Files => negotiate_target_effect(&paths, target.as_ref(), key_state.0),
+            IncomingKind::Ephemeral | IncomingKind::Virtual => {
+                incoming_copy_effect(target.as_ref(), allowed)
+            }
+        };
         set_native_effect(native_effect, effect);
         if let Ok(mut context) = self.context.lock() {
             *context = (!paths.is_empty()).then(|| DragContext {
                 paths: paths.clone(),
-                allowed_effects: allowed_effects(offered),
+                allowed_effects: allowed,
                 right_button: key_state.0 & MK_RBUTTON.0 != 0,
+                incoming,
             });
         }
         crate::operation_audit::record(
             "native_drag_enter",
             format!(
-                "hwnd={} paths={paths:?} target={target:?} offered={} effect={effect:?}",
+                "hwnd={} incoming={incoming:?} paths={paths:?} target={target:?} offered={} effect={effect:?}",
                 self.hwnd, offered.0
             ),
         );
@@ -516,16 +721,26 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
             return Ok(());
         }
         let target = self.target(_point);
-        let Some(paths) = self
-            .context
-            .lock()
-            .ok()
-            .and_then(|context| context.as_ref().map(|context| context.paths.clone()))
+        let Some((paths, allowed_effects, incoming)) =
+            self.context.lock().ok().and_then(|context| {
+                context.as_ref().map(|context| {
+                    (
+                        context.paths.clone(),
+                        context.allowed_effects,
+                        context.incoming,
+                    )
+                })
+            })
         else {
             set_native_effect(native_effect, DropEffect::None);
             return Ok(());
         };
-        let (effect, reason) = negotiate_target_effect(&paths, target.as_ref(), key_state.0);
+        let (effect, reason) = match incoming {
+            IncomingKind::Files => negotiate_target_effect(&paths, target.as_ref(), key_state.0),
+            IncomingKind::Ephemeral | IncomingKind::Virtual => {
+                incoming_copy_effect(target.as_ref(), allowed_effects)
+            }
+        };
         set_native_effect(native_effect, effect);
         if let Ok(mut context) = self.context.lock()
             && let Some(context) = context.as_mut()
@@ -625,6 +840,17 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
             self.reject_drop("no_active_file_drag", native_effect);
             return Ok(());
         };
+        match context.incoming {
+            IncomingKind::Virtual => {
+                self.finish_virtual_drop(data.as_ref(), &context, _point, native_effect);
+                return Ok(());
+            }
+            IncomingKind::Ephemeral => {
+                self.finish_ephemeral_drop(data.as_ref(), &context, _point, native_effect);
+                return Ok(());
+            }
+            IncomingKind::Files => {}
+        }
         let received_paths = match data.as_ref().map(read_drop_paths).transpose() {
             Ok(Some(paths)) => paths,
             Ok(None) => Vec::new(),
@@ -674,6 +900,7 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
                 screen_x: _point.x,
                 screen_y: _point.y,
                 allowed_effects,
+                staging_root: None,
             });
         }
         if let Some(reason) = reason {
@@ -811,6 +1038,433 @@ fn volume_identity(path: &Path) -> Option<String> {
         .get(..2)
         .filter(|value| value.ends_with(':'))
         .map(str::to_owned)
+}
+
+fn is_ephemeral_drop(paths: &[PathBuf]) -> bool {
+    !paths.is_empty() && paths.iter().all(|path| is_under_user_temp(path))
+}
+
+fn is_under_user_temp(path: &Path) -> bool {
+    temp_relative(path).is_some_and(|rest| !rest.is_empty())
+}
+
+fn temp_relative(path: &Path) -> Option<String> {
+    let mut temp = path_text(&std::env::temp_dir());
+    while temp.ends_with('\\') {
+        temp.pop();
+    }
+    let path = path_text(path);
+    if path.len() <= temp.len() || !path[..temp.len()].eq_ignore_ascii_case(&temp) {
+        return None;
+    }
+    let rest = path[temp.len()..].trim_start_matches('\\');
+    (!rest.is_empty()).then(|| rest.to_owned())
+}
+
+fn path_text(path: &Path) -> String {
+    path.as_os_str().to_string_lossy().replace('/', "\\")
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(source)?;
+    if metadata.is_dir() {
+        std::fs::create_dir_all(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(source, destination)?;
+        Ok(())
+    }
+}
+
+fn drop_target_directory(target: &DropTarget) -> Option<&Path> {
+    match target {
+        DropTarget::Directory(path) => Some(path),
+        DropTarget::QuickAccessPin => None,
+    }
+}
+
+fn incoming_copy_effect(
+    target: Option<&DropTarget>,
+    allowed: u32,
+) -> (DropEffect, Option<&'static str>) {
+    match target {
+        Some(DropTarget::Directory(_)) if allowed & ALLOW_COPY != 0 => (DropEffect::Copy, None),
+        Some(DropTarget::Directory(_)) if allowed & ALLOW_MOVE != 0 => (DropEffect::Move, None),
+        Some(DropTarget::Directory(_)) => (DropEffect::None, Some("effect_not_offered")),
+        Some(DropTarget::QuickAccessPin) => (DropEffect::None, Some("unsupported_data")),
+        None => (DropEffect::None, Some("target_unavailable")),
+    }
+}
+
+struct VirtualFormats {
+    descriptor_w: u16,
+    descriptor_a: u16,
+    contents: u16,
+}
+
+struct VirtualEntry {
+    relative: PathBuf,
+    is_dir: bool,
+}
+
+fn virtual_formats() -> Option<&'static VirtualFormats> {
+    static FORMATS: OnceLock<VirtualFormats> = OnceLock::new();
+    let formats = FORMATS.get_or_init(|| VirtualFormats {
+        descriptor_w: clipboard_format("FileGroupDescriptorW").unwrap_or(0),
+        descriptor_a: clipboard_format("FileGroupDescriptor").unwrap_or(0),
+        contents: clipboard_format("FileContents").unwrap_or(0),
+    });
+    (formats.descriptor_w != 0 && formats.contents != 0).then_some(formats)
+}
+
+fn virtual_file_names(data: &IDataObject) -> Option<Vec<PathBuf>> {
+    read_virtual_entries(data)
+        .ok()
+        .filter(|entries| !entries.is_empty())
+        .map(|entries| entries.into_iter().map(|entry| entry.relative).collect())
+}
+
+fn materialize_virtual(data: &IDataObject) -> io::Result<StagedDrop> {
+    let entries = read_virtual_entries(data)?;
+    if entries.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "virtual drop is empty",
+        ));
+    }
+    stage_drop(|root| {
+        let mut relatives = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.iter().enumerate() {
+            let destination = root.join(&entry.relative);
+            if entry.is_dir {
+                std::fs::create_dir_all(&destination)?;
+            } else {
+                if let Some(parent) = destination.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                write_virtual_contents(data, index, &destination)?;
+            }
+            relatives.push(entry.relative.clone());
+        }
+        Ok(top_level_paths(root, &relatives))
+    })
+}
+
+fn snapshot_ephemeral(sources: &[PathBuf]) -> io::Result<StagedDrop> {
+    let relatives = relatives_under_common_parent(sources)?;
+    stage_drop(|root| {
+        for (source, relative) in sources.iter().zip(&relatives) {
+            copy_tree(source, &root.join(relative))?;
+        }
+        Ok(top_level_paths(root, &relatives))
+    })
+}
+
+fn stage_drop(write: impl FnOnce(&Path) -> io::Result<Vec<PathBuf>>) -> io::Result<StagedDrop> {
+    let root = create_incoming_root()?;
+    match write(&root) {
+        Ok(paths) if !paths.is_empty() => Ok(StagedDrop { root, paths }),
+        Ok(_) => {
+            let _ = std::fs::remove_dir_all(&root);
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "staged drop is empty",
+            ))
+        }
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&root);
+            Err(error)
+        }
+    }
+}
+
+fn relatives_under_common_parent(paths: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
+    let parent = common_parent(paths).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "temporary drop has no common parent",
+        )
+    })?;
+    paths
+        .iter()
+        .map(|path| {
+            path.strip_prefix(&parent)
+                .map(Path::to_path_buf)
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "temporary drop item is outside its parent",
+                    )
+                })
+        })
+        .collect()
+}
+
+fn common_parent(paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut parent = paths.first()?.parent()?.to_path_buf();
+    for path in paths.iter().skip(1) {
+        while !path.starts_with(&parent) {
+            parent = parent.parent()?.to_path_buf();
+        }
+    }
+    Some(parent)
+}
+
+fn top_level_paths(root: &Path, relatives: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for relative in relatives {
+        let Some(name) = relative.components().find_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let path = root.join(name);
+        if !paths.iter().any(|existing| existing == &path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+fn create_incoming_root() -> io::Result<PathBuf> {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let root = std::env::temp_dir().join(format!(
+        "asterfiles-incoming-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&root)?;
+    Ok(root)
+}
+
+pub(crate) fn discard_drop_staging(root: Option<PathBuf>) {
+    let Some(root) = root else {
+        return;
+    };
+    let owned = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("asterfiles-incoming-"))
+        && is_under_user_temp(&root);
+    if !owned {
+        return;
+    }
+    std::thread::spawn(move || {
+        let _ = std::fs::remove_dir_all(root);
+    });
+}
+
+fn read_virtual_entries(data: &IDataObject) -> io::Result<Vec<VirtualEntry>> {
+    let Some(formats) = virtual_formats() else {
+        return Err(io::Error::other("virtual file format is unavailable"));
+    };
+    if let Some(entries) = read_descriptor_entries(data, formats.descriptor_w, true)? {
+        return Ok(entries);
+    }
+    if formats.descriptor_a != 0
+        && let Some(entries) = read_descriptor_entries(data, formats.descriptor_a, false)?
+    {
+        return Ok(entries);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "virtual file list is missing",
+    ))
+}
+
+fn read_descriptor_entries(
+    data: &IDataObject,
+    format_id: u16,
+    wide: bool,
+) -> io::Result<Option<Vec<VirtualEntry>>> {
+    let format = format_etc(format_id);
+    if unsafe { data.QueryGetData(&format) }.is_err() {
+        return Ok(None);
+    }
+    let mut medium = unsafe { data.GetData(&format) }.map_err(windows_error)?;
+    let result = parse_descriptors(&medium, wide);
+    unsafe { ReleaseStgMedium(&mut medium) };
+    result.map(Some)
+}
+
+fn parse_descriptors(medium: &STGMEDIUM, wide: bool) -> io::Result<Vec<VirtualEntry>> {
+    let bytes = global_bytes(medium)?;
+    let stride = if wide {
+        WIDE_DESCRIPTOR_SIZE
+    } else {
+        ANSI_DESCRIPTOR_SIZE
+    };
+    if bytes.len() < 4 {
+        return Err(io::Error::other("virtual file list is truncated"));
+    }
+    let count = u32::from_ne_bytes(bytes[..4].try_into().unwrap()) as usize;
+    let needed = count
+        .checked_mul(stride)
+        .and_then(|body| body.checked_add(4))
+        .ok_or_else(|| io::Error::other("virtual file list is too large"))?;
+    if bytes.len() < needed {
+        return Err(io::Error::other("virtual file list is truncated"));
+    }
+    let mut entries = Vec::with_capacity(count);
+    for index in 0..count {
+        let descriptor = &bytes[4 + index * stride..4 + (index + 1) * stride];
+        let flags = u32::from_ne_bytes(descriptor[..4].try_into().unwrap());
+        let attributes = u32::from_ne_bytes(descriptor[36..40].try_into().unwrap());
+        let is_dir = flags & FD_ATTRIBUTES != 0 && attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+        let name = if wide {
+            wide_descriptor_name(descriptor)
+        } else {
+            ansi_descriptor_name(descriptor)
+        };
+        let Some(relative) = name.and_then(|name| safe_relative(&name)) else {
+            return Err(io::Error::other("virtual file name is not a relative path"));
+        };
+        entries.push(VirtualEntry { relative, is_dir });
+    }
+    Ok(entries)
+}
+
+fn wide_descriptor_name(descriptor: &[u8]) -> Option<String> {
+    let bytes = descriptor.get(DESCRIPTOR_NAME_OFFSET..DESCRIPTOR_NAME_OFFSET + 520)?;
+    let units = bytes
+        .chunks_exact(2)
+        .map(|unit| u16::from_ne_bytes([unit[0], unit[1]]))
+        .take_while(|unit| *unit != 0)
+        .collect::<Vec<_>>();
+    let name = OsString::from_wide(&units).to_string_lossy().into_owned();
+    (!name.is_empty()).then_some(name)
+}
+
+fn ansi_descriptor_name(descriptor: &[u8]) -> Option<String> {
+    let bytes = descriptor.get(DESCRIPTOR_NAME_OFFSET..DESCRIPTOR_NAME_OFFSET + 260)?;
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    if end == 0 {
+        return None;
+    }
+    let name = String::from_utf8(bytes[..end].to_vec())
+        .unwrap_or_else(|_| bytes[..end].iter().map(|byte| char::from(*byte)).collect());
+    (!name.is_empty()).then_some(name)
+}
+
+fn safe_relative(name: &str) -> Option<PathBuf> {
+    let name = name.trim_matches(|ch| ch == '\\' || ch == '/');
+    if name.is_empty() {
+        return None;
+    }
+    let mut relative = PathBuf::new();
+    for component in Path::new(name).components() {
+        match component {
+            std::path::Component::Normal(part) if part != "." && part != ".." => {
+                relative.push(part);
+            }
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    (!relative.as_os_str().is_empty()).then_some(relative)
+}
+
+fn write_virtual_contents(data: &IDataObject, index: usize, destination: &Path) -> io::Result<()> {
+    let formats =
+        virtual_formats().ok_or_else(|| io::Error::other("file contents format is unavailable"))?;
+    let mut medium = unsafe {
+        data.GetData(&contents_format(
+            formats.contents,
+            i32::try_from(index).unwrap_or(i32::MAX),
+        ))
+    }
+    .map_err(windows_error)?;
+    let result = write_medium_bytes(&mut medium, destination);
+    if medium.tymed != 0 {
+        unsafe { ReleaseStgMedium(&mut medium) };
+    }
+    result
+}
+
+fn contents_format(format: u16, index: i32) -> FORMATETC {
+    FORMATETC {
+        cfFormat: format,
+        ptd: ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex: index,
+        tymed: TYMED_ISTREAM.0 as u32 | TYMED_HGLOBAL.0 as u32,
+    }
+}
+
+fn write_medium_bytes(medium: &mut STGMEDIUM, destination: &Path) -> io::Result<()> {
+    if medium.tymed == TYMED_ISTREAM.0 as u32 {
+        let stream = unsafe { ManuallyDrop::take(&mut medium.u.pstm) };
+        medium.tymed = 0;
+        unsafe { ReleaseStgMedium(medium) };
+        let stream = stream.ok_or_else(|| io::Error::other("file contents stream is empty"))?;
+        return write_stream(&stream, destination);
+    }
+    if medium.tymed == TYMED_HGLOBAL.0 as u32 {
+        return write_hglobal(medium, destination);
+    }
+    Err(io::Error::other(
+        "file contents use an unsupported storage medium",
+    ))
+}
+
+fn write_stream(stream: &IStream, destination: &Path) -> io::Result<()> {
+    let mut file = std::fs::File::create(destination)?;
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let mut read = 0u32;
+        unsafe {
+            stream
+                .Read(
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len() as u32,
+                    Some(&mut read),
+                )
+                .ok()
+                .map_err(windows_error)?;
+        }
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read as usize])?;
+    }
+    Ok(())
+}
+
+fn write_hglobal(medium: &STGMEDIUM, destination: &Path) -> io::Result<()> {
+    let bytes = global_bytes(medium)?;
+    std::fs::write(destination, bytes)
+}
+
+fn global_bytes(medium: &STGMEDIUM) -> io::Result<Vec<u8>> {
+    if medium.tymed != TYMED_HGLOBAL.0 as u32 {
+        return Err(io::Error::other("drop data is not memory"));
+    }
+    let handle = unsafe { medium.u.hGlobal };
+    if handle.is_invalid() {
+        return Err(io::Error::other("drop memory is invalid"));
+    }
+    let size = unsafe { GlobalSize(handle) };
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    let pointer = unsafe { GlobalLock(handle) }.cast::<u8>();
+    if pointer.is_null() {
+        return Err(io::Error::other("drop memory is locked"));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(pointer, size) }.to_vec();
+    let _ = unsafe { GlobalUnlock(handle) };
+    Ok(bytes)
 }
 
 fn read_drop_paths(data: &IDataObject) -> io::Result<Vec<PathBuf>> {
@@ -2513,5 +3167,363 @@ mod tests {
         }
 
         assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn paths_under_the_user_temp_directory_are_ephemeral() {
+        let temp = std::env::temp_dir();
+        assert!(is_under_user_temp(&temp.join("scratch").join("demo.jpg")));
+        assert!(is_under_user_temp(&temp.join("7zEABC").join("demo.jpg")));
+        assert!(!is_under_user_temp(Path::new(r"D:\elsewhere\demo.jpg")));
+        assert!(!is_under_user_temp(&temp));
+    }
+
+    #[test]
+    fn temporary_drop_stages_a_copy_and_leaves_the_existing_file_untouched() {
+        let _ole = OleApartment::initialize().unwrap();
+        let source_root = std::env::temp_dir().join(format!("scratch-drop-{}", std::process::id()));
+        let destination =
+            std::env::temp_dir().join(format!("aster-drop-dest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&source_root);
+        let _ = std::fs::remove_dir_all(&destination);
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        let source = source_root.join("demo.jpg");
+        std::fs::write(&source, b"extracted").unwrap();
+        std::fs::write(destination.join("demo.jpg"), b"old").unwrap();
+        let data = memory_file_data(std::slice::from_ref(&source));
+
+        let (effect, intent) = drop_onto(&data, &destination);
+
+        assert_eq!(effect, DROPEFFECT_COPY);
+        assert_eq!(intent.effect, DropEffect::Copy);
+        assert_eq!(std::fs::read(destination.join("demo.jpg")).unwrap(), b"old");
+        assert_eq!(intent.paths.len(), 1);
+        assert_eq!(
+            intent.paths[0].file_name(),
+            Some(std::ffi::OsStr::new("demo.jpg"))
+        );
+        assert_eq!(std::fs::read(&intent.paths[0]).unwrap(), b"extracted");
+        assert!(intent.staging_root.as_ref().is_some_and(|root| {
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("asterfiles-incoming-"))
+        }));
+        let _ = std::fs::remove_dir_all(intent.staging_root.unwrap());
+        let _ = std::fs::remove_dir_all(source_root);
+        let _ = std::fs::remove_dir_all(destination);
+    }
+
+    #[test]
+    fn virtual_file_drop_stages_contents_without_overwriting_the_target() {
+        let _ole = OleApartment::initialize().unwrap();
+        let destination =
+            std::env::temp_dir().join(format!("aster-virtual-dest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&destination);
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("demo.jpg"), b"old").unwrap();
+        let data = virtual_file_data(
+            &[("demo.jpg", false), ("textures\\wood.png", false)],
+            &[
+                VirtualPayload::Memory(b"extracted".to_vec()),
+                VirtualPayload::Stream(b"wood".to_vec()),
+            ],
+        );
+
+        let (effect, intent) = drop_onto(&data, &destination);
+
+        assert_eq!(effect, DROPEFFECT_COPY);
+        assert_eq!(intent.effect, DropEffect::Copy);
+        assert_eq!(std::fs::read(destination.join("demo.jpg")).unwrap(), b"old");
+        assert!(!destination.join("textures").exists());
+        let staged_file = intent
+            .paths
+            .iter()
+            .find(|path| path.file_name() == Some(std::ffi::OsStr::new("demo.jpg")))
+            .unwrap();
+        let staged_dir = intent
+            .paths
+            .iter()
+            .find(|path| path.file_name() == Some(std::ffi::OsStr::new("textures")))
+            .unwrap();
+        assert_eq!(std::fs::read(staged_file).unwrap(), b"extracted");
+        assert_eq!(std::fs::read(staged_dir.join("wood.png")).unwrap(), b"wood");
+        let _ = std::fs::remove_dir_all(intent.staging_root.unwrap());
+        let _ = std::fs::remove_dir_all(destination);
+    }
+
+    fn drop_onto(data: &IDataObject, directory: &Path) -> (DROPEFFECT, DropIntent) {
+        let (target, intents) = directory_drop_target(directory);
+        let mut effect = all_native_effects();
+        let point = POINTL { x: 10, y: 10 };
+        unsafe {
+            target
+                .DragEnter(data, MK_LBUTTON, point, &mut effect)
+                .unwrap();
+            target
+                .Drop(data, MODIFIERKEYS_FLAGS(0), point, &mut effect)
+                .unwrap();
+        }
+        (effect, intents.try_recv().unwrap())
+    }
+
+    fn directory_drop_target(directory: &Path) -> (IDropTarget, mpsc::Receiver<DropIntent>) {
+        let (intents, receiver) = mpsc::channel();
+        let state = Arc::new(Mutex::new(DragDropState::default()));
+        state.lock().unwrap().record(DragDropEvent::Registered);
+        let target = IDropTarget::from(NativeDropTarget {
+            hwnd: 0,
+            helper: None,
+            state,
+            target: Arc::new(Mutex::new(DropTargetSnapshot {
+                current: Some(directory.to_path_buf()),
+                ..DropTargetSnapshot::default()
+            })),
+            context: Mutex::new(None),
+            tab_context: Mutex::new(None),
+            intents,
+        });
+        (target, receiver)
+    }
+
+    fn virtual_file_data(names: &[(&str, bool)], contents: &[VirtualPayload]) -> IDataObject {
+        IDataObject::from(VirtualDropSource {
+            descriptor: wide_file_group(names),
+            contents: contents.to_vec(),
+        })
+    }
+
+    fn wide_file_group(names: &[(&str, bool)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(names.len() as u32).to_ne_bytes());
+        for (name, is_dir) in names {
+            let mut descriptor = vec![0u8; WIDE_DESCRIPTOR_SIZE];
+            if *is_dir {
+                descriptor[..4].copy_from_slice(&FD_ATTRIBUTES.to_ne_bytes());
+                descriptor[36..40].copy_from_slice(&FILE_ATTRIBUTE_DIRECTORY.to_ne_bytes());
+            }
+            let mut units: Vec<u16> = name.encode_utf16().collect();
+            units.push(0);
+            let encoded: Vec<u8> = units.into_iter().flat_map(u16::to_ne_bytes).collect();
+            descriptor[DESCRIPTOR_NAME_OFFSET..DESCRIPTOR_NAME_OFFSET + encoded.len()]
+                .copy_from_slice(&encoded);
+            bytes.extend_from_slice(&descriptor);
+        }
+        bytes
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+enum VirtualPayload {
+    Memory(Vec<u8>),
+    Stream(Vec<u8>),
+}
+
+#[cfg(test)]
+#[implement(IDataObject)]
+struct VirtualDropSource {
+    descriptor: Vec<u8>,
+    contents: Vec<VirtualPayload>,
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+impl IDataObject_Impl for VirtualDropSource_Impl {
+    fn GetData(&self, format: *const FORMATETC) -> windows::core::Result<STGMEDIUM> {
+        let format = unsafe { format.as_ref() }.ok_or_else(|| WindowsError::from(E_NOTIMPL))?;
+        let Some(formats) = virtual_formats() else {
+            return Err(DV_E_FORMATETC.into());
+        };
+        if supports_format(format, formats.descriptor_w) {
+            return allocate_medium(&self.descriptor);
+        }
+        if format.cfFormat == formats.contents
+            && format.lindex >= 0
+            && (format.lindex as usize) < self.contents.len()
+        {
+            return match &self.contents[format.lindex as usize] {
+                VirtualPayload::Memory(bytes) if format.tymed & TYMED_HGLOBAL.0 as u32 != 0 => {
+                    allocate_medium(bytes)
+                }
+                VirtualPayload::Stream(bytes) if format.tymed & TYMED_ISTREAM.0 as u32 != 0 => {
+                    stream_medium(bytes.clone())
+                }
+                _ => Err(DV_E_FORMATETC.into()),
+            };
+        }
+        Err(DV_E_FORMATETC.into())
+    }
+
+    fn GetDataHere(
+        &self,
+        _format: *const FORMATETC,
+        _medium: *mut STGMEDIUM,
+    ) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn QueryGetData(&self, format: *const FORMATETC) -> HRESULT {
+        let Some(format) = (unsafe { format.as_ref() }) else {
+            return DV_E_FORMATETC;
+        };
+        let Some(formats) = virtual_formats() else {
+            return DV_E_FORMATETC;
+        };
+        if supports_format(format, formats.descriptor_w)
+            || (format.cfFormat == formats.contents
+                && format.lindex >= 0
+                && (format.lindex as usize) < self.contents.len())
+        {
+            HRESULT(0)
+        } else {
+            DV_E_FORMATETC
+        }
+    }
+
+    fn GetCanonicalFormatEtc(&self, _input: *const FORMATETC, output: *mut FORMATETC) -> HRESULT {
+        if let Some(output) = unsafe { output.as_mut() } {
+            output.ptd = ptr::null_mut();
+        }
+        DATA_S_SAMEFORMATETC
+    }
+
+    fn SetData(
+        &self,
+        _format: *const FORMATETC,
+        _medium: *const STGMEDIUM,
+        _release: windows::core::BOOL,
+    ) -> windows::core::Result<()> {
+        Err(DV_E_FORMATETC.into())
+    }
+
+    fn EnumFormatEtc(&self, _direction: u32) -> windows::core::Result<IEnumFORMATETC> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn DAdvise(
+        &self,
+        _format: *const FORMATETC,
+        _flags: u32,
+        _sink: Ref<IAdviseSink>,
+    ) -> windows::core::Result<u32> {
+        Err(OLE_E_ADVISENOTSUPPORTED.into())
+    }
+
+    fn DUnadvise(&self, _connection: u32) -> windows::core::Result<()> {
+        Err(OLE_E_ADVISENOTSUPPORTED.into())
+    }
+
+    fn EnumDAdvise(&self) -> windows::core::Result<IEnumSTATDATA> {
+        Err(OLE_E_ADVISENOTSUPPORTED.into())
+    }
+}
+
+#[cfg(test)]
+fn stream_medium(bytes: Vec<u8>) -> windows::core::Result<STGMEDIUM> {
+    let stream = IStream::from(MemoryStream {
+        bytes,
+        cursor: Mutex::new(0),
+    });
+    Ok(STGMEDIUM {
+        tymed: TYMED_ISTREAM.0 as u32,
+        u: STGMEDIUM_0 {
+            pstm: ManuallyDrop::new(Some(stream)),
+        },
+        pUnkForRelease: ManuallyDrop::new(None),
+    })
+}
+
+#[cfg(test)]
+#[implement(IStream)]
+struct MemoryStream {
+    bytes: Vec<u8>,
+    cursor: Mutex<usize>,
+}
+
+#[cfg(test)]
+impl ISequentialStream_Impl for MemoryStream_Impl {
+    fn Read(&self, pv: *mut c_void, cb: u32, pcbread: *mut u32) -> HRESULT {
+        let mut cursor = self.cursor.lock().unwrap();
+        if *cursor >= self.bytes.len() {
+            if !pcbread.is_null() {
+                unsafe { *pcbread = 0 };
+            }
+            return HRESULT(0);
+        }
+        let end = (*cursor + cb as usize).min(self.bytes.len());
+        let count = end - *cursor;
+        unsafe {
+            ptr::copy_nonoverlapping(self.bytes[*cursor..].as_ptr(), pv.cast(), count);
+            if !pcbread.is_null() {
+                *pcbread = count as u32;
+            }
+        }
+        *cursor = end;
+        HRESULT(0)
+    }
+
+    fn Write(&self, _pv: *const c_void, _cb: u32, _pcbwritten: *mut u32) -> HRESULT {
+        E_NOTIMPL
+    }
+}
+
+#[cfg(test)]
+impl IStream_Impl for MemoryStream_Impl {
+    fn Seek(
+        &self,
+        _dlibmove: i64,
+        _dworigin: STREAM_SEEK,
+        _plibnewposition: *mut u64,
+    ) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn SetSize(&self, _libnewsize: u64) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn CopyTo(
+        &self,
+        _pstm: Ref<IStream>,
+        _cb: u64,
+        _pcbread: *mut u64,
+        _pcbwritten: *mut u64,
+    ) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn Commit(&self, _grfcommitflags: &STGC) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn Revert(&self) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn LockRegion(
+        &self,
+        _liboffset: u64,
+        _cb: u64,
+        _dwlocktype: &LOCKTYPE,
+    ) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn UnlockRegion(
+        &self,
+        _liboffset: u64,
+        _cb: u64,
+        _dwlocktype: u32,
+    ) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn Stat(&self, _pstatstg: *mut STATSTG, _grfstatflag: &STATFLAG) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn Clone(&self) -> windows::core::Result<IStream> {
+        Err(E_NOTIMPL.into())
     }
 }

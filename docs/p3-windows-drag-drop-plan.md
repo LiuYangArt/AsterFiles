@@ -91,6 +91,14 @@ platform/windows/drag_drop：IDataObject、IDropSource、IDropTarget、OLE
 - 拖出到 Explorer 时，冲突和取消由 Explorer 处理；AsterFiles 不叠加第二套任务中心。
 - 外部目标没有返回可靠执行效果时，结束后只做定向刷新，不猜测删除源项。
 
+### 5.4 虚拟文件和临时拖放
+
+- `FileGroupDescriptorW`（没有 Unicode 列表时回退 `FileGroupDescriptor`）配合 `FileContents` 是虚拟文件的通用协议。目录项只建文件夹；文件内容在 `Drop` 返回前从 `IStream` 或内存块读出。流只在放下所在的 OLE 线程上有效。
+- `CF_HDROP` 里的路径如果全部位于用户临时目录，就按来源会在拖放结束时删除它们来处理。这覆盖 NanaZip、7-Zip、WinRAR 等把解压结果放进临时目录的软件，不识别某个软件的私有剪贴板格式。`Drop` 返回前在工作线程把这些文件复制到 AsterFiles 自己的临时目录。
+- 上述两类都先落到 `asterfiles-incoming-*` 中转目录，再作为普通复制定向当前文件夹。重复拖入同一个名字时走现有的覆盖、保留两者或跳过提示，不在放下时直接写到目标上。
+- 中转目录在复制完成、跳过、失败或取消后删除。从临时目录拖入真实文件时，结果是复制到目标并保留原件，而不是同卷移动。
+- 压缩包里的相对路径保留目录结构。只把每个顶层名字交给复制任务，子文件随所在文件夹一起复制，并在已有同名文件时进入冲突提示。
+
 ## 6. 交互反馈
 
 - 拖动达到系统拖动阈值后才开始，普通点击和选择不得误触。
@@ -102,14 +110,15 @@ platform/windows/drag_drop：IDataObject、IDropSource、IDropTarget、OLE
 
 ## 7. 首版范围外
 
-- Outlook、浏览器或压缩软件提供的虚拟文件流（`FileGroupDescriptor` / `FileContents`）。
-- 回收站、控制面板、库等无普通文件系统路径的 Shell 命名空间对象。
+- 回收站、控制面板、库等无普通文件系统路径、且不提供 `FileGroupDescriptor` / `FileContents` 的 Shell 命名空间对象。
 - 远程协议文件在拖出前自动下载。
 - 跨完整性级别绕过 Windows 安全限制，例如普通权限应用向管理员窗口拖放。
 - 悬停自动展开目录树、自动进入文件夹或跨标签自动切换。
 - 拖放撤销。
 
-遇到范围外数据时显示不支持或禁止状态，不静默落成临时文件，也不增加兼容回退。
+遇到仍不支持的数据时显示不支持或禁止状态，不静默落成临时文件，也不增加某个软件专用的剪贴板协议。
+
+虚拟文件和位于用户临时目录中的 `CF_HDROP` 按 5.4 处理：先复制到 AsterFiles 的中转目录，再进入普通复制和冲突流程。不使用 `7-Zip::SetTargetFolder` 这类来源私有约定。
 
 ## 8. 实施切片
 
