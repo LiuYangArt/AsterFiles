@@ -23,6 +23,7 @@ pub mod shortcut;
 pub mod single_instance;
 
 pub mod tab_insertion_indicator;
+pub mod window_dpi;
 pub mod window_drag_recovery;
 pub mod window_trace;
 
@@ -132,29 +133,6 @@ pub fn show_error_dialog(owner: isize, title: &str, message: &str) {
             MB_OK | MB_ICONERROR | MB_TASKMODAL | MB_SETFOREGROUND,
         );
     }
-}
-
-pub fn begin_window_drag(hwnd: isize) -> io::Result<()> {
-    if hwnd == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "main window handle is not available",
-        ));
-    }
-    unsafe {
-        let mut cursor = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
-        windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut cursor);
-        let screen_position =
-            ((cursor.y as u32 & 0xffff) << 16 | (cursor.x as u32 & 0xffff)) as isize;
-        windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
-        windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
-            hwnd as windows_sys::Win32::Foundation::HWND,
-            windows_sys::Win32::UI::WindowsAndMessaging::WM_NCLBUTTONDOWN,
-            windows_sys::Win32::UI::WindowsAndMessaging::HTCAPTION as usize,
-            screen_position,
-        );
-    }
-    Ok(())
 }
 
 pub fn has_pointer_capture(hwnd: isize) -> bool {

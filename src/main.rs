@@ -27,6 +27,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     struct AuditFlush;
     impl Drop for AuditFlush {
         fn drop(&mut self) {
+            #[cfg(windows)]
+            if let Err(error) = platform::windows::window_trace::flush() {
+                eprintln!("window trace flush failed: {error}");
+            }
             if let Err(error) = operation_audit::flush() {
                 eprintln!("file operation audit flush failed: {error}");
             }

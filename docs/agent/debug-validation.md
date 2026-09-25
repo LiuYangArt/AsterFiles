@@ -63,6 +63,19 @@ P4V、FDM、Lark 的“打开所在文件夹/查看文件夹”均由用户手�
 
 诊断复用异步审计日志：Debug 为 `artifacts/logs/file-operation-audit.jsonl`，本地 Release 构建运行时为 `%LOCALAPPDATA%/AsterFiles/logs/file-operation-audit.jsonl`。筛选 `external-open-foreground-permission`、`external-open-forwarded`、`external-open-activation`、`shell-select-received`、`shell-select-trap`、`external-launch-probe`：前三项记录授权、发送、目标 HWND 与实际前台结果；`shell-select-received` 记录所有者和回调线程、收到选择的耗时与目标原始路径，两线程必须一致；`shell-select-trap` 记录交付结果与总耗时；`external-launch-probe` 只记录直接父进程、本进程命令行。用 PID 和时间关联一次打开；`active=false` 不能当作成功激活；没有收到选择需继续查接收与注册时序，不能据此排除某个来源软件。
 
+## 混合缩放跨屏拖动（#129）
+
+窗口适配拆为拖动恢复、原生 DPI 协议和只读诊断。主窗口与确认、登录、重命名、操作窗口共用拖动入口，不覆盖快捷键。标题栏仍通过 winit 异步启动系统循环，保留其松键与恢复行为；原生适配在系统接收前修正打包屏幕坐标，包含左侧负坐标显示器。
+
+尺寸基准按 HWND 隔离，在第一次 DPI 查询前接受最大化/Snap 的恢复尺寸，之后整次拖动保持固定。无原生边框的正常窗口通过 `WM_GETDPISCALEDSIZE` 把目标外框交给 Windows，使系统同时计算尺寸和鼠标抓取位置。`WM_DPICHANGED` 继续交给 winit/Slint 更新缩放；仅在这个原生消息栈内，一次性将 winit 的移动与缩放请求还原为 Windows 的完整建议矩形（位置及尺寸）。这是针对锁定的 winit 0.30.13 使用尚未移动的 HWND 判定目标屏幕的适配，升级依赖时须重新审查。普通移动、边缘缩放和拖动结束后的请求不改写，不再使用 `InnerSizeWriter` 或延迟纠正。
+
+运行 `python tools/verify.py --quick` 可执行格式、Clippy、Rust 测试与 Debug 构建；Issue 完整回归使用 `python tools/verify.py`。Rust 测试覆盖现场错误位置回放、DPI 往返、迟到尺寸不能污染基准、消息重入、一次消费、最大化/Snap 恢复、边缘缩放、窗口隔离、负坐标、日志队列饱和和退出落盘。汇总为 `artifacts/verify/summary.json`；这些无界面验证不能证明真实 Windows 跨屏手感。
+
+用户手动启动 `target/debug/asterfiles.exe`：普通窗口按住标题栏，在中间 150% / 右侧 100% 和左侧 125% / 中间 150% 两条边界各往返五次，中途不松鼠标；检查持续变大、额外跳位、卡住，以及拖完后按钮与边缘缩放仍响应。再检查最大化拖出、贴边恢复、确认或操作窗口跨屏。正常的单次 DPI 比例变化不属于异常。
+
+Debug 自动记录 `artifacts/logs/window-interaction-diagnostic.jsonl`；可用 `ASTERFILES_WINDOW_TRACE` 指定日志。按 HWND 对照 `WM_GETDPISCALEDSIZE` 的候选外框、`dpi-scale-size` 的基准目标、`WM_DPICHANGED` 的旧/新 DPI 与建议矩形、`dpi-system-placement` 的实际交接，以及 `WM_ENTERSIZEMOVE` / `WM_EXITSIZEMOVE`。完整建议矩形必须同时保留位置与尺寸；仅客户区宽高正确不算通过。诊断只读，后台有界队列写入；出现 `trace-queue-overflow` 时该段证据不完整。不要在拖动热路径同步刷盘。
+
+本机 Windhawk 的窗口吸附模块是现场对照变量。先保留原样观察；若仍有边界“粘住”，由用户按其现有设置按住 Alt 临时停用吸附作对照。Agent 不修改显示设置或 Windhawk，不自动操作 AsterFiles UI。
 ## Debug 优化配置（#100）
 
 日常 Debug 构建对应用代码使用一级优化，对第三方依赖使用二级优化；保留行号调试信息、增量编译、调试断言和溢出检查。测试继承相同优化等级。第三方构建依赖和过程宏也受二级优化影响，因此首次切换配置需要重编依赖；后续通常可复用缓存。优化可能影响逐行调试和局部变量可见性。

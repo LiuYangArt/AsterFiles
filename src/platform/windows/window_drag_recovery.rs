@@ -1,22 +1,17 @@
-//! winit 在发出移动或缩放前把 `dragging` 置为真，并且只在 `WM_EXITSIZEMOVE` 时清除。
-//! 最大化窗口会拒绝边缘缩放；Slint 在下一次鼠标移动前仍可能沿用最大化前的缩放方向。
-//! 系统因此不进入模态循环，也不会发送 `WM_EXITSIZEMOVE`，随后的移动和缩放都被忽略。
-//! 客户区点击不依赖该标记，所以按钮和文件夹仍然可用。
+//! 在 Windows 原生移动/缩放循环未启动时，恢复 winit 的拖动状态。
+//!
+//! 窗口几何和 DPI 由 Windows 与 winit 共同维护；这里不改写 `WM_DPICHANGED` 或
+//! `WM_WINDOWPOSCHANGING`，避免应用层与系统的建议矩形同时调整窗口尺寸。
 
-use std::{
-    cell::{Cell, RefCell},
-    io, mem,
-};
+use std::{cell::RefCell, collections::HashMap, io};
 
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
     UI::{
-        HiDpi::GetDpiForWindow,
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{
-            GetWindowRect, HTCAPTION, HTSIZEFIRST, HTSIZELAST, PostMessageW, SWP_NOSIZE, WINDOWPOS,
-            WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_NCDESTROY, WM_NCLBUTTONDOWN,
-            WM_WINDOWPOSCHANGING,
+            GetCursorPos, HTCAPTION, HTSIZEFIRST, HTSIZELAST, PostMessageW, WM_ENTERSIZEMOVE,
+            WM_EXITSIZEMOVE, WM_NCDESTROY, WM_NCLBUTTONDOWN,
         },
     },
 };
@@ -24,8 +19,7 @@ use windows_sys::Win32::{
 const SUBCLASS_ID: usize = 0x4153_4452_4147_3031;
 
 thread_local! {
-    static FRAMES: RefCell<DragFrames> = RefCell::new(DragFrames::default());
-    static CAPTION_MOVE: Cell<Option<CaptionMoveOrigin>> = const { Cell::new(None) };
+    static FRAMES: RefCell<HashMap<HWND, DragFrames>> = RefCell::new(HashMap::new());
 }
 
 #[derive(Default)]
@@ -44,7 +38,7 @@ impl DragFrames {
         }
     }
 
-    /// 只有最外层请求失败时才补发结束消息，避免打断已经开始的缩放循环。
+    /// 只有最外层请求失败时才补发结束消息，避免打断已经开始的移动/缩放循环。
     fn end(&mut self) -> bool {
         let entered = self.entered.pop().unwrap_or(true);
         self.entered.is_empty() && !entered
@@ -68,66 +62,26 @@ fn is_os_drag_hit(hit: u32) -> bool {
     hit == HTCAPTION || (HTSIZEFIRST..=HTSIZELAST).contains(&hit)
 }
 
-#[derive(Clone, Copy)]
-struct CaptionMoveOrigin {
-    dpi: u32,
-    width: i32,
-    height: i32,
+fn pack_screen_position(x: i32, y: i32) -> LPARAM {
+    ((y as u32 & 0xffff) << 16 | (x as u32 & 0xffff)) as LPARAM
 }
-
-/// 标题栏拖动只按进入时的外框换算一次 DPI，避免建议尺寸和 winit 各乘一次。
-fn proportional_outer(width: i32, height: i32, from_dpi: u32, to_dpi: u32) -> Option<(i32, i32)> {
-    if from_dpi == 0 || to_dpi == 0 || from_dpi == to_dpi {
-        return None;
-    }
-    let scale = |px: i32| {
-        ((i64::from(px) * i64::from(to_dpi) + i64::from(from_dpi) / 2) / i64::from(from_dpi)) as i32
-    };
-    Some((scale(width).max(1), scale(height).max(1)))
-}
-
-fn remember_caption_move(hwnd: HWND) {
-    let mut rect = unsafe { mem::zeroed::<RECT>() };
-    if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
-        return;
-    }
-    let dpi = unsafe { GetDpiForWindow(hwnd) };
-    if dpi == 0 {
-        return;
-    }
-    CAPTION_MOVE.with(|slot| {
-        slot.set(Some(CaptionMoveOrigin {
-            dpi,
-            width: rect.right - rect.left,
-            height: rect.bottom - rect.top,
-        }))
-    });
-}
-
-fn keep_single_dpi_scale(hwnd: HWND, lparam: LPARAM) {
-    let Some(origin) = CAPTION_MOVE.with(|slot| slot.get()) else {
-        return;
-    };
-    let Some((width, height)) =
-        proportional_outer(origin.width, origin.height, origin.dpi, unsafe {
-            GetDpiForWindow(hwnd)
-        })
-    else {
-        return;
-    };
-    let pos = unsafe { &mut *(lparam as *mut WINDOWPOS) };
-    pos.flags &= !SWP_NOSIZE;
-    pos.cx = width;
-    pos.cy = height;
-}
-
 struct RecoveryGuard {
     hwnd: HWND,
 }
 
 impl Drop for RecoveryGuard {
     fn drop(&mut self) {
-        let recover = FRAMES.with(|frames| frames.borrow_mut().end());
+        let recover = FRAMES.with(|frames| {
+            let mut all = frames.borrow_mut();
+            let Some(frame) = all.get_mut(&self.hwnd) else {
+                return false;
+            };
+            let recover = frame.end();
+            if frame.entered.is_empty() {
+                all.remove(&self.hwnd);
+            }
+            recover
+        });
         if !recover {
             return;
         }
@@ -151,25 +105,33 @@ unsafe extern "system" fn drag_recovery_proc(
     _: usize,
 ) -> LRESULT {
     if message == WM_ENTERSIZEMOVE {
-        FRAMES.with(|frames| frames.borrow_mut().note_enter());
-    }
-    if message == WM_WINDOWPOSCHANGING && CAPTION_MOVE.with(|slot| slot.get().is_some()) {
-        keep_single_dpi_scale(hwnd, lparam);
-    }
-    if message == WM_EXITSIZEMOVE {
-        CAPTION_MOVE.with(|slot| slot.set(None));
+        FRAMES.with(|frames| {
+            let mut all = frames.borrow_mut();
+            if let Some(frame) = all.get_mut(&hwnd) {
+                frame.note_enter();
+            }
+        });
     }
     if message == WM_NCLBUTTONDOWN && is_os_drag_hit(wparam as u32) {
-        if wparam as u32 == HTCAPTION {
-            remember_caption_move(hwnd);
-        } else {
-            CAPTION_MOVE.with(|slot| slot.set(None));
-        }
-        FRAMES.with(|frames| frames.borrow_mut().begin());
+        FRAMES.with(|frames| frames.borrow_mut().entry(hwnd).or_default().begin());
         let _guard = RecoveryGuard { hwnd };
-        return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+        // winit 0.30 passes a POINTS pointer here instead of packed coordinates.
+        // Keep its drag/release lifecycle, but give Windows the actual anchor.
+        let mut cursor = POINT::default();
+        if unsafe { GetCursorPos(&mut cursor) } == 0 {
+            eprintln!(
+                "failed to query window drag anchor: {}",
+                io::Error::last_os_error()
+            );
+            return 0;
+        }
+        let position = pack_screen_position(cursor.x, cursor.y);
+        return unsafe { DefSubclassProc(hwnd, message, wparam, position) };
     }
     if message == WM_NCDESTROY {
+        FRAMES.with(|frames| {
+            frames.borrow_mut().remove(&hwnd);
+        });
         unsafe {
             RemoveWindowSubclass(hwnd, Some(drag_recovery_proc), SUBCLASS_ID);
         }
@@ -219,9 +181,12 @@ mod tests {
     }
 
     #[test]
-    fn one_dpi_step_does_not_scale_twice() {
-        assert_eq!(proportional_outer(1117, 781, 96, 144), Some((1676, 1172)));
-        assert_eq!(proportional_outer(1676, 1172, 144, 144), None);
+    fn packed_drag_anchor_preserves_negative_monitor_coordinates() {
+        for (x, y) in [(-1440, 300), (3840, -1080), (-32768, 32767), (0, 0)] {
+            let packed = pack_screen_position(x, y) as u32;
+            assert_eq!((packed as u16 as i16) as i32, x);
+            assert_eq!(((packed >> 16) as u16 as i16) as i32, y);
+        }
     }
 
     #[test]
@@ -232,5 +197,18 @@ mod tests {
         frames.begin();
         assert!(!frames.end());
         assert!(!frames.end());
+    }
+    #[test]
+    fn recovery_frames_are_isolated_by_native_window() {
+        let first = 1usize as HWND;
+        let second = 2usize as HWND;
+        let mut frames = HashMap::new();
+        frames.insert(first, DragFrames::default());
+        frames.insert(second, DragFrames::default());
+        frames.get_mut(&first).unwrap().begin();
+        frames.get_mut(&first).unwrap().note_enter();
+        frames.get_mut(&second).unwrap().begin();
+        assert!(!frames.get_mut(&first).unwrap().end());
+        assert!(frames.get_mut(&second).unwrap().end());
     }
 }

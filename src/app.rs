@@ -7486,17 +7486,59 @@ fn native_window_handle(ui: &AppWindow) -> isize {
     component_window_handle(ui)
 }
 
-fn install_window_drag_recovery<T: slint::ComponentHandle>(ui: &T) {
-    if let Err(error) =
-        platform::windows::window_drag_recovery::install(component_window_handle(ui))
-    {
-        eprintln!("failed to install window drag recovery: {error}");
+fn handle_window_adaptation(
+    window: &slint::Window,
+    event: &winit::event::WindowEvent,
+    installed_hwnd: &mut isize,
+) {
+    if matches!(event, winit::event::WindowEvent::Destroyed) {
+        *installed_hwnd = 0;
+        return;
+    }
+    // Native windows do not exist while Slint components are initially wired.
+    // Resolve the HWND from the live event instead of capturing zero at startup.
+    let hwnd = slint_window_handle(window);
+    if hwnd == 0 {
+        return;
+    }
+    if *installed_hwnd != hwnd {
+        let recovery = platform::windows::window_drag_recovery::install(hwnd);
+        let dpi = platform::windows::window_dpi::install(hwnd);
+        if recovery.is_ok() && dpi.is_ok() {
+            *installed_hwnd = hwnd;
+            wire_window_trace(hwnd);
+        }
+        for error in [recovery.err(), dpi.err()].into_iter().flatten() {
+            eprintln!("failed to install window adaptation: {error}");
+        }
     }
 }
 
+fn wire_secondary_window_adaptation<T: slint::ComponentHandle>(ui: &T) {
+    let mut installed_hwnd = 0;
+    ui.window().on_winit_window_event(move |window, event| {
+        handle_window_adaptation(window, event, &mut installed_hwnd);
+        EventResult::Propagate
+    });
+}
+
+fn begin_component_window_drag<T: slint::ComponentHandle>(ui: &T) {
+    // Keep winit's release and recovery bookkeeping; the native adapter repairs
+    // the packed screen coordinates before Windows starts its move loop.
+    ui.window().with_winit_window(|window| {
+        if let Err(error) = window.drag_window() {
+            eprintln!("failed to begin window drag: {error}");
+        }
+    });
+}
+
 fn component_window_handle<T: slint::ComponentHandle>(ui: &T) -> isize {
+    slint_window_handle(ui.window())
+}
+
+fn slint_window_handle(window: &slint::Window) -> isize {
     use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    ui.window()
+    window
         .with_winit_window(|window| {
             window
                 .window_handle()
@@ -13237,7 +13279,9 @@ fn wire_mouse_navigation(
     let cursor_position = Cell::new(winit::dpi::PhysicalPosition::new(0.0, 0.0));
     let ctrl_wheel_accumulator = Cell::new(0.0_f32);
     let ctrl_wheel_context = Cell::new((0, 0));
-    ui.window().on_winit_window_event(move |_, event| {
+    let mut installed_hwnd = 0;
+    ui.window().on_winit_window_event(move |window, event| {
+        handle_window_adaptation(window, event, &mut installed_hwnd);
         if let Some(ui) = weak.upgrade() {
             match event {
                 WindowEvent::MouseInput {
@@ -14535,31 +14579,20 @@ fn prepare_drop_operation(
     }
 }
 
-fn wire_window_trace(ui: &AppWindow) {
+fn wire_window_trace(hwnd: isize) {
     let path = if let Some(path) = platform::windows::window_trace::requested_path() {
         path
     } else if cfg!(debug_assertions) {
-        let path = platform::windows::window_trace::default_path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        path
+        platform::windows::window_trace::default_path()
     } else {
         return;
     };
-    let weak = ui.as_weak();
-    let _ = slint::invoke_from_event_loop(move || {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let hwnd = native_window_handle(&ui);
-        if let Err(error) = platform::windows::window_trace::install(hwnd, &path) {
-            eprintln!(
-                "failed to install window trace at {}: {error}",
-                path.display()
-            );
-        }
-    });
+    if let Err(error) = platform::windows::window_trace::install(hwnd, &path) {
+        eprintln!(
+            "failed to install window trace at {}: {error}",
+            path.display()
+        );
+    }
 }
 fn wire_window_controls(ui: &AppWindow) {
     #[cfg(windows)]
@@ -14571,9 +14604,6 @@ fn wire_window_controls(ui: &AppWindow) {
         window.set_undecorated_shadow(true);
     });
 
-    wire_window_trace(ui);
-    install_window_drag_recovery(ui);
-
     let weak = ui.as_weak();
     ui.on_drag_window(move || {
         let Some(ui) = weak.upgrade() else {
@@ -14581,9 +14611,7 @@ fn wire_window_controls(ui: &AppWindow) {
         };
         let hwnd = native_window_handle(&ui);
         platform::windows::window_trace::log_request(hwnd, "move-request");
-        ui.window().with_winit_window(|window| {
-            let _ = window.drag_window();
-        });
+        begin_component_window_drag(&ui);
     });
 
     let weak = ui.as_weak();
@@ -14593,7 +14621,7 @@ fn wire_window_controls(ui: &AppWindow) {
         };
         let hwnd = native_window_handle(&ui);
         platform::windows::window_trace::log_request(hwnd, "move-request-after-menu-dismiss");
-        let _ = platform::windows::begin_window_drag(hwnd);
+        begin_component_window_drag(&ui);
     });
 }
 
@@ -14611,7 +14639,7 @@ fn configure_secondary_dialog_window<T: slint::ComponentHandle>(ui: &T) {
             window.set_undecorated_shadow(true);
         }
     });
-    install_window_drag_recovery(ui);
+    wire_secondary_window_adaptation(ui);
 }
 
 fn configure_confirmation_window(ui: &ConfirmationWindow) {
@@ -14627,9 +14655,7 @@ fn configure_confirmation_window(ui: &ConfirmationWindow) {
     let weak = ui.as_weak();
     ui.on_drag_window(move || {
         if let Some(ui) = weak.upgrade() {
-            ui.window().with_winit_window(|window| {
-                let _ = window.drag_window();
-            });
+            begin_component_window_drag(&ui);
         }
     });
     configure_secondary_dialog_window(ui);
@@ -15083,7 +15109,7 @@ fn wire_network_location_rename_window(ui: &NetworkLocationRenameWindow, state: 
     let weak = ui.as_weak();
     ui.on_drag_window(move || {
         if let Some(ui) = weak.upgrade() {
-            let _ = ui.window().with_winit_window(|window| window.drag_window());
+            begin_component_window_drag(&ui);
         }
     });
     let weak = ui.as_weak();
@@ -15231,9 +15257,7 @@ fn wire_network_login_window(
     let login_weak = login.as_weak();
     login.on_drag_window(move || {
         if let Some(login) = login_weak.upgrade() {
-            let _ = login
-                .window()
-                .with_winit_window(|window| window.drag_window());
+            begin_component_window_drag(&login);
         }
     });
     let login_weak = login.as_weak();
@@ -15496,9 +15520,7 @@ fn wire_operation_window(
     let operation_weak = operation_ui.as_weak();
     operation_ui.on_drag_window(move || {
         if let Some(operation_ui) = operation_weak.upgrade() {
-            operation_ui.window().with_winit_window(|window| {
-                let _ = window.drag_window();
-            });
+            begin_component_window_drag(&operation_ui);
         }
     });
     #[cfg(windows)]
@@ -15507,7 +15529,7 @@ fn wire_operation_window(
         window.set_undecorated_shadow(true);
         window.set_resizable(false);
     });
-    install_window_drag_recovery(operation_ui);
+    wire_secondary_window_adaptation(operation_ui);
 
     let state_for_cancel = state.clone();
     let operation_weak = operation_ui.as_weak();
