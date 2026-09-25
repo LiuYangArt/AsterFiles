@@ -1,5 +1,11 @@
 use super::*;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 struct Fixture {
     root: PathBuf,
     junctions: Vec<PathBuf>,
@@ -40,6 +46,7 @@ impl Fixture {
             ])
             .env("ASTERFILES_TEST_LINK", &link)
             .env("ASTERFILES_TEST_TARGET", target)
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
             .unwrap();
         assert!(
