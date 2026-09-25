@@ -2848,7 +2848,7 @@ const FILE_GRID_HORIZONTAL_INSET: f32 = 24.0;
 const FILE_GRID_VIEWPORT_MATCH_SLACK: f32 = 2.0;
 
 fn logical_window_width(ui: &AppWindow) -> f32 {
-    ui.window().size().width as f32 / ui.window().scale_factor()
+    ui.get_layout_width()
 }
 
 fn navigation_sidebar_width(window_width: f32) -> f32 {
@@ -13279,6 +13279,7 @@ fn wire_mouse_navigation(
     let cursor_position = Cell::new(winit::dpi::PhysicalPosition::new(0.0, 0.0));
     let ctrl_wheel_accumulator = Cell::new(0.0_f32);
     let ctrl_wheel_context = Cell::new((0, 0));
+    let geometry_refresh = slint::Timer::default();
     let mut installed_hwnd = 0;
     ui.window().on_winit_window_event(move |window, event| {
         handle_window_adaptation(window, event, &mut installed_hwnd);
@@ -13450,33 +13451,31 @@ fn wire_mouse_navigation(
             ime_composing.set(false);
             type_select.borrow_mut().clear();
         }
-        if let WindowEvent::Resized(size) = event {
-            platform::windows::window_trace::log_request(
-                native_window_handle(&ui),
-                "winit-resized",
-            );
-            let logical_width = size.width as f32 / ui.window().scale_factor();
-            reflow_after_window_resize(&ui, &shared_state, window_id, logical_width);
-            request_visible_file_images(&ui, &shared_state, window_id, &senders.thumbnail);
-            return EventResult::Propagate;
-        }
         if matches!(
             event,
-            WindowEvent::ScaleFactorChanged { .. } | WindowEvent::Moved(_)
+            WindowEvent::Resized(_)
+                | WindowEvent::ScaleFactorChanged { .. }
+                | WindowEvent::Moved(_)
         ) {
-            if matches!(event, WindowEvent::ScaleFactorChanged { .. }) {
+            let resized = matches!(event, WindowEvent::Resized(_));
+            if resized {
+                platform::windows::window_trace::log_request(
+                    native_window_handle(&ui),
+                    "winit-resized",
+                );
+            }
+            if (resized || matches!(event, WindowEvent::ScaleFactorChanged { .. }))
+                && !geometry_refresh.running()
+            {
+                // Slint commits geometry after this filter. Coalesce model reflows
+                // and read its logical layout instead of mixing physical size and DPI.
                 let weak = ui.as_weak();
-                let state = state.clone();
+                let shared_state = shared_state.clone();
                 let scheduler = senders.thumbnail.clone();
-                slint::Timer::single_shot(Duration::ZERO, move || {
+                geometry_refresh.start(slint::TimerMode::SingleShot, Duration::ZERO, move || {
                     if let Some(ui) = weak.upgrade() {
-                        reflow_after_window_resize(
-                            &ui,
-                            &state.shared,
-                            window_id,
-                            logical_window_width(&ui),
-                        );
-                        request_visible_file_images(&ui, &state.shared, window_id, &scheduler);
+                        reflow_after_window_resize(&ui, &shared_state, window_id);
+                        request_visible_file_images(&ui, &shared_state, window_id, &scheduler);
                     }
                 });
             }
@@ -21756,12 +21755,8 @@ fn refresh_window_ui(ui: &AppWindow, state: &SharedSessions, window_id: WindowId
     apply_pending_rename_ui(ui, state, window_id);
 }
 
-fn reflow_after_window_resize(
-    ui: &AppWindow,
-    state: &SharedSessions,
-    window_id: WindowId,
-    logical_width: f32,
-) {
+fn reflow_after_window_resize(ui: &AppWindow, state: &SharedSessions, window_id: WindowId) {
+    let logical_width = logical_window_width(ui);
     ui.set_window_width(logical_width);
     ui.set_home_content_width(home_content_width_for_window(logical_width));
     let anchor = if ui.get_active_is_home() || !projected_view_mode(ui).uses_grid_layout() {
@@ -30989,6 +30984,99 @@ mod tests {
         let status = named_element(&ui, "AppWindow::status-bar").expect("file status bar exists");
         assert_eq!(status.size().height, 30.0);
         assert!((status.absolute_position().y + status.size().height - 960.0).abs() <= 1.0);
+    }
+
+    #[test]
+    fn issue_130_sidebar_survives_scale_changes_before_resize_is_committed() {
+        use slint::platform::WindowEvent;
+
+        let ui = headless_file_view();
+        let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\dpi")], 0, [0, 1, 2, 3]);
+        let window_id = app.active_window;
+        let tab_id = app.active_window_state().active_tab;
+        let tab = app.tab_mut(tab_id).unwrap();
+        tab.replace_entries(vec![focus_entry(1, r"C:\dpi\selected.txt")]);
+        tab.load_state = LoadState::Complete;
+        tab.select_entry(EntryId(1), false, false);
+        let request_id = tab.latest_request;
+        let state = Arc::new(Mutex::new(app));
+        refresh_window_ui(&ui, &state, window_id);
+        update_test_layout(&ui);
+        let expected_columns = ui.get_grid_column_count();
+        let expected_home_width = ui.get_home_content_width();
+
+        for _ in 0..3 {
+            for scale_factor in [1.5, 1.0, 1.25, 1.5, 1.25, 1.0] {
+                ui.window()
+                    .dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor });
+                // Background model refreshes can land between the scale and resize events.
+                refresh_window_ui(&ui, &state, window_id);
+                reflow_after_window_resize(&ui, &state, window_id);
+                update_test_layout(&ui);
+                assert_eq!(ui.get_window_width(), 1180.0);
+                assert_eq!(ui.get_home_content_width(), expected_home_width);
+                assert_eq!(ui.get_grid_column_count(), expected_columns);
+                assert_eq!(
+                    named_element(&ui, "AppWindow::sidebar-scroll")
+                        .unwrap()
+                        .size()
+                        .width,
+                    218.0,
+                );
+
+                ui.window().dispatch_event(WindowEvent::Resized {
+                    size: slint::LogicalSize::new(1180.0, 760.0),
+                });
+                reflow_after_window_resize(&ui, &state, window_id);
+                update_test_layout(&ui);
+                assert_eq!(ui.get_window_width(), 1180.0);
+                assert_eq!(
+                    named_element(&ui, "AppWindow::sidebar-scroll")
+                        .unwrap()
+                        .size()
+                        .width,
+                    218.0,
+                );
+                let app = state.lock().unwrap();
+                let tab = app.tab(tab_id).unwrap();
+                assert_eq!(tab.latest_request, request_id);
+                assert_eq!(tab.selected, vec![EntryId(1)]);
+            }
+        }
+    }
+
+    #[test]
+    fn issue_130_sidebar_still_follows_real_logical_resize_at_each_scale() {
+        use slint::platform::WindowEvent;
+
+        let ui = headless_file_view();
+        let app = AppState::new_for_test(vec![PathBuf::from(r"C:\dpi")], 0, [0, 1, 2, 3]);
+        let window_id = app.active_window;
+        let state = Arc::new(Mutex::new(app));
+        for scale_factor in [1.0, 1.25, 1.5] {
+            ui.window()
+                .dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor });
+            for (width, sidebar_width) in [
+                (1180.0, Some(218.0)),
+                (999.0, Some(184.0)),
+                (899.0, None),
+                (900.0, Some(184.0)),
+                (1000.0, Some(218.0)),
+                (1400.0, Some(218.0)),
+            ] {
+                ui.window().dispatch_event(WindowEvent::Resized {
+                    size: slint::LogicalSize::new(width, 760.0),
+                });
+                reflow_after_window_resize(&ui, &state, window_id);
+                update_test_layout(&ui);
+                assert_eq!(ui.get_window_width(), width);
+                assert_eq!(
+                    named_element(&ui, "AppWindow::sidebar-scroll").map(|item| item.size().width),
+                    sidebar_width,
+                    "logical width {width} at scale {scale_factor}",
+                );
+            }
+        }
     }
 
     #[test]

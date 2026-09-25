@@ -845,6 +845,8 @@ export component AppWindow inherits Window {
     min-height: 520px;
     background: VisualStyle.cf5f6f8;
     changed dark-theme => { VisualStyle.dark-theme = root.dark-theme; }
+    // Keep responsive constraints independent of the window's intrinsic size calculation.
+    out property <length> layout-width: root.width;
     in property <length> window-width: 1180px;
     default-font-family: "Segoe UI";
 

@@ -357,7 +357,7 @@ fn issue_97_intermediate_zoom_preserves_grouped_anchor_and_selection() {
 
 fn resize_window(ui: &AppWindow, state: &WindowSessions, width: f32, height: f32) {
     ui.window().set_size(slint::LogicalSize::new(width, height));
-    reflow_after_window_resize(ui, &state.shared, state.window_id, logical_window_width(ui));
+    reflow_after_window_resize(ui, &state.shared, state.window_id);
     settle(ui);
 }
 
