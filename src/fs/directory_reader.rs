@@ -84,12 +84,63 @@ pub(crate) fn read_directory_entry(
     if is_internal_cleanup_path(&path) {
         return Ok(None);
     }
-    let metadata = entry.metadata()?;
-    if !metadata_is_visible(&metadata, visibility) {
+    Ok(entry_from_metadata(
+        entry.file_name(),
+        path,
+        entry.metadata()?,
+        visibility,
+        id,
+    ))
+}
+
+pub(crate) fn read_path_entry(
+    path: &Path,
+    visibility: FileVisibility,
+    id: u32,
+) -> io::Result<Option<FileEntry>> {
+    if is_internal_cleanup_path(path) {
         return Ok(None);
     }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        if attributes_need_followup_metadata(metadata.file_attributes()) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "watch snapshot cannot follow a reparse target",
+            ));
+        }
+    }
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "directory entry has no name")
+    })?;
+    Ok(entry_from_metadata(
+        name.to_owned(),
+        path.to_path_buf(),
+        metadata,
+        visibility,
+        id,
+    ))
+}
+
+fn entry_from_metadata(
+    name: std::ffi::OsString,
+    path: PathBuf,
+    metadata: fs::Metadata,
+    visibility: FileVisibility,
+    id: u32,
+) -> Option<FileEntry> {
+    if !metadata_is_visible(&metadata, visibility) {
+        return None;
+    }
     let metadata = metadata_for_entry(&path, metadata);
-    Ok(Some(file_entry(entry.file_name(), path, metadata, id)))
+    Some(file_entry(name, path, metadata, id))
 }
 
 fn file_entry(
@@ -273,6 +324,33 @@ mod tests {
             show_system: true,
         };
         assert!(attributes_are_visible(HIDDEN | SYSTEM, all));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn issue_133_watch_snapshot_rejects_real_junctions_without_following_the_target() {
+        use std::os::windows::process::CommandExt;
+
+        let fixture = TempTree::new("watch-reparse");
+        let target = fixture.child("target");
+        let link = fixture.child("junction");
+        fs::create_dir(&target).unwrap();
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "junction creation failed: {:?}",
+            output
+        );
+        fs::remove_dir(&target).unwrap();
+        let error = read_path_entry(&link, FileVisibility::default(), 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        fs::remove_dir(&link).unwrap();
     }
 
     #[cfg(windows)]

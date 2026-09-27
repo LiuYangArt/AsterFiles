@@ -4,8 +4,8 @@ use super::file_operation_worker::{
     FileOperationEvent, FileOperationRequest, undo_source_kind, uses_local_recycle_batch,
 };
 use super::{
-    AppState, RecentOperationChanges, SharedSessions, WindowId, queue_completed_focus,
-    queue_completed_rename, refresh_all_windows, refresh_operation_badges, undo_failure_message,
+    AppState, SharedSessions, WindowId, queue_completed_focus, queue_completed_rename,
+    refresh_all_windows, refresh_operation_badges, undo_failure_message,
 };
 use crate::{
     domain::{
@@ -24,7 +24,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock, mpsc},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 fn drop_staging_roots() -> &'static Mutex<HashMap<OperationId, PathBuf>> {
@@ -495,35 +495,6 @@ pub(super) fn release_operation_directories(
     directories
 }
 
-pub(super) fn mark_recent_operation_changes(
-    app: &mut AppState,
-    directories: &HashSet<PathBuf>,
-    items: &[OperationItem],
-) {
-    let now = Instant::now();
-    for directory in directories {
-        let paths = items
-            .iter()
-            .filter(|item| item.state == ItemState::Succeeded)
-            .flat_map(|item| [item.source.as_ref(), item.destination.as_ref()])
-            .flatten()
-            .filter(|path| {
-                path.parent() == Some(directory.as_path())
-                    || path.as_path() == directory
-                    || path.starts_with(directory)
-            })
-            .cloned()
-            .collect();
-        app.recent_operation_changes.insert(
-            directory.clone(),
-            RecentOperationChanges {
-                paths,
-                recorded_at: now,
-            },
-        );
-    }
-}
-
 pub(super) struct OperationCompletion {
     pub(super) affected: Vec<PathBuf>,
     pub(super) next: Option<FileOperationRequest>,
@@ -668,7 +639,6 @@ pub(super) fn finish_file_operation(
         }
         affected.sort();
         affected.dedup();
-        mark_recent_operation_changes(&mut app, &registered, &task_items);
         app.conflict_responses.remove(&id);
         if kind == FileOperationKind::CreateFolder {
             if let (Some(origin_tab), Some(target)) =

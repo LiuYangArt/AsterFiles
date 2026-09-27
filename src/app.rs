@@ -55,7 +55,12 @@ use crate::platform::windows::address_path::{
 
 pub(crate) mod action_scenario;
 mod actions;
+#[cfg(test)]
+mod copy_interaction_tests;
+#[cfg(test)]
+mod copy_selection_tests;
 mod directory_loading;
+mod directory_watch_refresh;
 mod file_operation_coordinator;
 mod file_operation_worker;
 #[path = "library_loading.rs"]
@@ -67,8 +72,7 @@ mod window_sessions;
 use directory_loading::{DirectoryEvent, DirectoryRequest, spawn_directory_workers};
 use file_operation_coordinator::{
     OperationCompletion, enqueue_operation, finish_file_operation, mark_operation_running_if_ready,
-    mark_recent_operation_changes, prepare_retry, register_operation_directories,
-    release_operation_directories, request_undo,
+    prepare_retry, register_operation_directories, release_operation_directories, request_undo,
 };
 use file_operation_worker::{
     FileOperationEvent, FileOperationRequest, cleanup_record_root, spawn_file_operation_worker,
@@ -2042,12 +2046,6 @@ struct PendingRenameUi {
 }
 
 #[derive(Debug, Clone)]
-struct RecentOperationChanges {
-    paths: HashSet<PathBuf>,
-    recorded_at: Instant,
-}
-
-#[derive(Debug, Clone)]
 struct PendingShellCreate {
     window_id: WindowId,
     tab_id: TabId,
@@ -2303,7 +2301,6 @@ struct AppState {
     pending_rename_ui: HashMap<WindowId, PendingRenameUi>,
     active_operation_directories: HashMap<PathBuf, usize>,
     deferred_watch_directories: HashSet<PathBuf>,
-    recent_operation_changes: HashMap<PathBuf, RecentOperationChanges>,
     pending_shell_creates: HashMap<WindowId, PendingShellCreate>,
     pending_permanent_delete: Option<(TabId, Vec<OperationItem>)>,
     pending_imported_network_location_remove: Option<NetworkLocation>,
@@ -2538,7 +2535,6 @@ impl AppState {
             pending_rename_ui: HashMap::new(),
             active_operation_directories: HashMap::new(),
             deferred_watch_directories: HashSet::new(),
-            recent_operation_changes: HashMap::new(),
             pending_shell_creates: HashMap::new(),
             pending_permanent_delete: None,
             pending_imported_network_location_remove: None,
@@ -17212,7 +17208,6 @@ fn start_file_operation_event_pump(
                             affected.extend(registered.iter().cloned());
                             affected.sort();
                             affected.dedup();
-                            mark_recent_operation_changes(&mut app, &registered, &task_items);
                             let _ = app.operations.finish(id, terminal, result);
 
                             if let Some(cleanup) = cleanup {
@@ -17474,66 +17469,12 @@ fn start_directory_watchers(
             }
         },
     );
-    thread::spawn(move || {
-        while let Ok(first) = event_receiver.recv() {
-            if let platform::windows::directory_watch::DirectoryWatchEvent::Error {
-                root,
-                message,
-            } = &first
-            {
-                eprintln!("directory watch failed for {}: {message}", root.display());
-                if let Ok(mut failed) = failed_roots.lock() {
-                    failed.insert(root.clone());
-                }
-            }
-            let mut events = vec![first];
-            thread::sleep(Duration::from_millis(120));
-            while let Ok(next) = event_receiver.try_recv() {
-                events.push(next);
-            }
-            let sender_for_ui = directory_sender.clone();
-            let state_for_ui = state.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                // Network paths are excluded from watched_roots, so this refresh cannot reach SMB.
-                for event in events {
-                    let changes = watch_event_changes(&event).to_vec();
-                    let root = watch_event_root(event);
-                    let should_refresh = {
-                        let mut app = state_for_ui
-                            .lock()
-                            .expect("app state mutex is not poisoned");
-                        classify_watch_refresh(&mut app, &root, &changes)
-                    };
-                    if !should_refresh {
-                        continue;
-                    }
-                    let targets = {
-                        let app = state_for_ui
-                            .lock()
-                            .expect("app state mutex is not poisoned");
-                        app.windows
-                            .values()
-                            .flat_map(|window| window.tabs.values())
-                            .filter_map(|tab| {
-                                (tab.visible_path() == Some(root.as_path()))
-                                    .then_some((tab.id, root.clone()))
-                            })
-                            .collect::<Vec<_>>()
-                    };
-                    for (tab, path) in targets {
-                        submit_navigation(
-                            &sender_for_ui,
-                            &state_for_ui,
-                            tab,
-                            path,
-                            NavigationKind::Refresh,
-                            None,
-                        );
-                    }
-                }
-            });
-        }
-    });
+    directory_watch_refresh::start_watch_refresh_pump(
+        event_receiver,
+        directory_sender,
+        state,
+        failed_roots,
+    );
     timer
 }
 fn watched_roots(app: &AppState) -> std::collections::HashSet<PathBuf> {
@@ -17557,68 +17498,6 @@ fn watched_roots(app: &AppState) -> std::collections::HashSet<PathBuf> {
         .collect()
 }
 
-fn watch_event_root(event: platform::windows::directory_watch::DirectoryWatchEvent) -> PathBuf {
-    use platform::windows::directory_watch::DirectoryWatchEvent;
-    match event {
-        DirectoryWatchEvent::Changes { root, .. }
-        | DirectoryWatchEvent::Overflow { root }
-        | DirectoryWatchEvent::Error { root, .. } => root,
-    }
-}
-
-fn watch_event_changes(
-    event: &platform::windows::directory_watch::DirectoryWatchEvent,
-) -> &[platform::windows::directory_watch::DirectoryChange] {
-    match event {
-        platform::windows::directory_watch::DirectoryWatchEvent::Changes { changes, .. } => changes,
-        _ => &[],
-    }
-}
-
-fn changed_paths(
-    changes: &[platform::windows::directory_watch::DirectoryChange],
-) -> HashSet<PathBuf> {
-    use platform::windows::directory_watch::DirectoryChange;
-    changes
-        .iter()
-        .flat_map(|change| match change {
-            DirectoryChange::Added(path)
-            | DirectoryChange::Removed(path)
-            | DirectoryChange::Modified(path) => vec![path.clone()],
-            DirectoryChange::Renamed { from, to } => vec![from.clone(), to.clone()],
-        })
-        .collect()
-}
-
-fn watch_event_is_recent_operation_echo(
-    recent: &RecentOperationChanges,
-    changes: &[platform::windows::directory_watch::DirectoryChange],
-) -> bool {
-    recent.recorded_at.elapsed() <= Duration::from_secs(2)
-        && !changes.is_empty()
-        && changed_paths(changes)
-            .iter()
-            .all(|changed| recent.paths.iter().any(|path| changed.starts_with(path)))
-}
-
-fn classify_watch_refresh(
-    app: &mut AppState,
-    root: &Path,
-    changes: &[platform::windows::directory_watch::DirectoryChange],
-) -> bool {
-    if app.active_operation_directories.contains_key(root) {
-        app.deferred_watch_directories.insert(root.to_path_buf());
-        return false;
-    }
-    let Some(recent) = app.recent_operation_changes.get(root) else {
-        return true;
-    };
-    if recent.recorded_at.elapsed() > Duration::from_secs(2) {
-        app.recent_operation_changes.remove(root);
-        return true;
-    }
-    !watch_event_is_recent_operation_echo(recent, changes)
-}
 fn refresh_affected_tabs(
     sender: &mpsc::Sender<DirectoryRequest>,
     network_sender: &mpsc::SyncSender<DirectoryRequest>,
@@ -17741,6 +17620,14 @@ fn start_event_pump(
                             "network_root_event_apply_started",
                         );
                     }
+                    let reveal_selection = finished.is_some_and(|(tab_id, request_id)| {
+                        state.lock().ok().is_some_and(|app| {
+                            app.focus_after_refresh.get(&tab_id).is_some_and(|pending| {
+                                pending.request_id == Some(request_id)
+                                    && pending.action == PendingFocusAction::Select
+                            })
+                        })
+                    });
                     let icon_requests = apply_event(&state, event);
                     if network_root_finished {
                         platform::windows::network::record_runtime_event(
@@ -17818,7 +17705,9 @@ fn start_event_pump(
                                     .filter(|tab| tab.latest_request == request_id)
                                     .and_then(|tab| tab.focused)
                             });
-                            if let Some(entry_id) = focused {
+                            if reveal_selection {
+                                reveal_completed_selection(&target_ui, &state, tab_id, request_id);
+                            } else if let Some(entry_id) = focused {
                                 reveal_entry(&target_ui, &state, tab_id, request_id, entry_id);
                             }
                             submit_visible_shortcuts(
@@ -17842,6 +17731,183 @@ fn start_event_pump(
             }
         }
     });
+}
+
+fn focus_bottom_selected_entry(app: &mut AppState, tab_id: TabId) {
+    let focused = app.tab(tab_id).and_then(|tab| {
+        let selected = tab.selected.iter().copied().collect::<HashSet<_>>();
+        directory_group_projections(app, tab, &tab.entries)
+            .into_iter()
+            .flat_map(|group| group.entries)
+            .rfind(|id| selected.contains(id))
+    });
+    if let Some(focused) = focused
+        && let Some(tab) = app.tab_mut(tab_id)
+    {
+        tab.focused = Some(focused);
+        tab.selection_anchor = Some(focused);
+    }
+}
+
+fn selected_entry_span(
+    groups: &[group_projection::GroupProjection],
+    view_mode: ViewMode,
+    columns: usize,
+    selected: &[EntryId],
+) -> Option<(f32, f32)> {
+    let geometry = file_layout_geometry(view_mode);
+    let header_height = group_header_height(groups);
+    let positions = if geometry.grid {
+        let projection =
+            IconProjection::from_groups(groups, columns, header_height, geometry.row_height as u64);
+        selected
+            .iter()
+            .filter_map(|id| {
+                projection
+                    .entry_position(*id)
+                    .and_then(|position| projection.offsets.row_start(position.row_index))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let projection =
+            ListProjection::from_groups(groups, header_height, geometry.row_height as u64);
+        selected
+            .iter()
+            .filter_map(|id| {
+                projection
+                    .entry_position(*id)
+                    .and_then(|position| projection.offsets.row_start(position))
+            })
+            .collect::<Vec<_>>()
+    };
+    Some((
+        *positions.iter().min()? as f32,
+        *positions.iter().max()? as f32 + geometry.row_height,
+    ))
+}
+
+fn completed_selection_scroll_target(
+    current: f32,
+    first_top: f32,
+    last_bottom: f32,
+    visible_height: f32,
+    maximum: f32,
+) -> f32 {
+    if last_bottom - first_top > visible_height {
+        // The bottommost result anchors a full viewport of preceding results.
+        (visible_height - last_bottom).clamp(-maximum, 0.0)
+    } else {
+        reveal_scroll_target(
+            current,
+            first_top,
+            last_bottom - first_top,
+            visible_height,
+            maximum,
+        )
+    }
+}
+
+struct VisibleSelectionBeforeReorder {
+    tab_id: TabId,
+    request_id: RequestId,
+    selected: Vec<EntryId>,
+}
+
+fn visible_selection_before_reorder(
+    ui: &AppWindow,
+    app: &AppState,
+    tab_id: TabId,
+    request_id: RequestId,
+) -> Option<VisibleSelectionBeforeReorder> {
+    let window = app.window(app.window_for_tab(tab_id)?)?;
+    let tab = window.tabs.get(&tab_id)?;
+    if window.active_tab != tab_id
+        || !tab.accepts_page(request_id, PageSource::Directory)
+        || tab.load_state != LoadState::Complete
+        || tab.selected.is_empty()
+        || ui.get_projected_file_tab_id() != tab_id.0 as i32
+        || ui.get_projected_file_request_id() != request_id.0 as i32
+    {
+        return None;
+    }
+    let mode = app.view_mode_for_tab(tab_id)?;
+    let groups = directory_group_projections(app, tab, &tab.entries);
+    let (_, bottom) = selected_entry_span(
+        &groups,
+        mode,
+        ui.get_grid_column_count().max(1) as usize,
+        &tab.selected,
+    )?;
+    let bottom = bottom + ui.get_file_viewport_y();
+    let row_height = file_layout_geometry(mode).row_height;
+    // A background reorder may keep a visible result in view, but cannot undo a user's scroll.
+    (bottom - row_height >= -0.5 && bottom <= ui.get_file_viewport_height() + 0.5).then(|| {
+        VisibleSelectionBeforeReorder {
+            tab_id,
+            request_id,
+            selected: tab.selected.clone(),
+        }
+    })
+}
+
+fn restore_visible_selection_after_reorder(
+    ui: &AppWindow,
+    state: &SharedSessions,
+    before: Option<VisibleSelectionBeforeReorder>,
+) {
+    let Some(before) = before else {
+        return;
+    };
+    let unchanged = state.lock().is_ok_and(|app| {
+        app.window_for_tab(before.tab_id)
+            .and_then(|id| app.window(id))
+            .filter(|window| window.active_tab == before.tab_id)
+            .and_then(|window| window.tabs.get(&before.tab_id))
+            .is_some_and(|tab| {
+                tab.accepts_page(before.request_id, PageSource::Directory)
+                    && tab.selected == before.selected
+            })
+    });
+    if unchanged {
+        reveal_completed_selection(ui, state, before.tab_id, before.request_id);
+    }
+}
+fn reveal_completed_selection(
+    ui: &AppWindow,
+    state: &SharedSessions,
+    tab_id: TabId,
+    request_id: RequestId,
+) {
+    let span = state.lock().ok().and_then(|app| {
+        let window = app.window(app.window_for_tab(tab_id)?)?;
+        let tab = window.tabs.get(&tab_id)?;
+        if window.active_tab != tab_id || tab.latest_request != request_id {
+            return None;
+        }
+        let view_mode = app.view_mode_for_tab(tab_id)?;
+        let groups = directory_group_projections(&app, tab, &tab.entries);
+        let span = selected_entry_span(
+            &groups,
+            view_mode,
+            ui.get_grid_column_count().max(1) as usize,
+            &tab.selected,
+        )?;
+        Some((view_mode, span))
+    });
+    let Some((view_mode, (first_top, last_bottom))) = span else {
+        return;
+    };
+    let visible_height = ui
+        .get_file_viewport_height()
+        .max(file_layout_geometry(view_mode).row_height);
+    let maximum = projected_scroll_maximum(ui, view_mode, visible_height);
+    ui.set_file_viewport_y(completed_selection_scroll_target(
+        ui.get_file_viewport_y(),
+        first_top,
+        last_bottom,
+        visible_height,
+        maximum,
+    ));
 }
 
 fn reveal_scroll_target(
@@ -18088,6 +18154,12 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                     };
                     (tab.visible_path().map(Path::to_path_buf), shell_created)
                 };
+                if focus
+                    .as_ref()
+                    .is_some_and(|focus| focus.action == PendingFocusAction::Select)
+                {
+                    focus_bottom_selected_entry(&mut app, tab_id);
+                }
                 if consumed_focus {
                     app.focus_after_refresh.remove(&tab_id);
                 }
@@ -19546,12 +19618,29 @@ fn start_shortcut_event_pump(
             let state = state.clone();
             if weak
                 .upgrade_in_event_loop(move |ui| {
+                    let target_ui = state
+                        .lock()
+                        .ok()
+                        .and_then(|app| app.window_for_tab(event.request.tab_id))
+                        .and_then(window_ui);
+                    let visible_selection = target_ui.as_ref().and_then(|target_ui| {
+                        state.lock().ok().and_then(|app| {
+                            visible_selection_before_reorder(
+                                target_ui,
+                                &app,
+                                event.request.tab_id,
+                                event.request.request_id,
+                            )
+                        })
+                    });
                     if let Some((tab_id, entry_id)) = apply_shortcut_event(&state, event) {
-                        if let Some(window_id) =
-                            state.lock().ok().and_then(|app| app.window_for_tab(tab_id))
-                            && window_ui(window_id).is_some()
-                        {
+                        if let Some(target_ui) = target_ui {
                             refresh_tab_window(&state, tab_id);
+                            restore_visible_selection_after_reorder(
+                                &target_ui,
+                                &state,
+                                visible_selection,
+                            );
                         } else {
                             update_file_rows(&ui, &state, tab_id, &HashSet::from([entry_id]));
                         }
@@ -31796,34 +31885,6 @@ mod tests {
         assert_eq!(app.cut_paths, paths);
         assert!(apply_clipboard_snapshot(&mut app, 31, Some(same_cut)).is_empty());
         assert_eq!(app.cut_paths, paths);
-    }
-
-    #[test]
-    fn watcher_changes_are_deferred_during_an_operation_and_deduplicated_afterward() {
-        let root = PathBuf::from(r"C:\target");
-        let changed = root.join("item.txt");
-        let mut app = AppState::new_for_test(vec![root.clone()], 0, [0, 1, 2, 3]);
-        app.active_operation_directories.insert(root.clone(), 1);
-        let changes = vec![
-            platform::windows::directory_watch::DirectoryChange::Removed(changed.join("child.txt")),
-        ];
-        assert!(!classify_watch_refresh(&mut app, &root, &changes));
-        assert!(app.deferred_watch_directories.contains(&root));
-        app.active_operation_directories.clear();
-        app.recent_operation_changes.insert(
-            root.clone(),
-            RecentOperationChanges {
-                paths: HashSet::from([changed]),
-                recorded_at: Instant::now(),
-            },
-        );
-        assert!(!classify_watch_refresh(&mut app, &root, &changes));
-        assert!(app.recent_operation_changes.contains_key(&root));
-        let unrelated = vec![platform::windows::directory_watch::DirectoryChange::Added(
-            root.join("external.txt"),
-        )];
-        assert!(classify_watch_refresh(&mut app, &root, &unrelated));
-        assert!(app.recent_operation_changes.contains_key(&root));
     }
 
     #[test]

@@ -390,3 +390,22 @@ python tools/verify.py
 专项无界面回归：`cargo test --locked issue_125_ -- --nocapture`。测试使用内存菜单数据与 Slint testing backend，不显示桌面窗口、不调用真实 Shell 命令；覆盖打开方式直接命令、无动词和多级动态子项、菜单重建后的稳定 token、未知命令继续刷新，以及完成后的请求、选择和滚动位置保留。
 
 完整验证运行 `python tools/verify.py`，结果见 `artifacts/verify/summary.json` 与 `artifacts/logs/verify-test.log`。人工验收：打开文件较多的目录，滚动到中后部并选中文件，右键 → Open with → 任意程序；回到 AsterFiles 确认列表和选择保持原位。再从“选择其他应用”进入选择器后取消，确认仍保持原位。
+
+
+## Issue #133 复制完成后的选中与滚动
+
+专项命令：`cargo test --locked issue_133 -- --nocapture`；完整验证：`python tools/verify.py`，包含 Debug 构建。测试不操作桌面窗口。
+
+后台回归使用临时文件与实际应用状态，串起复制临时项改名、最终刷新、分批提交、选中恢复和延迟监听。相同结果不得生成第二次刷新，且列表数据、选择、焦点与锚点保持不变。另覆盖超过两秒的通知、真实外部修改、临时名前缀的真实文件、加载中通知、过期请求、导航与关闭停止后续读取、慢目录隔离、读取失败和目录快捷方式。
+
+Slint 无窗口后端验证各视图及分组中的目标范围滚动，并派发重新激活后的两次点击、右键和 Ctrl/Shift 输入。快捷方式从文件变为目录后的真实排序另验证选中可见、用户滚离不拉回、选择与请求失效后不追踪。点击测试复用真实控件与选择逻辑，但不接入 Windows 前台激活或整个目录打开流程，不能替代真实桌面验收。
+
+专项日志为 `artifacts/logs/issue-133-tests.log`。完整结果见 `artifacts/verify/summary.json`、`artifacts/logs/verify-test.log` 与 `artifacts/logs/issue-133-full-verify.log`。运行期日志 `artifacts/logs/file-operation-audit.jsonl` 新增 `watch_refresh`，用 PID、标签和请求编号关联复制完成后的 `unchanged` / `refresh` 判定。
+
+用户手动启动 `target/debug/asterfiles.exe`，使用临时目录验收：
+
+1. 分别粘贴单个文件和排序后不连续的多个文件。等待数秒，确认成功目标持续选中；能同屏时全部可见，不能同屏时优先显示最下方目标。列表、网格与类型分组各试一次。
+2. 切换到其他程序，再直接双击 AsterFiles 中的文件夹，确认两次点击即可打开；重新失焦后首次右键应立即打开菜单。
+3. 检查普通单选、Ctrl 离散选择、Shift 范围选择，以及打开目录后侧键返回再双击。手动 F5 和真实外部改动仍按原有刷新规则处理。
+
+排查历史见 [操作完成选择复盘](../postmortem/postmortem-2026-08-31-operation-focus-selection.md)。
