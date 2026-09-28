@@ -24,7 +24,7 @@ if ($Tag -ne "v$version") {
 }
 
 if (-not $SkipBuild) {
-    cargo build --release --locked
+    python tools/build.py build --release --locked
     if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
 }
 

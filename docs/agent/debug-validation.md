@@ -4,7 +4,7 @@
 
 `.github/workflows/ci.yml` 在 main push、以 main 为目标的 PR 和手动运行时执行完整验证：验证脚本测试、Pester 脚本测试、格式、Clippy、Rust 测试、Debug 构建和全部 20 个无界面场景。Windows Server 2025 runner 提供 PowerShell 7、Rustup、Visual Studio C++ 与 Windows SDK；工作流安装 Python 3.13 和 Pester 4.10.1，Rustup 从 `rust-toolchain.toml` 安装固定版本及 rustfmt/Clippy。本地也需这些依赖；Pester 安装命令为 `Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser -Force -SkipPublisherCheck`。Rust 版本只有该 TOML 文件一处来源，标签构建同样读取它。固定 Server 2025 是因为现有 CopyFile2 稀疏复制依赖 Windows 11 22H2 之后的标志；Server 2022 会返回 Win32 87，不能作为该功能的验证环境。
 
-Cargo 检查、测试、Debug 和本地 Release 构建均使用 `--locked`，依赖变化必须显式更新并提交 `Cargo.lock`。CI 缓存 Rust 依赖，只允许 main 保存缓存，不缓存 `artifacts/verify` 成功标记。PR 使用 `pull_request` 事件与只读权限，checkout 不保留凭据。工作流不执行发布；同一 PR/引用的新运行取消旧运行，最长 60 分钟。
+Cargo 检查、测试、Debug 和本地 Release 构建均使用 `--locked`，依赖变化必须显式更新并提交 `Cargo.lock`。CI 缓存 Cargo 下载数据与 kache，只允许 main 保存缓存，不缓存 `target` 或 `artifacts/verify` 成功标记。首次准备使用 `python tools/build.py setup`，本地、CI 与标签打包共用固定版本和缓存配置。PR 使用 `pull_request` 事件与只读权限，checkout 不保留凭据。工作流不执行发布；同一 PR/引用的新运行取消旧运行，最长 60 分钟。
 
 在 Actions 的 Windows CI 运行页下载 `windows-verification-<run-id>-<attempt>`：其中包含 `verify/summary.json`、`logs/verify-*.log` 和 `state/`。成功或失败都执行上传，保留 14 天；安装依赖或 checkout 失败时可能没有仓库内验证产物，此时查看对应 Actions 步骤日志。验证入口的前置检查失败、命令启动失败及非零退出均写入日志与失败汇总；验证步骤失败时，后续必要步骤标为 skipped。超时或强制取消可能没有最终汇总，需查看已有日志与 Actions 终止原因。
 
@@ -20,6 +20,10 @@ gh run download <失败演练编号> --dir artifacts/ci-failure-probe
 ```
 
 `failure_probe` 默认关闭，只在显式手动运行时向 runner 临时 checkout 的 `src/main.rs` 追加未格式化函数。预期格式检查失败、后续步骤跳过、任务最终失败，但证据上传成功；核对下载汇总中的 `format: failed` 与对应日志。演练不提交文件，不改本地源码，也不创建标签。将正常与演练运行链接回写 Issue。`tools/test_verify.py` 另在独占临时目录实际启动返回 7 的 Python 子进程，验证日志、失败汇总、后续跳过和最终退出码，不操作应用窗口。
+
+## 构建与缓存（#140）
+
+日常构建使用 `python tools/build.py build --locked`，运行使用 `python tools/build.py run --locked`。完整验证自动执行构建前维护与失败后的收尾。空间预算、NTFS 恢复成本、工具安装与排查入口见 [构建缓存策略](build-cache.md)。
 
 ## 统一验证
 

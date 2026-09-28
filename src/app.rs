@@ -12940,12 +12940,11 @@ fn wire_callbacks(
                 refresh_all_windows(&state_for_context_command.shared);
             }
             command
-                if (CMD_GROUP_BASE..CMD_GROUP_BASE + 6).contains(&command)
-                    || matches!(command, CMD_GROUP_ASC | CMD_GROUP_DESC) =>
+                if ((CMD_GROUP_BASE..CMD_GROUP_BASE + 6).contains(&command)
+                    || matches!(command, CMD_GROUP_ASC | CMD_GROUP_DESC))
+                    && apply_group_command(&state_for_context_command, command) =>
             {
-                if apply_group_command(&state_for_context_command, command) {
-                    refresh_all_windows(&state_for_context_command.shared);
-                }
+                refresh_all_windows(&state_for_context_command.shared);
             }
             CMD_COLUMN_FIT | CMD_COLUMNS_FIT => {
                 if let Ok(mut app) = state_for_context_command.lock() {

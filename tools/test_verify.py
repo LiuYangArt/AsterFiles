@@ -72,9 +72,7 @@ class VerifyTests(unittest.TestCase):
     def test_validation_starts_with_build_cache_maintenance(self) -> None:
         first_name, first_command = verify.validation_steps(True, False)[0]
         self.assertEqual(first_name, "build-cache")
-        self.assertEqual(
-            first_command[-1], str(verify.ROOT / "tools" / "maintain-build-cache.ps1")
-        )
+        self.assertEqual(first_command, [verify.sys.executable, str(verify.ROOT / "tools" / "build.py"), "prepare"])
 
     def test_finish_issue_tests_are_part_of_every_validation_mode(self) -> None:
         for quick in (True, False):

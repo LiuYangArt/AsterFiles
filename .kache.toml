@@ -1,0 +1,10 @@
+# NTFS restores use copies; unsafe shared hardlinks are deliberately disabled.
+[cache]
+local_only = true
+local_max_size = "4GiB"
+windows_hardlink = false
+cache_executables = false
+adaptive_incremental = false
+auto_gc = false
+daemon_publish = false
+prefetch_enabled = false

@@ -5,19 +5,20 @@
 ## 启动与验证
 
 ```powershell
-cargo run
+python tools/build.py setup # 首次安装固定 Rust 与 kache
+python tools/build.py run --locked # 日常开发，自动执行缓存维护
 python tools/verify.py --quick # 小改动：格式、Clippy、测试、Debug 构建
 python tools/verify.py         # Issue 完整 Debug 验证
 python tools/verify.py --release # 用户确认 Issue 后的本地 Release 构建验证；不发布
 ```
 
-验证默认首个失败即停止，并在开始前关闭由本仓库 Debug/Release 程序启动的 AsterFiles；诊断全部失败时显式加 `--keep-going`。验证开始时执行 `./tools/maintain-build-cache.ps1`：`target` 超过 30 GB 时仅清理当前包的历史编译产物，保留第三方依赖缓存；手动预演使用 `./tools/maintain-build-cache.ps1 -DryRun`，强制清理使用 `./tools/maintain-build-cache.ps1 -Force`。完整验证只构建一次 Debug，随后直接复用程序运行全部无界面场景。`--release` 仅在本机生成并验证 `target/release/asterfiles.exe`，不会更新版本、提交、打标签、推送或创建 GitHub Release；工作树内容未变化时复用最近成功的完整验证，只补本地 Release 构建。Issue 收尾使用 `./tools/finish-issue.ps1 <编号> -Message '<提交说明>' -Paths <本 Issue 文件>`，依次验证、提交、回写 Issue、设为 Done 并关闭；任一步失败立即停止，且不会带入未明确列出的改动。机器可读汇总位于 `artifacts/verify/summary.json`；详细规则和确定性 UI 场景见 `docs/agent/debug-validation.md`。UI 截图写入 `artifacts/ui/`，日志写入 `artifacts/logs/`，状态导出写入 `artifacts/state/`，性能 artifacts 写入 `artifacts/perf/`。
+验证默认首个失败即停止，并在开始前关闭由本仓库 Debug/Release 程序启动的 AsterFiles；诊断全部失败时显式加 `--keep-going`。验证开始和结束时执行 `tools/build.py` 的构建缓存维护。`target` 预算 8 GiB，kache 数据预算 4 GiB，两者连同工具和索引的收尾总预算 13 GiB。工具链、依赖或构建配置变化时退休旧 `target`，保留最终程序；超预算同样清理整个旧输出，依赖从 kache 恢复。查看占用使用 `python tools/build.py status`，主动退休编译输出使用 `python tools/build.py clean`。具体边界见 `docs/agent/build-cache.md`。完整验证只构建一次 Debug，随后直接复用程序运行全部无界面场景。`--release` 仅在本机生成并验证 `target/release/asterfiles.exe`，不会更新版本、提交、打标签、推送或创建 GitHub Release；工作树内容未变化时复用最近成功的完整验证，只补本地 Release 构建。Issue 收尾使用 `./tools/finish-issue.ps1 <编号> -Message '<提交说明>' -Paths <本 Issue 文件>`，依次验证、提交、回写 Issue、设为 Done 并关闭；任一步失败立即停止，且不会带入未明确列出的改动。机器可读汇总位于 `artifacts/verify/summary.json`；详细规则和确定性 UI 场景见 `docs/agent/debug-validation.md`。UI 截图写入 `artifacts/ui/`，日志写入 `artifacts/logs/`，状态导出写入 `artifacts/state/`，性能 artifacts 写入 `artifacts/perf/`。
 
 本地正式发布默认使用 `./tools/publish.ps1`：它读取上一个 GitHub Release 之后关闭且恰好带一个 `type: *` 标签的 Issue；只要包含 `type: feature` 就升级 feature 版本，否则升级 bugfix 版本，并把这些 Issue 按类型写入中文 Release Note。没有已完成 Issue 或 Issue 类型标签不合规时停止发布。确需人工覆盖时才使用 `./tools/publish.ps1 major|feature|bugfix`；`-DryRun` 仅预演。脚本负责递增 `Cargo.toml` 版本、验证、提交、将 Release Note 写入标签并原子推送。用户只要求“更新版本并让 GitHub Action 打 Release 包”时，运行脚本并确认其成功触发 Action 后立即结束，不等待 Action 构建完成，也不重复执行脚本已覆盖的检查；只有用户明确要求确认云端发布结果时才等待。发布包可使用 `./tools/release.ps1 -Tag v<版本>` 在本地生成，输出位于 `artifacts/release/`；GitHub Release 由 `.github/workflows/release.yml` 读取标签说明并发布。版本唯一来源是 `Cargo.toml`。
 
 ## Windows 持续验证（#106）
 
-主线 push、面向 main 的 PR 和手动运行触发 `.github/workflows/ci.yml`，在 Windows Server 2025 / PowerShell 7 上运行完整 `python tools/verify.py`。本地、CI 和标签打包共同读取 `rust-toolchain.toml`；Rust 版本只在该文件维护。首次本地验证需安装 Python 3.13、Rustup、Visual Studio C++/Windows SDK，以及 `Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser -Force -SkipPublisherCheck`。验证显式导入该 Pester 版本；Cargo 检查、测试和构建均使用 `--locked`。
+主线 push、面向 main 的 PR 和手动运行触发 `.github/workflows/ci.yml`，在 Windows Server 2025 / PowerShell 7 上运行完整 `python tools/verify.py`。本地、CI 和标签打包共同读取 `rust-toolchain.toml`；Rust 版本只在该文件维护。首次本地验证需安装 Python 3.13+、Rustup、Visual Studio C++/Windows SDK，运行 `python tools/build.py setup`，以及 `Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser -Force -SkipPublisherCheck`。验证显式导入该 Pester 版本；Cargo 检查、测试和构建均使用 `--locked`。
 
 CI 只有仓库读取权限，不发布、不创建标签；同一 PR/引用的新运行取消旧运行，单次超时 60 分钟。日志、状态和汇总上传到 `windows-verification-<run-id>-<attempt>`，保存 14 天。成功与失败路径的云端复验命令及下载入口见 `docs/agent/debug-validation.md`；受控失败只修改 runner 的临时 checkout。
 

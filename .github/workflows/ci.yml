@@ -41,18 +41,28 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install verification dependencies
+      - name: Restore Cargo and kache data
+        id: build-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            .cache/kache
+          key: windows-cargo-kache-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', '.kache.toml', 'tools/build.py', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            windows-cargo-kache-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', '.kache.toml', 'tools/build.py', 'Cargo.lock') }}-
+            windows-cargo-kache-
+
+      - name: Install verification dependencies and kache
         run: |
           if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'PowerShell 7 is required.' }
           Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser -Force -SkipPublisherCheck -ErrorAction Stop
-          # rustup reads the repository toolchain file, including rustfmt and clippy.
+          python tools/build.py setup
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustup show active-toolchain
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Inject controlled format failure
         if: github.event_name == 'workflow_dispatch' && inputs.failure_probe
@@ -63,6 +73,17 @@ jobs:
         run: |
           python tools/verify.py
           exit $LASTEXITCODE
+
+      - name: Save Cargo and kache data
+        if: github.ref == 'refs/heads/main' && steps.build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            .cache/kache
+          key: ${{ steps.build-cache.outputs.cache-primary-key }}
 
       - name: Upload verification evidence
         if: always()

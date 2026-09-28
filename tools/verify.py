@@ -314,14 +314,13 @@ def validation_steps(quick: bool, include_release: bool) -> list[tuple[str, list
         (
             "build-cache",
             [
-                "pwsh",
-                "-NoLogo",
-                "-NoProfile",
-                "-File",
-                str(ROOT / "tools" / "maintain-build-cache.ps1"),
+                sys.executable,
+                str(ROOT / "tools" / "build.py"),
+                "prepare",
             ],
         ),
         ("verify-tests", [sys.executable, str(ROOT / "tools" / "test_verify.py")]),
+        ("build-policy-tests", [sys.executable, str(ROOT / "tools" / "test_build.py")]),
         (
             "publish-tests",
             [
@@ -469,6 +468,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
         }
         emit({"event": "validation_step", **reused})
         results = [reused]
+        prepared = run_step("build-cache", [sys.executable, str(ROOT / "tools" / "build.py"), "prepare"])
+        results.append(prepared)
+        if prepared["status"] != "passed":
+            write_summary(results, mode, reuse)
+            return 1
         results.extend(execute_steps([("release", ["cargo", "build", "--release", "--locked"])], False))
     else:
         results = execute_steps(
@@ -476,6 +480,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
             args.keep_going,
         )
 
+    if any(step["name"] in {"clippy", "test", "debug", "release"} and step["status"] != "skipped" for step in results):
+        results.append(run_step("build-cache-finalize", [sys.executable, str(ROOT / "tools" / "build.py"), "finish"]))
     summary = write_summary(results, mode, reuse)
     if summary["status"] == "passed" and not args.quick and not args.release:
         FULL_DEBUG_SUMMARY.write_text(

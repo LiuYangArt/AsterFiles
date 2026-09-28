@@ -2,6 +2,9 @@
 /target/
 *.pdb
 
+# Project-local compiler cache and tools
+/.cache/
+
 # Generated validation and performance output
 /artifacts/
 __pycache__/
