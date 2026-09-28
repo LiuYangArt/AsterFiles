@@ -15494,16 +15494,12 @@ fn wire_operation_window(
     #[cfg(windows)]
     use winit::platform::windows::{CornerPreference, WindowExtWindows};
 
-    let auto_opened = Rc::new(Cell::new(false));
-
     let operation_weak = operation_ui.as_weak();
-    let auto_opened_for_close = auto_opened.clone();
     operation_ui.window().on_close_requested(move || {
         platform::windows::window_trace::log_diagnostic(
             "operation-window-hide-requested",
             "source=window-close",
         );
-        auto_opened_for_close.set(false);
         if operation_weak.upgrade().is_none() {
             platform::windows::window_trace::log_diagnostic(
                 "operation-window-hide-failed",
@@ -15568,12 +15564,12 @@ fn wire_operation_window(
         }
     });
 
-    wire_operation_window_opener(ui, operation_ui, state.clone(), auto_opened.clone());
+    wire_operation_window_opener(ui, operation_ui, state.clone());
 
     let operation_weak = operation_ui.as_weak();
     let ui_weak = ui.as_weak();
     let state_for_auto_open = state.clone();
-    let auto_opened_for_timer = auto_opened;
+    let mut shown_notifications = HashSet::new();
     let timer = slint::Timer::default();
     timer.start(
         slint::TimerMode::Repeated,
@@ -15594,42 +15590,71 @@ fn wire_operation_window(
             if removed > 0 {
                 refresh_operation_badges(&state_for_auto_open);
                 refresh_operation_window(&operation_ui, &state_for_auto_open);
-                let should_close = state_for_auto_open.lock().is_ok_and(|app| {
-                    should_close_auto_opened_operation_window(auto_opened_for_timer.get(), &app)
-                });
+                let should_close = state_for_auto_open
+                    .lock()
+                    .is_ok_and(|app| should_close_operation_window(&app));
                 if should_close {
-                    auto_opened_for_timer.set(false);
                     let _ = operation_ui.hide();
                 }
             }
-            let should_open = state_for_auto_open
+            if operation_ui.window().is_visible() {
+                let rows = operation_ui.get_operations();
+                let pause_changed = state_for_auto_open.lock().is_ok_and(|app| {
+                    operation_pause_ack_changed(
+                        &app,
+                        rows.iter()
+                            .map(|row| (OperationId(row.id as u64), row.pause_pending)),
+                    )
+                });
+                if pause_changed {
+                    refresh_operation_progress(&operation_ui, &state_for_auto_open);
+                }
+            }
+            let pending_notifications = state_for_auto_open
                 .lock()
-                .is_ok_and(|app| should_auto_open_operation_window(&app));
-            if should_open && !operation_ui.window().is_visible() {
-                refresh_operation_window(&operation_ui, &state_for_auto_open);
+                .map(|app| pending_operation_window_notifications(&app, &mut shown_notifications))
+                .unwrap_or_default();
+            if pending_notifications.is_empty() {
+                return;
+            }
+            let already_visible = operation_ui.window().is_visible();
+            refresh_operation_window(&operation_ui, &state_for_auto_open);
+            if !already_visible {
                 if let Some(ui) = ui_weak.upgrade() {
                     position_window_centered(&ui, None, &operation_ui);
                 }
-                if operation_ui.show().is_ok() {
-                    auto_opened_for_timer.set(true);
+                if operation_ui.show().is_err() {
+                    return;
                 }
             }
+            shown_notifications.extend(pending_notifications);
         },
     );
     timer
+}
+
+fn operation_pause_ack_changed(
+    app: &AppState,
+    mut displayed: impl Iterator<Item = (OperationId, bool)>,
+) -> bool {
+    displayed.any(|(id, pending)| {
+        app.operations.task(id).is_some_and(|task| {
+            task.state == OperationState::Paused
+                && task.resource != OperationResource::Cleanup
+                && pending == task.cancellation.is_pause_acknowledged()
+        })
+    })
 }
 
 fn wire_operation_window_opener(
     ui: &AppWindow,
     operation_ui: &OperationWindow,
     state: SharedSessions,
-    auto_opened: Rc<Cell<bool>>,
 ) {
     let operation_weak = operation_ui.as_weak();
     let ui_weak = ui.as_weak();
     ui.on_open_operation_window(move || {
         if let (Some(ui), Some(operation_ui)) = (ui_weak.upgrade(), operation_weak.upgrade()) {
-            auto_opened.set(false);
             refresh_operation_window(&operation_ui, &state);
             position_window_centered(&ui, None, &operation_ui);
             let _ = operation_ui.show();
@@ -15645,23 +15670,44 @@ fn should_close_conflict_window(operation_id: &str, app: &AppState) -> bool {
     })
 }
 
-fn should_close_auto_opened_operation_window(auto_opened: bool, app: &AppState) -> bool {
-    auto_opened
-        && !app
-            .operations
-            .iter()
-            .any(|task| operation_has_visible_row(task.state))
+fn should_close_operation_window(app: &AppState) -> bool {
+    !app.operations.iter().any(operation_task_has_visible_row)
 }
 
-fn should_auto_open_operation_window(app: &AppState) -> bool {
-    app.operations.iter().any(|task| {
-        task.kind != FileOperationKind::PermanentDelete
-            && matches!(
+fn pending_operation_window_notifications(
+    app: &AppState,
+    shown: &mut HashSet<(OperationId, u32, bool)>,
+) -> Vec<(OperationId, u32, bool)> {
+    shown.retain(|(id, round, _)| {
+        app.operations
+            .task(*id)
+            .is_some_and(|task| task.execution_round == *round)
+    });
+    operation_window_notifications(app)
+        .into_iter()
+        .filter(|notification| !shown.contains(notification))
+        .collect()
+}
+fn operation_window_notifications(app: &AppState) -> HashSet<(OperationId, u32, bool)> {
+    app.operations
+        .iter()
+        .filter_map(|task| {
+            if task.kind == FileOperationKind::PermanentDelete {
+                return None;
+            }
+            let failed = matches!(
+                task.state,
+                OperationState::Failed | OperationState::PartiallyCompleted
+            );
+            let slow = matches!(
                 task.state,
                 OperationState::Preflight | OperationState::Running | OperationState::Paused
-            )
-            && task.cancellation.active_elapsed(task.started_at) >= Duration::from_millis(800)
-    })
+            ) && task.cancellation.active_elapsed(task.started_at)
+                >= Duration::from_millis(800);
+            // A failure deserves a new notification even after its progress window was dismissed.
+            (failed || slow).then_some((task.id, task.execution_round, failed))
+        })
+        .collect()
 }
 
 fn refresh_operation_window(ui: &OperationWindow, state: &SharedSessions) {
@@ -15867,7 +15913,7 @@ fn debug_operation_row(language: Language, state: OperationState, index: i32) ->
     let progress_known = !matches!(state, OperationState::Queued | OperationState::Preflight);
     let (progress, transferred, speed, eta, file_progress) = match state {
         OperationState::Queued => (0.0, "0 MB", "", "—", "0 / 32"),
-        OperationState::Preflight => (0.0, "0 MB", status, status, "正在扫描 · 已处理 0 项"),
+        OperationState::Preflight => (0.0, "0 MB", status, status, status),
         OperationState::Running => (
             0.38,
             "384 MB / 1.0 GB",
@@ -15898,7 +15944,7 @@ fn debug_operation_row(language: Language, state: OperationState, index: i32) ->
                 _ => eta,
             },
             if state == OperationState::Preflight {
-                "Scanning · 0 processed"
+                "Preparing"
             } else {
                 file_progress
             },
@@ -17025,13 +17071,30 @@ fn start_file_operation_event_pump(
                     );
                     continue;
                 }
+                FileOperationEvent::CopyRecovery { id, recovering } => {
+                    if let Ok(mut app) = state.lock()
+                        && let Some(task) = app.operations.task_mut(id)
+                        && task.state.is_active()
+                        && !task.cancellation.is_cancelled()
+                    {
+                        task.progress.copy_recovering = recovering;
+                    }
+                    queue_operation_progress_refresh(
+                        operation_weak.clone(),
+                        state.clone(),
+                        &progress_refresh_queued,
+                    );
+                    continue;
+                }
                 FileOperationEvent::Progress {
                     id,
                     completed_items,
                     completed_files,
+                    skipped_files,
                     total_files,
                     discovered_files,
                     processed_bytes,
+                    skipped_bytes,
                     total_bytes,
                     discovered_bytes,
                     scanning_complete,
@@ -17044,10 +17107,12 @@ fn start_file_operation_event_pump(
                     {
                         task.progress.completed_items = completed_items;
                         task.progress.completed_files = completed_files;
+                        task.progress.skipped_files = skipped_files;
                         task.progress.total_files = total_files;
                         task.progress.discovered_files =
                             task.progress.discovered_files.max(discovered_files);
                         task.progress.processed_bytes = processed_bytes;
+                        task.progress.skipped_bytes = skipped_bytes;
                         task.progress.total_bytes = total_bytes;
                         task.progress.discovered_bytes =
                             task.progress.discovered_bytes.max(discovered_bytes);
@@ -17077,6 +17142,7 @@ fn start_file_operation_event_pump(
                 let event_operation_id = match &event {
                     FileOperationEvent::DestinationCreated { id, .. }
                     | FileOperationEvent::Progress { id, .. }
+                    | FileOperationEvent::CopyRecovery { id, .. }
                     | FileOperationEvent::RecycleProgress { id, .. }
                     | FileOperationEvent::RecycleDiscovery { id, .. }
                     | FileOperationEvent::PermanentDeleteStage { id, .. }
@@ -17097,6 +17163,7 @@ fn start_file_operation_event_pump(
                         }
                     }
                     FileOperationEvent::Progress { .. }
+                    | FileOperationEvent::CopyRecovery { .. }
                     | FileOperationEvent::RecycleProgress { .. }
                     | FileOperationEvent::RecycleDiscovery { .. } => unreachable!(),
                     FileOperationEvent::PermanentDeleteStage {
@@ -21330,16 +21397,7 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
     let mut rows = app
         .operations
         .iter()
-        .filter(|task| {
-            (operation_has_visible_row(task.state) || is_cleanup_completion_receipt(task))
-                && (!task.recovered_cleanup
-                    || matches!(
-                        task.state,
-                        OperationState::Failed
-                            | OperationState::PartiallyCompleted
-                            | OperationState::WaitingConflict
-                    ))
-        })
+        .filter(|task| operation_task_has_visible_row(task))
         .map(|task| {
             let title = match (app.language, task.kind) {
                 (Language::Chinese, FileOperationKind::CreateFolder) => "新建文件夹",
@@ -21377,7 +21435,23 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
                     None => "Undo file operation",
                 },
             };
-            let status = if task.kind == FileOperationKind::PermanentDelete {
+            let pause_pending =
+                task.state == OperationState::Paused && !task.cancellation.is_pause_acknowledged();
+            let recovering_copy = task.resource == OperationResource::Network
+                && task.state == OperationState::Running
+                && matches!(task.kind, FileOperationKind::Copy | FileOperationKind::Move)
+                && task.progress.copy_recovering;
+            let waiting_network = task.resource == OperationResource::Network
+                && task.state == OperationState::Running
+                && matches!(task.kind, FileOperationKind::Copy | FileOperationKind::Move)
+                && task.progress.recent_speed_bps == Some(0);
+            let status = if pause_pending {
+                Texts::new(app.language).operation_pausing()
+            } else if recovering_copy {
+                Texts::new(app.language).operation_recovering_copy()
+            } else if waiting_network {
+                Texts::new(app.language).operation_waiting_network()
+            } else if task.kind == FileOperationKind::PermanentDelete {
                 match (app.language, task.permanent_delete_stage, task.state) {
                     (
                         Language::Chinese,
@@ -21454,7 +21528,7 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
                 task.progress
                     .total_bytes
                     .filter(|total| *total > 0)
-                    .map(|total| task.progress.processed_bytes as f32 / total as f32)
+                    .map(|total| task.progress.accounted_bytes() as f32 / total as f32)
                     .unwrap_or_else(|| {
                         if task.items.is_empty() {
                             0.0
@@ -21494,18 +21568,22 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
                     .filter(|total| *total > 0)
                     .map(|total| {
                         let speed = task.progress.recent_speed_bps.map(|speed| speed as f64);
-                        let remaining = total.saturating_sub(task.progress.processed_bytes);
+                        let remaining = total.saturating_sub(task.progress.accounted_bytes());
                         (
-                            format!(
-                                "{:.1} / {:.1} MB",
-                                task.progress.processed_bytes as f64 / 1_048_576.0,
-                                total as f64 / 1_048_576.0
-                            ),
+                            if task.progress.skipped_files > 0 {
+                                Texts::new(app.language).operation_processed_bytes(
+                                    task.progress.accounted_bytes(),
+                                    Some(total),
+                                )
+                            } else {
+                                format!(
+                                    "{:.1} / {:.1} MB",
+                                    task.progress.processed_bytes as f64 / 1_048_576.0,
+                                    total as f64 / 1_048_576.0
+                                )
+                            },
                             match (task.state, speed) {
-                                (OperationState::Paused, _) => {
-                                    operation_status_text(app.language, OperationState::Paused)
-                                        .to_owned()
-                                }
+                                (OperationState::Paused, _) => status.to_owned(),
                                 (OperationState::WaitingConflict, _) => operation_status_text(
                                     app.language,
                                     OperationState::WaitingConflict,
@@ -21542,21 +21620,54 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
                     })
             } else {
                 (
-                    format!(
-                        "{:.1} MB",
-                        task.progress.processed_bytes as f64 / 1_048_576.0
-                    ),
-                    if task.state == OperationState::Running {
-                        preparing_text(app.language).to_owned()
+                    if task.progress.skipped_files > 0 {
+                        Texts::new(app.language)
+                            .operation_processed_bytes(task.progress.accounted_bytes(), None)
+                    } else if matches!(task.kind, FileOperationKind::Copy | FileOperationKind::Move)
+                    {
+                        Texts::new(app.language).operation_copied(task.progress.processed_bytes)
                     } else {
-                        String::new()
+                        format!(
+                            "{:.1} MB",
+                            task.progress.processed_bytes as f64 / 1_048_576.0
+                        )
+                    },
+                    match task.state {
+                        OperationState::Running => task
+                            .progress
+                            .recent_speed_bps
+                            .map(|speed| format!("{:.1} MB/s", speed as f64 / 1_048_576.0))
+                            .unwrap_or_else(|| estimating_text(app.language).to_owned()),
+                        OperationState::Paused | OperationState::WaitingConflict => {
+                            status.to_owned()
+                        }
+                        _ => String::new(),
                     },
                     if task.state == OperationState::Running {
-                        preparing_text(app.language).to_owned()
+                        Texts::new(app.language)
+                            .operation_total_pending()
+                            .to_owned()
                     } else {
                         "—".to_owned()
                     },
                 )
+            };
+            let (speed_text, eta_text) = if recovering_copy {
+                (
+                    Texts::new(app.language)
+                        .operation_recovering_copy()
+                        .to_owned(),
+                    "—".to_owned(),
+                )
+            } else if waiting_network {
+                (
+                    Texts::new(app.language)
+                        .operation_waiting_network()
+                        .to_owned(),
+                    "—".to_owned(),
+                )
+            } else {
+                (speed_text, eta_text)
             };
             let source = task
                 .items
@@ -21625,6 +21736,7 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
                 status.to_owned(),
                 queue.clone(),
                 failure_summary.clone(),
+                current_item_line.clone(),
                 transferred.clone(),
                 speed_text.clone(),
                 eta_text.clone(),
@@ -21680,14 +21792,26 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
                     task.progress
                         .total_files
                         .map(|total| {
-                            format!("{} / {total}", task.progress.completed_files.min(total))
+                            format!("{} / {total}", task.progress.accounted_files().min(total))
                         })
-                        .unwrap_or_else(|| match app.language {
-                            Language::Chinese => {
-                                format!("正在扫描 · 已处理 {} 项", task.progress.completed_files)
-                            }
-                            Language::English => {
-                                format!("Scanning · {} processed", task.progress.completed_files)
+                        .unwrap_or_else(|| {
+                            if task.state == OperationState::Preflight {
+                                operation_status_text(app.language, task.state).to_owned()
+                            } else if task.state == OperationState::Running
+                                && task.progress.processed_bytes > 0
+                                && matches!(
+                                    task.kind,
+                                    FileOperationKind::Copy | FileOperationKind::Move
+                                )
+                            {
+                                Texts::new(app.language)
+                                    .operation_copying_files(task.progress.completed_files)
+                            } else if task.state == OperationState::Running {
+                                Texts::new(app.language)
+                                    .operation_total_pending()
+                                    .to_owned()
+                            } else {
+                                status.to_owned()
                             }
                         })
                 }
@@ -21725,8 +21849,19 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
     rows
 }
 
-fn operation_has_visible_row(state: OperationState) -> bool {
-    !matches!(state, OperationState::Completed | OperationState::Cancelled)
+fn operation_task_has_visible_row(task: &crate::domain::file_operations::OperationTask) -> bool {
+    if task.recovered_cleanup {
+        return matches!(
+            task.state,
+            OperationState::Failed
+                | OperationState::PartiallyCompleted
+                | OperationState::WaitingConflict
+        );
+    }
+    !matches!(
+        task.state,
+        OperationState::Completed | OperationState::Cancelled
+    ) || is_cleanup_completion_receipt(task)
 }
 
 fn is_cleanup_completion_receipt(task: &crate::domain::file_operations::OperationTask) -> bool {
@@ -21771,12 +21906,6 @@ fn operation_status_text(language: Language, state: OperationState) -> &'static 
     }
 }
 
-fn preparing_text(language: Language) -> &'static str {
-    match language {
-        Language::Chinese => "正在准备",
-        Language::English => "Preparing",
-    }
-}
 fn estimating_text(language: Language) -> &'static str {
     match language {
         Language::Chinese => "正在估算",
@@ -23737,6 +23866,9 @@ fn initial_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new("C:\\").to_path_buf())
 }
+
+#[cfg(test)]
+mod issue_139_tests;
 
 #[cfg(test)]
 mod tests {
@@ -27209,6 +27341,81 @@ mod tests {
     }
 
     #[test]
+    fn issue_135_fast_failures_notify_once_and_new_execution_can_notify_again() {
+        for terminal_state in [OperationState::Failed, OperationState::PartiallyCompleted] {
+            let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
+            let id = app.operations.submit(
+                OperationResource::Network,
+                FileOperationKind::Copy,
+                None,
+                vec![OperationItem::pending(
+                    Some(PathBuf::from(r"\\server\share\file")),
+                    Some(PathBuf::from("C:/test/file")),
+                )],
+            );
+            let mut shown = HashSet::new();
+            assert!(pending_operation_window_notifications(&app, &mut shown).is_empty());
+            app.operations
+                .start_next(OperationResource::Network)
+                .unwrap();
+            app.operations.mark_running(id).unwrap();
+            assert!(pending_operation_window_notifications(&app, &mut shown).is_empty());
+            app.operations.task_mut(id).unwrap().state = terminal_state;
+
+            let pending = pending_operation_window_notifications(&app, &mut shown);
+            assert_eq!(pending.len(), 1);
+            shown.extend(pending);
+            assert!(pending_operation_window_notifications(&app, &mut shown).is_empty());
+
+            // A retry can fail between timer ticks, so the execution round must distinguish it.
+            app.operations.task_mut(id).unwrap().execution_round += 1;
+            let pending = pending_operation_window_notifications(&app, &mut shown);
+            assert_eq!(pending.len(), 1);
+            assert!(shown.is_empty());
+            shown.extend(pending);
+            assert!(pending_operation_window_notifications(&app, &mut shown).is_empty());
+        }
+    }
+
+    #[test]
+    fn issue_135_failure_after_dismissed_progress_notifies_but_success_does_not() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
+        let id = app.operations.submit(
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![OperationItem::pending(
+                Some(PathBuf::from("C:/test/a")),
+                Some(PathBuf::from("C:/test/b")),
+            )],
+        );
+        app.operations.start_next(OperationResource::Local).unwrap();
+        app.operations.mark_running(id).unwrap();
+        let task = app.operations.task_mut(id).unwrap();
+        task.started_at = Instant::now() - Duration::from_secs(1);
+        let mut shown = HashSet::new();
+        shown.extend(pending_operation_window_notifications(
+            &app,
+            &mut HashSet::new(),
+        ));
+        assert!(pending_operation_window_notifications(&app, &mut shown).is_empty());
+
+        app.operations.task_mut(id).unwrap().state = OperationState::Failed;
+        let pending = pending_operation_window_notifications(&app, &mut shown);
+        assert_eq!(pending.len(), 1);
+        shown.extend(pending);
+        assert!(pending_operation_window_notifications(&app, &mut shown).is_empty());
+
+        for state in [OperationState::Completed, OperationState::Cancelled] {
+            app.operations.task_mut(id).unwrap().state = state;
+            assert!(pending_operation_window_notifications(&app, &mut HashSet::new()).is_empty());
+        }
+        let task = app.operations.task_mut(id).unwrap();
+        task.kind = FileOperationKind::PermanentDelete;
+        task.state = OperationState::Failed;
+        assert!(pending_operation_window_notifications(&app, &mut HashSet::new()).is_empty());
+    }
+    #[test]
     fn operation_window_waits_until_conflict_is_resolved_and_runtime_reaches_threshold() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
         let id = app.operations.submit(
@@ -27238,7 +27445,7 @@ mod tests {
             })
             .unwrap();
         }
-        assert!(!should_auto_open_operation_window(&app));
+        assert!(operation_window_notifications(&app).is_empty());
 
         app.operations
             .task_mut(id)
@@ -27248,7 +27455,7 @@ mod tests {
                 apply_to_all: false,
             })
             .unwrap();
-        assert!(should_auto_open_operation_window(&app));
+        assert!(!operation_window_notifications(&app).is_empty());
     }
 
     #[test]
@@ -27274,7 +27481,7 @@ mod tests {
             task.started_at = Instant::now() - Duration::from_secs(5);
             task.set_permanent_delete_stage(stage);
 
-            assert!(!should_auto_open_operation_window(&app));
+            assert!(operation_window_notifications(&app).is_empty());
             assert_eq!(operation_rows(&app).len(), 1);
         }
     }
@@ -27316,7 +27523,7 @@ mod tests {
         app.operations.task_mut(copy_id).unwrap().started_at =
             Instant::now() - Duration::from_secs(5);
 
-        assert!(should_auto_open_operation_window(&app));
+        assert!(!operation_window_notifications(&app).is_empty());
         assert_eq!(operation_rows(&app).len(), 2);
     }
     #[test]
@@ -27563,7 +27770,7 @@ mod tests {
         )));
     }
     #[test]
-    fn issue_76_auto_opened_operation_window_closes_only_after_successful_rows_are_cleared() {
+    fn issue_76_operation_window_closes_only_after_successful_rows_are_cleared() {
         for (kind, item_count) in [
             (FileOperationKind::RecycleDelete, 1),
             (FileOperationKind::RecycleDelete, 3),
@@ -27585,7 +27792,7 @@ mod tests {
             app.operations.start_next(OperationResource::Local).unwrap();
             app.operations.mark_running(id).unwrap();
 
-            assert!(!should_close_auto_opened_operation_window(true, &app));
+            assert!(!should_close_operation_window(&app));
 
             app.operations
                 .finish(
@@ -27601,8 +27808,7 @@ mod tests {
                 .unwrap();
             assert!(operation_rows(&app).is_empty());
             assert_eq!(app.operations.prune_transient(Duration::ZERO), 1);
-            assert!(should_close_auto_opened_operation_window(true, &app));
-            assert!(!should_close_auto_opened_operation_window(false, &app));
+            assert!(should_close_operation_window(&app));
         }
     }
 
@@ -27636,7 +27842,7 @@ mod tests {
     }
 
     #[test]
-    fn issue_76_auto_opened_operation_window_keeps_active_and_attention_rows() {
+    fn issue_76_operation_window_keeps_active_and_attention_rows() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
         let id = app.operations.submit(
             OperationResource::Local,
@@ -27647,10 +27853,10 @@ mod tests {
                 None,
             )],
         );
-        assert!(!should_close_auto_opened_operation_window(true, &app));
+        assert!(!should_close_operation_window(&app));
         app.operations.start_next(OperationResource::Local).unwrap();
         app.operations.mark_running(id).unwrap();
-        assert!(!should_close_auto_opened_operation_window(true, &app));
+        assert!(!should_close_operation_window(&app));
         app.operations.task_mut(id).unwrap().items[0].state = ItemState::Failed;
         app.operations
             .finish(
@@ -27667,7 +27873,7 @@ mod tests {
 
         assert_eq!(app.operations.prune_transient(Duration::ZERO), 0);
         assert!(!operation_rows(&app).is_empty());
-        assert!(!should_close_auto_opened_operation_window(true, &app));
+        assert!(!should_close_operation_window(&app));
     }
 
     #[test]
@@ -27751,6 +27957,226 @@ mod tests {
         let english = operation_rows(&app);
         assert_eq!(english[0].status.as_str(), "Running");
         assert_eq!(english[1].queue.as_str(), "Queue position 1");
+    }
+
+    #[test]
+    fn issue_136_pause_ack_refreshes_only_when_displayed_state_changes() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
+        let id = app.operations.submit(
+            OperationResource::Network,
+            FileOperationKind::Copy,
+            None,
+            vec![OperationItem::pending(
+                Some(PathBuf::from("a")),
+                Some(PathBuf::from("b")),
+            )],
+        );
+        app.operations
+            .start_next(OperationResource::Network)
+            .unwrap();
+        app.operations.mark_running(id).unwrap();
+        assert!(!operation_pause_ack_changed(
+            &app,
+            [(id, false)].into_iter()
+        ));
+
+        app.operations.set_paused(id, true).unwrap();
+        assert!(!operation_pause_ack_changed(&app, [(id, true)].into_iter()));
+        app.operations
+            .task(id)
+            .unwrap()
+            .cancellation
+            .acknowledge_pause();
+        assert!(operation_pause_ack_changed(&app, [(id, true)].into_iter()));
+        assert!(!operation_pause_ack_changed(
+            &app,
+            [(id, false)].into_iter()
+        ));
+        assert!(!operation_pause_ack_changed(&app, [].into_iter()));
+
+        app.operations.set_paused(id, false).unwrap();
+        assert!(!operation_pause_ack_changed(
+            &app,
+            [(id, false)].into_iter()
+        ));
+    }
+
+    #[test]
+    fn issue_136_copy_projection_reports_transfer_before_total_and_pause_ack() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
+        let id = app.operations.submit(
+            OperationResource::Network,
+            FileOperationKind::Copy,
+            None,
+            vec![OperationItem::pending(
+                Some(PathBuf::from("a")),
+                Some(PathBuf::from("b")),
+            )],
+        );
+        app.operations
+            .start_next(OperationResource::Network)
+            .unwrap();
+        let preparing = operation_rows(&app);
+        assert_eq!(preparing[0].file_progress.as_str(), "正在准备");
+        app.operations.mark_running(id).unwrap();
+        let task = app.operations.task_mut(id).unwrap();
+        task.progress.processed_bytes = 2 * 1_048_576;
+        task.progress.recent_speed_bps = Some(1_048_576);
+        let row = operation_rows(&app).remove(0);
+        assert!(!row.progress_known);
+        assert_eq!(row.transferred.as_str(), "已复制 2.0 MB");
+        assert_eq!(row.speed.as_str(), "1.0 MB/s");
+        assert_eq!(row.eta.as_str(), "总大小统计中");
+        assert_eq!(row.file_progress.as_str(), "正在复制 · 已完成 0 个文件");
+
+        app.language = Language::English;
+        let row = operation_rows(&app).remove(0);
+        assert_eq!(row.transferred.as_str(), "2.0 MB copied");
+        assert_eq!(row.eta.as_str(), "Calculating total size");
+        assert_eq!(row.file_progress.as_str(), "Copying · 0 files completed");
+
+        app.language = Language::Chinese;
+        let task = app.operations.task_mut(id).unwrap();
+        task.state = OperationState::Paused;
+        task.cancellation.pause();
+        let row = operation_rows(&app).remove(0);
+        assert!(row.pause_pending);
+        assert_eq!(row.status.as_str(), "正在暂停");
+        assert_eq!(row.speed.as_str(), "正在暂停");
+        app.operations
+            .task(id)
+            .unwrap()
+            .cancellation
+            .acknowledge_pause();
+        let row = operation_rows(&app).remove(0);
+        assert!(!row.pause_pending);
+        assert_eq!(row.status.as_str(), "已暂停");
+        assert_eq!(row.speed.as_str(), "已暂停");
+
+        let task = app.operations.task_mut(id).unwrap();
+        task.state = OperationState::Running;
+        task.cancellation.resume();
+        task.progress.scanning_complete = true;
+        task.progress.total_bytes = Some(10 * 1_048_576);
+        task.progress.total_files = Some(3);
+        let row = operation_rows(&app).remove(0);
+        assert!(row.progress_known);
+        assert_eq!(row.percent.as_str(), "20%");
+        assert_eq!(row.speed.as_str(), "1.0 MB/s");
+        assert_eq!(row.eta.as_str(), "预计剩余 8 秒");
+        assert_eq!(row.file_progress.as_str(), "0 / 3");
+    }
+
+    #[test]
+    fn issue_137_network_wait_projection_preserves_pause_priority() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
+        let id = app.operations.submit(
+            OperationResource::Network,
+            FileOperationKind::Copy,
+            None,
+            vec![OperationItem::pending(
+                Some("source".into()),
+                Some("target".into()),
+            )],
+        );
+        app.operations
+            .start_next(OperationResource::Network)
+            .unwrap();
+        app.operations.mark_running(id).unwrap();
+        app.operations
+            .task_mut(id)
+            .unwrap()
+            .progress
+            .recent_speed_bps = Some(0);
+        let row = operation_rows(&app).remove(0);
+        assert_eq!(row.status.as_str(), "等待网络响应");
+        assert_eq!(row.speed.as_str(), "等待网络响应");
+        assert_eq!(row.eta.as_str(), "—");
+        app.language = Language::English;
+        assert_eq!(
+            operation_rows(&app)[0].status.as_str(),
+            "Waiting for network response"
+        );
+        app.language = Language::Chinese;
+        app.operations.set_paused(id, true).unwrap();
+        assert_eq!(operation_rows(&app)[0].status.as_str(), "正在暂停");
+        app.operations
+            .task(id)
+            .unwrap()
+            .cancellation
+            .acknowledge_pause();
+        assert_eq!(operation_rows(&app)[0].status.as_str(), "已暂停");
+        app.operations.set_paused(id, false).unwrap();
+        let task = app.operations.task_mut(id).unwrap();
+        task.progress.recent_speed_bps = Some(0);
+        task.resource = OperationResource::Local;
+        assert_ne!(operation_rows(&app)[0].status.as_str(), "等待网络响应");
+    }
+
+    #[test]
+    fn issue_137_recovery_projection_preserves_pause_priority() {
+        let mut app = AppState::new_for_test(vec![PathBuf::from("C:/test")], 0, [0, 1, 2, 3]);
+        let id = app.operations.submit(
+            OperationResource::Network,
+            FileOperationKind::Copy,
+            None,
+            vec![OperationItem::pending(
+                Some("source".into()),
+                Some("target".into()),
+            )],
+        );
+        app.operations
+            .start_next(OperationResource::Network)
+            .unwrap();
+        app.operations.mark_running(id).unwrap();
+        let task = app.operations.task_mut(id).unwrap();
+        task.progress.processed_bytes = 4_096;
+        task.progress.total_bytes = Some(8_192);
+        task.progress.total_files = Some(1);
+        task.progress.scanning_complete = true;
+        task.progress.recent_speed_bps = Some(0);
+        task.progress.copy_recovering = true;
+        let row = operation_rows(&app).remove(0);
+        assert_eq!(row.status.as_str(), "正在自动恢复");
+        assert_eq!(row.speed.as_str(), "正在自动恢复");
+        assert_eq!(row.eta.as_str(), "—");
+        assert_eq!(row.percent.as_str(), "50%");
+        assert_eq!(
+            app.operations.task(id).unwrap().progress.processed_bytes,
+            4_096
+        );
+        app.language = Language::English;
+        assert_eq!(
+            operation_rows(&app)[0].status.as_str(),
+            "Automatically recovering"
+        );
+        app.language = Language::Chinese;
+        app.operations.set_paused(id, true).unwrap();
+        let row = operation_rows(&app).remove(0);
+        assert_eq!(row.status.as_str(), "正在暂停");
+        assert_eq!(row.speed.as_str(), "正在暂停");
+        app.operations
+            .task(id)
+            .unwrap()
+            .cancellation
+            .acknowledge_pause();
+        let row = operation_rows(&app).remove(0);
+        assert_eq!(row.status.as_str(), "已暂停");
+        assert_eq!(row.speed.as_str(), "已暂停");
+        app.operations.set_paused(id, false).unwrap();
+        assert_eq!(operation_rows(&app)[0].status.as_str(), "正在自动恢复");
+        let task = app.operations.task_mut(id).unwrap();
+        task.progress.copy_recovering = false;
+        task.progress.recent_speed_bps = Some(0);
+        assert_eq!(operation_rows(&app)[0].status.as_str(), "等待网络响应");
+        let task = app.operations.task_mut(id).unwrap();
+        task.progress.copy_recovering = true;
+        task.state = OperationState::Completed;
+        assert!(operation_rows(&app).is_empty());
+        let task = app.operations.task_mut(id).unwrap();
+        task.state = OperationState::Running;
+        task.resource = OperationResource::Local;
+        assert_ne!(operation_rows(&app)[0].status.as_str(), "正在自动恢复");
     }
 
     #[test]

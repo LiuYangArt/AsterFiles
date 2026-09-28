@@ -352,6 +352,52 @@ impl Texts {
         }
     }
 
+    pub fn operation_pausing(self) -> &'static str {
+        self.choose("正在暂停", "Pausing")
+    }
+
+    pub fn operation_recovering_copy(self) -> &'static str {
+        self.choose("正在自动恢复", "Automatically recovering")
+    }
+
+    pub fn operation_waiting_network(self) -> &'static str {
+        self.choose("等待网络响应", "Waiting for network response")
+    }
+
+    pub fn operation_total_pending(self) -> &'static str {
+        self.choose("总大小统计中", "Calculating total size")
+    }
+
+    pub fn operation_copied(self, bytes: u64) -> String {
+        let size = format!("{:.1} MB", bytes as f64 / 1_048_576.0);
+        match self.language {
+            Language::Chinese => format!("已复制 {size}"),
+            Language::English => format!("{size} copied"),
+        }
+    }
+
+    pub fn operation_copying_files(self, files: usize) -> String {
+        match self.language {
+            Language::Chinese => format!("正在复制 · 已完成 {files} 个文件"),
+            Language::English => format!("Copying · {files} files completed"),
+        }
+    }
+
+    pub fn operation_processed_bytes(self, bytes: u64, total: Option<u64>) -> String {
+        let size = match total {
+            Some(total) => format!(
+                "{:.1} / {:.1} MB",
+                bytes as f64 / 1_048_576.0,
+                total as f64 / 1_048_576.0
+            ),
+            None => format!("{:.1} MB", bytes as f64 / 1_048_576.0),
+        };
+        match self.language {
+            Language::Chinese => format!("已处理 {size}"),
+            Language::English => format!("Processed {size}"),
+        }
+    }
+
     pub fn recycle_preparing(self, prepared: usize, total: usize) -> String {
         match self.language {
             Language::Chinese => format!("正在准备 · {prepared} / {total} 个所选项目"),

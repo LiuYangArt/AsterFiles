@@ -25,6 +25,8 @@ use windows::{
 
 #[cfg(windows)]
 use crate::domain::{EntryId, EntryKind, FileEntry, FileVisibility, FolderSizeState};
+#[cfg(windows)]
+use crate::fs::file_operations::FileProgressKind;
 
 pub fn record_runtime_event(event: &str) {
     record_runtime_detail(event);
@@ -919,8 +921,11 @@ pub fn isolated_network_file_operation(
         &Path,
     ) -> crate::domain::file_operations::ConflictAction,
     discovered: &mut dyn FnMut(u64, &Path),
-    progress: &mut dyn FnMut(u64, bool, &Path),
+    progress: &mut dyn FnMut(u64, FileProgressKind, &Path),
+    scan: &mut dyn FnMut(usize, u64, bool),
+    recovering: &mut dyn FnMut(bool),
 ) -> io::Result<IsolatedNetworkOperationReport> {
+    recovering(false);
     let stamp = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -931,105 +936,224 @@ pub fn isolated_network_file_operation(
     ));
     let input = base.with_extension("in");
     let output = base.with_extension("out");
+    let completed = base.with_extension("complete");
     let event = base.with_extension("event");
     let response = base.with_extension("response");
+    let diagnostic = base.with_extension("stderr");
+    let control = base.with_extension("control");
+    let acknowledgement = base.with_extension("ack");
+    let scan_path = base.with_extension("scan");
+    let progress_path = base.with_extension("progress");
+    let temporary_copy = base.with_extension("temporary-copy");
     write_network_operation_input(&input, kind, source, destination)?;
     let result = (|| {
         use std::os::windows::process::CommandExt;
         let mut command = Command::new(std::env::current_exe()?);
         command
             .arg(CHILD_PREFIX)
-            .arg("network-operation")
+            .arg(if operation_probe::is_stall_probe() {
+                "network-operation-probe-stall"
+            } else {
+                "network-operation"
+            })
             .arg(&input)
             .arg(&output)
             .creation_flags(0x08000000)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::from(std::fs::File::create(&diagnostic)?));
         let mut child = command.spawn()?;
         let job = match KillOnCloseJob::create() {
             Ok(job) => job,
             Err(error) => {
                 let _ = child.kill();
-                let _ = child.wait();
+
                 return Err(error);
             }
         };
         if let Err(error) = job.assign(&child) {
             let _ = child.kill();
-            let _ = child.wait();
+
             return Err(error);
         }
-        let mut last_sequence = 0_u64;
-        let mut last_activity = std::time::Instant::now();
-        loop {
-            if let Some(status) = child.try_wait()? {
-                if !status.success() {
-                    return Err(io::Error::other(format!(
-                        "network operation helper exited with {status}"
-                    )));
+        let result = (|| {
+            let mut last_sequence = 0_u64;
+            let mut last_progress = NetworkOperationProgress::default();
+            let mut control_sequence = 0_u64;
+            let mut sent_control = 0_u8;
+            let mut last_scan = None;
+            let mut cancelling_since = None;
+            let mut last_rate_tick = std::time::Instant::now();
+            loop {
+                let desired_control = if cancel.is_cancelled() {
+                    2
+                } else {
+                    u8::from(cancel.is_paused())
+                };
+                if desired_control != sent_control {
+                    control_sequence += 1;
+                    let mut bytes = control_sequence.to_le_bytes().to_vec();
+                    bytes.push(desired_control);
+                    atomic_write(&control, &bytes)?;
+                    sent_control = desired_control;
+                    if desired_control == 2 {
+                        cancelling_since = Some(std::time::Instant::now());
+                    }
                 }
-                return read_network_operation_result(&output);
-            }
-            if cancel.is_cancelled() {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "network operation helper cancelled",
-                ));
-            }
-            if let Ok((sequence, helper_event)) = read_network_operation_event(&event)
-                && sequence > last_sequence
-            {
-                last_sequence = sequence;
-                last_activity = std::time::Instant::now();
-                match helper_event {
-                    NetworkOperationEvent::Discovered { bytes, path } => discovered(bytes, &path),
-                    NetworkOperationEvent::Progress {
-                        bytes,
-                        file_completed,
-                        path,
-                    } => progress(bytes, file_completed, &path),
+                if sent_control == 1
+                    && available_snapshot(read_snapshot(&acknowledgement))?
+                        .is_some_and(|bytes| bytes == control_sequence.to_le_bytes())
+                {
+                    cancel.acknowledge_pause();
+                }
+                if let Some(bytes) = available_snapshot(read_snapshot(&scan_path))?
+                    && bytes.len() == 17
+                    && last_scan.as_ref() != Some(&bytes)
+                {
+                    let files = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+                    let count = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                    scan(files, count, bytes[16] != 0);
+                    last_scan = Some(bytes);
+                }
+                if let Some(snapshot) =
+                    available_snapshot(read_network_operation_progress(&progress_path))?
+                    && snapshot != last_progress
+                {
+                    deliver_network_operation_progress(
+                        &snapshot,
+                        &last_progress,
+                        discovered,
+                        progress,
+                        recovering,
+                    );
+                    last_progress = snapshot;
+                }
+                if last_rate_tick.elapsed() >= Duration::from_secs(1) {
+                    let current = if last_progress.current_path.as_os_str().is_empty() {
+                        source
+                    } else {
+                        &last_progress.current_path
+                    };
+                    progress(0, FileProgressKind::Transferred, current);
+                    last_rate_tick = std::time::Instant::now();
+                }
+                if let Some((
+                    sequence,
                     NetworkOperationEvent::Conflict {
                         category,
                         source,
                         destination,
-                    } => {
-                        let action = resolve_conflict(category, &source, &destination);
-                        write_network_operation_response(&response, sequence, action)?;
-                    }
+                    },
+                )) = available_snapshot(read_network_operation_event(&event))?
+                    && sequence > last_sequence
+                {
+                    last_sequence = sequence;
+                    let action = resolve_conflict(category, &source, &destination);
+                    write_network_operation_response(&response, sequence, action)?;
                 }
+                let status = child.try_wait()?;
+                let result_ready = available_snapshot(read_snapshot(&completed))?
+                    .is_some_and(|bytes| bytes == [1]);
+                if status.is_some() || result_ready {
+                    if let Some(snapshot) =
+                        available_snapshot(read_network_operation_progress(&progress_path))?
+                    {
+                        deliver_network_operation_progress(
+                            &snapshot,
+                            &last_progress,
+                            discovered,
+                            progress,
+                            recovering,
+                        );
+                    }
+                    if let Some(bytes) = available_snapshot(read_snapshot(&scan_path))?
+                        && bytes.len() == 17
+                    {
+                        scan(
+                            u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize,
+                            u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+                            bytes[16] != 0,
+                        );
+                    }
+                    if cancel.is_cancelled() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "network operation helper cancelled",
+                        ));
+                    }
+                    if let Some(status) = status
+                        && !status.success()
+                        && !result_ready
+                    {
+                        let detail = std::fs::read_to_string(&diagnostic).unwrap_or_default();
+                        return Err(io::Error::other(format!(
+                            "network operation helper exited with {status}: {}\n{}",
+                            source.display(),
+                            detail.trim()
+                        )));
+                    }
+                    return read_network_operation_result(&output);
+                }
+                if cancelling_since
+                    .is_some_and(|started| started.elapsed() >= Duration::from_secs(1))
+                {
+                    let _ = child.kill();
+
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "network operation helper cancelled",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(20));
             }
-            if last_activity.elapsed() >= ISOLATED_TIMEOUT {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "network operation helper inactive for 10 seconds",
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        })();
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
         }
+        drop(job);
+        let cleanup =
+            temporary_copy::cleanup_registered(&temporary_copy, child.id(), result.is_ok());
+        if matches!(cleanup, Ok(true)) {
+            let _ = std::fs::remove_file(&temporary_copy);
+        }
+        if let Err(cleanup) = cleanup {
+            record_runtime_detail(&format!(
+                "temporary_copy_cleanup_failed code={:?}",
+                cleanup.raw_os_error()
+            ));
+            return Err(match result {
+                Err(error) => io::Error::new(error.kind(), format!("{error}; {cleanup}")),
+                Ok(_) => cleanup,
+            });
+        }
+        result
     })();
-    for path in [&input, &output, &event, &response] {
+    for path in [
+        &input,
+        &output,
+        &completed,
+        &event,
+        &response,
+        &diagnostic,
+        &control,
+        &acknowledgement,
+        &scan_path,
+        &progress_path,
+    ] {
         let _ = std::fs::remove_file(path);
     }
+    recovering(false);
     result
 }
 
 #[cfg(windows)]
+mod operation_probe;
+#[cfg(windows)]
+pub use operation_probe::try_run_operation_probe_from_args;
+
+#[cfg(windows)]
 #[derive(Debug)]
 enum NetworkOperationEvent {
-    Discovered {
-        bytes: u64,
-        path: PathBuf,
-    },
-    Progress {
-        bytes: u64,
-        file_completed: bool,
-        path: PathBuf,
-    },
     Conflict {
         category: crate::domain::file_operations::ConflictCategory,
         source: PathBuf,
@@ -1044,11 +1168,11 @@ pub use directory::isolated_directory;
 pub(crate) use directory::test_directory_stream_started;
 
 #[cfg(windows)]
-struct KillOnCloseJob(windows_sys::Win32::Foundation::HANDLE);
+pub(crate) struct KillOnCloseJob(windows_sys::Win32::Foundation::HANDLE);
 
 #[cfg(windows)]
 impl KillOnCloseJob {
-    fn create() -> io::Result<Self> {
+    pub(crate) fn create() -> io::Result<Self> {
         use windows_sys::Win32::System::JobObjects::{
             CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -1076,7 +1200,7 @@ impl KillOnCloseJob {
         Ok(Self(job))
     }
 
-    fn assign(&self, child: &std::process::Child) -> io::Result<()> {
+    pub(crate) fn assign(&self, child: &std::process::Child) -> io::Result<()> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
 
@@ -1225,13 +1349,19 @@ pub fn try_run_child_from_args() -> io::Result<bool> {
         write_file_mutation_result(&output, &result)?;
         return Ok(true);
     }
-    if mode == "network-operation" {
+    if mode == "network-operation" || mode == "network-operation-probe-stall" {
+        // This dedicated diagnostic mode models a source blocked before its first byte.
+        if mode == "network-operation-probe-stall" {
+            std::thread::sleep(Duration::from_secs(15));
+        }
         let (kind, source, destination) = read_network_operation_input(&input)?;
         let event = input.with_extension("event");
         let response = input.with_extension("response");
         let result =
-            execute_network_operation(kind, &source, destination.as_deref(), &event, &response)?;
+            execute_network_operation(kind, &source, destination.as_deref(), &event, &response);
         write_network_operation_result(&output, &result)?;
+        // A finished task can outlive its read-only SMB worker during kernel cleanup.
+        atomic_write(&output.with_extension("complete"), &[1])?;
         return Ok(true);
     }
     let result = if mode == "devices" {
@@ -1688,6 +1818,45 @@ fn read_network_operation_input(
 }
 
 #[cfg(windows)]
+fn network_operation_error(error: crate::fs::file_operations::OperationError) -> io::Error {
+    use crate::fs::file_operations::OperationError;
+    match error {
+        OperationError::Io {
+            path,
+            kind,
+            message,
+        } => io::Error::new(kind, format!("{}: {message}", path.display())),
+        OperationError::SourceInsideDestination => io::Error::other("SourceInsideDestination"),
+        OperationError::Cancelled => io::Error::from(io::ErrorKind::Interrupted),
+        OperationError::DestinationExists(path) => io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{}: {}",
+                path.display(),
+                io::Error::from(io::ErrorKind::AlreadyExists)
+            ),
+        ),
+        OperationError::ConflictSkipped(path) => io::Error::new(
+            io::ErrorKind::Interrupted,
+            format!(
+                "{}: {}",
+                path.display(),
+                io::Error::from(io::ErrorKind::Interrupted)
+            ),
+        ),
+        OperationError::InvalidName(_) => io::Error::from(io::ErrorKind::InvalidInput),
+        OperationError::DestinationCommittedSourceRetained {
+            source,
+            destination,
+            message,
+        } => io::Error::other(format!(
+            "{} → {}: {message}",
+            source.display(),
+            destination.display()
+        )),
+    }
+}
+#[cfg(windows)]
 fn execute_network_operation(
     kind: IsolatedNetworkOperationKind,
     source: &Path,
@@ -1697,118 +1866,450 @@ fn execute_network_operation(
 ) -> io::Result<IsolatedNetworkOperationReport> {
     use crate::domain::file_operations::{CancellationToken, ConflictAction};
 
+    let _temporary_registration =
+        temporary_copy::Registration::new(event_path.with_extension("temporary-copy"));
     let cancel = CancellationToken::new();
-    let sequence = std::cell::Cell::new(0_u64);
-    let mut conflict = |category, source: &Path, destination: &Path| {
-        sequence.set(sequence.get().saturating_add(1));
-        let _ = write_network_operation_event(
-            event_path,
-            sequence.get(),
-            &NetworkOperationEvent::Conflict {
-                category,
-                source: source.to_path_buf(),
-                destination: destination.to_path_buf(),
-            },
-        );
-        let started = std::time::Instant::now();
-        loop {
-            if let Ok((response_sequence, action)) = read_network_operation_response(response_path)
-                && response_sequence == sequence.get()
-            {
-                return action;
+    let scan = crate::fs::file_operations::CopyScanProgress::default();
+    let shared_progress =
+        std::sync::Arc::new(std::sync::Mutex::new(NetworkOperationProgress::default()));
+    let copy_progress_registration = CopyProgressRegistration::new(shared_progress.clone());
+    let mut monitor = NetworkOperationMonitor::start(
+        event_path,
+        cancel.clone(),
+        scan.clone(),
+        shared_progress.clone(),
+    );
+    let ipc_error = monitor.error.clone();
+    let operation = (|| {
+        let sequence = std::cell::Cell::new(0_u64);
+        let mut conflict = |category, source: &Path, destination: &Path| {
+            sequence.set(sequence.get().saturating_add(1));
+            if let Err(error) = write_network_operation_event(
+                event_path,
+                sequence.get(),
+                &NetworkOperationEvent::Conflict {
+                    category,
+                    source: source.to_path_buf(),
+                    destination: destination.to_path_buf(),
+                },
+            ) {
+                ipc_error
+                    .lock()
+                    .expect("IPC error lock")
+                    .get_or_insert(error);
+                cancel.cancel();
             }
-            if started.elapsed() >= ISOLATED_TIMEOUT {
-                return ConflictAction::Skip;
+            loop {
+                match available_snapshot(read_network_operation_response(response_path)) {
+                    Ok(Some((response_sequence, action)))
+                        if response_sequence == sequence.get() =>
+                    {
+                        return action;
+                    }
+                    Err(error) => {
+                        ipc_error
+                            .lock()
+                            .expect("IPC error lock")
+                            .get_or_insert(error);
+                        cancel.cancel();
+                    }
+                    _ => {}
+                }
+                if cancel.is_cancelled() {
+                    return ConflictAction::Skip;
+                }
+                std::thread::sleep(Duration::from_millis(20));
             }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    };
-    let mut discovered = |bytes, path: &Path| {
-        sequence.set(sequence.get().saturating_add(1));
-        let _ = write_network_operation_event(
-            event_path,
-            sequence.get(),
-            &NetworkOperationEvent::Discovered {
-                bytes,
-                path: path.to_path_buf(),
-            },
-        );
-    };
-    let mut progress = |bytes, file_completed, path: &Path| {
-        sequence.set(sequence.get().saturating_add(1));
-        let _ = write_network_operation_event(
-            event_path,
-            sequence.get(),
-            &NetworkOperationEvent::Progress {
-                bytes,
-                file_completed,
-                path: path.to_path_buf(),
-            },
-        );
-    };
+        };
+        let mut discovered = |bytes, path: &Path| {
+            let mut snapshot = shared_progress.lock().expect("operation progress lock");
+            snapshot.discovered_files += 1;
+            snapshot.discovered_bytes += bytes;
+            snapshot.discovered_path = path.to_path_buf();
+        };
+        let mut progress = |bytes, kind, path: &Path| {
+            let mut snapshot = shared_progress.lock().expect("operation progress lock");
+            match kind {
+                FileProgressKind::Transferred => snapshot.transferred_bytes += bytes,
+                FileProgressKind::Completed => {
+                    snapshot.transferred_bytes += bytes;
+                    snapshot.completed_files += 1;
+                }
+                FileProgressKind::Skipped => {
+                    snapshot.skipped_bytes += bytes;
+                    snapshot.skipped_files += 1;
+                }
+            }
+            snapshot.current_path = path.to_path_buf();
+        };
 
-    let report = match kind {
-        IsolatedNetworkOperationKind::Copy => {
-            let destination = destination.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing copy destination")
-            })?;
-            crate::fs::file_operations::copy_path_with_progress(
-                source,
-                destination,
-                &cancel,
-                &mut conflict,
-                &mut discovered,
-                &mut progress,
-                &mut |_| {},
-            )
-            .map_err(|error| io::Error::other(format!("{error:?}")))?
-        }
-        IsolatedNetworkOperationKind::Move => {
-            let destination = destination.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing move destination")
-            })?;
-            crate::fs::file_operations::move_path_with_progress(
-                source,
-                destination,
-                &cancel,
-                &mut conflict,
-                &mut discovered,
-                &mut progress,
-            )
-            .map_err(|error| io::Error::other(format!("{error:?}")))?
-        }
-        IsolatedNetworkOperationKind::PermanentDelete => {
-            crate::fs::file_operations::permanently_delete(source, &cancel)
-                .map_err(|error| io::Error::other(format!("{error:?}")))?
-        }
-        IsolatedNetworkOperationKind::Recycle => {
-            let result =
-                crate::platform::windows::file_operation::recycle(&[source.to_path_buf()], || {
-                    false
-                });
-            if let Some(error) = result.items.into_iter().find_map(|item| item.result.err()) {
-                return Err(io::Error::other(error));
+        let report = match kind {
+            IsolatedNetworkOperationKind::Copy => {
+                let destination = destination.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "missing copy destination")
+                })?;
+                crate::fs::file_operations::copy_path_with_progress(
+                    source,
+                    destination,
+                    &cancel,
+                    &mut conflict,
+                    &mut discovered,
+                    &mut progress,
+                    &mut |_| {},
+                    &scan,
+                )
+                .map_err(network_operation_error)?
             }
-            return Ok(IsolatedNetworkOperationReport {
-                files: 0,
-                directories: 0,
-                bytes: 0,
-                skipped: Vec::new(),
-                affected_directories: source.parent().map(Path::to_path_buf).into_iter().collect(),
-                completed_paths: vec![source.to_path_buf()],
-                aborted: result.aborted,
-            });
+            IsolatedNetworkOperationKind::Move => {
+                let destination = destination.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "missing move destination")
+                })?;
+                crate::fs::file_operations::move_path_with_progress(
+                    source,
+                    destination,
+                    &cancel,
+                    &mut conflict,
+                    &mut discovered,
+                    &mut progress,
+                )
+                .map_err(network_operation_error)?
+            }
+            IsolatedNetworkOperationKind::PermanentDelete => {
+                crate::fs::file_operations::permanently_delete(source, &cancel)
+                    .map_err(network_operation_error)?
+            }
+            IsolatedNetworkOperationKind::Recycle => {
+                let result = crate::platform::windows::file_operation::recycle(
+                    &[source.to_path_buf()],
+                    || false,
+                );
+                if let Some(error) = result.items.into_iter().find_map(|item| item.result.err()) {
+                    return Err(io::Error::other(error));
+                }
+                return Ok(IsolatedNetworkOperationReport {
+                    files: 0,
+                    directories: 0,
+                    bytes: 0,
+                    skipped: Vec::new(),
+                    affected_directories: source
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .into_iter()
+                        .collect(),
+                    completed_paths: vec![source.to_path_buf()],
+                    aborted: result.aborted,
+                });
+            }
+        };
+        Ok(IsolatedNetworkOperationReport {
+            files: report.files,
+            directories: report.directories,
+            bytes: report.bytes,
+            skipped: report.skipped,
+            affected_directories: report.affected_directories,
+            completed_paths: report.completed_paths,
+            aborted: false,
+        })
+    })();
+    drop(copy_progress_registration);
+    monitor.finish();
+    if let Some(error) = monitor.error.lock().expect("IPC error lock").take() {
+        return Err(error);
+    }
+    operation
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct NetworkOperationProgress {
+    discovered_files: u64,
+    discovered_bytes: u64,
+    transferred_bytes: u64,
+    completed_files: u64,
+    skipped_files: u64,
+    skipped_bytes: u64,
+    recovering: bool,
+    discovered_path: PathBuf,
+    current_path: PathBuf,
+}
+
+#[cfg(windows)]
+thread_local! {
+    static COPY_PROGRESS: std::cell::RefCell<Option<std::sync::Arc<std::sync::Mutex<NetworkOperationProgress>>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(windows)]
+struct CopyProgressRegistration(Option<std::sync::Arc<std::sync::Mutex<NetworkOperationProgress>>>);
+
+#[cfg(windows)]
+impl CopyProgressRegistration {
+    fn new(progress: std::sync::Arc<std::sync::Mutex<NetworkOperationProgress>>) -> Self {
+        Self(COPY_PROGRESS.with(|slot| slot.replace(Some(progress))))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CopyProgressRegistration {
+    fn drop(&mut self) {
+        set_copy_recovering(false);
+        COPY_PROGRESS.with(|slot| slot.replace(self.0.take()));
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn set_copy_recovering(recovering: bool) {
+    COPY_PROGRESS.with(|slot| {
+        if let Some(progress) = slot.borrow().as_ref() {
+            progress.lock().expect("operation progress lock").recovering = recovering;
         }
+    });
+}
+
+#[cfg(windows)]
+fn write_network_operation_progress(
+    path: &Path,
+    snapshot: &NetworkOperationProgress,
+) -> io::Result<()> {
+    let mut bytes = Vec::new();
+    for value in [
+        snapshot.discovered_files,
+        snapshot.discovered_bytes,
+        snapshot.transferred_bytes,
+        snapshot.completed_files,
+        snapshot.skipped_files,
+        snapshot.skipped_bytes,
+    ] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes.push(u8::from(snapshot.recovering));
+    for path in [&snapshot.discovered_path, &snapshot.current_path] {
+        write_units(
+            &mut bytes,
+            &path.as_os_str().encode_wide().collect::<Vec<_>>(),
+        )?;
+    }
+    atomic_write(path, &bytes)
+}
+
+#[cfg(windows)]
+fn read_network_operation_progress(path: &Path) -> io::Result<NetworkOperationProgress> {
+    let bytes = read_snapshot(path)?;
+    let mut offset = 0;
+    let snapshot = NetworkOperationProgress {
+        discovered_files: read_u64(&bytes, &mut offset)?,
+        discovered_bytes: read_u64(&bytes, &mut offset)?,
+        transferred_bytes: read_u64(&bytes, &mut offset)?,
+        completed_files: read_u64(&bytes, &mut offset)?,
+        skipped_files: read_u64(&bytes, &mut offset)?,
+        skipped_bytes: read_u64(&bytes, &mut offset)?,
+        recovering: match read_byte(&bytes, &mut offset)? {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid copy recovery state",
+                ));
+            }
+        },
+        discovered_path: PathBuf::from(OsString::from_wide(&read_units_at(&bytes, &mut offset)?)),
+        current_path: PathBuf::from(OsString::from_wide(&read_units_at(&bytes, &mut offset)?)),
     };
-    Ok(IsolatedNetworkOperationReport {
-        files: report.files,
-        directories: report.directories,
-        bytes: report.bytes,
-        skipped: report.skipped,
-        affected_directories: report.affected_directories,
-        completed_paths: report.completed_paths,
-        aborted: false,
-    })
+    if offset != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing operation progress data",
+        ));
+    }
+    Ok(snapshot)
+}
+
+#[cfg(windows)]
+fn deliver_network_operation_progress(
+    snapshot: &NetworkOperationProgress,
+    previous: &NetworkOperationProgress,
+    discovered: &mut dyn FnMut(u64, &Path),
+    progress: &mut dyn FnMut(u64, FileProgressKind, &Path),
+    recovering: &mut dyn FnMut(bool),
+) {
+    if snapshot.recovering != previous.recovering {
+        recovering(snapshot.recovering);
+    }
+    let files = snapshot
+        .discovered_files
+        .saturating_sub(previous.discovered_files);
+    for index in 0..files {
+        discovered(
+            if index == 0 {
+                snapshot
+                    .discovered_bytes
+                    .saturating_sub(previous.discovered_bytes)
+            } else {
+                0
+            },
+            &snapshot.discovered_path,
+        );
+    }
+    let transferred = snapshot
+        .transferred_bytes
+        .saturating_sub(previous.transferred_bytes);
+    if transferred > 0 {
+        progress(
+            transferred,
+            FileProgressKind::Transferred,
+            &snapshot.current_path,
+        );
+    }
+    for _ in previous.completed_files..snapshot.completed_files {
+        progress(0, FileProgressKind::Completed, &snapshot.current_path);
+    }
+    for index in previous.skipped_files..snapshot.skipped_files {
+        progress(
+            if index == previous.skipped_files {
+                snapshot
+                    .skipped_bytes
+                    .saturating_sub(previous.skipped_bytes)
+            } else {
+                0
+            },
+            FileProgressKind::Skipped,
+            &snapshot.current_path,
+        );
+    }
+}
+
+// The monitor stays independent of CopyFile2 so control reaches a blocked transfer.
+#[cfg(windows)]
+struct NetworkOperationMonitor {
+    stop: std::sync::Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    error: std::sync::Arc<std::sync::Mutex<Option<io::Error>>>,
+}
+
+#[cfg(windows)]
+impl NetworkOperationMonitor {
+    fn start(
+        event_path: &Path,
+        cancel: crate::domain::file_operations::CancellationToken,
+        scan: crate::fs::file_operations::CopyScanProgress,
+        progress: std::sync::Arc<std::sync::Mutex<NetworkOperationProgress>>,
+    ) -> Self {
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let error = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let worker_error = error.clone();
+        let control = event_path.with_extension("control");
+        let acknowledgement = event_path.with_extension("ack");
+        let scan_path = event_path.with_extension("scan");
+        let progress_path = event_path.with_extension("progress");
+        let thread = std::thread::spawn(move || {
+            let mut sequence = 0;
+            let mut acknowledged = 0;
+            let mut last_scan = Vec::new();
+            let mut last_progress = NetworkOperationProgress::default();
+            let mut last_written = std::time::Instant::now();
+            loop {
+                let control_bytes = match available_snapshot(read_snapshot(&control)) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        worker_error
+                            .lock()
+                            .expect("IPC error lock")
+                            .get_or_insert(error);
+                        cancel.cancel();
+                        break;
+                    }
+                };
+                if let Some(bytes) = control_bytes
+                    && bytes.len() == 9
+                {
+                    let next = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+                    if next > sequence {
+                        sequence = next;
+                        match bytes[8] {
+                            0 => cancel.resume(),
+                            1 => cancel.pause(),
+                            2 => cancel.cancel(),
+                            _ => cancel.cancel(),
+                        }
+                    }
+                }
+                let snapshot = scan.snapshot();
+                let mut bytes = (snapshot.files as u64).to_le_bytes().to_vec();
+                bytes.extend_from_slice(&snapshot.bytes.to_le_bytes());
+                bytes.push(u8::from(snapshot.complete));
+                if bytes != last_scan {
+                    if let Err(error) = atomic_write(&scan_path, &bytes) {
+                        worker_error
+                            .lock()
+                            .expect("IPC error lock")
+                            .get_or_insert(error);
+                        cancel.cancel();
+                        break;
+                    }
+                    last_scan = bytes;
+                }
+                let stopping = worker_stop.load(Ordering::Acquire);
+                let snapshot = progress.lock().expect("operation progress lock").clone();
+                if snapshot != last_progress
+                    && (stopping
+                        || (cancel.is_pause_acknowledged() && acknowledged != sequence)
+                        || last_progress.transferred_bytes == 0
+                        || snapshot.completed_files != last_progress.completed_files
+                        || snapshot.skipped_files != last_progress.skipped_files
+                        || snapshot.recovering != last_progress.recovering
+                        || last_written.elapsed() >= Duration::from_millis(125))
+                {
+                    if let Err(error) = write_network_operation_progress(&progress_path, &snapshot)
+                    {
+                        worker_error
+                            .lock()
+                            .expect("IPC error lock")
+                            .get_or_insert(error);
+                        cancel.cancel();
+                        break;
+                    }
+                    last_progress = snapshot;
+                    last_written = std::time::Instant::now();
+                }
+                if cancel.is_paused() && cancel.is_pause_acknowledged() && acknowledged != sequence
+                {
+                    if let Err(error) = atomic_write(&acknowledgement, &sequence.to_le_bytes()) {
+                        worker_error
+                            .lock()
+                            .expect("IPC error lock")
+                            .get_or_insert(error);
+                        cancel.cancel();
+                        break;
+                    }
+                    acknowledged = sequence;
+                }
+                if stopping {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+            error,
+        }
+    }
+
+    fn finish(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for NetworkOperationMonitor {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 #[cfg(windows)]
@@ -1819,27 +2320,6 @@ fn write_network_operation_event(
 ) -> io::Result<()> {
     let mut bytes = sequence.to_le_bytes().to_vec();
     match event {
-        NetworkOperationEvent::Discovered { bytes: count, path } => {
-            bytes.push(0);
-            bytes.extend_from_slice(&count.to_le_bytes());
-            write_units(
-                &mut bytes,
-                &path.as_os_str().encode_wide().collect::<Vec<_>>(),
-            )?;
-        }
-        NetworkOperationEvent::Progress {
-            bytes: count,
-            file_completed,
-            path,
-        } => {
-            bytes.push(1);
-            bytes.extend_from_slice(&count.to_le_bytes());
-            bytes.push(u8::from(*file_completed));
-            write_units(
-                &mut bytes,
-                &path.as_os_str().encode_wide().collect::<Vec<_>>(),
-            )?;
-        }
         NetworkOperationEvent::Conflict {
             category,
             source,
@@ -1862,34 +2342,19 @@ fn write_network_operation_event(
 
 #[cfg(windows)]
 fn read_network_operation_event(path: &Path) -> io::Result<(u64, NetworkOperationEvent)> {
-    let bytes = std::fs::read(path)?;
+    let bytes = read_snapshot(path)?;
     let mut offset = 0;
     let sequence = read_u64(&bytes, &mut offset)?;
-    let event = match read_byte(&bytes, &mut offset)? {
-        0 => NetworkOperationEvent::Discovered {
-            bytes: read_u64(&bytes, &mut offset)?,
-            path: PathBuf::from(OsString::from_wide(&read_units_at(&bytes, &mut offset)?)),
-        },
-        1 => {
-            let count = read_u64(&bytes, &mut offset)?;
-            let file_completed = read_byte(&bytes, &mut offset)? != 0;
-            NetworkOperationEvent::Progress {
-                bytes: count,
-                file_completed,
-                path: PathBuf::from(OsString::from_wide(&read_units_at(&bytes, &mut offset)?)),
-            }
-        }
-        2 => NetworkOperationEvent::Conflict {
-            category: conflict_category_from_code(read_byte(&bytes, &mut offset)?)?,
-            source: PathBuf::from(OsString::from_wide(&read_units_at(&bytes, &mut offset)?)),
-            destination: PathBuf::from(OsString::from_wide(&read_units_at(&bytes, &mut offset)?)),
-        },
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid operation event",
-            ));
-        }
+    if read_byte(&bytes, &mut offset)? != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid operation event",
+        ));
+    }
+    let event = NetworkOperationEvent::Conflict {
+        category: conflict_category_from_code(read_byte(&bytes, &mut offset)?)?,
+        source: PathBuf::from(OsString::from_wide(&read_units_at(&bytes, &mut offset)?)),
+        destination: PathBuf::from(OsString::from_wide(&read_units_at(&bytes, &mut offset)?)),
     };
     if offset != bytes.len() {
         return Err(io::Error::new(
@@ -1919,7 +2384,7 @@ fn write_network_operation_response(
 fn read_network_operation_response(
     path: &Path,
 ) -> io::Result<(u64, crate::domain::file_operations::ConflictAction)> {
-    let bytes = std::fs::read(path)?;
+    let bytes = read_snapshot(path)?;
     let mut offset = 0;
     let sequence = read_u64(&bytes, &mut offset)?;
     let action = match read_byte(&bytes, &mut offset)? {
@@ -1975,38 +2440,110 @@ fn conflict_category_from_code(
 }
 
 #[cfg(windows)]
-fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-
-    let mut temporary_name = path.as_os_str().to_os_string();
-    temporary_name.push(format!(".writing-{}", std::process::id()));
-    let temporary = PathBuf::from(temporary_name);
-    std::fs::write(&temporary, bytes)?;
-    let temporary_wide = wide_null(temporary.as_os_str());
-    let path_wide = wide_null(path.as_os_str());
-    if unsafe {
-        MoveFileExW(
-            temporary_wide.as_ptr(),
-            path_wide.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
-        let error = io::Error::last_os_error();
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error);
+fn available_snapshot<T>(result: io::Result<T>) -> io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::WouldBlock
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
-    Ok(())
+}
+
+#[cfg(windows)]
+fn snapshot_error(path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+}
+
+// Locks cover only small local IPC snapshots; never wait on network I/O.
+#[cfg(windows)]
+fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::{Seek, Write};
+    let write = || -> io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        let started = std::time::Instant::now();
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock)
+                    if started.elapsed() < Duration::from_secs(1) =>
+                {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "local IPC snapshot lock timed out",
+                    ));
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            }
+        }
+        file.rewind()?;
+        file.write_all(bytes)?;
+        file.set_len(bytes.len() as u64)?;
+        Ok(())
+    };
+    write().map_err(|error| snapshot_error(path, error))
+}
+
+#[cfg(windows)]
+fn read_snapshot(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let read = || -> io::Result<Vec<u8>> {
+        let file = std::fs::File::open(path)?;
+        match file.try_lock_shared() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Err(io::ErrorKind::WouldBlock.into()),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+        let mut bytes = Vec::new();
+        file.take(1_048_577).read_to_end(&mut bytes)?;
+        if bytes.is_empty() {
+            // A newly created snapshot is unpublished until its first locked write.
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        if bytes.len() > 1_048_576 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IPC snapshot exceeds size limit",
+            ));
+        }
+        Ok(bytes)
+    };
+    read().map_err(|error| snapshot_error(path, error))
 }
 
 #[cfg(windows)]
 fn write_network_operation_result(
     path: &Path,
-    result: &IsolatedNetworkOperationReport,
+    result: &io::Result<IsolatedNetworkOperationReport>,
 ) -> io::Result<()> {
     let mut bytes = Vec::new();
+    let result = match result {
+        Ok(report) => {
+            bytes.push(0);
+            report
+        }
+        Err(error) => {
+            bytes.push(1);
+            write_units(
+                &mut bytes,
+                &error.to_string().encode_utf16().collect::<Vec<_>>(),
+            )?;
+            return std::fs::write(path, bytes);
+        }
+    };
     bytes.extend_from_slice(&(result.files as u64).to_le_bytes());
     bytes.extend_from_slice(&(result.directories as u64).to_le_bytes());
     bytes.extend_from_slice(&result.bytes.to_le_bytes());
@@ -2021,6 +2558,26 @@ fn write_network_operation_result(
 fn read_network_operation_result(path: &Path) -> io::Result<IsolatedNetworkOperationReport> {
     let bytes = std::fs::read(path)?;
     let mut offset = 0;
+    match read_byte(&bytes, &mut offset)? {
+        0 => {}
+        1 => {
+            let message = String::from_utf16(&read_units_at(&bytes, &mut offset)?)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if offset != bytes.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "trailing operation error data",
+                ));
+            }
+            return Err(io::Error::other(message));
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid operation result kind",
+            ));
+        }
+    }
     let files = usize::try_from(read_u64(&bytes, &mut offset)?)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file count too large"))?;
     let directories = usize::try_from(read_u64(&bytes, &mut offset)?)
@@ -2499,7 +3056,7 @@ mod isolated_codec_tests {
             completed_paths: vec![destination],
             aborted: false,
         };
-        super::write_network_operation_result(&output, &report).unwrap();
+        super::write_network_operation_result(&output, &Ok(report.clone())).unwrap();
         assert_eq!(
             super::read_network_operation_result(&output).unwrap(),
             report
@@ -2508,6 +3065,58 @@ mod isolated_codec_tests {
         let _ = std::fs::remove_file(output);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn network_operation_failure_preserves_path_and_system_reason() {
+        let root = std::env::temp_dir().join(format!(
+            "asterfiles-network-operation-error-{}-{}",
+            std::process::id(),
+            super::SystemTime::now()
+                .duration_since(super::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("missing-source-文件.txt");
+        let destination = root.join("destination.txt");
+        let output = root.join("result");
+        let expected_reason = std::fs::symlink_metadata(&source).unwrap_err().to_string();
+        let result = super::execute_network_operation(
+            super::IsolatedNetworkOperationKind::Copy,
+            &source,
+            Some(&destination),
+            &root.join("event"),
+            &root.join("response"),
+        );
+        assert!(result.is_err());
+        super::write_network_operation_result(&output, &result).unwrap();
+        let message = super::read_network_operation_result(&output)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains(source.to_str().unwrap()), "{message}");
+        assert!(message.contains(&expected_reason), "{message}");
+        assert!(!message.contains("Io {"), "{message}");
+        assert!(!destination.exists());
+
+        let result = Err(super::network_operation_error(
+            crate::fs::file_operations::OperationError::SourceInsideDestination,
+        ));
+        super::write_network_operation_result(&output, &result).unwrap();
+        assert_eq!(
+            super::read_network_operation_result(&output)
+                .unwrap_err()
+                .to_string(),
+            "SourceInsideDestination"
+        );
+        std::fs::write(&output, [2]).unwrap();
+        assert_eq!(
+            super::read_network_operation_result(&output)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[cfg(windows)]
     #[test]
     fn network_operation_event_and_conflict_response_round_trip() {
@@ -2519,6 +3128,7 @@ mod isolated_codec_tests {
             "asterfiles-network-operation-response-{}",
             std::process::id()
         ));
+        std::fs::write(&event_file, []).unwrap();
         super::write_network_operation_event(
             &event_file,
             9,
@@ -2551,6 +3161,178 @@ mod isolated_codec_tests {
         let _ = std::fs::remove_file(event_file);
         let _ = std::fs::remove_file(response_file);
     }
+    #[cfg(windows)]
+    #[test]
+    fn issue_136_overwritten_progress_snapshots_preserve_all_totals() {
+        let path = std::env::temp_dir().join(format!("asterfiles-progress-{}", std::process::id()));
+        let mut snapshot = super::NetworkOperationProgress::default();
+        let mut maximum_size = 0;
+        for index in 1..=100 {
+            snapshot.discovered_files = index;
+            snapshot.discovered_bytes = index * 100;
+            snapshot.transferred_bytes = index * 100;
+            snapshot.completed_files = index;
+            snapshot.current_path = "source".into();
+            snapshot.discovered_path = "source".into();
+            super::write_network_operation_progress(&path, &snapshot).unwrap();
+            maximum_size = maximum_size.max(std::fs::metadata(&path).unwrap().len());
+        }
+        assert!(maximum_size < 100);
+        let snapshot = super::read_network_operation_progress(&path).unwrap();
+        let mut discovered_files = 0;
+        let mut discovered_bytes = 0;
+        let mut transferred = 0;
+        let mut completed = 0;
+        super::deliver_network_operation_progress(
+            &snapshot,
+            &Default::default(),
+            &mut |bytes, _| {
+                discovered_files += 1;
+                discovered_bytes += bytes;
+            },
+            &mut |bytes, finished, _| {
+                transferred += bytes;
+                completed += usize::from(finished == super::FileProgressKind::Completed);
+            },
+            &mut |_| panic!("unexpected recovery"),
+        );
+        assert_eq!(
+            (discovered_files, discovered_bytes, transferred, completed),
+            (100, 10000, 10000, 100)
+        );
+        super::deliver_network_operation_progress(
+            &snapshot,
+            &snapshot,
+            &mut |_, _| panic!("duplicate discovery"),
+            &mut |_, _, _| panic!("duplicate progress"),
+            &mut |_| panic!("duplicate recovery"),
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn issue_139_network_skip_snapshots_preserve_totals_without_replay() {
+        let path = std::env::temp_dir().join(format!(
+            "asterfiles-skipped-progress-{}",
+            std::process::id()
+        ));
+        let previous = super::NetworkOperationProgress {
+            skipped_files: 2,
+            skipped_bytes: 100,
+            transferred_bytes: 20,
+            completed_files: 1,
+            ..Default::default()
+        };
+        let snapshot = super::NetworkOperationProgress {
+            skipped_files: 14,
+            skipped_bytes: 900,
+            transferred_bytes: 70,
+            completed_files: 5,
+            current_path: "source.bin".into(),
+            ..Default::default()
+        };
+        super::write_network_operation_progress(&path, &snapshot).unwrap();
+        let snapshot = super::read_network_operation_progress(&path).unwrap();
+        let mut skipped = 0;
+        let mut skipped_bytes = 0;
+        let mut transferred = 0;
+        let mut completed = 0;
+        super::deliver_network_operation_progress(
+            &snapshot,
+            &previous,
+            &mut |_, _| panic!("no discovery"),
+            &mut |bytes, kind, _| match kind {
+                super::FileProgressKind::Transferred => transferred += bytes,
+                super::FileProgressKind::Completed => {
+                    transferred += bytes;
+                    completed += 1;
+                }
+                super::FileProgressKind::Skipped => {
+                    skipped += 1;
+                    skipped_bytes += bytes;
+                }
+            },
+            &mut |_| panic!("no recovery"),
+        );
+        assert_eq!(
+            (skipped, skipped_bytes, transferred, completed),
+            (12, 800, 50, 4)
+        );
+        super::deliver_network_operation_progress(
+            &snapshot,
+            &snapshot,
+            &mut |_, _| panic!("duplicate discovery"),
+            &mut |_, _, _| panic!("duplicate progress"),
+            &mut |_| panic!("duplicate recovery"),
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn issue_137_recovery_progress_preserves_logical_totals() {
+        use std::sync::{Arc, Mutex};
+
+        let path = std::env::temp_dir().join(format!(
+            "asterfiles-recovery-progress-{}",
+            std::process::id()
+        ));
+        let original = super::NetworkOperationProgress {
+            transferred_bytes: 8_192,
+            current_path: "source.bin".into(),
+            ..Default::default()
+        };
+        let shared = Arc::new(Mutex::new(original.clone()));
+        let registration = super::CopyProgressRegistration::new(shared.clone());
+        super::set_copy_recovering(true);
+        super::write_network_operation_progress(&path, &shared.lock().unwrap()).unwrap();
+        let recovering = super::read_network_operation_progress(&path).unwrap();
+        assert!(recovering.recovering);
+        let mut recovery_changes = Vec::new();
+        super::deliver_network_operation_progress(
+            &recovering,
+            &original,
+            &mut |_, _| panic!("recovery does not discover files"),
+            &mut |_, _, _| panic!("recopied bytes must not advance logical progress"),
+            &mut |value| recovery_changes.push(value),
+        );
+        super::deliver_network_operation_progress(
+            &recovering,
+            &recovering,
+            &mut |_, _| panic!("duplicate discovery"),
+            &mut |_, _, _| panic!("duplicate progress"),
+            &mut |_| panic!("duplicate recovery transition"),
+        );
+        super::set_copy_recovering(false);
+        let mut advanced = shared.lock().unwrap().clone();
+        advanced.transferred_bytes += 512;
+        advanced.completed_files = 1;
+        super::write_network_operation_progress(&path, &advanced).unwrap();
+        let advanced = super::read_network_operation_progress(&path).unwrap();
+        let mut transferred = 0;
+        let mut completed = 0;
+        super::deliver_network_operation_progress(
+            &advanced,
+            &recovering,
+            &mut |_, _| panic!("no discovery"),
+            &mut |bytes, finished, _| {
+                transferred += bytes;
+                completed += usize::from(finished == super::FileProgressKind::Completed);
+            },
+            &mut |value| recovery_changes.push(value),
+        );
+        assert_eq!(recovery_changes, [true, false]);
+        assert_eq!((transferred, completed), (512, 1));
+
+        super::set_copy_recovering(true);
+        drop(registration);
+        assert!(!shared.lock().unwrap().recovering);
+        super::set_copy_recovering(true);
+        assert!(!shared.lock().unwrap().recovering);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn directory_input_preserves_visibility_and_raw_path() {
@@ -2609,3 +3391,15 @@ mod host_display_tests {
         );
     }
 }
+
+#[cfg(all(windows, test))]
+mod snapshot_tests;
+
+#[cfg(windows)]
+mod temporary_copy;
+#[cfg(windows)]
+pub(crate) use temporary_copy::register as register_copy_temporary;
+#[cfg(windows)]
+pub(crate) use temporary_copy::register_staging as register_copy_staging;
+#[cfg(windows)]
+pub(crate) use temporary_copy::retire_staging as retire_copy_staging;

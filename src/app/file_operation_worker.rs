@@ -5,6 +5,7 @@ use crate::{
         OperationResult, PermanentDeletePhase, PermanentDeleteStage, TransferRateEstimator,
         UndoHistory, UndoItem, UndoSourceKind,
     },
+    fs::file_operations::FileProgressKind,
     platform,
 };
 use std::{
@@ -42,14 +43,20 @@ pub(super) enum FileOperationEvent {
         id: OperationId,
         completed_items: usize,
         completed_files: usize,
+        skipped_files: usize,
         total_files: Option<usize>,
         discovered_files: usize,
         processed_bytes: u64,
+        skipped_bytes: u64,
         total_bytes: Option<u64>,
         discovered_bytes: u64,
         scanning_complete: bool,
         current_item: PathBuf,
         recent_speed_bps: Option<u64>,
+    },
+    CopyRecovery {
+        id: OperationId,
+        recovering: bool,
     },
     Conflict {
         id: OperationId,
@@ -94,9 +101,11 @@ struct OperationProgressSnapshot {
     id: OperationId,
     completed_items: usize,
     completed_files: usize,
+    skipped_files: usize,
     total_files: Option<usize>,
     discovered_files: usize,
     processed_bytes: u64,
+    skipped_bytes: u64,
     total_bytes: Option<u64>,
     discovered_bytes: u64,
     scanning_complete: bool,
@@ -114,6 +123,7 @@ struct OperationProgressEmitter<'a> {
     rate_estimator: TransferRateEstimator,
     cancellation: crate::domain::file_operations::CancellationToken,
     started_at: Instant,
+    all_copy_scans_complete: bool,
 }
 
 impl<'a> OperationProgressEmitter<'a> {
@@ -134,6 +144,7 @@ impl<'a> OperationProgressEmitter<'a> {
             rate_estimator: TransferRateEstimator::default(),
             cancellation,
             started_at,
+            all_copy_scans_complete: true,
         }
     }
 
@@ -147,25 +158,53 @@ impl<'a> OperationProgressEmitter<'a> {
         self.send_if_due(false);
     }
 
-    fn advanced(&mut self, bytes: u64, file_completed: bool, current: &Path) {
+    fn advanced(&mut self, bytes: u64, kind: FileProgressKind, current: &Path) {
         if self.cancellation.is_cancelled() {
             return;
         }
-        self.snapshot.processed_bytes = self.snapshot.processed_bytes.saturating_add(bytes);
+        if kind == FileProgressKind::Skipped {
+            self.snapshot.skipped_bytes = self.snapshot.skipped_bytes.saturating_add(bytes);
+            self.snapshot.skipped_files = self.snapshot.skipped_files.saturating_add(1);
+        } else {
+            self.snapshot.processed_bytes = self.snapshot.processed_bytes.saturating_add(bytes);
+            if kind == FileProgressKind::Completed {
+                self.snapshot.completed_files = self.snapshot.completed_files.saturating_add(1);
+            }
+        }
         self.rate_estimator.record(
             self.cancellation.active_elapsed(self.started_at),
             self.snapshot.processed_bytes,
             self.cancellation.rate_epoch(),
         );
         self.snapshot.recent_speed_bps = self.rate_estimator.bytes_per_second();
-        if file_completed {
-            self.snapshot.completed_files = self.snapshot.completed_files.saturating_add(1);
-        }
         self.snapshot.current_item = current.to_path_buf();
-        self.send_if_due(false);
+        let rate_tick = bytes == 0
+            && kind == FileProgressKind::Transferred
+            && self.last_sent_at.elapsed() >= Duration::from_secs(1);
+        self.send_if_due(rate_tick);
+    }
+
+    fn scanned(&mut self, base: (usize, u64), files: usize, bytes: u64, complete: bool) {
+        if self.cancellation.is_cancelled() {
+            return;
+        }
+        self.snapshot.discovered_files = base.0.saturating_add(files);
+        self.snapshot.discovered_bytes = base.1.saturating_add(bytes);
+        let complete = complete && self.all_copy_scans_complete;
+        let finished = complete && !self.snapshot.scanning_complete;
+        if complete {
+            self.snapshot.scanning_complete = true;
+            self.snapshot.total_files = Some(self.snapshot.discovered_files);
+            self.snapshot.total_bytes = Some(self.snapshot.discovered_bytes);
+        }
+        self.send_if_due(finished);
     }
 
     fn finish_scan(&mut self) {
+        if !self.all_copy_scans_complete {
+            self.flush();
+            return;
+        }
         if self.cancellation.is_cancelled() {
             return;
         }
@@ -187,15 +226,17 @@ impl<'a> OperationProgressEmitter<'a> {
 
     fn send_if_due(&mut self, force: bool) {
         let now = Instant::now();
-        let byte_delta = self
+        let accounted_bytes = self
             .snapshot
             .processed_bytes
-            .saturating_sub(self.last_sent_bytes);
-        let file_delta = self
+            .saturating_add(self.snapshot.skipped_bytes);
+        let known_files = self
             .snapshot
             .completed_files
-            .max(self.snapshot.discovered_files)
-            .saturating_sub(self.last_sent_files);
+            .saturating_add(self.snapshot.skipped_files)
+            .max(self.snapshot.discovered_files);
+        let byte_delta = accounted_bytes.saturating_sub(self.last_sent_bytes);
+        let file_delta = known_files.saturating_sub(self.last_sent_files);
         if !force {
             let elapsed = now.saturating_duration_since(self.last_sent_at);
             if elapsed < OPERATION_PROGRESS_INTERVAL
@@ -208,9 +249,11 @@ impl<'a> OperationProgressEmitter<'a> {
             id: self.snapshot.id,
             completed_items: self.snapshot.completed_items,
             completed_files: self.snapshot.completed_files,
+            skipped_files: self.snapshot.skipped_files,
             total_files: self.snapshot.total_files,
             discovered_files: self.snapshot.discovered_files,
             processed_bytes: self.snapshot.processed_bytes,
+            skipped_bytes: self.snapshot.skipped_bytes,
             total_bytes: self.snapshot.total_bytes,
             discovered_bytes: self.snapshot.discovered_bytes,
             scanning_complete: self.snapshot.scanning_complete,
@@ -218,11 +261,8 @@ impl<'a> OperationProgressEmitter<'a> {
             recent_speed_bps: self.snapshot.recent_speed_bps,
         });
         self.last_sent_at = now;
-        self.last_sent_bytes = self.snapshot.processed_bytes;
-        self.last_sent_files = self
-            .snapshot
-            .completed_files
-            .max(self.snapshot.discovered_files);
+        self.last_sent_bytes = accounted_bytes;
+        self.last_sent_files = known_files;
     }
 }
 
@@ -553,9 +593,11 @@ fn execute_file_operation_request(
             id: request.id,
             completed_items: 0,
             completed_files: 0,
+            skipped_files: 0,
             total_files: (!copy_or_move).then_some(request.items.len()),
             discovered_files: 0,
             processed_bytes: 0,
+            skipped_bytes: 0,
             total_bytes: (!copy_or_move).then_some(0),
             discovered_bytes: 0,
             scanning_complete: !copy_or_move,
@@ -604,6 +646,9 @@ fn execute_file_operation_request(
             &request.cancellation,
             event_sender,
             &mut progress,
+            !request.items[item_index + 1..]
+                .iter()
+                .any(|item| item.state == ItemState::Pending),
             &mut conflict_defaults,
             conflict_gate,
         );
@@ -678,13 +723,14 @@ fn execute_file_operation_request(
                     .clone()
                     .or_else(|| item.source.clone())
                     .unwrap_or_default();
-                if report.skipped.is_empty() {
-                    succeeded.push(identity.clone());
+                let changed = report.files > 0 || report.directories > 0;
+                if report.skipped.is_empty() || changed {
+                    succeeded.push(identity);
                     indexed_states.push((item_index, ItemState::Succeeded, None));
                 } else {
-                    skipped.extend(report.skipped);
                     indexed_states.push((item_index, ItemState::Skipped, None));
                 }
+                skipped.extend(report.skipped);
                 for directory in report.affected_directories {
                     if !affected.contains(&directory) {
                         affected.push(directory);
@@ -692,6 +738,9 @@ fn execute_file_operation_request(
                 }
             }
             Err(error) => {
+                if request.kind == FileOperationKind::Copy && !progress.snapshot.scanning_complete {
+                    progress.all_copy_scans_complete = false;
+                }
                 undo_items = None;
                 let identity = item
                     .source
@@ -711,7 +760,7 @@ fn execute_file_operation_request(
             }
         }
     }
-    if copy_or_move {
+    if copy_or_move && failed.is_empty() && !request.cancellation.is_cancelled() {
         progress.finish_scan();
     } else {
         progress.flush();
@@ -994,9 +1043,11 @@ pub(super) fn execute_cleanup_request(
                     id: progress_id,
                     completed_items: snapshot.files.saturating_add(snapshot.directories) as usize,
                     completed_files: snapshot.files as usize,
+                    skipped_files: 0,
                     total_files: None,
                     discovered_files: 0,
                     processed_bytes: snapshot.bytes,
+                    skipped_bytes: 0,
                     total_bytes: None,
                     discovered_bytes: 0,
                     scanning_complete: false,
@@ -1172,9 +1223,11 @@ fn execute_recycle_delete_request(
             id: request.id,
             completed_items: completed_in_round + 1,
             completed_files: 0,
+            skipped_files: 0,
             total_files: None,
             discovered_files: 0,
             processed_bytes: 0,
+            skipped_bytes: 0,
             total_bytes: None,
             discovered_bytes: 0,
             scanning_complete: false,
@@ -1307,9 +1360,11 @@ fn execute_undo_request(
             id: request.id,
             completed_items: index + 1,
             completed_files: succeeded.len(),
+            skipped_files: 0,
             total_files: Some(request.undo_items.len()),
             discovered_files: request.undo_items.len(),
             processed_bytes: 0,
+            skipped_bytes: 0,
             total_bytes: Some(0),
             discovered_bytes: 0,
             scanning_complete: true,
@@ -1413,6 +1468,7 @@ fn execute_file_operation_item(
     cancel: &crate::domain::file_operations::CancellationToken,
     events: &mpsc::Sender<FileOperationEvent>,
     progress_emitter: &mut OperationProgressEmitter<'_>,
+    last_item: bool,
     conflict_defaults: &mut HashMap<
         crate::domain::file_operations::ConflictCategory,
         crate::domain::file_operations::ConflictAction,
@@ -1518,7 +1574,12 @@ fn execute_file_operation_item(
     };
     if let Some(network_kind) = network_operation {
         let source = item.source.as_ref().ok_or("missing source")?;
+        let scan_base = (
+            progress_emitter.snapshot.discovered_files,
+            progress_emitter.snapshot.discovered_bytes,
+        );
         let progress_emitter = RefCell::new(progress_emitter);
+        let scan_completed = std::cell::Cell::new(false);
         let report = platform::windows::network::isolated_network_file_operation(
             network_kind,
             source,
@@ -1526,15 +1587,34 @@ fn execute_file_operation_item(
             cancel,
             replace,
             &mut |bytes, current| {
-                progress_emitter.borrow_mut().discovered(bytes, current);
+                if kind != FileOperationKind::Copy {
+                    progress_emitter.borrow_mut().discovered(bytes, current);
+                }
             },
             &mut |bytes, file_completed, current| {
                 progress_emitter
                     .borrow_mut()
                     .advanced(bytes, file_completed, current);
             },
+            &mut |files, bytes, complete| {
+                scan_completed.set(complete);
+                if kind == FileOperationKind::Copy {
+                    progress_emitter.borrow_mut().scanned(
+                        scan_base,
+                        files,
+                        bytes,
+                        complete && last_item,
+                    );
+                }
+            },
+            &mut |recovering| {
+                let _ = events.send(FileOperationEvent::CopyRecovery { id, recovering });
+            },
         )
         .map_err(|error| error.to_string())?;
+        if kind == FileOperationKind::Copy && !scan_completed.get() {
+            progress_emitter.borrow_mut().all_copy_scans_complete = false;
+        }
         return Ok(crate::fs::file_operations::FileOperationReport {
             files: report.files,
             directories: report.directories,
@@ -1604,44 +1684,96 @@ fn execute_file_operation_item(
         FileOperationKind::Copy | FileOperationKind::Move => {
             let source = item.source.as_ref().ok_or("missing source")?;
             let destination = item.destination.as_ref().ok_or("missing destination")?;
-            let progress_emitter = RefCell::new(progress_emitter);
-            let mut progress = |bytes, file_completed, current: &Path| {
-                progress_emitter
-                    .borrow_mut()
-                    .advanced(bytes, file_completed, current);
-            };
-            let mut discovered = |bytes, current: &Path| {
-                progress_emitter.borrow_mut().discovered(bytes, current);
-            };
-            let mut root_destination_reported = false;
-            let result = if kind == FileOperationKind::Copy {
-                crate::fs::file_operations::copy_path_with_progress(
-                    source,
-                    destination,
-                    cancel,
-                    replace,
-                    &mut discovered,
-                    &mut progress,
-                    &mut |path| {
-                        if !root_destination_reported {
-                            root_destination_reported = true;
-                            let _ = events.send(FileOperationEvent::DestinationCreated {
-                                id,
-                                path: path.to_path_buf(),
-                            });
+            let scan_base = (
+                progress_emitter.snapshot.discovered_files,
+                progress_emitter.snapshot.discovered_bytes,
+            );
+            let scan = crate::fs::file_operations::CopyScanProgress::default();
+            let emitter = Mutex::new(progress_emitter);
+            let result = std::thread::scope(|scope| {
+                let (stop_sender, stop_receiver) = mpsc::channel::<()>();
+                let monitor = (kind == FileOperationKind::Copy).then(|| {
+                    let scan = &scan;
+                    let emitter = &emitter;
+                    scope.spawn(move || {
+                        let mut previous = None;
+                        loop {
+                            let snapshot = scan.snapshot();
+                            if previous != Some(snapshot) {
+                                emitter.lock().unwrap().scanned(
+                                    scan_base,
+                                    snapshot.files,
+                                    snapshot.bytes,
+                                    snapshot.complete && last_item,
+                                );
+                                previous = Some(snapshot);
+                            }
+                            match stop_receiver.recv_timeout(OPERATION_PROGRESS_INTERVAL) {
+                                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                            }
                         }
-                    },
-                )
-            } else {
-                crate::fs::file_operations::move_path_with_progress(
-                    source,
-                    destination,
-                    cancel,
-                    replace,
-                    &mut discovered,
-                    &mut progress,
-                )
-            };
+                    })
+                });
+                let mut progress = |bytes, file_completed, current: &Path| {
+                    emitter
+                        .lock()
+                        .unwrap()
+                        .advanced(bytes, file_completed, current);
+                };
+                let mut discovered = |bytes, current: &Path| {
+                    if kind != FileOperationKind::Copy {
+                        emitter.lock().unwrap().discovered(bytes, current);
+                    }
+                };
+                let mut root_destination_reported = false;
+                let result = if kind == FileOperationKind::Copy {
+                    crate::fs::file_operations::copy_path_with_progress(
+                        source,
+                        destination,
+                        cancel,
+                        replace,
+                        &mut discovered,
+                        &mut progress,
+                        &mut |path| {
+                            if !root_destination_reported {
+                                root_destination_reported = true;
+                                let _ = events.send(FileOperationEvent::DestinationCreated {
+                                    id,
+                                    path: path.to_path_buf(),
+                                });
+                            }
+                        },
+                        &scan,
+                    )
+                } else {
+                    crate::fs::file_operations::move_path_with_progress(
+                        source,
+                        destination,
+                        cancel,
+                        replace,
+                        &mut discovered,
+                        &mut progress,
+                    )
+                };
+                let _ = stop_sender.send(());
+                if let Some(monitor) = monitor {
+                    monitor.join().unwrap();
+                }
+                if kind == FileOperationKind::Copy {
+                    let snapshot = scan.snapshot();
+                    if !snapshot.complete {
+                        emitter.lock().unwrap().all_copy_scans_complete = false;
+                    }
+                    emitter.lock().unwrap().scanned(
+                        scan_base,
+                        snapshot.files,
+                        snapshot.bytes,
+                        snapshot.complete && last_item,
+                    );
+                }
+                result
+            });
             result.map_err(ExecuteFileOperationError::from_operation)
         }
         FileOperationKind::Undo => unreachable!("undo requests use the undo batch executor"),
@@ -1825,6 +1957,50 @@ mod tests {
         ));
     }
     #[test]
+    fn issue_136_scan_completion_reaches_progress_before_transfer_finishes() {
+        let (sender, receiver) = mpsc::channel();
+        let mut emitter = OperationProgressEmitter::new(
+            &sender,
+            OperationProgressSnapshot {
+                id: OperationId(136),
+                completed_items: 0,
+                completed_files: 0,
+                skipped_files: 0,
+                total_files: None,
+                discovered_files: 0,
+                processed_bytes: 0,
+                skipped_bytes: 0,
+                total_bytes: None,
+                discovered_bytes: 0,
+                scanning_complete: false,
+                current_item: PathBuf::from("large.bin"),
+                recent_speed_bps: None,
+            },
+            crate::domain::file_operations::CancellationToken::new(),
+            Instant::now(),
+        );
+        emitter.scanned((0, 0), 2, 8_000, false);
+        assert!(!emitter.snapshot.scanning_complete);
+        emitter.scanned((2, 8_000), 3, 12_000, true);
+        assert_eq!(emitter.snapshot.total_files, Some(5));
+        assert_eq!(emitter.snapshot.total_bytes, Some(20_000));
+        assert_eq!(emitter.snapshot.processed_bytes, 0);
+        assert!(receiver.try_iter().any(|event| matches!(
+            event,
+            FileOperationEvent::Progress {
+                scanning_complete: true,
+                total_files: Some(5),
+                total_bytes: Some(20_000),
+                processed_bytes: 0,
+                ..
+            }
+        )));
+        emitter.advanced(500, FileProgressKind::Transferred, Path::new("large.bin"));
+        assert_eq!(emitter.snapshot.total_bytes, Some(20_000));
+        assert_eq!(emitter.snapshot.processed_bytes, 500);
+    }
+
+    #[test]
     fn issue_61_progress_emitter_coalesces_and_flushes_scan_completion() {
         let (sender, receiver) = mpsc::channel();
         let mut emitter = OperationProgressEmitter::new(
@@ -1833,9 +2009,11 @@ mod tests {
                 id: OperationId(61),
                 completed_items: 0,
                 completed_files: 0,
+                skipped_files: 0,
                 total_files: None,
                 discovered_files: 0,
                 processed_bytes: 0,
+                skipped_bytes: 0,
                 total_bytes: None,
                 discovered_bytes: 0,
                 scanning_complete: false,
@@ -1850,12 +2028,16 @@ mod tests {
         for index in 0..32 {
             let path = PathBuf::from(format!("file-{index}"));
             emitter.discovered(1, &path);
-            emitter.advanced(1, true, &path);
+            emitter.advanced(1, FileProgressKind::Completed, &path);
         }
         assert_eq!(receiver.try_iter().count(), 1);
 
         emitter.last_sent_at = Instant::now() - OPERATION_PROGRESS_INTERVAL;
-        emitter.advanced(OPERATION_PROGRESS_BYTES, false, Path::new("large.bin"));
+        emitter.advanced(
+            OPERATION_PROGRESS_BYTES,
+            FileProgressKind::Transferred,
+            Path::new("large.bin"),
+        );
         assert_eq!(receiver.try_iter().count(), 1);
 
         emitter.finish_scan();
@@ -2078,9 +2260,11 @@ mod tests {
                 id: OperationId(61),
                 completed_items: 0,
                 completed_files: 0,
+                skipped_files: 0,
                 total_files: None,
                 discovered_files: 0,
                 processed_bytes: 0,
+                skipped_bytes: 0,
                 total_bytes: None,
                 discovered_bytes: 0,
                 scanning_complete: false,
@@ -2102,14 +2286,15 @@ mod tests {
                 *discovered_bytes.borrow_mut() += bytes;
                 emitter.borrow_mut().discovered(bytes, path);
             },
-            &mut |bytes, completed, path| {
+            &mut |bytes, kind, path| {
                 *raw_progress_events.borrow_mut() += 1;
-                if completed && first_copy_started.borrow().is_none() {
+                if kind == FileProgressKind::Completed && first_copy_started.borrow().is_none() {
                     *first_copy_started.borrow_mut() = Some(started.elapsed());
                 }
-                emitter.borrow_mut().advanced(bytes, completed, path);
+                emitter.borrow_mut().advanced(bytes, kind, path);
             },
             &mut |_| {},
+            &crate::fs::file_operations::CopyScanProgress::default(),
         )
         .unwrap();
         let scan_finished = started.elapsed();
@@ -2153,3 +2338,9 @@ mod tests {
         .unwrap();
     }
 }
+
+#[cfg(test)]
+mod issue_136_tests;
+
+#[cfg(test)]
+mod issue_139_tests;

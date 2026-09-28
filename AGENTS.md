@@ -21,6 +21,18 @@ python tools/verify.py --release # 用户确认 Issue 后的本地 Release 构�
 
 CI 只有仓库读取权限，不发布、不创建标签；同一 PR/引用的新运行取消旧运行，单次超时 60 分钟。日志、状态和汇总上传到 `windows-verification-<run-id>-<attempt>`，保存 14 天。成功与失败路径的云端复验命令及下载入口见 `docs/agent/debug-validation.md`；受控失败只修改 runner 的临时 checkout。
 
+## 网络复制专项验证（#136）
+
+`target/debug/asterfiles.exe --agent-network-copy-probe '<至少 128 MiB 的源文件路径>'` 运行真实父进程与网络辅助进程，无应用界面。探针只读取来源，在 `artifacts/state/issue-136/parent-probe/` 创建独占目标，验证实际暂停、保持 12 秒不增长、继续及暂停中取消，随后回收进程并清理目标。结果写入该目录的 `result.json`。请使用足够大的文件，避免传输在请求暂停前完成；来源不会被删除或修改。单元回归使用 `cargo test --locked issue_136 -- --nocapture`，真实界面仍由用户验收。
+
+## HybridMount 慢源专项验证（#137）
+
+`target/debug/asterfiles.exe --agent-network-copy-probe --stall` 验证未暂停且连续 15 秒无进度后仍完成复制，以及等待中取消在 3 秒内回收辅助进程。结果位于 `artifacts/state/issue-137/stall-probe/result.json`。
+
+`target/debug/asterfiles.exe --agent-network-copy-probe --complete '<源文件路径>'` 通过真实父进程和辅助进程完整复制，再逐字节比较内容并清理测试副本。比较会再次读取来源；来源始终只读。进度、结果及错误位于 `artifacts/state/issue-137/complete-probe/`。受控中断恢复测试使用 `cargo test --locked robocopy -- --nocapture`，快照并发测试使用 `cargo test --locked issue_137 -- --nocapture`。受控测试不等于真实断开 NAS 网络。 Windows 已请求终止但退出事件未触发的回归使用 `cargo test --locked issue_137_pending -- --nocapture`；退出等待上限为 250 ms，旧暂存文件退休隔离。`artifacts/state/issue-137/disconnect-live/` 保存真实挂起现场的线程栈和进程等待信号；`network-copy-retired` / `network-copy-cleanup-deferred` 审计保存尚未完成系统回收的精确路径。
+
+`target/debug/asterfiles.exe --agent-network-copy-probe --resume-complete '<至少 256 MiB 的源文件路径>'` 在真实传输达到 128 MiB 后暂停，确认后保持 2 秒，再继续到完整复制并逐字节比较。结果仍写入 `artifacts/state/issue-137/complete-probe/` 的独占运行目录；`network-copy-block-start` 审计记录恢复读取的位置。NAS→本地块续传回归使用 `cargo test --locked issue_137_block_download -- --nocapture`，槽位上限回归使用 `cargo test --locked issue_137_read_limit -- --nocapture`。恢复仅覆盖当前任务，不覆盖应用退出或崩溃。读取与元数据查询共用 4 个槽位，旧 Windows I/O 必须真正退出才释放槽位；槽位耗尽时仍可暂停取消。
+
 ## UI 操作与验证
 
 - 禁止 Codex 操作、自动化或尝试控制 AsterFiles 的 UI，包括通过内置浏览器、Chrome、Computer Use、Playwright、agent-browser、截图点击或键鼠模拟等方式。

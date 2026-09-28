@@ -43,6 +43,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     #[cfg(windows)]
+    if platform::windows::network::try_run_operation_probe_from_args()? {
+        return Ok(());
+    }
+
+    #[cfg(windows)]
     if platform::windows::shell_select_trap::probe::try_run()? {
         return Ok(());
     }

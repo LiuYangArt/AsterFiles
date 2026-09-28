@@ -97,6 +97,7 @@ fn operation(
             &mut discovered,
             &mut progress,
             &mut |_| {},
+            &CopyScanProgress::default(),
         )
     }
 }

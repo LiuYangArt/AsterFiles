@@ -1,16 +1,10 @@
+use crate::domain::file_operations::CancellationToken;
 use std::{ffi::c_void, io, mem::size_of, os::windows::ffi::OsStrExt, path::Path};
-
 use windows::{
     Win32::{
-        Foundation::{
-            ERROR_BAD_NET_NAME, ERROR_BAD_NETPATH, ERROR_CONNECTION_UNAVAIL,
-            ERROR_HOST_UNREACHABLE, ERROR_NETNAME_DELETED, ERROR_NETWORK_UNREACHABLE,
-            ERROR_NO_NETWORK, ERROR_REQUEST_ABORTED, ERROR_REQUEST_PAUSED, ERROR_SEM_TIMEOUT,
-            ERROR_UNEXP_NET_ERR, WIN32_ERROR,
-        },
+        Foundation::{ERROR_REQUEST_ABORTED, ERROR_REQUEST_PAUSED, WIN32_ERROR},
         Storage::FileSystem::{
-            COPY_FILE_ENABLE_SPARSE_COPY, COPY_FILE_FAIL_IF_EXISTS,
-            COPY_FILE_REQUEST_COMPRESSED_TRAFFIC, COPY_FILE_RESUME_FROM_PAUSE,
+            COPY_FILE_ENABLE_SPARSE_COPY, COPY_FILE_FAIL_IF_EXISTS, COPY_FILE_RESUME_FROM_PAUSE,
             COPYFILE2_CALLBACK_CHUNK_FINISHED, COPYFILE2_EXTENDED_PARAMETERS, COPYFILE2_MESSAGE,
             COPYFILE2_MESSAGE_ACTION, COPYFILE2_PROGRESS_CANCEL, COPYFILE2_PROGRESS_CONTINUE,
             COPYFILE2_PROGRESS_PAUSE, CopyFile2,
@@ -19,14 +13,11 @@ use windows::{
     core::PCWSTR,
 };
 
-use crate::domain::file_operations::CancellationToken;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyFileErrorKind {
     Cancelled,
     Failed,
 }
-
 #[derive(Debug)]
 pub struct CopyFileError {
     pub kind: CopyFileErrorKind,
@@ -47,6 +38,9 @@ pub fn copy_file(
     cancel: &CancellationToken,
     progress: &mut dyn FnMut(u64),
 ) -> Result<u64, CopyFileError> {
+    if crate::network::is_unc_path(source) || crate::network::is_unc_path(destination) {
+        return super::network_copy::copy_file(source, destination, cancel, progress);
+    }
     let source_wide = wide_path(source);
     let destination_wide = wide_path(destination);
     let mut context = CopyContext {
@@ -57,19 +51,13 @@ pub fn copy_file(
         callback_panicked: false,
     };
     let mut resume = false;
-    let network_copy =
-        crate::network::is_unc_path(source) || crate::network::is_unc_path(destination);
-    let mut retry_count = 0_u8;
-
     loop {
+        cancel.wait_if_paused();
         if cancel.is_cancelled() {
             return Err(cancelled_error());
         }
         context.pause_requested = false;
         let mut flags = COPY_FILE_FAIL_IF_EXISTS | COPY_FILE_ENABLE_SPARSE_COPY;
-        if network_copy {
-            flags |= COPY_FILE_REQUEST_COMPRESSED_TRAFFIC;
-        }
         if resume {
             flags |= COPY_FILE_RESUME_FROM_PAUSE;
         }
@@ -95,37 +83,18 @@ pub fn copy_file(
         }
         match result {
             Ok(()) => return Ok(context.last_total),
-            Err(error) if cancel.is_cancelled() => return Err(cancelled_error()),
+            Err(_) if cancel.is_cancelled() => return Err(cancelled_error()),
             Err(error)
                 if context.pause_requested
                     && WIN32_ERROR::from_error(&error) == Some(ERROR_REQUEST_PAUSED) =>
             {
-                cancel.wait_if_paused();
-                if cancel.is_cancelled() {
-                    return Err(cancelled_error());
-                }
                 resume = true;
             }
-            Err(error)
-                if network_copy
-                    && retry_count < MAX_NETWORK_AUTO_RETRIES
-                    && WIN32_ERROR::from_error(&error).is_some_and(is_retryable_network_error) =>
-            {
-                retry_count += 1;
-                let _ = std::fs::remove_file(destination);
-                resume = false;
-                std::thread::sleep(std::time::Duration::from_millis(
-                    250 * u64::from(retry_count),
-                ));
-            }
             Err(error) => {
-                let code = WIN32_ERROR::from_error(&error)
-                    .map(|value| format!("Win32 {}", value.0))
-                    .unwrap_or_else(|| format!("HRESULT 0x{:08X}", error.code().0 as u32));
                 return Err(CopyFileError {
                     kind: CopyFileErrorKind::Failed,
                     error: io::Error::other(format!(
-                        "CopyFile2 failed ({code}) from {} to {}: {error}",
+                        "CopyFile2 failed from {} to {}: {error}",
                         source.display(),
                         destination.display()
                     )),
@@ -163,35 +132,15 @@ unsafe extern "system" fn copy_progress(
         }
     }
     if context.cancel.is_paused() {
-        context.cancel.acknowledge_pause();
         context.pause_requested = true;
         COPYFILE2_PROGRESS_PAUSE
     } else {
         COPYFILE2_PROGRESS_CONTINUE
     }
 }
-
 fn wide_path(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
-
-const MAX_NETWORK_AUTO_RETRIES: u8 = 1;
-
-fn is_retryable_network_error(error: WIN32_ERROR) -> bool {
-    matches!(
-        error,
-        ERROR_BAD_NETPATH
-            | ERROR_BAD_NET_NAME
-            | ERROR_CONNECTION_UNAVAIL
-            | ERROR_HOST_UNREACHABLE
-            | ERROR_NETNAME_DELETED
-            | ERROR_NETWORK_UNREACHABLE
-            | ERROR_NO_NETWORK
-            | ERROR_SEM_TIMEOUT
-            | ERROR_UNEXP_NET_ERR
-    )
-}
-
 fn cancelled_error() -> CopyFileError {
     CopyFileError {
         kind: CopyFileErrorKind::Cancelled,
@@ -229,11 +178,6 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
-    }
-
-    #[test]
-    fn issue_42_network_copy_retries_at_most_once() {
-        assert_eq!(MAX_NETWORK_AUTO_RETRIES, 1);
     }
 
     #[test]
@@ -314,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn issue_60_copyfile2_pause_resumes_same_destination() {
+    fn issue_136_copyfile2_acknowledges_only_after_transfer_stops() {
         let temp = TempDir::new();
         let source = temp.0.join("source.bin");
         let destination = temp.0.join("destination.bin");
@@ -324,18 +268,34 @@ mod tests {
         let worker_destination = destination.clone();
         let (progress_sender, progress_receiver) = mpsc::channel();
         let worker = thread::spawn(move || {
+            let mut requested = false;
             copy_file(&source, &worker_destination, &worker_cancel, &mut |bytes| {
+                if !requested {
+                    worker_cancel.pause();
+                    assert!(!worker_cancel.is_pause_acknowledged());
+                    requested = true;
+                }
                 progress_sender.send(bytes).unwrap();
             })
         });
         progress_receiver
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
-        cancel.pause();
+        let started = std::time::Instant::now();
+        while !cancel.is_pause_acknowledged() && started.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let acknowledged = cancel.is_pause_acknowledged();
+        let queued: u64 = progress_receiver.try_iter().sum();
         thread::sleep(Duration::from_millis(100));
-        assert!(destination.exists());
+        let advanced: u64 = progress_receiver.try_iter().sum();
         cancel.resume();
         worker.join().unwrap().unwrap();
-        assert_eq!(fs::metadata(destination).unwrap().len(), 64 * 1024 * 1024);
+        assert!(acknowledged, "CopyFile2 must acknowledge actual suspension");
+        assert_eq!(
+            advanced, 0,
+            "transfer advanced after pause acknowledgement; queued={queued}"
+        );
+        assert_eq!(fs::read(destination).unwrap(), vec![9_u8; 64 * 1024 * 1024]);
     }
 }

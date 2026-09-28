@@ -14,6 +14,12 @@ use crate::domain::file_operations::{
 const COPY_TEST_CHUNK_SIZE: usize = 1024 * 1024;
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+mod copy_scan;
+pub use copy_scan::CopyScanProgress;
+#[cfg(test)]
+use copy_scan::CopyScanSnapshot;
+use copy_scan::CopyTraversal;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NameValidationError {
     Empty,
@@ -566,7 +572,7 @@ fn execute_quarantined_move_back(
     let staging = unique_sibling_preserving_name(original, ".asterfiles-undo-restore");
     let mut no_conflict = |_: ConflictCategory, _: &Path, _: &Path| ConflictAction::Skip;
     let mut discovered = |_: u64, _: &Path| {};
-    let mut progress = |_: u64, _: bool, _: &Path| {};
+    let mut progress = |_: u64, _: FileProgressKind, _: &Path| {};
     let copy = copy_path_with_progress(
         current,
         &staging,
@@ -575,6 +581,7 @@ fn execute_quarantined_move_back(
         &mut discovered,
         &mut progress,
         &mut |_| {},
+        &CopyScanProgress::default(),
     );
     let copy_report = match copy {
         Ok(report) => report,
@@ -962,10 +969,18 @@ fn is_traversable_directory(metadata: &fs::Metadata) -> bool {
     }
 }
 
-pub type FileProgressCallback<'a> = dyn FnMut(u64, bool, &Path) + 'a;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileProgressKind {
+    Transferred,
+    Completed,
+    Skipped,
+}
+
+pub type FileProgressCallback<'a> = dyn FnMut(u64, FileProgressKind, &Path) + 'a;
 pub type FileDiscoveredCallback<'a> = dyn FnMut(u64, &Path) + 'a;
 pub type DestinationCreatedCallback<'a> = dyn FnMut(&Path) + 'a;
 
+#[allow(clippy::too_many_arguments)]
 pub fn copy_path_with_progress(
     source: &Path,
     destination: &Path,
@@ -974,19 +989,33 @@ pub fn copy_path_with_progress(
     discovered: &mut FileDiscoveredCallback<'_>,
     progress: &mut FileProgressCallback<'_>,
     destination_created: &mut DestinationCreatedCallback<'_>,
+    scan: &CopyScanProgress,
 ) -> Result<FileOperationReport, OperationError> {
     check_cancel(cancel)?;
     let kept_destination = (source == destination).then(|| keep_both_path(destination));
     let destination = kept_destination.as_deref().unwrap_or(destination);
     reject_destination_inside_source(source, destination, cancel)?;
-    let source_metadata =
-        fs::symlink_metadata(source).map_err(|error| OperationError::io(source, error))?;
+    let source_metadata = copy_source_metadata(source, cancel)?;
     let destination_existed = path_exists(destination);
     let copy_into_existing_directory = destination_existed
         && source_metadata.file_type().is_dir()
         && fs::symlink_metadata(destination).is_ok_and(|metadata| metadata.file_type().is_dir());
     let mut report = FileOperationReport::new();
-    copy_entry(
+    let (sender, receiver) = std::sync::mpsc::sync_channel(copy_scan::QUEUE_CAPACITY);
+    let scan_source = source.to_path_buf();
+    let scan_cancel = cancel.clone();
+    let scan_progress = scan.clone();
+    let scanner = std::thread::spawn(move || {
+        copy_scan::scan(
+            &scan_source,
+            &source_metadata,
+            &scan_cancel,
+            &scan_progress,
+            sender,
+        );
+    });
+    let mut traversal = Some(CopyTraversal::new(receiver));
+    let copied = copy_entry(
         source,
         source,
         destination,
@@ -997,7 +1026,18 @@ pub fn copy_path_with_progress(
         destination_created,
         &mut report,
         false,
-    )?;
+        &mut traversal,
+    );
+    // A dropped queue releases the producer; blocked SMB reads remain inside the operation helper.
+    drop(traversal);
+    if copied.is_ok() || !crate::network::is_unc_path(source) || scanner.is_finished() {
+        scanner.join().map_err(|_| OperationError::Io {
+            path: source.to_path_buf(),
+            kind: io::ErrorKind::Other,
+            message: "copy directory scanner panicked".to_owned(),
+        })?;
+    }
+    copied?;
     let actual_root = if copy_into_existing_directory {
         None
     } else if report
@@ -1058,10 +1098,22 @@ fn move_path_with_progress_inner(
     }
     reject_destination_inside_source(source_root, destination, cancel)?;
     check_cancel(cancel)?;
+    let source_metadata = copy_source_metadata(source, cancel)?;
+    if discover_source && !source_metadata.file_type().is_dir() {
+        discovered(discovered_size(&source_metadata), source);
+    }
     if !path_exists(destination) {
         match fs::rename(source, destination) {
             Ok(()) => {
                 let mut report = FileOperationReport::new();
+                if source_metadata.file_type().is_dir() {
+                    report.directories = 1;
+                } else {
+                    let bytes = discovered_size(&source_metadata);
+                    report.files = 1;
+                    report.bytes = bytes;
+                    progress(bytes, FileProgressKind::Completed, source);
+                }
                 report.affect(source);
                 report.affect(destination);
                 return Ok(report);
@@ -1071,11 +1123,6 @@ fn move_path_with_progress_inner(
             }
             Err(_) => {}
         }
-    }
-    let source_metadata =
-        fs::symlink_metadata(source).map_err(|error| OperationError::io(source, error))?;
-    if discover_source && !source_metadata.file_type().is_dir() {
-        discovered(discovered_size(&source_metadata), source);
     }
     let destination_metadata = fs::symlink_metadata(destination).ok();
     if source_metadata.file_type().is_dir()
@@ -1104,6 +1151,14 @@ fn move_path_with_progress_inner(
             Err(OperationError::ConflictSkipped(_)) => {
                 let mut report = FileOperationReport::new();
                 report.skipped.push(source.to_path_buf());
+                report_skipped_progress(
+                    source,
+                    &source_metadata,
+                    cancel,
+                    discovered,
+                    progress,
+                    None,
+                )?;
                 return Ok(report);
             }
             Err(error) => return Err(error),
@@ -1135,6 +1190,7 @@ fn move_path_with_progress_inner(
         &mut |_| {},
         &mut report,
         true,
+        &mut None,
     )?;
     Ok(report)
 }
@@ -2101,10 +2157,10 @@ fn copy_entry(
     destination_created: &mut DestinationCreatedCallback<'_>,
     report: &mut FileOperationReport,
     remove_source: bool,
+    traversal: &mut Option<CopyTraversal>,
 ) -> Result<(), OperationError> {
     check_cancel(cancel)?;
-    let source_metadata =
-        fs::symlink_metadata(source).map_err(|error| OperationError::io(source, error))?;
+    let source_metadata = copy_source_metadata(source, cancel)?;
     if !source_metadata.file_type().is_dir() {
         discovered(discovered_size(&source_metadata), source);
     }
@@ -2113,6 +2169,14 @@ fn copy_entry(
             Ok(resolution) => resolution,
             Err(OperationError::ConflictSkipped(_)) => {
                 report.skipped.push(source.to_path_buf());
+                report_skipped_progress(
+                    source,
+                    &source_metadata,
+                    cancel,
+                    discovered,
+                    progress,
+                    traversal.as_ref(),
+                )?;
                 return Ok(());
             }
             Err(error) => return Err(error),
@@ -2128,7 +2192,41 @@ fn copy_entry(
         destination_created,
         report,
         remove_source,
+        traversal,
     )
+}
+
+fn report_skipped_progress(
+    source: &Path,
+    metadata: &fs::Metadata,
+    cancel: &CancellationToken,
+    discovered: &mut FileDiscoveredCallback<'_>,
+    progress: &mut FileProgressCallback<'_>,
+    traversal: Option<&CopyTraversal>,
+) -> Result<(), OperationError> {
+    if !metadata.file_type().is_dir() {
+        progress(discovered_size(metadata), FileProgressKind::Skipped, source);
+        return Ok(());
+    }
+    if let Some(traversal) = traversal {
+        return traversal.skip_directory(source, cancel, &mut |bytes, path| {
+            discovered(bytes, path);
+            progress(bytes, FileProgressKind::Skipped, path);
+        });
+    }
+    // Moves have no scan queue; inspect skipped descendants once without reading their contents.
+    for child in fs::read_dir(source).map_err(|error| OperationError::io(source, error))? {
+        check_cancel(cancel)?;
+        let child = child
+            .map_err(|error| OperationError::io(source, error))?
+            .path();
+        let metadata = copy_source_metadata(&child, cancel)?;
+        if !metadata.file_type().is_dir() {
+            discovered(discovered_size(&metadata), &child);
+        }
+        report_skipped_progress(&child, &metadata, cancel, discovered, progress, None)?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2143,10 +2241,10 @@ fn copy_resolved_entry(
     destination_created: &mut DestinationCreatedCallback<'_>,
     report: &mut FileOperationReport,
     remove_source: bool,
+    traversal: &mut Option<CopyTraversal>,
 ) -> Result<(), OperationError> {
     reject_destination_inside_source(source_root, &resolution.path, cancel)?;
-    let source_metadata =
-        fs::symlink_metadata(source).map_err(|error| OperationError::io(source, error))?;
+    let source_metadata = copy_source_metadata(source, cancel)?;
     let file_type = source_metadata.file_type();
     if file_type.is_symlink() {
         let private_identity = copy_symlink_safely(
@@ -2185,6 +2283,7 @@ fn copy_resolved_entry(
                 destination_created,
                 report,
                 remove_source,
+                traversal,
             );
         }
         copy_directory(
@@ -2198,6 +2297,7 @@ fn copy_resolved_entry(
             destination_created,
             report,
             remove_source,
+            traversal,
         )?;
     } else {
         copy_file_safely(
@@ -2227,6 +2327,7 @@ fn copy_directory(
     destination_created: &mut DestinationCreatedCallback<'_>,
     report: &mut FileOperationReport,
     remove_source: bool,
+    traversal: &mut Option<CopyTraversal>,
 ) -> Result<(), OperationError> {
     if !path_exists(destination) {
         fs::create_dir(destination).map_err(|error| OperationError::io(destination, error))?;
@@ -2238,14 +2339,29 @@ fn copy_directory(
             .push((destination.to_path_buf(), identity));
         destination_created(destination);
     }
-    let traversal = (|| {
-        for entry in fs::read_dir(source).map_err(|error| OperationError::io(source, error))? {
+    let copied = (|| {
+        let mut entries = if traversal.is_none() {
+            Some(fs::read_dir(source).map_err(|error| OperationError::io(source, error))?)
+        } else {
+            None
+        };
+        loop {
             check_cancel(cancel)?;
-            let entry = entry.map_err(|error| OperationError::io(source, error))?;
+            let child = if let Some(scan) = traversal.as_mut() {
+                scan.next_child(source, cancel)?
+            } else {
+                entries
+                    .as_mut()
+                    .and_then(Iterator::next)
+                    .transpose()
+                    .map_err(|error| OperationError::io(source, error))?
+                    .map(|entry| entry.path())
+            };
+            let Some(child) = child else { break };
             copy_entry(
                 source_root,
-                &entry.path(),
-                &destination.join(entry.file_name()),
+                &child,
+                &destination.join(child.file_name().unwrap()),
                 cancel,
                 resolve_conflict,
                 discovered,
@@ -2253,11 +2369,12 @@ fn copy_directory(
                 destination_created,
                 report,
                 remove_source,
+                traversal,
             )?;
         }
         Ok(())
     })();
-    if let Err(error) = traversal {
+    if let Err(error) = copied {
         return Err(if remove_source {
             partial_directory_move_error(error, source, destination, report)
         } else {
@@ -2282,6 +2399,7 @@ fn replace_directory_safely(
     destination_created: &mut DestinationCreatedCallback<'_>,
     report: &mut FileOperationReport,
     remove_source: bool,
+    traversal: &mut Option<CopyTraversal>,
 ) -> Result<(), OperationError> {
     let temporary = unique_sibling(destination, ".asterfiles-copy");
     let manifest_start = report.undo_identities.len();
@@ -2296,6 +2414,7 @@ fn replace_directory_safely(
         destination_created,
         report,
         false,
+        traversal,
     )?;
     replace_with_temporary(&temporary, destination)?;
     if remove_source {
@@ -2435,6 +2554,8 @@ fn copy_file_safely(
     report: &mut FileOperationReport,
 ) -> Result<(), OperationError> {
     let temporary = unique_sibling(destination, ".asterfiles-copy");
+    crate::platform::windows::network::register_copy_temporary(&temporary)
+        .map_err(|error| OperationError::io(&temporary, error))?;
     let result = copy_file_to_new_path(source, &temporary, cancel, progress, report);
     if let Err(error) = result {
         let _ = fs::remove_file(&temporary);
@@ -2480,7 +2601,7 @@ fn copy_file_to_new_path(
 ) -> Result<(), OperationError> {
     let copied =
         crate::platform::windows::copy_file::copy_file(source, destination, cancel, &mut |bytes| {
-            progress(bytes, false, source)
+            progress(bytes, FileProgressKind::Transferred, source)
         })
         .map_err(|error| match error.kind {
             crate::platform::windows::copy_file::CopyFileErrorKind::Cancelled => {
@@ -2491,7 +2612,7 @@ fn copy_file_to_new_path(
             }
         })?;
     report.bytes += copied;
-    progress(0, true, source);
+    progress(0, FileProgressKind::Completed, source);
     Ok(())
 }
 
@@ -2603,16 +2724,67 @@ fn remove_entry(
     Ok(())
 }
 
+fn copy_source_metadata(
+    source: &Path,
+    cancel: &CancellationToken,
+) -> Result<fs::Metadata, OperationError> {
+    if crate::network::is_unc_path(source) {
+        let owned_source = source.to_path_buf();
+        crate::platform::windows::network_copy::copy_query(cancel, move || {
+            fs::symlink_metadata(&owned_source)
+        })
+        .map_err(|error| {
+            if cancel.is_cancelled() {
+                OperationError::Cancelled
+            } else {
+                OperationError::io(source, error)
+            }
+        })
+    } else {
+        fs::symlink_metadata(source).map_err(|error| OperationError::io(source, error))
+    }
+}
+
 fn reject_destination_inside_source(
     source: &Path,
     destination: &Path,
     cancel: &CancellationToken,
 ) -> Result<(), OperationError> {
-    if crate::platform::windows::path_relation::destination_is_within_source(
-        source,
-        destination,
-        cancel,
-    )? {
+    let result = if crate::network::is_unc_path(source) || crate::network::is_unc_path(destination)
+    {
+        let owned_source = source.to_path_buf();
+        let owned_destination = destination.to_path_buf();
+        let query_cancel = cancel.clone();
+        crate::platform::windows::network_copy::copy_query(cancel, move || {
+            crate::platform::windows::path_relation::destination_is_within_source(
+                &owned_source,
+                &owned_destination,
+                &query_cancel,
+            )
+        })
+    } else {
+        crate::platform::windows::path_relation::destination_is_within_source(
+            source,
+            destination,
+            cancel,
+        )
+    };
+    let within_source = result.map_err(|error| {
+        if cancel.is_cancelled() {
+            OperationError::Cancelled
+        } else {
+            OperationError::Io {
+                path: source.to_path_buf(),
+                kind: error.kind(),
+                message: format!(
+                    "source={} destination={}: {error}",
+                    source.display(),
+                    destination.display()
+                ),
+            }
+        }
+    })?;
+    if within_source {
         return Err(OperationError::SourceInsideDestination);
     }
     Ok(())
@@ -2648,7 +2820,12 @@ fn unique_sibling(path: &Path, marker: &str) -> PathBuf {
     let parent = path.parent().unwrap_or_else(|| Path::new(""));
     loop {
         let candidate = parent.join(format!(
-            "{marker}-{}",
+            "{marker}-{}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
             UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         if !path_exists(&candidate) {
@@ -3233,6 +3410,7 @@ mod tests {
             &mut |_, _| {},
             &mut |_, _, _| {},
             &mut |_| {},
+            &CopyScanProgress::default(),
         )
     }
     fn move_path(
@@ -3302,6 +3480,7 @@ mod tests {
             &mut |_| {},
             &mut report,
             true,
+            &mut None,
         )?;
         Ok(report)
     }
@@ -3331,7 +3510,7 @@ mod tests {
                 }
             },
             &mut |_, done, path| {
-                if done {
+                if done == FileProgressKind::Completed {
                     completed.borrow_mut().push(path.to_path_buf());
                 }
             },
@@ -3394,7 +3573,7 @@ mod tests {
             &cancel,
             &mut |_, _| {},
             &mut |_, done, _| {
-                if done {
+                if done == FileProgressKind::Completed {
                     cancel.cancel();
                 }
             },
@@ -3423,7 +3602,7 @@ mod tests {
             &mut replace,
             &mut |_, _| {},
             &mut |_, done, path| {
-                if done {
+                if done == FileProgressKind::Completed {
                     assert!(path.exists());
                     assert_eq!(fs::read(&destination).unwrap(), b"old");
                 }
@@ -3477,7 +3656,7 @@ mod tests {
             &CancellationToken::new(),
             &mut |_, _| {},
             &mut |_, done, _| {
-                if done {
+                if done == FileProgressKind::Completed {
                     held = Some(
                         fs::OpenOptions::new()
                             .read(true)
@@ -3652,7 +3831,7 @@ mod tests {
                 }
             },
             &mut |_, done, path| {
-                if done {
+                if done == FileProgressKind::Completed {
                     completed.borrow_mut().push(path.to_path_buf());
                 }
             },
@@ -3904,6 +4083,7 @@ mod tests {
             &mut |_, _| {},
             &mut move |_, _, _| cancel_after_first_chunk.cancel(),
             &mut |_| {},
+            &CopyScanProgress::default(),
         );
         assert_eq!(result, Err(OperationError::Cancelled));
         assert_eq!(fs::read(&destination).unwrap(), b"old target");
@@ -3949,17 +4129,277 @@ mod tests {
             &mut replace,
             &mut |_, _| {},
             &mut |bytes, completed, _| {
-                if bytes > 0 && !completed {
+                if bytes > 0 && completed == FileProgressKind::Transferred {
                     increments.push(bytes);
                 }
             },
             &mut |_| {},
+            &CopyScanProgress::default(),
         )
         .unwrap();
         assert_eq!(fs::read(&destination).unwrap(), content);
         assert_eq!(report.bytes, (COPY_TEST_CHUNK_SIZE + 17) as u64);
         assert_eq!(increments, vec![COPY_TEST_CHUNK_SIZE as u64, 17]);
         assert!(temporary_siblings(temp.path()).is_empty());
+    }
+
+    #[test]
+    fn issue_136_scan_error_does_not_publish_a_complete_total() {
+        let temp = TempDir::new();
+        let source = temp.path().join("removed-before-scan");
+        fs::create_dir(&source).unwrap();
+        let metadata = fs::symlink_metadata(&source).unwrap();
+        fs::remove_dir(&source).unwrap();
+        let scan = CopyScanProgress::default();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(copy_scan::QUEUE_CAPACITY);
+        copy_scan::scan(&source, &metadata, &CancellationToken::new(), &scan, sender);
+        assert!(!scan.snapshot().complete);
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            copy_scan::ScanEntry::Error(_)
+        ));
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            copy_scan::ScanEntry::DirectoryEnd(_)
+        ));
+    }
+
+    #[test]
+    fn issue_136_scan_finishes_while_the_first_file_is_still_copying() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(source.join("nested")).unwrap();
+        for index in 0..4 {
+            write(
+                &source.join(format!("{index}.bin")),
+                &vec![7; COPY_TEST_CHUNK_SIZE + 17],
+            );
+        }
+        write(&source.join("nested/small.txt"), b"small");
+        let scan = CopyScanProgress::default();
+        let mut checked_during_transfer = false;
+        copy_path_with_progress(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut replace,
+            &mut |_, _| {},
+            &mut |bytes, completed, _| {
+                if bytes > 0
+                    && completed == FileProgressKind::Transferred
+                    && !checked_during_transfer
+                {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while !scan.snapshot().complete && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    assert_eq!(
+                        scan.snapshot(),
+                        CopyScanSnapshot {
+                            files: 5,
+                            bytes: 4 * (COPY_TEST_CHUNK_SIZE as u64 + 17) + 5,
+                            complete: true,
+                        }
+                    );
+                    checked_during_transfer = true;
+                }
+            },
+            &mut |_| {},
+            &scan,
+        )
+        .unwrap();
+        assert!(checked_during_transfer);
+    }
+
+    #[test]
+    fn issue_139_mixed_and_all_skipped_copy_account_without_transfer() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        write(&source.join("existing.bin"), b"source");
+        write(&source.join("new.bin"), b"new");
+        write(&source.join("empty.bin"), b"");
+        write(&destination.join("existing.bin"), b"untouched");
+        write(&destination.join("empty.bin"), b"");
+        for (expected_completed, expected_skipped, expected_transferred) in [(1, 2, 3), (0, 3, 0)] {
+            let scan = CopyScanProgress::default();
+            let mut transferred = 0;
+            let mut completed = 0;
+            let mut skipped = 0;
+            let mut skipped_bytes = 0;
+            let report = copy_path_with_progress(
+                &source,
+                &destination,
+                &CancellationToken::new(),
+                &mut |_, _, _| ConflictAction::Skip,
+                &mut |_, _| {},
+                &mut |bytes, kind, _| match kind {
+                    FileProgressKind::Transferred => transferred += bytes,
+                    FileProgressKind::Completed => {
+                        transferred += bytes;
+                        completed += 1;
+                    }
+                    FileProgressKind::Skipped => {
+                        skipped_bytes += bytes;
+                        skipped += 1;
+                    }
+                },
+                &mut |_| {},
+                &scan,
+            )
+            .unwrap();
+            assert_eq!(
+                (completed, skipped, transferred),
+                (expected_completed, expected_skipped, expected_transferred)
+            );
+            assert_eq!(transferred + skipped_bytes, scan.snapshot().bytes);
+            assert_eq!(completed + skipped, scan.snapshot().files);
+            assert!(scan.snapshot().complete);
+            assert_eq!(report.files, completed);
+            assert_eq!(report.skipped.len(), skipped);
+            assert_eq!(
+                fs::read(destination.join("existing.bin")).unwrap(),
+                b"untouched"
+            );
+            assert_eq!(fs::read(destination.join("new.bin")).unwrap(), b"new");
+        }
+    }
+
+    #[test]
+    fn issue_139_skipped_subtree_counts_queue_metadata_and_keeps_next_sibling() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(source.join("skip/deep")).unwrap();
+        fs::create_dir(&destination).unwrap();
+        let count = copy_scan::QUEUE_CAPACITY + 10;
+        for index in 0..count {
+            write(&source.join(format!("skip/deep/{index}.bin")), b"skip");
+        }
+        write(&source.join("outside.bin"), b"outside");
+        write(&destination.join("skip"), b"untouched");
+        let scan = CopyScanProgress::default();
+        let mut skipped = 0;
+        let mut skipped_bytes = 0;
+        let mut transferred = 0;
+        let mut completed = 0;
+        copy_path_with_progress(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut |_, _, _| ConflictAction::Skip,
+            &mut |_, _| {},
+            &mut |bytes, kind, _| match kind {
+                FileProgressKind::Skipped => {
+                    skipped += 1;
+                    skipped_bytes += bytes;
+                }
+                FileProgressKind::Transferred => transferred += bytes,
+                FileProgressKind::Completed => completed += 1,
+            },
+            &mut |_| {},
+            &scan,
+        )
+        .unwrap();
+        assert_eq!((skipped, skipped_bytes), (count, count as u64 * 4));
+        assert_eq!((completed, transferred), (1, 7));
+        assert_eq!(skipped_bytes + transferred, scan.snapshot().bytes);
+        assert_eq!(skipped + completed, scan.snapshot().files);
+        assert_eq!(
+            fs::read(destination.join("outside.bin")).unwrap(),
+            b"outside"
+        );
+        assert_eq!(fs::read(destination.join("skip")).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn issue_139_skipped_move_subtree_reports_files_without_modifying_them() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(source.join("deep")).unwrap();
+        write(&source.join("deep/file.bin"), b"source");
+        write(&destination, b"untouched");
+        let mut events = Vec::new();
+        let report = move_path_with_progress(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut |_, _, _| ConflictAction::Skip,
+            &mut |_, _| {},
+            &mut |bytes, kind, path| events.push((bytes, kind, path.to_path_buf())),
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            [(6, FileProgressKind::Skipped, source.join("deep/file.bin"))]
+        );
+        assert_eq!(report.skipped, vec![source.clone()]);
+        assert_eq!(fs::read(source.join("deep/file.bin")).unwrap(), b"source");
+        assert_eq!(fs::read(destination).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn issue_136_skipped_directory_does_not_consume_its_next_sibling() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(source.join("skip/deep")).unwrap();
+        fs::create_dir(&destination).unwrap();
+        write(&source.join("skip/deep/inside.txt"), b"inside");
+        write(&source.join("outside.txt"), b"outside");
+        write(&destination.join("skip"), b"keep");
+        let report = copy_path_with_progress(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut |_, _, _| ConflictAction::Skip,
+            &mut |_, _| {},
+            &mut |_, _, _| {},
+            &mut |_| {},
+            &CopyScanProgress::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(destination.join("outside.txt")).unwrap(),
+            b"outside"
+        );
+        assert_eq!(fs::read(destination.join("skip")).unwrap(), b"keep");
+        assert_eq!(report.skipped, vec![source.join("skip")]);
+    }
+
+    #[test]
+    fn issue_136_failed_copy_releases_a_scanner_with_a_full_queue() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        for index in 0..copy_scan::QUEUE_CAPACITY + 10 {
+            write(&source.join(format!("{index}.txt")), b"file");
+        }
+        let cancel = CancellationToken::new();
+        let scan = CopyScanProgress::default();
+        let result = copy_path_with_progress(
+            &source,
+            &destination,
+            &cancel,
+            &mut replace,
+            &mut |_, _| {
+                // Keep the consumer stationary until the producer reaches its bounded capacity.
+                std::thread::sleep(Duration::from_millis(100));
+                assert!(!scan.snapshot().complete);
+                assert!(scan.snapshot().files <= copy_scan::QUEUE_CAPACITY + 1);
+                cancel.cancel();
+            },
+            &mut |_, _, _| {},
+            &mut |_| {},
+            &scan,
+        );
+        assert_eq!(result, Err(OperationError::Cancelled));
     }
 
     #[test]
@@ -3981,11 +4421,12 @@ mod tests {
             &mut replace,
             &mut |_, path| events.borrow_mut().push(("discovered", path.to_path_buf())),
             &mut |_, completed, path| {
-                if completed {
+                if completed == FileProgressKind::Completed {
                     events.borrow_mut().push(("completed", path.to_path_buf()));
                 }
             },
             &mut |_| {},
+            &CopyScanProgress::default(),
         )
         .unwrap();
 
@@ -4025,6 +4466,7 @@ mod tests {
             &mut |bytes, path| discovered.push((path.to_path_buf(), bytes)),
             &mut |_, _, _| {},
             &mut |_| {},
+            &CopyScanProgress::default(),
         )
         .unwrap();
 
@@ -4058,6 +4500,7 @@ mod tests {
             &mut |bytes, path| discovered.push((bytes, path.to_path_buf())),
             &mut |_, _, _| {},
             &mut |_| {},
+            &CopyScanProgress::default(),
         );
 
         assert_eq!(result, Err(OperationError::Cancelled));
@@ -4086,6 +4529,7 @@ mod tests {
                 &mut |bytes, path| discovered_sender.send((bytes, path.to_path_buf())).unwrap(),
                 &mut |_, _, _| {},
                 &mut |_| {},
+                &CopyScanProgress::default(),
             )
         });
 
@@ -4200,6 +4644,7 @@ mod tests {
             &mut |_, _| {},
             &mut |_, _, _| {},
             &mut |_| {},
+            &CopyScanProgress::default(),
         )
         .unwrap();
         let item = UndoItem::RemoveCreated {
@@ -4227,6 +4672,7 @@ mod tests {
             &mut |_, _| {},
             &mut |_, _, _| {},
             &mut |_| {},
+            &CopyScanProgress::default(),
         )
         .unwrap();
         let actual =
@@ -4276,6 +4722,7 @@ mod tests {
             &mut |_, _| {},
             &mut |_, _, _| {},
             &mut |_| {},
+            &CopyScanProgress::default(),
         )
         .unwrap();
         assert_eq!(
@@ -4292,6 +4739,7 @@ mod tests {
             &mut |_, _| {},
             &mut |_, _, _| {},
             &mut |_| {},
+            &CopyScanProgress::default(),
         )
         .unwrap();
         assert_eq!(merged_report.undo_root, None);
@@ -4313,6 +4761,7 @@ mod tests {
             &mut |_, _| {},
             &mut |_, _, _| {},
             &mut |_| {},
+            &CopyScanProgress::default(),
         )
         .unwrap();
         assert_eq!(fs::read(&destination).unwrap(), b"new");
@@ -4389,26 +4838,59 @@ mod tests {
     }
 
     #[test]
-    fn issue_61_same_volume_move_rename_does_not_scan() {
+    fn issue_139_same_volume_file_move_reports_known_size_once() {
         let temp = TempDir::new();
         let source = temp.path().join("source.bin");
         let destination = temp.path().join("destination.bin");
         write(&source, b"content");
         let mut discovered = Vec::new();
+        let mut progress = Vec::new();
 
-        move_path_with_progress(
+        let report = move_path_with_progress(
             &source,
             &destination,
             &CancellationToken::new(),
             &mut replace,
             &mut |bytes, path| discovered.push((bytes, path.to_path_buf())),
-            &mut |_, _, _| {},
+            &mut |bytes, kind, path| progress.push((bytes, kind, path.to_path_buf())),
+        )
+        .unwrap();
+
+        assert_eq!(discovered, [(7, source.clone())]);
+        assert_eq!(progress, [(7, FileProgressKind::Completed, source.clone())]);
+        assert_eq!((report.files, report.bytes), (1, 7));
+        assert!(!source.exists());
+        assert_eq!(fs::read(destination).unwrap(), b"content");
+    }
+
+    #[test]
+    fn issue_61_same_volume_directory_move_rename_does_not_scan() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        write(&source.join("nested/content.bin"), b"content");
+        let mut discovered = Vec::new();
+        let mut progress = Vec::new();
+
+        let report = move_path_with_progress(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut replace,
+            &mut |bytes, path| discovered.push((bytes, path.to_path_buf())),
+            &mut |bytes, kind, path| progress.push((bytes, kind, path.to_path_buf())),
         )
         .unwrap();
 
         assert!(discovered.is_empty());
+        assert!(progress.is_empty());
+        assert_eq!((report.directories, report.files, report.bytes), (1, 0, 0));
         assert!(!source.exists());
-        assert_eq!(fs::read(destination).unwrap(), b"content");
+        assert_eq!(
+            fs::read(destination.join("nested/content.bin")).unwrap(),
+            b"content"
+        );
     }
 
     #[test]
@@ -4428,6 +4910,7 @@ mod tests {
             &mut |_, _| {},
             &mut |_, _, _| {},
             &mut |path| created.push(path.to_path_buf()),
+            &CopyScanProgress::default(),
         )
         .unwrap();
 

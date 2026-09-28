@@ -378,14 +378,27 @@ pub struct OperationProgress {
     pub completed_items: usize,
     pub total_files: Option<usize>,
     pub completed_files: usize,
+    pub skipped_files: usize,
     pub discovered_files: usize,
     pub processed_bytes: u64,
+    pub skipped_bytes: u64,
     pub total_bytes: Option<u64>,
     pub discovered_bytes: u64,
     pub scanning_complete: bool,
     pub prepared_items: usize,
     pub current_item: Option<PathBuf>,
     pub recent_speed_bps: Option<u64>,
+    pub copy_recovering: bool,
+}
+
+impl OperationProgress {
+    pub fn accounted_bytes(&self) -> u64 {
+        self.processed_bytes.saturating_add(self.skipped_bytes)
+    }
+
+    pub fn accounted_files(&self) -> usize {
+        self.completed_files.saturating_add(self.skipped_files)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -411,7 +424,7 @@ impl TransferRateEstimator {
         if self
             .samples
             .back()
-            .is_some_and(|(_, previous)| processed_bytes <= *previous)
+            .is_some_and(|(elapsed, _)| active_elapsed <= *elapsed)
         {
             return;
         }
@@ -431,8 +444,11 @@ impl TransferRateEstimator {
         let (first_elapsed, first_bytes) = self.samples.front()?;
         let (last_elapsed, last_bytes) = self.samples.back()?;
         let elapsed = last_elapsed.saturating_sub(*first_elapsed);
-        if elapsed < Self::MIN_SPAN || last_bytes <= first_bytes {
+        if elapsed < Self::MIN_SPAN {
             return None;
+        }
+        if last_bytes == first_bytes {
+            return (elapsed >= Self::WINDOW).then_some(0);
         }
         Some((last_bytes - first_bytes).saturating_mul(1_000) / elapsed.as_millis() as u64)
     }
@@ -639,6 +655,7 @@ impl OperationTask {
             conflict_defaults: HashMap::new(),
         }
     }
+
     pub fn set_permanent_delete_stage(&mut self, stage: PermanentDeleteStage) {
         if self.kind == FileOperationKind::PermanentDelete {
             self.permanent_delete_stage = Some(stage);
@@ -1003,6 +1020,7 @@ impl OperationManager {
             ) {
                 return true;
             }
+
             let required_age = if task.resource == OperationResource::Cleanup
                 && task.kind == FileOperationKind::PermanentDelete
                 && task.state == OperationState::Completed
@@ -1294,6 +1312,22 @@ mod tests {
         assert_eq!(estimator.bytes_per_second(), Some(10_000));
         estimator.record(Duration::from_millis(7_000), 41_000, 0);
         assert_eq!(estimator.bytes_per_second(), Some(5_000));
+    }
+
+    #[test]
+    fn issue_137_idle_rate_ticks_expire_stale_speed_and_recover() {
+        let mut estimator = TransferRateEstimator::default();
+        estimator.record(Duration::ZERO, 0, 0);
+        estimator.record(Duration::from_secs(1), 10_000, 0);
+        assert_eq!(estimator.bytes_per_second(), Some(10_000));
+        for second in 2..=6 {
+            estimator.record(Duration::from_secs(second), 10_000, 0);
+        }
+        assert_eq!(estimator.bytes_per_second(), Some(0));
+        estimator.record(Duration::from_secs(7), 20_000, 0);
+        assert_eq!(estimator.bytes_per_second(), Some(2_000));
+        estimator.record(Duration::from_secs(7), 20_000, 1);
+        assert_eq!(estimator.bytes_per_second(), None);
     }
 
     #[test]
