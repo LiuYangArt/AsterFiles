@@ -2,7 +2,7 @@
 
 ## Windows CI（#106）
 
-`.github/workflows/ci.yml` 在 main push、以 main 为目标的 PR 和手动运行时执行完整验证：验证脚本测试、Pester 脚本测试、格式、Clippy、Rust 测试、Debug 构建和全部 20 个无界面场景。Windows Server 2025 runner 提供 PowerShell 7、Rustup、Visual Studio C++ 与 Windows SDK；工作流安装 Python 3.13 和 Pester 4.10.1，Rustup 从 `rust-toolchain.toml` 安装固定版本及 rustfmt/Clippy。本地也需这些依赖；Pester 安装命令为 `Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser -Force -SkipPublisherCheck`。Rust 版本只有该 TOML 文件一处来源，标签构建同样读取它。固定 Server 2025 是因为现有 CopyFile2 稀疏复制依赖 Windows 11 22H2 之后的标志；Server 2022 会返回 Win32 87，不能作为该功能的验证环境。
+`.github/workflows/ci.yml` 在 main push、以 main 为目标的 PR 和手动运行时执行完整验证：验证脚本测试、Pester 脚本测试、格式、Clippy、Rust 测试、Debug 构建和全部 20 个无界面场景。提交说明以 `chore: release ` 开头的版本提交跳过 Windows CI；`publish.ps1` 已在本地跑过完整验证，标签推送只触发 Release 打包。不要用 `[skip ci]`，否则连打包工作流也会被跳过。Windows Server 2025 runner 提供 PowerShell 7、Rustup、Visual Studio C++ 与 Windows SDK；工作流安装 Python 3.13 和 Pester 4.10.1，Rustup 从 `rust-toolchain.toml` 安装固定版本及 rustfmt/Clippy。本地也需这些依赖；Pester 安装命令为 `Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser -Force -SkipPublisherCheck`。Rust 版本只有该 TOML 文件一处来源，标签构建同样读取它。固定 Server 2025 是因为现有 CopyFile2 稀疏复制依赖 Windows 11 22H2 之后的标志；Server 2022 会返回 Win32 87，不能作为该功能的验证环境。
 
 Cargo 检查、测试、Debug 和本地 Release 构建均使用 `--locked`，依赖变化必须显式更新并提交 `Cargo.lock`。CI 缓存 Cargo 下载数据与 kache，只允许 main 保存缓存，不缓存 `target` 或 `artifacts/verify` 成功标记。首次准备使用 `python tools/build.py setup`，本地、CI 与标签打包共用固定版本和缓存配置。PR 使用 `pull_request` 事件与只读权限，checkout 不保留凭据。工作流不执行发布；同一 PR/引用的新运行取消旧运行，最长 60 分钟。
 

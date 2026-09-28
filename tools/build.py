@@ -78,6 +78,9 @@ def measure(path: Path) -> dict[str, int]:
         disk_size.restype = ctypes.c_int
     if path.is_symlink() or path.is_junction():
         raise RuntimeError(f"Cannot measure redirected root: {path}")
+    # Fresh CI checkouts and first local runs have no target yet.
+    if not path.exists():
+        return result
     for directory, children, files in os.walk(path, onerror=lambda error: (_ for _ in ()).throw(error)):
         for child in children:
             candidate = Path(directory) / child

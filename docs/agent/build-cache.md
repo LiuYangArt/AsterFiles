@@ -46,6 +46,6 @@ Windows 可执行文件缓存默认关闭，最终程序仍由 Cargo 正常编�
 
 ## CI 与标签打包
 
-Windows CI 与标签构建先执行同一个 setup，再恢复或使用 Cargo 下载缓存与 kache。云端不保存 target，避免不断上传历史构建树。缓存键包含工具链、构建配置、依赖锁文件和提交；CI 仅 main 保存。标签打包通过 `release.ps1` 调用受管构建入口。
+Windows CI 与标签构建先执行同一个 setup，再恢复或使用 Cargo 下载缓存与 kache。云端不保存 target，避免不断上传历史构建树。尚未创建的 `target` 按空目录统计，首次 checkout 不会因此失败。缓存键包含工具链、构建配置、依赖锁文件和提交；CI 仅 main 保存。版本发布提交不跑 Windows CI，标签打包通过 `release.ps1` 调用受管构建入口。
 
 本地 Release 构建仍只在用户明确要求或确认 Issue 完成后执行。工具链升级与缓存配置修改不触发发布，也不改变版本、标签或推送行为。

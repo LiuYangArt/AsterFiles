@@ -53,6 +53,16 @@ class BuildPolicyTests(unittest.TestCase):
         self.assertEqual(exe.read_bytes(), b"runnable")
         self.assertFalse((build.TARGET / "debug" / "old.o").exists())
 
+    def test_prepare_and_status_allow_missing_target(self):
+        self.assertFalse(build.TARGET.exists())
+        with mock.patch.object(build, "run", return_value=mock.Mock(stdout="kache test\n")):
+            build.prepare()
+        empty = build.measure(build.TARGET)
+        self.assertEqual(empty["files"], 0)
+        self.assertEqual(empty["allocated_bytes"], 0)
+        build.report("status")
+        self.assertTrue((build.EVIDENCE / "build-cache-status.json").is_file())
+
     def test_prepare_cleans_on_first_run_and_input_change_but_not_unchanged(self):
         stale = build.TARGET / "debug" / "stale.o"
         stale.parent.mkdir(parents=True)
