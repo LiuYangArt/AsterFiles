@@ -32,7 +32,7 @@ Describe 'publish.ps1' {
         $scriptContent | Should Match "refs/tags/\{0\}:refs/tags/\{0\}"
     }
     It 'skips Windows CI for version-bump release commits without skipping the tag workflow' {
-        $ciWorkflowContent | Should Match "github\.event_name != 'push' \|\| !startsWith\(github\.event\.head_commit\.message, 'chore: release '"
+        $ciWorkflowContent | Should Match "if: `"`\$\{\{ github\.event_name != 'push' \|\| !startsWith\(github\.event\.head_commit\.message, 'chore: release '"
         $ciWorkflowContent | Should Not Match '\[skip ci\]'
         $scriptContent | Should Match 'chore: release \$tag'
         $scriptContent | Should Not Match '\[skip ci\]'

@@ -22,7 +22,7 @@ concurrency:
 jobs:
   verify:
     # 版本提交已在本地验证，标签工作流负责打包，无需再跑 Windows CI。
-    if: github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'chore: release ')
+    if: "${{ github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'chore: release ') }}"
     runs-on: windows-2025
     timeout-minutes: 60
     defaults:
