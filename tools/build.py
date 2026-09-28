@@ -41,11 +41,11 @@ def run(command: list[str], capture: bool = False) -> subprocess.CompletedProces
 
 
 def safe_tree(path: Path) -> Path:
-    expected = ROOT.absolute()
     absolute = path.absolute()
     if absolute not in (TARGET, STORE, CACHE_ROOT / "runtime"):
         raise RuntimeError(f"Not a managed build directory: {path}")
-    if not absolute.resolve().is_relative_to(expected) or absolute.is_symlink() or absolute.is_junction():
+    # Compare expanded paths. GitHub runners store the profile as RUNNER~1.
+    if not absolute.resolve().is_relative_to(ROOT.resolve()) or absolute.is_symlink() or absolute.is_junction():
         raise RuntimeError(f"Refusing redirected build directory: {path}")
     for directory, children, _ in os.walk(absolute):
         for name in children:

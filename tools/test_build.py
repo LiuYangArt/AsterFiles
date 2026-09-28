@@ -81,6 +81,20 @@ class BuildPolicyTests(unittest.TestCase):
             build.prepare()
         self.assertFalse(fresh.exists())
 
+    def test_safe_tree_accepts_short_names_that_resolve_inside_the_root(self):
+        build.TARGET.mkdir()
+        original = Path.resolve
+
+        def expand(self, *args, **kwargs):
+            root = os.path.normcase(os.path.normpath(str(build.ROOT)))
+            text = os.path.normcase(os.path.normpath(str(self)))
+            if text == root or text.startswith(root + os.sep):
+                return Path("D:/normalized-root") / Path(text).relative_to(root)
+            return original(self, *args, **kwargs)
+
+        with mock.patch.object(Path, "resolve", expand):
+            self.assertEqual(build.safe_tree(build.TARGET), build.TARGET.absolute())
+
     def test_redirected_file_and_directory_are_rejected(self):
         target = build.TARGET
         target.mkdir(parents=True)
