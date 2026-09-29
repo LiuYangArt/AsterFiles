@@ -7,7 +7,7 @@ export struct FileRow { id: int, loaded: bool, group-header: bool, group-label: 
 export struct GridRow { group-header: bool, group-label: string, group-detail: string, group-count: int, entries: [FileRow] }
 export struct PositionedGridRow { row: GridRow, offset: float, extent: float }
 export struct HistoryRow { index: int, label: string }
-export struct BreadcrumbRow { index: int, label: string, current: bool }
+export struct BreadcrumbRow { index: int, label: string, current: bool, natural-width: float, offset: float, extent: float, generation: int }
 export struct TabRow { id: int, title: string, active: bool, loading: bool, icon: image, is-drive: bool, is-home: bool, is-settings: bool }
 export struct SidebarRow { index: int, stable-id: string, label: string, icon-kind: int, group-kind: int, source-kind: int, is-drive: bool, icon: image, drive-progress: float, drive-state: int, drive-status: string }
 export struct ColumnRow { kind: int, label: string, visible: bool, min-width: length, content-left: length, content-right: length, icon-slot: length }
@@ -590,25 +590,37 @@ component LightScrollBar inherits Rectangle {
 
 component BreadcrumbButton inherits Rectangle {
     in property <string> label;
+    in property <string> tip: root.label;
     in property <bool> current: false;
     callback clicked();
-    min-width: 42px;
     height: 30px;
+    clip: true;
     border-radius: 4px;
     background: !root.current && crumb-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
-    HorizontalLayout {
-        padding-left: 8px;
-        padding-right: 8px;
-        spacing: 5px;
-        Text { text: root.label; color: VisualStyle.c30333a; font-size: 12px; font-weight: root.current ? 600 : 400; vertical-alignment: center; }
-        Text { visible: !root.current; text: "›"; color: VisualStyle.c777b85; font-size: 14px; vertical-alignment: center; }
+    Text {
+        x: 8px;
+        width: max(0px, parent.width - (root.current ? 16px : 29px));
+        height: parent.height;
+        text: root.label;
+        color: VisualStyle.c30333a;
+        font-size: 12px;
+        font-weight: root.current ? 600 : 400;
+        vertical-alignment: center;
+        overflow: elide;
+        wrap: no-wrap;
+    }
+    if !root.current: Text {
+        x: max(0px, parent.width - 16px); width: 8px; height: parent.height;
+        text: "›"; color: VisualStyle.c777b85; font-size: 14px;
+        vertical-alignment: center;
     }
     crumb-touch := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
     }
+    Tooltip { text: @markdown("\{root.tip}"); }
     accessible-role: button;
-    accessible-label: root.label;
+    accessible-label: root.tip;
     accessible-enabled: true;
     accessible-action-default => { root.clicked(); }
 }
@@ -894,7 +906,33 @@ export component AppWindow inherits Window {
     in property <[TabRow]> tabs;
     in property <[HistoryRow]> back-history;
     in property <[HistoryRow]> forward-history;
+    in property <[BreadcrumbRow]> breadcrumb-source;
     in property <[BreadcrumbRow]> breadcrumbs;
+    in property <[BreadcrumbRow]> breadcrumb-overflow;
+    in property <float> breadcrumb-overflow-x;
+    in property <float> breadcrumb-overflow-width;
+    in property <int> breadcrumb-generation;
+    in property <int> breadcrumb-tab-id: -1;
+    in property <string> breadcrumb-request-id;
+    out property <float> breadcrumb-available-width: breadcrumb-strip.width / 1px;
+    changed breadcrumb-available-width => { root.breadcrumb-width-changed(); }
+    callback breadcrumb-width-changed();
+    private property <string> breadcrumb-measure-label;
+    private property <bool> breadcrumb-measure-current;
+    public function measure-breadcrumb(label: string, current: bool) -> float {
+        root.breadcrumb-measure-label = label;
+        root.breadcrumb-measure-current = current;
+        return ceil(breadcrumb-measure.preferred-width / 1px) + (current ? 16 : 29);
+    }
+    breadcrumb-measure := Text {
+        visible: false;
+        text: root.breadcrumb-measure-label;
+        font-size: 12px;
+        font-weight: root.breadcrumb-measure-current ? 600 : 400;
+        wrap: no-wrap;
+    }
+    public function close-breadcrumb-menu() { breadcrumb-menu.close(); }
+    changed address-editing => { root.close-breadcrumb-menu(); }
     in property <[SidebarRow]> sidebar-items;
     in property <[ColumnRow]> columns;
     in property <float> insertion-indicator-width: 5;
@@ -1116,6 +1154,7 @@ export component AppWindow inherits Window {
     in property <string> text-window-close: "关闭";
     in property <string> text-cancel-edit: "取消编辑";
     in property <string> text-address: "路径";
+    in property <string> text-breadcrumb-overflow;
     in property <string> text-search-recursive: "搜索当前文件夹及子文件夹";
     in property <string> text-search-current: "仅搜索当前文件夹";
     in property <string> text-search-global-disabled: "全局搜索不支持切换范围";
@@ -1177,7 +1216,7 @@ export component AppWindow inherits Window {
     callback show-sidebar-background-menu(float, float);
     callback toggle-network();
     callback refresh-network();
-    callback navigate-breadcrumb(int);
+    callback navigate-breadcrumb(int, int);
     callback select-entry(int, bool, bool);
     callback clear-selection();
     callback begin-rectangle-selection(float, float, bool, bool);
@@ -1642,9 +1681,59 @@ export component AppWindow inherits Window {
                 IconButton { accessible-id: "navigation-up"; icon-source: IconMap.action-up; tip: root.text-up + " (Alt+Up)"; enabled: root.can-navigate-up; button-label: root.text-up; clicked => { root.navigate-up(); } }
                 if !root.compact: IconButton { accessible-id: "navigation-refresh"; icon-source: IconMap.action-refresh; tip: root.text-refresh + " (F5)"; enabled: root.can-refresh; button-label: root.text-refresh; clicked => { root.refresh(); } }
                 Rectangle {
-                    height: 38px; horizontal-stretch: 1; background: VisualStyle.dark-theme && address-hover.has-hover ? #282828 : VisualStyle.cffffff; border-width: root.address-editing ? 1px : 0px; border-color: VisualStyle.c4f6bed; border-radius: 5px;
+                    height: 38px; min-width: 0px; horizontal-stretch: 1; background: VisualStyle.dark-theme && address-hover.has-hover ? #282828 : VisualStyle.cffffff; border-width: root.address-editing ? 1px : 0px; border-color: VisualStyle.c4f6bed; border-radius: 5px;
                     address-hover := TouchArea {
-                        if !root.address-editing: Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; HorizontalLayout { padding-left: 8px; padding-right: 8px; padding-top: 3px; padding-bottom: 3px; spacing: 2px; Rectangle { width: 18px; height: 100%; InlineIcon { y: (parent.height - self.height) / 2; icon-source: root.current-location-icon.width != 0 ? root.current-location-icon : (root.active-is-home ? IconMap.location-home : (root.current-location-is-drive ? IconMap.location-drive : IconMap.file-folder)); icon-size: 16px; } address-drag-touch := TouchArea { enabled: root.can-refresh && !root.search-results-mode; mouse-cursor: self.enabled ? grab : default; pointer-event(event) => { if event.button == PointerEventButton.left && event.kind == PointerEventKind.down { root.begin-address-drag((self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px, (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px); } if event.button == PointerEventButton.left && event.kind == PointerEventKind.up { root.end-address-drag(); } } moved => { if self.pressed { root.update-address-drag((self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px, (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px); } } } } for crumb in root.breadcrumbs: BreadcrumbButton { label: crumb.label; current: crumb.current; clicked => { root.navigate-breadcrumb(crumb.index); } } Rectangle { horizontal-stretch: 1; TouchArea { mouse-cursor: text; clicked => { root.begin-search(); } } } } }
+                        breadcrumb-view := Rectangle {
+                            visible: !root.address-editing;
+                            x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px;
+                            clip: true;
+                            Rectangle {
+                                x: 8px; y: 3px; width: 18px; height: 30px;
+                                InlineIcon {
+                                    y: (parent.height - self.height) / 2;
+                                    icon-source: root.current-location-icon.width != 0 ? root.current-location-icon : (root.active-is-home ? IconMap.location-home : (root.current-location-is-drive ? IconMap.location-drive : IconMap.file-folder));
+                                    icon-size: 16px;
+                                }
+                                address-drag-touch := TouchArea {
+                                    enabled: root.can-refresh && !root.search-results-mode;
+                                    mouse-cursor: self.enabled ? grab : default;
+                                    pointer-event(event) => {
+                                        if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                                            root.begin-address-drag((self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px, (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px);
+                                        }
+                                        if event.button == PointerEventButton.left && event.kind == PointerEventKind.up { root.end-address-drag(); }
+                                    }
+                                    moved => {
+                                        if self.pressed { root.update-address-drag((self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px, (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px); }
+                                    }
+                                }
+                            }
+                            TouchArea { x: 28px; width: max(0px, parent.width - 28px); mouse-cursor: text; clicked => { root.begin-search(); } }
+                            breadcrumb-strip := Rectangle {
+                                x: 28px; y: 3px; width: max(0px, parent.width - 54px); height: 30px;
+                                clip: true;
+                                for crumb in root.breadcrumbs: BreadcrumbButton {
+                                    x: crumb.offset * 1px; width: crumb.extent * 1px;
+                                    label: crumb.label; current: crumb.current;
+                                    clicked => { root.navigate-breadcrumb(crumb.index, crumb.generation); }
+                                }
+                                breadcrumb-menu := ContextMenuArea {
+                                    x: root.breadcrumb-overflow-x * 1px;
+                                    width: root.breadcrumb-overflow-width * 1px; height: 30px;
+                                    BreadcrumbButton {
+                                        width: parent.width; visible: root.breadcrumb-overflow.length > 0;
+                                        label: "…"; tip: root.text-breadcrumb-overflow;
+                                        clicked => { breadcrumb-menu.show({ x: 0px, y: self.height }); }
+                                    }
+                                    Menu {
+                                        for crumb in root.breadcrumb-overflow: MenuItem {
+                                            title: crumb.label;
+                                            activated => { root.navigate-breadcrumb(crumb.index, crumb.generation); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         address-editor := AddressEditor { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: parent.height - 4px; text <=> root.address-input; address-label: root.search-mode ? root.text-parent-path : root.text-address; cancel-label: root.text-cancel-edit; depth-enabled: root.search-mode && root.search-depth-enabled; recursive: root.search-recursive; depth-label: !root.search-depth-enabled ? root.text-search-global-disabled : (root.search-recursive ? root.text-search-recursive : root.text-search-current); changed(value) => { root.address-input-changed(value); } accepted(value) => { root.navigate-path(value); } cancelled => { root.cancel-address-edit(); } toggle-depth => { root.toggle-search-depth(); } }
                     }
 

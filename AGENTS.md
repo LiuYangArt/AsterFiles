@@ -42,6 +42,10 @@ CI 只有仓库读取权限，不发布、不创建标签；同一 PR/引用的�
 
 `python tools/build.py test --locked issue_143 -- --nocapture` 使用无窗口后端和模拟时间检查 500 ms 提示延迟、首批与终态即时显示、导航和关闭后的旧计时隔离。统一验证为 `python tools/verify.py --quick`，日志位于 `artifacts/logs/issue-143-verify.log` 和 `artifacts/logs/verify-test.log`。真实文字闪现由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
 
+## 深层面包屑专项验证（#145）
+
+`python tools/build.py test --locked issue_145 -- --nocapture` 使用无窗口后端验证实测字宽、首尾保留、祖先折叠顺序、窄宽度边界和过期导航拒收，日志为 `artifacts/logs/issue-145-tests.log`。统一验证使用 `python tools/verify.py --quick`，日志为 `artifacts/logs/issue-145-verify.log`，汇总为 `artifacts/verify/summary.json`。真实缩放、悬停与菜单跳转由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
+
 ## UI 操作与验证
 
 - 禁止 Codex 操作、自动化或尝试控制 AsterFiles 的 UI，包括通过内置浏览器、Chrome、Computer Use、Playwright、agent-browser、截图点击或键鼠模拟等方式。

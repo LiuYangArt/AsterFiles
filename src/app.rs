@@ -55,6 +55,8 @@ use crate::platform::windows::address_path::{
 
 pub(crate) mod action_scenario;
 mod actions;
+mod breadcrumb;
+mod breadcrumb_layout;
 #[cfg(test)]
 mod copy_interaction_tests;
 #[cfg(test)]
@@ -10220,6 +10222,7 @@ fn wire_callbacks(
         operation: operation_sender.clone(),
     };
     wire_system_integration(ui, &state);
+    breadcrumb::wire_resize(ui);
     let weak_for_network = ui.as_weak();
     let discovery_sender_for_ui = network_discovery_sender.clone();
     let discovery_state_for_ui = state.clone();
@@ -10543,15 +10546,19 @@ fn wire_callbacks(
     let sender_for_breadcrumb = sender.clone();
     let network_sender_for_breadcrumb = network_sender.clone();
     let state_for_breadcrumb = state.clone();
-    ui.on_navigate_breadcrumb(move |index| {
+    ui.on_navigate_breadcrumb(move |index, generation| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if generation != ui.get_breadcrumb_generation() {
+            return;
+        }
         let target = {
             let app = state_for_breadcrumb
                 .lock()
                 .expect("app state mutex is not poisoned");
-            usize::try_from(index)
-                .ok()
-                .and_then(|index| app.active().breadcrumb_paths().get(index).cloned())
-                .map(|(_, path)| (app.active_window_state().active_tab, path))
+            breadcrumb::resolve_target(&ui, app.active(), index, generation)
+                .map(|path| (app.active_window_state().active_tab, path))
         };
         if let Some((tab_id, location)) = target {
             if location
@@ -10570,9 +10577,7 @@ fn wire_callbacks(
                 location,
                 NavigationKind::Normal,
             );
-            if let Some(ui) = weak.upgrade() {
-                refresh_ui(&ui, &state_for_breadcrumb);
-            }
+            refresh_ui(&ui, &state_for_breadcrumb);
         }
     });
     let weak = ui.as_weak();
@@ -22736,22 +22741,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
             })
             .collect::<Vec<_>>(),
     )));
-    let breadcrumb_paths = tab.breadcrumb_paths();
-    ui.set_breadcrumbs(ModelRc::new(VecModel::from(
-        breadcrumb_paths
-            .iter()
-            .enumerate()
-            .map(|(index, (label, location))| BreadcrumbRow {
-                index: index as i32,
-                label: match location {
-                    NavigationLocation::Home => navigation_display_name(location, app.language),
-                    _ => label.clone(),
-                }
-                .into(),
-                current: index + 1 == breadcrumb_paths.len(),
-            })
-            .collect::<Vec<_>>(),
-    )));
+    breadcrumb::project(ui, tab, app.language);
     ui.set_back_history(ModelRc::new(VecModel::from(
         tab.back_history
             .iter()
@@ -23933,6 +23923,7 @@ fn apply_ui_texts(ui: &AppWindow, language: Language) {
     ui.set_text_window_maximize(maximize.into());
     ui.set_text_window_close(close.into());
     ui.set_text_address(address.into());
+    ui.set_text_breadcrumb_overflow(Texts::new(language).breadcrumb_overflow().into());
     ui.set_text_cancel_edit(cancel_edit.into());
     ui.set_text_search_recursive(search_recursive.into());
     ui.set_text_search_current(search_current.into());

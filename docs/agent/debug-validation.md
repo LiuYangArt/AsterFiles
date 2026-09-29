@@ -55,6 +55,19 @@ python tools/verify.py --release     # 收尾：复用未过期的完整验证�
 
 该入口只暂存 `-Paths` 明确列出的文件；存在其他未暂存或未跟踪内容时拒绝继续。随后按顺序执行 Release 收尾验证、差异检查、提交、证据回写、Project `Done` 和关闭 Issue；任一步失败都立即停止，不自动推送、打标签或发布。
 
+## 深层面包屑折叠（#145）
+
+`python tools/build.py test --locked issue_145 -- --nocapture` 使用无窗口后端，验证实际文字测量、宽度分配、首尾保留、祖先顺序、全名恢复、UNC 与虚拟位置，以及导航或标签变化后的旧动作拒收。纯布局覆盖 0～1999 逻辑像素，组件投影覆盖 640、900、1280 和 4000 逻辑像素窗口宽度。测试不访问网络或打开应用窗口。
+
+专项日志为 `artifacts/logs/issue-145-tests.log`。统一检查使用 `python tools/verify.py --quick`，日志为 `artifacts/logs/issue-145-verify.log`，汇总为 `artifacts/verify/summary.json`。
+
+用户手动验收：
+
+1. 打开包含多层目录和长名称的路径，缩窄再拉宽窗口，确认文字不重叠、当前位置始终可见，空间足够时恢复完整层级。
+2. 点击根位置后的省略按钮，确认隐藏祖先按路径顺序排列，并任选一项检查跳转。
+3. 悬停省略名称检查全名；按 `Ctrl+L` 检查完整路径仍可编辑和复制。
+4. 菜单展开后切换标签或导航，确认旧菜单关闭；在现有 UNC 路径和中英文界面各检查一次。
+
 ## 编译验证期间终端连续闪现（#131）
 
 Debug 验证和 Issue 收尾都执行 Cargo 测试。此前应用的 Windows GUI 子系统设置也作用于测试程序，导致测试程序没有可继承的控制台；目录联接回归测试又会启动 13 次 PowerShell。旧测试程序的单例实测捕获到其 PowerShell 子进程触发 conhost、OpenConsole 和 WindowsTerminal，新窗口随短命命令退出而消失。

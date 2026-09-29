@@ -36,6 +36,10 @@ impl Texts {
         Self { language }
     }
 
+    pub fn breadcrumb_overflow(self) -> &'static str {
+        self.choose("显示隐藏的上级目录", "Show hidden parent folders")
+    }
+
     pub fn rename_validation(
         self,
         error: crate::fs::file_operations::NameValidationError,
