@@ -1016,6 +1016,8 @@ export component AppWindow inherits Window {
     in property <int> sort-field: 0;
     in property <bool> sort-descending: false;
     in property <int> page-state: 0;
+    in property <bool> loading-hint-visible: false;
+    in property <int> loading-hint-generation: 0;
     in property <bool> dark-theme: false;
     in property <int> theme-mode: 0;
     in property <int> language-mode: 0;
@@ -2490,7 +2492,7 @@ accessible-label: entry.name;
                             }
                         }
                     }
-                    if root.page-state == 1 || root.page-state == 3: VerticalLayout {
+                    if (root.page-state == 1 && root.loading-hint-visible) || root.page-state == 3: VerticalLayout {
                         alignment: center; spacing: 8px;
                         Text { text: root.page-state == 1 ? root.text-loading : (root.search-results-mode ? root.text-no-search-results : root.text-empty-folder); color: VisualStyle.c62656f; font-size: 16px; horizontal-alignment: center; }
                     }

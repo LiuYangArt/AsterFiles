@@ -413,3 +413,21 @@ Slint 无窗口后端验证各视图及分组中的目标范围滚动，并派�
 3. 检查普通单选、Ctrl 离散选择、Shift 范围选择，以及打开目录后侧键返回再双击。手动 F5 和真实外部改动仍按原有刷新规则处理。
 
 排查历史见 [操作完成选择复盘](../postmortem/postmortem-2026-08-31-operation-focus-selection.md)。
+
+## Issue #141 网络目录增量排序
+
+专项命令：`python tools/build.py test --locked issue_141 -- --nocapture --test-threads=1`；完整验证：`python tools/verify.py`，包含 Debug 构建。
+
+专项测试使用内存数据和 Slint 无窗口后端，覆盖目标目录排序偏好、五种字段与升降序、多批合并、加载中改变排序、完成时顺序与选择保留、列表插入和滚动位置、分组及网格投影、导航和关闭后迟到结果拒收。另验证网络生产者等待消费确认时，本地目录仍可推进且取消能释放等待。既有 #103、#104 测试覆盖实际辅助进程挂起、超时、取消与本地来源隔离。
+
+十万条目按 256 项分批的测试输出合并总耗时、单批峰值和显示模型更新时间，不打开真实窗口；这些指标不能代替 NAS 速度和真实交互验收。专项日志为 `artifacts/logs/issue-141-tests.log`，完整验证日志为 `artifacts/logs/issue-141-full-verify.log`，汇总为 `artifacts/verify/summary.json`。
+
+用户手动启动 `target/debug/asterfiles.exe`：在原网络目录分别按名称和修改时间排序，确认首批、后续批次与加载完成后的顺序一致；加载中滚动并选中文件，检查选择和可见位置保持；在慢连接下切换本地标签、关闭网络标签，确认按钮响应及本地加载正常。列表、网格与分组各检查一次。真实窗口由用户验收，确认前 Issue 保持打开。
+
+## Issue #143 网络目录加载文字防闪烁
+
+专项命令：`python tools/build.py test --locked issue_143 -- --nocapture`；统一验证：`python tools/verify.py --quick`，包含 Debug 构建。测试使用 Slint 无窗口后端和模拟时间，覆盖 499/500 ms 显示边界、刷新不重置等待、快速首批、提示显示后首批到达、空目录与错误、取消与关闭、连续导航和切换标签。测试不显示或操作桌面窗口。
+
+日志为 `artifacts/logs/issue-143-verify.log`、`artifacts/logs/verify-test.log`，汇总为 `artifacts/verify/summary.json`。用户手动进入原网络目录，确认快速加载时不闪现中央文字；较慢时在约半秒后显示，文件出现时消失。等待期间切换本地标签或关闭网络标签，确认按钮响应正常。
+
+排序与提示闪现的根因、修复边界和长期排查入口见 [网络目录显示复盘](../postmortem/postmortem-2026-09-29-network-directory-presentation.md)。

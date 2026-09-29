@@ -1011,17 +1011,56 @@ impl TabSession {
     }
 
     pub fn append_pending(&mut self, mut entries: Vec<FileEntry>) -> usize {
-        let start = self.pending_entries.len();
-        for (offset, entry) in entries.iter().enumerate() {
-            self.entry_indices.insert(entry.id, start + offset);
+        let previous_len = self.pending_entries.len();
+        let field = self.sort_field;
+        let direction = self.sort_direction;
+        entries.sort_unstable_by(|left, right| compare_entries(left, right, field, direction));
+        let append_only =
+            self.pending_entries
+                .last()
+                .zip(entries.first())
+                .is_none_or(|(last, first)| {
+                    compare_entries(last, first, field, direction) != Ordering::Greater
+                });
+        if append_only {
+            for (offset, entry) in entries.iter().enumerate() {
+                self.entry_indices.insert(entry.id, previous_len + offset);
+            }
+            self.pending_entries.append(&mut entries);
+        } else {
+            // Binary searches compare only new entries; the growing directory is moved once.
+            let positions = entries
+                .iter()
+                .map(|entry| {
+                    self.pending_entries.partition_point(|existing| {
+                        compare_entries(existing, entry, field, direction) != Ordering::Greater
+                    })
+                })
+                .collect::<Vec<_>>();
+            let existing = std::mem::take(&mut self.pending_entries);
+            let mut merged = Vec::with_capacity(existing.len() + entries.len());
+            let mut existing = existing.into_iter();
+            let mut copied = 0;
+            for (entry, position) in entries.into_iter().zip(positions) {
+                merged.extend(existing.by_ref().take(position - copied));
+                copied = position;
+                merged.push(entry);
+            }
+            merged.extend(existing);
+            self.pending_entries = merged;
+            self.entry_indices = self
+                .pending_entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (entry.id, index))
+                .collect();
         }
-        self.pending_entries.append(&mut entries);
         if self.page_source == PageSource::Search {
             self.search_state = SearchState::Partial;
         } else {
             self.load_state = LoadState::Partial;
         }
-        start
+        previous_len
     }
 
     pub fn merge_search_page(
@@ -1400,11 +1439,7 @@ impl TabSession {
             self.sort_field = field;
             self.sort_direction = SortDirection::Ascending;
         }
-        let field = self.sort_field;
-        let direction = self.sort_direction;
-        Arc::make_mut(&mut self.entries)
-            .sort_unstable_by(|left, right| compare_entries(left, right, field, direction));
-        self.rebuild_entry_indices();
+        self.resort_entries();
     }
 
     pub fn set_search_sort(&mut self, field: SortField) {
@@ -1431,6 +1466,10 @@ impl TabSession {
             .collect();
     }
     pub fn resort_entries(&mut self) {
+        if matches!(self.load_state, LoadState::Loading | LoadState::Partial) {
+            self.sort_pending();
+            return;
+        }
         let field = self.sort_field;
         let direction = self.sort_direction;
         Arc::make_mut(&mut self.entries)

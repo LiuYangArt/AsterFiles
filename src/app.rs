@@ -65,6 +65,9 @@ mod file_operation_coordinator;
 mod file_operation_worker;
 #[path = "library_loading.rs"]
 mod library_loading;
+mod loading_hint;
+#[cfg(test)]
+mod network_sort_tests;
 #[cfg(test)]
 mod test_support;
 mod window_sessions;
@@ -10922,6 +10925,19 @@ fn wire_callbacks(
         } else {
             None
         };
+        let directory_sort = app
+            .tab(tab_id)
+            .filter(|tab| tab.page_source == PageSource::Directory)
+            .and_then(|tab| {
+                tab.visible_path()
+                    .map(|path| (path.to_path_buf(), tab.sort_field, tab.sort_direction))
+            });
+        if let Some((path, field, direction)) = directory_sort {
+            app.update_directory_preference(path, |preference| {
+                preference.sort_field = field;
+                preference.sort_direction = direction;
+            });
+        }
         drop(app);
         submit_folder_size_queries(
             &everything_for_sort,
@@ -17686,14 +17702,31 @@ fn start_event_pump(
                             "network_root_event_apply_started",
                         );
                     }
-                    let reveal_selection = finished.is_some_and(|(tab_id, request_id)| {
-                        state.lock().ok().is_some_and(|app| {
-                            app.focus_after_refresh.get(&tab_id).is_some_and(|pending| {
-                                pending.request_id == Some(request_id)
-                                    && pending.action == PendingFocusAction::Select
-                            })
-                        })
+                    let focus_action = finished.and_then(|(tab_id, request_id)| {
+                        let app = state.lock().ok()?;
+                        app.focus_after_refresh
+                            .get(&tab_id)
+                            .filter(|pending| pending.request_id == Some(request_id))
+                            .map(|pending| pending.action)
                     });
+                    let network_scroll =
+                        finished
+                            .filter(|_| network_tab)
+                            .and_then(|(tab_id, request_id)| {
+                                let target = state.lock().ok().and_then(|app| {
+                                    app.tab(tab_id).filter(|tab| tab.accepts(request_id))?;
+                                    let window_id = app.window_for_tab(tab_id)?;
+                                    (app.window(window_id)?.active_tab == tab_id)
+                                        .then(|| window_ui(window_id))
+                                        .flatten()
+                                })?;
+                                (target.get_file_viewport_y() < 0.0).then(|| {
+                                    (
+                                        target.clone_strong(),
+                                        capture_zoom_anchor(&target, 16.0, 0.0),
+                                    )
+                                })
+                            });
                     let icon_requests = apply_event(&state, event);
                     if network_root_finished {
                         platform::windows::network::record_runtime_event(
@@ -17759,6 +17792,9 @@ fn start_event_pump(
                         } else {
                             refresh_all_windows(&state);
                         }
+                        if let Some((target, anchor)) = network_scroll {
+                            restore_zoom_anchor(&target, anchor);
+                        }
                         if let Some((tab_id, request_id)) = finished
                             && let Some(target_ui) = state
                                 .lock()
@@ -17771,9 +17807,11 @@ fn start_event_pump(
                                     .filter(|tab| tab.latest_request == request_id)
                                     .and_then(|tab| tab.focused)
                             });
-                            if reveal_selection {
+                            if focus_action == Some(PendingFocusAction::Select) {
                                 reveal_completed_selection(&target_ui, &state, tab_id, request_id);
-                            } else if let Some(entry_id) = focused {
+                            } else if let Some(entry_id) =
+                                focused.filter(|_| !network_tab || focus_action.is_some())
+                            {
                                 reveal_entry(&target_ui, &state, tab_id, request_id, entry_id);
                             }
                             submit_visible_shortcuts(
@@ -18104,6 +18142,21 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
         } => {
             let accepted = app.tab(tab_id).is_some_and(|tab| tab.accepts(request_id));
             if accepted {
+                let first_preference = app.tab(tab_id).and_then(|tab| {
+                    tab.pending_entries.is_empty().then(|| {
+                        tab.visible_path()
+                            .map(|path| app.directory_preference(path))
+                            .unwrap_or(app.default_directory_view)
+                    })
+                });
+                if let Some(preference) = first_preference {
+                    let tab = app.tab_mut(tab_id).expect("accepted tab exists");
+                    tab.sort_field = preference.sort_field;
+                    tab.sort_direction = preference.sort_direction;
+                    if tab.visible_path().is_some_and(crate::network::is_unc_path) {
+                        tab.clear_selection();
+                    }
+                }
                 let grid_layout = app
                     .view_mode_for_tab(tab_id)
                     .is_some_and(ViewMode::uses_grid_layout);
@@ -18167,14 +18220,27 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                     .unwrap_or_else(|| app.directory_preference(&path));
                 let (location_path, shell_created) = {
                     let tab = app.tab_mut(tab_id).expect("accepted tab exists");
-                    tab.sort_field = preference.sort_field;
-                    tab.sort_direction = preference.sort_direction;
-                    tab.sort_pending();
+                    let preserve_selection =
+                        crate::network::is_unc_path(&path) && tab.load_state == LoadState::Partial;
+                    if tab.sort_field != preference.sort_field
+                        || tab.sort_direction != preference.sort_direction
+                    {
+                        tab.sort_field = preference.sort_field;
+                        tab.sort_direction = preference.sort_direction;
+                        tab.sort_pending();
+                    }
                     tab.commit_pending();
+                    let selection = preserve_selection
+                        .then(|| (tab.selected.clone(), tab.focused, tab.selection_anchor));
                     if let Some(library) = library.clone() {
                         tab.commit_location(NavigationLocation::Library(library));
                     } else {
                         tab.commit_path(path);
+                    }
+                    if let Some((selected, focused, anchor)) = selection {
+                        tab.selected = selected;
+                        tab.focused = focused;
+                        tab.selection_anchor = anchor;
                     }
                     let mut reveal_missing = false;
                     if let Some(focus) = focus.as_ref() {
@@ -19242,6 +19308,16 @@ fn project_search_page(
     }
     refresh_tab_window(state, tab_id);
     ui.set_page_state(if total == 0 { 3 } else { 4 });
+}
+
+fn sort_field_ui_value(field: SortField) -> i32 {
+    match field {
+        SortField::Name => 0,
+        SortField::Kind => 1,
+        SortField::Size => 2,
+        SortField::Modified => 3,
+        SortField::Created => 4,
+    }
 }
 
 fn everything_sort(
@@ -21037,6 +21113,11 @@ fn append_active_file_rows(
         return;
     }
     let texts = Texts::new(app.language);
+    ui.set_page_state(agent_debug::page_projection(tab.load_state, false).index);
+    ui.set_loading_hint_visible(false);
+    ui.set_selected_count(tab.selected.len() as i32);
+    ui.set_sort_field(sort_field_ui_value(tab.sort_field));
+    ui.set_sort_descending(tab.sort_direction == SortDirection::Descending);
     let grouped = matches!(tab.visible_location(), Some(NavigationLocation::Library(_)))
         || tab
             .visible_path()
@@ -21058,12 +21139,44 @@ fn append_active_file_rows(
         };
         let pending_entries = tab.pending_entries.len();
         let should_refresh = should_rebuild_projection(projected_entries, pending_entries);
-        drop(app);
         if should_refresh {
-            refresh_tab_window(state, tab_id);
-        } else {
-            update_tab_status(ui, state, tab_id);
+            let anchor = (ui.get_file_viewport_y() < 0.0)
+                .then(|| capture_zoom_anchor(ui, 16.0, 0.0))
+                .flatten();
+            // Directory batches must not reset unrelated controls or cancel an active drag.
+            let mode = app.active_view_mode();
+            let columns = grid_column_count_for_view(ui, mode);
+            if grid_layout {
+                let requested_px = grid_thumbnail_request_px(mode, ui.window().scale_factor());
+                ui.set_grid_rows(ModelRc::new(VecModel::from(projected_directory_grid_rows(
+                    &tab.pending_entries,
+                    tab,
+                    texts,
+                    &app,
+                    columns,
+                    requested_px,
+                ))));
+                ui.set_grid_column_count(columns as i32);
+                rebuild_grouped_grid_layout(
+                    ui,
+                    grouped
+                        && matches!(
+                            tab.visible_location(),
+                            Some(NavigationLocation::Directory(_))
+                        ),
+                );
+                rebuild_grid_entry_positions(ui, app.active_window);
+            } else {
+                ui.set_files(ModelRc::new(VecModel::from(projected_directory_rows(
+                    &tab.pending_entries,
+                    tab,
+                    texts,
+                    &app,
+                ))));
+            }
+            restore_zoom_anchor(ui, anchor);
         }
+        ui.set_status_text(status_text(tab, texts).into());
         return;
     }
     let start = model.row_count();
@@ -21072,11 +21185,32 @@ fn append_active_file_rows(
         refresh_tab_window(state, tab_id);
         return;
     }
-    model.extend(
-        tab.pending_entries[start..]
-            .iter()
-            .map(|entry| file_row(entry, tab, texts, &app, None)),
-    );
+    let row_height = file_row_height(app.active_view_mode());
+    let viewport_y = ui.get_file_viewport_y();
+    let anchor_index = ((-viewport_y).max(0.0) / row_height).floor() as usize;
+    let anchor = (viewport_y < 0.0)
+        .then(|| model.row_data(anchor_index))
+        .flatten()
+        .map(|row| {
+            (
+                EntryId(row.id as u32),
+                viewport_y + anchor_index as f32 * row_height,
+            )
+        });
+    for (index, entry) in tab.pending_entries.iter().enumerate() {
+        if model
+            .row_data(index)
+            .is_some_and(|row| row.id == entry.id.0 as i32)
+        {
+            continue;
+        }
+        model.insert(index, file_row(entry, tab, texts, &app, None));
+    }
+    if let Some((id, screen_y)) = anchor
+        && let Some(index) = tab.visible_entry_index(id)
+    {
+        ui.set_file_viewport_y(screen_y - index as f32 * row_height);
+    }
     ui.set_status_text(status_text(tab, texts).into());
 }
 
@@ -22420,9 +22554,9 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     ui.set_view_mode(view_mode_to_ui(view_mode));
     let projected_tab_id = tab.id.0 as i32;
     let projected_request_id = tab.latest_request.0 as i32;
-    if ui.get_projected_file_tab_id() != projected_tab_id
-        || ui.get_projected_file_request_id() != projected_request_id
-    {
+    let projection_changed = ui.get_projected_file_tab_id() != projected_tab_id
+        || ui.get_projected_file_request_id() != projected_request_id;
+    if projection_changed {
         if ui.get_rectangle_selection_pointer_active() {
             ui.invoke_cancel_rectangle_selection();
         }
@@ -22812,16 +22946,10 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     } else {
         (tab.sort_field, tab.sort_direction)
     };
-    ui.set_sort_field(match sort_field {
-        SortField::Name => 0,
-        SortField::Kind => 1,
-        SortField::Size => 2,
-        SortField::Modified => 3,
-        SortField::Created => 4,
-    });
+    ui.set_sort_field(sort_field_ui_value(sort_field));
     ui.set_sort_descending(sort_direction == crate::domain::SortDirection::Descending);
     let page_projection = agent_debug::page_projection(tab.load_state, tab.entries.is_empty());
-    ui.set_page_state(if tab.page_source == PageSource::Search {
+    let page_state = if tab.page_source == PageSource::Search {
         match tab.search_state {
             SearchState::Searching if tab.entries.is_empty() => 1,
             SearchState::NoResults => 3,
@@ -22837,7 +22965,8 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
         }
     } else {
         page_projection.index
-    });
+    };
+    loading_hint::project_page_state(ui, state, window_id, tab, projection_changed, page_state);
     let show_request_access = page_projection
         .visible_page_operations
         .contains(&agent_debug::PageOperation::RequestWindowsAccess);

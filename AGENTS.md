@@ -34,6 +34,14 @@ CI 只有仓库读取权限，不发布、不创建标签；同一 PR/引用的�
 
 `target/debug/asterfiles.exe --agent-network-copy-probe --resume-complete '<至少 256 MiB 的源文件路径>'` 在真实传输达到 128 MiB 后暂停，确认后保持 2 秒，再继续到完整复制并逐字节比较。结果仍写入 `artifacts/state/issue-137/complete-probe/` 的独占运行目录；`network-copy-block-start` 审计记录恢复读取的位置。NAS→本地块续传回归使用 `cargo test --locked issue_137_block_download -- --nocapture`，槽位上限回归使用 `cargo test --locked issue_137_read_limit -- --nocapture`。恢复仅覆盖当前任务，不覆盖应用退出或崩溃。读取与元数据查询共用 4 个槽位，旧 Windows I/O 必须真正退出才释放槽位；槽位耗尽时仍可暂停取消。
 
+## 网络目录排序专项验证（#141）
+
+`python tools/build.py test --locked issue_141 -- --nocapture --test-threads=1` 验证首批排序、多批合并、加载中切换排序、选择与滚动保留、迟到结果隔离和网络等待期间的取消/本地导航；十万条目场景输出合并与显示模型耗时。测试使用无窗口后端，日志为 `artifacts/logs/issue-141-tests.log`。完整验证使用 `python tools/verify.py`，日志为 `artifacts/logs/issue-141-full-verify.log`，汇总为 `artifacts/verify/summary.json`；真实慢网络交互由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
+
+## 网络加载提示专项验证（#143）
+
+`python tools/build.py test --locked issue_143 -- --nocapture` 使用无窗口后端和模拟时间检查 500 ms 提示延迟、首批与终态即时显示、导航和关闭后的旧计时隔离。统一验证为 `python tools/verify.py --quick`，日志位于 `artifacts/logs/issue-143-verify.log` 和 `artifacts/logs/verify-test.log`。真实文字闪现由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
+
 ## UI 操作与验证
 
 - 禁止 Codex 操作、自动化或尝试控制 AsterFiles 的 UI，包括通过内置浏览器、Chrome、Computer Use、Playwright、agent-browser、截图点击或键鼠模拟等方式。
