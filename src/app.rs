@@ -30617,6 +30617,47 @@ mod tests {
     }
 
     #[test]
+    fn issue_146_rename_targets_one_selected_entry_in_every_view_mode() {
+        i_slint_backend_testing::init_no_event_loop();
+        for mode in 0..8 {
+            let ui = AppWindow::new().unwrap();
+            ui.set_view_mode(mode);
+            let mut app =
+                AppState::new_for_test(vec![PathBuf::from(r"C:\target")], 0, [0, 1, 2, 3]);
+            let window_id = app.active_window;
+            let tab_id = app.active_window_state().active_tab;
+            let tab = app.tab_mut(tab_id).unwrap();
+            tab.replace_entries(vec![
+                focus_entry(1, r"C:\target\报告.txt"),
+                focus_entry(2, r"C:\target\other.txt"),
+            ]);
+            tab.load_state = LoadState::Complete;
+            let shared = Arc::new(Mutex::new(app));
+            let state = WindowSessions::new(shared.clone(), window_id);
+            for selected in [vec![], vec![EntryId(1), EntryId(2)]] {
+                shared.lock().unwrap().tab_mut(tab_id).unwrap().selected = selected;
+                begin_rename_ui(&ui.as_weak(), &state);
+                assert!(!ui.get_rename_editing(), "mode {mode}");
+                assert!(shared.lock().unwrap().rename_targets.is_empty());
+            }
+            shared.lock().unwrap().tab_mut(tab_id).unwrap().selected = vec![EntryId(1)];
+            begin_rename_ui(&ui.as_weak(), &state);
+            assert!(ui.get_rename_editing(), "mode {mode}");
+            assert_eq!(ui.get_rename_entry_id(), 1);
+            assert_eq!(ui.get_rename_input().as_str(), "报告.txt");
+            assert_eq!(ui.get_rename_selection_end(), 6);
+            let app = shared.lock().unwrap();
+            let target = app.rename_targets.get(&window_id).unwrap();
+            assert_eq!(target.entry_id, EntryId(1));
+            assert_eq!(target.tab.tab_id, tab_id);
+            assert_eq!(
+                target.tab.request_id,
+                app.tab(tab_id).unwrap().latest_request
+            );
+        }
+    }
+
+    #[test]
     fn rename_validation_keeps_invalid_names_out_of_operation_queue() {
         assert!(crate::fs::file_operations::validate_name(std::ffi::OsStr::new("")).is_err());
         assert!(

@@ -444,3 +444,16 @@ Slint 无窗口后端验证各视图及分组中的目标范围滚动，并派�
 日志为 `artifacts/logs/issue-143-verify.log`、`artifacts/logs/verify-test.log`，汇总为 `artifacts/verify/summary.json`。用户手动进入原网络目录，确认快速加载时不闪现中央文字；较慢时在约半秒后显示，文件出现时消失。等待期间切换本地标签或关闭网络标签，确认按钮响应正常。
 
 排序与提示闪现的根因、修复边界和长期排查入口见 [网络目录显示复盘](../postmortem/postmortem-2026-09-29-network-directory-presentation.md)。
+
+## Issue #146 各视图行内重命名
+
+统一验证：`python tools/verify.py --quick`，包含格式、Clippy、测试和 Debug 构建。汇总位于 `artifacts/verify/summary.json`，测试日志为 `artifacts/logs/verify-test.log`，本轮终端日志为 `artifacts/logs/issue-146-verify.log`。
+
+无窗口回归检查各模式的编辑入口、单选约束和编辑器覆盖；自动检查不替代真实窗口中的焦点、裁切与键鼠交互验收。
+
+用户手动启动 `target/debug/asterfiles.exe`，在临时目录准备一个中文文件名的文件和一个文件夹：
+
+1. 逐一切换详情、列表、小／中／大／超大图标、平铺和内容模式。单选后按 F2，检查输入框可见，文件默认选中主文件名，文件夹选中完整名称。
+2. 修改后按 Enter，确认文件名更新；再次 F2 后按 Esc，确认不修改。再检查点击输入框外部的提交行为。
+3. 从右键菜单重命名，并新建文件夹，确认进入同样的编辑框。
+4. 图标和平铺再启用分组、滚动到后面的文件，检查输入框仍对应所选文件；调整图标尺寸并在搜索结果中复查。切换目录或标签后，旧编辑不得修改新页面的文件。

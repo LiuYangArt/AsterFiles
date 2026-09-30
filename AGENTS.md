@@ -46,6 +46,10 @@ CI 只有仓库读取权限，不发布、不创建标签；同一 PR/引用的�
 
 `python tools/build.py test --locked issue_145 -- --nocapture` 使用无窗口后端验证实测字宽、首尾保留、祖先折叠顺序、窄宽度边界和过期导航拒收，日志为 `artifacts/logs/issue-145-tests.log`。统一验证使用 `python tools/verify.py --quick`，日志为 `artifacts/logs/issue-145-verify.log`，汇总为 `artifacts/verify/summary.json`。真实缩放、悬停与菜单跳转由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
 
+## 各视图重命名专项验证（#146）
+
+运行 `python tools/verify.py --quick` 检查八种视图及分组布局的唯一编辑框、提交状态、单选限制和目标身份，并更新 Debug 程序。日志为 `artifacts/logs/issue-146-verify.log`、`artifacts/logs/verify-test.log`，汇总为 `artifacts/verify/summary.json`。真实焦点、输入、提交和取消由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
+
 ## UI 操作与验证
 
 - 禁止 Codex 操作、自动化或尝试控制 AsterFiles 的 UI，包括通过内置浏览器、Chrome、Computer Use、Playwright、agent-browser、截图点击或键鼠模拟等方式。

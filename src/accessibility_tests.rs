@@ -1,6 +1,6 @@
 use crate::app::{AppWindow, FileRow, GridRow, PopupCommandRow, QuickMenuWindow, TabRow};
 use i_slint_backend_testing::{ElementHandle, ElementRoot};
-use slint::{ModelRc, VecModel};
+use slint::{ComponentHandle, ModelRc, VecModel};
 
 fn by_id(root: &impl ElementRoot, id: &str) -> ElementHandle {
     let id = id.to_owned();
@@ -106,5 +106,76 @@ fn issue_111_menu_placeholders_are_not_actions() {
                 .find_all()
                 .is_empty()
         );
+    }
+}
+
+#[test]
+fn issue_146_every_layout_has_exactly_one_rename_editor() {
+    use crate::app::{ColumnRow, PositionedGridRow};
+
+    i_slint_backend_testing::init_no_event_loop();
+    for mode in 0..8 {
+        for grouped in [false, true] {
+            let ui = AppWindow::new().unwrap();
+            ui.window().set_size(slint::LogicalSize::new(1180.0, 760.0));
+            ui.set_page_state(2);
+            ui.set_accessibility_context("rename-test".into());
+            ui.set_view_mode(mode);
+            ui.set_grouped_grid_enabled(grouped);
+            ui.set_layout_row_height(160.0);
+            ui.set_layout_card_width(200.0);
+            ui.set_layout_icon_size(64.0);
+            ui.set_columns(ModelRc::new(VecModel::from(vec![ColumnRow {
+                kind: 0,
+                visible: true,
+                ..Default::default()
+            }])));
+            let entry = FileRow {
+                id: 4,
+                loaded: true,
+                selected: true,
+                name: "报告.txt".into(),
+                ..Default::default()
+            };
+            ui.set_files(ModelRc::new(VecModel::from(vec![entry.clone()])));
+            let row = GridRow {
+                entries: ModelRc::new(VecModel::from(vec![entry])),
+                ..Default::default()
+            };
+            ui.set_grid_rows(ModelRc::new(VecModel::from(vec![row.clone()])));
+            ui.set_grouped_grid_visible_rows(ModelRc::new(VecModel::from(vec![
+                PositionedGridRow {
+                    row,
+                    offset: 0.0,
+                    extent: 160.0,
+                },
+            ])));
+            ui.set_rename_entry_id(4);
+            ui.set_rename_input("报告.txt".into());
+            ui.set_rename_selection_end(6);
+            ui.set_rename_editing(true);
+            let editors = ui
+                .root_element()
+                .query_descendants()
+                .match_predicate(|element| {
+                    element.accessible_id().as_deref() == Some("rename-test/entry/4/rename")
+                })
+                .find_all();
+            assert_eq!(editors.len(), 1, "mode {mode}, grouped {grouped}");
+            assert_eq!(editors[0].accessible_label().as_deref(), Some("报告.txt"));
+            assert_eq!(editors[0].accessible_enabled(), Some(true));
+            ui.set_rename_submitting(true);
+            assert_eq!(editors[0].accessible_enabled(), Some(false));
+            ui.set_rename_editing(false);
+            assert!(
+                ui.root_element()
+                    .query_descendants()
+                    .match_predicate(|element| {
+                        element.accessible_id().as_deref() == Some("rename-test/entry/4/rename")
+                    })
+                    .find_all()
+                    .is_empty()
+            );
+        }
     }
 }
