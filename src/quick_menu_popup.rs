@@ -392,7 +392,7 @@ pub fn export_state(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(
+    crate::app::action_scenario::Evidence::write_report(
         path,
         format!(
             concat!(
@@ -437,6 +437,41 @@ pub fn export_state(path: &Path) -> io::Result<()> {
             stale_request_closed,
             session.is_open(),
         ),
+        &[
+            ("root_inside_work_area", contains(work_area, root.rect)),
+            ("root_flipped_horizontal", root.horizontal_flipped),
+            ("root_flipped_vertical", root.vertical_flipped),
+            (
+                "root_rect_stable_after_submenu_load",
+                root.rect
+                    == place_root_popup(
+                        PhysicalPoint::new(-80, 1040),
+                        PhysicalSize::new(480, 720),
+                        work_area,
+                    )
+                    .rect,
+            ),
+            (
+                "loading_submenu_inside_work_area",
+                contains(work_area, loading_submenu[0].rect),
+            ),
+            (
+                "loaded_submenu_inside_work_area",
+                contains(work_area, loaded_submenus[0].rect),
+            ),
+            (
+                "loaded_submenu_height_limited",
+                loaded_submenus[0].height_limited,
+            ),
+            (
+                "multilevel_submenu_inside_work_area",
+                contains(work_area, loaded_submenus[1].rect),
+            ),
+            ("multi_level_branch_added", branch_added),
+            ("cross_window_event_rejected", cross_window_rejected),
+            ("stale_request_closed_session", stale_request_closed),
+            ("inactive_after_invalidation", !session.is_open()),
+        ],
     )
 }
 

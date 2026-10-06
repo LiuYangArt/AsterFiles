@@ -25,6 +25,12 @@ gh run download <失败演练编号> --dir artifacts/ci-failure-probe
 
 日常构建使用 `python tools/build.py build --locked`，运行使用 `python tools/build.py run --locked`。完整验证自动执行构建前维护与失败后的收尾。空间预算、NTFS 恢复成本、工具安装与排查入口见 [构建缓存策略](build-cache.md)。
 
+## 无界面场景报告与退出码（#147）
+
+完整 `python tools/verify.py` 按每个 Agent 场景进程的退出码判定通过或失败。场景会先写状态 JSON，再用 `Evidence::check` 记录必要检查；任一必要检查失败时仍保留报告，但进程返回非零，后续步骤按统一验证的 fail-fast 规则停止。报告中的 `false` 只表示该字段的实际状态，只有列在 `checks` 中的必要检查参与退出码。
+
+专项证据写入 `artifacts/state/issue-147/` 和 `artifacts/logs/issue-147/`。受控失败验证应确认：报告包含 `passed: false` 和失败检查，场景进程返回非零，完整验证汇总将该场景标为 `failed`；恢复生产代码后重新运行完整验证。
+
 ## 统一验证
 
 在仓库根目录运行：

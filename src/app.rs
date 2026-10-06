@@ -144,7 +144,18 @@ pub fn export_thumbnail_scheduler_state(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, state)
+    action_scenario::Evidence::write_report(
+        path,
+        state,
+        &[
+            ("bounded_initial_plan", bounded_initial),
+            ("latest_generation_advanced", latest_generation == 2),
+            ("latest_visible_scheduled", latest_visible_scheduled),
+            ("stale_result_rejected", stale_rejected),
+            ("pending_after_jump", plan.pending_len() == 24),
+            ("in_flight_after_jump", plan.in_flight_len() == 0),
+        ],
+    )
 }
 
 fn entry_type_icon_key(
@@ -301,7 +312,31 @@ pub fn export_drive_capacity_state(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, state)
+    action_scenario::Evidence::write_report(
+        path,
+        state,
+        &[
+            (
+                "normal_used_ratio",
+                (normal.used_ratio() - 0.75).abs() < f32::EPSILON,
+            ),
+            (
+                "warning_used_ratio",
+                (warning.used_ratio() - 0.901).abs() < f32::EPSILON,
+            ),
+            ("warning_below_ten_percent", warning.is_low_space()),
+            (
+                "zero_total_safe",
+                zero.used_ratio() == 0.0 && !zero.is_low_space(),
+            ),
+            ("stale_generation_rejected", stale_rejected),
+            ("affected_local_roots", affected.len() == 2),
+            (
+                "unc_excluded_from_local_refresh",
+                !affected.contains(Path::new(r"\\server\share")),
+            ),
+        ],
+    )
 }
 
 pub fn export_home_state(path: &Path) -> io::Result<()> {
@@ -335,7 +370,11 @@ pub fn export_home_state(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, state)?;
+    let result = action_scenario::Evidence::write_report(
+        path,
+        state,
+        &[("back_returns_home", back_returns_home)],
+    );
 
     let log_dir = Path::new("artifacts/logs/home");
     std::fs::create_dir_all(log_dir)?;
@@ -357,7 +396,8 @@ pub fn export_home_state(path: &Path) -> io::Result<()> {
             "{{\n  \"schema_version\": 1,\n  \"scenario\": \"home\",\n  \"model_projection_elapsed_us\": {},\n  \"blocking_io_on_ui_thread\": false\n}}\n",
             started.elapsed().as_micros()
         ),
-    )
+    )?;
+    result
 }
 pub fn export_file_list_type_select_state(path: &Path) -> io::Result<()> {
     let context = TypeSelectContext {
@@ -419,7 +459,19 @@ pub fn export_file_list_type_select_state(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, json)
+    action_scenario::Evidence::write_report(
+        path,
+        json,
+        &[
+            ("first_match", first == Some(EntryId(1))),
+            ("prefix_match", prefix == Some(EntryId(1))),
+            (
+                "cycle_match",
+                cycle_first == Some(EntryId(1)) && cycle_second == Some(EntryId(257)),
+            ),
+            ("request_id_unchanged", request_id_unchanged),
+        ],
+    )
 }
 
 pub fn export_windows_libraries_state(path: &Path) -> io::Result<()> {
@@ -471,14 +523,29 @@ pub fn export_windows_libraries_state(path: &Path) -> io::Result<()> {
             "}}\n"
         ),
         library.identity != std::ffi::OsString::from(&library.display_name),
-        tab.current_location == Some(NavigationLocation::Library(library)),
+        tab.current_location == Some(NavigationLocation::Library(library.clone())),
         request_id.0,
         tab.entries.len(),
     );
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, json)
+    action_scenario::Evidence::write_report(
+        path,
+        json,
+        &[
+            (
+                "stable_identity_separate_from_display_name",
+                library.identity != std::ffi::OsString::from(&library.display_name),
+            ),
+            (
+                "navigation_history_uses_library_identity",
+                tab.current_location == Some(NavigationLocation::Library(library.clone())),
+            ),
+            ("navigation_request_created", request_id.0 > 0),
+            ("entry_count", tab.entries.len() == 1),
+        ],
+    )
 }
 pub fn export_network_foundation_state(path: &Path) -> io::Result<()> {
     use crate::network::{
@@ -564,7 +631,32 @@ pub fn export_network_foundation_state(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, state)
+    action_scenario::Evidence::write_report(
+        path,
+        state,
+        &[
+            ("location_sources_separate", imported.source != owned.source),
+            (
+                "windows_import_not_owned",
+                imported.source == NetworkLocationSource::WindowsImported,
+            ),
+            (
+                "owned_location_persistable",
+                owned.source == NetworkLocationSource::AsterOwned,
+            ),
+            ("owned_location_crud", owned_location_removable),
+            (
+                "unc_identity_preserved",
+                matches!(owned.target, NetworkTarget::WindowsPath(ref target) if target == Path::new(r"\\服务器\自有")),
+            ),
+            ("stale_result_rejected", stale_rejected),
+            (
+                "previous_request_cancelled",
+                stale_cancel.load(Ordering::Acquire),
+            ),
+            ("current_result_accepted", current_accepted),
+        ],
+    )
 }
 
 pub fn export_quick_access_state(path: &Path) -> io::Result<()> {
@@ -606,7 +698,20 @@ pub fn export_quick_access_state(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, state)
+    action_scenario::Evidence::write_report(
+        path,
+        state,
+        &[
+            (
+                "single_folder_accepted",
+                single_effect == DropEffect::Link && single_reason.is_none(),
+            ),
+            (
+                "multi_selection_rejected",
+                multi_effect == DropEffect::None && multi_reason.is_some(),
+            ),
+        ],
+    )
 }
 pub fn export_folder_size_scheduler_state(path: &Path) -> io::Result<()> {
     use crate::domain::{
@@ -659,13 +764,14 @@ pub fn export_folder_size_scheduler_state(path: &Path) -> io::Result<()> {
         pending = complete.next_complete_queries(&mut sorted_entries);
     }
     let progress = complete.progress().expect("complete sort has progress");
-    let old = complete.begin_complete_sort(RequestId(2), &mut sorted_entries);
+    let mut cancellation_entries = vec![entry(56)];
+    let old = complete.begin_complete_sort(RequestId(2), &mut cancellation_entries);
     complete.cancel(RequestId(3));
-    let cancelled_rejected = old.first().is_none_or(|query| !complete.accepts(query));
+    let cancelled_rejected = old.first().is_some_and(|query| !complete.accepts(query));
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(
+    action_scenario::Evidence::write_report(
         path,
         format!(
             "{{\n  \"schema_version\": 2,\n  \"scenario\": \"folder-size-scheduler\",\n  \"visible_range\": {{\"entry_count\": 80, \"first_submitted\": {}, \"repeated_submitted\": {}, \"scrolled_submitted\": {}, \"submit_limit\": 24}},\n  \"complete_sort\": {{\"directory_count\": {}, \"completed\": {}, \"terminal_failures\": 5, \"final_refreshes\": {}}},\n  \"cancellation\": {{\"old_generation_rejected\": {}}}\n}}\n",
@@ -677,6 +783,23 @@ pub fn export_folder_size_scheduler_state(path: &Path) -> io::Result<()> {
             refreshes,
             cancelled_rejected,
         ),
+        &[
+            ("first_submitted", first.len() == 20),
+            ("repeated_submitted", repeated.is_empty()),
+            ("scrolled_submitted", scrolled.len() == 4),
+            ("directory_count", progress.total == 55),
+            ("completed", progress.completed == 55),
+            ("final_refreshes", refreshes == 1),
+            (
+                "terminal_failures",
+                sorted_entries
+                    .iter()
+                    .filter(|entry| entry.folder_size == FolderSizeState::NotIndexed)
+                    .count()
+                    == 5,
+            ),
+            ("old_generation_rejected", cancelled_rejected),
+        ],
     )
 }
 pub fn export_quick_menu_search_state(path: &Path) -> io::Result<()> {
@@ -773,7 +896,45 @@ pub fn export_quick_menu_search_state(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, json)
+    action_scenario::Evidence::write_report(
+        path,
+        json,
+        &[
+            (
+                "case_insensitive_ids",
+                english.iter().map(|row| row.id).collect::<Vec<_>>() == [1],
+            ),
+            (
+                "chinese_ids",
+                chinese.iter().map(|row| row.id).collect::<Vec<_>>()
+                    == [SHELL_CONTEXT_COMMAND_BASE + 42],
+            ),
+            (
+                "full_pinyin_ids",
+                full_pinyin.iter().map(|row| row.id).collect::<Vec<_>>()
+                    == [SHELL_CONTEXT_COMMAND_BASE + 42],
+            ),
+            (
+                "initials_ids",
+                initials.iter().map(|row| row.id).collect::<Vec<_>>() == [2],
+            ),
+            (
+                "uppercase_pinyin_ids",
+                uppercase_pinyin
+                    .iter()
+                    .map(|row| row.id)
+                    .collect::<Vec<_>>()
+                    == [2],
+            ),
+            ("empty_result_count", missing.is_empty()),
+            (
+                "row_identity_preserved",
+                full_pinyin.first().is_some_and(|row| {
+                    row.node_id == 9 && row.shell && !row.enabled && row.checked
+                }),
+            ),
+        ],
+    )
 }
 
 pub fn export_multi_window_state_layering(path: &Path) -> io::Result<()> {
@@ -861,7 +1022,29 @@ pub fn export_multi_window_state_layering(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, state)
+    action_scenario::Evidence::write_report(
+        path,
+        state,
+        &[
+            ("tab_ids_globally_unique", first_tab != second_tab),
+            (
+                "closed_window_request_cancelled",
+                first_cancel.load(Ordering::Acquire),
+            ),
+            (
+                "remaining_window_registered",
+                app.window(second_window).is_some(),
+            ),
+            (
+                "shared_operation_survived",
+                app.operations.task(operation).is_some(),
+            ),
+            (
+                "close_decision",
+                matches!(close_decision, WindowCloseDecision::KeepRunning),
+            ),
+        ],
+    )
 }
 
 pub fn export_tab_reorder_state(path: &Path) -> io::Result<()> {
@@ -935,7 +1118,37 @@ pub fn export_tab_reorder_state(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, state)
+    action_scenario::Evidence::write_report(
+        path,
+        state,
+        &[
+            ("threshold_preserved_order", threshold_preserved),
+            ("target_slot", target_slot == 2),
+            ("reordered", reordered),
+            (
+                "tab_order",
+                app.active_window_state().tab_order == [TabId(2), TabId(3), TabId(1)],
+            ),
+            (
+                "active_tab_unchanged",
+                app.active_window_state().active_tab == active,
+            ),
+            (
+                "request_id_unchanged",
+                app.tab(source)
+                    .is_some_and(|tab| tab.latest_request == request_id),
+            ),
+            (
+                "session_paths",
+                app.stable_locations()
+                    == [
+                        NavigationLocation::Directory(PathBuf::from("b")),
+                        NavigationLocation::Directory(PathBuf::from("c")),
+                        NavigationLocation::Directory(PathBuf::from("a")),
+                    ],
+            ),
+        ],
+    )
 }
 
 pub fn export_tab_detach_state(path: &Path) -> io::Result<()> {
@@ -955,10 +1168,9 @@ pub fn export_tab_detach_state(path: &Path) -> io::Result<()> {
     );
     let source_window = app.active_window;
     let tab_id = app.active_window_state().active_tab;
-    let old_request = {
+    let (old_request, old_cancel) = {
         let tab = app.tab_mut(tab_id).expect("detached tab exists");
         tab.begin_directory_navigation(PathBuf::from("pending"), NavigationKind::Refresh)
-            .0
     };
     app.begin_tab_drag(source_window, tab_id, 0, 100.0, 20.0);
     app.update_tab_drag(100.0, 80.0, 47.0, 540.0, 0.0, 178.0);
@@ -1005,14 +1217,41 @@ pub fn export_tab_detach_state(path: &Path) -> io::Result<()> {
                 .join(", "))
             .unwrap_or_default(),
         tab_id.0,
-        matches!(outcome.restart, Some(DetachedTabRestart::Directory(_))),
+        old_cancel.load(Ordering::Acquire),
         outcome.restart.is_some(),
         old_request.0,
     );
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, state)
+    action_scenario::Evidence::write_report(
+        path,
+        state,
+        &[
+            (
+                "single_owner_after_commit",
+                app.window_for_tab(tab_id) == Some(destination_window),
+            ),
+            (
+                "source_order_after",
+                app.window(source_window)
+                    .is_some_and(|window| window.tab_order == [TabId(2)]),
+            ),
+            (
+                "destination_order",
+                app.window(destination_window)
+                    .is_some_and(|window| window.tab_order == [tab_id]),
+            ),
+            (
+                "pending_request_cancelled",
+                old_cancel.load(Ordering::Acquire),
+            ),
+            (
+                "destination_request_restart_required",
+                matches!(outcome.restart, Some(DetachedTabRestart::Directory(_))),
+            ),
+        ],
+    )
 }
 
 pub fn export_tab_cross_window_state(path: &Path) -> io::Result<()> {
@@ -1090,7 +1329,32 @@ pub fn export_tab_cross_window_state(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, state)
+    action_scenario::Evidence::write_report(
+        path,
+        state,
+        &[
+            (
+                "inserted_at_target_slot",
+                app.window(destination).unwrap().tab_order[1] == tab_id,
+            ),
+            (
+                "single_owner_after_commit",
+                app.window_for_tab(tab_id) == Some(destination),
+            ),
+            (
+                "active_in_destination",
+                app.window(destination).unwrap().active_tab == tab_id,
+            ),
+            (
+                "request_identity_preserved_for_complete_tab",
+                app.tab(tab_id).unwrap().latest_request == request_before,
+            ),
+            (
+                "source_window_remains_open",
+                !outcome.source_window_closed && app.window(source_window).is_some(),
+            ),
+        ],
+    )
 }
 
 pub fn export_file_operation_center_state(path: &Path) -> io::Result<()> {
@@ -1138,7 +1402,7 @@ pub fn export_file_operation_center_state(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(
+    action_scenario::Evidence::write_report(
         path,
         format!(
             concat!(
@@ -1161,6 +1425,13 @@ pub fn export_file_operation_center_state(path: &Path) -> io::Result<()> {
             permanent_delete_cleanup,
             operations
         ),
+        &[
+            ("undo_available", undo_available),
+            ("undo_history_depth", undo_depth == 1),
+            ("undo_latest_kind", undo_latest_kind == "recycle_delete"),
+            ("undo_idle", !undo_in_progress),
+            ("undo_last_failure", history.last_failure().is_none()),
+        ],
     )
 }
 
@@ -13234,6 +13505,25 @@ fn should_close_context_menu(event: &winit::event::WindowEvent) -> bool {
     )
 }
 
+fn file_list_type_select_allowed(
+    file_list_target: bool,
+    rectangle_selection_active: bool,
+    modifiers: [bool; 4],
+    ime_composing: bool,
+    text: Option<&str>,
+) -> bool {
+    file_list_target
+        && !rectangle_selection_active
+        && !modifiers.into_iter().any(|pressed| pressed)
+        && !ime_composing
+        && text.is_some_and(|value| {
+            let mut chars = value.chars();
+            chars
+                .next()
+                .is_some_and(|character| character.is_alphanumeric())
+                && chars.next().is_none()
+        })
+}
 fn keyboard_shortcuts_suppressed(rename_editing: bool, context_menu_open: bool) -> bool {
     rename_editing || context_menu_open
 }
@@ -13855,20 +14145,13 @@ fn wire_mouse_navigation(
                         ui.invoke_show_keyboard_context_menu();
                         true
                     }
-                    _ if ui.get_file_list_keyboard_target()
-                        && !ui.get_rectangle_selection_pointer_active()
-                        && !control
-                        && !alt
-                        && !shift
-                        && !super_key
-                        && !ime_composing.get()
-                        && event.text.as_ref().is_some_and(|value| {
-                            let mut chars = value.chars();
-                            chars
-                                .next()
-                                .is_some_and(|character| character.is_alphanumeric())
-                                && chars.next().is_none()
-                        }) =>
+                    _ if file_list_type_select_allowed(
+                        ui.get_file_list_keyboard_target(),
+                        ui.get_rectangle_selection_pointer_active(),
+                        [control, alt, shift, super_key],
+                        ime_composing.get(),
+                        event.text.as_deref(),
+                    ) =>
                     {
                         let typed = event.text.as_ref().and_then(|value| value.chars().next());
                         if let Some((tab_id, input)) =
@@ -25163,23 +25446,67 @@ mod tests {
         );
     }
     #[test]
-    fn issue_20_window_keyboard_route_excludes_editors_ime_and_shortcuts() {
-        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/app.rs"));
-        for marker in [
-            "WindowEvent::Ime(ime)",
-            "ui.get_file_list_keyboard_target()",
-            "!editing_address",
-            "!settings_active",
-            "!control",
-            "!alt",
-            "!super_key",
-            "!ime_composing.get()",
-            "event.text.as_ref().is_some_and",
-        ] {
-            assert!(source.contains(marker), "missing keyboard guard: {marker}");
-        }
+    fn issue_20_keyboard_shortcuts_are_suppressed_only_by_editing_or_context_menu() {
+        assert!(!keyboard_shortcuts_suppressed(false, false));
+        assert!(keyboard_shortcuts_suppressed(true, false));
+        assert!(keyboard_shortcuts_suppressed(false, true));
+        assert!(keyboard_shortcuts_suppressed(true, true));
     }
 
+    #[test]
+    fn issue_147_type_select_rejects_non_file_targets_ime_modifiers_and_invalid_text() {
+        assert!(file_list_type_select_allowed(
+            true,
+            false,
+            [false; 4],
+            false,
+            Some("a")
+        ));
+        assert!(file_list_type_select_allowed(
+            true,
+            false,
+            [false; 4],
+            false,
+            Some("中")
+        ));
+        assert!(!file_list_type_select_allowed(
+            false,
+            false,
+            [false; 4],
+            false,
+            Some("a")
+        ));
+        assert!(!file_list_type_select_allowed(
+            true,
+            true,
+            [false; 4],
+            false,
+            Some("a")
+        ));
+        assert!(!file_list_type_select_allowed(
+            true,
+            false,
+            [false; 4],
+            true,
+            Some("a")
+        ));
+        for index in 0..4 {
+            let mut modifiers = [false; 4];
+            modifiers[index] = true;
+            assert!(!file_list_type_select_allowed(
+                true,
+                false,
+                modifiers,
+                false,
+                Some("a")
+            ));
+        }
+        for text in [None, Some(""), Some("ab"), Some(" "), Some("/"), Some("\n")] {
+            assert!(!file_list_type_select_allowed(
+                true, false, [false; 4], false, text
+            ));
+        }
+    }
     #[test]
     fn issue_49_active_tab_uses_one_continuous_contour() {
         let ui = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
@@ -28362,10 +28689,32 @@ mod tests {
     }
 
     #[test]
-    fn issue_62_showcase_explains_that_all_states_are_scrollable() {
-        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/app.rs"));
-        assert!(source.contains("含真实窗口不会保留的完成/取消状态"));
-        assert!(source.contains("set_size(slint::LogicalSize::new(580.0, 650.0))"));
+    fn issue_147_showcase_exposes_demo_notice_rows_and_window_size() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = OperationWindow::new().unwrap();
+        let state = Arc::new(Mutex::new(AppState::new_for_test(
+            vec![PathBuf::from("C:/test")],
+            0,
+            [0, 1, 2, 3],
+        )));
+        for (language, notice) in [
+            (
+                Language::Chinese,
+                "陈列室示例：共 12 行，含真实窗口不会保留的完成/取消状态，请滚动查看",
+            ),
+            (
+                Language::English,
+                "Showcase: 12 rows, including completed/cancelled states not retained in real use",
+            ),
+        ] {
+            state.lock().unwrap().language = language;
+            refresh_debug_operation_window(&ui, &state);
+            assert!(ui.get_demo_mode());
+            assert_eq!(ui.get_demo_notice(), notice);
+            assert_eq!(ui.get_operations().row_count(), 12);
+            let size = ui.window().size().to_logical(ui.window().scale_factor());
+            assert_eq!(size, slint::LogicalSize::new(580.0, 650.0));
+        }
     }
 
     #[test]

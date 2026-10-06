@@ -35,12 +35,54 @@ impl Drop for Sandbox {
 }
 
 #[derive(Default)]
-struct Evidence {
+pub(crate) struct Evidence {
     checks: Vec<(&'static str, bool)>,
     trace: Vec<String>,
 }
 
 impl Evidence {
+    pub(crate) fn write_report(
+        path: &Path,
+        report: String,
+        checks: &[(&'static str, bool)],
+    ) -> io::Result<()> {
+        let mut evidence = Self::default();
+        let mut failure = None;
+        for &(name, passed) in checks {
+            if let Err(error) = evidence.check(name, passed) {
+                failure.get_or_insert(error);
+            }
+        }
+        let fields = evidence
+            .checks
+            .iter()
+            .map(|(name, passed)| format!("    \"{name}\": {passed}"))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        let message = failure
+            .as_ref()
+            .map(|error| json_string(&error.to_string()))
+            .unwrap_or_else(|| "null".into());
+        let report = report
+            .trim_end()
+            .strip_suffix('}')
+            .ok_or_else(|| io::Error::other("scenario report must be a JSON object"))?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(
+            path,
+            format!(
+                "{report},\n  \"passed\": {},\n  \"failure\": {message},\n  \"checks\": {{\n{fields}\n  }}\n}}\n",
+                failure.is_none(),
+            ),
+        )?;
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     fn check(&mut self, name: &'static str, passed: bool) -> io::Result<()> {
         self.checks.push((name, passed));
         if passed {
@@ -825,4 +867,41 @@ fn run(evidence: &mut Evidence) -> io::Result<()> {
         fs::read(&second_file)? == b"second-window",
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+
+    #[test]
+    fn issue_147_failed_checks_keep_report_and_return_error() {
+        let sandbox = Sandbox::new().unwrap();
+        let path = sandbox.0.join("failed.json");
+        let error = Evidence::write_report(
+            &path,
+            "{\"source_window_closed\": false}\n".into(),
+            &[
+                ("first_required", false),
+                ("later_required", false),
+                ("observed", true),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "check failed: first_required");
+        let report = fs::read_to_string(&path).unwrap();
+        assert!(report.contains("\"passed\": false"));
+        assert!(report.contains("\"first_required\": false"));
+        assert!(report.contains("\"later_required\": false"));
+        assert!(report.contains("\"observed\": true"));
+        assert!(report.contains("\"source_window_closed\": false"));
+        Evidence::write_report(
+            &path,
+            "{\"source_window_closed\": false}\n".into(),
+            &[("source_stays_open", true)],
+        )
+        .unwrap();
+        let report = fs::read_to_string(path).unwrap();
+        assert!(report.contains("\"passed\": true"));
+        assert!(report.contains("\"failure\": null"));
+    }
 }

@@ -50,6 +50,10 @@ CI 只有仓库读取权限，不发布、不创建标签；同一 PR/引用的�
 
 运行 `python tools/verify.py --quick` 检查八种视图及分组布局的唯一编辑框、提交状态、单选限制和目标身份，并更新 Debug 程序。日志为 `artifacts/logs/issue-146-verify.log`、`artifacts/logs/verify-test.log`，汇总为 `artifacts/verify/summary.json`。真实焦点、输入、提交和取消由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
 
+## 无界面验证可信度（#147）
+
+`cargo test --locked issue_147 -- --nocapture` 检查必要失败的报告保留、键盘输入保护和编译后的陈列室属性。完整验证必须运行 `python tools/verify.py`，其中包含全部 Agent 场景及 `cargo build --locked`；`--quick` 不覆盖场景退出码。专项日志位于 `artifacts/logs/issue-147/`，受控失败及恢复结果位于 `artifacts/state/issue-147/`。场景报告中的 `checks` 是必要条件；普通状态字段为 false 不代表失败。约定见 `docs/agent/debug-validation.md`。
+
 ## UI 操作与验证
 
 - 禁止 Codex 操作、自动化或尝试控制 AsterFiles 的 UI，包括通过内置浏览器、Chrome、Computer Use、Playwright、agent-browser、截图点击或键鼠模拟等方式。

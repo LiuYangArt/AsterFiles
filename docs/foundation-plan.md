@@ -206,6 +206,7 @@ Issue #9 进一步取消十万级搜索结果对 Slint 物理内容高度的依�
 
 - 统一检查：`python tools/verify.py`，覆盖格式、静态检查、测试、确定性无界面场景和 Debug 构建；正式 Release 由用户明确要求后通过 `python tools/verify.py --release` 触发。
 - 单元测试覆盖请求代次、标签隔离、路径身份和取消状态转换。
+- 无界面场景的必要检查复用 `Evidence::check`（#147）。先保存状态及检查结果，再将失败传递到进程退出码；范围说明和预期关闭状态不作为失败。键盘保护测试调用生产判定，陈列室测试读取编译后的 Slint 属性，不读取自身源码证明实现存在。
 - 机器可读汇总写入 `artifacts/verify/summary.json`；UI 状态写入 `artifacts/state/`；截图写入 `artifacts/ui/`；加载与取消日志写入 `artifacts/logs/`；性能数据写入 `artifacts/perf/`。
 - Issue #1 真实 UI 证据必须覆盖默认、窄、最大化窗口下的普通目录与 Everything 搜索截图，另保留换序后调宽、横向滚动同步、重启恢复普通/搜索独立列宽，以及 100%、125%、150% DPI 检查记录；未执行项必须明确标为人工验收，不能由编译或领域测试代替。
 - Agent 调试入口和状态字段见 [agent/debug-validation.md](agent/debug-validation.md)。
