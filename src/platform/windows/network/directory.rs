@@ -12,20 +12,27 @@ pub fn isolated_directory(
     cancel: &AtomicBool,
     on_batch: impl FnMut(Vec<FileEntry>) -> io::Result<()>,
 ) -> io::Result<usize> {
+    #[cfg(not(test))]
     use std::os::windows::process::CommandExt;
 
     let files = StreamFiles::create()?;
     write_directory_input(&files.input(), path, visibility)?;
-    let mut command = Command::new(std::env::current_exe()?);
-    command
-        .arg(CHILD_PREFIX)
-        .arg("directory")
-        .arg(files.input())
-        .arg(files.output())
-        .creation_flags(0x08000000)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    #[cfg(test)]
+    let command = tests::child_command(&files, "enumerate");
+    #[cfg(not(test))]
+    let command = {
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .arg(CHILD_PREFIX)
+            .arg("directory")
+            .arg(files.input())
+            .arg(files.output())
+            .creation_flags(0x08000000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    };
     receive_stream(command, &files.output(), cancel, ISOLATED_TIMEOUT, on_batch)
 }
 
@@ -532,7 +539,7 @@ mod tests {
         }
     }
 
-    fn child_command(files: &StreamFiles, mode: &str) -> Command {
+    pub(super) fn child_command(files: &StreamFiles, mode: &str) -> Command {
         use std::os::windows::process::CommandExt;
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
@@ -640,6 +647,16 @@ mod tests {
                 }
                 publish_batch(&output, &[], 0, true).unwrap();
             }
+            "count-100k" => {
+                publish_batch(&output, &[entry(1)], 0, false).unwrap();
+                for start in (2..=100_000).step_by(MAX_BATCH_ITEMS) {
+                    let entries = (start..=(start + MAX_BATCH_ITEMS as u32 - 1).min(100_000))
+                        .map(entry)
+                        .collect::<Vec<_>>();
+                    publish_batch(&output, &entries, 0, false).unwrap();
+                }
+                publish_batch(&output, &[], 0, true).unwrap();
+            }
             "enumerate" => {
                 let (path, visibility) =
                     read_directory_input(&output.with_file_name("input")).unwrap();
@@ -647,6 +664,45 @@ mod tests {
             }
             _ => panic!("unknown fixture"),
         }
+    }
+
+    #[test]
+    fn issue_150_100k_slow_consumer_preserves_every_entry() {
+        let files = StreamFiles::create().unwrap();
+        let command = child_command(&files, "count-100k");
+        let cancel = AtomicBool::new(false);
+        let started = Instant::now();
+        let mut first_ms = None;
+        let mut count = 0_u32;
+        let mut batches = 0;
+        let mut largest = 0;
+        receive_stream(
+            command,
+            &files.output(),
+            &cancel,
+            Duration::from_secs(30),
+            |entries| {
+                first_ms.get_or_insert_with(|| started.elapsed().as_millis());
+                largest = largest.max(entries.len());
+                batches += 1;
+                for entry in entries {
+                    count += 1;
+                    assert_eq!(entry.id.0, count);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(count, 100_000);
+        assert!(largest <= MAX_BATCH_ITEMS);
+        let report = format!(
+            "{{\"entries\":{count},\"batches\":{batches},\"largest_batch\":{largest},\"first_ms\":{},\"total_ms\":{},\"transport_slots\":1}}",
+            first_ms.unwrap(),
+            started.elapsed().as_millis()
+        );
+        std::fs::create_dir_all("artifacts/state/issue-150").unwrap();
+        std::fs::write("artifacts/state/issue-150/100k.json", report).unwrap();
     }
 
     #[test]

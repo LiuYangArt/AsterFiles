@@ -1,7 +1,7 @@
 //! Directory workers own local/network queues; results retain tab/request identity.
 use crate::{
     domain::{EntryId, FileEntry, FolderSizeState, LibraryLocationId, RequestId, TabId},
-    fs::{ReadOutcome, read_directory_batches_filtered},
+    fs::ReadOutcome,
     network::NetworkExecutionKey,
     platform,
 };
@@ -91,16 +91,11 @@ pub(super) fn network_directory_request(path: &str) -> DirectoryRequest {
 
 #[derive(Debug)]
 pub(super) enum DirectoryEvent {
-    NetworkBatch {
-        tab_id: TabId,
-        request_id: RequestId,
-        entries: Vec<FileEntry>,
-        acknowledgement: mpsc::Sender<()>,
-    },
     Batch {
         tab_id: TabId,
         request_id: RequestId,
         entries: Vec<FileEntry>,
+        acknowledgement: mpsc::Sender<()>,
     },
     Finished {
         tab_id: TabId,
@@ -129,10 +124,7 @@ pub(super) enum DirectoryEvent {
 impl DirectoryEvent {
     pub(super) fn request_identity(&self) -> (TabId, RequestId) {
         match self {
-            Self::NetworkBatch {
-                tab_id, request_id, ..
-            }
-            | Self::Batch {
+            Self::Batch {
                 tab_id, request_id, ..
             }
             | Self::Finished {
@@ -154,11 +146,7 @@ pub(super) fn spawn_directory_workers(
     mpsc::SyncSender<DirectoryRequest>,
     mpsc::Receiver<DirectoryEvent>,
 ) {
-    spawn_directory_workers_with_library_reader(
-        worker_count,
-        network_worker_count,
-        super::library_loading::read_source,
-    )
+    spawn_directory_workers_with_library_reader(worker_count, network_worker_count, read_source)
 }
 
 pub(super) fn spawn_directory_workers_with_library_reader(
@@ -174,7 +162,7 @@ pub(super) fn spawn_directory_workers_with_library_reader(
     let (request_sender, request_receiver) = mpsc::channel::<DirectoryRequest>();
     let (network_request_sender, network_request_receiver) =
         mpsc::sync_channel::<DirectoryRequest>(network_worker_count.saturating_mul(32));
-    let (event_sender, event_receiver) = mpsc::channel::<DirectoryEvent>();
+    let (event_sender, event_receiver) = mpsc::sync_channel::<DirectoryEvent>(32);
     let (local_sender, local_receiver) = mpsc::channel();
     let library_sender = super::library_loading::start(event_sender.clone(), library_reader).0;
     thread::spawn(move || {
@@ -217,7 +205,7 @@ pub(super) fn spawn_directory_workers_with_library_reader(
 fn spawn_network_directory_scheduler(
     worker_count: usize,
     requests: mpsc::Receiver<DirectoryRequest>,
-    events: mpsc::Sender<DirectoryEvent>,
+    events: mpsc::SyncSender<DirectoryEvent>,
 ) {
     let (work_sender, work_receiver) = mpsc::channel::<(NetworkExecutionKey, DirectoryRequest)>();
     let (completion_sender, completion_receiver) = mpsc::channel::<NetworkDirectoryCompletion>();
@@ -235,6 +223,7 @@ fn spawn_network_directory_scheduler(
                 let Ok((key, request)) = work else {
                     break;
                 };
+                let completion_cancel = request.cancel.clone();
                 let slow_cancel = request.cancel.clone();
                 let slow_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let slow_done_for_timer = slow_done.clone();
@@ -251,7 +240,7 @@ fn spawn_network_directory_scheduler(
                         }
                         thread::sleep(Duration::from_millis(20));
                     }
-                    let _ = slow_events.send(DirectoryEvent::Slow {
+                    let _ = slow_events.try_send(DirectoryEvent::Slow {
                         tab_id: slow_tab_id,
                         request_id: slow_request_id,
                     });
@@ -261,12 +250,16 @@ fn spawn_network_directory_scheduler(
                 }));
                 slow_done.store(true, std::sync::atomic::Ordering::Release);
                 if outcome.is_err() {
-                    let _ = events.send(DirectoryEvent::Failed {
-                        tab_id: slow_tab_id,
-                        request_id: slow_request_id,
-                        kind: io::ErrorKind::Other,
-                        message: "network directory worker failed unexpectedly".to_owned(),
-                    });
+                    let _ = send_event(
+                        &completion_cancel,
+                        &events,
+                        DirectoryEvent::Failed {
+                            tab_id: slow_tab_id,
+                            request_id: slow_request_id,
+                            kind: io::ErrorKind::Other,
+                            message: "network directory worker failed unexpectedly".to_owned(),
+                        },
+                    );
                 }
                 let _ = completion_sender.send(NetworkDirectoryCompletion { key });
             }
@@ -280,7 +273,7 @@ fn spawn_network_directory_scheduler(
                 scheduler.complete(&completion.key);
             }
             for request in scheduler.take_cancelled() {
-                let _ = events.send(DirectoryEvent::Cancelled {
+                let _ = events.try_send(DirectoryEvent::Cancelled {
                     tab_id: request.tab_id,
                     request_id: request.request_id,
                 });
@@ -305,12 +298,17 @@ fn spawn_network_directory_scheduler(
                         if let Some(key) = NetworkExecutionKey::from_unc(&request.path) {
                             scheduler.push(key, request);
                         } else {
-                            let _ = events.send(DirectoryEvent::Failed {
-                                tab_id: request.tab_id,
-                                request_id: request.request_id,
-                                kind: io::ErrorKind::InvalidInput,
-                                message: "network directory request requires a UNC path".to_owned(),
-                            });
+                            let _ = send_event(
+                                &request.cancel,
+                                &events,
+                                DirectoryEvent::Failed {
+                                    tab_id: request.tab_id,
+                                    request_id: request.request_id,
+                                    kind: io::ErrorKind::InvalidInput,
+                                    message: "network directory request requires a UNC path"
+                                        .to_owned(),
+                                },
+                            );
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -321,12 +319,16 @@ fn spawn_network_directory_scheduler(
                 if let Some(key) = NetworkExecutionKey::from_unc(&request.path) {
                     scheduler.push(key, request);
                 } else {
-                    let _ = events.send(DirectoryEvent::Failed {
-                        tab_id: request.tab_id,
-                        request_id: request.request_id,
-                        kind: io::ErrorKind::InvalidInput,
-                        message: "network directory request requires a UNC path".to_owned(),
-                    });
+                    let _ = send_event(
+                        &request.cancel,
+                        &events,
+                        DirectoryEvent::Failed {
+                            tab_id: request.tab_id,
+                            request_id: request.request_id,
+                            kind: io::ErrorKind::InvalidInput,
+                            message: "network directory request requires a UNC path".to_owned(),
+                        },
+                    );
                 }
             }
         }
@@ -335,7 +337,7 @@ fn spawn_network_directory_scheduler(
 
 fn read_network_root_batches(
     request: &DirectoryRequest,
-    events: &mpsc::Sender<DirectoryEvent>,
+    events: &mpsc::SyncSender<DirectoryEvent>,
 ) -> io::Result<ReadOutcome> {
     use std::sync::atomic::Ordering;
 
@@ -377,32 +379,27 @@ fn read_network_root_batches(
                 }
             })
             .collect();
-        let _ = events.send(DirectoryEvent::Batch {
-            tab_id: request.tab_id,
-            request_id: request.request_id,
-            entries,
-        });
+        deliver_directory_batch(request, events, entries)?;
     }
     Ok(ReadOutcome::Complete { skipped: 0 })
 }
 
-pub(super) fn deliver_network_directory_batch(
+pub(super) fn deliver_directory_batch(
     request: &DirectoryRequest,
-    events: &mpsc::Sender<DirectoryEvent>,
+    events: &mpsc::SyncSender<DirectoryEvent>,
     entries: Vec<FileEntry>,
 ) -> io::Result<()> {
     if request.cancelled() {
         return Err(io::ErrorKind::Interrupted.into());
     }
     let (acknowledgement, applied) = mpsc::channel();
-    events
-        .send(DirectoryEvent::NetworkBatch {
-            tab_id: request.tab_id,
-            request_id: request.request_id,
-            entries,
-            acknowledgement,
-        })
-        .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+    let event = DirectoryEvent::Batch {
+        tab_id: request.tab_id,
+        request_id: request.request_id,
+        entries,
+        acknowledgement,
+    };
+    send_event(&request.cancel, events, event)?;
     loop {
         if request.cancelled() {
             return Err(io::ErrorKind::Interrupted.into());
@@ -417,18 +414,29 @@ pub(super) fn deliver_network_directory_batch(
     }
 }
 
-fn read_network_directory_batches(
+pub(super) fn read_source(
+    path: &std::path::Path,
+    visibility: crate::domain::FileVisibility,
+    cancel: &std::sync::atomic::AtomicBool,
+    on_batch: &mut dyn FnMut(Vec<FileEntry>) -> io::Result<()>,
+) -> io::Result<usize> {
+    // Local spelling cannot prove locality: ancestors and children can cross into SMB.
+    // Probe and enumeration therefore share the same terminable process boundary.
+    platform::windows::network::isolated_directory(path, visibility, cancel, on_batch)
+}
+
+fn read_directory_batches(
     request: &DirectoryRequest,
-    events: &mpsc::Sender<DirectoryEvent>,
+    events: &mpsc::SyncSender<DirectoryEvent>,
 ) -> io::Result<ReadOutcome> {
     if request.cancelled() {
         return Ok(ReadOutcome::Cancelled);
     }
-    let result = platform::windows::network::isolated_directory(
+    let result = read_source(
         &request.path,
         request.visibility,
         &request.cancel,
-        |entries| deliver_network_directory_batch(request, events, entries),
+        &mut |entries| deliver_directory_batch(request, events, entries),
     );
     if request.cancelled() {
         return Ok(ReadOutcome::Cancelled);
@@ -437,30 +445,18 @@ fn read_network_directory_batches(
 }
 pub(super) fn run_directory_request(
     request: DirectoryRequest,
-    events: &mpsc::Sender<DirectoryEvent>,
+    events: &mpsc::SyncSender<DirectoryEvent>,
 ) {
-    if crate::network::is_unc_server_root(&request.path) {
+    let is_server_root = crate::network::is_unc_server_root(&request.path);
+    if is_server_root {
         platform::windows::network::record_runtime_event("network_root_request_started");
     }
-    let result = if crate::network::is_unc_server_root(&request.path) {
+    let result = if is_server_root {
         read_network_root_batches(&request, events)
-    } else if crate::network::is_unc_path(&request.path) {
-        read_network_directory_batches(&request, events)
     } else {
-        read_directory_batches_filtered(
-            &request.path,
-            &request.cancel,
-            request.visibility,
-            |entries| {
-                let _ = events.send(DirectoryEvent::Batch {
-                    tab_id: request.tab_id,
-                    request_id: request.request_id,
-                    entries,
-                });
-            },
-        )
+        read_directory_batches(&request, events)
     };
-    if crate::network::is_unc_server_root(&request.path) {
+    if is_server_root {
         platform::windows::network::record_runtime_event(match &result {
             Ok(ReadOutcome::Complete { .. }) => "network_root_request_completed",
             Ok(ReadOutcome::Cancelled) => "network_root_request_cancelled",
@@ -487,13 +483,145 @@ pub(super) fn run_directory_request(
             message: error.to_string(),
         },
     };
-    let _ = events.send(event);
+    let _ = send_event(&request.cancel, events, event);
+}
+
+pub(super) fn send_event(
+    cancel: &std::sync::atomic::AtomicBool,
+    events: &mpsc::SyncSender<DirectoryEvent>,
+    mut event: DirectoryEvent,
+) -> io::Result<()> {
+    loop {
+        match events.try_send(event) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::TrySendError::Full(pending)) => {
+                if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                event = pending;
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+    #[test]
+    fn issue_150_local_slow_consumer_stops_after_first_batch() {
+        let path =
+            std::env::temp_dir().join(format!("asterfiles-150-baseline-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        for index in 0..1024 {
+            std::fs::write(path.join(format!("{index}.txt")), b"").unwrap();
+        }
+        let mut request = network_directory_request("");
+        request.path = path.clone();
+        let cancel = request.cancel.clone();
+        let (sender, receiver) = mpsc::sync_channel(32);
+        let started = Instant::now();
+        let worker = thread::spawn(move || run_directory_request(request, &sender));
+        let first = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        let first_ms = started.elapsed().as_millis();
+        thread::sleep(Duration::from_millis(150));
+        let queued = receiver.try_iter().count();
+        let cancelling = Instant::now();
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        drop(first);
+        worker.join().unwrap();
+        let cancel_ms = cancelling.elapsed().as_millis();
+        std::fs::remove_dir_all(&path).unwrap();
+        eprintln!(
+            "issue_150 first_ms={first_ms} pending_events={} cancel_ms={cancel_ms}",
+            queued + 1
+        );
+        std::fs::create_dir_all("artifacts/state/issue-150").unwrap();
+        std::fs::write("artifacts/state/issue-150/local-slow.json", format!(
+            "{{\"fixture_entries\":1024,\"first_ms\":{first_ms},\"pending_events\":{},\"cancel_ms\":{cancel_ms}}}", queued + 1
+        )).unwrap();
+        assert_eq!(queued, 0, "producer must wait for consumption");
+    }
+
+    #[test]
+    fn issue_150_full_queue_cancellation_and_receiver_close_release_producer() {
+        for close in [false, true] {
+            let request = network_directory_request(r"C:\local\junction");
+            let cancel = request.cancel.clone();
+            let (sender, receiver) = mpsc::sync_channel(1);
+            sender
+                .send(DirectoryEvent::Slow {
+                    tab_id: request.tab_id,
+                    request_id: request.request_id,
+                })
+                .unwrap();
+            let worker = thread::spawn(move || deliver_directory_batch(&request, &sender, vec![]));
+            thread::sleep(Duration::from_millis(40));
+            let started = Instant::now();
+            if close {
+                drop(receiver);
+            } else {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+            let error = worker.join().unwrap().unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if close {
+                    io::ErrorKind::BrokenPipe
+                } else {
+                    io::ErrorKind::Interrupted
+                }
+            );
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+    }
+
+    #[test]
+    fn issue_150_reparse_path_preserves_identity_and_bounded_delivery() {
+        use std::os::windows::process::CommandExt;
+        let root =
+            std::env::temp_dir().join(format!("asterfiles-150-junction-{}", std::process::id()));
+        let target = root.join("target");
+        let link = root.join("link");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("kept.txt"), b"test").unwrap();
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let mut request = network_directory_request("");
+        request.path = link.clone();
+        let (sender, receiver) = mpsc::sync_channel(32);
+        let worker = thread::spawn(move || run_directory_request(request, &sender));
+        let first = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        let DirectoryEvent::Batch {
+            entries,
+            acknowledgement,
+            ..
+        } = first
+        else {
+            panic!("{first:?}")
+        };
+        assert_eq!(entries[0].path, link.join("kept.txt"));
+        assert!(receiver.recv_timeout(Duration::from_millis(80)).is_err());
+        acknowledgement.send(()).unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(10)).unwrap(),
+            DirectoryEvent::Finished { .. }
+        ));
+        worker.join().unwrap();
+        std::fs::remove_dir(&link).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn network_directory_scheduler_serializes_one_host_and_allows_another() {
         let mut scheduler = NetworkDirectoryScheduler::default();
@@ -532,10 +660,9 @@ mod tests {
         for cancel_request in [false, true] {
             let request = network_directory_request(r"\\server\share");
             let cancel = request.cancel.clone();
-            let (sender, receiver) = mpsc::channel();
-            let worker = thread::spawn(move || {
-                deliver_network_directory_batch(&request, &sender, Vec::new())
-            });
+            let (sender, receiver) = mpsc::sync_channel(32);
+            let worker =
+                thread::spawn(move || deliver_directory_batch(&request, &sender, Vec::new()));
             let event = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
             if cancel_request {
                 cancel.store(true, std::sync::atomic::Ordering::Release);

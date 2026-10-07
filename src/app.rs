@@ -17924,6 +17924,23 @@ fn refresh_affected_tabs(
     }
 }
 
+fn deliver_directory_event_to_ui<E>(
+    enqueue: impl FnOnce(mpsc::Sender<()>) -> Result<(), E>,
+    alive: impl Fn() -> bool,
+) -> bool {
+    let (completed, completion) = mpsc::channel();
+    if enqueue(completed).is_err() {
+        return false;
+    }
+    loop {
+        match completion.recv_timeout(Duration::from_millis(20)) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return true,
+            Err(mpsc::RecvTimeoutError::Timeout) if !alive() => return false,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
 fn start_event_pump(
     ui: &AppWindow,
     receiver: Arc<Mutex<mpsc::Receiver<DirectoryEvent>>>,
@@ -17948,177 +17965,187 @@ fn start_event_pump(
             let thumbnail_scheduler = thumbnail_scheduler.clone();
             let shortcut_sender = shortcut_sender.clone();
             let everything_sender = everything_sender.clone();
-            if weak
-                .upgrade_in_event_loop(move |ui| {
-                    let routed_tab = Some(event.request_identity().0);
-                    let batch = match &event {
-                        DirectoryEvent::NetworkBatch {
-                            tab_id, request_id, ..
-                        }
-                        | DirectoryEvent::Batch {
-                            tab_id, request_id, ..
-                        } => Some((*tab_id, *request_id)),
-                        _ => None,
-                    };
-                    let finished = match &event {
-                        DirectoryEvent::Finished {
-                            tab_id, request_id, ..
-                        } => Some((*tab_id, *request_id)),
-                        _ => None,
-                    };
-                    let network_tab = routed_tab.is_some_and(|tab_id| {
-                        state.lock().ok().is_some_and(|app| {
-                            app.tab(tab_id)
-                                .and_then(TabSession::visible_path)
-                                .is_some_and(crate::network::is_unc_path)
-                        })
-                    });
-                    let network_root_finished = finished.is_some_and(|(tab_id, request_id)| {
-                        state.lock().ok().is_some_and(|app| {
-                            app.tab(tab_id).is_some_and(|tab| {
-                                tab.latest_request == request_id
-                                    && tab
-                                        .requested_location
-                                        .as_ref()
-                                        .and_then(NavigationLocation::directory_path)
-                                        .is_some_and(crate::network::is_unc_server_root)
-                            })
-                        })
-                    });
-                    if network_root_finished {
-                        platform::windows::network::record_runtime_event(
-                            "network_root_event_apply_started",
-                        );
-                    }
-                    let focus_action = finished.and_then(|(tab_id, request_id)| {
-                        let app = state.lock().ok()?;
-                        app.focus_after_refresh
-                            .get(&tab_id)
-                            .filter(|pending| pending.request_id == Some(request_id))
-                            .map(|pending| pending.action)
-                    });
-                    let network_scroll =
-                        finished
-                            .filter(|_| network_tab)
-                            .and_then(|(tab_id, request_id)| {
-                                let target = state.lock().ok().and_then(|app| {
-                                    app.tab(tab_id).filter(|tab| tab.accepts(request_id))?;
-                                    let window_id = app.window_for_tab(tab_id)?;
-                                    (app.window(window_id)?.active_tab == tab_id)
-                                        .then(|| window_ui(window_id))
-                                        .flatten()
-                                })?;
-                                (target.get_file_viewport_y() < 0.0).then(|| {
-                                    (
-                                        target.clone_strong(),
-                                        capture_zoom_anchor(&target, 16.0, 0.0),
-                                    )
-                                })
-                            });
-                    let icon_requests = apply_event(&state, event);
-                    if network_root_finished {
-                        platform::windows::network::record_runtime_event(
-                            "network_root_event_apply_completed",
-                        );
-                    }
-                    for request in icon_requests {
-                        let _ = icon_sender.send(request);
-                    }
-                    if let Some((tab_id, request_id)) = batch {
-                        if let Some(window_id) =
-                            state.lock().ok().and_then(|app| app.window_for_tab(tab_id))
-                            && let Some(target_ui) = window_ui(window_id)
-                        {
-                            append_active_file_rows(
-                                &target_ui,
-                                &WindowSessions::new(state.clone(), window_id),
-                                tab_id,
-                                request_id,
-                            );
-                        } else {
-                            append_active_file_rows(&ui, &state, tab_id, request_id);
-                        }
-                        defer_visible_file_images(
-                            state.clone(),
-                            tab_id,
-                            thumbnail_scheduler.clone(),
-                        );
-                        if let Some(target_ui) = state
-                            .lock()
-                            .ok()
-                            .and_then(|app| app.window_for_tab(tab_id))
-                            .and_then(window_ui)
-                        {
-                            submit_visible_shortcuts(
-                                &shortcut_sender,
-                                &state,
-                                &target_ui,
-                                tab_id,
-                                request_id,
-                            );
-                        }
-                    } else {
-                        if let Some((tab_id, request_id)) = finished.filter(|_| !network_tab) {
-                            let viewport = state
-                                .lock()
-                                .ok()
-                                .and_then(|app| app.window_for_tab(tab_id))
-                                .and_then(window_ui)
-                                .map(|ui| (ui.get_file_viewport_y(), ui.get_file_viewport_height()))
-                                .unwrap_or((0.0, 640.0));
-                            submit_visible_folder_sizes(
-                                &everything_sender,
-                                &state,
-                                tab_id,
-                                request_id,
-                                viewport.0,
-                                viewport.1,
-                            );
-                        }
-                        if let Some(tab_id) = routed_tab {
-                            refresh_tab_window(&state, tab_id);
-                        } else {
-                            refresh_all_windows(&state);
-                        }
-                        if let Some((target, anchor)) = network_scroll {
-                            restore_zoom_anchor(&target, anchor);
-                        }
-                        if let Some((tab_id, request_id)) = finished
-                            && let Some(target_ui) = state
-                                .lock()
-                                .ok()
-                                .and_then(|app| app.window_for_tab(tab_id))
-                                .and_then(window_ui)
-                        {
-                            let focused = state.lock().ok().and_then(|app| {
+            let waiting_state = state.clone();
+            if !deliver_directory_event_to_ui(
+                |completed| {
+                    weak.upgrade_in_event_loop(move |ui| {
+                        // Retain this guard until the model and visible rows have consumed the event.
+                        let _completed = completed;
+                        let routed_tab = Some(event.request_identity().0);
+                        let batch = match &event {
+                            DirectoryEvent::Batch {
+                                tab_id, request_id, ..
+                            } => Some((*tab_id, *request_id)),
+                            _ => None,
+                        };
+                        let finished = match &event {
+                            DirectoryEvent::Finished {
+                                tab_id, request_id, ..
+                            } => Some((*tab_id, *request_id)),
+                            _ => None,
+                        };
+                        let network_tab = routed_tab.is_some_and(|tab_id| {
+                            state.lock().ok().is_some_and(|app| {
                                 app.tab(tab_id)
-                                    .filter(|tab| tab.latest_request == request_id)
-                                    .and_then(|tab| tab.focused)
-                            });
-                            if focus_action == Some(PendingFocusAction::Select) {
-                                reveal_completed_selection(&target_ui, &state, tab_id, request_id);
-                            } else if let Some(entry_id) =
-                                focused.filter(|_| !network_tab || focus_action.is_some())
-                            {
-                                reveal_entry(&target_ui, &state, tab_id, request_id, entry_id);
-                            }
-                            submit_visible_shortcuts(
-                                &shortcut_sender,
-                                &state,
-                                &target_ui,
-                                tab_id,
-                                request_id,
-                            );
-                        }
+                                    .and_then(TabSession::visible_path)
+                                    .is_some_and(crate::network::is_unc_path)
+                            })
+                        });
+                        let network_root_finished = finished.is_some_and(|(tab_id, request_id)| {
+                            state.lock().ok().is_some_and(|app| {
+                                app.tab(tab_id).is_some_and(|tab| {
+                                    tab.latest_request == request_id
+                                        && tab
+                                            .requested_location
+                                            .as_ref()
+                                            .and_then(NavigationLocation::directory_path)
+                                            .is_some_and(crate::network::is_unc_server_root)
+                                })
+                            })
+                        });
                         if network_root_finished {
                             platform::windows::network::record_runtime_event(
-                                "network_root_ui_refresh_completed",
+                                "network_root_event_apply_started",
                             );
                         }
-                    }
-                })
-                .is_err()
-            {
+                        let focus_action = finished.and_then(|(tab_id, request_id)| {
+                            let app = state.lock().ok()?;
+                            app.focus_after_refresh
+                                .get(&tab_id)
+                                .filter(|pending| pending.request_id == Some(request_id))
+                                .map(|pending| pending.action)
+                        });
+                        let network_scroll =
+                            finished
+                                .filter(|_| network_tab)
+                                .and_then(|(tab_id, request_id)| {
+                                    let target = state.lock().ok().and_then(|app| {
+                                        app.tab(tab_id).filter(|tab| tab.accepts(request_id))?;
+                                        let window_id = app.window_for_tab(tab_id)?;
+                                        (app.window(window_id)?.active_tab == tab_id)
+                                            .then(|| window_ui(window_id))
+                                            .flatten()
+                                    })?;
+                                    (target.get_file_viewport_y() < 0.0).then(|| {
+                                        (
+                                            target.clone_strong(),
+                                            capture_zoom_anchor(&target, 16.0, 0.0),
+                                        )
+                                    })
+                                });
+                        let icon_requests = apply_event(&state, event);
+                        if network_root_finished {
+                            platform::windows::network::record_runtime_event(
+                                "network_root_event_apply_completed",
+                            );
+                        }
+                        for request in icon_requests {
+                            let _ = icon_sender.send(request);
+                        }
+                        if let Some((tab_id, request_id)) = batch {
+                            if let Some(window_id) =
+                                state.lock().ok().and_then(|app| app.window_for_tab(tab_id))
+                                && let Some(target_ui) = window_ui(window_id)
+                            {
+                                append_active_file_rows(
+                                    &target_ui,
+                                    &WindowSessions::new(state.clone(), window_id),
+                                    tab_id,
+                                    request_id,
+                                );
+                            } else {
+                                append_active_file_rows(&ui, &state, tab_id, request_id);
+                            }
+                            defer_visible_file_images(
+                                state.clone(),
+                                tab_id,
+                                thumbnail_scheduler.clone(),
+                            );
+                            if let Some(target_ui) = state
+                                .lock()
+                                .ok()
+                                .and_then(|app| app.window_for_tab(tab_id))
+                                .and_then(window_ui)
+                            {
+                                submit_visible_shortcuts(
+                                    &shortcut_sender,
+                                    &state,
+                                    &target_ui,
+                                    tab_id,
+                                    request_id,
+                                );
+                            }
+                        } else {
+                            if let Some((tab_id, request_id)) = finished.filter(|_| !network_tab) {
+                                let viewport = state
+                                    .lock()
+                                    .ok()
+                                    .and_then(|app| app.window_for_tab(tab_id))
+                                    .and_then(window_ui)
+                                    .map(|ui| {
+                                        (ui.get_file_viewport_y(), ui.get_file_viewport_height())
+                                    })
+                                    .unwrap_or((0.0, 640.0));
+                                submit_visible_folder_sizes(
+                                    &everything_sender,
+                                    &state,
+                                    tab_id,
+                                    request_id,
+                                    viewport.0,
+                                    viewport.1,
+                                );
+                            }
+                            if let Some(tab_id) = routed_tab {
+                                refresh_tab_window(&state, tab_id);
+                            } else {
+                                refresh_all_windows(&state);
+                            }
+                            if let Some((target, anchor)) = network_scroll {
+                                restore_zoom_anchor(&target, anchor);
+                            }
+                            if let Some((tab_id, request_id)) = finished
+                                && let Some(target_ui) = state
+                                    .lock()
+                                    .ok()
+                                    .and_then(|app| app.window_for_tab(tab_id))
+                                    .and_then(window_ui)
+                            {
+                                let focused = state.lock().ok().and_then(|app| {
+                                    app.tab(tab_id)
+                                        .filter(|tab| tab.latest_request == request_id)
+                                        .and_then(|tab| tab.focused)
+                                });
+                                if focus_action == Some(PendingFocusAction::Select) {
+                                    reveal_completed_selection(
+                                        &target_ui, &state, tab_id, request_id,
+                                    );
+                                } else if let Some(entry_id) =
+                                    focused.filter(|_| !network_tab || focus_action.is_some())
+                                {
+                                    reveal_entry(&target_ui, &state, tab_id, request_id, entry_id);
+                                }
+                                submit_visible_shortcuts(
+                                    &shortcut_sender,
+                                    &state,
+                                    &target_ui,
+                                    tab_id,
+                                    request_id,
+                                );
+                            }
+                            if network_root_finished {
+                                platform::windows::network::record_runtime_event(
+                                    "network_root_ui_refresh_completed",
+                                );
+                            }
+                        }
+                    })
+                },
+                || {
+                    waiting_state
+                        .lock()
+                        .is_ok_and(|app| !app.windows.is_empty())
+                },
+            ) {
                 break;
             }
         }
@@ -18409,7 +18436,7 @@ fn reveal_entry(
 
 fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest> {
     let acknowledgement = match &event {
-        DirectoryEvent::NetworkBatch {
+        DirectoryEvent::Batch {
             acknowledgement, ..
         } => Some(acknowledgement.clone()),
         _ => None,
@@ -18417,16 +18444,11 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
     let mut app = state.lock().expect("app state mutex is not poisoned");
     let mut icon_requests = Vec::new();
     match event {
-        DirectoryEvent::NetworkBatch {
+        DirectoryEvent::Batch {
             tab_id,
             request_id,
             entries,
             ..
-        }
-        | DirectoryEvent::Batch {
-            tab_id,
-            request_id,
-            entries,
         } => {
             let accepted = app.tab(tab_id).is_some_and(|tab| tab.accepts(request_id));
             if accepted {
@@ -18669,7 +18691,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
             }
         }
     }
-    // Release network backpressure only after the batch was applied or rejected.
+    // Release the producer only after the batch was applied or rejected.
     if let Some(acknowledgement) = acknowledgement {
         let _ = acknowledgement.send(());
     }
@@ -24804,6 +24826,7 @@ mod tests {
         apply_event(
             &state,
             DirectoryEvent::Batch {
+                acknowledgement: mpsc::channel().0,
                 tab_id,
                 request_id,
                 entries: vec![
@@ -25144,6 +25167,7 @@ mod tests {
         apply_event(
             &state,
             DirectoryEvent::Batch {
+                acknowledgement: mpsc::channel().0,
                 tab_id: TabId(1),
                 request_id: stale_request,
                 entries: vec![focus_entry(1, r"C:\first\late.txt")],
@@ -25875,6 +25899,7 @@ mod tests {
         let grid_requests = apply_event(
             &grid,
             DirectoryEvent::Batch {
+                acknowledgement: mpsc::channel().0,
                 tab_id: TabId(1),
                 request_id: RequestId(4),
                 entries: vec![focus_entry(1, r"C:\grid\photo.png")],
@@ -25891,6 +25916,7 @@ mod tests {
         let details_requests = apply_event(
             &details,
             DirectoryEvent::Batch {
+                acknowledgement: mpsc::channel().0,
                 tab_id: TabId(1),
                 request_id: RequestId(5),
                 entries: vec![focus_entry(1, r"C:\details\photo.png")],
@@ -27630,6 +27656,7 @@ mod tests {
         let requests = apply_event(
             &state,
             DirectoryEvent::Batch {
+                acknowledgement: mpsc::channel().0,
                 tab_id: TabId(1),
                 request_id: RequestId(4),
                 entries: vec![focus_entry(1, r"C:\grid\photo.png")],
@@ -27668,6 +27695,7 @@ mod tests {
         let batch = apply_event(
             &state,
             DirectoryEvent::Batch {
+                acknowledgement: mpsc::channel().0,
                 tab_id: TabId(1),
                 request_id: RequestId(4),
                 entries: vec![
@@ -27724,6 +27752,7 @@ mod tests {
         let requests = apply_event(
             &state,
             DirectoryEvent::Batch {
+                acknowledgement: mpsc::channel().0,
                 tab_id: TabId(1),
                 request_id: RequestId(8),
                 entries: vec![
@@ -29243,6 +29272,7 @@ mod tests {
         apply_event(
             &state,
             DirectoryEvent::Batch {
+                acknowledgement: mpsc::channel().0,
                 tab_id: second_tab,
                 request_id: RequestId(7),
                 entries: vec![entry],
@@ -29329,6 +29359,7 @@ mod tests {
         apply_event(
             &state,
             DirectoryEvent::Batch {
+                acknowledgement: mpsc::channel().0,
                 tab_id: first_tab,
                 request_id: RequestId(9),
                 entries: vec![focus_entry(1, "one/late.txt")],
@@ -29337,6 +29368,7 @@ mod tests {
         apply_event(
             &state,
             DirectoryEvent::Batch {
+                acknowledgement: mpsc::channel().0,
                 tab_id: second_tab,
                 request_id: RequestId(9),
                 entries: vec![focus_entry(1, "two/current.txt")],
@@ -29668,17 +29700,84 @@ mod tests {
     }
 
     #[test]
+    fn issue_150_event_pump_waits_until_callback_is_consumed_or_dropped() {
+        let (queued, callbacks) = mpsc::channel();
+        let (finished, completion) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            for _ in 0..2 {
+                assert!(deliver_directory_event_to_ui(
+                    |guard| { queued.send(guard).map_err(|_| ()) },
+                    || true
+                ));
+            }
+            finished.send(()).unwrap();
+        });
+        let first = callbacks.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(callbacks.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(first);
+        let second = callbacks.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(completion.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(second);
+        completion.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        assert!(!deliver_directory_event_to_ui(
+            |_guard| Err::<(), _>(()),
+            || true
+        ));
+        let (queued, callbacks) = mpsc::channel();
+        let started = Instant::now();
+        assert!(!deliver_directory_event_to_ui(
+            |guard| queued.send(guard).map_err(|_| ()),
+            || false,
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(callbacks.recv().unwrap());
+    }
+
+    #[test]
+    fn issue_150_cancelled_and_replaced_batches_are_acknowledged_without_model_changes() {
+        for cancelled in [false, true] {
+            let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\local")], 0, [0, 1, 2, 3]);
+            let (request_id, _) = app
+                .tab_mut(TabId(1))
+                .unwrap()
+                .begin_directory_navigation(PathBuf::from(r"C:\first"), NavigationKind::Normal);
+            if cancelled {
+                app.tab_mut(TabId(1)).unwrap().cancel_pending();
+            } else {
+                app.tab_mut(TabId(1)).unwrap().begin_directory_navigation(
+                    PathBuf::from(r"C:\second"),
+                    NavigationKind::Normal,
+                );
+            }
+            let state = Arc::new(Mutex::new(app));
+            let (acknowledgement, consumed) = mpsc::channel();
+            apply_event(
+                &state,
+                DirectoryEvent::Batch {
+                    tab_id: TabId(1),
+                    request_id,
+                    entries: vec![focus_entry(1, r"C:\first\late")],
+                    acknowledgement,
+                },
+            );
+            consumed.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(state.lock().unwrap().active().pending_entries.is_empty());
+        }
+    }
+
+    #[test]
     fn issue_103_network_backpressure_waits_for_application_and_preserves_local_loading() {
         use super::directory_loading::{
-            deliver_network_directory_batch, network_directory_request, run_directory_request,
+            deliver_directory_batch, network_directory_request, run_directory_request,
         };
 
         let request = network_directory_request(r"\\server\share");
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(32);
         let worker_sender = sender.clone();
         let worker = thread::spawn(move || {
             for id in 1..=2 {
-                deliver_network_directory_batch(
+                deliver_directory_batch(
                     &request,
                     &worker_sender,
                     vec![focus_entry(id, r"\\server\share\item")],
@@ -29725,7 +29824,7 @@ mod tests {
         let (acknowledgement, applied) = mpsc::channel();
         apply_event(
             &state,
-            DirectoryEvent::NetworkBatch {
+            DirectoryEvent::Batch {
                 tab_id: TabId(1),
                 request_id,
                 entries: vec![focus_entry(1, r"\\server\share\first")],
@@ -29744,7 +29843,7 @@ mod tests {
         let (acknowledgement, applied) = mpsc::channel();
         apply_event(
             &state,
-            DirectoryEvent::NetworkBatch {
+            DirectoryEvent::Batch {
                 tab_id: TabId(1),
                 request_id,
                 entries: vec![focus_entry(2, r"\\server\share\late")],
@@ -29767,6 +29866,7 @@ mod tests {
         let state = Arc::new(Mutex::new(app));
         for event in [
             DirectoryEvent::Batch {
+                acknowledgement: mpsc::channel().0,
                 tab_id: TabId(1),
                 request_id,
                 entries: vec![focus_entry(1, r"\\server\share\late")],
@@ -30126,6 +30226,7 @@ mod tests {
         apply_event(
             &state,
             DirectoryEvent::Batch {
+                acknowledgement: mpsc::channel().0,
                 tab_id: closing,
                 request_id,
                 entries: vec![focus_entry(1, "two/late.txt")],
@@ -30639,6 +30740,7 @@ mod tests {
         apply_event(
             &state,
             DirectoryEvent::Batch {
+                acknowledgement: mpsc::channel().0,
                 tab_id,
                 request_id,
                 entries: vec![
@@ -30694,6 +30796,7 @@ mod tests {
         apply_event(
             &state,
             DirectoryEvent::Batch {
+                acknowledgement: mpsc::channel().0,
                 tab_id,
                 request_id: request.request_id,
                 entries: vec![folder],

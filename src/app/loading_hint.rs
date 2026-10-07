@@ -117,6 +117,7 @@ mod tests {
             apply_event(
                 &state.shared,
                 DirectoryEvent::Batch {
+                    acknowledgement: mpsc::channel().0,
                     tab_id: TabId(1),
                     request_id,
                     entries: vec![item],

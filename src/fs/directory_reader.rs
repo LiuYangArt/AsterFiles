@@ -1,78 +1,20 @@
+#[cfg(test)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+};
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering as AtomicOrdering},
-    },
 };
 
 use crate::domain::folder_size_scheduler::is_internal_cleanup_path;
 use crate::domain::{EntryId, EntryKind, FileEntry, FileVisibility};
 
-pub const DIRECTORY_FIRST_BATCH_SIZE: usize = 32;
-pub const DIRECTORY_BATCH_SIZE: usize = 256;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadOutcome {
     Complete { skipped: usize },
     Cancelled,
-}
-
-#[cfg(test)]
-fn read_directory_batches(
-    path: &Path,
-    cancel: &Arc<AtomicBool>,
-    on_batch: impl FnMut(Vec<FileEntry>),
-) -> io::Result<ReadOutcome> {
-    read_directory_batches_filtered(path, cancel, FileVisibility::default(), on_batch)
-}
-pub fn read_directory_batches_filtered(
-    path: &Path,
-    cancel: &Arc<AtomicBool>,
-    visibility: FileVisibility,
-    mut on_batch: impl FnMut(Vec<FileEntry>),
-) -> io::Result<ReadOutcome> {
-    let mut batch_limit = DIRECTORY_FIRST_BATCH_SIZE;
-    let mut batch = Vec::with_capacity(batch_limit);
-    let mut skipped = 0;
-    let mut next_id = 1_u32;
-
-    for result in fs::read_dir(path)? {
-        if cancel.load(AtomicOrdering::Acquire) {
-            return Ok(ReadOutcome::Cancelled);
-        }
-        let directory_entry = match result {
-            Ok(entry) => entry,
-            Err(_) => {
-                skipped += 1;
-                continue;
-            }
-        };
-        let entry = match read_directory_entry(directory_entry, visibility, next_id) {
-            Ok(Some(entry)) => entry,
-            Ok(None) => continue,
-            Err(_) => {
-                skipped += 1;
-                continue;
-            }
-        };
-        if cancel.load(AtomicOrdering::Acquire) {
-            return Ok(ReadOutcome::Cancelled);
-        }
-        batch.push(entry);
-        next_id = next_id.checked_add(1).expect("directory entry ID overflow");
-
-        if batch.len() == batch_limit {
-            on_batch(std::mem::take(&mut batch));
-            batch_limit = DIRECTORY_BATCH_SIZE;
-            batch = Vec::with_capacity(batch_limit);
-        }
-    }
-    if !batch.is_empty() {
-        on_batch(batch);
-    }
-    Ok(ReadOutcome::Complete { skipped })
 }
 
 pub(crate) fn read_directory_entry(
@@ -213,11 +155,30 @@ fn attributes_are_visible(attributes: u32, visibility: FileVisibility) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn first_batch_is_small_and_following_batches_are_larger() {
-        assert_eq!(DIRECTORY_FIRST_BATCH_SIZE, 32);
-        assert_eq!(DIRECTORY_BATCH_SIZE, 256);
+    fn collect_directory_fixture(
+        path: &Path,
+        cancel: &Arc<AtomicBool>,
+        visibility: FileVisibility,
+        mut on_batch: impl FnMut(Vec<FileEntry>),
+    ) -> io::Result<ReadOutcome> {
+        if cancel.load(AtomicOrdering::Acquire) {
+            return Ok(ReadOutcome::Cancelled);
+        }
+        crate::platform::windows::network::isolated_directory(path, visibility, cancel, |batch| {
+            on_batch(batch);
+            Ok(())
+        })
+        .map(|skipped| ReadOutcome::Complete { skipped })
     }
+
+    fn collect_directory_default(
+        path: &Path,
+        cancel: &Arc<AtomicBool>,
+        on_batch: impl FnMut(Vec<FileEntry>),
+    ) -> io::Result<ReadOutcome> {
+        collect_directory_fixture(path, cancel, FileVisibility::default(), on_batch)
+    }
+
     #[test]
     fn default_visibility_shows_hidden_but_not_system_entries() {
         assert_eq!(
@@ -234,7 +195,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let mut entries = Vec::new();
         let outcome =
-            read_directory_batches(Path::new("."), &cancel, |batch| entries.extend(batch))
+            collect_directory_default(Path::new("."), &cancel, |batch| entries.extend(batch))
                 .expect("current directory must be readable");
         assert!(matches!(outcome, ReadOutcome::Complete { .. }));
         assert!(
@@ -279,7 +240,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let mut entries = Vec::new();
 
-        read_directory_batches_filtered(
+        collect_directory_fixture(
             &fixture.0,
             &cancel,
             FileVisibility {
@@ -373,7 +334,7 @@ mod tests {
         .unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let mut entries = Vec::new();
-        read_directory_batches_filtered(
+        collect_directory_fixture(
             &fixture.0,
             &cancel,
             FileVisibility {
@@ -414,7 +375,7 @@ mod tests {
             let started = Instant::now();
             let mut first_batch_ms = None;
             let mut count = 0_usize;
-            let outcome = read_directory_batches_filtered(
+            let outcome = collect_directory_fixture(
                 path,
                 &cancel,
                 FileVisibility {
@@ -445,7 +406,7 @@ mod tests {
                     "{{\n  \"schema_version\": 1,\n",
                     "  \"ordinary\": {{\"count\": {}, \"first_batch_ms\": {}, \"full_enumeration_ms\": {}, \"followup_path_metadata_reads\": 0}},\n",
                     "  \"shortcuts\": {{\"count\": {}, \"first_batch_ms\": {}, \"full_enumeration_ms\": {}, \"resolved_during_enumeration\": 0}},\n",
-                    "  \"batch_sizes\": [32, 256]\n}}\n"
+                    "  \"batch_sizes\": [1, 256]\n}}\n"
                 ),
                 ordinary_result.2,
                 ordinary_result.0,
@@ -471,7 +432,7 @@ mod tests {
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let mut entries = Vec::new();
-        read_directory_batches_filtered(
+        collect_directory_fixture(
             users,
             &cancel,
             FileVisibility {
@@ -495,7 +456,7 @@ mod tests {
     #[test]
     fn honours_cancellation_before_enumeration() {
         let cancel = Arc::new(AtomicBool::new(true));
-        let outcome = read_directory_batches(Path::new("."), &cancel, |_| {})
+        let outcome = collect_directory_default(Path::new("."), &cancel, |_| {})
             .expect("current directory must be readable");
         assert_eq!(outcome, ReadOutcome::Cancelled);
     }

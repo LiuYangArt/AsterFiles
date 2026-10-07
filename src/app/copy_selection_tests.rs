@@ -45,6 +45,7 @@ fn issue_133_completion_focus_follows_display_order_and_grouping() {
             apply_event(
                 &state,
                 DirectoryEvent::Batch {
+                    acknowledgement: mpsc::channel().0,
                     tab_id,
                     request_id,
                     entries: vec![
@@ -242,6 +243,7 @@ fn issue_133_f5_still_clears_selection_and_old_completion_cannot_restore_it() {
     apply_event(
         &state,
         DirectoryEvent::Batch {
+            acknowledgement: mpsc::channel().0,
             tab_id,
             request_id: request.request_id,
             entries: vec![

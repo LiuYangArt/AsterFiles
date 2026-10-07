@@ -97,7 +97,7 @@ struct Loader {
 }
 impl Loader {
     fn new(reader: SourceReader) -> Self {
-        let (events, receiver) = mpsc::channel();
+        let (events, receiver) = mpsc::sync_channel(32);
         let (sender, handle) = start(events, reader);
         Self {
             sender: Some(sender),
@@ -116,7 +116,7 @@ impl Loader {
         let mut batches = Vec::new();
         loop {
             match self.receive() {
-                DirectoryEvent::NetworkBatch {
+                DirectoryEvent::Batch {
                     entries: batch,
                     acknowledgement,
                     ..
@@ -186,7 +186,14 @@ fn issue_104_four_hanging_library_helpers_do_not_block_healthy_sources_or_local_
     let mut local_finished = false;
     while healthy_tabs.len() < 4 || !local_finished {
         match events.recv_timeout(Duration::from_secs(10)).unwrap() {
-            DirectoryEvent::NetworkBatch {
+            DirectoryEvent::Batch {
+                tab_id: TabId(99),
+                acknowledgement,
+                ..
+            } => {
+                acknowledgement.send(()).unwrap();
+            }
+            DirectoryEvent::Batch {
                 tab_id,
                 entries,
                 acknowledgement,
@@ -200,9 +207,6 @@ fn issue_104_four_hanging_library_helpers_do_not_block_healthy_sources_or_local_
             DirectoryEvent::Finished {
                 tab_id: TabId(99), ..
             } => local_finished = true,
-            DirectoryEvent::Batch {
-                tab_id: TabId(99), ..
-            } => {}
             unexpected => panic!("library finished while source still hung: {unexpected:?}"),
         }
     }
@@ -324,7 +328,7 @@ fn issue_104_large_source_is_incremental_and_backpressured() {
             .is_err()
     );
     let first_count = match first {
-        DirectoryEvent::NetworkBatch {
+        DirectoryEvent::Batch {
             entries,
             acknowledgement,
             ..
@@ -428,7 +432,7 @@ fn issue_104_closed_input_cancels_active_and_queued_sources() {
 #[test]
 fn issue_104_dropped_receiver_releases_backpressured_source() {
     let fixture = Fixture::new("receiver-drop");
-    let (events, receiver) = mpsc::channel();
+    let (events, receiver) = mpsc::sync_channel(32);
     let (sender, handle) = start(events, fixture_reader);
     sender
         .send(request(1, vec![(1, fixture.directory("many", 301))]))
@@ -557,7 +561,7 @@ fn issue_104_parent_cancel_reaps_real_helper_while_page_acknowledgement_is_pendi
     let cancel = pending_request.cancel.clone();
     loader.send(pending_request);
     let acknowledgement = match loader.receive() {
-        DirectoryEvent::NetworkBatch {
+        DirectoryEvent::Batch {
             entries,
             acknowledgement,
             ..
@@ -601,4 +605,38 @@ fn issue_104_parent_cancel_reaps_real_helper_while_page_acknowledgement_is_pendi
         "#104: parent cancellation reclaimed real helper with pending page acknowledgement in {} ms; input remained open",
         started.elapsed().as_millis()
     );
+}
+
+#[test]
+fn issue_150_full_output_input_close_reclaims_pending_batch_and_terminal() {
+    for sources in [vec![(1, PathBuf::from("partial"))], vec![]] {
+        let (events, receiver) = mpsc::sync_channel(1);
+        events
+            .send(DirectoryEvent::Slow {
+                tab_id: TabId(99),
+                request_id: crate::domain::RequestId(1),
+            })
+            .unwrap();
+        let (sender, handle) = start(events, partial_failure_reader);
+        let input = request(1, sources);
+        let cancel = input.cancel.clone();
+        sender.send(input).unwrap();
+        // Give the scheduler a turn with a permanently full output before closing ingress.
+        thread::sleep(Duration::from_millis(100));
+        let (finished, completion) = mpsc::channel();
+        let joiner = thread::spawn(move || {
+            let result = handle.join();
+            let _ = finished.send(result);
+        });
+        drop(sender);
+        let result = completion.recv_timeout(Duration::from_secs(2));
+        cancel.store(true, Ordering::Release);
+        drop(receiver);
+        joiner.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "closed input must release full-output wait: {result:?}"
+        );
+        result.unwrap().unwrap();
+    }
 }

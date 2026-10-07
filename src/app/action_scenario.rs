@@ -278,9 +278,12 @@ impl Harness {
         }
     }
 
-    fn collect_directory(&self, target: ActionTarget) -> io::Result<Vec<DirectoryEvent>> {
+    fn consume_directory(
+        &self,
+        target: ActionTarget,
+        mut consume: impl FnMut(DirectoryEvent),
+    ) -> io::Result<()> {
         let deadline = Instant::now() + TIMEOUT;
-        let mut events = Vec::new();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let event = self
@@ -294,11 +297,26 @@ impl Harness {
                         | DirectoryEvent::Failed { .. }
                         | DirectoryEvent::Cancelled { .. }
                 );
-            events.push(event);
+            consume(event);
             if terminal {
-                return Ok(events);
+                return Ok(());
             }
         }
+    }
+
+    fn collect_directory(&self, target: ActionTarget) -> io::Result<Vec<DirectoryEvent>> {
+        let mut events = Vec::new();
+        self.consume_directory(target, |event| {
+            // This bounded fixture deliberately retains consumed events to replay them after navigation.
+            if let DirectoryEvent::Batch {
+                acknowledgement, ..
+            } = &event
+            {
+                let _ = acknowledgement.send(());
+            }
+            events.push(event);
+        })?;
+        Ok(events)
     }
 
     fn wait_directory(
@@ -306,10 +324,10 @@ impl Harness {
         evidence: &mut Evidence,
         target: ActionTarget,
     ) -> io::Result<LoadState> {
-        for event in self.collect_directory(target)? {
+        self.consume_directory(target, |event| {
             evidence.trace.push(format!("directory event: {event:?}"));
             apply_event(&self.state, event);
-        }
+        })?;
         self.query(evidence, target.window_id)?
             .tabs
             .into_iter()

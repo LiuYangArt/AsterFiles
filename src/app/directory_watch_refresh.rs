@@ -576,6 +576,7 @@ mod tests {
         apply_event(
             &state,
             DirectoryEvent::Batch {
+                acknowledgement: mpsc::channel().0,
                 tab_id: request.tab_id,
                 request_id: request.request_id,
                 entries: vec![fixture.entry("finished.txt", 1)],
@@ -856,6 +857,7 @@ mod tests {
         apply_event(
             &state,
             DirectoryEvent::Batch {
+                acknowledgement: mpsc::channel().0,
                 tab_id: TabId(1),
                 request_id,
                 entries: Vec::new(),

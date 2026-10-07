@@ -104,19 +104,8 @@ enum SourceEvent {
     },
 }
 
-pub(super) fn read_source(
-    path: &Path,
-    visibility: crate::domain::FileVisibility,
-    cancel: &AtomicBool,
-    on_batch: &mut dyn FnMut(Vec<FileEntry>) -> io::Result<()>,
-) -> io::Result<usize> {
-    // A local-looking library path may cross a mapped drive or reparse point into SMB.
-    // Both resource domains therefore need process termination, not only UNC paths.
-    platform::windows::network::isolated_directory(path, visibility, cancel, on_batch)
-}
-
 pub(super) fn start(
-    events: mpsc::Sender<DirectoryEvent>,
+    events: mpsc::SyncSender<DirectoryEvent>,
     reader: SourceReader,
 ) -> (mpsc::Sender<DirectoryRequest>, thread::JoinHandle<()>) {
     let (sender, requests) = mpsc::channel::<DirectoryRequest>();
@@ -126,7 +115,7 @@ pub(super) fn start(
 
 fn schedule(
     requests: mpsc::Receiver<DirectoryRequest>,
-    events: mpsc::Sender<DirectoryEvent>,
+    events: mpsc::SyncSender<DirectoryEvent>,
     reader: SourceReader,
 ) {
     let (source_sender, source_events) = mpsc::sync_channel(SOURCE_SLOTS * 2);
@@ -136,7 +125,28 @@ fn schedule(
     let mut workers = HashMap::new();
     let mut next_job = 0_u64;
     let mut input_open = true;
+    let mut pending = VecDeque::<(Arc<DirectoryRequest>, DirectoryEvent)>::new();
     loop {
+        while let Some((request, event)) = pending.pop_front() {
+            if request.cancelled() {
+                continue;
+            }
+            match events.try_send(event) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(event)) => {
+                    pending.push_front((request, event));
+                    break;
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    for job in jobs.values() {
+                        job.request.cancel.store(true, Ordering::Release);
+                    }
+                    input_open = false;
+                    pending.clear();
+                    break;
+                }
+            }
+        }
         // Limit each ingress turn so a busy producer cannot starve source delivery or cancellation.
         for _ in 0..32 {
             if !input_open {
@@ -144,6 +154,13 @@ fn schedule(
             }
             match requests.try_recv() {
                 Ok(request) => {
+                    if request.cancelled() {
+                        let _ = events.try_send(DirectoryEvent::Cancelled {
+                            tab_id: request.tab_id,
+                            request_id: request.request_id,
+                        });
+                        continue;
+                    }
                     next_job += 1;
                     let request = Arc::new(request);
                     let mut paths = HashSet::new();
@@ -178,6 +195,7 @@ fn schedule(
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     input_open = false;
+                    pending.clear();
                     for job in jobs.values() {
                         job.request.cancel.store(true, Ordering::Release);
                     }
@@ -194,7 +212,7 @@ fn schedule(
                     true
                 }
             });
-            while active[domain] < SOURCE_SLOTS {
+            while pending.is_empty() && active[domain] < SOURCE_SLOTS {
                 let Some(source) = queue.pop_front() else {
                     break;
                 };
@@ -226,15 +244,27 @@ fn schedule(
             .filter_map(|(id, job)| (job.remaining == 0).then_some(*id))
             .collect::<Vec<_>>();
         for id in completed {
-            let job = jobs.remove(&id).unwrap();
-            if events.send(job.terminal()).is_err() {
-                for job in jobs.values() {
-                    job.request.cancel.store(true, Ordering::Release);
+            let job = jobs.get(&id).unwrap();
+            // Retain only job state when output is full; pending holds at most one batch per source.
+            match events.try_send(job.terminal()) {
+                Ok(()) => {
+                    jobs.remove(&id);
                 }
-                input_open = false;
+                Err(mpsc::TrySendError::Full(_)) if job.request.cancelled() => {
+                    jobs.remove(&id);
+                }
+                Err(mpsc::TrySendError::Full(_)) => {}
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    input_open = false;
+                    pending.clear();
+                    for job in jobs.values() {
+                        job.request.cancel.store(true, Ordering::Release);
+                    }
+                    jobs.remove(&id);
+                }
             }
         }
-        if !input_open && jobs.is_empty() {
+        if !input_open && jobs.is_empty() && pending.is_empty() {
             break;
         }
         match source_events.recv_timeout(POLL) {
@@ -250,16 +280,16 @@ fn schedule(
                     let entries = aggregate.batch(index, entries);
                     if entries.is_empty() {
                         let _ = acknowledgement.send(());
-                    } else if events
-                        .send(DirectoryEvent::NetworkBatch {
-                            tab_id: aggregate.request.tab_id,
-                            request_id: aggregate.request.request_id,
-                            entries,
-                            acknowledgement,
-                        })
-                        .is_err()
-                    {
-                        aggregate.request.cancel.store(true, Ordering::Release);
+                    } else {
+                        pending.push_back((
+                            aggregate.request.clone(),
+                            DirectoryEvent::Batch {
+                                tab_id: aggregate.request.tab_id,
+                                request_id: aggregate.request.request_id,
+                                entries,
+                                acknowledgement,
+                            },
+                        ));
                     }
                 }
             }

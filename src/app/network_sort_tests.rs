@@ -75,7 +75,7 @@ fn apply_network_batch(state: &SharedSessions, request_id: RequestId, entries: V
     let (acknowledgement, applied) = mpsc::channel();
     apply_event(
         state,
-        DirectoryEvent::NetworkBatch {
+        DirectoryEvent::Batch {
             tab_id: TabId(1),
             request_id,
             entries,
@@ -460,7 +460,7 @@ fn issue_141_rejected_late_batches_acknowledge_navigation_cancellation_and_close
 
 #[test]
 fn issue_141_waiting_network_producer_does_not_block_local_navigation_or_cancellation() {
-    use super::directory_loading::deliver_network_directory_batch;
+    use super::directory_loading::deliver_directory_batch;
     let app = AppState::new_for_test(vec![PathBuf::from(r"C:\source")], 0, [0, 1, 2, 3]);
     let state = Arc::new(Mutex::new(app));
     let (network_sender, network_requests) = mpsc::sync_channel(1);
@@ -477,11 +477,10 @@ fn issue_141_waiting_network_producer_does_not_block_local_navigation_or_cancell
         .recv_timeout(Duration::from_secs(1))
         .unwrap();
     let network_cancel = request.cancel.clone();
-    let (events, receiver) = mpsc::channel();
+    let (events, receiver) = mpsc::sync_channel(32);
     let (done, completion) = mpsc::channel();
     let worker = thread::spawn(move || {
-        let result =
-            deliver_network_directory_batch(&request, &events, vec![entry(1, "pending.txt")]);
+        let result = deliver_directory_batch(&request, &events, vec![entry(1, "pending.txt")]);
         done.send(result.map_err(|error| error.kind())).unwrap();
     });
     let pending = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -511,6 +510,7 @@ fn issue_141_waiting_network_producer_does_not_block_local_navigation_or_cancell
     apply_event(
         &state,
         DirectoryEvent::Batch {
+            acknowledgement: mpsc::channel().0,
             tab_id: TabId(1),
             request_id: local.request_id,
             entries: vec![local_entry],
