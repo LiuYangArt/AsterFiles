@@ -62,6 +62,10 @@ impl Drop for StreamFiles {
         ] {
             let _ = std::fs::remove_file(path);
         }
+        let diagnostic = self.output().with_extension("stderr");
+        if std::fs::metadata(&diagnostic).is_ok_and(|metadata| metadata.len() == 0) {
+            let _ = std::fs::remove_file(diagnostic);
+        }
         let _ = std::fs::remove_dir(&self.0);
     }
 }
@@ -80,6 +84,10 @@ fn receive_stream(
     if cancel.load(Ordering::Acquire) {
         return Err(cancelled());
     }
+    let diagnostic = output.with_extension("stderr");
+    command.stderr(Stdio::from(std::fs::File::create(&diagnostic)?));
+    #[cfg(test)]
+    command.env("RUST_BACKTRACE", "1");
     let job = KillOnCloseJob::create()?;
     let mut child = command.spawn()?;
     let result = (|| {
@@ -137,7 +145,7 @@ fn receive_stream(
                     Ok(skipped)
                 } else {
                     Err(io::Error::other(format!(
-                        "network directory helper exited with {status}; completed={completed}"
+                        "network directory helper exited with {status}; completed={completed}; stderr={diagnostic:?}"
                     )))
                 };
             }
@@ -168,6 +176,15 @@ fn receive_stream(
     }
     #[cfg(not(test))]
     let _ = status;
+    match std::fs::read_to_string(&diagnostic) {
+        Ok(stderr) if result.is_err() && !stderr.is_empty() => {
+            eprintln!("directory helper stderr ({diagnostic:?}):\n{stderr}");
+        }
+        Ok(_) => {
+            let _ = std::fs::remove_file(&diagnostic);
+        }
+        Err(error) => eprintln!("cannot read directory helper stderr {diagnostic:?}: {error}"),
+    }
     result
 }
 
@@ -182,34 +199,51 @@ fn publish_batch(
 }
 
 fn publish_frame(output: &Path, bytes: &[u8]) -> io::Result<()> {
+    publish_frame_with_probe(output, bytes, frame_slot_exists)
+}
+
+fn publish_frame_with_probe(
+    output: &Path,
+    bytes: &[u8],
+    mut slot_exists: impl FnMut(&Path) -> io::Result<bool>,
+) -> io::Result<()> {
     let pending = output.with_extension("pending");
-    std::fs::write(&pending, bytes)?;
-    std::fs::rename(&pending, output)?;
-    while frame_slot_exists(output)? {
+    let report = |stage: &str, error: io::Error| {
+        eprintln!("directory frame {stage}: output={output:?}; error={error:?}");
+        error
+    };
+    std::fs::write(&pending, bytes).map_err(|error| report("write", error))?;
+    std::fs::rename(&pending, output).map_err(|error| report("publish", error))?;
+    while slot_exists(output).map_err(|error| report("acknowledge", error))? {
         std::thread::sleep(POLL_INTERVAL);
     }
     Ok(())
 }
 
 fn frame_slot_exists(output: &Path) -> io::Result<bool> {
-    use windows_sys::Win32::{
-        Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND},
-        Storage::FileSystem::{GetFileAttributesW, INVALID_FILE_ATTRIBUTES},
-    };
+    use windows_sys::Win32::Storage::FileSystem::{GetFileAttributesW, INVALID_FILE_ATTRIBUTES};
 
     let path = output
         .as_os_str()
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
-    // Metadata opens a handle and can report access denied while the parent deletes the slot.
-    // A handle-free lookup observes the acknowledgement even while an old handle is still open.
+    // Avoid opening a handle that would prolong deletion of the single frame slot.
     if unsafe { GetFileAttributesW(path.as_ptr()) } != INVALID_FILE_ATTRIBUTES {
         return Ok(true);
     }
-    let error = io::Error::last_os_error();
+    frame_slot_error(io::Error::last_os_error())
+}
+
+fn frame_slot_error(error: io::Error) -> io::Result<bool> {
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
+    };
     match error.raw_os_error().map(|code| code as u32) {
         Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => Ok(false),
+        // DeleteFile can overlap GetFileAttributes even without an open reader handle.
+        // Only absence acknowledges consumption; access denied keeps backpressure in place.
+        Some(ERROR_ACCESS_DENIED) => Ok(true),
         _ => Err(error),
     }
 }
@@ -579,6 +613,22 @@ mod tests {
         match mode.as_str() {
             "hang" => std::thread::sleep(Duration::from_secs(60)),
             "crash" => std::process::exit(17),
+            "panic" => panic!("issue_138_original_child_error"),
+            "ack-denied" => {
+                let mut ready = false;
+                publish_frame_with_probe(&output, &encode_batch(&[], 0, true).unwrap(), |_| {
+                    if !ready {
+                        std::fs::write(output.with_extension("denied"), b"waiting").unwrap();
+                        ready = true;
+                    }
+                    frame_slot_error(io::Error::from_raw_os_error(5))
+                })
+                .unwrap();
+            }
+            "complete-panic" => {
+                publish_batch(&output, &[], 0, true).unwrap();
+                panic!("issue_138_original_child_error");
+            }
             "incomplete" => {}
             "bad-order" => publish_batch(&output, &[entry(2)], 0, false).unwrap(),
             "slow" | "backpressure" => {
@@ -596,6 +646,144 @@ mod tests {
                 run_child(&path, visibility, &output).unwrap();
             }
             _ => panic!("unknown fixture"),
+        }
+    }
+
+    #[test]
+    fn issue_138_delete_in_progress_keeps_backpressure_and_preserves_other_errors() {
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
+            ERROR_SHARING_VIOLATION,
+        };
+        assert!(
+            frame_slot_error(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)).unwrap()
+        );
+        for code in [ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND] {
+            assert!(!frame_slot_error(io::Error::from_raw_os_error(code as i32)).unwrap());
+        }
+        assert_eq!(
+            frame_slot_error(io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION as i32))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION as i32)
+        );
+    }
+
+    #[test]
+    fn issue_138_access_denied_waits_until_absence_before_reusing_slot() {
+        let files = StreamFiles::create().unwrap();
+        let bytes = encode_batch(&[entry(1)], 0, false).unwrap();
+        let mut queries = 0;
+        publish_frame_with_probe(&files.output(), &bytes, |output| {
+            queries += 1;
+            assert_eq!(std::fs::read(output).unwrap(), bytes);
+            if queries <= 3 {
+                frame_slot_error(io::Error::from_raw_os_error(5))
+            } else {
+                std::fs::remove_file(output).unwrap();
+                frame_slot_exists(output)
+            }
+        })
+        .unwrap();
+        assert_eq!(queries, 4);
+        assert!(!frame_slot_exists(&files.output()).unwrap());
+    }
+
+    #[test]
+    fn issue_138_permanent_ack_denial_after_completion_is_timed_out_and_cancelled() {
+        for cancel_after_start in [false, true] {
+            let files = StreamFiles::create().unwrap();
+            let cancel = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                if cancel_after_start {
+                    scope.spawn(|| {
+                        let started = Instant::now();
+                        while !files.output().with_extension("denied").is_file() {
+                            assert!(started.elapsed() < Duration::from_secs(10));
+                            std::thread::sleep(POLL_INTERVAL);
+                        }
+                        cancel.store(true, Ordering::Release);
+                    });
+                }
+                let error = receive_stream(
+                    child_command(&files, "ack-denied"),
+                    &files.output(),
+                    &cancel,
+                    Duration::from_secs(2),
+                    |_| Ok(()),
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    if cancel_after_start {
+                        io::ErrorKind::Interrupted
+                    } else {
+                        io::ErrorKind::TimedOut
+                    }
+                );
+            });
+            std::fs::remove_file(files.output().with_extension("denied")).unwrap();
+        }
+    }
+
+    #[test]
+    fn issue_138_concurrent_delete_and_ack_query_preserves_slot_reuse() {
+        let files = StreamFiles::create().unwrap();
+        let output = files.output();
+        std::thread::scope(|scope| {
+            let (delete, pending) = std::sync::mpsc::sync_channel(0);
+            let (deleted, consumed) = std::sync::mpsc::sync_channel(0);
+            let writer_output = &output;
+            scope.spawn(move || {
+                while pending.recv().is_ok() {
+                    std::fs::remove_file(writer_output).unwrap();
+                    if deleted.send(()).is_err() {
+                        break;
+                    }
+                }
+            });
+            for _ in 0..4096 {
+                std::fs::write(&output, b"frame").unwrap();
+                assert!(frame_slot_exists(&output).unwrap());
+                delete.send(()).unwrap();
+                let started = Instant::now();
+                while frame_slot_exists(&output).unwrap() {
+                    assert!(started.elapsed() < Duration::from_secs(5));
+                }
+                consumed.recv().unwrap();
+            }
+            drop(delete);
+            drop(consumed);
+        });
+    }
+
+    #[test]
+    fn issue_138_child_panic_preserves_stderr_stack_and_rejects_completed_failure() {
+        for (mode, completed) in [("panic", false), ("complete-panic", true)] {
+            let files = StreamFiles::create().unwrap();
+            let error = receive_stream(
+                child_command(&files, mode),
+                &files.output(),
+                &AtomicBool::new(false),
+                Duration::from_secs(10),
+                |_| Ok(()),
+            )
+            .unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("101"), "{message}");
+            assert!(
+                message.contains(&format!("completed={completed}")),
+                "{message}"
+            );
+            assert!(message.contains("stderr="), "{message}");
+            let diagnostic = files.output().with_extension("stderr");
+            let stderr = std::fs::read_to_string(&diagnostic).unwrap();
+            assert!(
+                stderr.contains("issue_138_original_child_error"),
+                "{stderr}"
+            );
+            assert!(stderr.contains("stack backtrace:"), "{stderr}");
+            std::fs::remove_file(diagnostic).unwrap();
         }
     }
 

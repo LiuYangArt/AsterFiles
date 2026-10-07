@@ -58,6 +58,10 @@ CI 只有仓库读取权限，不发布、不创建标签；同一 PR/引用的�
 
 `cargo test --locked operation_audit -- --nocapture` 检查阻塞写入器下的独立入队、启动失败、队列断开、文件打开失败、退出冲刷与诊断字段。随后运行 `python tools/verify.py --quick` 和 `cargo build --locked`。日志位于 `artifacts/logs/issue-148/`，机器结果位于 `artifacts/state/issue-148/result.json`，统一汇总为 `artifacts/verify/summary.json`。网络运行时记录复用 `file-operation-audit.jsonl`。
 
+## 目录帧删除竞争专项验证（#138）
+
+`python tools/build.py test --locked issue_138 -- --nocapture` 验证删除并发、拒绝访问期间的背压、持续拒绝访问时的取消和超时回收，以及完成帧后异常退出的标准错误与栈。随后运行默认并发 `python tools/verify.py`，包含 Debug 构建。专项日志位于 `artifacts/logs/issue-138/`，统一汇总为 `artifacts/verify/summary.json`。子进程失败的非空原始错误保留在父进程日志指向的 `%TEMP%/asterfiles-directory-*/batch.stderr`。根因和证据见 `docs/postmortem/postmortem-2026-10-07-directory-frame-race.md`。
+
 ## UI 操作与验证
 
 - 禁止 Codex 操作、自动化或尝试控制 AsterFiles 的 UI，包括通过内置浏览器、Chrome、Computer Use、Playwright、agent-browser、截图点击或键鼠模拟等方式。

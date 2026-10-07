@@ -473,3 +473,13 @@ Slint 无窗口后端验证各视图及分组中的目标范围滚动，并派�
 网络运行时记录现在与操作审计共用日志：Debug 为 `artifacts/logs/file-operation-audit.jsonl`，本地 Release 程序为 `%LOCALAPPDATA%/AsterFiles/logs/file-operation-audit.jsonl`。按 `detail=source=network_runtime` 筛选，`event` 保留原事件文本。正常退出复用主程序冲刷；强制结束进程可能丢失尚未落盘的记录。
 
 若需检查真实交互，由用户启动 Debug 程序，导航网络目录、点击面包屑返回上层并正常关窗，然后检查日志包含对应导航及退出事件。自动验证不操作应用界面，也不替代真实慢盘下的交互体验验收。
+
+## Issue #138 目录帧删除与确认竞争
+
+先运行 `python tools/build.py test --locked issue_138 -- --nocapture`，再运行默认并发 `python tools/verify.py`。专项日志为 `artifacts/logs/issue-138/regression-final.log`，完整验证日志为 `artifacts/logs/issue-138/full-verify.log`，汇总为 `artifacts/verify/summary.json`。不要设置较低的 `RUST_TEST_THREADS` 掩盖竞争。
+
+专项回归检查真实 Windows 并发删除与属性查询、受控拒绝访问期间的槽位保留、恢复后的确认、持续拒绝访问时的超时和取消回收。真实子进程在完成前后主动 panic，父进程必须拒绝成功并保留原始错误和错误栈。既有 #103、#104 回归继续检查大目录多批传输、混合失败来源、背压和取消。
+
+辅助进程原始错误写入独占临时目录的 `batch.stderr`，失败日志包含完整路径；测试错误栈开启。成功或空错误文件清理，失败的非空文件保留供排查。阶段诊断区分写入、发布和确认。复盘见 [目录帧删除竞争](../postmortem/postmortem-2026-10-07-directory-frame-race.md)。
+
+自动验证不操作应用界面。如需真实交互确认，由用户打开包含多个来源的库及超过 300 项的网络目录，确认内容完整；加载中切换本地标签或关闭网络标签，确认仍可响应。
