@@ -1,4 +1,4 @@
-use crate::domain::file_operations::CancellationToken;
+use super::CopyExecution;
 use std::{
     io,
     sync::{
@@ -28,7 +28,8 @@ impl Drop for ReadSlot {
 }
 
 impl ReadSlots {
-    fn acquire(self: &Arc<Self>, cancel: &CancellationToken) -> io::Result<ReadSlot> {
+    fn acquire(self: &Arc<Self>, execution: &CopyExecution) -> io::Result<ReadSlot> {
+        let cancel = execution.cancel();
         loop {
             cancel.wait_if_paused();
             if cancel.is_cancelled() {
@@ -43,15 +44,15 @@ impl ReadSlots {
             {
                 return Ok(ReadSlot(self.clone()));
             }
-            super::super::network::set_copy_recovering(true);
+            execution.set_recovering(true);
             thread::sleep(Duration::from_millis(20));
         }
     }
 }
 
 // A permit remains with the worker until even its network handles have finished closing.
-pub(super) fn acquire_read_slot(cancel: &CancellationToken) -> io::Result<ReadSlot> {
-    READ_SLOTS.acquire(cancel)
+pub(super) fn acquire_read_slot(execution: &CopyExecution) -> io::Result<ReadSlot> {
+    READ_SLOTS.acquire(execution)
 }
 
 pub(super) fn cancel_read_worker<T>(worker: &thread::JoinHandle<T>) {
@@ -67,6 +68,7 @@ pub(super) fn cancel_read_worker<T>(worker: &thread::JoinHandle<T>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::file_operations::CancellationToken;
     use std::{sync::mpsc, time::Instant};
     #[test]
     fn issue_137_read_limit_preserves_pause_cancel_and_releases_only_on_worker_end() {
@@ -74,14 +76,20 @@ mod tests {
             active: AtomicUsize::new(0),
             limit: 1,
         });
-        let held = slots.acquire(&CancellationToken::new()).unwrap();
+        let held = slots
+            .acquire(&CopyExecution::local(CancellationToken::new()))
+            .unwrap();
         let cancel = CancellationToken::new();
         let waiting_cancel = cancel.clone();
         let waiting_slots = slots.clone();
         let (sent, received) = mpsc::channel();
         let waiting = thread::spawn(move || {
-            sent.send(waiting_slots.acquire(&waiting_cancel).map(|_| ()))
-                .unwrap();
+            sent.send(
+                waiting_slots
+                    .acquire(&CopyExecution::local(waiting_cancel.clone()))
+                    .map(|_| ()),
+            )
+            .unwrap();
         });
         cancel.pause();
         let start = Instant::now();
@@ -102,7 +110,9 @@ mod tests {
         waiting.join().unwrap();
         assert_eq!(slots.active.load(Ordering::Acquire), 1);
         drop(held);
-        let recovered = slots.acquire(&CancellationToken::new()).unwrap();
+        let recovered = slots
+            .acquire(&CopyExecution::local(CancellationToken::new()))
+            .unwrap();
         assert_eq!(slots.active.load(Ordering::Acquire), 1);
         drop(recovered);
         assert_eq!(slots.active.load(Ordering::Acquire), 0);

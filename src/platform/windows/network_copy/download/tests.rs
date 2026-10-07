@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::file_operations::CancellationToken;
 use crate::platform::windows::copy_file::CopyFileErrorKind;
 use std::sync::{Condvar, Mutex, atomic::AtomicUsize};
 
@@ -150,16 +151,18 @@ fn issue_137_block_download_resumes_after_more_than_twelve_disconnects_without_r
     let faults = Arc::new(Faults::default());
     faults.errors.store(16, Ordering::Release);
     let mut bytes = 0;
+    let execution = CopyExecution::local(CancellationToken::new());
     let copied = copy_with(
         Arc::new(FaultSource(faults.clone())),
         &source,
         &destination,
-        &CancellationToken::new(),
+        &execution,
         &mut |count| bytes += count,
         Duration::from_secs(3),
         Some(Duration::ZERO),
     )
     .unwrap();
+    assert!(!execution.is_recovering());
     let original = fs::read(&source).unwrap();
     assert_eq!(fs::read(&destination).unwrap(), original);
     assert_eq!(copied, original.len() as u64);
@@ -175,20 +178,20 @@ fn blocked_copy(
     faults: &Arc<Faults>,
     source: &Path,
     destination: &Path,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
     timeout: Duration,
 ) -> thread::JoinHandle<Result<u64, CopyFileError>> {
     faults.block_once.store(true, Ordering::Release);
     let backend = Arc::new(FaultSource(faults.clone()));
     let source = source.to_owned();
     let destination = destination.to_owned();
-    let cancel = cancel.clone();
+    let execution = execution.clone();
     thread::spawn(move || {
         copy_with(
             backend,
             &source,
             &destination,
-            &cancel,
+            &execution,
             &mut |_| {},
             timeout,
             Some(Duration::ZERO),
@@ -203,12 +206,13 @@ fn issue_137_block_download_pause_discards_blocked_old_read_and_resumes_from_con
     let destination = fixture.0.join("copy.tmp");
     let faults = Arc::new(Faults::default());
     let cancel = CancellationToken::new();
+    let execution = CopyExecution::local(cancel.clone());
     let _release = ReleaseOnDrop(faults.clone());
     let task = blocked_copy(
         &faults,
         &source,
         &destination,
-        &cancel,
+        &execution,
         Duration::from_secs(120),
     );
     until(|| {
@@ -240,12 +244,13 @@ fn issue_137_block_download_cancel_does_not_wait_for_stuck_source_or_keep_partia
     let destination = fixture.0.join("copy.tmp");
     let faults = Arc::new(Faults::default());
     let cancel = CancellationToken::new();
+    let execution = CopyExecution::local(cancel.clone());
     let _release = ReleaseOnDrop(faults.clone());
     let task = blocked_copy(
         &faults,
         &source,
         &destination,
-        &cancel,
+        &execution,
         Duration::from_secs(120),
     );
     until(|| faults.entered.load(Ordering::Acquire));
@@ -272,7 +277,7 @@ fn issue_137_block_download_timeout_resumes_without_reusing_old_reader() {
         &faults,
         &source,
         &destination,
-        &CancellationToken::new(),
+        &CopyExecution::local(CancellationToken::new()),
         Duration::from_millis(40),
     );
     until(|| task.is_finished());
@@ -294,17 +299,19 @@ fn issue_137_block_download_rejects_changed_source_before_resuming() {
     let faults = Arc::new(Faults::default());
     faults.errors.store(1, Ordering::Release);
     let cancel = CancellationToken::new();
+    let execution = CopyExecution::local(cancel.clone());
     let task = {
         let backend = Arc::new(FaultSource(faults.clone()));
         let source = source.clone();
         let destination = destination.clone();
         let cancel = cancel.clone();
+        let execution = execution.clone();
         thread::spawn(move || {
             copy_with(
                 backend,
                 &source,
                 &destination,
-                &cancel,
+                &execution,
                 &mut |_| cancel.pause(),
                 Duration::from_secs(120),
                 Some(Duration::ZERO),
@@ -318,6 +325,7 @@ fn issue_137_block_download_rejects_changed_source_before_resuming() {
     let error = task.join().unwrap().unwrap_err();
     assert_eq!(error.kind, CopyFileErrorKind::Failed);
     assert_eq!(error.error.kind(), io::ErrorKind::InvalidData);
+    assert!(!execution.is_recovering());
     assert!(!destination.exists());
 }
 
@@ -332,7 +340,7 @@ fn issue_137_block_download_does_not_retry_permission_errors_or_touch_existing_d
         Arc::new(FaultSource(faults.clone())),
         &source,
         &destination,
-        &CancellationToken::new(),
+        &CopyExecution::local(CancellationToken::new()),
         &mut |_| {},
         Duration::from_secs(1),
         Some(Duration::ZERO),
@@ -346,7 +354,7 @@ fn issue_137_block_download_does_not_retry_permission_errors_or_touch_existing_d
         copy_file(
             &source,
             &destination,
-            &CancellationToken::new(),
+            &CopyExecution::local(CancellationToken::new()),
             &mut |_| {}
         )
         .is_err()
@@ -376,7 +384,7 @@ fn issue_137_block_download_preserves_named_streams_time_and_readonly_hidden_att
     copy_file(
         &source,
         &destination,
-        &CancellationToken::new(),
+        &CopyExecution::local(CancellationToken::new()),
         &mut |count| total += count,
     )
     .unwrap();
@@ -398,4 +406,55 @@ fn issue_137_block_download_preserves_named_streams_time_and_readonly_hidden_att
         SetFileAttributesW(wide(&source).as_ptr(), FILE_ATTRIBUTE_NORMAL);
         SetFileAttributesW(wide(&destination).as_ptr(), FILE_ATTRIBUTE_NORMAL);
     }
+}
+
+#[test]
+fn issue_149_block_download_resets_explicit_recovery_after_cancel_and_early_error() {
+    let fixture = Fixture::new();
+    let source = fixture.source();
+    let destination = fixture.0.join("copy.tmp");
+    let faults = Arc::new(Faults::default());
+    faults.errors.store(1, Ordering::Release);
+    let execution = CopyExecution::local(CancellationToken::new());
+    let unrelated = CopyExecution::local(CancellationToken::new());
+    let task = {
+        let worker = execution.clone();
+        let source = source.clone();
+        let destination = destination.clone();
+        thread::spawn(move || {
+            copy_with(
+                Arc::new(FaultSource(faults)),
+                &source,
+                &destination,
+                &worker,
+                &mut |_| {},
+                Duration::from_secs(120),
+                Some(Duration::from_secs(120)),
+            )
+        })
+    };
+    until(|| execution.is_recovering());
+    assert!(!unrelated.is_recovering());
+    execution.cancel().cancel();
+    until(|| task.is_finished());
+    assert_eq!(
+        task.join().unwrap().unwrap_err().kind,
+        CopyFileErrorKind::Cancelled
+    );
+    assert!(!execution.is_recovering());
+    assert!(!destination.exists());
+
+    let early_error = CopyExecution::local(CancellationToken::new());
+    early_error.set_recovering(true);
+    assert!(
+        copy_file(
+            &fixture.0.join("missing-source"),
+            &destination,
+            &early_error,
+            &mut |_| {}
+        )
+        .is_err()
+    );
+    assert!(!early_error.is_recovering());
+    assert!(!destination.exists());
 }

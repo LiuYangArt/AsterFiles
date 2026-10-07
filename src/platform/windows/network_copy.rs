@@ -1,6 +1,7 @@
+use super::copy_execution::CopyExecution;
 use super::{
     copy_file::{CopyFileError, CopyFileErrorKind},
-    network::KillOnCloseJob,
+    process_job::KillOnCloseJob,
 };
 use crate::domain::file_operations::CancellationToken;
 use std::{
@@ -292,6 +293,7 @@ impl Drop for Running {
 }
 
 struct Staging {
+    execution: CopyExecution,
     destination: PathBuf,
     filename: OsString,
     path: PathBuf,
@@ -299,8 +301,9 @@ struct Staging {
     retired: bool,
 }
 impl Staging {
-    fn new(source: &Path, destination: &Path) -> io::Result<Self> {
+    fn new(source: &Path, destination: &Path, execution: &CopyExecution) -> io::Result<Self> {
         let mut stage = Self {
+            execution: execution.clone(),
             destination: destination.to_path_buf(),
             filename: source
                 .file_name()
@@ -317,7 +320,8 @@ impl Staging {
         self.path.join(&self.filename)
     }
     fn create(&mut self) -> io::Result<()> {
-        super::network::register_copy_staging(&self.destination, &self.file())?;
+        self.execution
+            .register_staging(&self.destination, &self.file())?;
         fs::create_dir(&self.path)?;
         self.retired = false;
         Ok(())
@@ -343,7 +347,8 @@ impl Staging {
                     self.file().display()
                 ),
             );
-            super::network::retire_copy_staging(&self.destination, &self.file())?;
+            self.execution
+                .retire_staging(&self.destination, &self.file())?;
         }
         Ok(())
     }
@@ -390,22 +395,24 @@ fn query_retryable(error: &io::Error) -> bool {
 
 // Only read-only source/identity queries belong here. Pending SMB calls are contained by the helper.
 pub(crate) fn copy_query<T: Send + 'static>(
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
     query: impl Fn() -> io::Result<T> + Send + Sync + 'static,
 ) -> io::Result<T> {
-    copy_query_with(cancel, query, STALL_LIMIT, None)
+    copy_query_with(execution, query, STALL_LIMIT, None)
 }
 
 fn copy_query_with<T: Send + 'static>(
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
     query: impl Fn() -> io::Result<T> + Send + Sync + 'static,
     timeout: Duration,
     retry_wait: Option<Duration>,
 ) -> io::Result<T> {
+    let _recovery = execution.recovery_scope();
+    let cancel = execution.cancel();
     let query = Arc::new(query);
     let mut attempt = 0_u32;
     loop {
-        let slot = acquire_read_slot(cancel)?;
+        let slot = acquire_read_slot(execution)?;
         let worker_query = query.clone();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let worker = thread::Builder::new()
@@ -449,7 +456,7 @@ fn copy_query_with<T: Send + 'static>(
         match result {
             Err(error) if query_retryable(&error) => {
                 attempt = attempt.saturating_add(1);
-                super::network::set_copy_recovering(true);
+                execution.set_recovering(true);
                 crate::operation_audit::record(
                     "network-copy-query-retry",
                     format!("attempt={attempt} error={error}"),
@@ -464,10 +471,11 @@ fn copy_query_with<T: Send + 'static>(
 
 fn source_version(
     source: &Path,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
 ) -> Result<(u64, SystemTime), CopyFileError> {
+    let cancel = execution.cancel();
     let source = source.to_owned();
-    copy_query(cancel, move || {
+    copy_query(execution, move || {
         let metadata = fs::metadata(&source)?;
         if !metadata.is_file() {
             return Err(io::Error::new(
@@ -582,7 +590,7 @@ fn spawn(
 pub fn copy_file(
     source: &Path,
     destination: &Path,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
     progress: &mut dyn FnMut(u64),
 ) -> Result<u64, CopyFileError> {
     if crate::network::is_unc_path(source) {
@@ -590,7 +598,7 @@ pub fn copy_file(
             .parent()
             .ok_or_else(|| failed(io::Error::other("copy target has no parent")))?
             .to_owned();
-        let local = copy_query(cancel, move || {
+        let local = copy_query(execution, move || {
             use std::os::windows::ffi::OsStrExt;
             let resolved = fs::canonicalize(&parent)?;
             if crate::network::is_unc_path(&resolved) {
@@ -616,32 +624,32 @@ pub fn copy_file(
         })
         .map_err(failed)?;
         if local {
-            return download::copy_file(source, destination, cancel, progress);
+            return download::copy_file(source, destination, execution, progress);
         }
     }
-    copy_file_with(source, destination, cancel, progress, &[], STALL_LIMIT)
+    copy_file_with(source, destination, execution, progress, &[], STALL_LIMIT)
 }
 
 fn copy_file_with(
     source: &Path,
     destination: &Path,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
     progress: &mut dyn FnMut(u64),
     extra: &[OsString],
     stall_limit: Duration,
 ) -> Result<u64, CopyFileError> {
-    super::network::set_copy_recovering(false);
-    let mut staging = Staging::new(source, destination).map_err(failed)?;
+    execution.set_recovering(false);
+    let mut staging = Staging::new(source, destination, execution).map_err(failed)?;
     let outcome = copy_into_staging(
         source,
         destination,
         &mut staging,
-        cancel,
+        execution,
         progress,
         extra,
         stall_limit,
     );
-    super::network::set_copy_recovering(false);
+    execution.set_recovering(false);
     let cleanup = staging.cleanup();
     match (outcome, cleanup) {
         (Ok(bytes), Ok(())) => Ok(bytes),
@@ -667,12 +675,13 @@ fn copy_into_staging(
     source: &Path,
     destination: &Path,
     staging: &mut Staging,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
     progress: &mut dyn FnMut(u64),
     extra: &[OsString],
     stall_limit: Duration,
 ) -> Result<u64, CopyFileError> {
-    let expected = source_version(source, cancel)?;
+    let cancel = execution.cancel();
+    let expected = source_version(source, execution)?;
     let mut high_water = 0_u64;
     let mut retries = 0_u32;
     loop {
@@ -680,7 +689,7 @@ fn copy_into_staging(
         if cancel.is_cancelled() {
             return Err(cancelled());
         }
-        if source_version(source, cancel)? != expected {
+        if source_version(source, execution)? != expected {
             return Err(failed(io::Error::other(format!(
                 "copy source changed: {}",
                 source.display()
@@ -716,7 +725,7 @@ fn copy_into_staging(
                         / 10000) as u64;
                     let count = count.min(expected.0.saturating_sub(1));
                     if count >= high_water {
-                        super::network::set_copy_recovering(false);
+                        execution.set_recovering(false);
                     }
                     if count > high_water {
                         progress(count - high_water);
@@ -747,7 +756,7 @@ fn copy_into_staging(
         };
         if paused {
             cancel.wait_if_paused();
-            super::network::set_copy_recovering(true);
+            execution.set_recovering(true);
             continue;
         }
         if cancel.is_cancelled() {
@@ -759,7 +768,7 @@ fn copy_into_staging(
         }
         let output = shared.lock().expect("robocopy output lock");
         if exit.is_some_and(|code| (0..8).contains(&code)) && output.read_error.is_none() {
-            if source_version(source, cancel)? != expected
+            if source_version(source, execution)? != expected
                 || fs::metadata(staging.file()).map_err(failed)?.len() != expected.0
             {
                 return Err(failed(io::Error::other(
@@ -793,7 +802,7 @@ fn copy_into_staging(
             return Err(failed(io::Error::other(detail)));
         }
         retries += 1;
-        super::network::set_copy_recovering(true);
+        execution.set_recovering(true);
         crate::operation_audit::record(
             "network-copy-retry",
             format!(
@@ -816,8 +825,9 @@ mod tests {
     fn issue_137_read_only_query_retries_network_error_and_timeout() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let worker_calls = calls.clone();
+        let execution = CopyExecution::local(CancellationToken::new());
         let result = copy_query_with(
-            &CancellationToken::new(),
+            &execution,
             move || match worker_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
                 0..=15 => Err(io::Error::from_raw_os_error(53)),
                 16 => Err(io::ErrorKind::TimedOut.into()),
@@ -828,7 +838,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, 42);
+        assert!(!execution.is_recovering());
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 18);
+    }
+
+    #[test]
+    fn issue_149_query_restores_its_entry_recovery_state() {
+        for recovering in [false, true] {
+            for fail in [false, true] {
+                let execution = CopyExecution::local(CancellationToken::new());
+                execution.set_recovering(recovering);
+                let calls = std::sync::atomic::AtomicUsize::new(0);
+                let result = copy_query_with(
+                    &execution,
+                    move || {
+                        if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                            Err(io::Error::from_raw_os_error(53))
+                        } else if fail {
+                            Err(io::Error::from_raw_os_error(5))
+                        } else {
+                            Ok(42)
+                        }
+                    },
+                    Duration::from_secs(1),
+                    Some(Duration::ZERO),
+                );
+                if fail {
+                    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+                } else {
+                    assert_eq!(result.unwrap(), 42);
+                }
+                assert_eq!(execution.is_recovering(), recovering);
+            }
+        }
     }
 
     #[test]
@@ -840,7 +882,7 @@ mod tests {
         let release_receiver = Mutex::new(release_receiver);
         let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
-            copy_query(&worker_cancel, move || {
+            copy_query(&CopyExecution::local(worker_cancel.clone()), move || {
                 started_sender.send(()).unwrap();
                 release_receiver.lock().unwrap().recv().unwrap();
                 finished_sender.send(()).unwrap();
@@ -907,7 +949,7 @@ mod tests {
             let result = copy_file_with(
                 &source,
                 &target,
-                &worker_cancel,
+                &CopyExecution::local(worker_cancel.clone()),
                 &mut |count| {
                     bytes += count;
                     if !requested {
@@ -1012,7 +1054,7 @@ mod tests {
             copy_file(
                 &source,
                 &destination,
-                &CancellationToken::new(),
+                &CopyExecution::local(CancellationToken::new()),
                 &mut |count| bytes += count
             )
             .unwrap(),
@@ -1043,7 +1085,7 @@ mod tests {
         let result = copy_file_with(
             &source,
             &destination,
-            &cancel,
+            &CopyExecution::local(cancel.clone()),
             &mut |_| cancel.cancel(),
             &[OsString::from("/IORATE:4m")],
             STALL_LIMIT,
@@ -1081,7 +1123,7 @@ mod tests {
             copy_file_with(
                 &source,
                 &target,
-                &worker_cancel,
+                &CopyExecution::local(worker_cancel.clone()),
                 &mut |count| {
                     worker_bytes.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
                 },
@@ -1139,7 +1181,7 @@ mod tests {
             copy_file_with(
                 &source,
                 &target,
-                &worker_cancel,
+                &CopyExecution::local(worker_cancel.clone()),
                 &mut |_| {},
                 &[schedule],
                 Duration::from_millis(50),
@@ -1180,7 +1222,7 @@ mod tests {
         let result = copy_file_with(
             &source,
             &destination,
-            &CancellationToken::new(),
+            &CopyExecution::local(CancellationToken::new()),
             &mut |_| {},
             &[OsString::from("/ASTERFILES_INVALID_TEST_SWITCH")],
             STALL_LIMIT,
@@ -1210,7 +1252,7 @@ mod tests {
             copy_file_with(
                 &worker_source,
                 &target,
-                &worker_cancel,
+                &CopyExecution::local(worker_cancel.clone()),
                 &mut |_| {
                     if !requested {
                         worker_cancel.pause();
@@ -1298,7 +1340,7 @@ mod tests {
             copy_file_with(
                 &source,
                 &target,
-                &worker_cancel,
+                &CopyExecution::local(worker_cancel.clone()),
                 &mut |_| {
                     if !announced {
                         sender.send(()).unwrap();

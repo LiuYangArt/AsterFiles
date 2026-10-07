@@ -2,9 +2,7 @@ use super::{
     STALL_LIMIT, acquire_read_slot, cancelled, copy_query, failed, query_retryable, retry_backoff,
     retry_delay,
 };
-use crate::{
-    domain::file_operations::CancellationToken, platform::windows::copy_file::CopyFileError,
-};
+use crate::platform::windows::{copy_execution::CopyExecution, copy_file::CopyFileError};
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
@@ -290,9 +288,9 @@ fn start_reading(
     stream: StreamVersion,
     expected: SourceVersion,
     offset: u64,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
 ) -> io::Result<Reading> {
-    let slot = acquire_read_slot(cancel)?;
+    let slot = acquire_read_slot(execution)?;
     crate::operation_audit::record(
         "network-copy-block-start",
         format!(
@@ -406,14 +404,14 @@ fn preserve_metadata(file: &File, path: &Path, version: &SourceVersion) -> io::R
 pub(super) fn copy_file(
     source: &Path,
     destination: &Path,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
     progress: &mut dyn FnMut(u64),
 ) -> Result<u64, CopyFileError> {
     copy_with(
         Arc::new(NativeSource),
         source,
         destination,
-        cancel,
+        execution,
         progress,
         STALL_LIMIT,
         None,
@@ -425,33 +423,33 @@ fn copy_with(
     backend: Arc<dyn Source>,
     source: &Path,
     destination: &Path,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
     progress: &mut dyn FnMut(u64),
     timeout: Duration,
     retry_wait: Option<Duration>,
 ) -> Result<u64, CopyFileError> {
-    super::super::network::set_copy_recovering(false);
+    execution.set_recovering(false);
     let outcome = copy_inner(
         backend,
         source,
         destination,
-        cancel,
+        execution,
         progress,
         timeout,
         retry_wait,
     );
-    super::super::network::set_copy_recovering(false);
+    execution.set_recovering(false);
     outcome
 }
 
 fn source_version(
     backend: Arc<dyn Source>,
     source: &Path,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
 ) -> Result<SourceVersion, CopyFileError> {
     let source = source.to_owned();
-    copy_query(cancel, move || backend.version(&source)).map_err(|error| {
-        if cancel.is_cancelled() {
+    copy_query(execution, move || backend.version(&source)).map_err(|error| {
+        if execution.cancel().is_cancelled() {
             cancelled()
         } else {
             failed(error)
@@ -464,14 +462,14 @@ fn copy_inner(
     backend: Arc<dyn Source>,
     source: &Path,
     destination: &Path,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
     progress: &mut dyn FnMut(u64),
     timeout: Duration,
     retry_wait: Option<Duration>,
 ) -> Result<u64, CopyFileError> {
-    let expected = source_version(backend.clone(), source, cancel)?;
-    cancel.wait_if_paused();
-    if cancel.is_cancelled() {
+    let expected = source_version(backend.clone(), source, execution)?;
+    execution.cancel().wait_if_paused();
+    if execution.cancel().is_cancelled() {
         return Err(cancelled());
     }
     let primary = OpenOptions::new()
@@ -500,7 +498,7 @@ fn copy_inner(
                 stream,
                 &expected,
                 &mut file,
-                cancel,
+                execution,
                 &mut |count| {
                     if stream.name.is_empty() {
                         progress(count);
@@ -511,11 +509,11 @@ fn copy_inner(
             )?;
             file.sync_all().map_err(failed)?;
         }
-        if !source_version(backend, source, cancel)?.same_content(&expected) {
+        if !source_version(backend, source, execution)?.same_content(&expected) {
             return Err(failed(changed()));
         }
-        cancel.wait_if_paused();
-        if cancel.is_cancelled() {
+        execution.cancel().wait_if_paused();
+        if execution.cancel().is_cancelled() {
             return Err(cancelled());
         }
         preserve_metadata(&primary, destination, &expected).map_err(failed)?;
@@ -535,7 +533,7 @@ fn copy_stream(
     stream: &StreamVersion,
     expected: &SourceVersion,
     destination: &mut File,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
     progress: &mut dyn FnMut(u64),
     timeout: Duration,
     retry_wait: Option<Duration>,
@@ -543,8 +541,8 @@ fn copy_stream(
     let mut confirmed = 0_u64;
     let mut attempt = 0_u32;
     loop {
-        cancel.wait_if_paused();
-        if cancel.is_cancelled() {
+        execution.cancel().wait_if_paused();
+        if execution.cancel().is_cancelled() {
             return Err(cancelled());
         }
         let reading = start_reading(
@@ -553,10 +551,10 @@ fn copy_stream(
             stream.clone(),
             expected.clone(),
             confirmed,
-            cancel,
+            execution,
         )
         .map_err(|error| {
-            if cancel.is_cancelled() {
+            if execution.cancel().is_cancelled() {
                 cancelled()
             } else {
                 failed(error)
@@ -564,18 +562,18 @@ fn copy_stream(
         })?;
         let mut changed_at = Instant::now();
         let result = loop {
-            if cancel.is_cancelled() {
+            if execution.cancel().is_cancelled() {
                 return Err(cancelled());
             }
-            if cancel.is_paused() {
+            if execution.cancel().is_paused() {
                 break None;
             }
             match reading.receiver.recv_timeout(POLL) {
                 Ok(Ok(ReadEvent::Block { offset, bytes })) => {
-                    if cancel.is_paused() {
+                    if execution.cancel().is_paused() {
                         break None;
                     }
-                    if cancel.is_cancelled() {
+                    if execution.cancel().is_cancelled() {
                         return Err(cancelled());
                     }
                     if offset != confirmed
@@ -592,7 +590,7 @@ fn copy_stream(
                     progress(bytes.len() as u64);
                     attempt = 0;
                     changed_at = Instant::now();
-                    super::super::network::set_copy_recovering(false);
+                    execution.set_recovering(false);
                 }
                 Ok(Ok(ReadEvent::Finished)) if confirmed == stream.size => return Ok(()),
                 Ok(Ok(ReadEvent::Finished)) => return Err(failed(changed())),
@@ -611,7 +609,7 @@ fn copy_stream(
         };
         // Dropping this receiver discards all old blocks before a paused task is acknowledged.
         drop(reading);
-        super::super::network::set_copy_recovering(true);
+        execution.set_recovering(true);
         if let Some(error) = result {
             if !query_retryable(&error) {
                 return Err(failed(error));
@@ -621,7 +619,10 @@ fn copy_stream(
                 "network-copy-block-retry",
                 format!("offset={confirmed} attempt={attempt} error={error}"),
             );
-            retry_delay(cancel, retry_wait.unwrap_or_else(|| retry_backoff(attempt)))?;
+            retry_delay(
+                execution.cancel(),
+                retry_wait.unwrap_or_else(|| retry_backoff(attempt)),
+            )?;
         }
     }
 }

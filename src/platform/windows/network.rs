@@ -24,6 +24,16 @@ use windows::{
 };
 
 #[cfg(windows)]
+use super::{
+    copy_execution::{CopyExecution, temporary_copy},
+    network_snapshot::{
+        MAX_HELPER_UTF16_UNITS, atomic_write, read_snapshot, read_u32, read_u64, read_units_at,
+        write_units,
+    },
+    process_job::KillOnCloseJob,
+};
+
+#[cfg(windows)]
 use crate::domain::{EntryId, EntryKind, FileEntry, FileVisibility, FolderSizeState};
 #[cfg(windows)]
 use crate::fs::file_operations::FileProgressKind;
@@ -1140,56 +1150,6 @@ pub use directory::isolated_directory;
 #[cfg(all(windows, test))]
 pub(crate) use directory::test_directory_stream_started;
 
-#[cfg(windows)]
-pub(crate) struct KillOnCloseJob(windows_sys::Win32::Foundation::HANDLE);
-
-#[cfg(windows)]
-impl KillOnCloseJob {
-    pub(crate) fn create() -> io::Result<Self> {
-        use windows_sys::Win32::System::JobObjects::{
-            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject,
-        };
-
-        let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
-        if job.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        if unsafe {
-            SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                std::mem::size_of_val(&limits) as u32,
-            )
-        } == 0
-        {
-            unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self(job))
-    }
-
-    pub(crate) fn assign(&self, child: &std::process::Child) -> io::Result<()> {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
-
-        if unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle() as _) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-impl Drop for KillOnCloseJob {
-    fn drop(&mut self) {
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
-    }
-}
 fn run_isolated<T>(
     mode: &str,
     prepare_input: impl FnOnce(&Path) -> io::Result<()>,
@@ -1839,19 +1799,16 @@ fn execute_network_operation(
 ) -> io::Result<IsolatedNetworkOperationReport> {
     use crate::domain::file_operations::{CancellationToken, ConflictAction};
 
-    let _temporary_registration =
-        temporary_copy::Registration::new(event_path.with_extension("temporary-copy"));
-    let cancel = CancellationToken::new();
-    let scan = crate::fs::file_operations::CopyScanProgress::default();
-    let shared_progress =
-        std::sync::Arc::new(std::sync::Mutex::new(NetworkOperationProgress::default()));
-    let copy_progress_registration = CopyProgressRegistration::new(shared_progress.clone());
-    let mut monitor = NetworkOperationMonitor::start(
-        event_path,
-        cancel.clone(),
-        scan.clone(),
-        shared_progress.clone(),
-    );
+    let context = IsolatedOperationContext {
+        copy: CopyExecution::isolated(
+            CancellationToken::new(),
+            Some(event_path.with_extension("temporary-copy")),
+        )?,
+        scan: crate::fs::file_operations::CopyScanProgress::default(),
+        progress: std::sync::Arc::new(std::sync::Mutex::new(NetworkOperationProgress::default())),
+    };
+    let cancel = context.copy.cancel();
+    let mut monitor = NetworkOperationMonitor::start(event_path, context.clone());
     let ipc_error = monitor.error.clone();
     let operation = (|| {
         let sequence = std::cell::Cell::new(0_u64);
@@ -1895,13 +1852,13 @@ fn execute_network_operation(
             }
         };
         let mut discovered = |bytes, path: &Path| {
-            let mut snapshot = shared_progress.lock().expect("operation progress lock");
+            let mut snapshot = context.progress.lock().expect("operation progress lock");
             snapshot.discovered_files += 1;
             snapshot.discovered_bytes += bytes;
             snapshot.discovered_path = path.to_path_buf();
         };
         let mut progress = |bytes, kind, path: &Path| {
-            let mut snapshot = shared_progress.lock().expect("operation progress lock");
+            let mut snapshot = context.progress.lock().expect("operation progress lock");
             match kind {
                 FileProgressKind::Transferred => snapshot.transferred_bytes += bytes,
                 FileProgressKind::Completed => {
@@ -1921,15 +1878,15 @@ fn execute_network_operation(
                 let destination = destination.ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "missing copy destination")
                 })?;
-                crate::fs::file_operations::copy_path_with_progress(
+                crate::fs::file_operations::copy_path_with_execution(
                     source,
                     destination,
-                    &cancel,
+                    &context.copy,
                     &mut conflict,
                     &mut discovered,
                     &mut progress,
                     &mut |_| {},
-                    &scan,
+                    &context.scan,
                 )
                 .map_err(network_operation_error)?
             }
@@ -1937,10 +1894,10 @@ fn execute_network_operation(
                 let destination = destination.ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "missing move destination")
                 })?;
-                crate::fs::file_operations::move_path_with_progress(
+                crate::fs::file_operations::move_path_with_execution(
                     source,
                     destination,
-                    &cancel,
+                    &context.copy,
                     &mut conflict,
                     &mut discovered,
                     &mut progress,
@@ -1948,7 +1905,7 @@ fn execute_network_operation(
                 .map_err(network_operation_error)?
             }
             IsolatedNetworkOperationKind::PermanentDelete => {
-                crate::fs::file_operations::permanently_delete(source, &cancel)
+                crate::fs::file_operations::permanently_delete(source, cancel)
                     .map_err(network_operation_error)?
             }
             IsolatedNetworkOperationKind::Recycle => {
@@ -1984,7 +1941,6 @@ fn execute_network_operation(
             aborted: false,
         })
     })();
-    drop(copy_progress_registration);
     monitor.finish();
     if let Some(error) = monitor.error.lock().expect("IPC error lock").take() {
         return Err(error);
@@ -2004,38 +1960,6 @@ struct NetworkOperationProgress {
     recovering: bool,
     discovered_path: PathBuf,
     current_path: PathBuf,
-}
-
-#[cfg(windows)]
-thread_local! {
-    static COPY_PROGRESS: std::cell::RefCell<Option<std::sync::Arc<std::sync::Mutex<NetworkOperationProgress>>>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(windows)]
-struct CopyProgressRegistration(Option<std::sync::Arc<std::sync::Mutex<NetworkOperationProgress>>>);
-
-#[cfg(windows)]
-impl CopyProgressRegistration {
-    fn new(progress: std::sync::Arc<std::sync::Mutex<NetworkOperationProgress>>) -> Self {
-        Self(COPY_PROGRESS.with(|slot| slot.replace(Some(progress))))
-    }
-}
-
-#[cfg(windows)]
-impl Drop for CopyProgressRegistration {
-    fn drop(&mut self) {
-        set_copy_recovering(false);
-        COPY_PROGRESS.with(|slot| slot.replace(self.0.take()));
-    }
-}
-
-#[cfg(windows)]
-pub(crate) fn set_copy_recovering(recovering: bool) {
-    COPY_PROGRESS.with(|slot| {
-        if let Some(progress) = slot.borrow().as_ref() {
-            progress.lock().expect("operation progress lock").recovering = recovering;
-        }
-    });
 }
 
 #[cfg(windows)]
@@ -2151,9 +2075,18 @@ fn deliver_network_operation_progress(
     }
 }
 
+#[cfg(windows)]
+#[derive(Clone)]
+struct IsolatedOperationContext {
+    copy: CopyExecution,
+    scan: crate::fs::file_operations::CopyScanProgress,
+    progress: std::sync::Arc<std::sync::Mutex<NetworkOperationProgress>>,
+}
+
 // The monitor stays independent of CopyFile2 so control reaches a blocked transfer.
 #[cfg(windows)]
 struct NetworkOperationMonitor {
+    execution: CopyExecution,
     stop: std::sync::Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     error: std::sync::Arc<std::sync::Mutex<Option<io::Error>>>,
@@ -2161,12 +2094,7 @@ struct NetworkOperationMonitor {
 
 #[cfg(windows)]
 impl NetworkOperationMonitor {
-    fn start(
-        event_path: &Path,
-        cancel: crate::domain::file_operations::CancellationToken,
-        scan: crate::fs::file_operations::CopyScanProgress,
-        progress: std::sync::Arc<std::sync::Mutex<NetworkOperationProgress>>,
-    ) -> Self {
+    fn start(event_path: &Path, context: IsolatedOperationContext) -> Self {
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let error = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -2175,7 +2103,9 @@ impl NetworkOperationMonitor {
         let acknowledgement = event_path.with_extension("ack");
         let scan_path = event_path.with_extension("scan");
         let progress_path = event_path.with_extension("progress");
+        let execution = context.copy.clone();
         let thread = std::thread::spawn(move || {
+            let cancel = context.copy.cancel();
             let mut sequence = 0;
             let mut acknowledged = 0;
             let mut last_scan = Vec::new();
@@ -2207,7 +2137,7 @@ impl NetworkOperationMonitor {
                         }
                     }
                 }
-                let snapshot = scan.snapshot();
+                let snapshot = context.scan.snapshot();
                 let mut bytes = (snapshot.files as u64).to_le_bytes().to_vec();
                 bytes.extend_from_slice(&snapshot.bytes.to_le_bytes());
                 bytes.push(u8::from(snapshot.complete));
@@ -2223,7 +2153,12 @@ impl NetworkOperationMonitor {
                     last_scan = bytes;
                 }
                 let stopping = worker_stop.load(Ordering::Acquire);
-                let snapshot = progress.lock().expect("operation progress lock").clone();
+                let mut snapshot = context
+                    .progress
+                    .lock()
+                    .expect("operation progress lock")
+                    .clone();
+                snapshot.recovering = context.copy.is_recovering();
                 if snapshot != last_progress
                     && (stopping
                         || (cancel.is_pause_acknowledged() && acknowledged != sequence)
@@ -2264,6 +2199,7 @@ impl NetworkOperationMonitor {
             }
         });
         Self {
+            execution,
             stop,
             thread: Some(thread),
             error,
@@ -2271,6 +2207,7 @@ impl NetworkOperationMonitor {
     }
 
     fn finish(&mut self) {
+        self.execution.set_recovering(false);
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -2429,75 +2366,6 @@ fn available_snapshot<T>(result: io::Result<T>) -> io::Result<Option<T>> {
 }
 
 #[cfg(windows)]
-fn snapshot_error(path: &Path, error: io::Error) -> io::Error {
-    io::Error::new(error.kind(), format!("{}: {error}", path.display()))
-}
-
-// Locks cover only small local IPC snapshots; never wait on network I/O.
-#[cfg(windows)]
-fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::io::{Seek, Write};
-    let write = || -> io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
-        let started = std::time::Instant::now();
-        loop {
-            match file.try_lock() {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::WouldBlock)
-                    if started.elapsed() < Duration::from_secs(1) =>
-                {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "local IPC snapshot lock timed out",
-                    ));
-                }
-                Err(std::fs::TryLockError::Error(error)) => return Err(error),
-            }
-        }
-        file.rewind()?;
-        file.write_all(bytes)?;
-        file.set_len(bytes.len() as u64)?;
-        Ok(())
-    };
-    write().map_err(|error| snapshot_error(path, error))
-}
-
-#[cfg(windows)]
-fn read_snapshot(path: &Path) -> io::Result<Vec<u8>> {
-    use std::io::Read;
-    let read = || -> io::Result<Vec<u8>> {
-        let file = std::fs::File::open(path)?;
-        match file.try_lock_shared() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Err(io::ErrorKind::WouldBlock.into()),
-            Err(std::fs::TryLockError::Error(error)) => return Err(error),
-        }
-        let mut bytes = Vec::new();
-        file.take(1_048_577).read_to_end(&mut bytes)?;
-        if bytes.is_empty() {
-            // A newly created snapshot is unpublished until its first locked write.
-            return Err(io::ErrorKind::WouldBlock.into());
-        }
-        if bytes.len() > 1_048_576 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "IPC snapshot exceeds size limit",
-            ));
-        }
-        Ok(bytes)
-    };
-    read().map_err(|error| snapshot_error(path, error))
-}
-
-#[cfg(windows)]
 fn write_network_operation_result(
     path: &Path,
     result: &io::Result<IsolatedNetworkOperationReport>,
@@ -2619,21 +2487,6 @@ fn read_optional_path(bytes: &[u8], offset: &mut usize) -> io::Result<Option<Pat
 }
 
 #[cfg(windows)]
-fn write_units(bytes: &mut Vec<u8>, units: &[u16]) -> io::Result<()> {
-    if units.len() > MAX_HELPER_UTF16_UNITS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "helper item too long",
-        ));
-    }
-    bytes.extend_from_slice(&(units.len() as u32).to_le_bytes());
-    for unit in units {
-        bytes.extend_from_slice(&unit.to_le_bytes());
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
 fn write_optional_u64(bytes: &mut Vec<u8>, value: Option<u64>) {
     bytes.push(u8::from(value.is_some()));
     if let Some(value) = value {
@@ -2684,8 +2537,6 @@ fn read_system_time(bytes: &[u8], offset: &mut usize) -> io::Result<Option<Syste
 }
 #[cfg(windows)]
 const MAX_HELPER_ITEMS: usize = 4096;
-#[cfg(windows)]
-const MAX_HELPER_UTF16_UNITS: usize = 32767;
 #[cfg(windows)]
 fn write_utf16_path(path: &Path, value: &Path) -> io::Result<()> {
     let units: Vec<u16> = value.as_os_str().encode_wide().collect();
@@ -2782,64 +2633,12 @@ fn read_units(bytes: &[u8]) -> io::Result<Vec<u16>> {
     })
 }
 #[cfg(windows)]
-fn read_units_at(bytes: &[u8], offset: &mut usize) -> io::Result<Vec<u16>> {
-    let count = read_u32(bytes, offset)? as usize;
-    if count > MAX_HELPER_UTF16_UNITS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "UTF-16 value too long",
-        ));
-    }
-    let end = offset
-        .checked_add(
-            count
-                .checked_mul(2)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "path too long"))?,
-        )
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "path too long"))?;
-    if end > bytes.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "truncated UTF-16 data",
-        ));
-    }
-    let mut units = Vec::with_capacity(count);
-    while *offset < end {
-        units.push(u16::from_le_bytes([bytes[*offset], bytes[*offset + 1]]));
-        *offset += 2;
-    }
-    Ok(units)
-}
-#[cfg(windows)]
 fn read_byte(bytes: &[u8], offset: &mut usize) -> io::Result<u8> {
     let value = *bytes
         .get(*offset)
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "truncated byte"))?;
     *offset += 1;
     Ok(value)
-}
-
-#[cfg(windows)]
-fn read_u64(bytes: &[u8], offset: &mut usize) -> io::Result<u64> {
-    let end = offset
-        .checked_add(8)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid length"))?;
-    let value = bytes
-        .get(*offset..end)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "truncated number"))?;
-    *offset = end;
-    Ok(u64::from_le_bytes(value.try_into().unwrap()))
-}
-#[cfg(windows)]
-fn read_u32(bytes: &[u8], offset: &mut usize) -> io::Result<u32> {
-    let end = offset
-        .checked_add(4)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid length"))?;
-    let value = bytes
-        .get(*offset..end)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "truncated length"))?;
-    *offset = end;
-    Ok(u32::from_le_bytes(value.try_into().unwrap()))
 }
 
 #[cfg(test)]
@@ -3247,20 +3046,50 @@ mod isolated_codec_tests {
     fn issue_137_recovery_progress_preserves_logical_totals() {
         use std::sync::{Arc, Mutex};
 
-        let path = std::env::temp_dir().join(format!(
+        let directory = std::env::temp_dir().join(format!(
             "asterfiles-recovery-progress-{}",
             std::process::id()
         ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let event_path = directory.join("operation.event");
+        let path = event_path.with_extension("progress");
         let original = super::NetworkOperationProgress {
             transferred_bytes: 8_192,
             current_path: "source.bin".into(),
             ..Default::default()
         };
         let shared = Arc::new(Mutex::new(original.clone()));
-        let registration = super::CopyProgressRegistration::new(shared.clone());
-        super::set_copy_recovering(true);
-        super::write_network_operation_progress(&path, &shared.lock().unwrap()).unwrap();
-        let recovering = super::read_network_operation_progress(&path).unwrap();
+        let execution = super::CopyExecution::isolated(
+            crate::domain::file_operations::CancellationToken::new(),
+            Some(directory.join("operation.temporary-copy")),
+        )
+        .unwrap();
+        let unrelated = super::CopyExecution::isolated(
+            crate::domain::file_operations::CancellationToken::new(),
+            Some(directory.join("unrelated.temporary-copy")),
+        )
+        .unwrap();
+        execution.set_recovering(true);
+        assert!(!unrelated.is_recovering());
+        let mut monitor = super::NetworkOperationMonitor::start(
+            &event_path,
+            super::IsolatedOperationContext {
+                copy: execution.clone(),
+                scan: crate::fs::file_operations::CopyScanProgress::default(),
+                progress: shared.clone(),
+            },
+        );
+        let started = std::time::Instant::now();
+        let recovering = loop {
+            match super::available_snapshot(super::read_network_operation_progress(&path)).unwrap()
+            {
+                Some(snapshot) if snapshot.recovering => break snapshot,
+                _ => {
+                    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        };
         assert!(recovering.recovering);
         let mut recovery_changes = Vec::new();
         super::deliver_network_operation_progress(
@@ -3277,12 +3106,18 @@ mod isolated_codec_tests {
             &mut |_, _, _| panic!("duplicate progress"),
             &mut |_| panic!("duplicate recovery transition"),
         );
-        super::set_copy_recovering(false);
-        let mut advanced = shared.lock().unwrap().clone();
-        advanced.transferred_bytes += 512;
-        advanced.completed_files = 1;
-        super::write_network_operation_progress(&path, &advanced).unwrap();
+        {
+            let mut advanced = shared.lock().unwrap();
+            advanced.transferred_bytes += 512;
+            advanced.completed_files = 1;
+        }
+        unrelated.set_recovering(true);
+        monitor.finish();
+        assert!(monitor.error.lock().unwrap().is_none());
+        assert!(!execution.is_recovering());
+        assert!(unrelated.is_recovering());
         let advanced = super::read_network_operation_progress(&path).unwrap();
+        assert!(!advanced.recovering);
         let mut transferred = 0;
         let mut completed = 0;
         super::deliver_network_operation_progress(
@@ -3298,12 +3133,7 @@ mod isolated_codec_tests {
         assert_eq!(recovery_changes, [true, false]);
         assert_eq!((transferred, completed), (512, 1));
 
-        super::set_copy_recovering(true);
-        drop(registration);
-        assert!(!shared.lock().unwrap().recovering);
-        super::set_copy_recovering(true);
-        assert!(!shared.lock().unwrap().recovering);
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(windows)]
@@ -3367,12 +3197,3 @@ mod host_display_tests {
 
 #[cfg(all(windows, test))]
 mod snapshot_tests;
-
-#[cfg(windows)]
-mod temporary_copy;
-#[cfg(windows)]
-pub(crate) use temporary_copy::register as register_copy_temporary;
-#[cfg(windows)]
-pub(crate) use temporary_copy::register_staging as register_copy_staging;
-#[cfg(windows)]
-pub(crate) use temporary_copy::retire_staging as retire_copy_staging;

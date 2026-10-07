@@ -2,6 +2,7 @@ pub mod address_path;
 pub(crate) mod atomic_file;
 pub mod clipboard;
 pub mod context_menu;
+pub(crate) mod copy_execution;
 pub mod copy_file;
 #[allow(dead_code)]
 pub mod directory_watch;
@@ -14,7 +15,9 @@ pub mod launch_probe;
 pub mod libraries;
 pub mod network;
 pub(crate) mod network_copy;
+pub(crate) mod network_snapshot;
 pub mod path_relation;
+pub(crate) mod process_job;
 pub mod quick_access;
 pub mod quick_menu_window;
 pub mod shell_icons;

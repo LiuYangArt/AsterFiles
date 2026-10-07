@@ -1,3 +1,4 @@
+use super::copy_execution::CopyExecution;
 use crate::domain::file_operations::CancellationToken;
 use std::{ffi::c_void, io, mem::size_of, os::windows::ffi::OsStrExt, path::Path};
 use windows::{
@@ -35,11 +36,12 @@ struct CopyContext<'a> {
 pub fn copy_file(
     source: &Path,
     destination: &Path,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
     progress: &mut dyn FnMut(u64),
 ) -> Result<u64, CopyFileError> {
+    let cancel = execution.cancel();
     if crate::network::is_unc_path(source) || crate::network::is_unc_path(destination) {
-        return super::network_copy::copy_file(source, destination, cancel, progress);
+        return super::network_copy::copy_file(source, destination, execution, progress);
     }
     let source_wide = wide_path(source);
     let destination_wide = wide_path(destination);
@@ -203,7 +205,7 @@ mod tests {
         copy_file(
             &source,
             &destination,
-            &CancellationToken::new(),
+            &CopyExecution::local(CancellationToken::new()),
             &mut |_| {},
         )
         .unwrap();
@@ -232,7 +234,7 @@ mod tests {
         copy_file(
             &source,
             &destination,
-            &CancellationToken::new(),
+            &CopyExecution::local(CancellationToken::new()),
             &mut |_| {},
         )
         .unwrap();
@@ -250,9 +252,12 @@ mod tests {
         fs::write(&source, vec![7_u8; 64 * 1024 * 1024]).unwrap();
         let cancel = CancellationToken::new();
         let callback_cancel = cancel.clone();
-        let result = copy_file(&source, &destination, &cancel, &mut move |_| {
-            callback_cancel.cancel()
-        });
+        let result = copy_file(
+            &source,
+            &destination,
+            &CopyExecution::local(cancel.clone()),
+            &mut move |_| callback_cancel.cancel(),
+        );
         assert_eq!(result.unwrap_err().kind, CopyFileErrorKind::Cancelled);
         assert!(!destination.exists());
     }
@@ -269,14 +274,19 @@ mod tests {
         let (progress_sender, progress_receiver) = mpsc::channel();
         let worker = thread::spawn(move || {
             let mut requested = false;
-            copy_file(&source, &worker_destination, &worker_cancel, &mut |bytes| {
-                if !requested {
-                    worker_cancel.pause();
-                    assert!(!worker_cancel.is_pause_acknowledged());
-                    requested = true;
-                }
-                progress_sender.send(bytes).unwrap();
-            })
+            copy_file(
+                &source,
+                &worker_destination,
+                &CopyExecution::local(worker_cancel.clone()),
+                &mut |bytes| {
+                    if !requested {
+                        worker_cancel.pause();
+                        assert!(!worker_cancel.is_pause_acknowledged());
+                        requested = true;
+                    }
+                    progress_sender.send(bytes).unwrap();
+                },
+            )
         });
         progress_receiver
             .recv_timeout(Duration::from_secs(5))

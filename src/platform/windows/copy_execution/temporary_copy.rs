@@ -1,22 +1,64 @@
-use super::*;
-use std::{cell::RefCell, os::windows::fs::MetadataExt, path::Component};
+use super::super::network_snapshot::{
+    atomic_write, read_snapshot, read_u64, read_units_at, snapshot_error, write_units,
+};
+use std::{
+    ffi::{OsStr, OsString},
+    io,
+    os::windows::{
+        ffi::{OsStrExt, OsStringExt},
+        fs::MetadataExt,
+    },
+    path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
-thread_local! {
-    static REGISTRATION: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+#[derive(Clone)]
+pub(super) struct Registration {
+    path: PathBuf,
+    lock: Arc<Mutex<()>>,
 }
-
-pub(super) struct Registration(Option<PathBuf>);
 
 impl Registration {
     pub(super) fn new(path: PathBuf) -> Self {
-        Self(REGISTRATION.with(|slot| slot.replace(Some(path))))
+        Self {
+            path,
+            lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    // Publish ownership before the copy can create either temporary file.
+    pub(super) fn register(&self, path: &Path, staged: Option<&Path>) -> io::Result<()> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| io::Error::other("temporary copy registration lock poisoned"))?;
+        let mut registry = read_registry(&self.path)?;
+        registry.current = path.to_path_buf();
+        registry.staged = staged.unwrap_or_else(|| Path::new("")).to_path_buf();
+        write_registry(&self.path, &registry)
+    }
+
+    // Retain exact ownership while Windows may still hold the cancelled target open.
+    pub(super) fn retire_staging(&self, path: &Path, staged: &Path) -> io::Result<()> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| io::Error::other("temporary copy registration lock poisoned"))?;
+        let mut registry = read_registry(&self.path)?;
+        if registry.current != path || registry.staged != staged {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cannot retire unregistered copy staging",
+            ));
+        }
+        validate_staging_ownership(path, staged)?;
+        registry.retired.push(std::mem::take(&mut registry.staged));
+        write_registry(&self.path, &registry)
     }
 }
 
-impl Drop for Registration {
-    fn drop(&mut self) {
-        REGISTRATION.with(|slot| slot.replace(self.0.take()));
-    }
+fn wide_null(value: &OsStr) -> Vec<u16> {
+    value.encode_wide().chain(Some(0)).collect()
 }
 
 const MAX_STAGED_PATHS: usize = 4096;
@@ -98,45 +140,6 @@ fn write_registry(path: &Path, registry: &Registry) -> io::Result<()> {
     atomic_write(path, &bytes)
 }
 
-// Publish exact ownership before either the copy or its staging file can be created.
-pub(crate) fn register(path: &Path) -> io::Result<()> {
-    register_paths(path, None)
-}
-pub(crate) fn register_staging(path: &Path, staged: &Path) -> io::Result<()> {
-    register_paths(path, Some(staged))
-}
-fn register_paths(path: &Path, staged: Option<&Path>) -> io::Result<()> {
-    REGISTRATION.with(|slot| {
-        let Some(registry_path) = slot.borrow().clone() else {
-            return Ok(());
-        };
-        let mut registry = read_registry(&registry_path)?;
-        registry.current = path.to_path_buf();
-        registry.staged = staged.unwrap_or_else(|| Path::new("")).to_path_buf();
-        write_registry(&registry_path, &registry)
-    })
-}
-
-// A terminated SMB process can retain its target handle until the driver finishes cancellation.
-// Keep that target separate from subsequent attempts and preserve its ownership for later cleanup.
-pub(crate) fn retire_staging(path: &Path, staged: &Path) -> io::Result<()> {
-    REGISTRATION.with(|slot| {
-        let Some(registry_path) = slot.borrow().clone() else {
-            return Ok(());
-        };
-        let mut registry = read_registry(&registry_path)?;
-        if registry.current != path || registry.staged != staged {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "cannot retire unregistered copy staging",
-            ));
-        }
-        validate_staging_ownership(path, staged)?;
-        registry.retired.push(std::mem::take(&mut registry.staged));
-        write_registry(&registry_path, &registry)
-    })
-}
-
 fn owned_temporary_name(path: &Path, pid: u32) -> bool {
     let Some(name) = path.file_name().and_then(OsStr::to_str) else {
         return false;
@@ -197,7 +200,7 @@ fn retired_base(staged: &Path, pid: u32) -> io::Result<PathBuf> {
 }
 
 // False means only retired targets are still held open; their registry must remain on disk.
-pub(super) fn cleanup_registered(
+pub(crate) fn cleanup_registered(
     registry_path: &Path,
     pid: u32,
     completed: bool,
@@ -369,6 +372,11 @@ fn validate_local_path(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        domain::file_operations::CancellationToken,
+        platform::windows::copy_execution::CopyExecution,
+    };
+    use std::time::SystemTime;
 
     fn root(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -391,12 +399,14 @@ mod tests {
             r"\\not-a-server\share\.asterfiles-copy-{}-12345-1",
             std::process::id()
         ));
-        let _registration = Registration::new(registry.clone());
-        register_staging(
-            &destination,
-            &destination.with_extension("stage-0").join("source.bin"),
-        )
-        .unwrap();
+        let execution =
+            CopyExecution::isolated(CancellationToken::new(), Some(registry.clone())).unwrap();
+        execution
+            .register_staging(
+                &destination,
+                &destination.with_extension("stage-0").join("source.bin"),
+            )
+            .unwrap();
         assert!(cleanup_registered(&registry, std::process::id(), true).unwrap());
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -411,8 +421,9 @@ mod tests {
         for path in [&owned, &other, &formal] {
             std::fs::write(path, b"keep").unwrap();
         }
-        let _registration = Registration::new(registry.clone());
-        register(&owned).unwrap();
+        let execution =
+            CopyExecution::isolated(CancellationToken::new(), Some(registry.clone())).unwrap();
+        execution.register_temporary(&owned).unwrap();
         cleanup_registered(&registry, std::process::id(), false).unwrap();
         assert!(!owned.exists());
         assert_eq!(std::fs::read(&formal).unwrap(), b"keep");
@@ -430,8 +441,9 @@ mod tests {
         std::fs::create_dir(&stage).unwrap();
         let staged = stage.join("source.bin");
         std::fs::write(&staged, b"partial").unwrap();
-        let _registration = Registration::new(registry.clone());
-        register_staging(&destination, &staged).unwrap();
+        let execution =
+            CopyExecution::isolated(CancellationToken::new(), Some(registry.clone())).unwrap();
+        execution.register_staging(&destination, &staged).unwrap();
         cleanup_registered(&registry, std::process::id(), false).unwrap();
         assert!(!stage.exists());
         std::fs::remove_dir_all(root).unwrap();
@@ -448,9 +460,10 @@ mod tests {
         std::fs::create_dir(&first_stage).unwrap();
         let retired = first_stage.join("source.bin");
         std::fs::write(&retired, b"pending kernel cancellation").unwrap();
-        let _registration = Registration::new(registry_path.clone());
-        register_staging(&first, &retired).unwrap();
-        retire_staging(&first, &retired).unwrap();
+        let execution =
+            CopyExecution::isolated(CancellationToken::new(), Some(registry_path.clone())).unwrap();
+        execution.register_staging(&first, &retired).unwrap();
+        execution.retire_staging(&first, &retired).unwrap();
         let held = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(0)
@@ -458,10 +471,10 @@ mod tests {
             .unwrap();
 
         let second = root.join(format!(".asterfiles-copy-{}-12345-2", std::process::id()));
-        register(&second).unwrap();
+        execution.register_temporary(&second).unwrap();
         let second_stage = second.with_extension("stage-1");
         let staged = second_stage.join("next.bin");
-        register_staging(&second, &staged).unwrap();
+        execution.register_staging(&second, &staged).unwrap();
         std::fs::create_dir(&second_stage).unwrap();
         std::fs::write(&staged, b"current partial").unwrap();
         assert!(!cleanup_registered(&registry_path, std::process::id(), false).unwrap());
@@ -488,8 +501,9 @@ mod tests {
         let current = root.join(format!(".asterfiles-copy-{}-12345-1", std::process::id()));
         let stage = current.with_extension("stage-0");
         let staged = stage.join("source.bin");
-        let _registration = Registration::new(registry.clone());
-        register_staging(&current, &staged).unwrap();
+        let execution =
+            CopyExecution::isolated(CancellationToken::new(), Some(registry.clone())).unwrap();
+        execution.register_staging(&current, &staged).unwrap();
         std::fs::create_dir(&stage).unwrap();
         std::fs::write(&staged, b"partial").unwrap();
         let held = std::fs::OpenOptions::new()
@@ -576,11 +590,12 @@ mod tests {
         let destination = root.join("target.bin");
         std::fs::write(&source, b"source").unwrap();
         std::fs::create_dir(root.join("registry")).unwrap();
-        let _registration = Registration::new(root.join("registry"));
-        let result = crate::fs::file_operations::copy_path_with_progress(
+        let execution =
+            CopyExecution::isolated(CancellationToken::new(), Some(root.join("registry"))).unwrap();
+        let result = crate::fs::file_operations::copy_path_with_execution(
             &source,
             &destination,
-            &crate::domain::file_operations::CancellationToken::new(),
+            &execution,
             &mut |_, _, _| crate::domain::file_operations::ConflictAction::Skip,
             &mut |_, _| {},
             &mut |_, _, _| {},
@@ -599,8 +614,9 @@ mod tests {
         let registry = root.join("registry");
         let other = root.join(".asterfiles-copy-99999-12345-2");
         std::fs::write(&other, b"keep").unwrap();
-        let _registration = Registration::new(registry.clone());
-        register(&other).unwrap();
+        let execution =
+            CopyExecution::isolated(CancellationToken::new(), Some(registry.clone())).unwrap();
+        execution.register_temporary(&other).unwrap();
         assert_eq!(
             cleanup_registered(&registry, std::process::id(), false)
                 .unwrap_err()
@@ -608,17 +624,75 @@ mod tests {
             io::ErrorKind::PermissionDenied
         );
         assert_eq!(std::fs::read(&other).unwrap(), b"keep");
-        register(&PathBuf::from(format!(
-            r"\\not-a-server\share\.asterfiles-copy-{}-12345-1",
-            std::process::id()
-        )))
-        .unwrap();
+        execution
+            .register_temporary(&PathBuf::from(format!(
+                r"\\not-a-server\share\.asterfiles-copy-{}-12345-1",
+                std::process::id()
+            )))
+            .unwrap();
         assert_eq!(
             cleanup_registered(&registry, std::process::id(), false)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::PermissionDenied
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue_149_registry_follows_context_across_threads_and_separates_operations() {
+        let root = root("context-isolation");
+        let first_registry = root.join("first-registry");
+        let second_registry = root.join("second-registry");
+        let first = CopyExecution::isolated(CancellationToken::new(), Some(first_registry.clone()))
+            .unwrap();
+        let second =
+            CopyExecution::isolated(CancellationToken::new(), Some(second_registry.clone()))
+                .unwrap();
+        let first_path = root.join("first");
+        let second_path = root.join("second");
+        std::thread::scope(|scope| {
+            scope.spawn(|| first.register_temporary(&first_path).unwrap());
+            scope.spawn(|| second.register_temporary(&second_path).unwrap());
+        });
+        assert_eq!(read_registry(&first_registry).unwrap().current, first_path);
+        assert_eq!(
+            read_registry(&second_registry).unwrap().current,
+            second_path
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue_149_cloned_registration_serializes_ownership_retirement() {
+        let root = root("concurrent-retirement");
+        let registry = root.join("registry");
+        let current = root.join(format!(".asterfiles-copy-{}-12345-1", std::process::id()));
+        let staged = current.with_extension("stage-0").join("source.bin");
+        let execution =
+            CopyExecution::isolated(CancellationToken::new(), Some(registry.clone())).unwrap();
+        execution.register_staging(&current, &staged).unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        let successes = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let worker = execution.clone();
+                    let current = &current;
+                    let staged = &staged;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        worker.retire_staging(current, staged).is_ok()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| usize::from(handle.join().unwrap()))
+                .sum::<usize>()
+        });
+        assert_eq!(successes, 1);
+        assert_eq!(read_registry(&registry).unwrap().retired, vec![staged]);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

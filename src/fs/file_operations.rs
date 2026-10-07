@@ -6,6 +6,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crate::platform::windows::copy_execution::CopyExecution;
+
 use crate::domain::file_operations::{
     CancellationToken, ConflictAction, ConflictCategory, FileIdentity, UndoItem,
 };
@@ -991,11 +993,35 @@ pub fn copy_path_with_progress(
     destination_created: &mut DestinationCreatedCallback<'_>,
     scan: &CopyScanProgress,
 ) -> Result<FileOperationReport, OperationError> {
+    copy_path_with_execution(
+        source,
+        destination,
+        &CopyExecution::local(cancel.clone()),
+        resolve_conflict,
+        discovered,
+        progress,
+        destination_created,
+        scan,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn copy_path_with_execution(
+    source: &Path,
+    destination: &Path,
+    execution: &CopyExecution,
+    resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
+    discovered: &mut FileDiscoveredCallback<'_>,
+    progress: &mut FileProgressCallback<'_>,
+    destination_created: &mut DestinationCreatedCallback<'_>,
+    scan: &CopyScanProgress,
+) -> Result<FileOperationReport, OperationError> {
+    let cancel = execution.cancel();
     check_cancel(cancel)?;
     let kept_destination = (source == destination).then(|| keep_both_path(destination));
     let destination = kept_destination.as_deref().unwrap_or(destination);
-    reject_destination_inside_source(source, destination, cancel)?;
-    let source_metadata = copy_source_metadata(source, cancel)?;
+    reject_destination_inside_source(source, destination, execution)?;
+    let source_metadata = copy_source_metadata(source, execution)?;
     let destination_existed = path_exists(destination);
     let copy_into_existing_directory = destination_existed
         && source_metadata.file_type().is_dir()
@@ -1019,7 +1045,7 @@ pub fn copy_path_with_progress(
         source,
         source,
         destination,
-        cancel,
+        execution,
         resolve_conflict,
         discovered,
         progress,
@@ -1067,11 +1093,29 @@ pub fn move_path_with_progress(
     discovered: &mut FileDiscoveredCallback<'_>,
     progress: &mut FileProgressCallback<'_>,
 ) -> Result<FileOperationReport, OperationError> {
+    move_path_with_execution(
+        source,
+        destination,
+        &CopyExecution::local(cancel.clone()),
+        resolve_conflict,
+        discovered,
+        progress,
+    )
+}
+
+pub(crate) fn move_path_with_execution(
+    source: &Path,
+    destination: &Path,
+    execution: &CopyExecution,
+    resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
+    discovered: &mut FileDiscoveredCallback<'_>,
+    progress: &mut FileProgressCallback<'_>,
+) -> Result<FileOperationReport, OperationError> {
     move_path_with_progress_inner(
         source,
         source,
         destination,
-        cancel,
+        execution,
         resolve_conflict,
         discovered,
         progress,
@@ -1084,21 +1128,22 @@ fn move_path_with_progress_inner(
     source_root: &Path,
     source: &Path,
     destination: &Path,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
     discovered: &mut FileDiscoveredCallback<'_>,
     progress: &mut FileProgressCallback<'_>,
     discover_source: bool,
 ) -> Result<FileOperationReport, OperationError> {
+    let cancel = execution.cancel();
     check_cancel(cancel)?;
     if source == destination {
         let mut report = FileOperationReport::new();
         report.affect(source);
         return Ok(report);
     }
-    reject_destination_inside_source(source_root, destination, cancel)?;
+    reject_destination_inside_source(source_root, destination, execution)?;
     check_cancel(cancel)?;
-    let source_metadata = copy_source_metadata(source, cancel)?;
+    let source_metadata = copy_source_metadata(source, execution)?;
     if discover_source && !source_metadata.file_type().is_dir() {
         discovered(discovered_size(&source_metadata), source);
     }
@@ -1135,7 +1180,7 @@ fn move_path_with_progress_inner(
             source_root,
             source,
             destination,
-            cancel,
+            execution,
             resolve_conflict,
             discovered,
             progress,
@@ -1154,7 +1199,7 @@ fn move_path_with_progress_inner(
                 report_skipped_progress(
                     source,
                     &source_metadata,
-                    cancel,
+                    execution,
                     discovered,
                     progress,
                     None,
@@ -1163,7 +1208,7 @@ fn move_path_with_progress_inner(
             }
             Err(error) => return Err(error),
         };
-    reject_destination_inside_source(source_root, &resolution.path, cancel)?;
+    reject_destination_inside_source(source_root, &resolution.path, execution)?;
     if !resolution.replace_existing {
         match fs::rename(source, &resolution.path) {
             Ok(()) => {
@@ -1183,7 +1228,7 @@ fn move_path_with_progress_inner(
         source_root,
         source,
         &resolution,
-        cancel,
+        execution,
         resolve_conflict,
         discovered,
         progress,
@@ -2150,7 +2195,7 @@ fn copy_entry(
     source_root: &Path,
     source: &Path,
     destination: &Path,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
     discovered: &mut FileDiscoveredCallback<'_>,
     progress: &mut FileProgressCallback<'_>,
@@ -2159,8 +2204,9 @@ fn copy_entry(
     remove_source: bool,
     traversal: &mut Option<CopyTraversal>,
 ) -> Result<(), OperationError> {
+    let cancel = execution.cancel();
     check_cancel(cancel)?;
-    let source_metadata = copy_source_metadata(source, cancel)?;
+    let source_metadata = copy_source_metadata(source, execution)?;
     if !source_metadata.file_type().is_dir() {
         discovered(discovered_size(&source_metadata), source);
     }
@@ -2172,7 +2218,7 @@ fn copy_entry(
                 report_skipped_progress(
                     source,
                     &source_metadata,
-                    cancel,
+                    execution,
                     discovered,
                     progress,
                     traversal.as_ref(),
@@ -2185,7 +2231,7 @@ fn copy_entry(
         source_root,
         source,
         &resolution,
-        cancel,
+        execution,
         resolve_conflict,
         discovered,
         progress,
@@ -2199,11 +2245,12 @@ fn copy_entry(
 fn report_skipped_progress(
     source: &Path,
     metadata: &fs::Metadata,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
     discovered: &mut FileDiscoveredCallback<'_>,
     progress: &mut FileProgressCallback<'_>,
     traversal: Option<&CopyTraversal>,
 ) -> Result<(), OperationError> {
+    let cancel = execution.cancel();
     if !metadata.file_type().is_dir() {
         progress(discovered_size(metadata), FileProgressKind::Skipped, source);
         return Ok(());
@@ -2220,11 +2267,11 @@ fn report_skipped_progress(
         let child = child
             .map_err(|error| OperationError::io(source, error))?
             .path();
-        let metadata = copy_source_metadata(&child, cancel)?;
+        let metadata = copy_source_metadata(&child, execution)?;
         if !metadata.file_type().is_dir() {
             discovered(discovered_size(&metadata), &child);
         }
-        report_skipped_progress(&child, &metadata, cancel, discovered, progress, None)?;
+        report_skipped_progress(&child, &metadata, execution, discovered, progress, None)?;
     }
     Ok(())
 }
@@ -2234,7 +2281,7 @@ fn copy_resolved_entry(
     source_root: &Path,
     source: &Path,
     resolution: &DestinationResolution,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
     discovered: &mut FileDiscoveredCallback<'_>,
     progress: &mut FileProgressCallback<'_>,
@@ -2243,8 +2290,9 @@ fn copy_resolved_entry(
     remove_source: bool,
     traversal: &mut Option<CopyTraversal>,
 ) -> Result<(), OperationError> {
-    reject_destination_inside_source(source_root, &resolution.path, cancel)?;
-    let source_metadata = copy_source_metadata(source, cancel)?;
+    let cancel = execution.cancel();
+    reject_destination_inside_source(source_root, &resolution.path, execution)?;
+    let source_metadata = copy_source_metadata(source, execution)?;
     let file_type = source_metadata.file_type();
     if file_type.is_symlink() {
         let private_identity = copy_symlink_safely(
@@ -2276,7 +2324,7 @@ fn copy_resolved_entry(
                 source_root,
                 source,
                 &resolution.path,
-                cancel,
+                execution,
                 resolve_conflict,
                 discovered,
                 progress,
@@ -2290,7 +2338,7 @@ fn copy_resolved_entry(
             source_root,
             source,
             &resolution.path,
-            cancel,
+            execution,
             resolve_conflict,
             discovered,
             progress,
@@ -2304,7 +2352,7 @@ fn copy_resolved_entry(
             source,
             &resolution.path,
             resolution.replace_existing,
-            cancel,
+            execution,
             progress,
             report,
         )?;
@@ -2320,7 +2368,7 @@ fn copy_directory(
     source_root: &Path,
     source: &Path,
     destination: &Path,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
     discovered: &mut FileDiscoveredCallback<'_>,
     progress: &mut FileProgressCallback<'_>,
@@ -2329,6 +2377,7 @@ fn copy_directory(
     remove_source: bool,
     traversal: &mut Option<CopyTraversal>,
 ) -> Result<(), OperationError> {
+    let cancel = execution.cancel();
     if !path_exists(destination) {
         fs::create_dir(destination).map_err(|error| OperationError::io(destination, error))?;
         let identity = file_identity(destination)?;
@@ -2362,7 +2411,7 @@ fn copy_directory(
                 source_root,
                 &child,
                 &destination.join(child.file_name().unwrap()),
-                cancel,
+                execution,
                 resolve_conflict,
                 discovered,
                 progress,
@@ -2392,7 +2441,7 @@ fn replace_directory_safely(
     source_root: &Path,
     source: &Path,
     destination: &Path,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
     discovered: &mut FileDiscoveredCallback<'_>,
     progress: &mut FileProgressCallback<'_>,
@@ -2401,13 +2450,14 @@ fn replace_directory_safely(
     remove_source: bool,
     traversal: &mut Option<CopyTraversal>,
 ) -> Result<(), OperationError> {
+    let cancel = execution.cancel();
     let temporary = unique_sibling(destination, ".asterfiles-copy");
     let manifest_start = report.undo_identities.len();
     copy_directory(
         source_root,
         source,
         &temporary,
-        cancel,
+        execution,
         resolve_conflict,
         discovered,
         progress,
@@ -2443,13 +2493,14 @@ fn move_directory_merged(
     source_root: &Path,
     source: &Path,
     destination: &Path,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
     resolve_conflict: &mut dyn FnMut(ConflictCategory, &Path, &Path) -> ConflictAction,
     discovered: &mut FileDiscoveredCallback<'_>,
     progress: &mut FileProgressCallback<'_>,
     report: &mut FileOperationReport,
 ) -> Result<(), OperationError> {
-    reject_destination_inside_source(source_root, destination, cancel)?;
+    let cancel = execution.cancel();
+    reject_destination_inside_source(source_root, destination, execution)?;
     let traversal = (|| {
         for entry in fs::read_dir(source).map_err(|error| OperationError::io(source, error))? {
             check_cancel(cancel)?;
@@ -2470,7 +2521,7 @@ fn move_directory_merged(
                     source_root,
                     &source_child,
                     &destination_child,
-                    cancel,
+                    execution,
                     resolve_conflict,
                     discovered,
                     progress,
@@ -2482,7 +2533,7 @@ fn move_directory_merged(
                 source_root,
                 &source_child,
                 &destination_child,
-                cancel,
+                execution,
                 resolve_conflict,
                 discovered,
                 progress,
@@ -2549,14 +2600,15 @@ fn copy_file_safely(
     source: &Path,
     destination: &Path,
     replace_existing: bool,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
     progress: &mut FileProgressCallback<'_>,
     report: &mut FileOperationReport,
 ) -> Result<(), OperationError> {
     let temporary = unique_sibling(destination, ".asterfiles-copy");
-    crate::platform::windows::network::register_copy_temporary(&temporary)
+    execution
+        .register_temporary(&temporary)
         .map_err(|error| OperationError::io(&temporary, error))?;
-    let result = copy_file_to_new_path(source, &temporary, cancel, progress, report);
+    let result = copy_file_to_new_path(source, &temporary, execution, progress, report);
     if let Err(error) = result {
         let _ = fs::remove_file(&temporary);
         return Err(error);
@@ -2595,22 +2647,24 @@ fn copy_file_safely(
 fn copy_file_to_new_path(
     source: &Path,
     destination: &Path,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
     progress: &mut FileProgressCallback<'_>,
     report: &mut FileOperationReport,
 ) -> Result<(), OperationError> {
-    let copied =
-        crate::platform::windows::copy_file::copy_file(source, destination, cancel, &mut |bytes| {
-            progress(bytes, FileProgressKind::Transferred, source)
-        })
-        .map_err(|error| match error.kind {
-            crate::platform::windows::copy_file::CopyFileErrorKind::Cancelled => {
-                OperationError::Cancelled
-            }
-            crate::platform::windows::copy_file::CopyFileErrorKind::Failed => {
-                OperationError::io(destination, error.error)
-            }
-        })?;
+    let copied = crate::platform::windows::copy_file::copy_file(
+        source,
+        destination,
+        execution,
+        &mut |bytes| progress(bytes, FileProgressKind::Transferred, source),
+    )
+    .map_err(|error| match error.kind {
+        crate::platform::windows::copy_file::CopyFileErrorKind::Cancelled => {
+            OperationError::Cancelled
+        }
+        crate::platform::windows::copy_file::CopyFileErrorKind::Failed => {
+            OperationError::io(destination, error.error)
+        }
+    })?;
     report.bytes += copied;
     progress(0, FileProgressKind::Completed, source);
     Ok(())
@@ -2726,11 +2780,12 @@ fn remove_entry(
 
 fn copy_source_metadata(
     source: &Path,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
 ) -> Result<fs::Metadata, OperationError> {
+    let cancel = execution.cancel();
     if crate::network::is_unc_path(source) {
         let owned_source = source.to_path_buf();
-        crate::platform::windows::network_copy::copy_query(cancel, move || {
+        crate::platform::windows::network_copy::copy_query(execution, move || {
             fs::symlink_metadata(&owned_source)
         })
         .map_err(|error| {
@@ -2748,14 +2803,15 @@ fn copy_source_metadata(
 fn reject_destination_inside_source(
     source: &Path,
     destination: &Path,
-    cancel: &CancellationToken,
+    execution: &CopyExecution,
 ) -> Result<(), OperationError> {
+    let cancel = execution.cancel();
     let result = if crate::network::is_unc_path(source) || crate::network::is_unc_path(destination)
     {
         let owned_source = source.to_path_buf();
         let owned_destination = destination.to_path_buf();
         let query_cancel = cancel.clone();
-        crate::platform::windows::network_copy::copy_query(cancel, move || {
+        crate::platform::windows::network_copy::copy_query(execution, move || {
             crate::platform::windows::path_relation::destination_is_within_source(
                 &owned_source,
                 &owned_destination,
@@ -2882,6 +2938,87 @@ fn copy_symlink(
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn issue_149_recursive_copy_preserves_isolated_registration_failure() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let registry = temp.path().join("registry");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::create_dir(&registry).unwrap();
+        write(&source.join("nested/file.bin"), b"source");
+        let execution = CopyExecution::isolated(CancellationToken::new(), Some(registry)).unwrap();
+        let result = copy_path_with_execution(
+            &source,
+            &destination,
+            &execution,
+            &mut replace,
+            &mut |_, _| {},
+            &mut |_, _, _| {},
+            &mut |_| {},
+            &CopyScanProgress::default(),
+        );
+        assert!(result.is_err());
+        assert!(!destination.join("nested/file.bin").exists());
+        assert_eq!(fs::read(source.join("nested/file.bin")).unwrap(), b"source");
+        assert!(temporary_siblings(&destination.join("nested")).is_empty());
+    }
+
+    #[test]
+    fn issue_149_recursive_move_preserves_context_when_rename_requires_copy() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let registry = temp.path().join("registry");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::create_dir_all(destination.join("nested")).unwrap();
+        fs::create_dir(&registry).unwrap();
+        write(&source.join("nested/file.bin"), b"source");
+        write(&destination.join("nested/file.bin"), b"existing");
+        let execution = CopyExecution::isolated(CancellationToken::new(), Some(registry)).unwrap();
+        let result = move_path_with_execution(
+            &source,
+            &destination,
+            &execution,
+            &mut replace,
+            &mut |_, _| {},
+            &mut |_, _, _| {},
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(source.join("nested/file.bin")).unwrap(), b"source");
+        assert_eq!(
+            fs::read(destination.join("nested/file.bin")).unwrap(),
+            b"existing"
+        );
+        assert!(temporary_siblings(&destination.join("nested")).is_empty());
+    }
+
+    #[test]
+    fn issue_149_local_recursive_copy_needs_no_isolated_registry() {
+        let temp = TempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        write(&source.join("nested/file.bin"), b"source");
+        let report = copy_path_with_progress(
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            &mut replace,
+            &mut |_, _| {},
+            &mut |_, _, _| {},
+            &mut |_| {},
+            &CopyScanProgress::default(),
+        )
+        .unwrap();
+        assert_eq!(report.files, 1);
+        assert_eq!(
+            fs::read(destination.join("nested/file.bin")).unwrap(),
+            b"source"
+        );
+        assert!(temporary_siblings(&destination.join("nested")).is_empty());
+    }
 
     #[test]
     fn issue_82_cleanup_task_moves_immediately_and_is_discoverable() {
@@ -3473,7 +3610,7 @@ mod tests {
                 path: destination.to_path_buf(),
                 replace_existing: false,
             },
-            cancel,
+            &CopyExecution::local(cancel.clone()),
             &mut replace,
             discovered,
             progress,

@@ -104,7 +104,11 @@ fn operation(
 
 fn assert_rejected(source: &Path, destination: &Path) {
     assert_eq!(
-        reject_destination_inside_source(source, destination, &CancellationToken::new()),
+        reject_destination_inside_source(
+            source,
+            destination,
+            &CopyExecution::local(CancellationToken::new())
+        ),
         Err(OperationError::SourceInsideDestination),
         "source: {source:?}, destination: {destination:?}"
     );
@@ -152,7 +156,7 @@ fn issue_102_preflight_covers_case_direct_deep_and_uncreated_paths() {
         reject_destination_inside_source(
             &source,
             &outside.join("new/further"),
-            &CancellationToken::new()
+            &CopyExecution::local(CancellationToken::new())
         )
         .is_ok()
     );
@@ -275,7 +279,11 @@ fn issue_102_cancellation_precedes_identity_queries_and_mutations() {
     let cancel = CancellationToken::new();
     cancel.cancel();
     assert_eq!(
-        reject_destination_inside_source(&fixture.root.join("missing"), &destination, &cancel),
+        reject_destination_inside_source(
+            &fixture.root.join("missing"),
+            &destination,
+            &CopyExecution::local(cancel.clone())
+        ),
         Err(OperationError::Cancelled)
     );
     for moving in [false, true] {
