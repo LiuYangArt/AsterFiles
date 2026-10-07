@@ -54,6 +54,10 @@ CI 只有仓库读取权限，不发布、不创建标签；同一 PR/引用的�
 
 `cargo test --locked issue_147 -- --nocapture` 检查必要失败的报告保留、键盘输入保护和编译后的陈列室属性。完整验证必须运行 `python tools/verify.py`，其中包含全部 Agent 场景及 `cargo build --locked`；`--quick` 不覆盖场景退出码。专项日志位于 `artifacts/logs/issue-147/`，受控失败及恢复结果位于 `artifacts/state/issue-147/`。场景报告中的 `checks` 是必要条件；普通状态字段为 false 不代表失败。约定见 `docs/agent/debug-validation.md`。
 
+## 网络运行时异步日志专项验证（#148）
+
+`cargo test --locked operation_audit -- --nocapture` 检查阻塞写入器下的独立入队、启动失败、队列断开、文件打开失败、退出冲刷与诊断字段。随后运行 `python tools/verify.py --quick` 和 `cargo build --locked`。日志位于 `artifacts/logs/issue-148/`，机器结果位于 `artifacts/state/issue-148/result.json`，统一汇总为 `artifacts/verify/summary.json`。网络运行时记录复用 `file-operation-audit.jsonl`。
+
 ## UI 操作与验证
 
 - 禁止 Codex 操作、自动化或尝试控制 AsterFiles 的 UI，包括通过内置浏览器、Chrome、Computer Use、Playwright、agent-browser、截图点击或键鼠模拟等方式。

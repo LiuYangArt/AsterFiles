@@ -14,20 +14,27 @@ pub fn record(event: &str, detail: impl AsRef<str>) {
     let mut state = state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if state.is_none() {
-        match AuditWriter::start(default_path()) {
-            Ok(writer) => *state = Some(writer),
-            Err(error) => {
-                eprintln!("file operation audit worker could not start: {error}");
-                return;
-            }
-        }
+    if let Err(error) = enqueue(&mut state, event, detail.as_ref(), || {
+        AuditWriter::start(default_path())
+    }) {
+        eprintln!(
+            "audit could not queue evidence: {error}; {}",
+            json_line(event, detail.as_ref())
+        );
     }
-    if let Some(writer) = state.as_ref()
-        && let Err(error) = writer.record(event, detail.as_ref())
-    {
-        eprintln!("file operation audit could not queue evidence: {error}");
-    }
+}
+
+fn enqueue(
+    state: &mut Option<AuditWriter>,
+    event: &str,
+    detail: &str,
+    start: impl FnOnce() -> io::Result<AuditWriter>,
+) -> io::Result<()> {
+    let writer = match state {
+        Some(writer) => writer,
+        None => state.insert(start()?),
+    };
+    writer.record(event, detail)
 }
 
 /// Drain all queued evidence and join the worker; call after producers stop at exit.
@@ -63,20 +70,32 @@ struct AuditWriter {
 
 impl AuditWriter {
     fn start(path: PathBuf) -> io::Result<Self> {
-        let (sender, receiver) = mpsc::channel::<String>();
+        Self::start_with(move |receiver| {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+            for line in receiver {
+                file.write_all(line.as_bytes())?;
+                // Do not retain operation evidence in a userspace buffer between events.
+                file.flush()?;
+            }
+            file.sync_data()
+        })
+    }
+
+    fn start_with(
+        write_records: impl FnOnce(mpsc::Receiver<String>) -> io::Result<()> + Send + 'static,
+    ) -> io::Result<Self> {
+        let (sender, receiver) = mpsc::channel();
         let worker = thread::Builder::new()
             .name("file-operation-audit".into())
             .spawn(move || {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
+                let result = write_records(receiver);
+                if let Err(error) = &result {
+                    eprintln!("audit worker could not persist evidence: {error}");
                 }
-                let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-                for line in receiver {
-                    file.write_all(line.as_bytes())?;
-                    // Do not retain operation evidence in a userspace buffer between events.
-                    file.flush()?;
-                }
-                file.sync_data()
+                result
             })?;
         Ok(Self {
             sender: Some(sender),
@@ -192,6 +211,95 @@ mod tests {
         for index in 0..64 {
             assert!(lines[index + 1].ends_with(&format!("\"detail\":\"结果={index}\"}}")));
         }
+        writer.flush().unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn issue_148_blocked_writer_does_not_block_submission_and_exit_drains() {
+        let (entered, waiting) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let (persisted, evidence) = mpsc::channel();
+        let writer = AuditWriter::start_with(move |receiver| {
+            entered.send(()).unwrap();
+            gate.recv().unwrap();
+            persisted
+                .send(receiver.into_iter().collect::<Vec<_>>())
+                .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        if let Err(error) = waiting.recv_timeout(std::time::Duration::from_secs(5)) {
+            drop(release);
+            panic!("writer did not enter the gate: {error}");
+        }
+        let (submitted, done) = mpsc::channel();
+        let producer = thread::spawn(move || {
+            let mut state = Some(writer);
+            for index in 0..64 {
+                enqueue(
+                    &mut state,
+                    "network_root_event_apply_started",
+                    &format!("request={index} path=\\\\服务器\\共享\\\"中文\"\n"),
+                    || panic!("must reuse writer"),
+                )
+                .unwrap();
+            }
+            submitted.send(()).unwrap();
+            state.unwrap()
+        });
+        let completed_while_blocked = done.recv_timeout(std::time::Duration::from_secs(5));
+        release.send(()).unwrap();
+        let mut writer = producer.join().unwrap();
+        writer.flush().unwrap();
+        assert!(
+            completed_while_blocked.is_ok(),
+            "submission waited for the writer"
+        );
+        let lines = evidence.recv().unwrap();
+        assert_eq!(lines.len(), 64);
+        for (index, line) in lines.iter().enumerate() {
+            assert!(line.contains(&format!("request={index} ")));
+            assert!(line.contains(r#"path=\\\\服务器\\共享\\\"中文\"\n"#));
+            assert!(line.contains(r#""event":"network_root_event_apply_started""#));
+            assert!(line.contains(&format!(r#""pid":{}"#, std::process::id())));
+            assert!(line.starts_with(r#"{"timestamp_ms":"#));
+        }
+        assert!(writer.worker.is_none());
+        assert!(writer.sender.is_none());
+    }
+
+    #[test]
+    fn issue_148_start_failure_and_disconnected_queue_are_reported() {
+        let mut state = None;
+        let error = enqueue(&mut state, "close", "request=42", || {
+            Err(io::Error::other("injected thread start failure"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("injected thread start failure"));
+        assert!(state.is_none());
+
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+        state = Some(AuditWriter {
+            sender: Some(sender),
+            worker: None,
+        });
+        let error = enqueue(&mut state, "close", "request=42", || {
+            panic!("must not restart or wait on a disconnected worker")
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn issue_148_file_open_failure_is_reported_at_exit() {
+        let path = temporary_path();
+        fs::create_dir_all(&path).unwrap();
+        let mut writer = AuditWriter::start(path.clone()).unwrap();
+        let _ = writer.record("close", "request=42");
+        assert!(writer.flush().is_err());
+        assert!(writer.worker.is_none());
         writer.flush().unwrap();
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }

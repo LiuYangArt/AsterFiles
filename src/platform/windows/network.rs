@@ -29,36 +29,9 @@ use crate::domain::{EntryId, EntryKind, FileEntry, FileVisibility, FolderSizeSta
 use crate::fs::file_operations::FileProgressKind;
 
 pub fn record_runtime_event(event: &str) {
-    record_runtime_detail(event);
+    crate::operation_audit::record(event, "source=network_runtime");
 }
 
-fn record_runtime_detail(event: &str) {
-    use std::{fs::OpenOptions, io::Write};
-
-    let Some(local_data) = std::env::var_os("LOCALAPPDATA") else {
-        return;
-    };
-    let directory = PathBuf::from(local_data).join("AsterFiles").join("logs");
-    if std::fs::create_dir_all(&directory).is_err() {
-        return;
-    }
-    let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(directory.join("network-runtime.jsonl"))
-    else {
-        return;
-    };
-    let timestamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let _ = writeln!(
-        file,
-        "{{\"timestamp_ms\":{timestamp},\"pid\":{},\"event\":\"{event}\"}}",
-        std::process::id(),
-    );
-}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkLocation {
     pub label: String,
@@ -1117,7 +1090,7 @@ pub fn isolated_network_file_operation(
             let _ = std::fs::remove_file(&temporary_copy);
         }
         if let Err(cleanup) = cleanup {
-            record_runtime_detail(&format!(
+            record_runtime_event(&format!(
                 "temporary_copy_cleanup_failed code={:?}",
                 cleanup.raw_os_error()
             ));

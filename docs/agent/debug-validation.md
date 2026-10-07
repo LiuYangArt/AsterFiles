@@ -463,3 +463,13 @@ Slint 无窗口后端验证各视图及分组中的目标范围滚动，并派�
 2. 修改后按 Enter，确认文件名更新；再次 F2 后按 Esc，确认不修改。再检查点击输入框外部的提交行为。
 3. 从右键菜单重命名，并新建文件夹，确认进入同样的编辑框。
 4. 图标和平铺再启用分组、滚动到后面的文件，检查输入框仍对应所选文件；调整图标尺寸并在搜索结果中复查。切换目录或标签后，旧编辑不得修改新页面的文件。
+
+## Issue #148 网络运行时异步日志
+
+运行 `cargo test --locked operation_audit -- --nocapture`，再运行 `python tools/verify.py --quick` 和 `cargo build --locked`。专项日志为 `artifacts/logs/issue-148/tests.log`、`quick.log`、`build.log`；退出码汇总为 `artifacts/state/issue-148/result.json`，统一验证汇总为 `artifacts/verify/summary.json`。
+
+阻塞写入器测试在后台暂停期间提交 64 条记录，确认提交先完成，再解除阻塞并冲刷，检查顺序、时间、进程号、请求和中文路径转义。故障测试覆盖线程启动失败、接收端断开及文件打开失败；现有落盘测试检查退出冲刷与重复冲刷。
+
+网络运行时记录现在与操作审计共用日志：Debug 为 `artifacts/logs/file-operation-audit.jsonl`，本地 Release 程序为 `%LOCALAPPDATA%/AsterFiles/logs/file-operation-audit.jsonl`。按 `detail=source=network_runtime` 筛选，`event` 保留原事件文本。正常退出复用主程序冲刷；强制结束进程可能丢失尚未落盘的记录。
+
+若需检查真实交互，由用户启动 Debug 程序，导航网络目录、点击面包屑返回上层并正常关窗，然后检查日志包含对应导航及退出事件。自动验证不操作应用界面，也不替代真实慢盘下的交互体验验收。
