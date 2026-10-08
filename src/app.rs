@@ -344,7 +344,12 @@ pub fn export_home_state(path: &Path) -> io::Result<()> {
     let mut tab = TabSession::new_home(TabId(1));
     tab.navigate_home(NavigationKind::Refresh);
     tab.begin_directory_navigation(PathBuf::from(r"C:\Target"), NavigationKind::Normal);
-    tab.commit_path(PathBuf::from(r"C:\Target"));
+    tab.finish_directory_navigation(
+        tab.latest_request(),
+        NavigationLocation::Directory(PathBuf::from(r"C:\Target")),
+        DirectoryViewPreference::default(),
+        None,
+    );
     let back_returns_home = tab.back_target() == Some(NavigationLocation::Home);
     let state = format!(
         concat!(
@@ -479,29 +484,39 @@ pub fn export_windows_libraries_state(path: &Path) -> io::Result<()> {
         std::ffi::OsString::from("shell:library:documents"),
         "Documents".to_owned(),
     );
-    let mut tab = TabSession::new(TabId(1));
-    tab.current_location = Some(NavigationLocation::Directory(PathBuf::from(r"C:\Before")));
+    let mut tab = TabSession::new_at(
+        TabId(1),
+        NavigationLocation::Directory(PathBuf::from(r"C:\Before")),
+    );
     let (request_id, _) = tab.begin_navigation(
         NavigationLocation::Library(library.clone()),
         NavigationKind::Normal,
     );
-    tab.append_pending(vec![FileEntry {
-        id: EntryId(1),
-        original_name: std::ffi::OsString::from("first.txt"),
-        display_name: "first.txt".to_owned(),
-        name_highlights: Vec::new(),
-        path: PathBuf::from(r"C:\SourceA\first.txt"),
-        kind: crate::domain::EntryKind::File,
-        open_target: None,
-        library_source_index: None,
-        parent_display: r"C:\SourceA".to_owned(),
-        size_bytes: Some(1),
-        folder_size: FolderSizeState::Unknown,
-        modified: None,
-        created: None,
-    }]);
-    tab.commit_pending();
-    tab.commit_location(NavigationLocation::Library(library.clone()));
+    tab.accept_directory_batch(
+        request_id,
+        vec![FileEntry {
+            id: EntryId(1),
+            original_name: std::ffi::OsString::from("first.txt"),
+            display_name: "first.txt".to_owned(),
+            name_highlights: Vec::new(),
+            path: PathBuf::from(r"C:\SourceA\first.txt"),
+            kind: crate::domain::EntryKind::File,
+            open_target: None,
+            library_source_index: None,
+            parent_display: r"C:\SourceA".to_owned(),
+            size_bytes: Some(1),
+            folder_size: FolderSizeState::Unknown,
+            modified: None,
+            created: None,
+        }],
+        DirectoryViewPreference::default(),
+    );
+    tab.finish_directory_navigation(
+        request_id,
+        NavigationLocation::Library(library.clone()),
+        DirectoryViewPreference::default(),
+        None,
+    );
     let json = format!(
         concat!(
             "{{\n",
@@ -523,7 +538,7 @@ pub fn export_windows_libraries_state(path: &Path) -> io::Result<()> {
             "}}\n"
         ),
         library.identity != std::ffi::OsString::from(&library.display_name),
-        tab.current_location == Some(NavigationLocation::Library(library.clone())),
+        *tab.current_location() == Some(NavigationLocation::Library(library.clone())),
         request_id.0,
         tab.entries.len(),
     );
@@ -540,7 +555,7 @@ pub fn export_windows_libraries_state(path: &Path) -> io::Result<()> {
             ),
             (
                 "navigation_history_uses_library_identity",
-                tab.current_location == Some(NavigationLocation::Library(library.clone())),
+                *tab.current_location() == Some(NavigationLocation::Library(library.clone())),
             ),
             ("navigation_request_created", request_id.0 > 0),
             ("entry_count", tab.entries.len() == 1),
@@ -1112,7 +1127,7 @@ pub fn export_tab_reorder_state(path: &Path) -> io::Result<()> {
         app.active_window_state().tab_order[2].0,
         app.active_window_state().active_tab == active,
         app.tab(source)
-            .is_some_and(|tab| tab.latest_request == request_id),
+            .is_some_and(|tab| tab.latest_request() == request_id),
         paths,
     );
     if let Some(parent) = path.parent() {
@@ -1136,7 +1151,7 @@ pub fn export_tab_reorder_state(path: &Path) -> io::Result<()> {
             (
                 "request_id_unchanged",
                 app.tab(source)
-                    .is_some_and(|tab| tab.latest_request == request_id),
+                    .is_some_and(|tab| tab.latest_request() == request_id),
             ),
             (
                 "session_paths",
@@ -1284,7 +1299,7 @@ pub fn export_tab_cross_window_state(path: &Path) -> io::Result<()> {
         },
     );
     let tab_id = app.window(source_window).unwrap().tab_order[0];
-    let request_before = app.tab(tab_id).unwrap().latest_request;
+    let request_before = app.tab(tab_id).unwrap().latest_request();
     app.begin_tab_drag(source_window, tab_id, 0, 100.0, 20.0);
     app.update_tab_drag(100.0, 80.0, 47.0, 540.0, 0.0, 178.0);
     let outcome = app
@@ -1323,7 +1338,7 @@ pub fn export_tab_cross_window_state(path: &Path) -> io::Result<()> {
         app.window(destination).unwrap().tab_order[1] == tab_id,
         app.window_for_tab(tab_id) == Some(destination),
         app.window(destination).unwrap().active_tab == tab_id,
-        app.tab(tab_id).unwrap().latest_request == request_before,
+        app.tab(tab_id).unwrap().latest_request() == request_before,
         outcome.source_window_closed,
     );
     if let Some(parent) = path.parent() {
@@ -1347,7 +1362,7 @@ pub fn export_tab_cross_window_state(path: &Path) -> io::Result<()> {
             ),
             (
                 "request_identity_preserved_for_complete_tab",
-                app.tab(tab_id).unwrap().latest_request == request_before,
+                app.tab(tab_id).unwrap().latest_request() == request_before,
             ),
             (
                 "source_window_remains_open",
@@ -1809,7 +1824,7 @@ fn list_icon_plan(ui: &AppWindow, state: &SharedSessions, window_id: WindowId) -
     let height = ui.get_file_viewport_height().max(row_height);
     let rows = ui.get_files();
     let tab_id = tab.id;
-    let request_id = tab.latest_request;
+    let request_id = tab.latest_request();
     let visible_top = (-ui.get_file_viewport_y()).max(0.0);
     let request_top = (visible_top - height).max(0.0);
     let request_bottom = visible_top + height * 2.0;
@@ -1893,7 +1908,7 @@ fn grid_thumbnail_plan(
         })
         .collect::<Vec<_>>();
     let tab_id = tab.id;
-    let request_id = tab.latest_request;
+    let request_id = tab.latest_request();
     let entries = entry_ids
         .into_iter()
         .filter_map(|entry_id| tab.visible_entry(entry_id).cloned())
@@ -2723,11 +2738,7 @@ impl AppState {
         for location in initial_locations {
             let id = TabId(next_tab_id);
             next_tab_id += 1;
-            let mut tab = if matches!(location, NavigationLocation::Home) {
-                TabSession::new_home(id)
-            } else {
-                TabSession::new(id)
-            };
+            let mut tab = TabSession::new_at(id, location.clone());
             let preference = directory_views
                 .get(location.directory_path().unwrap_or(Path::new("")))
                 .copied()
@@ -2736,7 +2747,6 @@ impl AppState {
             tab.sort_direction = preference.sort_direction;
             tab.search_sort_field = search_view.sort_field;
             tab.search_sort_direction = search_view.sort_direction;
-            tab.current_location = Some(location);
             tabs.insert(id, tab);
             tab_order.push(id);
         }
@@ -4331,7 +4341,7 @@ pub fn run(
                 app.active_window_state()
                     .tabs
                     .get(id)
-                    .and_then(|tab| tab.current_location.clone())
+                    .and_then(|tab| tab.current_location().clone())
                     .map(|path| (*id, path))
             })
             .collect::<Vec<_>>()
@@ -4622,7 +4632,7 @@ fn external_reveal_context(state: &SharedSessions, tab_id: TabId) -> Option<Exte
     let tab = app.tab(tab_id)?;
     Some(ExternalRevealContext {
         tab_id,
-        request_id: tab.latest_request,
+        request_id: tab.latest_request(),
         directory: tab.visible_path()?.to_path_buf(),
     })
 }
@@ -4771,15 +4781,13 @@ fn open_classified_external_launches(
 }
 fn fail_directory_dispatch(state: &SharedSessions, request: &DirectoryRequest) {
     if let Ok(mut app) = state.lock() {
-        let accepted = app
-            .tab(request.tab_id)
-            .is_some_and(|tab| tab.latest_request == request.request_id);
-        if accepted && let Some(tab) = app.tab_mut(request.tab_id) {
-            tab.cancel_pending();
-            tab.discard_pending();
-            tab.load_state = LoadState::Failed;
-            tab.error = Some("queue-unavailable".to_owned());
-        }
+        let accepted = app.tab_mut(request.tab_id).is_some_and(|tab| {
+            tab.fail_directory_navigation(
+                request.request_id,
+                LoadState::Failed,
+                "queue-unavailable".to_owned(),
+            )
+        });
         if accepted {
             app.focus_after_refresh.remove(&request.tab_id);
         }
@@ -4900,13 +4908,13 @@ fn submit_network_navigation(
         Ok(()) => true,
         Err(mpsc::TrySendError::Full(request)) => {
             if let Ok(mut app) = state.lock() {
-                let accepted = app
-                    .tab(request.tab_id)
-                    .is_some_and(|tab| tab.latest_request == request.request_id);
-                if accepted && let Some(tab) = app.tab_mut(request.tab_id) {
-                    tab.load_state = LoadState::Failed;
-                    tab.error = Some("network directory queue is busy".to_owned());
-                }
+                let accepted = app.tab_mut(request.tab_id).is_some_and(|tab| {
+                    tab.fail_directory_navigation(
+                        request.request_id,
+                        LoadState::Failed,
+                        "network directory queue is busy".to_owned(),
+                    )
+                });
                 if accepted {
                     app.focus_after_refresh.remove(&request.tab_id);
                 }
@@ -4971,6 +4979,7 @@ fn submit_reveal_navigation(
             },
         )
     };
+    let request_id = request.request_id;
     let sent = if crate::network::is_unc_path(&parent) {
         network_sender.try_send(request).is_ok()
     } else {
@@ -4979,8 +4988,11 @@ fn submit_reveal_navigation(
     if !sent && let Ok(mut app) = state.lock() {
         app.focus_after_refresh.remove(&tab_id);
         if let Some(tab) = app.tab_mut(tab_id) {
-            tab.load_state = LoadState::Failed;
-            tab.error = Some("directory queue is unavailable".to_owned());
+            tab.fail_directory_navigation(
+                request_id,
+                LoadState::Failed,
+                "directory queue is unavailable".to_owned(),
+            );
         }
     }
     Some(tab_id)
@@ -5058,8 +5070,9 @@ fn submit_library_navigation(
         else {
             let message = Texts::new(app.language).library_unavailable().to_owned();
             if let Some(tab) = app.tab_mut(tab_id) {
-                tab.load_state = LoadState::Failed;
-                tab.error = Some(message);
+                let (request_id, _) =
+                    tab.begin_navigation(NavigationLocation::Library(library.clone()), kind);
+                tab.fail_directory_navigation(request_id, LoadState::Failed, message);
             }
             return false;
         };
@@ -5341,7 +5354,7 @@ fn new_window_location(app: &AppState, source_window: WindowId) -> NavigationLoc
     app.window(source_window)
         .map(WindowState::active)
         .filter(|tab| tab.kind == TabKind::Files && tab.load_state == LoadState::Complete)
-        .and_then(|tab| tab.current_location.as_ref())
+        .and_then(|tab| tab.current_location().as_ref())
         .and_then(NavigationLocation::directory_path)
         .map(|path| NavigationLocation::Directory(path.to_path_buf()))
         .unwrap_or_else(|| NavigationLocation::Directory(initial_path()))
@@ -6141,7 +6154,7 @@ fn begin_rename_ui(weak: &slint::Weak<AppWindow>, state: &WindowSessions) {
         let entry = app.active().visible_entry(id).cloned();
         let rename = entry.as_ref().map(rename_input_for_entry);
         let tab_id = app.active_window_state().active_tab;
-        let request_id = app.active().latest_request;
+        let request_id = app.active().latest_request();
         app.rename_targets.insert(
             state.window_id,
             actions::EntryTarget {
@@ -6788,7 +6801,7 @@ fn quick_menu_key(
     let key = QuickMenuKey {
         window_id: state.window_id,
         tab_id: tab.id,
-        navigation_request: tab.latest_request,
+        navigation_request: tab.latest_request(),
         scope: QuickMenuScope::Content {
             paths: paths.clone(),
             location: location.clone(),
@@ -6865,7 +6878,7 @@ fn quick_menu_key_is_current(state: &SharedSessions, key: &QuickMenuKey) -> bool
         let Some(tab) = app.tab(key.tab_id) else {
             return false;
         };
-        if tab.latest_request != key.navigation_request {
+        if tab.latest_request() != key.navigation_request {
             return false;
         }
         match &key.scope {
@@ -8226,7 +8239,7 @@ fn open_quick_menu_popup(window_id: WindowId, client_x: f32, client_y: f32) {
         popup.next_branch = popup.next_branch.wrapping_add(1).max(1);
         let (tab_id, request_id) = runtime.sessions.lock().ok().map(|app| {
             let tab = app.window(window_id).expect("popup owner window exists").active_tab;
-            (tab, app.tab(tab).expect("popup owner tab exists").latest_request)
+            (tab, app.tab(tab).expect("popup owner tab exists").latest_request())
         }).unwrap_or((TabId(0), RequestId(0)));
         let shell_generation = runtime
             ._quick_menu
@@ -9489,7 +9502,7 @@ impl FileDragGesture {
         };
         let drag = InternalDrag {
             origin_tab: tab.id,
-            request_id: tab.latest_request,
+            request_id: tab.latest_request(),
             entries,
             start_x,
             start_y,
@@ -9502,7 +9515,7 @@ impl FileDragGesture {
         let drag = self.pending.as_ref()?;
         let tab = app.active();
         if tab.id != drag.origin_tab
-            || tab.latest_request != drag.request_id
+            || tab.latest_request() != drag.request_id
             || drag.entries.is_empty()
             || drag.entries.iter().any(|(id, path)| {
                 tab.visible_entry(*id)
@@ -9979,7 +9992,7 @@ fn cancel_rectangle_selection(
             None
         } else {
             let tab = app.active_window_state_mut().tabs.get_mut(&tab_id).unwrap();
-            if tab.latest_request != request_id {
+            if tab.latest_request() != request_id {
                 None
             } else {
                 let before = selection_projection_ids(tab);
@@ -10106,7 +10119,7 @@ fn update_rectangle_selection(
                 rect,
             );
             let tab = app.active_window_state_mut().tabs.get_mut(&tab_id).unwrap();
-            if tab.latest_request != request_id {
+            if tab.latest_request() != request_id {
                 None
             } else {
                 let previous_focus = tab.focused;
@@ -10170,7 +10183,7 @@ fn wire_rectangle_selection(ui: &AppWindow, state: WindowSessions) -> Rc<slint::
         if let Ok(mut gesture) = gesture_for_begin.lock() {
             *gesture = Some(RectangleSelectionGesture {
                 tab_id: tab.id,
-                request_id: tab.latest_request,
+                request_id: tab.latest_request(),
                 start_x: x,
                 start_content_y: y - ui.get_file_viewport_y(),
                 pointer_x: x,
@@ -10600,7 +10613,7 @@ fn wire_callbacks(
     ui.on_request_folder_size_range(move |viewport_y, viewport_height| {
         let target = state_for_folder_range.lock().ok().and_then(|app| {
             let tab = app.active();
-            (tab.page_source == PageSource::Directory).then_some((tab.id, tab.latest_request))
+            (tab.page_source == PageSource::Directory).then_some((tab.id, tab.latest_request()))
         });
         if let Some((tab_id, request_id)) = target {
             submit_visible_folder_sizes(
@@ -11191,7 +11204,7 @@ fn wire_callbacks(
                 cancel_folder_sizes(tab);
                 tab.set_sort(field);
                 if tab.sort_field == SortField::Size {
-                    let request_id = tab.latest_request;
+                    let request_id = tab.latest_request();
                     folder_queries = with_folder_scheduler(tab, |scheduler, entries| {
                         scheduler.begin_complete_sort(request_id, entries)
                     });
@@ -11337,7 +11350,7 @@ fn wire_callbacks(
             } else {
                 let location = app
                     .active()
-                    .current_location
+                    .current_location()
                     .clone()
                     .unwrap_or_else(|| NavigationLocation::Directory(initial_path()));
                 let tab_id = app.create_tab(location.clone());
@@ -11689,9 +11702,9 @@ fn wire_callbacks(
                 .expect("app state mutex is not poisoned");
             let tab = app.active();
             let stack = if is_back {
-                &tab.back_history
+                &tab.back_history()
             } else {
-                &tab.forward_history
+                &tab.forward_history()
             };
             let index = usize::try_from(index).ok();
             index
@@ -11789,7 +11802,7 @@ fn wire_callbacks(
             (app.active().load_state == LoadState::PermissionDenied)
                 .then(|| {
                     app.active()
-                        .requested_location
+                        .requested_location()
                         .as_ref()
                         .and_then(NavigationLocation::directory_path)
                         .map(Path::to_path_buf)
@@ -11797,7 +11810,7 @@ fn wire_callbacks(
                             (
                                 app.active_window,
                                 app.active_window_state().active_tab,
-                                app.active().latest_request,
+                                app.active().latest_request(),
                                 path,
                             )
                         })
@@ -12179,7 +12192,7 @@ fn wire_callbacks(
                 (
                     app.language,
                     tab.id,
-                    tab.latest_request,
+                    tab.latest_request(),
                     resolved
                         .quick_access_path
                         .as_ref()
@@ -12246,7 +12259,7 @@ fn wire_callbacks(
                     app.sidebar_visibility,
                     app.language,
                     tab.id,
-                    tab.latest_request,
+                    tab.latest_request(),
                 )
             })
             .unwrap();
@@ -14194,7 +14207,7 @@ fn wire_mouse_navigation(
                                     update_file_rows(&ui, &state, tab_id, &changed);
                                     update_selection_summary(&ui, &state);
                                     let request_id = state.lock().ok().and_then(|app| {
-                                        app.tab(tab_id).map(|tab| tab.latest_request)
+                                        app.tab(tab_id).map(|tab| tab.latest_request())
                                     });
                                     if let Some(request_id) = request_id {
                                         reveal_entry(
@@ -15589,8 +15602,8 @@ fn wire_network_login_window(
                     app.window_for_tab(session_for_monitor.tab_id)
                         == Some(session_for_monitor.window_id)
                         && app.tab(session_for_monitor.tab_id).is_some_and(|tab| {
-                            tab.latest_request == session_for_monitor.failed_request_id
-                                && tab.requested_location.as_ref().and_then(NavigationLocation::directory_path)
+                            tab.latest_request() == session_for_monitor.failed_request_id
+                                && tab.requested_location().as_ref().and_then(NavigationLocation::directory_path)
                                     == Some(session_for_monitor.target.as_path())
                         })
                 });
@@ -15629,8 +15642,8 @@ fn wire_network_login_window(
                     && state.lock().ok().is_some_and(|app| {
                         app.window_for_tab(session.tab_id) == Some(session.window_id)
                             && app.tab(session.tab_id).is_some_and(|tab| {
-                                tab.latest_request == session.failed_request_id
-                                    && tab.requested_location.as_ref().and_then(NavigationLocation::directory_path)
+                                tab.latest_request() == session.failed_request_id
+                                    && tab.requested_location().as_ref().and_then(NavigationLocation::directory_path)
                                         == Some(session.target.as_path())
                             })
                     });
@@ -17140,7 +17153,7 @@ fn refresh_cut_rows(state: &SharedSessions, changed_paths: &[PathBuf]) {
             let entries = tab
                 .entries
                 .iter()
-                .chain(tab.pending_entries.iter())
+                .chain(tab.pending_entries().iter())
                 .filter(|entry| changed_paths.contains(&entry.path))
                 .map(|entry| entry.id)
                 .collect::<HashSet<_>>();
@@ -17918,7 +17931,7 @@ fn refresh_affected_tabs(
         ) && let Some(mut pending) = pending
             && let Ok(mut app) = state.lock()
         {
-            pending.request_id = app.tab(tab).map(|session| session.latest_request);
+            pending.request_id = app.tab(tab).map(|session| session.latest_request());
             app.focus_after_refresh.insert(tab, pending);
         }
     }
@@ -17971,17 +17984,21 @@ fn start_event_pump(
                     weak.upgrade_in_event_loop(move |ui| {
                         // Retain this guard until the model and visible rows have consumed the event.
                         let _completed = completed;
-                        let routed_tab = Some(event.request_identity().0);
+                        let accepted = state
+                            .lock()
+                            .ok()
+                            .is_some_and(|app| directory_event_is_current(&app, &event));
+                        let routed_tab = accepted.then_some(event.request_identity().0);
                         let batch = match &event {
                             DirectoryEvent::Batch {
                                 tab_id, request_id, ..
-                            } => Some((*tab_id, *request_id)),
+                            } if accepted => Some((*tab_id, *request_id)),
                             _ => None,
                         };
                         let finished = match &event {
                             DirectoryEvent::Finished {
                                 tab_id, request_id, ..
-                            } => Some((*tab_id, *request_id)),
+                            } if accepted => Some((*tab_id, *request_id)),
                             _ => None,
                         };
                         let network_tab = routed_tab.is_some_and(|tab_id| {
@@ -17994,9 +18011,9 @@ fn start_event_pump(
                         let network_root_finished = finished.is_some_and(|(tab_id, request_id)| {
                             state.lock().ok().is_some_and(|app| {
                                 app.tab(tab_id).is_some_and(|tab| {
-                                    tab.latest_request == request_id
+                                    tab.latest_request() == request_id
                                         && tab
-                                            .requested_location
+                                            .requested_location()
                                             .as_ref()
                                             .and_then(NavigationLocation::directory_path)
                                             .is_some_and(crate::network::is_unc_server_root)
@@ -18033,7 +18050,11 @@ fn start_event_pump(
                                         )
                                     })
                                 });
-                        let icon_requests = apply_event(&state, event);
+                        let change = apply_event(&state, event);
+                        if !change.accepted {
+                            return;
+                        }
+                        let icon_requests = change.icon_requests;
                         if network_root_finished {
                             platform::windows::network::record_runtime_event(
                                 "network_root_event_apply_completed",
@@ -18112,7 +18133,7 @@ fn start_event_pump(
                             {
                                 let focused = state.lock().ok().and_then(|app| {
                                     app.tab(tab_id)
-                                        .filter(|tab| tab.latest_request == request_id)
+                                        .filter(|tab| tab.latest_request() == request_id)
                                         .and_then(|tab| tab.focused)
                                 });
                                 if focus_action == Some(PendingFocusAction::Select) {
@@ -18300,7 +18321,7 @@ fn reveal_completed_selection(
     let span = state.lock().ok().and_then(|app| {
         let window = app.window(app.window_for_tab(tab_id)?)?;
         let tab = window.tabs.get(&tab_id)?;
-        if window.active_tab != tab_id || tab.latest_request != request_id {
+        if window.active_tab != tab_id || tab.latest_request() != request_id {
             return None;
         }
         let view_mode = app.view_mode_for_tab(tab_id)?;
@@ -18358,7 +18379,7 @@ fn reveal_entry(
         let window_id = app.window_for_tab(tab_id)?;
         let window = app.window(window_id)?;
         let tab = window.tabs.get(&tab_id)?;
-        (window.active_tab == tab_id && tab.latest_request == request_id).then(|| {
+        (window.active_tab == tab_id && tab.latest_request() == request_id).then(|| {
             let entries = directory_display_entries(tab);
             (
                 app.view_mode_for_tab(tab_id)
@@ -18434,7 +18455,38 @@ fn reveal_entry(
     ));
 }
 
-fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest> {
+fn directory_event_is_current(app: &AppState, event: &DirectoryEvent) -> bool {
+    let (tab_id, request_id) = event.request_identity();
+    let Some(tab) = app.tab(tab_id) else {
+        return false;
+    };
+    match event {
+        DirectoryEvent::Finished { path, library, .. } => {
+            let location = library
+                .clone()
+                .map(NavigationLocation::Library)
+                .unwrap_or_else(|| NavigationLocation::Directory(path.clone()));
+            tab.accepts_directory(request_id)
+                && tab.requested_location().as_ref() == Some(&location)
+        }
+        DirectoryEvent::Cancelled { .. } => {
+            tab.latest_request() == request_id
+                && tab.page_source == PageSource::Directory
+                && matches!(
+                    tab.load_state,
+                    LoadState::Loading | LoadState::Partial | LoadState::Cancelled
+                )
+        }
+        _ => tab.accepts_directory(request_id),
+    }
+}
+
+struct DirectoryEventChange {
+    accepted: bool,
+    icon_requests: Vec<IconRequest>,
+}
+
+fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> DirectoryEventChange {
     let acknowledgement = match &event {
         DirectoryEvent::Batch {
             acknowledgement, ..
@@ -18442,6 +18494,16 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
         _ => None,
     };
     let mut app = state.lock().expect("app state mutex is not poisoned");
+    let accepted = directory_event_is_current(&app, &event);
+    if !accepted {
+        if let Some(acknowledgement) = acknowledgement {
+            let _ = acknowledgement.send(());
+        }
+        return DirectoryEventChange {
+            accepted: false,
+            icon_requests: Vec::new(),
+        };
+    }
     let mut icon_requests = Vec::new();
     match event {
         DirectoryEvent::Batch {
@@ -18450,35 +18512,22 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
             entries,
             ..
         } => {
-            let accepted = app.tab(tab_id).is_some_and(|tab| tab.accepts(request_id));
-            if accepted {
-                let first_preference = app.tab(tab_id).and_then(|tab| {
-                    tab.pending_entries.is_empty().then(|| {
-                        tab.visible_path()
-                            .map(|path| app.directory_preference(path))
-                            .unwrap_or(app.default_directory_view)
-                    })
-                });
-                if let Some(preference) = first_preference {
-                    let tab = app.tab_mut(tab_id).expect("accepted tab exists");
-                    tab.sort_field = preference.sort_field;
-                    tab.sort_direction = preference.sort_direction;
-                    if tab.visible_path().is_some_and(crate::network::is_unc_path) {
-                        tab.clear_selection();
-                    }
-                }
-                let grid_layout = app
-                    .view_mode_for_tab(tab_id)
-                    .is_some_and(ViewMode::uses_grid_layout);
-                if !grid_layout {
-                    icon_requests.extend(entries.iter().filter_map(|entry| {
-                        ordinary_icon_request(&mut app, tab_id, request_id, entry)
-                    }));
-                }
-                app.tab_mut(tab_id)
-                    .expect("accepted tab exists")
-                    .append_pending(entries);
+            let preference = app
+                .tab(tab_id)
+                .and_then(|tab| tab.visible_path())
+                .map(|path| app.directory_preference(path))
+                .unwrap_or(app.default_directory_view);
+            let grid_layout = app
+                .view_mode_for_tab(tab_id)
+                .is_some_and(ViewMode::uses_grid_layout);
+            if !grid_layout {
+                icon_requests.extend(entries.iter().filter_map(|entry| {
+                    ordinary_icon_request(&mut app, tab_id, request_id, entry)
+                }));
             }
+            app.tab_mut(tab_id)
+                .expect("accepted tab exists")
+                .accept_directory_batch(request_id, entries, preference);
         }
         DirectoryEvent::Finished {
             tab_id,
@@ -18488,10 +18537,14 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
             source_failures,
             library,
         } => {
-            let accepted = app.tab(tab_id).is_some_and(|tab| tab.accepts(request_id));
-            let pending_focus = accepted
-                .then(|| app.focus_after_refresh.get(&tab_id).cloned())
-                .flatten()
+            let location = library
+                .clone()
+                .map(NavigationLocation::Library)
+                .unwrap_or_else(|| NavigationLocation::Directory(path.clone()));
+            let pending_focus = app
+                .focus_after_refresh
+                .get(&tab_id)
+                .cloned()
                 .filter(|pending| {
                     library.is_none()
                         && pending.request_id == Some(request_id)
@@ -18506,9 +18559,8 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
             }
             let focus =
                 pending_focus.filter(|pending| pending_focus_is_valid(&app, tab_id, pending));
-            let shell_create = accepted
-                .then(|| app.window_for_tab(tab_id))
-                .flatten()
+            let shell_create = app
+                .window_for_tab(tab_id)
                 .and_then(|window_id| app.pending_shell_creates.get(&window_id).cloned())
                 .filter(|pending| {
                     library.is_none() && pending.tab_id == tab_id && pending.directory == path
@@ -18521,149 +18573,129 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
                         .is_some_and(|window| window.active_tab == tab_id))
                 .then_some(pending)
             });
-            if accepted {
-                let consumed_focus = focus.is_some();
-                let language = app.language;
-                let preference = library
-                    .as_ref()
-                    .map(|_| app.default_directory_view)
-                    .unwrap_or_else(|| app.directory_preference(&path));
-                let (location_path, shell_created) = {
-                    let tab = app.tab_mut(tab_id).expect("accepted tab exists");
-                    let preserve_selection =
-                        crate::network::is_unc_path(&path) && tab.load_state == LoadState::Partial;
-                    if tab.sort_field != preference.sort_field
-                        || tab.sort_direction != preference.sort_direction
-                    {
-                        tab.sort_field = preference.sort_field;
-                        tab.sort_direction = preference.sort_direction;
-                        tab.sort_pending();
-                    }
-                    tab.commit_pending();
-                    let selection = preserve_selection
-                        .then(|| (tab.selected.clone(), tab.focused, tab.selection_anchor));
-                    if let Some(library) = library.clone() {
-                        tab.commit_location(NavigationLocation::Library(library));
-                    } else {
-                        tab.commit_path(path);
-                    }
-                    if let Some((selected, focused, anchor)) = selection {
-                        tab.selected = selected;
-                        tab.focused = focused;
-                        tab.selection_anchor = anchor;
-                    }
-                    let mut reveal_missing = false;
-                    if let Some(focus) = focus.as_ref() {
-                        let ids = focus
-                            .paths
-                            .iter()
-                            .filter_map(|target| {
-                                tab.entries
-                                    .iter()
-                                    .find(|entry| entry.path == *target)
-                                    .map(|entry| entry.id)
-                            })
-                            .collect::<Vec<_>>();
-                        if let Some(focused) = ids.last().copied() {
-                            tab.selected = ids;
-                            tab.focused = Some(focused);
-                            tab.selection_anchor = Some(focused);
-                        } else {
-                            reveal_missing =
-                                matches!(focus.action, PendingFocusAction::Reveal { .. });
-                        }
-                    }
-                    let shell_created = shell_create.as_ref().and_then(|pending| {
-                        detect_unique_created_path(&pending.baseline, &tab.entries)
-                    });
-                    if let Some(target) = shell_created.as_ref()
-                        && focus.is_none()
-                        && let Some(entry) = tab.entries.iter().find(|entry| entry.path == *target)
-                    {
-                        tab.selected = vec![entry.id];
-                        tab.focused = Some(entry.id);
-                        tab.selection_anchor = Some(entry.id);
-                    }
-                    tab.error = if reveal_missing {
-                        Some(format!(
-                            "reveal_target_missing:{}",
-                            Texts::new(language).reveal_target_missing()
-                        ))
-                    } else if source_failures > 0 {
-                        Some(format!("library_sources:{source_failures}"))
-                    } else {
-                        (skipped > 0).then(|| skipped.to_string())
-                    };
-                    (tab.visible_path().map(Path::to_path_buf), shell_created)
+            let consumed_focus = focus.is_some();
+            let language = app.language;
+            let preference = library
+                .as_ref()
+                .map(|_| app.default_directory_view)
+                .unwrap_or_else(|| app.directory_preference(&path));
+            let (location_path, shell_created) = {
+                let tab = app.tab_mut(tab_id).expect("accepted tab exists");
+                let warning = if source_failures > 0 {
+                    Some(format!("library_sources:{source_failures}"))
+                } else {
+                    (skipped > 0).then(|| skipped.to_string())
                 };
-                if focus
-                    .as_ref()
-                    .is_some_and(|focus| focus.action == PendingFocusAction::Select)
-                {
-                    focus_bottom_selected_entry(&mut app, tab_id);
+                if !tab.finish_directory_navigation(request_id, location, preference, warning) {
+                    return DirectoryEventChange {
+                        accepted: false,
+                        icon_requests,
+                    };
                 }
-                if consumed_focus {
-                    app.focus_after_refresh.remove(&tab_id);
+                let mut reveal_missing = false;
+                if let Some(focus) = focus.as_ref() {
+                    let ids = focus
+                        .paths
+                        .iter()
+                        .filter_map(|target| {
+                            tab.entries
+                                .iter()
+                                .find(|entry| entry.path == *target)
+                                .map(|entry| entry.id)
+                        })
+                        .collect::<Vec<_>>();
+                    if let Some(focused) = ids.last().copied() {
+                        tab.selected = ids;
+                        tab.focused = Some(focused);
+                        tab.selection_anchor = Some(focused);
+                    } else {
+                        reveal_missing = matches!(focus.action, PendingFocusAction::Reveal { .. });
+                    }
                 }
-                if let Some(focus) = focus
-                    && let PendingFocusAction::Rename { window_id } = focus.action
-                    && let Some(entry) = app
-                        .tab(tab_id)
-                        .and_then(|tab| tab.focused.and_then(|id| tab.visible_entry(id).cloned()))
+                let shell_created = shell_create.as_ref().and_then(|pending| {
+                    detect_unique_created_path(&pending.baseline, &tab.entries)
+                });
+                if let Some(target) = shell_created.as_ref()
+                    && focus.is_none()
+                    && let Some(entry) = tab.entries.iter().find(|entry| entry.path == *target)
                 {
-                    let (input, selection_end) = rename_input_for_entry(&entry);
-                    app.pending_rename_ui.insert(
-                        window_id,
-                        PendingRenameUi {
-                            tab_id,
-                            request_id,
-                            entry_id: entry.id,
-                            input,
-                            selection_end,
-                        },
-                    );
+                    tab.selected = vec![entry.id];
+                    tab.focused = Some(entry.id);
+                    tab.selection_anchor = Some(entry.id);
                 }
-                if let Some(pending) = shell_create
-                    && let Some(target) = shell_created
-                    && let Some(entry) = app
-                        .tab(tab_id)
-                        .and_then(|tab| tab.entries.iter().find(|entry| entry.path == target))
-                        .cloned()
-                {
-                    app.focus_after_refresh.remove(&tab_id);
-                    let (input, selection_end) = rename_input_for_entry(&entry);
-                    app.pending_rename_ui.insert(
-                        pending.window_id,
-                        PendingRenameUi {
-                            tab_id,
-                            request_id,
-                            entry_id: entry.id,
-                            input,
-                            selection_end,
-                        },
-                    );
+                if reveal_missing {
+                    tab.error = Some(format!(
+                        "reveal_target_missing:{}",
+                        Texts::new(language).reveal_target_missing()
+                    ));
                 }
-                if let Some(location_path) = location_path
-                    && !crate::network::is_unc_path(&location_path)
-                {
-                    icon_requests.push(IconRequest {
+                (tab.visible_path().map(Path::to_path_buf), shell_created)
+            };
+            if focus
+                .as_ref()
+                .is_some_and(|focus| focus.action == PendingFocusAction::Select)
+            {
+                focus_bottom_selected_entry(&mut app, tab_id);
+            }
+            if consumed_focus {
+                app.focus_after_refresh.remove(&tab_id);
+            }
+            if let Some(focus) = focus
+                && let PendingFocusAction::Rename { window_id } = focus.action
+                && let Some(entry) = app
+                    .tab(tab_id)
+                    .and_then(|tab| tab.focused.and_then(|id| tab.visible_entry(id).cloned()))
+            {
+                let (input, selection_end) = rename_input_for_entry(&entry);
+                app.pending_rename_ui.insert(
+                    window_id,
+                    PendingRenameUi {
                         tab_id,
                         request_id,
-                        target: IconTarget::Location,
-                        path: location_path,
-                        thumbnail: false,
-                        requested_px: 0,
-                        type_key: None,
-                    });
-                }
+                        entry_id: entry.id,
+                        input,
+                        selection_end,
+                    },
+                );
+            }
+            if let Some(pending) = shell_create
+                && let Some(target) = shell_created
+                && let Some(entry) = app
+                    .tab(tab_id)
+                    .and_then(|tab| tab.entries.iter().find(|entry| entry.path == target))
+                    .cloned()
+            {
+                app.focus_after_refresh.remove(&tab_id);
+                let (input, selection_end) = rename_input_for_entry(&entry);
+                app.pending_rename_ui.insert(
+                    pending.window_id,
+                    PendingRenameUi {
+                        tab_id,
+                        request_id,
+                        entry_id: entry.id,
+                        input,
+                        selection_end,
+                    },
+                );
+            }
+            if let Some(location_path) = location_path
+                && !crate::network::is_unc_path(&location_path)
+            {
+                icon_requests.push(IconRequest {
+                    tab_id,
+                    request_id,
+                    target: IconTarget::Location,
+                    path: location_path,
+                    thumbnail: false,
+                    requested_px: 0,
+                    type_key: None,
+                });
             }
         }
         DirectoryEvent::Cancelled { tab_id, request_id } => {
             if let Some(tab) = app.tab_mut(tab_id)
-                && tab.latest_request == request_id
+                && tab.cancel_directory_navigation(request_id)
             {
-                tab.discard_pending();
-                tab.load_state = LoadState::Cancelled;
                 app.focus_after_refresh.remove(&tab_id);
             }
         }
@@ -18674,20 +18706,14 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
             message,
         } => {
             if let Some(tab) = app.tab_mut(tab_id)
-                && tab.accepts(request_id)
+                && tab.fail_directory_navigation(request_id, classify_error(kind), message)
             {
-                tab.discard_pending();
-                tab.load_state = classify_error(kind);
-                tab.error = Some(message);
                 app.focus_after_refresh.remove(&tab_id);
             }
         }
         DirectoryEvent::Slow { tab_id, request_id } => {
-            if let Some(tab) = app.tab_mut(tab_id)
-                && tab.accepts(request_id)
-                && tab.load_state == LoadState::Loading
-            {
-                tab.error = Some("network_slow".to_owned());
+            if let Some(tab) = app.tab_mut(tab_id) {
+                tab.mark_directory_slow(request_id);
             }
         }
     }
@@ -18695,7 +18721,10 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> Vec<IconRequest
     if let Some(acknowledgement) = acknowledgement {
         let _ = acknowledgement.send(());
     }
-    icon_requests
+    DirectoryEventChange {
+        accepted: true,
+        icon_requests,
+    }
 }
 
 fn platform_everything_config(
@@ -19234,7 +19263,7 @@ fn with_folder_scheduler<T>(
 }
 
 fn cancel_folder_sizes(tab: &mut TabSession) {
-    let request_id = tab.latest_request;
+    let request_id = tab.latest_request();
     with_folder_scheduler(tab, |scheduler, entries| {
         for entry in entries {
             if entry.folder_size == FolderSizeState::Querying {
@@ -19417,7 +19446,6 @@ fn start_everything_event_pump(
                             cancel,
                         })
                     });
-                    tab.discard_pending();
                     tab.search_state = match error {
                         platform::windows::everything::EverythingError::NotConfigured
                         | platform::windows::everything::EverythingError::InvalidExecutable(_) => SearchState::NotConfigured,
@@ -19606,7 +19634,7 @@ fn project_search_page(
         app.window_for_tab(tab_id) == Some(app.active_window)
             && app.active_window_state().active_tab == tab_id
             && app.tab(tab_id).is_some_and(|tab| {
-                tab.latest_request == request_id && tab.page_source == PageSource::Search
+                tab.latest_request() == request_id && tab.page_source == PageSource::Search
             })
     });
     if !should_refresh {
@@ -19769,7 +19797,7 @@ fn submit_search_page(
         };
         EverythingRequest::Search {
             tab_id,
-            request_id: tab.latest_request,
+            request_id: tab.latest_request(),
             scope: tab.search_scope.clone(),
             depth: tab.search_depth,
             query: tab.search_query.clone(),
@@ -19927,7 +19955,7 @@ fn submit_visible_shortcuts(
     let requests = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         if !app.tab(tab_id).is_some_and(|tab| {
-            tab.latest_request == request_id && tab.page_source == PageSource::Directory
+            tab.latest_request() == request_id && tab.page_source == PageSource::Directory
         }) {
             return;
         }
@@ -19986,7 +20014,7 @@ fn spawn_shortcut_worker(
         while let Ok(request) = request_receiver.recv() {
             let current = state.lock().ok().is_some_and(|app| {
                 app.tab(request.tab_id).is_some_and(|tab| {
-                    tab.latest_request == request.request_id
+                    tab.latest_request() == request.request_id
                         && tab
                             .visible_entry(request.entry_id)
                             .is_some_and(|entry| entry.path == request.path)
@@ -20176,7 +20204,7 @@ fn run_icon_request(
         .is_none_or(|(_, key)| thumbnails.accepts(key));
     let is_current = state.lock().ok().is_some_and(|app| {
         app.tab(request.tab_id)
-            .is_some_and(|tab| tab.latest_request == request.request_id)
+            .is_some_and(|tab| tab.latest_request() == request.request_id)
     }) && planned_current;
     if !is_current {
         if !request.thumbnail
@@ -20852,7 +20880,7 @@ fn reload_libraries(
                 app.windows
                     .values()
                     .flat_map(|window| window.tabs.values())
-                    .filter_map(|tab| match tab.current_location.as_ref()? {
+                    .filter_map(|tab| match tab.current_location().as_ref()? {
                         NavigationLocation::Library(library) => Some((tab.id, library.clone())),
                         NavigationLocation::Home | NavigationLocation::Directory(_) => None,
                     })
@@ -21364,7 +21392,7 @@ fn apply_icon_event(state: &SharedSessions, event: IconEvent) -> Option<IconUpda
 
 fn icon_event_is_current(app: &AppState, event: &IconEvent) -> bool {
     app.tab(event.tab_id).is_some_and(|tab| {
-        tab.latest_request == event.request_id
+        tab.latest_request() == event.request_id
             && match event.target {
                 IconTarget::Entry(entry_id) => tab.visible_entry(entry_id).is_some_and(|entry| {
                     event.type_key.as_ref().is_some_and(|key| {
@@ -21406,7 +21434,7 @@ fn append_active_file_rows(
         return;
     }
     let tab = app.active();
-    if tab.latest_request != request_id || tab.load_state != LoadState::Partial {
+    if tab.latest_request() != request_id || tab.load_state != LoadState::Partial {
         return;
     }
     let model = ui.get_files();
@@ -21447,7 +21475,7 @@ fn append_active_file_rows(
                 .filter(|row| row.loaded && !row.group_header)
                 .count()
         };
-        let pending_entries = tab.pending_entries.len();
+        let pending_entries = tab.pending_entries().len();
         let should_refresh = should_rebuild_projection(projected_entries, pending_entries);
         if should_refresh {
             let anchor = (ui.get_file_viewport_y() < 0.0)
@@ -21459,7 +21487,7 @@ fn append_active_file_rows(
             if grid_layout {
                 let requested_px = grid_thumbnail_request_px(mode, ui.window().scale_factor());
                 ui.set_grid_rows(ModelRc::new(VecModel::from(projected_directory_grid_rows(
-                    &tab.pending_entries,
+                    tab.pending_entries(),
                     tab,
                     texts,
                     &app,
@@ -21478,7 +21506,7 @@ fn append_active_file_rows(
                 rebuild_grid_entry_positions(ui, app.active_window);
             } else {
                 ui.set_files(ModelRc::new(VecModel::from(projected_directory_rows(
-                    &tab.pending_entries,
+                    tab.pending_entries(),
                     tab,
                     texts,
                     &app,
@@ -21490,7 +21518,7 @@ fn append_active_file_rows(
         return;
     }
     let start = model.row_count();
-    if start > tab.pending_entries.len() {
+    if start > tab.pending_entries().len() {
         drop(app);
         refresh_tab_window(state, tab_id);
         return;
@@ -21507,7 +21535,7 @@ fn append_active_file_rows(
                 viewport_y + anchor_index as f32 * row_height,
             )
         });
-    for (index, entry) in tab.pending_entries.iter().enumerate() {
+    for (index, entry) in tab.pending_entries().iter().enumerate() {
         if model
             .row_data(index)
             .is_some_and(|row| row.id == entry.id.0 as i32)
@@ -21610,7 +21638,7 @@ fn update_tab_status(ui: &AppWindow, state: &SharedSessions, tab_id: TabId) {
     };
     if window.active_tab == tab_id
         && ui.get_projected_file_tab_id() == tab_id.0 as i32
-        && ui.get_projected_file_request_id() == tab.latest_request.0 as i32
+        && ui.get_projected_file_request_id() == tab.latest_request().0 as i32
     {
         ui.set_status_text(status_text(tab, Texts::new(app.language)).into());
     }
@@ -21640,7 +21668,7 @@ fn update_file_rows(
         return;
     };
     if ui.get_projected_file_tab_id() != tab_id.0 as i32
-        || ui.get_projected_file_request_id() != tab.latest_request.0 as i32
+        || ui.get_projected_file_request_id() != tab.latest_request().0 as i32
     {
         return;
     }
@@ -22434,7 +22462,7 @@ fn apply_pending_rename_ui(ui: &AppWindow, state: &SharedSessions, window_id: Wi
         let pending = app.pending_rename_ui.get(&window_id)?.clone();
         let window = app.window(window_id)?;
         let tab = window.tabs.get(&pending.tab_id)?;
-        if tab.latest_request != pending.request_id || tab.focused != Some(pending.entry_id) {
+        if tab.latest_request() != pending.request_id || tab.focused != Some(pending.entry_id) {
             app.pending_rename_ui.remove(&window_id);
             return None;
         }
@@ -22451,7 +22479,7 @@ fn apply_pending_rename_ui(ui: &AppWindow, state: &SharedSessions, window_id: Wi
                 tab: actions::ActionTarget {
                     window_id,
                     tab_id: pending.tab_id,
-                    request_id: tab.latest_request,
+                    request_id: tab.latest_request(),
                 },
                 entry_id: pending.entry_id,
             };
@@ -22499,7 +22527,7 @@ fn type_select_context(app: &AppState, tab: &TabSession) -> TypeSelectContext {
     };
     TypeSelectContext {
         tab_id: tab.id,
-        request_id: tab.latest_request,
+        request_id: tab.latest_request(),
         view_mode: app
             .view_mode_for_tab(tab.id)
             .unwrap_or(app.default_directory_view.view_mode),
@@ -22674,7 +22702,7 @@ fn projected_directory_grid_rows(
 }
 fn directory_display_entries(tab: &TabSession) -> &[FileEntry] {
     if matches!(tab.load_state, LoadState::Loading | LoadState::Partial) {
-        &tab.pending_entries
+        tab.pending_entries()
     } else if tab.has_failed_location() {
         &[]
     } else {
@@ -22755,12 +22783,14 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     ui.set_accessibility_context(
         format!(
             "window/{}/tab/{}/request/{}",
-            window_id.0, tab.id.0, tab.latest_request.0
+            window_id.0,
+            tab.id.0,
+            tab.latest_request().0
         )
         .into(),
     );
     if let Some(window_id) = window_id_for_ui(ui) {
-        let request_id = tab.latest_request;
+        let request_id = tab.latest_request();
         let invalidated = WINDOW_RUNTIMES.with_borrow_mut(|runtimes| {
             runtimes.get_mut(&window_id).is_some_and(|runtime| {
                 runtime
@@ -22863,7 +22893,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     project_file_geometry(ui, view_mode);
     ui.set_view_mode(view_mode_to_ui(view_mode));
     let projected_tab_id = tab.id.0 as i32;
-    let projected_request_id = tab.latest_request.0 as i32;
+    let projected_request_id = tab.latest_request().0 as i32;
     let projection_changed = ui.get_projected_file_tab_id() != projected_tab_id
         || ui.get_projected_file_request_id() != projected_request_id;
     if projection_changed {
@@ -22979,12 +23009,15 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     ui.set_status_text(status_text(tab, texts).into());
     let network_permission = tab.load_state == LoadState::PermissionDenied
         && tab
-            .requested_location
+            .requested_location()
             .as_ref()
             .and_then(NavigationLocation::directory_path)
             .is_some_and(crate::network::is_unc_path);
     let library_failed = tab.load_state == LoadState::Failed
-        && matches!(tab.requested_location, Some(NavigationLocation::Library(_)));
+        && matches!(
+            tab.requested_location(),
+            Some(NavigationLocation::Library(_))
+        );
     let (error_page_title, error_page_description) = if library_failed {
         match app.language {
             Language::Chinese => ("无法打开此库", texts.library_all_sources_failed()),
@@ -23048,7 +23081,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     )));
     breadcrumb::project(ui, tab, app.language);
     ui.set_back_history(ModelRc::new(VecModel::from(
-        tab.back_history
+        tab.back_history()
             .iter()
             .rev()
             .enumerate()
@@ -23059,7 +23092,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
             .collect::<Vec<_>>(),
     )));
     ui.set_forward_history(ModelRc::new(VecModel::from(
-        tab.forward_history
+        tab.forward_history()
             .iter()
             .rev()
             .enumerate()
@@ -23268,7 +23301,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     ui.set_show_request_access(show_request_access);
     if show_request_access
         && tab
-            .requested_location
+            .requested_location()
             .as_ref()
             .and_then(NavigationLocation::directory_path)
             .is_some_and(crate::network::is_unc_path)
@@ -23297,9 +23330,9 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
         tab.page_source == PageSource::Search && tab.search_state == SearchState::Disconnected,
     );
     ui.set_can_navigate_back(
-        !active_is_settings && (tab.has_failed_location() || !tab.back_history.is_empty()),
+        !active_is_settings && (tab.has_failed_location() || !tab.back_history().is_empty()),
     );
-    ui.set_can_navigate_forward(!active_is_settings && !tab.forward_history.is_empty());
+    ui.set_can_navigate_forward(!active_is_settings && !tab.forward_history().is_empty());
     ui.set_can_navigate_up(
         !active_is_settings && tab.visible_path().and_then(Path::parent).is_some(),
     );
@@ -23401,7 +23434,7 @@ fn file_row(
         (grid_requested_px.is_none() || crate::network::is_unc_path(&entry.path))
             .then(|| {
                 app.icons
-                    .get(&(tab.id, tab.latest_request, entry.id))
+                    .get(&(tab.id, tab.latest_request(), entry.id))
                     .or_else(|| app.icon_cache.get(&entry.path))
                     .or_else(|| {
                         entry_type_icon_key(&entry.path, entry.kind)
@@ -23452,7 +23485,7 @@ fn file_row(
                 4
             } else if app.thumbnail_failures.contains_key(&(
                 tab.id,
-                tab.latest_request,
+                tab.latest_request(),
                 entry.path.clone(),
                 requested_px,
             )) {
@@ -24310,6 +24343,30 @@ mod tests {
         }
     }
 
+    fn advance_test_navigation(tab: &mut TabSession, request: RequestId) {
+        let location = tab.visible_location().cloned().expect("test location");
+        while tab.latest_request().0 < request.0 {
+            tab.begin_navigation(location.clone(), NavigationKind::Refresh);
+        }
+        assert_eq!(tab.latest_request(), request);
+    }
+
+    fn complete_test_navigation(
+        tab: &mut TabSession,
+        location: NavigationLocation,
+        kind: NavigationKind,
+    ) {
+        let entries = tab.visible_entries().to_vec();
+        let preference = DirectoryViewPreference {
+            sort_field: tab.sort_field,
+            sort_direction: tab.sort_direction,
+            ..Default::default()
+        };
+        let (request, _) = tab.begin_navigation(location.clone(), kind);
+        assert!(tab.accept_directory_batch(request, entries, preference));
+        assert!(tab.finish_directory_navigation(request, location, preference, None));
+    }
+
     #[test]
     fn issue_90_centered_window_position_follows_the_anchor_monitor() {
         // 主窗口位于左侧带负坐标的显示器时，弹窗必须留在同一显示器内。
@@ -24371,22 +24428,22 @@ mod tests {
         app.new_tab_opens_home = true;
         let home = app.create_tab(NavigationLocation::Home);
         assert_eq!(
-            app.tab(home).unwrap().current_location,
-            Some(NavigationLocation::Home)
+            app.tab(home).unwrap().current_location(),
+            &Some(NavigationLocation::Home)
         );
 
         let explicit = app.create_tab(NavigationLocation::Directory(PathBuf::from(r"D:\Target")));
         assert_eq!(
-            app.tab(explicit).unwrap().current_location,
-            Some(NavigationLocation::Directory(PathBuf::from(r"D:\Target")))
+            app.tab(explicit).unwrap().current_location(),
+            &Some(NavigationLocation::Directory(PathBuf::from(r"D:\Target")))
         );
 
         app.new_tab_opens_home = false;
         app.tab_mut(explicit).unwrap().load_state = LoadState::Complete;
         let duplicate = app.duplicate_active_tab().unwrap();
         assert_eq!(
-            app.tab(duplicate).unwrap().current_location,
-            Some(NavigationLocation::Directory(PathBuf::from(r"D:\Target")))
+            app.tab(duplicate).unwrap().current_location(),
+            &Some(NavigationLocation::Directory(PathBuf::from(r"D:\Target")))
         );
 
         let home_page = HomePageState {
@@ -25124,14 +25181,14 @@ mod tests {
         );
         app.libraries.push(library);
         let active_tab = app.active_window_state().active_tab;
-        app.active_window_state_mut()
-            .tabs
-            .get_mut(&active_tab)
-            .unwrap()
-            .current_location = Some(NavigationLocation::Library(LibraryLocationId::new(
-            "shell:library:documents".into(),
-            "Documents".to_owned(),
-        )));
+        complete_test_navigation(
+            app.tab_mut(active_tab).unwrap(),
+            NavigationLocation::Library(LibraryLocationId::new(
+                "shell:library:documents".into(),
+                "Documents".to_owned(),
+            )),
+            NavigationKind::Normal,
+        );
 
         assert_eq!(
             active_write_target(&app, app.active_window).unwrap().1,
@@ -25186,12 +25243,12 @@ mod tests {
         );
         let app = state.lock().unwrap();
         let tab = app.active();
-        assert_eq!(tab.latest_request, current_request);
+        assert_eq!(tab.latest_request(), current_request);
         assert_eq!(
-            tab.requested_location,
-            Some(NavigationLocation::Library(second))
+            tab.requested_location(),
+            &Some(NavigationLocation::Library(second))
         );
-        assert!(tab.pending_entries.is_empty());
+        assert!(tab.pending_entries().is_empty());
         assert_eq!(tab.load_state, LoadState::Loading);
     }
     #[test]
@@ -25407,7 +25464,7 @@ mod tests {
             projection.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
             vec![EntryId(1), EntryId(4)]
         );
-        assert_eq!(app.active().latest_request, RequestId(0));
+        assert_eq!(app.active().latest_request(), RequestId(0));
     }
 
     #[test]
@@ -25778,7 +25835,11 @@ mod tests {
         let tab = app.tab_mut(TabId(1)).unwrap();
         tab.begin_directory_navigation(PathBuf::from(r"C:\new"), NavigationKind::Normal);
         assert!(directory_display_entries(tab).is_empty());
-        tab.append_pending(vec![focus_entry(1, r"C:\new\photo.png")]);
+        tab.accept_directory_batch(
+            tab.latest_request(),
+            vec![focus_entry(1, r"C:\new\photo.png")],
+            DirectoryViewPreference::default(),
+        );
         assert_eq!(directory_display_entries(tab).len(), 1);
         assert!(app.icons.is_empty());
         assert!(app.thumbnail_cache.is_empty());
@@ -25893,10 +25954,13 @@ mod tests {
             preference.view_mode = ViewMode::ExtraLargeIcons
         });
         let tab = grid.tab_mut(TabId(1)).unwrap();
-        tab.latest_request = RequestId(4);
+        advance_test_navigation(tab, RequestId(4));
         tab.load_state = LoadState::Loading;
         let grid = Arc::new(Mutex::new(grid));
-        let grid_requests = apply_event(
+        let DirectoryEventChange {
+            icon_requests: grid_requests,
+            ..
+        } = apply_event(
             &grid,
             DirectoryEvent::Batch {
                 acknowledgement: mpsc::channel().0,
@@ -25910,10 +25974,13 @@ mod tests {
         let mut details =
             AppState::new_for_test(vec![PathBuf::from(r"C:\details")], 0, [0, 1, 2, 3]);
         let tab = details.tab_mut(TabId(1)).unwrap();
-        tab.latest_request = RequestId(5);
+        advance_test_navigation(tab, RequestId(5));
         tab.load_state = LoadState::Loading;
         let details = Arc::new(Mutex::new(details));
-        let details_requests = apply_event(
+        let DirectoryEventChange {
+            icon_requests: details_requests,
+            ..
+        } = apply_event(
             &details,
             DirectoryEvent::Batch {
                 acknowledgement: mpsc::channel().0,
@@ -26434,7 +26501,12 @@ mod tests {
         let key = QuickMenuKey {
             window_id: WindowId(1),
             tab_id: TabId(1),
-            navigation_request: shared.lock().unwrap().tab(TabId(1)).unwrap().latest_request,
+            navigation_request: shared
+                .lock()
+                .unwrap()
+                .tab(TabId(1))
+                .unwrap()
+                .latest_request(),
             scope: QuickMenuScope::Sidebar {
                 group: 0,
                 stable_id: resolved.stable_id,
@@ -26451,8 +26523,7 @@ mod tests {
             .unwrap()
             .tab_mut(TabId(1))
             .unwrap()
-            .latest_request
-            .0 += 1;
+            .begin_directory_navigation(PathBuf::from(r"C:\current"), NavigationKind::Refresh);
         assert!(!quick_menu_key_is_current(&shared, &key));
         let mut other = key.clone();
         other.window_id = WindowId(2);
@@ -26513,7 +26584,12 @@ mod tests {
         let key = QuickMenuKey {
             window_id: WindowId(1),
             tab_id: TabId(1),
-            navigation_request: shared.lock().unwrap().tab(TabId(1)).unwrap().latest_request,
+            navigation_request: shared
+                .lock()
+                .unwrap()
+                .tab(TabId(1))
+                .unwrap()
+                .latest_request(),
             scope: QuickMenuScope::Sidebar {
                 group: 0,
                 stable_id: resolved.stable_id.clone(),
@@ -26541,8 +26617,11 @@ mod tests {
         let identity =
             std::ffi::OsString::from(r"::{031E4825-7B94-4DC3-B131-E946B44C8DD5}\项目.library-ms");
         let library = LibraryLocationId::new(identity.clone(), "项目".to_owned());
-        app.tab_mut(TabId(1)).unwrap().current_location =
-            Some(NavigationLocation::Library(library));
+        complete_test_navigation(
+            app.tab_mut(TabId(1)).unwrap(),
+            NavigationLocation::Library(library),
+            NavigationKind::Normal,
+        );
         app.libraries.push(test_library(
             identity.to_string_lossy().as_ref(),
             "项目",
@@ -26594,9 +26673,14 @@ mod tests {
     fn issue_69_library_powershell_reuses_the_default_save_location() {
         let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\before")], 0, [0, 1, 2, 3]);
         let identity = std::ffi::OsString::from("shell:library:multi-source");
-        app.tab_mut(TabId(1)).unwrap().current_location = Some(NavigationLocation::Library(
-            LibraryLocationId::new(identity.clone(), "Multi source".to_owned()),
-        ));
+        complete_test_navigation(
+            app.tab_mut(TabId(1)).unwrap(),
+            NavigationLocation::Library(LibraryLocationId::new(
+                identity.clone(),
+                "Multi source".to_owned(),
+            )),
+            NavigationKind::Normal,
+        );
         app.libraries.push(test_library(
             identity.to_string_lossy().as_ref(),
             "Multi source",
@@ -26621,8 +26705,11 @@ mod tests {
     fn issue_69_library_background_key_rejects_refresh_and_location_changes() {
         let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\before")], 0, [0, 1, 2, 3]);
         let library = LibraryLocationId::new("shell:library:one".into(), "One".to_owned());
-        app.tab_mut(TabId(1)).unwrap().current_location =
-            Some(NavigationLocation::Library(library.clone()));
+        complete_test_navigation(
+            app.tab_mut(TabId(1)).unwrap(),
+            NavigationLocation::Library(library.clone()),
+            NavigationKind::Normal,
+        );
         let shared = Arc::new(Mutex::new(app));
         let state = WindowSessions::new(shared.clone(), WindowId(1));
         let (key, _) = quick_menu_key(&state, true).expect("library background target");
@@ -26633,16 +26720,23 @@ mod tests {
             .unwrap()
             .tab_mut(TabId(1))
             .unwrap()
-            .latest_request = RequestId(1);
+            .begin_navigation(
+                NavigationLocation::Library(library.clone()),
+                NavigationKind::Refresh,
+            );
         assert!(!quick_menu_key_is_current(&shared, &key));
         {
             let mut app = shared.lock().unwrap();
             let tab = app.tab_mut(TabId(1)).unwrap();
-            tab.latest_request = key.navigation_request;
-            tab.current_location = Some(NavigationLocation::Library(LibraryLocationId::new(
-                "shell:library:two".into(),
-                "Two".to_owned(),
-            )));
+            *tab = TabSession::new_at(tab.id, NavigationLocation::Library(library));
+            complete_test_navigation(
+                tab,
+                NavigationLocation::Library(LibraryLocationId::new(
+                    "shell:library:two".into(),
+                    "Two".to_owned(),
+                )),
+                NavigationKind::Normal,
+            );
         }
         assert!(!quick_menu_key_is_current(&shared, &key));
     }
@@ -27459,7 +27553,7 @@ mod tests {
                 .replace_entries(vec![entry.clone()]);
             let request = ordinary_icon_request(&mut app, TabId(1), RequestId(12), &entry).unwrap();
             assert!(ordinary_icon_request(&mut app, TabId(1), RequestId(12), &entry).is_none());
-            app.tab_mut(TabId(1)).unwrap().latest_request = RequestId(13);
+            advance_test_navigation(app.tab_mut(TabId(1)).unwrap(), RequestId(13));
             request
         };
         let (sender, _) = mpsc::channel();
@@ -27491,7 +27585,7 @@ mod tests {
     fn issue_98_state() -> SharedSessions {
         let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\grid")], 0, [0, 1, 2, 3]);
         let tab = app.tab_mut(TabId(1)).unwrap();
-        tab.latest_request = RequestId(12);
+        advance_test_navigation(tab, RequestId(12));
         tab.replace_entries(vec![focus_entry(1, r"C:\grid\model.mtl")]);
         Arc::new(Mutex::new(app))
     }
@@ -27649,11 +27743,14 @@ mod tests {
             preference.view_mode = ViewMode::MediumIcons
         });
         let tab = app.tab_mut(TabId(1)).unwrap();
-        tab.latest_request = RequestId(4);
+        advance_test_navigation(tab, RequestId(4));
         tab.load_state = LoadState::Loading;
         let state = Arc::new(Mutex::new(app));
 
-        let requests = apply_event(
+        let DirectoryEventChange {
+            icon_requests: requests,
+            ..
+        } = apply_event(
             &state,
             DirectoryEvent::Batch {
                 acknowledgement: mpsc::channel().0,
@@ -27688,11 +27785,14 @@ mod tests {
         let path = PathBuf::from(r"\\server\share");
         let mut app = AppState::new_for_test(vec![path.clone()], 0, [0, 1, 2, 3]);
         let tab = app.tab_mut(TabId(1)).unwrap();
-        tab.latest_request = RequestId(4);
+        advance_test_navigation(tab, RequestId(4));
         tab.load_state = LoadState::Loading;
         let state = Arc::new(Mutex::new(app));
 
-        let batch = apply_event(
+        let DirectoryEventChange {
+            icon_requests: batch,
+            ..
+        } = apply_event(
             &state,
             DirectoryEvent::Batch {
                 acknowledgement: mpsc::channel().0,
@@ -27706,7 +27806,10 @@ mod tests {
                 ],
             },
         );
-        let finished = apply_event(
+        let DirectoryEventChange {
+            icon_requests: finished,
+            ..
+        } = apply_event(
             &state,
             DirectoryEvent::Finished {
                 tab_id: TabId(1),
@@ -27745,11 +27848,14 @@ mod tests {
         let mut app =
             AppState::new_for_test(vec![PathBuf::from(r"\\server\share")], 0, [0, 1, 2, 3]);
         let tab = app.tab_mut(TabId(1)).unwrap();
-        tab.latest_request = RequestId(8);
+        advance_test_navigation(tab, RequestId(8));
         tab.load_state = LoadState::Loading;
         let state = Arc::new(Mutex::new(app));
 
-        let requests = apply_event(
+        let DirectoryEventChange {
+            icon_requests: requests,
+            ..
+        } = apply_event(
             &state,
             DirectoryEvent::Batch {
                 acknowledgement: mpsc::channel().0,
@@ -27769,7 +27875,7 @@ mod tests {
                 .unwrap()
                 .tab(TabId(1))
                 .unwrap()
-                .pending_entries
+                .pending_entries()
                 .len(),
             2
         );
@@ -27780,7 +27886,7 @@ mod tests {
         let mut app =
             AppState::new_for_test(vec![PathBuf::from(r"\\server\share")], 0, [0, 1, 2, 3]);
         let tab = app.tab_mut(TabId(1)).unwrap();
-        tab.latest_request = RequestId(12);
+        advance_test_navigation(tab, RequestId(12));
         tab.replace_entries(vec![focus_entry(1, r"\\server\share\model.obj")]);
         let key = entry_type_icon_key(
             Path::new(r"\\server\share\model.obj"),
@@ -28890,7 +28996,7 @@ mod tests {
     fn column_drag_threshold_cancel_and_source_isolation_preserve_state() {
         let mut app = AppState::new_for_test(vec![PathBuf::from("a")], 0, [0, 1, 2, 3]);
         let widths = app.active_column_layout().widths;
-        let request = app.active().latest_request;
+        let request = app.active().latest_request();
         let sort = app.active().sort_field;
         assert!(app.begin_column_drag(app.active_window, 1, 100.0, 20.0));
         assert_eq!(
@@ -28945,7 +29051,7 @@ mod tests {
             ]
         );
         assert_eq!(app.active_column_layout().widths, widths);
-        assert_eq!(app.active().latest_request, request);
+        assert_eq!(app.active().latest_request(), request);
         assert_eq!(app.active().sort_field, sort);
 
         let tab_id = app.active_window_state().active_tab;
@@ -29263,7 +29369,7 @@ mod tests {
         let second_tab = app.window(second_window).unwrap().active_tab;
         for tab_id in [first_tab, second_tab] {
             let tab = app.tab_mut(tab_id).unwrap();
-            tab.latest_request = RequestId(7);
+            advance_test_navigation(tab, RequestId(7));
             tab.load_state = LoadState::Loading;
         }
         let state = Arc::new(Mutex::new(app));
@@ -29351,7 +29457,7 @@ mod tests {
         let second_tab = app.window(second_window).unwrap().active_tab;
         for tab_id in [first_tab, second_tab] {
             let tab = app.tab_mut(tab_id).unwrap();
-            tab.latest_request = RequestId(9);
+            advance_test_navigation(tab, RequestId(9));
             tab.load_state = LoadState::Loading;
         }
         app.close_window(first_window).unwrap();
@@ -29376,7 +29482,7 @@ mod tests {
         );
         let app = state.lock().unwrap();
         assert!(app.tab(first_tab).is_none());
-        assert_eq!(app.tab(second_tab).unwrap().pending_entries.len(), 1);
+        assert_eq!(app.tab(second_tab).unwrap().pending_entries().len(), 1);
     }
 
     #[test]
@@ -29434,9 +29540,25 @@ mod tests {
         let tab_id = app.active_window_state().active_tab;
         {
             let tab = app.tab_mut(tab_id).unwrap();
-            tab.current_location = Some(NavigationLocation::Directory(PathBuf::from("a/current")));
-            tab.back_history = vec![NavigationLocation::Directory(PathBuf::from("a/previous"))];
-            tab.forward_history = vec![NavigationLocation::Directory(PathBuf::from("a/next"))];
+            *tab = TabSession::new_at(
+                tab.id,
+                NavigationLocation::Directory(PathBuf::from("a/previous")),
+            );
+            complete_test_navigation(
+                tab,
+                NavigationLocation::Directory(PathBuf::from("a/current")),
+                NavigationKind::Normal,
+            );
+            complete_test_navigation(
+                tab,
+                NavigationLocation::Directory(PathBuf::from("a/next")),
+                NavigationKind::Normal,
+            );
+            complete_test_navigation(
+                tab,
+                NavigationLocation::Directory(PathBuf::from("a/current")),
+                NavigationKind::Back,
+            );
             tab.replace_entries(vec![focus_entry(7, "a/current/item.txt")]);
             tab.selected = vec![EntryId(7)];
             tab.focused = Some(EntryId(7));
@@ -29447,7 +29569,7 @@ mod tests {
             tab.search_state = SearchState::Complete;
             tab.load_state = LoadState::Complete;
         }
-        let request = app.tab(tab_id).unwrap().latest_request;
+        let request = app.tab(tab_id).unwrap().latest_request();
         let before_entries = app.tab(tab_id).unwrap().entries.clone();
         assert!(app.begin_tab_drag(source, tab_id, 0, 100.0, 20.0));
         app.update_tab_drag(140.0, 80.0, 47.0, 540.0, 0.0, 178.0);
@@ -29462,15 +29584,15 @@ mod tests {
         assert_eq!(app.window(source).unwrap().placement.x, 320);
         assert_eq!(app.window(source).unwrap().placement.y, 240);
         let tab = app.tab(tab_id).unwrap();
-        assert_eq!(tab.latest_request, request);
+        assert_eq!(tab.latest_request(), request);
         assert_eq!(
-            tab.current_location
+            tab.current_location()
                 .as_ref()
                 .and_then(NavigationLocation::directory_path),
             Some(Path::new("a/current"))
         );
-        assert_eq!(tab.back_history, [PathBuf::from("a/previous")]);
-        assert_eq!(tab.forward_history, [PathBuf::from("a/next")]);
+        assert_eq!(*tab.back_history(), [PathBuf::from("a/previous")]);
+        assert_eq!(*tab.forward_history(), [PathBuf::from("a/next")]);
         assert_eq!(tab.selected, [EntryId(7)]);
         assert_eq!(tab.focused, Some(EntryId(7)));
         assert_eq!(tab.selection_anchor, Some(EntryId(7)));
@@ -29695,7 +29817,7 @@ mod tests {
             app.windows
                 .values()
                 .flat_map(|window| window.tabs.values())
-                .all(|tab| tab.visible_path().is_some() && !tab.accepts(tab.latest_request))
+                .all(|tab| tab.visible_path().is_some() && !tab.accepts(tab.latest_request()))
         );
     }
 
@@ -29762,7 +29884,7 @@ mod tests {
                 },
             );
             consumed.recv_timeout(Duration::from_secs(1)).unwrap();
-            assert!(state.lock().unwrap().active().pending_entries.is_empty());
+            assert!(state.lock().unwrap().active().pending_entries().is_empty());
         }
     }
 
@@ -29803,14 +29925,14 @@ mod tests {
             }
         }
         let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\local")], 0, [0, 1, 2, 3]);
-        app.tab_mut(TabId(1)).unwrap().latest_request = RequestId(2);
+        advance_test_navigation(app.tab_mut(TabId(1)).unwrap(), RequestId(2));
         let state = Arc::new(Mutex::new(app));
         apply_event(&state, first);
         let second = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
         apply_event(&state, second);
         worker.join().unwrap().unwrap();
         std::fs::remove_dir(local_path).unwrap();
-        assert!(state.lock().unwrap().active().pending_entries.is_empty());
+        assert!(state.lock().unwrap().active().pending_entries().is_empty());
     }
 
     #[test]
@@ -29836,7 +29958,7 @@ mod tests {
             let mut app = state.lock().unwrap();
             let tab = app.tab(TabId(1)).unwrap();
             assert_eq!(tab.load_state, LoadState::Partial);
-            assert_eq!(tab.pending_entries.len(), 1);
+            assert_eq!(tab.pending_entries().len(), 1);
             let window_id = app.active_window;
             app.close_window(window_id).unwrap();
         }
@@ -29889,7 +30011,7 @@ mod tests {
             apply_event(&state, event);
             let app = state.lock().unwrap();
             assert_eq!(app.active().load_state, LoadState::Cancelled);
-            assert!(app.active().pending_entries.is_empty());
+            assert!(app.active().pending_entries().is_empty());
             assert!(app.active().error.is_none());
         }
     }
@@ -30234,7 +30356,7 @@ mod tests {
         );
         let app = state.lock().unwrap();
         assert!(app.tab(closing).is_none());
-        assert!(app.tab(right).unwrap().pending_entries.is_empty());
+        assert!(app.tab(right).unwrap().pending_entries().is_empty());
     }
 
     #[test]
@@ -30280,8 +30402,8 @@ mod tests {
         ));
         assert!(receiver.try_recv().is_err());
         let app = state.lock().expect("app state mutex is not poisoned");
-        assert_eq!(app.active().latest_request, RequestId(0));
-        assert!(app.active().back_history.is_empty());
+        assert_eq!(app.active().latest_request(), RequestId(0));
+        assert!(app.active().back_history().is_empty());
     }
 
     #[test]
@@ -30354,7 +30476,7 @@ mod tests {
             [0, 1, 2, 3],
         );
         let tab_a = app.active_window_state().tab_order[0];
-        let request = app.tab(tab_a).unwrap().latest_request;
+        let request = app.tab(tab_a).unwrap().latest_request();
         app.update_directory_preference(PathBuf::from("A"), |preference| {
             preference.view_mode = ViewMode::MediumIcons
         });
@@ -30369,7 +30491,7 @@ mod tests {
             app.directory_preference(Path::new("B")).view_mode,
             ViewMode::List
         );
-        assert_eq!(app.tab(tab_a).unwrap().latest_request, request);
+        assert_eq!(app.tab(tab_a).unwrap().latest_request(), request);
     }
 
     #[test]
@@ -30464,7 +30586,7 @@ mod tests {
             .tabs
             .get_mut(&TabId(1))
             .unwrap();
-        tab.latest_request = RequestId(7);
+        advance_test_navigation(tab, RequestId(7));
         tab.replace_entries(vec![FileEntry {
             id: EntryId(3),
             original_name: "file.txt".into(),
@@ -30568,7 +30690,7 @@ mod tests {
             .tabs
             .get_mut(&TabId(1))
             .unwrap();
-        tab.latest_request = RequestId(8);
+        advance_test_navigation(tab, RequestId(8));
         tab.page_source = PageSource::Directory;
         tab.replace_entries(vec![FileEntry {
             id: EntryId(1),
@@ -30961,11 +31083,15 @@ mod tests {
             let (_, cancel) = tab
                 .begin_directory_navigation(PathBuf::from(r"C:\target"), NavigationKind::Refresh);
             assert!(!cancel.load(std::sync::atomic::Ordering::Acquire));
-            let request_id = tab.latest_request;
-            tab.pending_entries = vec![
-                focus_entry(1, r"C:\target\first.txt"),
-                focus_entry(2, r"C:\target\second.txt"),
-            ];
+            let request_id = tab.latest_request();
+            tab.accept_directory_batch(
+                request_id,
+                vec![
+                    focus_entry(1, r"C:\target\first.txt"),
+                    focus_entry(2, r"C:\target\second.txt"),
+                ],
+                DirectoryViewPreference::default(),
+            );
             app.focus_after_refresh.get_mut(&tab_id).unwrap().request_id = Some(request_id);
         }
         let state = Arc::new(Mutex::new(app));
@@ -31104,7 +31230,7 @@ mod tests {
             assert_eq!(target.tab.tab_id, tab_id);
             assert_eq!(
                 target.tab.request_id,
-                app.tab(tab_id).unwrap().latest_request
+                app.tab(tab_id).unwrap().latest_request()
             );
         }
     }
@@ -31172,7 +31298,7 @@ mod tests {
             tab.replace_entries(vec![focus_entry(1, source)]);
             tab.load_state = LoadState::Complete;
             tab.selected = vec![EntryId(1)];
-            let request_id = app.tab(tab_id).unwrap().latest_request;
+            let request_id = app.tab(tab_id).unwrap().latest_request();
             app.rename_targets.insert(
                 window_id,
                 actions::EntryTarget {
@@ -31917,7 +32043,7 @@ mod tests {
         );
         tab.load_state = LoadState::Complete;
         tab.select_entry(EntryId(80), false, false);
-        let request_id = tab.latest_request;
+        let request_id = tab.latest_request();
         let state = Arc::new(Mutex::new(app));
         refresh_ui_inner(&ui, &state, window_id);
         ui.set_file_viewport_y(-1_500.0);
@@ -31954,7 +32080,7 @@ mod tests {
             assert_eq!(ui.get_file_viewport_y(), -1_500.0);
             let app = state.lock().unwrap();
             let tab = app.tab(tab_id).unwrap();
-            assert_eq!(tab.latest_request, request_id);
+            assert_eq!(tab.latest_request(), request_id);
             assert_eq!(tab.selected, vec![EntryId(80)]);
             assert_eq!(tab.focused, Some(EntryId(80)));
             assert_eq!(tab.entries.len(), 200);
@@ -32125,7 +32251,7 @@ mod tests {
         tab.replace_entries(vec![focus_entry(1, r"C:\dpi\selected.txt")]);
         tab.load_state = LoadState::Complete;
         tab.select_entry(EntryId(1), false, false);
-        let request_id = tab.latest_request;
+        let request_id = tab.latest_request();
         let state = Arc::new(Mutex::new(app));
         refresh_window_ui(&ui, &state, window_id);
         update_test_layout(&ui);
@@ -32166,7 +32292,7 @@ mod tests {
                 );
                 let app = state.lock().unwrap();
                 let tab = app.tab(tab_id).unwrap();
-                assert_eq!(tab.latest_request, request_id);
+                assert_eq!(tab.latest_request(), request_id);
                 assert_eq!(tab.selected, vec![EntryId(1)]);
             }
         }
@@ -32959,7 +33085,7 @@ mod tests {
         let root = PathBuf::from(r"C:\links");
         let mut app = AppState::new_for_test(vec![root.clone()], 0, [0, 1, 2, 3]);
         let tab_id = app.active().id;
-        let request_id = app.active().latest_request;
+        let request_id = app.active().latest_request();
         let mut item = focus_entry(1, r"C:\links\docs.lnk");
         item.kind = crate::domain::EntryKind::File;
         app.active_window_state_mut()
@@ -32991,11 +33117,9 @@ mod tests {
         state
             .lock()
             .unwrap()
-            .active_window_state_mut()
-            .tabs
-            .get_mut(&tab_id)
+            .tab_mut(tab_id)
             .unwrap()
-            .latest_request = RequestId(request_id.0 + 1);
+            .begin_directory_navigation(PathBuf::from(r"C:\links"), NavigationKind::Refresh);
         let request = ShortcutRequest {
             tab_id,
             request_id,
@@ -33025,3 +33149,6 @@ mod drag_safety_tests;
 #[cfg(test)]
 #[path = "grouped_grid_tests.rs"]
 mod grouped_grid_tests;
+
+#[cfg(test)]
+mod navigation_transition_tests;

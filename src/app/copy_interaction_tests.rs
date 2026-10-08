@@ -26,27 +26,36 @@ impl InputFixture {
         });
         let tab_id = app.active().id;
         let tab = app.tab_mut(tab_id).unwrap();
-        tab.load_state = LoadState::Complete;
-        tab.latest_request = RequestId(10);
-        tab.replace_entries(
-            (1..=3)
-                .map(|id| FileEntry {
-                    id: EntryId(id),
-                    original_name: format!("folder{id}").into(),
-                    display_name: format!("folder{id}"),
-                    name_highlights: Vec::new(),
-                    path: root.join(format!("folder{id}")),
-                    kind: crate::domain::EntryKind::Directory,
-                    open_target: None,
-                    library_source_index: None,
-                    parent_display: String::new(),
-                    size_bytes: None,
-                    folder_size: FolderSizeState::Unknown,
-                    modified: None,
-                    created: None,
-                })
-                .collect(),
+        let (request, _) = tab.begin_directory_navigation(root.clone(), NavigationKind::Normal);
+        assert!(
+            tab.accept_directory_batch(
+                request,
+                (1..=3)
+                    .map(|id| FileEntry {
+                        id: EntryId(id),
+                        original_name: format!("folder{id}").into(),
+                        display_name: format!("folder{id}"),
+                        name_highlights: Vec::new(),
+                        path: root.join(format!("folder{id}")),
+                        kind: crate::domain::EntryKind::Directory,
+                        open_target: None,
+                        library_source_index: None,
+                        parent_display: String::new(),
+                        size_bytes: None,
+                        folder_size: FolderSizeState::Unknown,
+                        modified: None,
+                        created: None,
+                    })
+                    .collect(),
+                DirectoryViewPreference::default(),
+            )
         );
+        assert!(tab.finish_directory_navigation(
+            request,
+            NavigationLocation::Directory(root),
+            DirectoryViewPreference::default(),
+            None
+        ));
         let window_id = app.active_window;
         let state = WindowSessions::new(Arc::new(Mutex::new(app)), window_id);
         let ui = AppWindow::new().expect("in-memory backend");
@@ -164,7 +173,7 @@ fn issue_133_first_click_pair_after_reactivation_reaches_the_same_folder() {
     for mode in [ViewMode::Details, ViewMode::List] {
         let fixture = InputFixture::new(mode);
         let model = fixture.ui.get_files();
-        let request_id = fixture.state.lock().unwrap().active().latest_request;
+        let request_id = fixture.state.lock().unwrap().active().latest_request();
         fixture
             .ui
             .window()
@@ -189,7 +198,7 @@ fn issue_133_first_click_pair_after_reactivation_reaches_the_same_folder() {
         );
         assert_eq!(fixture.selected(), vec![EntryId(1)]);
         assert_eq!(
-            fixture.state.lock().unwrap().active().latest_request,
+            fixture.state.lock().unwrap().active().latest_request(),
             request_id
         );
         assert!(std::ptr::eq(

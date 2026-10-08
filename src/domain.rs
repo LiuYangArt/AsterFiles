@@ -557,9 +557,9 @@ struct DirectorySnapshot {
 pub struct TabSession {
     pub id: TabId,
     pub kind: TabKind,
-    pub latest_request: RequestId,
-    pub current_location: Option<NavigationLocation>,
-    pub requested_location: Option<NavigationLocation>,
+    latest_request: RequestId,
+    current_location: Option<NavigationLocation>,
+    requested_location: Option<NavigationLocation>,
     pub address_editing: bool,
     pub address_input: String,
     pub address_mode: AddressMode,
@@ -575,12 +575,12 @@ pub struct TabSession {
     pub search_cached_pages: VecDeque<u32>,
     pub search_page_retries: HashMap<u32, u8>,
     directory_snapshot: Option<DirectorySnapshot>,
-    pub navigation_kind: NavigationKind,
-    pub back_history: Vec<NavigationLocation>,
-    pub forward_history: Vec<NavigationLocation>,
+    navigation_kind: NavigationKind,
+    back_history: Vec<NavigationLocation>,
+    forward_history: Vec<NavigationLocation>,
     pub entries: Arc<Vec<FileEntry>>,
-    pub pending_entries: Vec<FileEntry>,
-    pub entry_indices: HashMap<EntryId, usize>,
+    pending_entries: Vec<FileEntry>,
+    entry_indices: HashMap<EntryId, usize>,
     pub load_state: LoadState,
     pub error: Option<String>,
     pub selected: Vec<EntryId>,
@@ -637,11 +637,44 @@ impl TabSession {
         }
     }
 
-    pub fn new_home(id: TabId) -> Self {
+    pub fn new_at(id: TabId, location: NavigationLocation) -> Self {
         let mut tab = Self::new(id);
-        tab.current_location = Some(NavigationLocation::Home);
-        tab.load_state = LoadState::Complete;
+        if location == NavigationLocation::Home {
+            tab.load_state = LoadState::Complete;
+        }
+        tab.current_location = Some(location);
         tab
+    }
+
+    pub fn latest_request(&self) -> RequestId {
+        self.latest_request
+    }
+
+    pub fn current_location(&self) -> &Option<NavigationLocation> {
+        &self.current_location
+    }
+
+    pub fn requested_location(&self) -> &Option<NavigationLocation> {
+        &self.requested_location
+    }
+
+    pub fn navigation_kind(&self) -> NavigationKind {
+        self.navigation_kind
+    }
+
+    pub fn back_history(&self) -> &Vec<NavigationLocation> {
+        &self.back_history
+    }
+
+    pub fn forward_history(&self) -> &Vec<NavigationLocation> {
+        &self.forward_history
+    }
+
+    pub fn pending_entries(&self) -> &Vec<FileEntry> {
+        &self.pending_entries
+    }
+    pub fn new_home(id: TabId) -> Self {
+        Self::new_at(id, NavigationLocation::Home)
     }
 
     pub fn new_settings(id: TabId) -> Self {
@@ -984,6 +1017,118 @@ impl TabSession {
                 .is_some_and(|cancel| cancel.load(AtomicOrdering::Acquire))
     }
 
+    pub fn accepts_directory(&self, request_id: RequestId) -> bool {
+        self.page_source == PageSource::Directory
+            && self.requested_location.is_some()
+            && matches!(self.load_state, LoadState::Loading | LoadState::Partial)
+            && self.accepts(request_id)
+    }
+
+    pub fn accept_directory_batch(
+        &mut self,
+        request_id: RequestId,
+        entries: Vec<FileEntry>,
+        preference: DirectoryViewPreference,
+    ) -> bool {
+        if !self.accepts_directory(request_id) {
+            return false;
+        }
+        if self.pending_entries.is_empty() {
+            self.sort_field = preference.sort_field;
+            self.sort_direction = preference.sort_direction;
+            if self.visible_path().is_some_and(crate::network::is_unc_path) {
+                self.clear_selection();
+            }
+        }
+        self.append_pending(entries);
+        true
+    }
+
+    pub fn finish_directory_navigation(
+        &mut self,
+        request_id: RequestId,
+        location: NavigationLocation,
+        preference: DirectoryViewPreference,
+        warning: Option<String>,
+    ) -> bool {
+        if !self.accepts_directory(request_id)
+            || self.requested_location.as_ref() != Some(&location)
+        {
+            return false;
+        }
+        let preserve_selection = self.load_state == LoadState::Partial
+            && location
+                .directory_path()
+                .is_some_and(crate::network::is_unc_path);
+        if self.sort_field != preference.sort_field
+            || self.sort_direction != preference.sort_direction
+        {
+            self.sort_field = preference.sort_field;
+            self.sort_direction = preference.sort_direction;
+            self.sort_pending();
+        }
+        self.commit_pending();
+        let selection = preserve_selection
+            .then(|| (self.selected.clone(), self.focused, self.selection_anchor));
+        self.commit_location(location);
+        if let Some((selected, focused, anchor)) = selection {
+            self.selected = selected;
+            self.focused = focused;
+            self.selection_anchor = anchor;
+        }
+        self.error = warning;
+        true
+    }
+
+    pub fn fail_directory_navigation(
+        &mut self,
+        request_id: RequestId,
+        state: LoadState,
+        error: String,
+    ) -> bool {
+        if !self.accepts_directory(request_id)
+            || !matches!(
+                state,
+                LoadState::NotFound
+                    | LoadState::PermissionDenied
+                    | LoadState::Disconnected
+                    | LoadState::Failed
+            )
+        {
+            return false;
+        }
+        self.cancel_pending();
+        self.load_state = state;
+        self.error = Some(error);
+        true
+    }
+
+    pub fn cancel_directory_navigation(&mut self, request_id: RequestId) -> bool {
+        if self.page_source != PageSource::Directory
+            || self.latest_request != request_id
+            || self.requested_location.is_none()
+        {
+            return false;
+        }
+        if self.load_state == LoadState::Cancelled {
+            return self
+                .cancel
+                .as_ref()
+                .is_some_and(|cancel| cancel.load(AtomicOrdering::Acquire));
+        }
+        if !matches!(self.load_state, LoadState::Loading | LoadState::Partial) {
+            return false;
+        }
+        self.cancel_pending();
+        true
+    }
+    pub fn mark_directory_slow(&mut self, request_id: RequestId) -> bool {
+        if !self.accepts_directory(request_id) || self.load_state != LoadState::Loading {
+            return false;
+        }
+        self.error = Some("network_slow".to_owned());
+        true
+    }
     pub fn cancel_pending(&mut self) {
         if let Some(cancel) = self.cancel.as_ref() {
             cancel.store(true, AtomicOrdering::Release);
@@ -994,8 +1139,16 @@ impl TabSession {
                 )
             {
                 self.search_state = SearchState::Cancelled;
-            } else if matches!(self.load_state, LoadState::Loading | LoadState::Partial) {
+            } else if self.page_source == PageSource::Directory
+                && matches!(self.load_state, LoadState::Loading | LoadState::Partial)
+            {
+                if self.load_state == LoadState::Partial {
+                    self.clear_selection();
+                }
+                self.discard_pending();
+                self.reconcile_selection();
                 self.load_state = LoadState::Cancelled;
+                self.error = None;
             }
         }
     }
@@ -1010,7 +1163,7 @@ impl TabSession {
         self.reconcile_selection();
     }
 
-    pub fn append_pending(&mut self, mut entries: Vec<FileEntry>) -> usize {
+    fn append_pending(&mut self, mut entries: Vec<FileEntry>) -> usize {
         let previous_len = self.pending_entries.len();
         let field = self.sort_field;
         let direction = self.sort_direction;
@@ -1198,14 +1351,14 @@ impl TabSession {
         }
         None
     }
-    pub fn commit_pending(&mut self) {
+    fn commit_pending(&mut self) {
         let entries = std::mem::take(&mut self.pending_entries);
         self.replace_entries(entries);
         self.load_state = LoadState::Complete;
         self.cancel = None;
     }
 
-    pub fn commit_location(&mut self, location: NavigationLocation) {
+    fn commit_location(&mut self, location: NavigationLocation) {
         let previous = self.current_location.clone();
         match self.navigation_kind {
             NavigationKind::Normal => {
@@ -1249,10 +1402,6 @@ impl TabSession {
         self.clear_selection();
     }
 
-    pub fn commit_path(&mut self, path: PathBuf) {
-        self.commit_location(NavigationLocation::Directory(path));
-    }
-
     pub fn back_target(&self) -> Option<NavigationLocation> {
         self.back_history.last().cloned()
     }
@@ -1260,7 +1409,7 @@ impl TabSession {
         self.forward_history.last().cloned()
     }
 
-    pub fn discard_pending(&mut self) {
+    fn discard_pending(&mut self) {
         self.pending_entries.clear();
         self.entry_indices = self
             .entries
@@ -1698,6 +1847,177 @@ mod tests {
     }
 
     #[test]
+    fn issue_151_directory_commit_checks_identity_location_and_terminal_state() {
+        let mut tab = TabSession::new_home(TabId(1));
+        let location = NavigationLocation::Directory(r"C:\target".into());
+        let preference = DirectoryViewPreference::default();
+        let (request, _) = tab.begin_navigation(location.clone(), NavigationKind::Normal);
+        assert!(!tab.accept_directory_batch(RequestId(request.0 + 1), vec![], preference));
+        assert!(tab.mark_directory_slow(request));
+        assert!(tab.accept_directory_batch(
+            request,
+            vec![
+                entry(2, "z", EntryKind::File, None),
+                entry(1, "a", EntryKind::File, None),
+            ],
+            preference
+        ));
+        assert_eq!(tab.load_state, LoadState::Partial);
+        assert!(!tab.mark_directory_slow(request));
+        assert_eq!(tab.visible_entries()[0].id, EntryId(1));
+        assert!(!tab.finish_directory_navigation(
+            request,
+            NavigationLocation::Home,
+            preference,
+            None
+        ));
+        assert_eq!(tab.load_state, LoadState::Partial);
+        assert!(tab.finish_directory_navigation(request, location.clone(), preference, None));
+        assert_eq!(tab.current_location, Some(location.clone()));
+        assert_eq!(tab.back_target(), Some(NavigationLocation::Home));
+        assert_eq!(tab.visible_entry(EntryId(2)).unwrap().display_name, "z");
+        assert!(!tab.finish_directory_navigation(request, location, preference, None));
+        assert!(!tab.accept_directory_batch(request, vec![], preference));
+        assert!(!tab.cancel_directory_navigation(request));
+        assert!(!tab.fail_directory_navigation(request, LoadState::Failed, "late".into()));
+    }
+
+    #[test]
+    fn issue_151_finished_navigation_cannot_be_revived_by_load_state() {
+        let mut tab = TabSession::new_home(TabId(1));
+        let preference = DirectoryViewPreference::default();
+        let location = NavigationLocation::Directory(r"C:\target".into());
+        let (request, _) = tab.begin_navigation(location.clone(), NavigationKind::Normal);
+        assert!(tab.finish_directory_navigation(request, location, preference, None));
+        tab.load_state = LoadState::Loading;
+        assert!(!tab.accepts_directory(request));
+        assert!(!tab.accept_directory_batch(request, vec![], preference));
+        assert!(!tab.cancel_directory_navigation(request));
+    }
+    #[test]
+    fn issue_151_empty_library_warning_and_history_commit_atomically() {
+        let mut tab = TabSession::new_home(TabId(1));
+        let location = NavigationLocation::Library(LibraryLocationId::new(
+            "library::documents".into(),
+            "Documents".into(),
+        ));
+        let preference = DirectoryViewPreference::default();
+        let (request, _) = tab.begin_navigation(location.clone(), NavigationKind::Normal);
+        assert!(tab.finish_directory_navigation(
+            request,
+            location.clone(),
+            preference,
+            Some("library_sources:1".into())
+        ));
+        assert_eq!(tab.error.as_deref(), Some("library_sources:1"));
+        assert!(tab.visible_entries().is_empty());
+        let (request, _) = tab.begin_navigation(NavigationLocation::Home, NavigationKind::Back);
+        assert!(tab.finish_directory_navigation(
+            request,
+            NavigationLocation::Home,
+            preference,
+            None
+        ));
+        assert!(tab.back_target().is_none());
+        assert_eq!(tab.forward_target(), Some(location));
+        assert!(tab.error.is_none());
+    }
+
+    #[test]
+    fn issue_151_network_selection_and_sort_survive_complete_commit() {
+        let mut tab = TabSession::new_home(TabId(1));
+        let location = NavigationLocation::Directory(r"\\server\share".into());
+        let preference = DirectoryViewPreference::default();
+        let (request, _) = tab.begin_navigation(location.clone(), NavigationKind::Normal);
+        assert!(tab.accept_directory_batch(
+            request,
+            vec![entry(1, "a", EntryKind::File, None)],
+            preference
+        ));
+        tab.select_entry(EntryId(1), false, false);
+        assert!(tab.accept_directory_batch(
+            request,
+            vec![entry(2, "z", EntryKind::File, None)],
+            preference
+        ));
+        let descending = DirectoryViewPreference {
+            sort_direction: SortDirection::Descending,
+            ..preference
+        };
+        assert!(tab.finish_directory_navigation(request, location, descending, Some("1".into())));
+        assert_eq!(tab.visible_entries()[0].id, EntryId(2));
+        assert_eq!(tab.selected, vec![EntryId(1)]);
+        assert_eq!(tab.focused, Some(EntryId(1)));
+        assert_eq!(tab.selection_anchor, Some(EntryId(1)));
+        assert_eq!(tab.error.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn issue_151_failure_and_cancel_restore_committed_indices_without_pending_selection() {
+        for failure in [None, Some(LoadState::PermissionDenied)] {
+            let mut tab = TabSession::new_home(TabId(1));
+            let preference = DirectoryViewPreference::default();
+            let original = NavigationLocation::Directory(r"C:\original".into());
+            let (request, _) = tab.begin_navigation(original.clone(), NavigationKind::Normal);
+            assert!(tab.accept_directory_batch(
+                request,
+                vec![entry(1, "old", EntryKind::File, None)],
+                preference
+            ));
+            assert!(tab.finish_directory_navigation(request, original.clone(), preference, None));
+            let destination = NavigationLocation::Directory(r"C:\next".into());
+            let (request, token) =
+                tab.begin_navigation(destination.clone(), NavigationKind::Normal);
+            assert!(tab.accept_directory_batch(
+                request,
+                vec![entry(1, "new", EntryKind::File, None)],
+                preference
+            ));
+            tab.select_entry(EntryId(1), false, false);
+            if let Some(state) = failure {
+                assert!(tab.fail_directory_navigation(request, state, "denied".into()));
+                assert_eq!(tab.load_state, state);
+            } else {
+                assert!(tab.cancel_directory_navigation(request));
+                assert_eq!(tab.load_state, LoadState::Cancelled);
+            }
+            assert!(token.load(AtomicOrdering::Acquire));
+            assert!(tab.pending_entries.is_empty());
+            assert!(tab.selected.is_empty());
+            assert_eq!(tab.focused, None);
+            assert_eq!(tab.visible_entry(EntryId(1)).unwrap().display_name, "old");
+            assert_eq!(tab.current_location, Some(original.clone()));
+            assert_eq!(tab.visible_location(), Some(&destination));
+            assert!(!tab.finish_directory_navigation(request, destination, preference, None));
+            assert!(!tab.accept_directory_batch(request, vec![], preference));
+            assert!(tab.restore_successful_location());
+            assert_eq!(tab.visible_location(), Some(&original));
+        }
+    }
+
+    #[test]
+    fn issue_151_navigation_replacement_and_search_reject_old_directory_events() {
+        let mut tab = TabSession::new_home(TabId(1));
+        let preference = DirectoryViewPreference::default();
+        let (old, token) = tab.begin_directory_navigation(r"C:\old".into(), NavigationKind::Normal);
+        assert!(tab.accept_directory_batch(
+            old,
+            vec![entry(1, "old", EntryKind::File, None)],
+            preference
+        ));
+        let (current, _) = tab.begin_directory_navigation(r"C:\new".into(), NavigationKind::Normal);
+        assert!(token.load(AtomicOrdering::Acquire));
+        assert!(!tab.cancel_directory_navigation(old));
+        assert!(!tab.fail_directory_navigation(old, LoadState::Failed, "late".into()));
+        assert!(!tab.accept_directory_batch(old, vec![], preference));
+        assert_eq!(tab.load_state, LoadState::Loading);
+        tab.cancel_pending();
+        assert!(!tab.accept_directory_batch(current, vec![], preference));
+        let (search, _) = tab.begin_search(SearchScope::Global, "query".into());
+        assert!(!tab.accept_directory_batch(search, vec![], preference));
+        assert!(!tab.cancel_directory_navigation(search));
+    }
+    #[test]
     fn view_mode_storage_codes_and_ctrl_wheel_order_are_stable() {
         let expected = [
             (ViewMode::Details, 0),
@@ -1826,8 +2146,12 @@ mod tests {
         let directory = NavigationLocation::Directory(PathBuf::from(r"C:\work"));
 
         session.begin_navigation(directory.clone(), NavigationKind::Normal);
-        session.commit_location(directory.clone());
-        session.commit_pending();
+        assert!(session.finish_directory_navigation(
+            session.latest_request,
+            directory.clone(),
+            DirectoryViewPreference::default(),
+            None
+        ));
         assert_eq!(session.back_target(), Some(NavigationLocation::Home));
 
         session.navigate_home(NavigationKind::Back);
@@ -1835,8 +2159,12 @@ mod tests {
         assert_eq!(session.forward_target(), Some(directory.clone()));
 
         session.begin_navigation(directory.clone(), NavigationKind::Forward);
-        session.commit_location(directory.clone());
-        session.commit_pending();
+        assert!(session.finish_directory_navigation(
+            session.latest_request,
+            directory.clone(),
+            DirectoryViewPreference::default(),
+            None
+        ));
         assert_eq!(session.current_location, Some(directory));
         assert_eq!(session.back_target(), Some(NavigationLocation::Home));
     }
@@ -1879,7 +2207,12 @@ mod tests {
         session.current_location = Some(NavigationLocation::Directory(PathBuf::from(r"C:\Users")));
 
         session.begin_navigation(documents.clone(), NavigationKind::Normal);
-        session.commit_location(renamed.clone());
+        assert!(session.finish_directory_navigation(
+            session.latest_request,
+            renamed.clone(),
+            DirectoryViewPreference::default(),
+            None
+        ));
         assert_eq!(session.current_location, Some(documents.clone()));
         assert_eq!(
             session.back_target(),
@@ -1892,7 +2225,12 @@ mod tests {
         assert_eq!(session.visible_path(), None);
 
         session.begin_navigation(renamed.clone(), NavigationKind::Refresh);
-        session.commit_location(renamed.clone());
+        assert!(session.finish_directory_navigation(
+            session.latest_request,
+            renamed.clone(),
+            DirectoryViewPreference::default(),
+            None
+        ));
         assert_eq!(session.current_location, Some(documents));
         assert_eq!(session.back_history.len(), 1);
     }
@@ -2351,13 +2689,24 @@ mod tests {
         let mut pending = entry(1, "docs.lnk", EntryKind::File, Some(4));
         pending.path = path.clone();
         let mut session = TabSession::new(TabId(1));
-        session.append_pending(vec![pending]);
+        let (request, _) =
+            session.begin_directory_navigation(r"C:\links".into(), NavigationKind::Normal);
+        assert!(session.accept_directory_batch(
+            request,
+            vec![pending],
+            DirectoryViewPreference::default()
+        ));
         assert!(session.apply_shortcut_target(EntryId(1), &path, target.clone(), Some(true)));
         assert_eq!(
             session.visible_entry(EntryId(1)).unwrap().kind,
             EntryKind::Directory
         );
-        session.commit_pending();
+        assert!(session.finish_directory_navigation(
+            session.latest_request,
+            session.requested_location.clone().unwrap(),
+            DirectoryViewPreference::default(),
+            None
+        ));
         assert!(!session.apply_shortcut_target(
             EntryId(1),
             Path::new(r"C:\links\stale.lnk"),
@@ -2377,7 +2726,13 @@ mod tests {
         let mut other = entry(2, "a-file.txt", EntryKind::File, Some(4));
         other.path = PathBuf::from(r"C:\links\a-file.txt");
         let mut session = TabSession::new(TabId(1));
-        session.append_pending(vec![directory_link, other]);
+        let (request, _) =
+            session.begin_directory_navigation(r"C:\links".into(), NavigationKind::Normal);
+        assert!(session.accept_directory_batch(
+            request,
+            vec![directory_link, other],
+            DirectoryViewPreference::default()
+        ));
         assert!(session.apply_shortcut_target(
             EntryId(1),
             Path::new(r"C:\links\z-folder.lnk"),
@@ -2398,10 +2753,16 @@ mod tests {
     fn partial_selection_uses_the_visible_batch_indices() {
         let mut session = TabSession::new(TabId(1));
         session.replace_entries(vec![entry(1, "old", EntryKind::File, Some(1))]);
-        session.append_pending(vec![
-            entry(2, "new-a", EntryKind::File, Some(2)),
-            entry(3, "new-b", EntryKind::File, Some(3)),
-        ]);
+        let (request, _) =
+            session.begin_directory_navigation(r"C:\links".into(), NavigationKind::Normal);
+        assert!(session.accept_directory_batch(
+            request,
+            vec![
+                entry(2, "new-a", EntryKind::File, Some(2)),
+                entry(3, "new-b", EntryKind::File, Some(3)),
+            ],
+            DirectoryViewPreference::default()
+        ));
 
         session.select_entry(EntryId(2), false, false);
         session.select_entry(EntryId(3), false, true);
@@ -2414,7 +2775,13 @@ mod tests {
         let old = entry(1, "old", EntryKind::Directory, None);
         let pending = entry(1, "pending", EntryKind::Directory, None);
         session.replace_entries(vec![old]);
-        session.append_pending(vec![pending]);
+        let (request, _) =
+            session.begin_directory_navigation(r"C:\links".into(), NavigationKind::Normal);
+        assert!(session.accept_directory_batch(
+            request,
+            vec![pending],
+            DirectoryViewPreference::default()
+        ));
 
         assert_eq!(
             session
@@ -2422,7 +2789,12 @@ mod tests {
                 .map(|entry| entry.display_name.as_str()),
             Some("pending")
         );
-        session.commit_pending();
+        assert!(session.finish_directory_navigation(
+            session.latest_request,
+            session.requested_location.clone().unwrap(),
+            DirectoryViewPreference::default(),
+            None
+        ));
         assert_eq!(
             session
                 .visible_entry(EntryId(1))
@@ -2451,9 +2823,17 @@ mod tests {
         session.select_entry(EntryId(1), false, false);
 
         session.begin_directory_navigation(PathBuf::from(r"C:\target"), NavigationKind::Normal);
-        session.pending_entries = vec![entry(2, "new.txt", EntryKind::File, Some(1))];
-        session.commit_pending();
-        session.commit_path(PathBuf::from(r"C:\target"));
+        assert!(session.accept_directory_batch(
+            session.latest_request,
+            vec![entry(2, "new.txt", EntryKind::File, Some(1))],
+            DirectoryViewPreference::default()
+        ));
+        assert!(session.finish_directory_navigation(
+            session.latest_request,
+            NavigationLocation::Directory(r"C:\target".into()),
+            DirectoryViewPreference::default(),
+            None
+        ));
 
         assert!(session.selected.is_empty());
         assert_eq!(session.focused, None);
@@ -2466,7 +2846,11 @@ mod tests {
         session.replace_entries(vec![entry(1, "DevUser", EntryKind::Directory, None)]);
         session
             .begin_directory_navigation(PathBuf::from(r"C:\Users\DevUser"), NavigationKind::Normal);
-        session.load_state = LoadState::PermissionDenied;
+        assert!(session.fail_directory_navigation(
+            session.latest_request,
+            LoadState::PermissionDenied,
+            "denied".into()
+        ));
 
         assert_eq!(session.visible_path(), Some(Path::new(r"C:\Users\DevUser")));
         assert!(session.has_failed_location());
@@ -2486,7 +2870,11 @@ mod tests {
         session.current_location = Some(NavigationLocation::Directory(PathBuf::from(r"C:\Users")));
         session
             .begin_directory_navigation(PathBuf::from(r"C:\Users\DevUser"), NavigationKind::Normal);
-        session.load_state = LoadState::PermissionDenied;
+        assert!(session.fail_directory_navigation(
+            session.latest_request,
+            LoadState::PermissionDenied,
+            "denied".into()
+        ));
 
         let requested = session
             .requested_location
@@ -2497,8 +2885,12 @@ mod tests {
             .expect("failed directory target exists")
             .to_path_buf();
         session.begin_directory_navigation(requested_path.clone(), NavigationKind::Normal);
-        session.commit_pending();
-        session.commit_path(requested_path.clone());
+        assert!(session.finish_directory_navigation(
+            session.latest_request,
+            requested,
+            DirectoryViewPreference::default(),
+            None
+        ));
 
         assert_eq!(session.visible_path(), Some(requested_path.as_path()));
         assert_eq!(
@@ -2514,7 +2906,11 @@ mod tests {
         session.current_location = Some(NavigationLocation::Directory("good".into()));
         session.back_history = vec![NavigationLocation::Directory("older".into())];
         session.begin_directory_navigation("missing".into(), NavigationKind::Normal);
-        session.load_state = LoadState::NotFound;
+        assert!(session.fail_directory_navigation(
+            session.latest_request,
+            LoadState::NotFound,
+            "missing".into()
+        ));
         assert_eq!(
             session.current_location,
             Some(NavigationLocation::Directory("good".into()))
@@ -2535,7 +2931,12 @@ mod tests {
         ];
         session.begin_directory_navigation("one".into(), NavigationKind::Back);
         assert_eq!(session.back_history.len(), 2);
-        session.commit_path("one".into());
+        assert!(session.finish_directory_navigation(
+            session.latest_request,
+            NavigationLocation::Directory("one".into()),
+            DirectoryViewPreference::default(),
+            None
+        ));
         assert!(session.back_history.is_empty());
         assert_eq!(
             session.forward_history,
@@ -2565,7 +2966,12 @@ mod tests {
         session.current_location = Some(NavigationLocation::Directory(PathBuf::from("C:\\成功")));
         session.begin_smart_address_edit();
         session.update_address_input("C:\\不存在📁".to_owned());
-        session.load_state = LoadState::NotFound;
+        session.begin_directory_navigation(PathBuf::from("C:\\不存在📁"), NavigationKind::Normal);
+        assert!(session.fail_directory_navigation(
+            session.latest_request,
+            LoadState::NotFound,
+            "missing".into()
+        ));
         session.cancel_address_edit();
         assert!(!session.address_editing);
         assert_eq!(

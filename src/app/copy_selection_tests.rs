@@ -186,7 +186,7 @@ fn issue_133_completed_selection_reveals_real_projected_list_and_grid() {
             );
             tab.load_state = LoadState::Complete;
             tab.selected = vec![EntryId(118), EntryId(2), EntryId(116)];
-            let request_id = tab.latest_request;
+            let request_id = tab.latest_request();
             focus_bottom_selected_entry(&mut app, tab_id);
             let state = Arc::new(Mutex::new(app));
             refresh_ui_inner(&ui, &state, window_id);
@@ -279,20 +279,28 @@ fn background_reorder_fixture() -> (AppWindow, WindowSessions, RequestId) {
     let window_id = app.active_window;
     let tab_id = app.active().id;
     let tab = app.tab_mut(tab_id).unwrap();
-    tab.latest_request = RequestId(10);
-    tab.load_state = LoadState::Complete;
-    tab.sort_field = SortField::Name;
-    tab.replace_entries(
-        (1..=120)
-            .map(|id| {
-                let extension = if id == 118 { "lnk" } else { "txt" };
-                entry(id, root.join(format!("{id:03}.{extension}")))
-            })
-            .collect(),
+    let (request, _) = tab.begin_directory_navigation(root.clone(), NavigationKind::Normal);
+    assert!(
+        tab.accept_directory_batch(
+            request,
+            (1..=120)
+                .map(|id| {
+                    let extension = if id == 118 { "lnk" } else { "txt" };
+                    entry(id, root.join(format!("{id:03}.{extension}")))
+                })
+                .collect(),
+            DirectoryViewPreference::default(),
+        )
     );
+    assert!(tab.finish_directory_navigation(
+        request,
+        NavigationLocation::Directory(root),
+        DirectoryViewPreference::default(),
+        None
+    ));
     tab.resort_entries();
     tab.select_entry(EntryId(118), false, false);
-    let request_id = tab.latest_request;
+    let request_id = tab.latest_request();
     let state = WindowSessions::new(Arc::new(Mutex::new(app)), window_id);
     let ui = AppWindow::new().unwrap();
     ui.window().set_size(slint::LogicalSize::new(1180.0, 760.0));
@@ -372,7 +380,8 @@ fn issue_133_background_reveal_rejects_stale_request_and_changed_selection() {
             let mut app = state.lock().unwrap();
             let tab = app.tab_mut(TabId(1)).unwrap();
             if request_changed {
-                tab.latest_request = RequestId(request_id.0 + 1);
+                let location = tab.current_location().clone().unwrap();
+                tab.begin_navigation(location, NavigationKind::Refresh);
             } else {
                 tab.select_entry(EntryId(119), false, false);
             }

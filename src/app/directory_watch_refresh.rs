@@ -158,12 +158,12 @@ fn disposition(app: &AppState, pending: &PendingWatch) -> Disposition {
     let Some(tab) = app.tab(pending.tab_id) else {
         return Disposition::Drop;
     };
-    if !tab.accepts(tab.latest_request)
+    if !tab.accepts(tab.latest_request())
         || tab.page_source != PageSource::Directory
         || tab.visible_path() != Some(pending.batch.root.as_path())
-        || (tab.latest_request != pending.observed_request
+        || (tab.latest_request() != pending.observed_request
             && matches!(tab.load_state, LoadState::Loading | LoadState::Partial)
-            && tab.navigation_kind != NavigationKind::Refresh)
+            && tab.navigation_kind() != NavigationKind::Refresh)
     {
         return Disposition::Drop;
     }
@@ -182,7 +182,7 @@ fn disposition(app: &AppState, pending: &PendingWatch) -> Disposition {
 fn prepare_probe(app: &AppState, pending: PendingWatch) -> Probe {
     let tab = app.tab(pending.tab_id).expect("pending tab was checked");
     Probe {
-        request_id: tab.latest_request,
+        request_id: tab.latest_request(),
         visibility: app.file_visibility,
         entries: tab.entries.clone(),
         pending,
@@ -214,7 +214,7 @@ fn probe_is_current(state: &SharedSessions, probe: &Probe) -> bool {
         disposition(&app, &probe.pending) == Disposition::Probe
             && app
                 .tab(probe.pending.tab_id)
-                .is_some_and(|tab| tab.latest_request == probe.request_id)
+                .is_some_and(|tab| tab.latest_request() == probe.request_id)
             && app.file_visibility == probe.visibility
     })
 }
@@ -291,7 +291,7 @@ fn apply_probe_result(
             Disposition::Probe => {}
         }
         let tab = app.tab(pending.tab_id).expect("pending tab was checked");
-        if tab.latest_request != probe.request_id || app.file_visibility != probe.visibility {
+        if tab.latest_request() != probe.request_id || app.file_visibility != probe.visibility {
             return Some(pending);
         }
         crate::operation_audit::record(
@@ -388,7 +388,7 @@ pub(super) fn start_watch_refresh_pump(
                                 &mut pending,
                                 PendingWatch {
                                     tab_id: tab.id,
-                                    observed_request: tab.latest_request,
+                                    observed_request: tab.latest_request(),
                                     batch: batch.clone(),
                                 },
                             );
@@ -429,7 +429,7 @@ pub(super) fn start_watch_refresh_pump(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::EntryId;
+    use crate::domain::{DirectoryViewPreference, EntryId, NavigationLocation};
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -601,7 +601,7 @@ mod tests {
         let committed = {
             let app = state.lock().unwrap();
             let tab = app.tab(TabId(1)).unwrap();
-            assert_eq!(tab.latest_request, request.request_id);
+            assert_eq!(tab.latest_request(), request.request_id);
             assert_eq!(tab.selected, vec![EntryId(1)]);
             assert_eq!(tab.focused, Some(EntryId(1)));
             assert_eq!(tab.selection_anchor, Some(EntryId(1)));
@@ -614,7 +614,7 @@ mod tests {
         assert!(receiver.try_recv().is_err());
         let app = state.lock().unwrap();
         let tab = app.tab(TabId(1)).unwrap();
-        assert_eq!(tab.latest_request, request.request_id);
+        assert_eq!(tab.latest_request(), request.request_id);
         assert_eq!(tab.selected, vec![EntryId(1)]);
         assert_eq!(tab.focused, Some(EntryId(1)));
         assert_eq!(tab.selection_anchor, Some(EntryId(1)));
@@ -658,11 +658,19 @@ mod tests {
             tab.begin_directory_navigation(fixture.0.clone(), NavigationKind::Refresh);
             assert_eq!(disposition(&app, &pending), Disposition::Wait);
             let tab = app.tab_mut(TabId(1)).unwrap();
-            tab.append_pending(vec![fixture.entry("finished.txt", 1)]);
+            assert!(tab.accept_directory_batch(
+                tab.latest_request(),
+                vec![fixture.entry("finished.txt", 1)],
+                DirectoryViewPreference::default()
+            ));
             assert_eq!(disposition(&app, &pending), Disposition::Wait);
             let tab = app.tab_mut(TabId(1)).unwrap();
-            tab.commit_pending();
-            tab.commit_path(fixture.0.clone());
+            assert!(tab.finish_directory_navigation(
+                tab.latest_request(),
+                NavigationLocation::Directory(fixture.0.clone()),
+                DirectoryViewPreference::default(),
+                None
+            ));
             tab.selected = vec![EntryId(1)];
             tab.focused = Some(EntryId(1));
         }
@@ -723,12 +731,24 @@ mod tests {
         let pending = fixture.pending(&["external.txt"]);
         let result = run_probe(&state, pending.clone());
         let (sender, receiver) = mpsc::channel();
-        state
-            .lock()
-            .unwrap()
-            .tab_mut(TabId(1))
-            .unwrap()
-            .latest_request = RequestId(2);
+        {
+            let mut app = state.lock().unwrap();
+            let tab = app.tab_mut(TabId(1)).unwrap();
+            let entries = tab.entries.as_ref().clone();
+            let (request, _) =
+                tab.begin_directory_navigation(fixture.0.clone(), NavigationKind::Refresh);
+            assert!(tab.accept_directory_batch(
+                request,
+                entries,
+                DirectoryViewPreference::default()
+            ));
+            assert!(tab.finish_directory_navigation(
+                request,
+                NavigationLocation::Directory(fixture.0.clone()),
+                DirectoryViewPreference::default(),
+                None
+            ));
+        }
         assert!(apply_probe_result(&state, &sender, result).is_some());
         assert!(receiver.try_recv().is_err());
         let mut app = state.lock().unwrap();
@@ -921,8 +941,12 @@ mod tests {
         for id in [TabId(1), TabId(2)] {
             let tab = app.tab_mut(id).unwrap();
             tab.begin_directory_navigation(fixture.0.clone(), NavigationKind::Refresh);
-            tab.commit_pending();
-            tab.commit_path(fixture.0.clone());
+            assert!(tab.finish_directory_navigation(
+                tab.latest_request(),
+                NavigationLocation::Directory(fixture.0.clone()),
+                DirectoryViewPreference::default(),
+                None
+            ));
         }
         let first = prepare_probe(&app, fixture.pending(&["first-only", "shared"]));
         let mut second_pending = fixture.pending(&["second-only", "shared"]);

@@ -70,6 +70,10 @@ CI 只有仓库读取权限，不发布、不创建标签；同一 PR/引用的�
 
 `python tools/build.py test --locked issue_150 -- --nocapture` 检查本地慢消费者、满队列取消、接收端关闭、重解析路径身份、十万条目真实进程传输和事件泵单回调确认。随后运行 `python tools/build.py test --locked issue_141 -- --nocapture --test-threads=1` 和完整 `python tools/verify.py`（包含 `cargo build --locked`）。专项日志位于 `artifacts/logs/issue-150/`，机器结果和完整验证副本位于 `artifacts/state/issue-150/`。真实 SMB 断网和视觉交互仍由用户验收，不执行 UI 自动化或本地 Release 构建。
 
+## 标签导航状态转换专项验证（#151）
+
+`python tools/build.py test --locked issue_151 -- --nocapture` 检查成功、部分成功、失败、取消、迟到与重复终态、位置身份、历史和网络选择。随后运行 `python tools/verify.py --quick`，包含 Debug 构建。专项日志位于 `artifacts/logs/issue-151/`，机器结果及统一汇总副本位于 `artifacts/state/issue-151/`。真实视觉和交互由用户手动验收，不自动操作 UI，不执行本地 Release 构建。
+
 ## UI 操作与验证
 
 - 禁止 Codex 操作、自动化或尝试控制 AsterFiles 的 UI，包括通过内置浏览器、Chrome、Computer Use、Playwright、agent-browser、截图点击或键鼠模拟等方式。

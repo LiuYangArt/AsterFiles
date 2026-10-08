@@ -452,7 +452,7 @@ fn issue_141_rejected_late_batches_acknowledge_navigation_cancellation_and_close
         } else {
             let tab = app.active();
             assert_eq!(tab.visible_path(), Some(Path::new(r"C:\after-network")));
-            assert!(tab.pending_entries.is_empty());
+            assert!(tab.pending_entries().is_empty());
             assert_eq!(tab.load_state, LoadState::Loading);
         }
     }
@@ -557,11 +557,11 @@ fn issue_141_large_directory_reports_merge_and_model_projection_cost() {
     {
         let app = state.lock().unwrap();
         let tab = app.active();
-        assert_eq!(tab.pending_entries.len(), COUNT as usize);
-        assert_eq!(tab.pending_entries.first().unwrap().id, EntryId(COUNT));
-        assert_eq!(tab.pending_entries.last().unwrap().id, EntryId(1));
+        assert_eq!(tab.pending_entries().len(), COUNT as usize);
+        assert_eq!(tab.pending_entries().first().unwrap().id, EntryId(COUNT));
+        assert_eq!(tab.pending_entries().last().unwrap().id, EntryId(1));
         assert!(
-            tab.pending_entries
+            tab.pending_entries()
                 .windows(2)
                 .all(|pair| pair[0].display_name < pair[1].display_name)
         );

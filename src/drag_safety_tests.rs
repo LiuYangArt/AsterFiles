@@ -13,9 +13,9 @@ fn memory_app() -> AppState {
     );
     let id = app.active().id;
     let tab = app.tab_mut(id).unwrap();
-    tab.load_state = LoadState::Complete;
-    tab.latest_request = RequestId(10);
-    tab.entries = Arc::new(vec![FileEntry {
+    let location = tab.current_location().clone().unwrap();
+    let (request, _) = tab.begin_navigation(location.clone(), NavigationKind::Normal);
+    let entries = vec![FileEntry {
         id: EntryId(7),
         original_name: "Bridge".into(),
         display_name: "Bridge".into(),
@@ -29,8 +29,14 @@ fn memory_app() -> AppState {
         folder_size: FolderSizeState::Unknown,
         modified: None,
         created: None,
-    }]);
-    tab.entry_indices.insert(EntryId(7), 0);
+    }];
+    assert!(tab.accept_directory_batch(request, entries, DirectoryViewPreference::default()));
+    assert!(tab.finish_directory_navigation(
+        request,
+        location,
+        DirectoryViewPreference::default(),
+        None
+    ));
     app
 }
 
@@ -73,7 +79,7 @@ fn issue_93_valid_native_drag_authorizes_original_paths_exactly_once() {
         .take_native_start(&app, 24.0, 20.0)
         .expect("native move crossed threshold");
     assert_eq!(drag.origin_tab, app.active().id);
-    assert_eq!(drag.request_id, RequestId(10));
+    assert_eq!(drag.request_id, app.active().latest_request());
     assert_eq!(
         drag.entries,
         vec![(
@@ -222,7 +228,9 @@ fn actual_file_view_release_cancels_after_model_rebuild(mode: i32, grouped: bool
         activated_events.borrow_mut().push("clicked");
         let mut app = activated_app.borrow_mut();
         let source = app.active().id;
-        app.tab_mut(source).unwrap().latest_request.0 += 1;
+        let tab = app.tab_mut(source).unwrap();
+        let location = tab.current_location().clone().unwrap();
+        tab.begin_navigation(location, NavigationKind::Refresh);
         if let Some(ui) = weak.upgrade() {
             set_probe_rows(&ui);
             if grouped {

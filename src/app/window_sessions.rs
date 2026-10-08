@@ -72,12 +72,7 @@ impl AppState {
         let mut tab_order = Vec::new();
         for location in paths {
             let tab_id = self.allocate_tab_id();
-            let mut tab = if matches!(location, NavigationLocation::Home) {
-                TabSession::new_home(tab_id)
-            } else {
-                TabSession::new(tab_id)
-            };
-            tab.current_location = Some(location);
+            let tab = TabSession::new_at(tab_id, location);
             tabs.insert(tab_id, tab);
             tab_order.push(tab_id);
         }
@@ -487,12 +482,7 @@ impl AppState {
     ) -> Option<TabId> {
         let id = self.allocate_tab_id();
         let location = location.into();
-        let mut tab = if matches!(location, NavigationLocation::Home) {
-            TabSession::new_home(id)
-        } else {
-            TabSession::new(id)
-        };
-        tab.current_location = Some(location);
+        let tab = TabSession::new_at(id, location);
         let window = self.windows.get_mut(&window_id)?;
         window.tabs.insert(id, tab);
         window.tab_order.push(id);
@@ -554,7 +544,7 @@ impl AppState {
             self.ordinary_icon_requests
                 .retain(|(tab_id, _, _)| *tab_id != closing);
             if tab.kind == TabKind::Files
-                && let Some(path) = tab.current_location.take()
+                && let Some(path) = tab.current_location().clone()
             {
                 let window = self.active_window_state_mut();
                 window.closed_tabs.push_front(path);
@@ -607,7 +597,7 @@ impl WindowState {
         self.tab_order
             .iter()
             .filter_map(|id| self.tabs.get(id))
-            .filter_map(|tab| tab.current_location.clone())
+            .filter_map(|tab| tab.current_location().clone())
             .collect()
     }
 
@@ -979,7 +969,7 @@ mod tests {
             [TabId(2), TabId(3), moved]
         );
         assert_eq!(app.active_window_state().active_tab, active);
-        assert_eq!(app.tab(active).unwrap().latest_request, request_id);
+        assert_eq!(app.tab(active).unwrap().latest_request(), request_id);
         assert!(!cancel.load(std::sync::atomic::Ordering::Acquire));
     }
     #[test]
@@ -1049,7 +1039,7 @@ mod tests {
             test_window_placement(160),
         );
         let tab_id = app.window(source).unwrap().active_tab;
-        let request = app.tab(tab_id).unwrap().latest_request;
+        let request = app.tab(tab_id).unwrap().latest_request();
         assert!(app.begin_tab_drag(source, tab_id, 0, 100.0, 20.0));
         app.update_tab_drag(100.0, 80.0, 47.0, 540.0, 0.0, 178.0);
 
@@ -1062,7 +1052,7 @@ mod tests {
             app.window(destination).unwrap().tab_order,
             [TabId(2), tab_id, TabId(3)]
         );
-        assert_eq!(app.tab(tab_id).unwrap().latest_request, request);
+        assert_eq!(app.tab(tab_id).unwrap().latest_request(), request);
     }
     #[test]
     fn cross_window_move_inserts_at_target_and_keeps_single_owner() {
@@ -1081,7 +1071,7 @@ mod tests {
             test_window_placement(160),
         );
         let tab_id = app.window(source).unwrap().tab_order[0];
-        let request = app.tab(tab_id).unwrap().latest_request;
+        let request = app.tab(tab_id).unwrap().latest_request();
         assert!(app.begin_tab_drag(source, tab_id, 0, 100.0, 20.0));
         app.update_tab_drag(100.0, 80.0, 47.0, 540.0, 0.0, 178.0);
 
@@ -1094,7 +1084,7 @@ mod tests {
         );
         assert_eq!(app.window_for_tab(tab_id), Some(destination));
         assert_eq!(app.window(destination).unwrap().active_tab, tab_id);
-        assert_eq!(app.tab(tab_id).unwrap().latest_request, request);
+        assert_eq!(app.tab(tab_id).unwrap().latest_request(), request);
         assert!(!outcome.source_window_closed);
     }
     #[test]
@@ -1266,30 +1256,40 @@ mod tests {
             .tabs
             .get_mut(&TabId(1))
             .unwrap();
-        source.latest_request = RequestId(7);
-        source.load_state = LoadState::Complete;
-        source.replace_entries(vec![FileEntry {
-            id: EntryId(1),
-            original_name: "file.txt".into(),
-            display_name: "file.txt".into(),
-            name_highlights: Vec::new(),
-            path: PathBuf::from("same/file.txt"),
-            kind: crate::domain::EntryKind::File,
-            open_target: None,
-            library_source_index: None,
-            parent_display: "same".into(),
-            size_bytes: Some(1),
-            folder_size: crate::domain::FolderSizeState::Unknown,
-            modified: None,
-            created: None,
-        }]);
+        let location = source.current_location().clone().unwrap();
+        let (source_request, _) = source.begin_navigation(location.clone(), NavigationKind::Normal);
+        assert!(source.accept_directory_batch(
+            source_request,
+            vec![FileEntry {
+                id: EntryId(1),
+                original_name: "file.txt".into(),
+                display_name: "file.txt".into(),
+                name_highlights: Vec::new(),
+                path: PathBuf::from("same/file.txt"),
+                kind: crate::domain::EntryKind::File,
+                open_target: None,
+                library_source_index: None,
+                parent_display: "same".into(),
+                size_bytes: Some(1),
+                folder_size: crate::domain::FolderSizeState::Unknown,
+                modified: None,
+                created: None,
+            }],
+            DirectoryViewPreference::default()
+        ));
+        assert!(source.finish_directory_navigation(
+            source_request,
+            location,
+            DirectoryViewPreference::default(),
+            None
+        ));
         let source_entries = source.entries.clone();
 
         let duplicate = app.duplicate_active_tab().expect("complete tab duplicates");
         let duplicated = app.active_window_state().tabs.get(&duplicate).unwrap();
 
         assert!(Arc::ptr_eq(&source_entries, &duplicated.entries));
-        assert_eq!(duplicated.latest_request, RequestId(7));
+        assert_eq!(duplicated.latest_request(), source_request);
         assert_eq!(duplicated.load_state, LoadState::Complete);
     }
     #[test]
@@ -1299,7 +1299,7 @@ mod tests {
         assert_eq!(app.active_window_state().active_tab, second);
         assert_eq!(app.close_tab(TabId(2)), Some(TabId(1)));
         assert_eq!(
-            app.active().current_location,
+            app.active().current_location().clone(),
             Some(NavigationLocation::Directory(PathBuf::from("one")))
         );
     }
@@ -1313,7 +1313,7 @@ mod tests {
         assert_eq!(app.close_tab(second), Some(third));
         assert_eq!(app.active_window_state().active_tab, third);
         assert_eq!(
-            app.active().current_location,
+            app.active().current_location().clone(),
             Some(NavigationLocation::Directory(PathBuf::from("three")))
         );
         assert!(!app.active_window_state().tabs.contains_key(&second));

@@ -22,7 +22,7 @@ pub(super) fn project(ui: &AppWindow, tab: &TabSession, language: Language) {
         })
         .collect();
     let source = ui.get_breadcrumb_source();
-    let request = tab.latest_request.0.to_string();
+    let request = tab.latest_request().0.to_string();
     if ui.get_breadcrumb_tab_id() == tab.id.0 as i32
         && ui.get_breadcrumb_request_id() == request
         && source.row_count() == labels.len()
@@ -99,7 +99,7 @@ pub(super) fn resolve_target(
 ) -> Option<NavigationLocation> {
     if generation != ui.get_breadcrumb_generation()
         || tab.id.0 as i32 != ui.get_breadcrumb_tab_id()
-        || ui.get_breadcrumb_request_id() != tab.latest_request.0.to_string()
+        || ui.get_breadcrumb_request_id() != tab.latest_request().0.to_string()
     {
         return None;
     }
@@ -116,9 +116,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn tab(id: u32, path: &str) -> TabSession {
-        let mut tab = TabSession::new(TabId(id));
-        tab.current_location = Some(NavigationLocation::Directory(PathBuf::from(path)));
-        tab
+        TabSession::new_at(
+            TabId(id),
+            NavigationLocation::Directory(PathBuf::from(path)),
+        )
     }
 
     #[test]
@@ -197,8 +198,7 @@ mod tests {
             resolve_target(&ui, &network, 0, generation),
             Some(network.breadcrumb_paths()[0].1.clone())
         );
-        let mut home = TabSession::new(TabId(4));
-        home.current_location = Some(NavigationLocation::Home);
+        let home = TabSession::new_home(TabId(4));
         project(&ui, &home, Language::Chinese);
         assert_eq!(ui.get_breadcrumb_source().row_count(), 1);
         assert_eq!(

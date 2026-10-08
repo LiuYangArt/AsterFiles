@@ -214,8 +214,19 @@ fn issue_91_library_does_not_enable_scoped_layout() {
     let (ui, state) = fixture(ViewMode::MediumIcons);
     {
         let mut app = state.lock().unwrap();
-        app.tab_mut(TabId(1)).unwrap().current_location = Some(NavigationLocation::Library(
-            crate::domain::LibraryLocationId::new("shell:test-library".into(), "Test".into()),
+        let tab = app.tab_mut(TabId(1)).unwrap();
+        let location = NavigationLocation::Library(crate::domain::LibraryLocationId::new(
+            "shell:test-library".into(),
+            "Test".into(),
+        ));
+        let entries = tab.entries.as_ref().clone();
+        let (request, _) = tab.begin_navigation(location.clone(), NavigationKind::Normal);
+        assert!(tab.accept_directory_batch(request, entries, DirectoryViewPreference::default()));
+        assert!(tab.finish_directory_navigation(
+            request,
+            location,
+            DirectoryViewPreference::default(),
+            None
         ));
     }
     refresh_ui(&ui, &state);
@@ -240,8 +251,9 @@ fn issue_91_batches_and_shorter_content_keep_full_data_and_bounded_nodes() {
         let mut entries = app.active().visible_entries().to_vec();
         entries.truncate(26);
         let tab = app.tab_mut(TabId(1)).unwrap();
-        tab.pending_entries = entries;
-        tab.load_state = LoadState::Partial;
+        let location = tab.current_location().clone().unwrap();
+        let (request, _) = tab.begin_navigation(location, NavigationKind::Refresh);
+        assert!(tab.accept_directory_batch(request, entries, DirectoryViewPreference::default()));
     }
     refresh_ui(&ui, &state);
     settle(&ui);
@@ -259,7 +271,10 @@ fn issue_91_batches_and_shorter_content_keep_full_data_and_bounded_nodes() {
     {
         let mut app = state.lock().unwrap();
         let entries = app.active().entries[..300].to_vec();
-        app.tab_mut(TabId(1)).unwrap().pending_entries = entries;
+        let tab = app.tab_mut(TabId(1)).unwrap();
+        let location = tab.current_location().clone().unwrap();
+        let (request, _) = tab.begin_navigation(location, NavigationKind::Refresh);
+        assert!(tab.accept_directory_batch(request, entries, DirectoryViewPreference::default()));
     }
     refresh_ui(&ui, &state);
     settle(&ui);
@@ -292,7 +307,7 @@ fn issue_97_intermediate_zoom_preserves_grouped_anchor_and_selection() {
         let mut app = state.lock().unwrap();
         let tab = app.tab_mut(TabId(1)).unwrap();
         tab.select_entry(id, false, false);
-        tab.latest_request
+        tab.latest_request()
     };
     update_file_rows(&ui, &state.shared, TabId(1), &HashSet::from([id]));
     let original_screen_y =
@@ -338,7 +353,7 @@ fn issue_97_intermediate_zoom_preserves_grouped_anchor_and_selection() {
         let app = state.lock().unwrap();
         let tab = app.active();
         assert_eq!(tab.id, TabId(1));
-        assert_eq!(tab.latest_request, request_id);
+        assert_eq!(tab.latest_request(), request_id);
         assert_eq!(tab.selected, vec![id]);
         assert_eq!(tab.focused, Some(id));
         assert_eq!(tab.visible_entries().len(), 1200);
@@ -362,7 +377,7 @@ fn resize_window(ui: &AppWindow, state: &WindowSessions, width: f32, height: f32
 }
 
 fn latest_request(state: &WindowSessions) -> RequestId {
-    state.lock().unwrap().active().latest_request
+    state.lock().unwrap().active().latest_request()
 }
 
 fn assert_grid_reflow(ui: &AppWindow, state: &WindowSessions, width: f32, mode: ViewMode) {

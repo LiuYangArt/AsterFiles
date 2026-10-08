@@ -210,96 +210,45 @@ fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
 }
 
 pub fn apply_scenario(session: &mut TabSession, scenario: AgentScenario) {
-    match scenario {
-        AgentScenario::PermissionDenied => {
-            session.current_location = Some(crate::domain::NavigationLocation::Directory(
-                PathBuf::from(r"C:\AgentScenarios"),
-            ));
-            session.requested_location = Some(crate::domain::NavigationLocation::Directory(
-                PathBuf::from(r"C:\AgentScenarios\PermissionDenied"),
-            ));
-            session.load_state = LoadState::PermissionDenied;
-            session.error = Some("permission denied".to_owned());
-        }
-        AgentScenario::DragDropFoundation => {
-            session.current_location = Some(crate::domain::NavigationLocation::Directory(
-                PathBuf::from(r"C:\AgentScenarios\DragDrop"),
-            ));
-            session.load_state = LoadState::Complete;
-        }
-        AgentScenario::MultiWindowStateLayering => {
-            session.current_location = Some(crate::domain::NavigationLocation::Directory(
-                PathBuf::from(r"C:\AgentScenarios\MultiWindow"),
-            ));
-            session.load_state = LoadState::Complete;
-        }
-        AgentScenario::TabReorder => {
-            session.current_location = Some(crate::domain::NavigationLocation::Directory(
-                PathBuf::from(r"C:\AgentScenarios\TabReorder"),
-            ));
-            session.load_state = LoadState::Complete;
-        }
-        AgentScenario::TabDetach => {
-            session.current_location = Some(crate::domain::NavigationLocation::Directory(
-                PathBuf::from(r"C:\AgentScenarios\TabDetach"),
-            ));
-            session.load_state = LoadState::Complete;
-        }
-        AgentScenario::TabCrossWindow => {
-            session.current_location = Some(crate::domain::NavigationLocation::Directory(
-                PathBuf::from(r"C:\AgentScenarios\TabCrossWindow"),
-            ));
-            session.load_state = LoadState::Complete;
-        }
-        AgentScenario::ExplorerPins => {
-            session.current_location = Some(crate::domain::NavigationLocation::Directory(
-                PathBuf::from(r"C:\AgentScenarios\ExplorerPins"),
-            ));
-            session.load_state = LoadState::Complete;
-        }
-        AgentScenario::WindowsLibraries => {
-            session.current_location = Some(crate::domain::NavigationLocation::Directory(
-                PathBuf::from(r"C:\AgentScenarios\WindowsLibraries"),
-            ));
-            session.load_state = LoadState::Complete;
-        }
-        AgentScenario::QuickAccess => {
-            session.current_location = Some(crate::domain::NavigationLocation::Directory(
-                PathBuf::from(r"C:\AgentScenarios\QuickAccess"),
-            ));
-            session.load_state = LoadState::Complete;
-        }
-        AgentScenario::ShellThumbnail => {
-            session.current_location = Some(crate::domain::NavigationLocation::Directory(
-                PathBuf::from(r"C:\AgentScenarios\ShellThumbnail"),
-            ));
-            session.load_state = LoadState::Complete;
-        }
-        AgentScenario::FolderSizeScheduler
-        | AgentScenario::ThumbnailScheduler
-        | AgentScenario::QuickMenuSearch
-        | AgentScenario::QuickMenuPopup
-        | AgentScenario::NetworkFoundation
-        | AgentScenario::DriveCapacity
-        | AgentScenario::Home
-        | AgentScenario::AgentActions
-        | AgentScenario::FileListTypeSelect => {
-            session.current_location = if scenario == AgentScenario::Home {
-                Some(crate::domain::NavigationLocation::Home)
-            } else {
-                Some(crate::domain::NavigationLocation::Directory(PathBuf::from(
-                    r"C:\AgentScenarios\FolderSizes",
-                )))
-            };
-            session.load_state = LoadState::Complete;
-        }
-        AgentScenario::FileOperationCenter => {
-            session.current_location = Some(crate::domain::NavigationLocation::Directory(
-                PathBuf::from(r"C:\AgentScenarios\FileOperations"),
-            ));
-            session.load_state = LoadState::Complete;
-            session.error = Some(scenario.name().to_owned());
-        }
+    use crate::domain::{DirectoryViewPreference, NavigationKind, NavigationLocation};
+
+    if scenario == AgentScenario::Home {
+        session.navigate_home(NavigationKind::Normal);
+        return;
+    }
+    let directory = match scenario {
+        AgentScenario::PermissionDenied => "",
+        AgentScenario::DragDropFoundation => "DragDrop",
+        AgentScenario::MultiWindowStateLayering => "MultiWindow",
+        AgentScenario::TabReorder => "TabReorder",
+        AgentScenario::TabDetach => "TabDetach",
+        AgentScenario::TabCrossWindow => "TabCrossWindow",
+        AgentScenario::ExplorerPins => "ExplorerPins",
+        AgentScenario::WindowsLibraries => "WindowsLibraries",
+        AgentScenario::QuickAccess => "QuickAccess",
+        AgentScenario::ShellThumbnail => "ShellThumbnail",
+        AgentScenario::FileOperationCenter => "FileOperations",
+        _ => "FolderSizes",
+    };
+    let location =
+        NavigationLocation::Directory(PathBuf::from(r"C:\AgentScenarios").join(directory));
+    let entries = session.entries.as_ref().clone();
+    let (request, _) = session.begin_navigation(location.clone(), NavigationKind::Normal);
+    let preference = DirectoryViewPreference::default();
+    assert!(session.accept_directory_batch(request, entries, preference));
+    let warning =
+        (scenario == AgentScenario::FileOperationCenter).then(|| scenario.name().to_owned());
+    assert!(session.finish_directory_navigation(request, location, preference, warning));
+    if scenario == AgentScenario::PermissionDenied {
+        let (request, _) = session.begin_directory_navigation(
+            PathBuf::from(r"C:\AgentScenarios\PermissionDenied"),
+            NavigationKind::Normal,
+        );
+        assert!(session.fail_directory_navigation(
+            request,
+            LoadState::PermissionDenied,
+            "permission denied".to_owned()
+        ));
     }
 }
 

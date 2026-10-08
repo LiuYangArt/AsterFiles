@@ -27,7 +27,7 @@ pub(super) fn project_page_state(
         let weak = ui.as_weak();
         let state = state.clone();
         let tab_id = tab.id;
-        let request_id = tab.latest_request;
+        let request_id = tab.latest_request();
         // Delay only the hint; navigation and batches continue without waiting for this timer.
         slint::Timer::single_shot(NETWORK_LOADING_HINT_DELAY, move || {
             let Some(ui) = weak.upgrade() else {
@@ -42,7 +42,7 @@ pub(super) fn project_page_state(
                         && window.tabs.get(&tab_id).is_some_and(|tab| {
                             tab.accepts(request_id)
                                 && tab.load_state == LoadState::Loading
-                                && tab.pending_entries.is_empty()
+                                && tab.pending_entries().is_empty()
                                 && is_network_directory(tab)
                         })
                 })
@@ -98,7 +98,7 @@ mod tests {
             let (ui, state) = fixture();
             advance(elapsed);
             assert_eq!(ui.get_loading_hint_visible(), elapsed == 500);
-            let request_id = state.lock().unwrap().active().latest_request;
+            let request_id = state.lock().unwrap().active().latest_request();
             let item = FileEntry {
                 id: EntryId(1),
                 original_name: "file.txt".into(),

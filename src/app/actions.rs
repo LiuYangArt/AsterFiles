@@ -137,7 +137,7 @@ pub(super) fn target(state: &WindowSessions) -> Result<ActionTarget, ActionError
     Ok(ActionTarget {
         window_id: state.window_id,
         tab_id: tab.id,
-        request_id: tab.latest_request,
+        request_id: tab.latest_request(),
     })
 }
 fn checked_tab(app: &AppState, target: ActionTarget) -> Result<&TabSession, ActionError> {
@@ -148,7 +148,7 @@ fn checked_tab(app: &AppState, target: ActionTarget) -> Result<&TabSession, Acti
         .tabs
         .get(&target.tab_id)
         .ok_or(ActionError::TabClosed)?;
-    if tab.latest_request != target.request_id {
+    if tab.latest_request() != target.request_id {
         return Err(ActionError::StaleRequest);
     }
     Ok(tab)
@@ -194,7 +194,7 @@ pub(super) fn snapshot(
             let target = ActionTarget {
                 window_id,
                 tab_id: tab.id,
-                request_id: tab.latest_request,
+                request_id: tab.latest_request(),
             };
             let files = tab.kind == TabKind::Files;
             let loading = matches!(tab.load_state, LoadState::Loading | LoadState::Partial);
@@ -384,9 +384,9 @@ fn navigate(
                 return Err(ActionError::NotAllowed);
             }
             (
-                tab.requested_location
+                tab.requested_location()
                     .clone()
-                    .or_else(|| tab.current_location.clone())
+                    .or_else(|| tab.current_location().clone())
                     .ok_or(ActionError::NotAllowed)?,
                 NavigationKind::Refresh,
             )
@@ -425,7 +425,7 @@ fn navigate(
     }
     Ok(ActionReceipt::DirectoryAccepted {
         target: ActionTarget {
-            request_id: tab.latest_request,
+            request_id: tab.latest_request(),
             ..target
         },
     })
@@ -581,7 +581,11 @@ mod tests {
             let tab = active_tab(&mut app);
             tab.replace_entries(vec![entry(1, r"C:\old\same.txt")]);
             tab.begin_directory_navigation(PathBuf::from(r"C:\new"), NavigationKind::Normal);
-            tab.append_pending(vec![entry(2, r"C:\new\same.txt")]);
+            assert!(tab.accept_directory_batch(
+                tab.latest_request(),
+                vec![entry(2, r"C:\new\same.txt")],
+                DirectoryViewPreference::default()
+            ));
         }
         let view = snapshot(&state, window.window_id).unwrap();
         assert_eq!(view.tabs[0].entries.len(), 1);
@@ -663,8 +667,14 @@ mod tests {
                     default_save_path: None,
                 });
             let tab = active_tab(&mut app);
-            tab.current_location = Some(NavigationLocation::Library(location));
-            tab.load_state = LoadState::Complete;
+            let location = NavigationLocation::Library(location);
+            let (request, _) = tab.begin_navigation(location.clone(), NavigationKind::Normal);
+            assert!(tab.finish_directory_navigation(
+                request,
+                location,
+                DirectoryViewPreference::default(),
+                None
+            ));
         }
         let target = target(&window).unwrap();
         assert!(matches!(
@@ -834,7 +844,7 @@ mod tests {
         let before = snapshot(&state, window.window_id).unwrap().revision;
         let id = {
             let mut app = state.lock().unwrap();
-            active_tab(&mut app).current_location = Some(NavigationLocation::Home);
+            active_tab(&mut app).navigate_home(NavigationKind::Normal);
             let tab_id = app.active().id;
             app.operations.submit_preparing(tab_id, Vec::new())
         };
