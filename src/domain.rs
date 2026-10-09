@@ -1153,6 +1153,29 @@ impl TabSession {
         }
     }
 
+    pub fn rename_loaded_entry(&mut self, old: &Path, new: &Path) -> Option<EntryId> {
+        if self.page_source != PageSource::Directory || self.load_state != LoadState::Complete {
+            return None;
+        }
+        let index = self.entries.iter().position(|entry| entry.path == old)?;
+        let name = new.file_name()?.to_owned();
+        let entry = &mut Arc::make_mut(&mut self.entries)[index];
+        let id = entry.id;
+        if old.extension().map(|ext| ext.to_ascii_lowercase())
+            != new.extension().map(|ext| ext.to_ascii_lowercase())
+            && entry.open_target.is_some()
+        {
+            entry.open_target = None;
+            entry.kind = EntryKind::File;
+        }
+        entry.path = new.to_path_buf();
+        entry.original_name = name;
+        entry.display_name = entry.original_name.to_string_lossy().into_owned();
+        entry.name_highlights.clear();
+        self.resort_entries();
+        Some(id)
+    }
+
     pub fn replace_entries(&mut self, entries: Vec<FileEntry>) {
         self.entry_indices = entries
             .iter()

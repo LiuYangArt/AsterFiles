@@ -117,3 +117,7 @@ CI 只有仓库读取权限，不发布、不创建标签；同一 PR/引用的�
 
 UI/交互参考 Files， 源码： F:\CodeProjects\Files
 网络部分参考WinSCP https://github.com/LiuYangArt/winscp
+
+## 文件名与缩略图专项验证（#154、#155、#156）
+
+运行 `python tools/verify.py --quick`，覆盖无窗口名称编辑、局部改名与缓存保留、目录监听并发、内容和详细信息视图缩略图，并更新 Debug 程序。专项回归可用 `python tools/build.py test --locked issue_154 -- --nocapture`、`issue_155` 和 `issue_156`（替换过滤词）。日志位于 `artifacts/logs/issue-154-156/`、`artifacts/logs/issue-155/` 和 `artifacts/logs/verify-test.log`，汇总为 `artifacts/verify/summary.json`。真实折行、选区、光标、缩略图及窗口边缘由用户验收；不自动操作 AsterFiles UI，不构建本地 Release。步骤见 `docs/agent/debug-validation.md`。

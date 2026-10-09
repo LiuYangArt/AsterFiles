@@ -395,8 +395,13 @@ fn issue_141_grouped_and_grid_projections_keep_the_sorted_order_within_each_grou
         } else {
             vec![3, 4, 2, 1, 5]
         };
-        let list =
-            projected_directory_rows(tab.visible_entries(), tab, Texts::new(app.language), &app);
+        let list = projected_directory_rows(
+            tab.visible_entries(),
+            tab,
+            Texts::new(app.language),
+            &app,
+            None,
+        );
         assert_eq!(
             list.iter()
                 .filter(|row| !row.group_header)

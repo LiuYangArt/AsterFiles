@@ -70,6 +70,7 @@ mod library_loading;
 mod loading_hint;
 #[cfg(test)]
 mod network_sort_tests;
+mod rename_updates;
 #[cfg(test)]
 mod test_support;
 mod window_sessions;
@@ -1676,6 +1677,20 @@ fn update_grid_thumbnail_residents(ui: &AppWindow, window_id: WindowId, wanted: 
     });
     let positions = GRID_ENTRY_POSITIONS
         .with_borrow(|by_window| by_window.get(&window_id).cloned().unwrap_or_default());
+    let list = ui.get_files();
+    if let Some(rows) = list.as_any().downcast_ref::<VecModel<FileRow>>() {
+        let removed_ids = removed.iter().copied().collect::<HashSet<_>>();
+        for index in 0..rows.row_count() {
+            if let Some(mut row) = rows.row_data(index)
+                && removed_ids.contains(&EntryId(row.id as u32))
+                && matches!(row.thumbnail_state, 2 | 4)
+            {
+                row.icon = Image::default();
+                row.thumbnail_state = 1;
+                rows.set_row_data(index, row);
+            }
+        }
+    }
     let grid = ui.get_grid_rows();
     for entry_id in removed {
         let Some((row_index, entry_index)) = positions.get(&entry_id).copied() else {
@@ -1806,19 +1821,23 @@ fn ordinary_icon_request(
     })
 }
 
-fn list_icon_plan(ui: &AppWindow, state: &SharedSessions, window_id: WindowId) -> Vec<IconRequest> {
+fn list_icon_plan(
+    ui: &AppWindow,
+    state: &SharedSessions,
+    window_id: WindowId,
+) -> (HashSet<EntryId>, Vec<IconRequest>) {
     let mut app = state.lock().expect("app state mutex is not poisoned");
     let Some(tab) = app
         .window(window_id)
         .and_then(|window| window.tabs.get(&window.active_tab))
     else {
-        return Vec::new();
+        return (HashSet::new(), Vec::new());
     };
     let Some(view_mode) = app.view_mode_for_tab(tab.id) else {
-        return Vec::new();
+        return (HashSet::new(), Vec::new());
     };
     if tab.kind != TabKind::Files || view_mode.uses_grid_layout() {
-        return Vec::new();
+        return (HashSet::new(), Vec::new());
     }
     let row_height = file_layout_geometry(view_mode).row_height;
     let height = ui.get_file_viewport_height().max(row_height);
@@ -1850,10 +1869,19 @@ fn list_icon_plan(ui: &AppWindow, state: &SharedSessions, window_id: WindowId) -
         }
         row_top = row_bottom;
     }
-    entries
+    let residents = entries.iter().map(|entry| entry.id).collect();
+    let requested_px = file_thumbnail_request_px(view_mode, ui.window().scale_factor());
+    let requests = entries
         .iter()
-        .filter_map(|entry| ordinary_icon_request(&mut app, tab_id, request_id, entry))
-        .collect()
+        .filter_map(|entry| {
+            if let Some(px) = requested_px {
+                thumbnail_request(&mut app, tab_id, request_id, entry, px)
+            } else {
+                ordinary_icon_request(&mut app, tab_id, request_id, entry)
+            }
+        })
+        .collect();
+    (residents, requests)
 }
 
 fn grid_thumbnail_plan(
@@ -1916,36 +1944,49 @@ fn grid_thumbnail_plan(
     let resident_ids = entries.iter().map(|entry| entry.id).collect::<HashSet<_>>();
     let mut requests = Vec::new();
     for entry in entries {
-        if crate::network::is_unc_path(&entry.path) {
-            if let Some(request) = ordinary_icon_request(&mut app, tab_id, request_id, &entry) {
-                requests.push(request);
-            }
-            continue;
-        }
-        if !app
-            .thumbnail_cache
-            .contains_key(&(entry.path.clone(), requested_px))
-            && !app
-                .grid_icon_cache
-                .contains_key(&(entry.path.clone(), requested_px))
-            && thumbnail_retry_due(
-                app.thumbnail_failures
-                    .get(&(tab_id, request_id, entry.path.clone(), requested_px)),
-                Instant::now(),
-            )
+        if let Some(request) = thumbnail_request(&mut app, tab_id, request_id, &entry, requested_px)
         {
-            requests.push(IconRequest {
-                tab_id,
-                request_id,
-                target: IconTarget::Entry(entry.id),
-                path: entry.path.clone(),
-                thumbnail: true,
-                requested_px,
-                type_key: None,
-            });
+            requests.push(request);
         }
     }
     (tab_id, resident_ids, requests)
+}
+
+fn file_thumbnail_request_px(view_mode: ViewMode, scale: f32) -> Option<u32> {
+    (view_mode.uses_grid_layout() || matches!(view_mode, ViewMode::Details | ViewMode::Content))
+        .then(|| grid_thumbnail_request_px(view_mode, scale))
+}
+
+fn thumbnail_request(
+    app: &mut AppState,
+    tab_id: TabId,
+    request_id: RequestId,
+    entry: &FileEntry,
+    requested_px: u32,
+) -> Option<IconRequest> {
+    if crate::network::is_unc_path(&entry.path) {
+        return ordinary_icon_request(app, tab_id, request_id, entry);
+    }
+    let key = (entry.path.clone(), requested_px);
+    if app.thumbnail_cache.contains_key(&key)
+        || app.grid_icon_cache.contains_key(&key)
+        || !thumbnail_retry_due(
+            app.thumbnail_failures
+                .get(&(tab_id, request_id, entry.path.clone(), requested_px)),
+            Instant::now(),
+        )
+    {
+        return None;
+    }
+    Some(IconRequest {
+        tab_id,
+        request_id,
+        target: IconTarget::Entry(entry.id),
+        path: entry.path.clone(),
+        thumbnail: true,
+        requested_px,
+        type_key: None,
+    })
 }
 
 fn thumbnail_retry_due(failure: Option<&(u8, Instant)>, now: Instant) -> bool {
@@ -1961,12 +2002,28 @@ fn request_visible_file_images(
     window_id: WindowId,
     scheduler: &ThumbnailScheduler,
 ) {
-    let (tab_id, resident_ids, mut requests) = grid_thumbnail_plan(ui, state, window_id);
-    requests.extend(list_icon_plan(ui, state, window_id));
+    let (tab_id, mut resident_ids, mut requests) = grid_thumbnail_plan(ui, state, window_id);
+    let (list_residents, list_requests) = list_icon_plan(ui, state, window_id);
+    resident_ids.extend(list_residents);
+    requests.extend(list_requests);
     update_grid_thumbnail_residents(ui, window_id, &resident_ids);
     if tab_id.0 != 0 {
         update_file_rows(ui, state, tab_id, &resident_ids);
         scheduler.replace(tab_id, requests);
+    }
+}
+
+fn request_completed_file_images(
+    ui: &AppWindow,
+    state: &SharedSessions,
+    tab_id: TabId,
+    scheduler: &ThumbnailScheduler,
+) {
+    let window_id = state.lock().ok().and_then(|app| app.window_for_tab(tab_id));
+    if let Some(window_id) = window_id {
+        // Final projection and focus can change both entry identities and the visible range.
+        request_visible_file_images(ui, state, window_id, scheduler);
+        defer_visible_file_images(state.clone(), tab_id, scheduler.clone());
     }
 }
 
@@ -3194,7 +3251,7 @@ fn file_layout_geometry(view_mode: ViewMode) -> FileLayoutGeometry {
         ViewMode::Icons(size) => {
             let logical_size = f32::from(size);
             let compact = size <= 16;
-            let card_height = if compact { 24.0 } else { logical_size + 44.0 };
+            let card_height = if compact { 24.0 } else { logical_size + 68.0 };
             FileLayoutGeometry {
                 row_height: card_height + 8.0,
                 card_width: if compact {
@@ -4292,7 +4349,12 @@ pub fn run(
     } else {
         EverythingRequest::TestConnection(0)
     });
-    start_icon_event_pump(&ui, icon_receiver, state.clone(), thumbnail_scheduler);
+    start_icon_event_pump(
+        &ui,
+        icon_receiver,
+        state.clone(),
+        thumbnail_scheduler.clone(),
+    );
     start_shortcut_event_pump(&ui, shortcut_receiver, state.clone());
     start_file_operation_event_pump(
         &ui,
@@ -4304,6 +4366,9 @@ pub fn run(
         operation_sender.clone(),
         request_sender.clone(),
         network_request_sender.clone(),
+        everything_sender.clone(),
+        shortcut_sender.clone(),
+        thumbnail_scheduler,
         state.clone(),
     );
     start_shell_menu_event_pump(
@@ -17313,6 +17378,9 @@ fn start_file_operation_event_pump(
     sender: mpsc::Sender<FileOperationRequest>,
     directory_sender: mpsc::Sender<DirectoryRequest>,
     network_directory_sender: mpsc::SyncSender<DirectoryRequest>,
+    everything_sender: mpsc::Sender<EverythingRequest>,
+    shortcut_sender: mpsc::SyncSender<ShortcutRequest>,
+    thumbnail_scheduler: ThumbnailScheduler,
     state: SharedSessions,
 ) {
     let weak = ui.as_weak();
@@ -17454,6 +17522,9 @@ fn start_file_operation_event_pump(
             let directory_sender = directory_sender.clone();
             let network_directory_sender = network_directory_sender.clone();
             let state = state.clone();
+            let everything_sender = everything_sender.clone();
+            let shortcut_sender = shortcut_sender.clone();
+            let thumbnail_scheduler = thumbnail_scheduler.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 let event_operation_id = match &event {
                     FileOperationEvent::DestinationCreated { id, .. }
@@ -17672,6 +17743,7 @@ fn start_file_operation_event_pump(
                             clear_completed_cut,
                             undo_failure,
                             containment_notice,
+                            rename_update,
                         }) = finish_file_operation(&state, event)
                         else {
                             return;
@@ -17707,6 +17779,15 @@ fn start_file_operation_event_pump(
                         if let Some(request) = next {
                             let _ = sender.send(request);
                         }
+                        rename_updates::present(
+                            &state,
+                            rename_update,
+                            &directory_sender,
+                            &network_directory_sender,
+                            &everything_sender,
+                            &shortcut_sender,
+                            &thumbnail_scheduler,
+                        );
                         refresh_operation_badges(&state);
                         let affected_roots = affected_drive_roots(&affected);
                         if !affected_roots.is_empty() {
@@ -18151,6 +18232,12 @@ fn start_event_pump(
                                     &target_ui,
                                     tab_id,
                                     request_id,
+                                );
+                                request_completed_file_images(
+                                    &target_ui,
+                                    &state,
+                                    tab_id,
+                                    &thumbnail_scheduler,
                                 );
                             }
                             if network_root_finished {
@@ -19727,8 +19814,8 @@ fn submit_search(
         let mut app = state.lock().expect("app state mutex is not poisoned");
         app.cancel_column_drag();
         let library_sources = app
-            .active()
-            .visible_location()
+            .tab(tab_id)
+            .and_then(TabSession::visible_location)
             .and_then(|location| match location {
                 NavigationLocation::Home => None,
                 NavigationLocation::Library(library) => app
@@ -21510,6 +21597,7 @@ fn append_active_file_rows(
                     tab,
                     texts,
                     &app,
+                    file_thumbnail_request_px(mode, ui.window().scale_factor()),
                 ))));
             }
             restore_zoom_anchor(ui, anchor);
@@ -21542,7 +21630,16 @@ fn append_active_file_rows(
         {
             continue;
         }
-        model.insert(index, file_row(entry, tab, texts, &app, None));
+        model.insert(
+            index,
+            file_row(
+                entry,
+                tab,
+                texts,
+                &app,
+                file_thumbnail_request_px(app.active_view_mode(), ui.window().scale_factor()),
+            ),
+        );
     }
     if let Some((id, screen_y)) = anchor
         && let Some(index) = tab.visible_entry_index(id)
@@ -21677,9 +21774,7 @@ fn update_file_rows(
     let Some(view_mode) = app.view_mode_for_tab(tab_id) else {
         return;
     };
-    let grid_requested_px = view_mode
-        .uses_grid_layout()
-        .then(|| grid_thumbnail_request_px(view_mode, ui.window().scale_factor()));
+    let grid_requested_px = file_thumbnail_request_px(view_mode, ui.window().scale_factor());
     let rows = changed
         .iter()
         .filter_map(|id| tab.visible_entry(*id))
@@ -22620,6 +22715,7 @@ fn projected_directory_rows(
     tab: &TabSession,
     texts: Texts,
     app: &AppState,
+    requested_px: Option<u32>,
 ) -> Vec<FileRow> {
     let groups = directory_group_projections(app, tab, entries);
     let by_id = entries
@@ -22642,7 +22738,7 @@ fn projected_directory_rows(
         } => Some(group_header_file_row(&label, &detail, entry_count)),
         ListVisualRow::Entry { entry_id } => by_id
             .get(&entry_id)
-            .map(|entry| file_row(entry, tab, texts, app, None)),
+            .map(|entry| file_row(entry, tab, texts, app, requested_px)),
     })
     .collect()
 }
@@ -22769,7 +22865,30 @@ fn shell_integration_projection(
         ),
     }
 }
+fn dismiss_stale_rename(ui: &AppWindow, state: &SharedSessions, window_id: WindowId) {
+    if !ui.get_rename_editing() {
+        return;
+    }
+    let mut app = state.lock().expect("app state mutex is not poisoned");
+    let current = app.rename_targets.get(&window_id).is_some_and(|target| {
+        app.window(window_id).is_some_and(|window| {
+            window.active_tab == target.tab.tab_id
+                && window.tabs.get(&target.tab.tab_id).is_some_and(|tab| {
+                    tab.latest_request() == target.tab.request_id
+                        && tab.visible_entry(target.entry_id).is_some()
+                })
+        })
+    });
+    if !current {
+        app.rename_targets.remove(&window_id);
+        drop(app);
+        ui.set_rename_editing(false);
+        ui.set_rename_submitting(false);
+    }
+}
+
 fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId) {
+    dismiss_stale_rename(ui, state, window_id);
     ui.invoke_cancel_internal_drag();
     let app = state.lock().expect("app state mutex is not poisoned");
     let texts = Texts::new(app.language);
@@ -22945,9 +23064,20 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
         (Vec::new(), grid_rows)
     } else {
         let file_rows = if tab.page_source == PageSource::Search {
-            search_window_rows(tab, &app, search_window, None)
+            search_window_rows(
+                tab,
+                &app,
+                search_window,
+                file_thumbnail_request_px(view_mode, ui.window().scale_factor()),
+            )
         } else {
-            projected_directory_rows(display_entries, tab, texts, &app)
+            projected_directory_rows(
+                display_entries,
+                tab,
+                texts,
+                &app,
+                file_thumbnail_request_px(view_mode, ui.window().scale_factor()),
+            )
         };
         (file_rows, Vec::new())
     };
@@ -25911,9 +26041,9 @@ mod tests {
             (ViewMode::Details, 32.0, 0.0, 32.0),
             (ViewMode::List, 30.0, 0.0, 30.0),
             (ViewMode::SmallIcons, 32.0, 180.0, 24.0),
-            (ViewMode::MediumIcons, 100.0, 88.0, 92.0),
-            (ViewMode::LargeIcons, 148.0, 112.0, 140.0),
-            (ViewMode::ExtraLargeIcons, 308.0, 272.0, 300.0),
+            (ViewMode::MediumIcons, 124.0, 88.0, 116.0),
+            (ViewMode::LargeIcons, 172.0, 112.0, 164.0),
+            (ViewMode::ExtraLargeIcons, 332.0, 272.0, 324.0),
             (ViewMode::Tiles, 78.0, 292.0, 70.0),
             (ViewMode::Content, 68.0, 0.0, 68.0),
         ] {
@@ -27341,12 +27471,12 @@ mod tests {
         assert_eq!(grid_window.start % 4, 0);
         assert_eq!(
             search_window_viewport_y(
-                -16_384.0 * 100.0 - 17.5,
+                -16_384.0 * 124.0 - 17.5,
                 grid_window,
                 ViewMode::MediumIcons,
                 4
             ),
-            -64.0 * 100.0 - 17.5
+            -64.0 * 124.0 - 17.5
         );
     }
     #[test]
@@ -27360,7 +27490,7 @@ mod tests {
             65_536
         );
         assert_eq!(
-            search_result_index_at_scroll(-16_384.0 * 100.0, 133_796, ViewMode::MediumIcons, 4),
+            search_result_index_at_scroll(-16_384.0 * 124.0, 133_796, ViewMode::MediumIcons, 4),
             65_536
         );
         assert_eq!(
@@ -27385,7 +27515,8 @@ mod tests {
     #[test]
     fn issue_99_switch_to_list_dispatches_missing_icons_once_and_uses_completed_cache() {
         i_slint_backend_testing::init_no_event_loop();
-        for mode in [ViewMode::List, ViewMode::Details] {
+        {
+            let mode = ViewMode::List;
             let ui = AppWindow::new().unwrap();
             ui.window().set_size(slint::LogicalSize::new(1180.0, 760.0));
             let state = issue_98_state();
@@ -27588,6 +27719,188 @@ mod tests {
         advance_test_navigation(tab, RequestId(12));
         tab.replace_entries(vec![focus_entry(1, r"C:\grid\model.mtl")]);
         Arc::new(Mutex::new(app))
+    }
+
+    #[test]
+    fn issue_155_completed_rename_refresh_requests_new_path_and_restores_thumbnail() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().unwrap();
+        ui.window().set_size(slint::LogicalSize::new(1180.0, 760.0));
+        let state = issue_98_state();
+        let sessions = WindowSessions::new(state.clone(), WindowId(1));
+        let (sender, _) = mpsc::channel();
+        let scheduler = ThumbnailScheduler::new(sender);
+        let old_path = PathBuf::from(r"C:\grid\before.png");
+        let new_path = PathBuf::from(r"C:\grid\after.png");
+        {
+            let mut app = state.lock().unwrap();
+            app.update_directory_preference(PathBuf::from(r"C:\grid"), |view| {
+                view.view_mode = ViewMode::MediumIcons
+            });
+            app.thumbnail_cache.insert((old_path, 48), test_image(48));
+            let tab = app.tab_mut(TabId(1)).unwrap();
+            advance_test_navigation(tab, RequestId(13));
+            tab.load_state = LoadState::Loading;
+        }
+        assert!(
+            apply_event(
+                &state,
+                DirectoryEvent::Batch {
+                    acknowledgement: mpsc::channel().0,
+                    tab_id: TabId(1),
+                    request_id: RequestId(13),
+                    entries: vec![focus_entry(8, new_path.to_str().unwrap())],
+                }
+            )
+            .accepted
+        );
+        assert!(
+            apply_event(
+                &state,
+                DirectoryEvent::Finished {
+                    tab_id: TabId(1),
+                    request_id: RequestId(13),
+                    path: PathBuf::from(r"C:\grid"),
+                    skipped: 0,
+                    source_failures: 0,
+                    library: None,
+                }
+            )
+            .accepted
+        );
+        refresh_ui(&ui, &sessions);
+        let first = || {
+            ui.get_grid_rows()
+                .row_data(0)
+                .unwrap()
+                .entries
+                .row_data(0)
+                .unwrap()
+        };
+        assert_eq!(first().icon.size().width, 0);
+        request_completed_file_images(&ui, &state, TabId(1), &scheduler);
+        let key = scheduler
+            .shared
+            .0
+            .lock()
+            .unwrap()
+            .plans
+            .next_any()
+            .unwrap()
+            .1;
+        assert_eq!(key.path, new_path);
+        assert_eq!(key.request_id, RequestId(13));
+        assert_eq!(key.entry_id, EntryId(8));
+        let stale = IconEvent {
+            request_id: RequestId(12),
+            ..issue_98_icon_event(r"C:\grid\before.png")
+        };
+        assert!(apply_icon_event(&state, stale).is_none());
+        let event = IconEvent {
+            tab_id: key.tab_id,
+            request_id: key.request_id,
+            target: IconTarget::Entry(key.entry_id),
+            path: key.path,
+            icon: test_image(key.requested_px),
+            actual_thumbnail: true,
+            requested_px: key.requested_px,
+            type_key: None,
+            thumbnail_failed: false,
+            thumbnail_plan: None,
+        };
+        update_icon_row(&ui, &state, apply_icon_event(&state, event).unwrap());
+        assert_eq!(first().thumbnail_state, 2);
+        assert_eq!(first().icon.size().width, 48);
+    }
+
+    #[test]
+    fn issue_156_content_and_details_request_and_project_thumbnails() {
+        i_slint_backend_testing::init_no_event_loop();
+        for mode in [ViewMode::Content, ViewMode::Details] {
+            let ui = AppWindow::new().unwrap();
+            ui.window().set_size(slint::LogicalSize::new(1180.0, 760.0));
+            let state = issue_98_state();
+            let sessions = WindowSessions::new(state.clone(), WindowId(1));
+            {
+                let mut app = state.lock().unwrap();
+                app.update_directory_preference(PathBuf::from(r"C:\grid"), |view| {
+                    view.view_mode = mode;
+                    view.group_field = GroupField::Kind;
+                });
+                let tab = app.tab_mut(TabId(1)).unwrap();
+                tab.load_state = LoadState::Complete;
+                tab.replace_entries(
+                    (1..=1000)
+                        .map(|id| focus_entry(id, &format!(r"C:\grid\image{id:04}.png")))
+                        .collect(),
+                );
+            }
+            refresh_ui(&ui, &sessions);
+            let (residents, requests) = list_icon_plan(&ui, &state, WindowId(1));
+            assert!(requests.len() > 1 && requests.len() < 1000);
+            let requested_px = file_thumbnail_request_px(mode, ui.window().scale_factor()).unwrap();
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.thumbnail && request.requested_px == requested_px)
+            );
+            assert_eq!(residents.len(), requests.len());
+            let request = &requests[0];
+            let event = IconEvent {
+                tab_id: request.tab_id,
+                request_id: request.request_id,
+                target: request.target,
+                path: request.path.clone(),
+                icon: test_image(requested_px),
+                actual_thumbnail: true,
+                requested_px,
+                type_key: None,
+                thumbnail_failed: false,
+                thumbnail_plan: None,
+            };
+            update_icon_row(&ui, &state, apply_icon_event(&state, event).unwrap());
+            let first = || ui.get_files().iter().find(|row| row.id == 1).unwrap();
+            assert_eq!(first().thumbnail_state, 2);
+            assert_eq!(first().icon.size().width, requested_px);
+            refresh_ui(&ui, &sessions);
+            assert_eq!(
+                first().icon.size().width,
+                requested_px,
+                "full projection must retain cached thumbnails"
+            );
+            assert!(
+                list_icon_plan(&ui, &state, WindowId(1))
+                    .1
+                    .iter()
+                    .all(|request| request.target != IconTarget::Entry(EntryId(1)))
+            );
+            ui.set_file_viewport_y(-800.0);
+            let (scrolled, _) = list_icon_plan(&ui, &state, WindowId(1));
+            assert!(!scrolled.contains(&EntryId(1)));
+        }
+    }
+
+    #[test]
+    fn issue_156_unc_uses_type_icons_and_unsupported_files_use_shell_icon() {
+        let state = issue_98_state();
+        let mut app = state.lock().unwrap();
+        let unc = focus_entry(1, r"\\server\share\photo.png");
+        let request = thumbnail_request(&mut app, TabId(1), RequestId(12), &unc, 48).unwrap();
+        assert!(!request.thumbnail);
+        assert!(request.type_key.is_some());
+        let entry = app
+            .tab(TabId(1))
+            .unwrap()
+            .visible_entry(EntryId(1))
+            .unwrap()
+            .clone();
+        app.grid_icon_cache
+            .insert((entry.path.clone(), 48), test_image(48));
+        assert!(thumbnail_request(&mut app, TabId(1), RequestId(12), &entry, 48).is_none());
+        let tab = app.tab(TabId(1)).unwrap();
+        let row = file_row(&entry, tab, Texts::new(Language::Chinese), &app, Some(48));
+        assert_eq!(row.thumbnail_state, 4);
+        assert_eq!(row.icon.size().width, 48);
     }
 
     #[test]
@@ -30448,6 +30761,7 @@ mod tests {
                 tab,
                 Texts::new(Language::Chinese),
                 &app,
+                None,
             );
             let labels = rows
                 .iter()
@@ -31235,6 +31549,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn issue_154_rename_is_dismissed_when_target_disappears_or_request_changes() {
+        i_slint_backend_testing::init_no_event_loop();
+        for navigation in [false, true] {
+            let ui = AppWindow::new().unwrap();
+            let state = issue_98_state();
+            let sessions = WindowSessions::new(state.clone(), WindowId(1));
+            state.lock().unwrap().tab_mut(TabId(1)).unwrap().selected = vec![EntryId(1)];
+            begin_rename_ui(&ui.as_weak(), &sessions);
+            dismiss_stale_rename(&ui, &state, WindowId(1));
+            assert!(ui.get_rename_editing());
+            {
+                let mut app = state.lock().unwrap();
+                let tab = app.tab_mut(TabId(1)).unwrap();
+                if navigation {
+                    advance_test_navigation(tab, RequestId(13));
+                } else {
+                    tab.replace_entries(Vec::new());
+                }
+            }
+            dismiss_stale_rename(&ui, &state, WindowId(1));
+            assert!(!ui.get_rename_editing());
+            assert!(!ui.get_rename_submitting());
+            assert!(state.lock().unwrap().rename_targets.is_empty());
+        }
+    }
     #[test]
     fn rename_validation_keeps_invalid_names_out_of_operation_queue() {
         assert!(crate::fs::file_operations::validate_name(std::ffi::OsStr::new("")).is_err());
@@ -32710,7 +33050,7 @@ mod tests {
         for (mode, expected) in [
             (ViewMode::Details, -96.0),
             (ViewMode::List, -90.0),
-            (ViewMode::MediumIcons, -300.0),
+            (ViewMode::MediumIcons, -372.0),
         ] {
             assert_eq!(
                 logical_scroll_delta(&MouseScrollDelta::LineDelta(0.0, -1.0), mode, 1.0),
@@ -32749,11 +33089,11 @@ mod tests {
         assert_eq!(file_scroll_maximum(67, ViewMode::List, 6, 590.0), 1_420.0);
         assert_eq!(
             file_scroll_maximum(67, ViewMode::MediumIcons, 6, 590.0),
-            610.0
+            898.0
         );
         assert_eq!(
             file_scroll_maximum(66, ViewMode::MediumIcons, 6, 590.0),
-            510.0
+            774.0
         );
         assert_eq!(file_scroll_maximum(2, ViewMode::MediumIcons, 6, 590.0), 0.0);
         assert_eq!(
@@ -32775,7 +33115,7 @@ mod tests {
         assert_eq!(file_scroll_maximum(100, ViewMode::List, 1, 400.0), 2_600.0);
         assert_eq!(
             file_scroll_maximum(10, ViewMode::MediumIcons, 3, 400.0),
-            0.0
+            96.0
         );
         assert_eq!(file_scroll_maximum(2, ViewMode::MediumIcons, 3, 400.0), 0.0);
     }

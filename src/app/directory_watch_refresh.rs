@@ -154,6 +154,18 @@ fn merge_pending(queue: &mut HashMap<WatchKey, PendingWatch>, pending: PendingWa
     }
 }
 
+fn rename_is_active(app: &AppState, root: &Path) -> bool {
+    app.operations.iter().any(|task| {
+        task.kind == crate::domain::file_operations::FileOperationKind::Rename
+            && task.state.is_active()
+            && task.items.iter().any(|item| {
+                [item.source.as_deref(), item.destination.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|path| path.parent() == Some(root))
+            })
+    })
+}
 fn disposition(app: &AppState, pending: &PendingWatch) -> Disposition {
     let Some(tab) = app.tab(pending.tab_id) else {
         return Disposition::Drop;
@@ -171,7 +183,11 @@ fn disposition(app: &AppState, pending: &PendingWatch) -> Disposition {
         .active_operation_directories
         .contains_key(&pending.batch.root)
     {
-        return Disposition::DeferredOperation;
+        return if rename_is_active(app, &pending.batch.root) {
+            Disposition::Wait
+        } else {
+            Disposition::DeferredOperation
+        };
     }
     if matches!(tab.load_state, LoadState::Loading | LoadState::Partial) {
         return Disposition::Wait;
@@ -291,7 +307,11 @@ fn apply_probe_result(
             Disposition::Probe => {}
         }
         let tab = app.tab(pending.tab_id).expect("pending tab was checked");
-        if tab.latest_request() != probe.request_id || app.file_visibility != probe.visibility {
+        // A completed rename may change entries without replacing the directory request.
+        if tab.latest_request() != probe.request_id
+            || app.file_visibility != probe.visibility
+            || !Arc::ptr_eq(&tab.entries, &probe.entries)
+        {
             return Some(pending);
         }
         crate::operation_audit::record(
@@ -376,7 +396,9 @@ pub(super) fn start_watch_refresh_pump(
             let probes = {
                 let Ok(mut app) = state.lock() else { break };
                 for batch in batches {
-                    if app.active_operation_directories.contains_key(&batch.root) {
+                    if app.active_operation_directories.contains_key(&batch.root)
+                        && !rename_is_active(&app, &batch.root)
+                    {
                         app.deferred_watch_directories.insert(batch.root);
                         continue;
                     }
@@ -977,6 +999,112 @@ mod tests {
         assert!(requests.try_recv().is_err());
     }
 
+    #[test]
+    fn issue_155_rename_watch_waits_and_preserves_other_changes() {
+        use crate::domain::file_operations::{FileOperationKind, OperationItem, OperationResource};
+        let fixture = Fixture::new();
+        fs::write(fixture.0.join("old.png"), b"image").unwrap();
+        let state = fixture.state(vec![fixture.entry("old.png", 1)]);
+        let pending = fixture.pending(&["old.png", "new.png", "other.txt"]);
+        {
+            let mut app = state.lock().unwrap();
+            app.operations.submit(
+                OperationResource::Local,
+                FileOperationKind::Rename,
+                Some(TabId(1)),
+                vec![OperationItem::pending(
+                    Some(fixture.0.join("old.png")),
+                    Some(fixture.0.join("new.png")),
+                )],
+            );
+            app.active_operation_directories
+                .insert(fixture.0.clone(), 1);
+            assert_eq!(disposition(&app, &pending), Disposition::Wait);
+        }
+        let result = run_probe(&state, pending);
+        let (sender, receiver) = mpsc::channel();
+        let retry = apply_probe_result(&state, &sender, result).unwrap();
+        assert_eq!(retry.batch.paths.len(), 3);
+        assert!(state.lock().unwrap().deferred_watch_directories.is_empty());
+        fs::rename(fixture.0.join("old.png"), fixture.0.join("new.png")).unwrap();
+        fs::write(fixture.0.join("other.txt"), b"external").unwrap();
+        {
+            let mut app = state.lock().unwrap();
+            app.active_operation_directories.clear();
+            app.tab_mut(TabId(1))
+                .unwrap()
+                .replace_entries(vec![fixture.entry("new.png", 1)]);
+        }
+        let result = run_probe(&state, retry);
+        assert!(result.changed);
+        assert!(apply_probe_result(&state, &sender, result).is_none());
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn issue_155_old_watch_snapshot_rechecks_after_local_rename() {
+        let fixture = Fixture::new();
+        fs::write(fixture.0.join("old.png"), b"image").unwrap();
+        let state = fixture.state(vec![fixture.entry("old.png", 1)]);
+        fs::rename(fixture.0.join("old.png"), fixture.0.join("new.png")).unwrap();
+        let result = run_probe(&state, fixture.pending(&["old.png", "new.png"]));
+        assert!(result.changed);
+        state
+            .lock()
+            .unwrap()
+            .tab_mut(TabId(1))
+            .unwrap()
+            .replace_entries(vec![fixture.entry("new.png", 1)]);
+        let (sender, receiver) = mpsc::channel();
+        let retry = apply_probe_result(&state, &sender, result).unwrap();
+        assert!(receiver.try_recv().is_err());
+        let result = run_probe(&state, retry);
+        assert!(!result.changed);
+        assert!(apply_probe_result(&state, &sender, result).is_none());
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            state.lock().unwrap().tab(TabId(1)).unwrap().selected,
+            vec![EntryId(1)]
+        );
+    }
+    #[test]
+    fn issue_155_failed_rename_watch_keeps_external_changes() {
+        use crate::domain::file_operations::{
+            FileOperationKind, OperationItem, OperationResource, OperationState,
+        };
+        let fixture = Fixture::new();
+        fs::write(fixture.0.join("old.png"), b"image").unwrap();
+        let state = fixture.state(vec![fixture.entry("old.png", 1)]);
+        let operation = {
+            let mut app = state.lock().unwrap();
+            let operation = app.operations.submit(
+                OperationResource::Local,
+                FileOperationKind::Rename,
+                Some(TabId(1)),
+                vec![OperationItem::pending(
+                    Some(fixture.0.join("old.png")),
+                    Some(fixture.0.join("new.png")),
+                )],
+            );
+            app.active_operation_directories
+                .insert(fixture.0.clone(), 1);
+            operation
+        };
+        let (sender, receiver) = mpsc::channel();
+        let result = run_probe(&state, fixture.pending(&["old.png", "other.txt"]));
+        let retry = apply_probe_result(&state, &sender, result).unwrap();
+        {
+            let mut app = state.lock().unwrap();
+            app.operations.task_mut(operation).unwrap().state = OperationState::Failed;
+            app.active_operation_directories.clear();
+        }
+        fs::write(fixture.0.join("other.txt"), b"external").unwrap();
+        let result = run_probe(&state, retry);
+        assert!(result.changed);
+        assert!(apply_probe_result(&state, &sender, result).is_none());
+        assert!(receiver.try_recv().is_ok());
+        assert!(fixture.0.join("old.png").is_file());
+    }
     #[test]
     fn issue_133_active_operations_own_their_final_refresh() {
         let fixture = Fixture::new();

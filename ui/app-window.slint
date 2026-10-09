@@ -404,12 +404,15 @@ component InlineRenameEditor inherits Rectangle {
     in property <int> submit-generation;
     in property <string> editor-id;
     in property <string> label;
+    in property <bool> multiline: false;
+    in property <length> editor-height-limit: 300px;
+    out property <length> content-height: rename-editor.preferred-height + 8px;
     callback commit(string);
     callback cancel();
     private property <bool> editor-active: false;
     private property <bool> submitted: false;
     private property <bool> editor-has-focus: rename-editor.has-focus;
-    height: 30px;
+    height: root.multiline ? min(root.editor-height-limit, max(30px, root.content-height)) : 30px;
     background: VisualStyle.cffffff;
     border-color: VisualStyle.c4f6bed;
     border-width: 1px;
@@ -431,34 +434,65 @@ component InlineRenameEditor inherits Rectangle {
             root.submit();
         }
     }
-    rename-editor := TextInput {
+    editor-viewport := Rectangle {
         x: 5px;
-        width: parent.width - 10px;
-        height: parent.height;
-        text <=> root.text;
-        color: VisualStyle.c24252a;
-        selection-background-color: VisualStyle.cc7d7ff;
-        selection-foreground-color: VisualStyle.c24252a;
-        font-size: VisualStyle.file-name-font-size;
-        single-line: true;
-        vertical-alignment: center;
-        init => {
-            self.focus();
-            self.set-selection-offsets(0, root.selection-end);
-        }
-        accepted => { root.submit(); }
-        key-pressed(event) => {
-            if event.text == Key.Escape {
-                parent.submitted = true;
-                root.cancel();
-                return accept;
+        y: 4px;
+        width: max(1px, parent.width - 10px);
+        height: max(1px, parent.height - 8px);
+        clip: true;
+        rename-editor := TextInput {
+            private property <length> scroll-x: 0px;
+            private property <length> scroll-y: 0px;
+            x: root.multiline ? 0px : min(0px, max(parent.width - self.width - self.text-cursor-width, self.scroll-x));
+            y: min(0px, max(parent.height - self.height, self.scroll-y));
+            width: root.multiline ? max(1px, parent.width - self.text-cursor-width) : max(parent.width - self.text-cursor-width, self.preferred-width);
+            height: max(parent.height, self.preferred-height);
+            text <=> root.text;
+            color: VisualStyle.c24252a;
+            selection-background-color: VisualStyle.cc7d7ff;
+            selection-foreground-color: VisualStyle.c24252a;
+            font-size: VisualStyle.file-name-font-size;
+            single-line: !root.multiline;
+            wrap: root.multiline ? word-wrap : no-wrap;
+            horizontal-alignment: root.multiline ? center : left;
+            page-height: parent.height;
+            read-only: root.submitting;
+            vertical-alignment: root.multiline ? top : center;
+            init => {
+                self.focus();
+                self.set-selection-offsets(0, root.selection-end);
             }
-            return reject;
+            // TextInput delegates clipping and cursor visibility to its enclosing widget.
+            cursor-position-changed(position) => {
+                if position.x + self.scroll-x < 0px {
+                    self.scroll-x = -position.x;
+                } else if position.x + self.scroll-x > parent.width - self.text-cursor-width {
+                    self.scroll-x = parent.width - position.x - self.text-cursor-width;
+                }
+                if position.y + self.scroll-y < 0px {
+                    self.scroll-y = -position.y;
+                } else if position.y + self.scroll-y > parent.height - 20px {
+                    self.scroll-y = parent.height - position.y - 20px;
+                }
+            }
+            accepted => { root.submit(); }
+            key-pressed(event) => {
+                if event.text == Key.Return {
+                    root.submit();
+                    return accept;
+                }
+                if event.text == Key.Escape {
+                    root.submitted = true;
+                    root.cancel();
+                    return accept;
+                }
+                return reject;
+            }
+            accessible-role: text-input;
+            accessible-id: root.editor-id;
+            accessible-enabled: !root.submitting;
+            accessible-label: root.label;
         }
-        accessible-role: text-input;
-        accessible-id: root.editor-id;
-        accessible-enabled: !root.submitting;
-        accessible-label: root.label;
     }
 }
 
@@ -1058,6 +1092,10 @@ export component AppWindow inherits Window {
         }
     }
     changed file-viewport-y => {
+        if root.rename-editing && root.is-grid-view-mode(root.view-mode) && root.grid-rename-anchor-id >= 0 {
+            root.grid-rename-anchor-id = -1;
+            root.cancel-rename();
+        }
         root.sync-active-file-viewport();
         if root.grouped-grid-enabled {
             root.refresh-grouped-grid-viewport();
@@ -1087,6 +1125,14 @@ export component AppWindow inherits Window {
     in property <bool> rename-editing: false;
     in-out property <bool> rename-submitting: false;
     in-out property <int> rename-submit-generation: 0;
+    private property <length> grid-rename-left;
+    private property <length> grid-rename-top;
+    private property <length> grid-rename-width;
+    private property <length> grid-rename-height;
+    private property <string> grid-rename-label;
+    private property <int> grid-rename-anchor-id: -1;
+    private property <string> grid-rename-context;
+    changed rename-editing => { if !root.rename-editing { root.grid-rename-anchor-id = -1; } }
     in property <string> operation-error: "";
     in property <bool> context-menu-has-entry: false;
     in-out property <bool> quick-access-expanded: true;
@@ -2461,24 +2507,27 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                                         x: root.view-mode == 3 ? 26px : root.view-mode == 6 ? 64px : 7px;
                                         y: root.view-mode == 3 ? 0px : root.view-mode == 6 ? 8px : root.layout-icon-size + 10px;
                                         width: root.view-mode == 3 ? parent.width - 30px : root.view-mode == 6 ? parent.width - 72px : parent.width - 14px;
-                                        height: root.view-mode == 3 ? parent.height : root.view-mode == 6 ? 24px : parent.height - root.layout-icon-size - 12px;
+                                        height: root.view-mode == 3 ? parent.height : root.view-mode == 6 ? 24px : 48px;
                                         text: entry.name; color: VisualStyle.c24252a; font-size: VisualStyle.file-name-font-size;
-                                        horizontal-alignment: root.view-mode == 3 || root.view-mode == 6 ? left : center; vertical-alignment: center; overflow: elide;
+                                        horizontal-alignment: root.view-mode == 3 || root.view-mode == 6 ? left : center; vertical-alignment: root.view-mode == 3 || root.view-mode == 6 ? center : top; wrap: root.view-mode == 3 || root.view-mode == 6 ? no-wrap : word-wrap; overflow: elide;
                                     }
-                                    if root.rename-editing && root.rename-entry-id == entry.id && root.is-grid-view-mode(root.view-mode): InlineRenameEditor {
-                                        z: 101;
+                                    if root.rename-editing && root.rename-entry-id == entry.id && root.is-grid-view-mode(root.view-mode): Rectangle {
                                         x: root.view-mode == 3 ? 26px : root.view-mode == 6 ? 64px : 7px;
                                         y: root.view-mode == 3 ? 0px : root.view-mode == 6 ? 8px : root.layout-icon-size + 10px;
-                                        width: max(0px, root.view-mode == 3 ? parent.width - 30px : root.view-mode == 6 ? parent.width - 72px : parent.width - 14px);
-                                        height: root.view-mode == 3 ? parent.height : root.view-mode == 6 ? 24px : min(30px, parent.height - root.layout-icon-size - 12px);
-                                        text <=> root.rename-input;
-                                        selection-end: root.rename-selection-end;
-                                        submitting <=> root.rename-submitting;
-                                        submit-generation: root.rename-submit-generation;
-                                        editor-id: root.accessibility-context + "/entry/" + entry.id + "/rename";
-                                        label: entry.name;
-                                        commit(name) => { root.commit-rename(name); }
-                                        cancel => { root.cancel-rename(); }
+                                        width: max(1px, root.view-mode == 3 ? parent.width - 30px : root.view-mode == 6 ? parent.width - 72px : parent.width - 14px);
+                                        height: root.view-mode == 3 ? parent.height : root.view-mode == 6 ? 24px : 30px;
+                                        function sync-editor-anchor() {
+                                            root.grid-rename-left = self.absolute-position.x - root.absolute-position.x;
+                                            root.grid-rename-top = self.absolute-position.y - root.absolute-position.y;
+                                            root.grid-rename-width = self.width;
+                                            root.grid-rename-height = self.height;
+                                            root.grid-rename-label = entry.name; root.grid-rename-context = root.accessibility-context;
+                                            root.grid-rename-anchor-id = entry.id;
+                                        }
+                                        init => { self.sync-editor-anchor(); }
+                                        changed absolute-position => { self.sync-editor-anchor(); }
+                                        changed width => { self.sync-editor-anchor(); }
+                                        changed height => { self.sync-editor-anchor(); }
                                     }
                                     if root.view-mode == 6: Text {
                                         x: 64px; y: 32px; width: parent.width - 142px; height: 20px;
@@ -2559,24 +2608,27 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                                     x: root.view-mode == 3 ? 26px : root.view-mode == 6 ? 64px : 7px;
                                     y: root.view-mode == 3 ? 0px : root.view-mode == 6 ? 8px : root.layout-icon-size + 10px;
                                     width: root.view-mode == 3 ? parent.width - 30px : root.view-mode == 6 ? parent.width - 72px : parent.width - 14px;
-                                    height: root.view-mode == 3 ? parent.height : root.view-mode == 6 ? 24px : parent.height - root.layout-icon-size - 12px;
+                                    height: root.view-mode == 3 ? parent.height : root.view-mode == 6 ? 24px : 48px;
                                     text: entry.name; color: VisualStyle.c24252a; font-size: VisualStyle.file-name-font-size;
-                                    horizontal-alignment: root.view-mode == 3 || root.view-mode == 6 ? left : center; vertical-alignment: center; overflow: elide;
+                                    horizontal-alignment: root.view-mode == 3 || root.view-mode == 6 ? left : center; vertical-alignment: root.view-mode == 3 || root.view-mode == 6 ? center : top; wrap: root.view-mode == 3 || root.view-mode == 6 ? no-wrap : word-wrap; overflow: elide;
                                 }
-                                if root.rename-editing && root.rename-entry-id == entry.id && root.is-grid-view-mode(root.view-mode): InlineRenameEditor {
-                                    z: 101;
+                                if root.rename-editing && root.rename-entry-id == entry.id && root.is-grid-view-mode(root.view-mode): Rectangle {
                                     x: root.view-mode == 3 ? 26px : root.view-mode == 6 ? 64px : 7px;
                                     y: root.view-mode == 3 ? 0px : root.view-mode == 6 ? 8px : root.layout-icon-size + 10px;
-                                    width: max(0px, root.view-mode == 3 ? parent.width - 30px : root.view-mode == 6 ? parent.width - 72px : parent.width - 14px);
-                                    height: root.view-mode == 3 ? parent.height : root.view-mode == 6 ? 24px : min(30px, parent.height - root.layout-icon-size - 12px);
-                                    text <=> root.rename-input;
-                                    selection-end: root.rename-selection-end;
-                                    submitting <=> root.rename-submitting;
-                                    submit-generation: root.rename-submit-generation;
-                                    editor-id: root.accessibility-context + "/entry/" + entry.id + "/rename";
-                                    label: entry.name;
-                                    commit(name) => { root.commit-rename(name); }
-                                    cancel => { root.cancel-rename(); }
+                                    width: max(1px, root.view-mode == 3 ? parent.width - 30px : root.view-mode == 6 ? parent.width - 72px : parent.width - 14px);
+                                    height: root.view-mode == 3 ? parent.height : root.view-mode == 6 ? 24px : 30px;
+                                    function sync-editor-anchor() {
+                                        root.grid-rename-left = self.absolute-position.x - root.absolute-position.x;
+                                        root.grid-rename-top = self.absolute-position.y - root.absolute-position.y;
+                                        root.grid-rename-width = self.width;
+                                        root.grid-rename-height = self.height;
+                                        root.grid-rename-label = entry.name; root.grid-rename-context = root.accessibility-context;
+                                        root.grid-rename-anchor-id = entry.id;
+                                    }
+                                    init => { self.sync-editor-anchor(); }
+                                    changed absolute-position => { self.sync-editor-anchor(); }
+                                    changed width => { self.sync-editor-anchor(); }
+                                    changed height => { self.sync-editor-anchor(); }
                                 }
                                 if root.view-mode == 6: Text {
                                     x: 64px; y: 32px; width: parent.width - 142px; height: 20px;
@@ -3020,6 +3072,24 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                 accessible-role: button; accessible-label: option; accessible-enabled: self.option-enabled;
             }
         }
+    }
+    // The editor must escape virtualized row clipping and remain above the outside-click layer.
+    if root.rename-editing && root.is-grid-view-mode(root.view-mode) && root.grid-rename-anchor-id == root.rename-entry-id && root.grid-rename-context == root.accessibility-context: InlineRenameEditor {
+        z: 101;
+        x: root.grid-rename-left;
+        y: max(root.file-list-top, min(root.grid-rename-top, root.height - 32px - self.height));
+        width: root.grid-rename-width;
+        multiline: root.view-mode != 3 && root.view-mode != 6;
+        editor-height-limit: max(30px, root.height - root.file-list-top - 32px);
+        height: self.multiline ? min(self.editor-height-limit, max(30px, self.content-height)) : root.grid-rename-height;
+        text <=> root.rename-input;
+        selection-end: root.rename-selection-end;
+        submitting <=> root.rename-submitting;
+        submit-generation: root.rename-submit-generation;
+        editor-id: root.accessibility-context + "/entry/" + root.rename-entry-id + "/rename";
+        label: root.grid-rename-label;
+        commit(name) => { root.commit-rename(name); }
+        cancel => { root.cancel-rename(); }
     }
     if root.rename-editing: TouchArea {
         z: 100;

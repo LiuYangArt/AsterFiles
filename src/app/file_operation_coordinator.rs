@@ -497,6 +497,7 @@ pub(super) fn release_operation_directories(
 
 pub(super) struct OperationCompletion {
     pub(super) affected: Vec<PathBuf>,
+    pub(super) rename_update: super::rename_updates::RenameUpdate,
     pub(super) next: Option<FileOperationRequest>,
     pub(super) clear_completed_cut: Vec<PathBuf>,
     pub(super) undo_failure: Option<String>,
@@ -568,7 +569,7 @@ pub(super) fn finish_file_operation(
         "operation_finished",
         format!("id={id:?} result={result:?} items={item_states:?}"),
     );
-    let (affected, next, clear_completed_cut, undo_failure, containment_notice) = {
+    let completion = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         if let Some(task) = app.operations.task_mut(id) {
             for (index, status, error) in item_states {
@@ -620,13 +621,40 @@ pub(super) fn finish_file_operation(
                 Vec::new(),
                 None,
             ));
-        let mut affected = result.affected_directories.clone();
+        let local_rename = kind == FileOperationKind::Rename
+            && terminal == OperationState::Completed
+            && task_items.iter().all(|item| {
+                item.state == ItemState::Succeeded
+                    && item.error.is_none()
+                    && item.source.is_some()
+                    && item.destination.is_some()
+            });
+        let mut rename_update = super::rename_updates::RenameUpdate::default();
+        if local_rename {
+            for item in &task_items {
+                let update = super::rename_updates::apply_completed(
+                    &mut app,
+                    item.source.as_deref().unwrap(),
+                    item.destination.as_deref().unwrap(),
+                );
+                rename_update.updated_tabs.extend(update.updated_tabs);
+                rename_update.reload_tabs.extend(update.reload_tabs);
+                rename_update.search_tabs.extend(update.search_tabs);
+            }
+        }
+        let mut affected = if local_rename {
+            Vec::new()
+        } else {
+            result.affected_directories.clone()
+        };
         let registered = if resource == OperationResource::Cleanup {
             HashSet::new()
         } else {
             release_operation_directories(&mut app, kind, &task_items)
         };
-        affected.extend(registered.iter().cloned());
+        if !local_rename {
+            affected.extend(registered.iter().cloned());
+        }
         let deferred = app
             .deferred_watch_directories
             .iter()
@@ -646,7 +674,7 @@ pub(super) fn finish_file_operation(
             {
                 queue_completed_rename(&mut app, origin_tab, target);
             }
-        } else {
+        } else if !local_rename {
             queue_completed_focus(&mut app, &completed_targets);
         }
         if kind == FileOperationKind::Undo {
@@ -713,21 +741,16 @@ pub(super) fn finish_file_operation(
             Vec::new()
         };
 
-        (
+        OperationCompletion {
             affected,
             next,
             clear_completed_cut,
             undo_failure,
             containment_notice,
-        )
+            rename_update,
+        }
     };
-    Some(OperationCompletion {
-        affected,
-        next,
-        clear_completed_cut,
-        undo_failure,
-        containment_notice,
-    })
+    Some(completion)
 }
 
 pub(super) fn prepare_retry(
