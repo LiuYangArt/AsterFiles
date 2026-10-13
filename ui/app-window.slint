@@ -2226,11 +2226,29 @@ export component AppWindow inherits Window {
                         horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
                         vertical-scrollbar-policy: ScrollBarPolicy.as-needed;
                         viewport-width: self.width;
+                        // Content must keep its own preferred height. Binding that height back to
+                        // the viewport collapses the scroll range to the visible page.
                         viewport-height: max(self.height, home-content.preferred-height);
+                        function clamp-viewport() {
+                            let maximum = max(0px, home-content.preferred-height - self.visible-height);
+                            self.viewport-y = max(-maximum, min(0px, self.viewport-y));
+                        }
+                        changed visible-height => { self.clamp-viewport(); }
+                        changed viewport-height => { self.clamp-viewport(); }
+                        home-wheel := TouchArea {
+                            width: home-scroll.visible-width;
+                            height: home-scroll.visible-height;
+                            scroll-event(event) => {
+                                let maximum = max(0px, home-content.preferred-height - home-scroll.visible-height);
+                                if maximum > 0px && event.delta-y != 0px {
+                                    home-scroll.viewport-y = max(-maximum, min(0px, home-scroll.viewport-y + event.delta-y));
+                                    return accept;
+                                }
+                                return reject;
+                            }
+                        }
                         home-content := VerticalLayout {
                             width: home-scroll.width;
-                            height: home-scroll.viewport-height;
-
                             padding-left: root.minimal ? 18px : 30px;
                             padding-right: root.minimal ? 18px : 30px;
                             padding-top: 22px; padding-bottom: 30px; spacing: 18px;
@@ -2257,7 +2275,6 @@ export component AppWindow inherits Window {
                                 activate-item(id) => { root.navigate-home-item(id); }
                                 item-menu-requested(group, id, x, y) => { root.show-sidebar-menu(group, id, x - root.absolute-position.x / 1px, y - root.absolute-position.y / 1px); }
                             }
-                            Rectangle { vertical-stretch: 1; }
                         }
                     }
                 }

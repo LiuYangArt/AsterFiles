@@ -14473,14 +14473,18 @@ fn wire_mouse_navigation(
                 let logical = cursor_position
                     .get()
                     .to_logical::<f32>(f64::from(ui.window().scale_factor()));
-                if !pointer_targets_file_area(
-                    logical.x,
-                    logical.y,
-                    ui.get_file_list_left(),
-                    ui.get_file_list_top(),
-                    ui.get_file_viewport_width(),
-                    ui.get_file_viewport_height(),
-                ) {
+                // The last folder keeps its rectangle after returning home, so that
+                // hit test would swallow the home page wheel and scroll a hidden list.
+                if ui.get_active_is_home()
+                    || !pointer_targets_file_area(
+                        logical.x,
+                        logical.y,
+                        ui.get_file_list_left(),
+                        ui.get_file_list_top(),
+                        ui.get_file_viewport_width(),
+                        ui.get_file_viewport_height(),
+                    )
+                {
                     ctrl_wheel_accumulator.set(0.0);
                     return EventResult::Propagate;
                 }
@@ -25276,7 +25280,69 @@ mod tests {
         let source = include_str!("../ui/app-window.slint");
         assert!(source.contains("wrap: root.item.source-kind == 2 ? word-wrap : no-wrap"));
         assert!(source.contains("visible: root.item.source-kind != 2"));
-        assert!(source.contains("height: home-scroll.viewport-height"));
+        assert!(!source.contains("height: home-scroll.viewport-height"));
+    }
+
+    #[test]
+    fn home_wheel_scrolls_overflow_without_moving_the_file_list() {
+        let ui = headless_file_view();
+        ui.window()
+            .set_size(slint::LogicalSize::new(1_180.0, 520.0));
+        ui.set_active_is_home(true);
+        ui.set_home_content_width(home_content_width_for_window(1_180.0));
+        ui.set_home_quick_access_expanded(true);
+        ui.set_file_viewport_y(-200.0);
+        ui.set_home_quick_access_items(ModelRc::new(VecModel::from(Vec::new())));
+        update_test_layout(&ui);
+        let content_y = || {
+            named_element(&ui, "AppWindow::home-content")
+                .expect("home content")
+                .absolute_position()
+                .y
+        };
+        let scroll_home = || {
+            named_element(&ui, "AppWindow::home-scroll")
+                .expect("home scroll")
+                .scroll(0.0, -160.0);
+            update_test_layout(&ui);
+        };
+        let fitted = content_y();
+        scroll_home();
+        assert_eq!(content_y(), fitted);
+
+        let item = |index: i32| HomeItemRow {
+            stable_id: index.to_string().into(),
+            label: format!("Home {index}").into(),
+            detail: "detail".into(),
+            icon: Image::default(),
+            progress: 0.0,
+            state: -1,
+            status: "".into(),
+            selected: false,
+            focused: false,
+            source_kind: 0,
+            menu_group: 0,
+            menu_stable_id: "".into(),
+        };
+        let rows = (0..24)
+            .map(item)
+            .collect::<Vec<_>>()
+            .chunks(2)
+            .map(|entries| HomeCardRow {
+                entries: ModelRc::new(VecModel::from(entries.to_vec())),
+            })
+            .collect::<Vec<_>>();
+        ui.set_home_quick_access_items(ModelRc::new(VecModel::from(rows)));
+        update_test_layout(&ui);
+
+        let before = content_y();
+        scroll_home();
+        let after = content_y();
+        assert!(
+            after < before - 100.0,
+            "home page should follow the wheel: {before} -> {after}"
+        );
+        assert_eq!(ui.get_file_viewport_y(), -200.0);
     }
 
     #[test]
