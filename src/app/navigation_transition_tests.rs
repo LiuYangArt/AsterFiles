@@ -35,6 +35,7 @@ fn issue_151_dispatch_failure_cancels_request_and_preserves_committed_location()
         unavailable_library_sources: 0,
         visibility: crate::domain::FileVisibility::default(),
         cancel: cancel.clone(),
+        webdav: None,
     };
     let state = Arc::new(Mutex::new(app));
     fail_directory_dispatch(&state, &request);

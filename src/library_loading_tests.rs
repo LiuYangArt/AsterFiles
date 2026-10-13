@@ -493,6 +493,7 @@ fn partial_failure_reader(
             folder_size: FolderSizeState::Unknown,
             modified: None,
             created: None,
+            webdav: None,
         }])?;
         return Err(io::ErrorKind::UnexpectedEof.into());
     }

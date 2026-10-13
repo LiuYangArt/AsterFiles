@@ -528,6 +528,7 @@ mod tests {
             folder_size: FolderSizeState::Unknown,
             modified: None,
             created: None,
+            webdav: None,
         }
     }
 

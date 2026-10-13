@@ -1274,6 +1274,7 @@ mod tests {
                 folder_size: crate::domain::FolderSizeState::Unknown,
                 modified: None,
                 created: None,
+                webdav: None,
             }],
             DirectoryViewPreference::default()
         ));

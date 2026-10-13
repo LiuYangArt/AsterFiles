@@ -113,6 +113,7 @@ mod tests {
                 folder_size: FolderSizeState::NotIndexed,
                 modified: None,
                 created: None,
+                webdav: None,
             };
             apply_event(
                 &state.shared,

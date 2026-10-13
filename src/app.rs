@@ -73,6 +73,7 @@ mod network_sort_tests;
 mod rename_updates;
 #[cfg(test)]
 mod test_support;
+mod webdav_ui;
 mod window_sessions;
 
 use directory_loading::{DirectoryEvent, DirectoryRequest, spawn_directory_workers};
@@ -509,6 +510,7 @@ pub fn export_windows_libraries_state(path: &Path) -> io::Result<()> {
             folder_size: FolderSizeState::Unknown,
             modified: None,
             created: None,
+            webdav: None,
         }],
         DirectoryViewPreference::default(),
     );
@@ -750,6 +752,7 @@ pub fn export_folder_size_scheduler_state(path: &Path) -> io::Result<()> {
         folder_size: FolderSizeState::Unknown,
         modified: None,
         created: None,
+        webdav: None,
     };
     let mut visible_entries = (1..=80).map(entry).collect::<Vec<_>>();
     let mut visible = FolderSizeScheduler::new();
@@ -1468,6 +1471,7 @@ struct WorkerSenders {
     network_login: slint::Weak<NetworkLoginWindow>,
     network_login_state: Arc<Mutex<NetworkLoginCoordinator>>,
     network_location_rename: slint::Weak<NetworkLocationRenameWindow>,
+    webdav_location: slint::Weak<WebDavLocationWindow>,
     operation_window: slint::Weak<OperationWindow>,
 }
 
@@ -1788,6 +1792,22 @@ fn grid_thumbnail_request_rows(
         .collect()
 }
 
+#[derive(Clone, PartialEq, Eq)]
+enum ActivateTarget {
+    Path(PathBuf),
+    WebDav(String),
+}
+
+impl From<&FileEntry> for ActivateTarget {
+    fn from(entry: &FileEntry) -> Self {
+        if let Some(item) = &entry.webdav {
+            Self::WebDav(item.path.clone())
+        } else {
+            Self::Path(entry.path.clone())
+        }
+    }
+}
+
 fn ordinary_icon_request(
     app: &mut AppState,
     tab_id: TabId,
@@ -2002,6 +2022,16 @@ fn request_visible_file_images(
     window_id: WindowId,
     scheduler: &ThumbnailScheduler,
 ) {
+    let remote = state.lock().ok().is_some_and(|app| {
+        app.window(window_id)
+            .and_then(|window| app.tab(window.active_tab))
+            .is_some_and(|tab| {
+                matches!(tab.visible_location(), Some(NavigationLocation::WebDav(_)))
+            })
+    });
+    if remote {
+        return;
+    }
     let (tab_id, mut resident_ids, mut requests) = grid_thumbnail_plan(ui, state, window_id);
     let (list_residents, list_requests) = list_icon_plan(ui, state, window_id);
     resident_ids.extend(list_residents);
@@ -4030,6 +4060,7 @@ pub fn run(
     let ui = AppWindow::new()?;
     let network_login_ui = NetworkLoginWindow::new()?;
     let network_location_rename_ui = NetworkLocationRenameWindow::new()?;
+    let webdav_location_ui = WebDavLocationWindow::new()?;
     let operation_ui = OperationWindow::new()?;
     let delete_ui = ConfirmationWindow::new()?;
     let conflict_ui = ConfirmationWindow::new()?;
@@ -4243,6 +4274,7 @@ pub fn run(
         network_login: network_login_ui.as_weak(),
         network_login_state: network_login.clone(),
         network_location_rename: network_location_rename_ui.as_weak(),
+        webdav_location: webdav_location_ui.as_weak(),
         operation_window: operation_ui.as_weak(),
     };
     let initial_window_id = state
@@ -4259,6 +4291,7 @@ pub fn run(
         network_login_ui.as_weak(),
         network_login.clone(),
         network_location_rename_ui.as_weak(),
+        webdav_location_ui.as_weak(),
         operation_ui.as_weak(),
         &delete_ui,
         &conflict_ui,
@@ -4318,6 +4351,7 @@ pub fn run(
         network_login.clone(),
     );
     wire_network_location_rename_window(&network_location_rename_ui, state.clone());
+    webdav_ui::wire_window(&webdav_location_ui, state.clone());
     wire_debug_showcase(
         &ui,
         &operation_ui,
@@ -4432,17 +4466,61 @@ pub fn run(
             }
         }
         for (index, (tab_id, location)) in initial_tabs.into_iter().enumerate() {
-            if let NavigationLocation::Directory(path) = location {
-                submit_path_navigation_with_reveal(
-                    &request_sender,
-                    &network_request_sender,
-                    &state,
-                    tab_id,
-                    path,
-                    NavigationKind::Refresh,
-                    startup_reveals.get(index).cloned().flatten(),
-                );
+            match location {
+                NavigationLocation::Directory(path) => {
+                    submit_path_navigation_with_reveal(
+                        &request_sender,
+                        &network_request_sender,
+                        &state,
+                        tab_id,
+                        path,
+                        NavigationKind::Refresh,
+                        startup_reveals.get(index).cloned().flatten(),
+                    );
+                }
+                NavigationLocation::WebDav(place) => {
+                    submit_webdav_navigation(
+                        &request_sender,
+                        &state,
+                        tab_id,
+                        place,
+                        NavigationKind::Refresh,
+                    );
+                }
+                NavigationLocation::Home | NavigationLocation::Library(_) => {}
             }
+        }
+        let restored_remote_tabs = state
+            .lock()
+            .map(|app| {
+                app.windows
+                    .iter()
+                    .filter(|(id, _)| **id != initial_window_id)
+                    .flat_map(|(_, window)| {
+                        window.tab_order.iter().filter_map(|id| {
+                            match window
+                                .tabs
+                                .get(id)
+                                .and_then(|tab| tab.current_location().as_ref())
+                            {
+                                Some(NavigationLocation::WebDav(place)) => {
+                                    Some((*id, place.clone()))
+                                }
+                                _ => None,
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (tab_id, place) in restored_remote_tabs {
+            submit_webdav_navigation(
+                &request_sender,
+                &state,
+                tab_id,
+                place,
+                NavigationKind::Refresh,
+            );
         }
     }
 
@@ -4907,6 +4985,7 @@ fn submit_navigation(
             unavailable_library_sources: 0,
             visibility,
             cancel,
+            webdav: None,
         }
     };
     match sender.send(request) {
@@ -4967,6 +5046,7 @@ fn submit_network_navigation(
             unavailable_library_sources: 0,
             visibility,
             cancel,
+            webdav: None,
         }
     };
     match sender.try_send(request) {
@@ -5041,6 +5121,7 @@ fn submit_reveal_navigation(
                 unavailable_library_sources: 0,
                 visibility,
                 cancel,
+                webdav: None,
             },
         )
     };
@@ -5179,6 +5260,7 @@ fn submit_library_navigation(
             library_sources: Some(library_sources),
             visibility,
             cancel,
+            webdav: None,
         }
     };
     match sender.send(request) {
@@ -5212,6 +5294,97 @@ fn submit_location_navigation(
         NavigationLocation::Library(library) => {
             submit_library_navigation(local_sender, state, tab_id, library, kind)
         }
+        NavigationLocation::WebDav(place) => {
+            submit_webdav_navigation(local_sender, state, tab_id, place, kind)
+        }
+    }
+}
+
+fn submit_webdav_navigation(
+    sender: &mpsc::Sender<DirectoryRequest>,
+    state: &SharedSessions,
+    tab_id: TabId,
+    place: crate::domain::WebDavPlace,
+    kind: NavigationKind,
+) -> bool {
+    let visibility = state.lock().ok().map(|app| app.file_visibility);
+    let Some(visibility) = visibility else {
+        return false;
+    };
+    let request = {
+        let mut app = state.lock().expect("app state mutex is not poisoned");
+        let connection = app
+            .network_locations
+            .iter()
+            .find_map(|location| match &location.target {
+                NetworkTarget::WebDav(connection)
+                    if connection.connection_id == place.connection_id =>
+                {
+                    Some(connection.clone())
+                }
+                _ => None,
+            });
+        let Some(connection) = connection else {
+            return false;
+        };
+        let root = connection.root.trim_end_matches('/');
+        let path = if place.path.is_empty() {
+            connection.root.clone()
+        } else {
+            place.path.clone()
+        };
+        let inside = path == connection.root
+            || path
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+        if !inside {
+            return false;
+        }
+        let location = NavigationLocation::WebDav(crate::domain::WebDavPlace {
+            connection_id: connection.connection_id,
+            revision: connection.revision,
+            root: connection.root.clone(),
+            path,
+        });
+        let Some(tab) = app.tab_mut(tab_id) else {
+            return false;
+        };
+        if tab.kind != TabKind::Files {
+            return false;
+        }
+        let directory = match &location {
+            NavigationLocation::WebDav(place) => place.path.clone(),
+            _ => return false,
+        };
+        let (request_id, cancel) = tab.begin_navigation(location, kind);
+        DirectoryRequest {
+            tab_id,
+            request_id,
+            path: PathBuf::new(),
+            library: None,
+            library_sources: None,
+            unavailable_library_sources: 0,
+            visibility,
+            cancel,
+            webdav: Some(directory_loading::WebDavListTarget {
+                connection_id: connection.connection_id,
+                revision: connection.revision,
+                https: connection.https,
+                host: connection.host,
+                port: connection.port,
+                root: connection.root,
+                username: connection.username,
+                directory,
+            }),
+        }
+    };
+    sender.send(request).is_ok()
+}
+
+fn webdav_incomplete_text(language: Language, detail: &str) -> String {
+    match language {
+        Language::Chinese => format!("目录没有完整读取：{detail}"),
+        Language::English => format!("The folder listing is incomplete: {detail}"),
     }
 }
 fn network_location_from_stable_id<'a>(
@@ -5237,7 +5410,7 @@ fn sidebar_navigation_target(app: &AppState, index: usize) -> Option<PathBuf> {
         .chain(app.network_locations.iter())
         .map(|location| match &location.target {
             NetworkTarget::WindowsPath(path) => (location.sort_order, Some(path.clone())),
-            NetworkTarget::ShellItemId(_) => (location.sort_order, None),
+            NetworkTarget::ShellItemId(_) | NetworkTarget::WebDav(_) => (location.sort_order, None),
         })
         .collect::<Vec<_>>();
     location_targets.sort_by_key(|(order, _)| *order);
@@ -5351,6 +5524,7 @@ fn install_app_window_at(
         senders.network_login.clone(),
         senders.network_login_state.clone(),
         senders.network_location_rename.clone(),
+        senders.webdav_location.clone(),
         senders.operation_window.clone(),
         delete_ui,
         conflict_ui,
@@ -5931,6 +6105,10 @@ fn active_write_target(app: &AppState, window_id: WindowId) -> Result<(TabId, Pa
             Language::English => "File writes are unavailable on Home".to_owned(),
         }),
         Some(NavigationLocation::Directory(path)) => Ok((tab_id, path.clone())),
+        Some(NavigationLocation::WebDav(_)) => Err(match app.language {
+            Language::Chinese => "WebDAV 位置不能执行本地写入".to_owned(),
+            Language::English => "Local writes are unavailable on a WebDAV location".to_owned(),
+        }),
         Some(NavigationLocation::Library(library)) => app
             .libraries
             .iter()
@@ -6441,6 +6619,7 @@ enum SidebarDestination {
     Directory(PathBuf),
     Library(LibraryLocationId),
     External(PathBuf),
+    WebDav(crate::domain::WebDavPlace),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6495,6 +6674,17 @@ fn sidebar_menu_target(
                         shell_identity: identity.as_os_str().to_owned(),
                     },
                     SidebarDestination::External(identity.clone()),
+                ),
+                NetworkTarget::WebDav(connection) => (
+                    ShellMenuItemTarget::Namespace {
+                        shell_identity: std::ffi::OsString::new(),
+                    },
+                    SidebarDestination::WebDav(crate::domain::WebDavPlace {
+                        connection_id: connection.connection_id,
+                        revision: connection.revision,
+                        root: connection.root.clone(),
+                        path: connection.root.clone(),
+                    }),
                 ),
             };
             Some(SidebarMenuResolved {
@@ -6625,15 +6815,25 @@ fn sidebar_context_rows(
                 false,
                 false,
             ),
-            quick_menu_row(
-                CMD_NETWORK_LOCATION_REMOVE,
+        ]);
+        if matches!(target.destination, SidebarDestination::WebDav(_)) {
+            rows.push(quick_menu_row(
+                webdav_ui::CMD_EDIT_WEBDAV_LOCATION,
                 0,
-                text("移除", "Remove"),
+                text("编辑连接", "Edit connection"),
                 true,
                 false,
                 false,
-            ),
-        ]);
+            ));
+        }
+        rows.push(quick_menu_row(
+            CMD_NETWORK_LOCATION_REMOVE,
+            0,
+            text("移除", "Remove"),
+            true,
+            false,
+            false,
+        ));
         if source == NetworkLocationSource::AsterOwned {
             rows.extend([
                 quick_menu_row(
@@ -6713,7 +6913,7 @@ fn selected_network_location_path(
         .find(|location| location.id == id)
         .and_then(|location| match &location.target {
             NetworkTarget::WindowsPath(path) => Some(path.clone()),
-            NetworkTarget::ShellItemId(_) => None,
+            NetworkTarget::ShellItemId(_) | NetworkTarget::WebDav(_) => None,
         })
 }
 
@@ -6842,6 +7042,7 @@ fn quick_menu_location_target(
                     .and_then(|candidate| candidate.default_save_path.clone()),
             },
         ),
+        NavigationLocation::WebDav(_) => None,
     }
 }
 
@@ -9515,11 +9716,22 @@ fn dismiss_quick_menu_session(window_id: WindowId, restore_focus: bool) {
         ui.invoke_dismiss_context_menu();
     }
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DraggedEntry {
+    Local(EntryId, PathBuf),
+    Remote {
+        id: EntryId,
+        identity: crate::domain::WebDavEntry,
+        name: String,
+        size: Option<u64>,
+    },
+}
+
 #[derive(Debug)]
 struct InternalDrag {
     origin_tab: TabId,
     request_id: RequestId,
-    entries: Vec<(EntryId, PathBuf)>,
+    entries: Vec<DraggedEntry>,
     start_x: f32,
     start_y: f32,
 }
@@ -9556,15 +9768,43 @@ impl FileDragGesture {
         let Some(entry) = tab.visible_entry(id) else {
             return;
         };
-        let entries = if tab.selected.contains(&id) {
+        let entries = if entry.webdav.is_some() {
+            let selected = if tab.selected.contains(&id) {
+                tab.selected
+                    .iter()
+                    .filter_map(|id| tab.visible_entry(*id))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![entry]
+            };
+            selected
+                .into_iter()
+                .filter(|entry| {
+                    entry.webdav.is_some() && entry.kind == crate::domain::EntryKind::File
+                })
+                .filter_map(|entry| {
+                    let identity = entry.webdav.clone()?;
+                    Some(DraggedEntry::Remote {
+                        id: entry.id,
+                        identity,
+                        name: entry.display_name.clone(),
+                        size: entry.size_bytes,
+                    })
+                })
+                .collect()
+        } else if tab.selected.contains(&id) {
             tab.selected
                 .iter()
                 .filter_map(|id| tab.visible_entry(*id))
-                .map(|entry| (entry.id, entry.path.clone()))
+                .filter(|entry| entry.webdav.is_none())
+                .map(|entry| DraggedEntry::Local(entry.id, entry.path.clone()))
                 .collect()
         } else {
-            vec![(entry.id, entry.path.clone())]
+            vec![DraggedEntry::Local(entry.id, entry.path.clone())]
         };
+        if entries.is_empty() {
+            return;
+        }
         let drag = InternalDrag {
             origin_tab: tab.id,
             request_id: tab.latest_request(),
@@ -9582,9 +9822,13 @@ impl FileDragGesture {
         if tab.id != drag.origin_tab
             || tab.latest_request() != drag.request_id
             || drag.entries.is_empty()
-            || drag.entries.iter().any(|(id, path)| {
-                tab.visible_entry(*id)
-                    .is_none_or(|entry| entry.path != *path)
+            || drag.entries.iter().any(|entry| match entry {
+                DraggedEntry::Local(id, path) => tab
+                    .visible_entry(*id)
+                    .is_none_or(|entry| entry.webdav.is_some() || entry.path != *path),
+                DraggedEntry::Remote { id, identity, .. } => tab
+                    .visible_entry(*id)
+                    .is_none_or(|entry| entry.webdav.as_ref() != Some(identity)),
             })
         {
             self.cancel("source_identity_changed");
@@ -9625,10 +9869,63 @@ fn wire_internal_drag_drop(
             .ok()
             .and_then(|app| gesture.borrow_mut().take_native_start(&app, x, y));
         let Some(drag) = drag else { return };
+        if drag
+            .entries
+            .iter()
+            .all(|entry| matches!(entry, DraggedEntry::Remote { .. }))
+        {
+            let files = drag
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    DraggedEntry::Remote {
+                        name,
+                        size,
+                        identity,
+                        ..
+                    } => Some((name.clone(), *size, identity.clone())),
+                    DraggedEntry::Local(_, _) => None,
+                })
+                .collect::<Vec<_>>();
+            let prepared = state
+                .lock()
+                .ok()
+                .and_then(|app| webdav_ui::prepare_remote_drag(&app, &files));
+            ui.invoke_release_internal_drag_pointer();
+            ui.set_drop_hover_entry_id(-1);
+            let Some(prepared) = prepared else {
+                if let Ok(mut app) = state.lock() {
+                    app.operation_errors
+                        .push("webdav drag could not start".to_owned());
+                }
+                return;
+            };
+            let files = prepared
+                .into_iter()
+                .map(|file| platform::windows::drag_drop::VirtualOutboundFile {
+                    name: file.name,
+                    size: file.size,
+                    open: file.open,
+                })
+                .collect();
+            match platform::windows::drag_drop::begin_virtual_outbound_drag(files) {
+                Ok(_) => {}
+                Err(error) => {
+                    if let Ok(mut app) = state.lock() {
+                        app.operation_errors
+                            .push(format!("outbound drag failed: {error}"));
+                    }
+                }
+            }
+            return;
+        }
         let paths = drag
             .entries
             .iter()
-            .map(|(_, path)| path.clone())
+            .filter_map(|entry| match entry {
+                DraggedEntry::Local(_, path) => Some(path.clone()),
+                DraggedEntry::Remote { .. } => None,
+            })
             .collect::<Vec<_>>();
         let source_directories = paths
             .iter()
@@ -10548,6 +10845,7 @@ fn wire_callbacks(
     network_login_ui: slint::Weak<NetworkLoginWindow>,
     network_login_state: Arc<Mutex<NetworkLoginCoordinator>>,
     network_location_rename_ui: slint::Weak<NetworkLocationRenameWindow>,
+    webdav_location_ui: slint::Weak<WebDavLocationWindow>,
     operation_window_ui: slint::Weak<OperationWindow>,
     delete_ui: &ConfirmationWindow,
     conflict_ui: &ConfirmationWindow,
@@ -10604,6 +10902,15 @@ fn wire_callbacks(
         let Ok(action_target) = actions::target(&state_for_path) else {
             return;
         };
+        let remote = state_for_path.lock().ok().is_some_and(|app| {
+            matches!(
+                app.active().visible_location(),
+                Some(NavigationLocation::WebDav(_))
+            )
+        });
+        if remote {
+            return;
+        }
         let input = path.to_string();
         let (tab_id, mode) = {
             let app = state_for_path
@@ -10856,19 +11163,22 @@ fn wire_callbacks(
                 Some(EntryId(entry_id as u32))
             };
             entry_id.and_then(|entry_id| {
-                app.active().visible_entry(entry_id).map(|entry| {
-                    (
-                        app.active_window_state().active_tab,
-                        entry
-                            .open_target
-                            .clone()
-                            .unwrap_or_else(|| entry.path.clone()),
-                        entry.kind == crate::domain::EntryKind::Directory,
-                    )
-                })
+                let entry = app.active().visible_entry(entry_id)?.clone();
+                Some((app.active_window_state().active_tab, entry))
             })
         };
-        if let Some((tab_id, target, is_directory)) = target {
+        if let Some((tab_id, entry)) = target.as_ref()
+            && entry.webdav.is_some()
+        {
+            webdav_ui::open_entry(&state_for_entry, &sender_for_entry, *tab_id, entry);
+            if let Some(ui) = weak.upgrade() {
+                refresh_ui(&ui, &state_for_entry);
+            }
+            return;
+        }
+        if let Some((tab_id, entry)) = target {
+            let is_directory = entry.kind == crate::domain::EntryKind::Directory;
+            let target = entry.open_target.unwrap_or(entry.path);
             if is_directory {
                 submit_path_navigation(
                     &sender_for_entry,
@@ -11037,6 +11347,23 @@ fn wire_callbacks(
                     refresh_ui(&ui, &state_for_network_location);
                 }
             }
+            Some((tab_id, NetworkTarget::WebDav(connection))) => {
+                submit_webdav_navigation(
+                    &sender_for_network_location,
+                    &state_for_network_location,
+                    tab_id,
+                    crate::domain::WebDavPlace {
+                        connection_id: connection.connection_id,
+                        revision: connection.revision,
+                        root: connection.root.clone(),
+                        path: connection.root,
+                    },
+                    NavigationKind::Normal,
+                );
+                if let Some(ui) = weak.upgrade() {
+                    refresh_ui(&ui, &state_for_network_location);
+                }
+            }
             Some((_, NetworkTarget::ShellItemId(identity))) => {
                 thread::spawn(move || {
                     if let Err(error) = platform::open_path(&identity) {
@@ -11052,11 +11379,11 @@ fn wire_callbacks(
     let sender_for_activate_entry = sender.clone();
     let network_sender_for_activate_entry = network_sender.clone();
     let state_for_activate_entry = state.clone();
-    let last_click = std::rc::Rc::new(RefCell::new(None::<(TabId, PathBuf, Instant)>));
+    let last_click = std::rc::Rc::new(RefCell::new(None::<(TabId, ActivateTarget, Instant)>));
     ui.on_activate_entry(move |entry_id, toggle, extend| {
         let entry_id = EntryId(entry_id as u32);
         let now = Instant::now();
-        let (tab_id, path) = {
+        let (tab_id, target) = {
             let app = state_for_activate_entry
                 .lock()
                 .expect("app state mutex is not poisoned");
@@ -11064,21 +11391,21 @@ fn wire_callbacks(
                 app.active_window_state().active_tab,
                 app.active()
                     .visible_entry(entry_id)
-                    .map(|entry| entry.path.clone()),
+                    .map(ActivateTarget::from),
             )
         };
         let double_click_interval = platform::double_click_interval();
         let should_open = last_click.borrow().as_ref().is_some_and(
-            |(previous_tab, previous_path, previous_time)| {
+            |(previous_tab, previous_target, previous_time)| {
                 *previous_tab == tab_id
-                    && path.as_ref() == Some(previous_path)
+                    && target.as_ref() == Some(previous_target)
                     && now.saturating_duration_since(*previous_time) <= double_click_interval
             },
-        ) && path.is_some();
+        ) && target.is_some();
         *last_click.borrow_mut() = if should_open {
             None
         } else {
-            path.map(|path| (tab_id, path, now))
+            target.map(|target| (tab_id, target, now))
         };
 
         if should_open {
@@ -11086,30 +11413,31 @@ fn wire_callbacks(
                 let app = state_for_activate_entry
                     .lock()
                     .expect("app state mutex is not poisoned");
-                app.active().visible_entry(entry_id).map(|entry| {
-                    (
-                        app.active_window_state().active_tab,
-                        entry
-                            .open_target
-                            .clone()
-                            .unwrap_or_else(|| entry.path.clone()),
-                        entry.kind == crate::domain::EntryKind::Directory,
-                    )
-                })
+                app.active()
+                    .visible_entry(entry_id)
+                    .map(|entry| (app.active_window_state().active_tab, entry.clone()))
             };
-            if let Some((tab_id, target, is_directory)) = target {
-                if is_directory {
+            if let Some((tab_id, entry)) = target {
+                if entry.webdav.is_some() {
+                    webdav_ui::open_entry(
+                        &state_for_activate_entry,
+                        &sender_for_activate_entry,
+                        tab_id,
+                        &entry,
+                    );
+                } else if entry.kind == crate::domain::EntryKind::Directory {
                     submit_path_navigation(
                         &sender_for_activate_entry,
                         &network_sender_for_activate_entry,
                         &state_for_activate_entry,
                         tab_id,
-                        target,
+                        entry.open_target.unwrap_or(entry.path),
                         NavigationKind::Normal,
                     );
                 } else {
+                    let path = entry.open_target.unwrap_or(entry.path);
                     thread::spawn(move || {
-                        if let Err(error) = platform::open_path(&target) {
+                        if let Err(error) = platform::open_path(&path) {
                             eprintln!("unable to open file: {error}");
                         }
                     });
@@ -11504,6 +11832,23 @@ fn wire_callbacks(
                     refresh_ui(&ui, &state_for_home);
                 }
             }
+            Some((tab_id, NetworkTarget::WebDav(connection))) => {
+                submit_webdav_navigation(
+                    &sender_for_home,
+                    &state_for_home,
+                    tab_id,
+                    crate::domain::WebDavPlace {
+                        connection_id: connection.connection_id,
+                        revision: connection.revision,
+                        root: connection.root.clone(),
+                        path: connection.root,
+                    },
+                    NavigationKind::Normal,
+                );
+                if let Some(ui) = weak.upgrade() {
+                    refresh_ui(&ui, &state_for_home);
+                }
+            }
             Some((_, NetworkTarget::ShellItemId(identity))) => {
                 thread::spawn(move || {
                     if let Err(error) = platform::open_path(&identity) {
@@ -11511,7 +11856,7 @@ fn wire_callbacks(
                     }
                 });
             }
-            _ => {}
+            None => {}
         }
     });
 
@@ -11611,6 +11956,7 @@ fn wire_callbacks(
         network_login: network_login_ui.clone(),
         network_login_state: network_login_state.clone(),
         network_location_rename: network_location_rename_ui.clone(),
+        webdav_location: webdav_location_ui.clone(),
         operation_window: operation_window_ui.clone(),
     };
     let confirmations_for_tab_drag = ConfirmationWindows::new(delete_ui, conflict_ui, exit_ui);
@@ -12220,17 +12566,45 @@ fn wire_callbacks(
         if let Ok(mut menu) = quick_menu_for_entry.lock() {
             menu.active_quick_access_path = quick_access_path;
         }
+        let remote = state_for_entry_menu
+            .lock()
+            .ok()
+            .is_some_and(|app| webdav_ui::location_is_remote(&app));
         if let Some(ui) = weak.upgrade() {
             ui.set_context_menu_anchor_x(x);
             ui.set_context_menu_anchor_y(y);
-            project_context_menu(&ui, &state_for_entry_menu, &quick_menu_for_entry, false);
-            begin_shell_menu_load(
-                &ui,
-                &state_for_entry_menu,
-                &quick_menu_for_entry,
-                &shell_menu_for_entry,
-                false,
-            );
+            if remote {
+                let language = state_for_entry_menu
+                    .lock()
+                    .ok()
+                    .map(|app| app.language)
+                    .unwrap_or(Language::Chinese);
+                let directory = state_for_entry_menu.lock().ok().is_some_and(|app| {
+                    app.active().selected.iter().any(|id| {
+                        app.active()
+                            .visible_entry(*id)
+                            .is_some_and(|entry| entry.kind == crate::domain::EntryKind::Directory)
+                    })
+                });
+                let rows = webdav_ui::entry_menu_rows(language, directory);
+                if let Ok(mut menu) = quick_menu_for_entry.lock() {
+                    menu.built_in_rows = rows.clone();
+                    menu.all_rows = rows;
+                    menu.submenu_rows.clear();
+                }
+                ui.set_context_shell_loading(false);
+                ui.set_context_menu_open(true);
+                project_filtered_context_menu(&ui, &quick_menu_for_entry, "");
+            } else {
+                project_context_menu(&ui, &state_for_entry_menu, &quick_menu_for_entry, false);
+                begin_shell_menu_load(
+                    &ui,
+                    &state_for_entry_menu,
+                    &quick_menu_for_entry,
+                    &shell_menu_for_entry,
+                    false,
+                );
+            }
         }
     });
 
@@ -12295,12 +12669,19 @@ fn wire_callbacks(
         ui.set_context_menu_anchor_x(x);
         ui.set_context_menu_anchor_y(y);
         ui.set_context_search("".into());
-        ui.set_context_shell_loading(true);
+        let remote_location = matches!(resolved.destination, SidebarDestination::WebDav(_));
+        if remote_location && let Ok(mut menu) = quick_menu_for_sidebar.lock() {
+            menu.all_rows = rows.clone();
+        }
+        ui.set_context_shell_loading(!remote_location);
         ui.set_context_submenu_open(false);
         project_filtered_context_menu(&ui, &quick_menu_for_sidebar, "");
         ui.set_context_menu_open(true);
         if let Some(window_id) = window_id_for_ui(&ui) {
             open_quick_menu_popup(window_id, x, y);
+        }
+        if remote_location {
+            return;
         }
         begin_shell_menu_load_for(
             &ui,
@@ -12328,7 +12709,20 @@ fn wire_callbacks(
                 )
             })
             .unwrap();
-        let rows = sidebar_visibility_rows(visibility, language);
+        let mut rows = sidebar_visibility_rows(visibility, language);
+        rows.push(quick_menu_separator());
+        rows.push(quick_menu_row(
+            webdav_ui::CMD_ADD_WEBDAV_LOCATION,
+            0,
+            if language == Language::Chinese {
+                "添加 WebDAV 位置"
+            } else {
+                "Add WebDAV location"
+            },
+            true,
+            false,
+            false,
+        ));
         let key = QuickMenuKey {
             window_id: state_for_sidebar_background.window_id,
             tab_id,
@@ -12458,22 +12852,54 @@ fn wire_callbacks(
                 tab.clear_selection();
             }
         }
+        let remote = state_for_background_menu
+            .lock()
+            .ok()
+            .is_some_and(|app| webdav_ui::location_is_remote(&app));
         if let Some(ui) = weak.upgrade() {
             ui.set_context_menu_anchor_x(x);
             ui.set_context_menu_anchor_y(y);
-            project_context_menu(
-                &ui,
-                &state_for_background_menu,
-                &quick_menu_for_background,
-                true,
-            );
-            begin_shell_menu_load(
-                &ui,
-                &state_for_background_menu,
-                &quick_menu_for_background,
-                &shell_menu_for_background,
-                true,
-            );
+            if remote {
+                let language = state_for_background_menu
+                    .lock()
+                    .ok()
+                    .map(|app| app.language)
+                    .unwrap_or(Language::Chinese);
+                let rows = vec![quick_menu_row(
+                    CMD_REFRESH,
+                    0,
+                    if language == Language::Chinese {
+                        "刷新"
+                    } else {
+                        "Refresh"
+                    },
+                    true,
+                    false,
+                    false,
+                )];
+                if let Ok(mut menu) = quick_menu_for_background.lock() {
+                    menu.built_in_rows = rows.clone();
+                    menu.all_rows = rows;
+                    menu.submenu_rows.clear();
+                }
+                ui.set_context_shell_loading(false);
+                ui.set_context_menu_open(true);
+                project_filtered_context_menu(&ui, &quick_menu_for_background, "");
+            } else {
+                project_context_menu(
+                    &ui,
+                    &state_for_background_menu,
+                    &quick_menu_for_background,
+                    true,
+                );
+                begin_shell_menu_load(
+                    &ui,
+                    &state_for_background_menu,
+                    &quick_menu_for_background,
+                    &shell_menu_for_background,
+                    true,
+                );
+            }
         }
     });
 
@@ -12915,6 +13341,7 @@ fn wire_callbacks(
     let sender_for_context_command = operation_sender.clone();
     let delete_weak_for_context = delete_ui.as_weak();
     let clipboard_for_context = clipboard_sender.clone();
+    let webdav_location_ui = webdav_location_ui.clone();
     let quick_menu_for_command = quick_menu.clone();
     let shell_menu_for_command = shell_menu_worker.clone();
     let everything_for_context_command = everything_sender.clone();
@@ -13023,6 +13450,48 @@ fn wire_callbacks(
                     );
                 }
             }
+            webdav_ui::CMD_ADD_WEBDAV_LOCATION => {
+                let Some(window) = webdav_location_ui.upgrade() else { return };
+                let Some(owner) = weak.upgrade() else { return };
+                if let Ok(app) = state_for_context_command.lock() {
+                    webdav_ui::show_new_dialog(&window, &owner, &app);
+                }
+            }
+            webdav_ui::CMD_EDIT_WEBDAV_LOCATION => {
+                let Some(id) = quick_menu_for_command.lock().ok().and_then(|menu| menu.active_network_location) else { return };
+                let Some(window) = webdav_location_ui.upgrade() else { return };
+                let Some(owner) = weak.upgrade() else { return };
+                if let Ok(app) = state_for_context_command.lock() {
+                    webdav_ui::show_edit_dialog(&window, &owner, &app, id);
+                }
+            }
+            webdav_ui::CMD_WEBDAV_DOWNLOAD | webdav_ui::CMD_WEBDAV_OPEN => {
+                let opened = state_for_context_command.lock().ok().and_then(|app| {
+                    let entries = webdav_ui::selected_remote_entries(&app)?;
+                    (command == webdav_ui::CMD_WEBDAV_OPEN
+                        && entries.len() == 1
+                        && entries[0].kind == crate::domain::EntryKind::Directory)
+                        .then(|| (app.active_window_state().active_tab, entries))
+                });
+                if let Some((tab_id, entries)) = opened {
+                    webdav_ui::open_entry(
+                        &state_for_context_command,
+                        &sender,
+                        tab_id,
+                        &entries[0],
+                    );
+                } else if let Some(entries) = state_for_context_command
+                    .lock()
+                    .ok()
+                    .and_then(|app| webdav_ui::selected_remote_entries(&app))
+                {
+                    webdav_ui::start_download(
+                        state_for_context_command.shared.clone(),
+                        entries,
+                        command == webdav_ui::CMD_WEBDAV_OPEN,
+                    );
+                }
+            }
             CMD_ADD_NETWORK_LOCATION => {
                 if let Ok(mut app) = state_for_context_command.lock()
                     && let Some(path) = app.active().visible_path().map(Path::to_path_buf)
@@ -13051,6 +13520,12 @@ fn wire_callbacks(
                             if let Some(tab_id) = tab_id { submit_library_navigation(&sender, &state_for_context_command, tab_id, library, NavigationKind::Normal); }
                         }
                         SidebarDestination::External(identity) => { thread::spawn(move || { let _ = platform::open_path(&identity); }); }
+                        SidebarDestination::WebDav(place) => {
+                            let tab_id = state_for_context_command.lock().ok().map(|app| app.active_window_state().active_tab);
+                            if let Some(tab_id) = tab_id {
+                                submit_webdav_navigation(&sender, &state_for_context_command, tab_id, place, NavigationKind::Normal);
+                            }
+                        }
                     }
                     return;
                 }
@@ -13068,6 +13543,26 @@ fn wire_callbacks(
                                 &state_for_context_command,
                                 tab_id,
                                 path,
+                                NavigationKind::Normal,
+                            );
+                        }
+                    }
+                    Some(NetworkTarget::WebDav(connection)) => {
+                        let tab_id = state_for_context_command
+                            .lock()
+                            .ok()
+                            .map(|app| app.active_window_state().active_tab);
+                        if let Some(tab_id) = tab_id {
+                            submit_webdav_navigation(
+                                &sender,
+                                &state_for_context_command,
+                                tab_id,
+                                crate::domain::WebDavPlace {
+                                    connection_id: connection.connection_id,
+                                    revision: connection.revision,
+                                    root: connection.root.clone(),
+                                    path: connection.root,
+                                },
                                 NavigationKind::Normal,
                             );
                         }
@@ -13093,6 +13588,20 @@ fn wire_callbacks(
                         SidebarDestination::Library(library) => {
                             let tab_id = state_for_context_command.lock().ok().map(|mut app| app.create_tab(NavigationLocation::Library(library.clone())));
                             if let Some(tab_id) = tab_id { submit_library_navigation(&sender, &state_for_context_command, tab_id, library, NavigationKind::Refresh); }
+                        }
+                        SidebarDestination::WebDav(place) => {
+                            let tab_id = state_for_context_command.lock().ok().map(|mut app| {
+                                app.create_tab(NavigationLocation::WebDav(place.clone()))
+                            });
+                            if let Some(tab_id) = tab_id {
+                                submit_webdav_navigation(
+                                    &sender,
+                                    &state_for_context_command,
+                                    tab_id,
+                                    place,
+                                    NavigationKind::Refresh,
+                                );
+                            }
                         }
                         SidebarDestination::External(_) => {}
                     }
@@ -13153,7 +13662,7 @@ fn wire_callbacks(
                 }
             }
             CMD_NETWORK_LOCATION_COPY_ADDRESS => {
-                let sidebar_path = current_sidebar_menu_target(&state_for_context_command, &quick_menu_for_command).and_then(|target| match target.destination { SidebarDestination::Directory(path) | SidebarDestination::External(path) => Some(path), SidebarDestination::Library(_) => None });
+                let sidebar_path = current_sidebar_menu_target(&state_for_context_command, &quick_menu_for_command).and_then(|target| match target.destination { SidebarDestination::Directory(path) | SidebarDestination::External(path) => Some(path), SidebarDestination::Library(_) | SidebarDestination::WebDav(_) => None });
                 if let Some(path) = sidebar_path.or_else(|| selected_network_location_path(&state_for_context_command, &quick_menu_for_command)) {
                     let result = platform::windows::clipboard::write_text(path.as_os_str());
                     if let Err(error) = result
@@ -13519,6 +14028,12 @@ fn wire_callbacks(
     let weak = ui.as_weak();
     let state_for_cancel_operation = state.clone();
     ui.on_cancel_operation(move |id| {
+        if webdav_ui::cancel_transfer(id as u64) {
+            if let Some(ui) = weak.upgrade() {
+                refresh_ui(&ui, &state_for_cancel_operation);
+            }
+            return;
+        }
         let _ = actions::cancel(
             &state_for_cancel_operation.shared,
             state_for_cancel_operation.window_id,
@@ -15910,6 +16425,12 @@ fn wire_operation_window(
             "operation-window-cancel-requested",
             &format!("id={id}"),
         );
+        if webdav_ui::cancel_transfer(id as u64) {
+            if let Some(operation_ui) = operation_weak.upgrade() {
+                refresh_operation_window(&operation_ui, &state_for_cancel);
+            }
+            return;
+        }
         cancel_operations(&state_for_cancel, [OperationId(id as u64)]);
         if let Some(operation_ui) = operation_weak.upgrade() {
             refresh_operation_window(&operation_ui, &state_for_cancel);
@@ -15959,6 +16480,17 @@ fn wire_operation_window(
             let Some(operation_ui) = operation_weak.upgrade() else {
                 return;
             };
+            webdav_ui::prune_finished_transfers();
+            if webdav_ui::has_transfer() {
+                refresh_operation_badges(&state_for_auto_open);
+                refresh_operation_window(&operation_ui, &state_for_auto_open);
+                if webdav_ui::has_active_transfer() && !operation_ui.window().is_visible() {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        position_window_centered(&ui, None, &operation_ui);
+                    }
+                    let _ = operation_ui.show();
+                }
+            }
             let removed = state_for_auto_open
                 .lock()
                 .map(|mut app| {
@@ -16978,6 +17510,10 @@ fn start_shell_menu_event_pump(
                                                 SidebarDestination::Library(library),
                                                 Some(NavigationLocation::Library(current)),
                                             ) => *library == current,
+                                            (
+                                                SidebarDestination::WebDav(place),
+                                                Some(NavigationLocation::WebDav(current)),
+                                            ) => place == &current,
                                             _ => false,
                                         };
                                         if matches {
@@ -16987,6 +17523,9 @@ fn start_shell_menu_event_pump(
                                                 }
                                                 SidebarDestination::Library(library) => {
                                                     NavigationLocation::Library(library)
+                                                }
+                                                SidebarDestination::WebDav(place) => {
+                                                    NavigationLocation::WebDav(place)
                                                 }
                                                 SidebarDestination::External(_) => {
                                                     unreachable!()
@@ -17946,7 +18485,7 @@ fn watched_roots(app: &AppState) -> std::collections::HashSet<PathBuf> {
         .values()
         .flat_map(|window| window.tabs.values())
         .flat_map(|tab| match tab.visible_location() {
-            Some(NavigationLocation::Home) => Vec::new(),
+            Some(NavigationLocation::Home | NavigationLocation::WebDav(_)) => Vec::new(),
             Some(NavigationLocation::Directory(path)) => vec![path.clone()],
             Some(NavigationLocation::Library(library)) => app
                 .libraries
@@ -17976,7 +18515,7 @@ fn refresh_affected_tabs(
             .filter_map(|tab| {
                 let location = tab.visible_location()?.clone();
                 let affected = match &location {
-                    NavigationLocation::Home => false,
+                    NavigationLocation::Home | NavigationLocation::WebDav(_) => false,
                     NavigationLocation::Directory(path) => directories.contains(path),
                     NavigationLocation::Library(library) => app
                         .libraries
@@ -18792,6 +19331,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> DirectoryEventC
             kind,
             message,
         } => {
+            let message = webdav_ui::listing_error_text(app.language, &message);
             if let Some(tab) = app.tab_mut(tab_id)
                 && tab.fail_directory_navigation(request_id, classify_error(kind), message)
             {
@@ -18801,6 +19341,28 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> DirectoryEventC
         DirectoryEvent::Slow { tab_id, request_id } => {
             if let Some(tab) = app.tab_mut(tab_id) {
                 tab.mark_directory_slow(request_id);
+            }
+        }
+        DirectoryEvent::WebDavFinished {
+            tab_id,
+            request_id,
+            connection_id,
+            revision,
+            root,
+            path,
+            incomplete,
+        } => {
+            let location = NavigationLocation::WebDav(crate::domain::WebDavPlace {
+                connection_id,
+                revision,
+                root,
+                path,
+            });
+            let language = app.language;
+            let preference = app.default_directory_view;
+            let warning = incomplete.map(|detail| webdav_incomplete_text(language, &detail));
+            if let Some(tab) = app.tab_mut(tab_id) {
+                tab.finish_remote_directory(request_id, location, preference, warning);
             }
         }
     }
@@ -19154,6 +19716,7 @@ fn spawn_everything_worker(
                                         .unwrap_or(FolderSizeState::NotIndexed),
                                     modified: item.modified,
                                     created: item.created,
+                                    webdav: None,
                                 })
                                 .collect::<Vec<_>>();
                             if !cancel.load(std::sync::atomic::Ordering::Acquire) {
@@ -19810,6 +20373,13 @@ fn submit_search(
     tab_id: TabId,
     query: String,
 ) {
+    if state.lock().ok().is_some_and(|app| {
+        app.tab(tab_id)
+            .and_then(TabSession::visible_location)
+            .is_some_and(|location| matches!(location, NavigationLocation::WebDav(_)))
+    }) {
+        return;
+    }
     let request = {
         let mut app = state.lock().expect("app state mutex is not poisoned");
         app.cancel_column_drag();
@@ -19829,7 +20399,7 @@ fn submit_search(
                             .filter_map(|source| source.path.clone())
                             .collect::<Vec<_>>()
                     }),
-                NavigationLocation::Directory(_) => None,
+                NavigationLocation::Directory(_) | NavigationLocation::WebDav(_) => None,
             });
         let Some(tab) = app.tab_mut(tab_id) else {
             return;
@@ -20627,18 +21197,30 @@ fn home_network_rows(app: &AppState, tab_id: TabId, columns: usize) -> Vec<HomeC
         .into_iter()
         .map(|location| {
             let stable_id = format!("home:2:{}", location.id);
-            let identity = match &location.target {
-                NetworkTarget::WindowsPath(path) | NetworkTarget::ShellItemId(path) => path,
+            let (detail, icon) = match &location.target {
+                NetworkTarget::WindowsPath(path) | NetworkTarget::ShellItemId(path) => (
+                    display_path(path),
+                    app.sidebar_icons
+                        .get(path)
+                        .map(shell_icon_image)
+                        .unwrap_or_default(),
+                ),
+                NetworkTarget::WebDav(connection) => (
+                    format!(
+                        "{}://{}:{}{}",
+                        if connection.https { "https" } else { "http" },
+                        connection.host,
+                        connection.port,
+                        connection.root
+                    ),
+                    Image::default(),
+                ),
             };
             HomeItemRow {
                 stable_id: stable_id.clone().into(),
                 label: location.display_name.clone().into(),
-                detail: display_path(identity).into(),
-                icon: app
-                    .sidebar_icons
-                    .get(identity)
-                    .map(shell_icon_image)
-                    .unwrap_or_default(),
+                detail: detail.into(),
+                icon,
                 progress: 0.0,
                 state: -1,
                 status: "".into(),
@@ -20681,7 +21263,7 @@ fn home_item_target(app: &AppState, stable_id: &str) -> Option<PathBuf> {
                 .find(|location| location.id == index as u64)
                 .and_then(|location| match &location.target {
                     NetworkTarget::WindowsPath(path) => Some(path.clone()),
-                    NetworkTarget::ShellItemId(_) => None,
+                    NetworkTarget::ShellItemId(_) | NetworkTarget::WebDav(_) => None,
                 });
         }
         _ => None,
@@ -20969,7 +21551,9 @@ fn reload_libraries(
                     .flat_map(|window| window.tabs.values())
                     .filter_map(|tab| match tab.current_location().as_ref()? {
                         NavigationLocation::Library(library) => Some((tab.id, library.clone())),
-                        NavigationLocation::Home | NavigationLocation::Directory(_) => None,
+                        NavigationLocation::Home
+                        | NavigationLocation::Directory(_)
+                        | NavigationLocation::WebDav(_) => None,
                     })
                     .collect::<Vec<_>>()
             };
@@ -21111,6 +21695,7 @@ fn normalize_restored_location(location: NavigationLocation) -> NavigationLocati
             platform::windows::network::network_drive_to_unc(&path).unwrap_or(path),
         ),
         library @ NavigationLocation::Library(_) => library,
+        place @ NavigationLocation::WebDav(_) => place,
     }
 }
 
@@ -22411,6 +22996,7 @@ fn operation_rows(app: &AppState) -> Vec<OperationRow> {
             }
         })
         .collect::<Vec<_>>();
+    rows.extend(webdav_ui::transfer_rows(app.language));
     rows.sort_by_key(|row| (operation_row_rank(row.state), row.id));
     rows
 }
@@ -23121,7 +23707,7 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     ui.set_current_location_icon(
         tab.visible_location()
             .and_then(|location| match location {
-                NavigationLocation::Home => None,
+                NavigationLocation::Home | NavigationLocation::WebDav(_) => None,
                 NavigationLocation::Directory(path) => app.icon_cache.get(path),
                 NavigationLocation::Library(library) => app.library_icons.get(&library.identity),
             })
@@ -23332,13 +23918,14 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
             drive_progress: 0.0,
             drive_state: 3,
             drive_status: "".into(),
-            icon: app
-                .sidebar_icons
-                .get(match &location.target {
-                    NetworkTarget::WindowsPath(path) | NetworkTarget::ShellItemId(path) => path,
-                })
-                .map(shell_icon_image)
-                .unwrap_or_default(),
+            icon: match &location.target {
+                NetworkTarget::WindowsPath(path) | NetworkTarget::ShellItemId(path) => app
+                    .sidebar_icons
+                    .get(path)
+                    .map(shell_icon_image)
+                    .unwrap_or_default(),
+                NetworkTarget::WebDav(_) => Image::default(),
+            },
         });
     }
     if let Some(discovery) = app.network_discovery.get(&window_id) {
@@ -23421,6 +24008,11 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
             | SearchState::Failed => 9,
             _ => 4,
         }
+    } else if tab.load_state == LoadState::Failed
+        && !tab.entries.is_empty()
+        && matches!(tab.visible_location(), Some(NavigationLocation::WebDav(_)))
+    {
+        4
     } else {
         page_projection.index
     };
@@ -23531,14 +24123,15 @@ fn file_row(
     app: &AppState,
     grid_requested_px: Option<u32>,
 ) -> FileRow {
-    debug_assert_eq!(
-        if crate::network::is_unc_path(&entry.path) {
-            crate::network::unc_leaf_name(&entry.path)
-        } else {
-            entry.path.file_name().map(ToOwned::to_owned)
-        }
-        .as_deref(),
-        Some(entry.original_name.as_os_str()),
+    debug_assert!(
+        entry.webdav.is_some() || {
+            let leaf = if crate::network::is_unc_path(&entry.path) {
+                crate::network::unc_leaf_name(&entry.path)
+            } else {
+                entry.path.file_name().map(ToOwned::to_owned)
+            };
+            leaf.as_deref() == Some(entry.original_name.as_os_str())
+        },
         "entry identity must retain its original file name"
     );
     let name_segments = if entry.name_highlights.is_empty() {
@@ -23584,7 +24177,10 @@ fn file_row(
         name_segments: ModelRc::new(VecModel::from(name_segments)),
         kind: if entry.kind == crate::domain::EntryKind::File {
             entry
-                .path
+                .webdav
+                .as_ref()
+                .map(|item| Path::new(item.path.as_str()))
+                .unwrap_or(entry.path.as_path())
                 .extension()
                 .map(|extension| extension.to_string_lossy().to_uppercase())
                 .filter(|extension| !extension.is_empty())
@@ -23635,6 +24231,12 @@ fn shell_icon_image(icon: &platform::windows::shell_icons::ShellIconRgba) -> Ima
 }
 
 fn status_text(tab: &TabSession, texts: Texts) -> String {
+    if tab.load_state == LoadState::Failed
+        && matches!(tab.visible_location(), Some(NavigationLocation::WebDav(_)))
+        && let Some(message) = tab.error.as_deref()
+    {
+        return message.to_owned();
+    }
     if tab.error.as_deref() == Some("network_slow")
         && matches!(tab.load_state, LoadState::Loading | LoadState::Partial)
     {
@@ -24707,6 +25309,30 @@ mod tests {
             home_item_network_target(&app, "home:2:86"),
             Some(NetworkTarget::WindowsPath(PathBuf::from(r"\\server\share")))
         );
+        app.network_locations.push(NetworkLocation {
+            id: 157,
+            source: NetworkLocationSource::AsterOwned,
+            display_name: "OpenList".to_owned(),
+            sort_order: 1,
+            target: NetworkTarget::WebDav(crate::network::WebDavConnection {
+                connection_id: 157,
+                revision: 1,
+                https: false,
+                host: "192.168.50.45".to_owned(),
+                port: 5244,
+                root: "/dav/mount".to_owned(),
+                username: "reader".to_owned(),
+            }),
+            shell_path: None,
+        });
+        assert_eq!(home_item_target(&app, "home:2:157"), None);
+        match home_item_network_target(&app, "home:2:157") {
+            Some(NetworkTarget::WebDav(connection)) => {
+                assert_eq!(connection.host, "192.168.50.45");
+                assert_eq!(connection.root, "/dav/mount");
+            }
+            other => panic!("home card lost the WebDAV target: {other:?}"),
+        }
         assert_eq!(home_item_target(&app, "Display only"), None);
     }
 
@@ -25202,6 +25828,7 @@ mod tests {
             folder_size: FolderSizeState::Unknown,
             modified: None,
             created: None,
+            webdav: None,
         }
     }
 
@@ -30915,6 +31542,7 @@ mod tests {
             folder_size: crate::domain::FolderSizeState::Unknown,
             modified: None,
             created: None,
+            webdav: None,
         }]);
         let event = IconEvent {
             tab_id: TabId(1),
@@ -31020,6 +31648,7 @@ mod tests {
             folder_size: FolderSizeState::Querying,
             modified: None,
             created: None,
+            webdav: None,
         }]);
 
         let queries = {
@@ -31089,6 +31718,7 @@ mod tests {
             folder_size: crate::domain::FolderSizeState::Unknown,
             modified: None,
             created: None,
+            webdav: None,
         }
     }
 
@@ -31338,11 +31968,11 @@ mod tests {
         gesture.bind_entry(&app, EntryId(2));
         let drag = gesture.take_native_start(&app, 5.0, 0.0).unwrap();
         assert_eq!(
-            drag.entries
-                .into_iter()
-                .map(|(_, path)| path)
-                .collect::<Vec<_>>(),
-            vec![PathBuf::from(r"C:\test\two.txt")]
+            drag.entries,
+            vec![DraggedEntry::Local(
+                EntryId(2),
+                PathBuf::from(r"C:\test\two.txt")
+            )]
         );
         let tab = &app.active_window_state().tabs[&TabId(1)];
         assert_eq!(tab.selected, vec![EntryId(1)]);
@@ -31370,13 +32000,10 @@ mod tests {
         gesture.bind_entry(&app, EntryId(2));
         let drag = gesture.take_native_start(&app, 5.0, 0.0).unwrap();
         assert_eq!(
-            drag.entries
-                .into_iter()
-                .map(|(_, path)| path)
-                .collect::<Vec<_>>(),
+            drag.entries,
             vec![
-                PathBuf::from(r"C:\test\one.txt"),
-                PathBuf::from(r"C:\test\two.txt"),
+                DraggedEntry::Local(EntryId(1), PathBuf::from(r"C:\test\one.txt")),
+                DraggedEntry::Local(EntryId(2), PathBuf::from(r"C:\test\two.txt")),
             ]
         );
     }
@@ -31807,6 +32434,7 @@ mod tests {
                 folder_size: crate::domain::FolderSizeState::Unknown,
                 modified: None,
                 created: None,
+                webdav: None,
             }]);
         }
         assert_eq!(
@@ -31885,6 +32513,7 @@ mod tests {
                             folder_size: crate::domain::FolderSizeState::Unknown,
                             modified: None,
                             created: None,
+                            webdav: None,
                         })
                         .collect(),
                 );

@@ -286,6 +286,7 @@ impl AgentState {
                 Some(crate::domain::NavigationLocation::Home) => "home",
                 Some(crate::domain::NavigationLocation::Directory(_)) => "directory",
                 Some(crate::domain::NavigationLocation::Library(_)) => "library",
+                Some(crate::domain::NavigationLocation::WebDav(_)) => "webdav",
                 None => "none",
             },
             current_path: session

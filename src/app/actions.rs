@@ -286,6 +286,12 @@ pub(super) fn snapshot(
                 3u8.hash(&mut hash);
                 library.identity.hash(&mut hash);
             }
+            Some(NavigationLocation::WebDav(place)) => {
+                4u8.hash(&mut hash);
+                place.connection_id.hash(&mut hash);
+                place.revision.hash(&mut hash);
+                place.path.hash(&mut hash);
+            }
         }
         format!("{:?}", tab.load_state).hash(&mut hash);
         for entry in &tab.entries {
@@ -530,6 +536,7 @@ mod tests {
             folder_size: FolderSizeState::Unknown,
             modified: None,
             created: None,
+            webdav: None,
         }
     }
     #[test]

@@ -349,6 +349,82 @@ export component NetworkLoginWindow inherits Window {
     }
 }
 
+export component WebDavLocationWindow inherits Window {
+    title: root.title-text;
+    icon: @image-url("../assets/app-icon.png");
+    no-frame: true;
+    resize-border-width: 0px;
+    preferred-width: 520px;
+    preferred-height: 640px;
+    min-width: 520px;
+    max-width: 520px;
+    min-height: 640px;
+    max-height: 640px;
+    background: VisualStyle.cffffff;
+    default-font-family: "Segoe UI";
+
+    in property <bool> dark-theme: false;
+    in property <string> location-id: "";
+    in property <string> title-text: "添加 WebDAV 位置";
+    in property <string> name-label: "显示名称";
+    in property <string> host-label: "主机";
+    in property <string> port-label: "端口";
+    in property <string> root-label: "根路径";
+    in property <string> user-label: "用户名";
+    in property <string> password-label: "密码";
+    in property <string> https-label: "使用 HTTPS";
+    in property <string> error-text: "";
+    in property <string> cancel-text: "取消";
+    in property <string> save-text: "保存";
+    in property <string> close-text: "关闭";
+    in-out property <string> name: "";
+    in-out property <string> host: "";
+    in-out property <string> port: "443";
+    in-out property <string> root: "/";
+    in-out property <string> username: "";
+    in-out property <string> password: "";
+    in-out property <bool> https: true;
+    callback save();
+    callback safe-cancel();
+    callback drag-window();
+
+    changed dark-theme => { VisualStyle.dark-theme = root.dark-theme; }
+
+    VerticalLayout {
+        StandaloneTitleBar { title: root.title-text; close-label: root.close-text; close-requested => { root.safe-cancel(); } drag-window => { root.drag-window(); } }
+        Rectangle {
+            vertical-stretch: 1;
+            background: VisualStyle.cffffff;
+            VerticalLayout {
+                padding-left: 20px; padding-right: 20px; padding-top: 12px; padding-bottom: 16px; spacing: 6px;
+                Text { text: root.name-label; color: VisualStyle.c62656f; font-size: 12px; }
+                LineEdit { accessible-id: "webdav-name"; text <=> root.name; }
+                Text { text: root.host-label; color: VisualStyle.c62656f; font-size: 12px; }
+                LineEdit { accessible-id: "webdav-host"; text <=> root.host; }
+                Text { text: root.port-label; color: VisualStyle.c62656f; font-size: 12px; }
+                LineEdit { accessible-id: "webdav-port"; text <=> root.port; }
+                Text { text: root.root-label; color: VisualStyle.c62656f; font-size: 12px; }
+                LineEdit { accessible-id: "webdav-root"; text <=> root.root; }
+                Text { text: root.user-label; color: VisualStyle.c62656f; font-size: 12px; }
+                LineEdit { accessible-id: "webdav-username"; text <=> root.username; }
+                Text { text: root.password-label; color: VisualStyle.c62656f; font-size: 12px; }
+                Rectangle {
+                    height: 34px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cffffff;
+                    TextInput { accessible-id: "webdav-password"; x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.password; single-line: true; input-type: InputType.password; }
+                }
+                CheckBox { accessible-id: "webdav-https"; text: root.https-label; checked <=> root.https; }
+                if root.error-text != "": Text { text: root.error-text; color: VisualStyle.cc42b1c; font-size: 12px; wrap: word-wrap; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    alignment: end; spacing: 8px;
+                    StandaloneActionButton { width: 96px; accessible-id: "dialog-cancel"; label: root.cancel-text; clicked => { root.safe-cancel(); } }
+                    StandaloneActionButton { width: 96px; accessible-id: "webdav-save"; label: root.save-text; enabled: root.name != "" && root.host != "" && root.port != "" && root.root != "" && root.username != "" && (root.password != "" || root.location-id != ""); clicked => { root.save(); } }
+                }
+            }
+        }
+    }
+}
+
 export component NetworkLocationRenameWindow inherits Window {
     title: root.title-text;
     icon: @image-url("../assets/app-icon.png");

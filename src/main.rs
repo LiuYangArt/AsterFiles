@@ -15,6 +15,7 @@ mod operation_audit;
 mod platform;
 mod quick_menu_popup;
 mod session_store;
+mod webdav;
 
 use std::path::PathBuf;
 

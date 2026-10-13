@@ -25,6 +25,7 @@ fn fixture(mode: ViewMode) -> (AppWindow, WindowSessions) {
                 folder_size: FolderSizeState::Unknown,
                 modified: None,
                 created: None,
+                webdav: None,
             }
         })
         .collect();

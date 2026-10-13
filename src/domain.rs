@@ -84,17 +84,41 @@ impl Hash for LibraryLocationId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WebDavPlace {
+    pub connection_id: u64,
+    pub revision: u64,
+    pub root: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebDavEntry {
+    pub connection_id: u64,
+    pub revision: u64,
+    pub root: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NavigationLocation {
     Home,
     Directory(PathBuf),
     Library(LibraryLocationId),
+    WebDav(WebDavPlace),
 }
 
 impl NavigationLocation {
     pub fn directory_path(&self) -> Option<&Path> {
         match self {
             Self::Directory(path) => Some(path),
-            Self::Home | Self::Library(_) => None,
+            Self::Home | Self::Library(_) | Self::WebDav(_) => None,
+        }
+    }
+
+    pub fn webdav_place(&self) -> Option<&WebDavPlace> {
+        match self {
+            Self::WebDav(place) => Some(place),
+            Self::Home | Self::Directory(_) | Self::Library(_) => None,
         }
     }
 
@@ -103,6 +127,7 @@ impl NavigationLocation {
             Self::Home => "Home".to_owned(),
             Self::Directory(path) => display_path(path),
             Self::Library(library) => library.display_name.clone(),
+            Self::WebDav(place) => webdav_label(&place.path),
         }
     }
 }
@@ -734,7 +759,9 @@ impl TabSession {
                 display_name: library.display_name.clone(),
                 sources: Vec::new(),
             },
-            Some(NavigationLocation::Home) | None => SearchScope::Global,
+            Some(NavigationLocation::Home | NavigationLocation::WebDav(_)) | None => {
+                SearchScope::Global
+            }
         };
         self.search_depth = SearchDepth::Recursive;
         self.search_query.clear();
@@ -801,8 +828,12 @@ impl TabSession {
         let Some(location) = self.visible_location() else {
             return Vec::new();
         };
-        let NavigationLocation::Directory(path) = location else {
-            return vec![(location.display_name(), location.clone())];
+        let path = match location {
+            NavigationLocation::Directory(path) => path,
+            NavigationLocation::WebDav(place) => return webdav_breadcrumbs(place),
+            NavigationLocation::Home | NavigationLocation::Library(_) => {
+                return vec![(location.display_name(), location.clone())];
+            }
         };
         let mut segments = Vec::new();
         let mut cursor = PathBuf::new();
@@ -1077,6 +1108,23 @@ impl TabSession {
             self.selection_anchor = anchor;
         }
         self.error = warning;
+        true
+    }
+
+    pub fn finish_remote_directory(
+        &mut self,
+        request_id: RequestId,
+        location: NavigationLocation,
+        preference: DirectoryViewPreference,
+        incomplete: Option<String>,
+    ) -> bool {
+        if !self.finish_directory_navigation(request_id, location, preference, incomplete.clone()) {
+            return false;
+        }
+        if let Some(message) = incomplete {
+            self.load_state = LoadState::Failed;
+            self.error = Some(message);
+        }
         true
     }
 
@@ -1706,9 +1754,12 @@ fn entry_type_key(entry: &FileEntry) -> String {
     if entry.kind == EntryKind::Directory {
         return "folder".to_owned();
     }
-    entry
-        .path
-        .extension()
+    let name = entry
+        .webdav
+        .as_ref()
+        .map(|identity| Path::new(&identity.path))
+        .unwrap_or(entry.path.as_path());
+    name.extension()
         .map(|extension| extension.to_string_lossy().to_lowercase())
         .unwrap_or_default()
 }
@@ -1735,10 +1786,15 @@ fn compare_entries(
         }
     }
     let value_order = match field {
-        SortField::Name => left
-            .display_name
-            .to_lowercase()
-            .cmp(&right.display_name.to_lowercase()),
+        SortField::Name => {
+            if left.webdav.is_some() || right.webdav.is_some() {
+                left.display_name.cmp(&right.display_name)
+            } else {
+                left.display_name
+                    .to_lowercase()
+                    .cmp(&right.display_name.to_lowercase())
+            }
+        }
         SortField::Kind => entry_type_key(left).cmp(&entry_type_key(right)),
         SortField::Size => entry_size_key(left).cmp(&entry_size_key(right)),
         SortField::Modified => left.modified.cmp(&right.modified),
@@ -1760,7 +1816,80 @@ fn compare_entries(
                 .to_lowercase()
                 .cmp(&right.display_name.to_lowercase())
         })
-        .then_with(|| left.path.cmp(&right.path))
+        .then_with(|| match (&left.webdav, &right.webdav) {
+            (Some(left_entry), Some(right_entry)) => left_entry.path.cmp(&right_entry.path),
+            _ => left.path.cmp(&right.path),
+        })
+}
+
+fn webdav_label(path: &str) -> String {
+    path.rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(path)
+        .to_owned()
+}
+
+fn webdav_breadcrumbs(place: &WebDavPlace) -> Vec<(String, NavigationLocation)> {
+    let root = if place.root.is_empty() {
+        "/"
+    } else {
+        place.root.as_str()
+    };
+    let path = if place.path.is_empty() {
+        "/"
+    } else {
+        place.path.as_str()
+    };
+    let root_trimmed = root.trim_end_matches('/');
+    let within = path == root
+        || path
+            .strip_prefix(root_trimmed)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+    if !within {
+        return vec![(
+            webdav_label(path),
+            NavigationLocation::WebDav(place.clone()),
+        )];
+    }
+    let mut crumbs = Vec::new();
+    let mut cursor = if root_trimmed.is_empty() {
+        "/"
+    } else {
+        root_trimmed
+    }
+    .to_owned();
+    crumbs.push((
+        webdav_label(&cursor),
+        NavigationLocation::WebDav(WebDavPlace {
+            path: if cursor == "/" {
+                "/".to_owned()
+            } else {
+                cursor.clone()
+            },
+            ..place.clone()
+        }),
+    ));
+    let suffix = path
+        .strip_prefix(root_trimmed)
+        .unwrap_or("")
+        .trim_start_matches('/');
+    if !suffix.is_empty() {
+        for segment in suffix.split('/').filter(|segment| !segment.is_empty()) {
+            if cursor == "/" {
+                cursor = format!("/{segment}");
+            } else {
+                cursor = format!("{cursor}/{segment}");
+            }
+            crumbs.push((
+                segment.to_owned(),
+                NavigationLocation::WebDav(WebDavPlace {
+                    path: cursor.clone(),
+                    ..place.clone()
+                }),
+            ));
+        }
+    }
+    crumbs
 }
 
 fn search_scope_prefix(path: &Path) -> String {
@@ -1805,11 +1934,12 @@ pub struct FileEntry {
     pub folder_size: FolderSizeState,
     pub modified: Option<std::time::SystemTime>,
     pub created: Option<std::time::SystemTime>,
+    pub webdav: Option<WebDavEntry>,
 }
 
 impl FileEntry {
     pub fn accepts_folder_size(&self, entry_id: EntryId, original_path: &Path) -> bool {
-        self.id == entry_id && self.path == original_path
+        self.webdav.is_none() && self.id == entry_id && self.path == original_path
     }
 
     pub fn set_folder_size(
@@ -1866,7 +1996,63 @@ mod tests {
             folder_size: FolderSizeState::Unknown,
             modified: None,
             created: None,
+            webdav: None,
         }
+    }
+
+    #[test]
+    fn issue_157_webdav_breadcrumbs_stay_inside_the_connection_root() {
+        let place = WebDavPlace {
+            connection_id: 7,
+            revision: 1,
+            root: "/dav/挂载".into(),
+            path: "/dav/挂载/子 目录/#".into(),
+        };
+        let mut tab = TabSession::new_home(TabId(1));
+        tab.begin_navigation(NavigationLocation::WebDav(place), NavigationKind::Normal);
+        let crumbs = tab.breadcrumb_paths();
+        assert_eq!(
+            crumbs
+                .iter()
+                .map(|(label, _)| label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["挂载", "子 目录", "#"]
+        );
+        match &crumbs[0].1 {
+            NavigationLocation::WebDav(crumb) => assert_eq!(crumb.path, "/dav/挂载"),
+            other => panic!("unexpected breadcrumb {other:?}"),
+        }
+        match &crumbs[2].1 {
+            NavigationLocation::WebDav(crumb) => assert_eq!(crumb.path, "/dav/挂载/子 目录/#"),
+            other => panic!("unexpected breadcrumb {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issue_157_incomplete_listing_keeps_entries_and_is_not_complete() {
+        let mut tab = TabSession::new_home(TabId(1));
+        let location = NavigationLocation::WebDav(WebDavPlace {
+            connection_id: 7,
+            revision: 1,
+            root: "/dav".into(),
+            path: "/dav".into(),
+        });
+        let preference = DirectoryViewPreference::default();
+        let (request, _) = tab.begin_navigation(location.clone(), NavigationKind::Normal);
+        assert!(tab.accept_directory_batch(
+            request,
+            vec![entry(1, "a", EntryKind::File, None)],
+            preference
+        ));
+        assert!(tab.finish_remote_directory(
+            request,
+            location,
+            preference,
+            Some("部分条目无法读取".into())
+        ));
+        assert_eq!(tab.load_state, LoadState::Failed);
+        assert_eq!(tab.entries.len(), 1);
+        assert_eq!(tab.error.as_deref(), Some("部分条目无法读取"));
     }
 
     #[test]
@@ -2676,6 +2862,7 @@ mod tests {
             folder_size: FolderSizeState::Querying,
             modified: None,
             created: None,
+            webdav: None,
         };
         assert!(!item.set_folder_size(EntryId(4), &original, FolderSizeState::Value(0)));
         assert!(!item.set_folder_size(
@@ -3179,6 +3366,7 @@ mod tests {
             folder_size: FolderSizeState::Unknown,
             modified: None,
             created: None,
+            webdav: None,
         }]);
         assert_eq!(
             session

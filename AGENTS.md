@@ -74,6 +74,10 @@ CI 只有仓库读取权限，不发布、不创建标签；同一 PR/引用的�
 
 `python tools/build.py test --locked issue_151 -- --nocapture` 检查成功、部分成功、失败、取消、迟到与重复终态、位置身份、历史和网络选择。随后运行 `python tools/verify.py --quick`，包含 Debug 构建。专项日志位于 `artifacts/logs/issue-151/`，机器结果及统一汇总副本位于 `artifacts/state/issue-151/`。真实视觉和交互由用户手动验收，不自动操作 UI，不执行本地 Release 构建。
 
+## OpenList WebDAV 专项验证（#157）
+
+`python tools/build.py test --locked webdav -- --nocapture` 检查路径身份、流式目录、取消与背压、HTTP 错误、跨源下载剥离凭据、冲突和会话往返。随后运行完整 `python tools/verify.py`，包含 Debug 构建。专项日志位于 `artifacts/logs/webdav/`，机器结果位于 `artifacts/state/webdav/`，统一汇总为 `artifacts/verify/summary.json`。真实连接、浏览、下载和重启由用户手动验收，不自动操作 UI，不执行本地 Release 构建，也不对用户 NAS 发起探针。
+
 ## UI 操作与验证
 
 - 禁止 Codex 操作、自动化或尝试控制 AsterFiles 的 UI，包括通过内置浏览器、Chrome、Computer Use、Playwright、agent-browser、截图点击或键鼠模拟等方式。
@@ -91,8 +95,8 @@ CI 只有仓库读取权限，不发布、不创建标签；同一 PR/引用的�
 - 不增加网络协议、插件或索引服务，除非当前里程碑明确需要。
 - 注释说明目的、性能约束或 Windows 平台决策，不复述代码。
 - 修改完成后至少运行与变更范围相符的最小验证，并保留可读取的错误输出。
-- 每个开发任务完成后必须运行 `cargo build`，确保 `target/debug/asterfiles.exe` 已更新，供用户直接测试。日常本地开发不计算或报告 SHA-256、文件时间等构建指纹。只有用户明确要求正式构建、发布验证，或用户确认某个 issue 已完成时，才运行本地 Release 构建；本地 Release 构建不等于发布，回复中必须明确称为“本地 Release 构建”，不得简称“发布”。如果有正在运行的 AsterFiles 进程阻挡打包，直接关闭进程。
-- 每个 issue 经用户明确确认完成后，必须在本地执行一次 Release 构建，产物为 `target/release/asterfiles.exe`；该动作不包含版本更新、提交、标签、推送或 GitHub Release。用户确认前不得因该规则提前执行本地 Release 构建。
+- 每个开发任务完成后必须运行 `cargo build`，确保 `target/debug/asterfiles.exe` 已更新，供用户直接测试。日常本地开发不计算或报告 SHA-256、文件时间等构建指纹。只有用户明确要求正式构建、发布验证；本地 Release 构建不等于发布，回复中必须明确称为“本地 Release 构建”，不得简称“发布”。如果有正在运行的 AsterFiles 进程阻挡打包，直接关闭进程。
+
 
 ## Issue 与任务状态
 

@@ -23,7 +23,7 @@ use crate::{
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-const MAGIC: &[u8; 6] = b"ASTF17";
+const MAGIC: &[u8; 6] = b"ASTF18";
 pub const DEFAULT_QUICK_MENU_BACKDROP_OPACITY: u8 = 85;
 const MAX_TABS: usize = 1_024;
 const MAX_WINDOWS: usize = 128;
@@ -492,10 +492,25 @@ fn encode(state: &SessionState) -> io::Result<Vec<u8>> {
         bytes.extend_from_slice(&location.id.to_le_bytes());
         write_string(&mut bytes, &location.display_name)?;
         bytes.extend_from_slice(&location.sort_order.to_le_bytes());
-        let NetworkTarget::WindowsPath(path) = &location.target else {
-            return Err(invalid_data("network location target cannot be persisted"));
-        };
-        write_os(&mut bytes, path.as_os_str())?;
+        match &location.target {
+            NetworkTarget::WindowsPath(path) => {
+                bytes.push(0);
+                write_os(&mut bytes, path.as_os_str())?;
+            }
+            NetworkTarget::WebDav(connection) => {
+                bytes.push(1);
+                bytes.push(u8::from(connection.https));
+                write_string(&mut bytes, &connection.host)?;
+                bytes.extend_from_slice(&connection.port.to_le_bytes());
+                write_string(&mut bytes, &connection.root)?;
+                write_string(&mut bytes, &connection.username)?;
+                bytes.extend_from_slice(&connection.connection_id.to_le_bytes());
+                bytes.extend_from_slice(&connection.revision.to_le_bytes());
+            }
+            NetworkTarget::ShellItemId(_) => {
+                return Err(invalid_data("network location target cannot be persisted"));
+            }
+        }
     }
     bytes.extend_from_slice(&(state.network_devices.len() as u32).to_le_bytes());
     for device in &state.network_devices {
@@ -578,7 +593,7 @@ fn decode(bytes: &[u8]) -> io::Result<SessionState> {
             source: NetworkLocationSource::AsterOwned,
             display_name: read_string(bytes, &mut offset)?,
             sort_order: read_u32(bytes, &mut offset)?,
-            target: NetworkTarget::WindowsPath(PathBuf::from(read_os(bytes, &mut offset)?)),
+            target: read_network_target(bytes, &mut offset)?,
             shell_path: None,
         });
     }
@@ -687,20 +702,31 @@ fn validate_network_locations(values: &[NetworkLocation]) -> io::Result<()> {
                 "imported network location cannot be persisted",
             ));
         }
-        let NetworkTarget::WindowsPath(path) = &location.target else {
-            return Err(invalid_data("network location target cannot be persisted"));
-        };
         if !ids.insert(location.id) {
             return Err(invalid_data("duplicate network location id"));
         }
-
         if location.display_name.trim().is_empty() {
             return Err(invalid_data("network location name cannot be empty"));
         }
         if location.display_name.encode_utf16().count() > MAX_PATH_UNITS {
             return Err(invalid_data("network location name is too long"));
         }
-        validate_path(path)?;
+        match &location.target {
+            NetworkTarget::WindowsPath(path) => validate_path(path)?,
+            NetworkTarget::WebDav(connection) => {
+                if connection.host.is_empty()
+                    || connection.root.is_empty()
+                    || connection.username.is_empty()
+                    || connection.port == 0
+                    || connection.connection_id == 0
+                {
+                    return Err(invalid_data("invalid webdav connection"));
+                }
+            }
+            NetworkTarget::ShellItemId(_) => {
+                return Err(invalid_data("network location target cannot be persisted"));
+            }
+        }
     }
     Ok(())
 }
@@ -748,6 +774,17 @@ fn validate_navigation_location(location: &NavigationLocation) -> io::Result<()>
                 || library.display_name.encode_utf16().count() > MAX_PATH_UNITS
             {
                 return Err(invalid_data("library location is too long"));
+            }
+            Ok(())
+        }
+        NavigationLocation::WebDav(place) => {
+            if place.connection_id == 0
+                || place.revision == 0
+                || place.root.is_empty()
+                || place.path.is_empty()
+                || !place.path.starts_with(place.root.trim_end_matches('/')) && place.root != "/"
+            {
+                return Err(invalid_data("invalid webdav location"));
             }
             Ok(())
         }
@@ -890,6 +927,43 @@ fn write_navigation_location(bytes: &mut Vec<u8>, location: &NavigationLocation)
             bytes.push(2);
             Ok(())
         }
+        NavigationLocation::WebDav(place) => {
+            bytes.push(3);
+            bytes.extend_from_slice(&place.connection_id.to_le_bytes());
+            bytes.extend_from_slice(&place.revision.to_le_bytes());
+            write_string(bytes, &place.root)?;
+            write_string(bytes, &place.path)
+        }
+    }
+}
+
+fn read_network_target(bytes: &[u8], offset: &mut usize) -> io::Result<NetworkTarget> {
+    match read_u8(bytes, offset)? {
+        0 => Ok(NetworkTarget::WindowsPath(PathBuf::from(read_os(
+            bytes, offset,
+        )?))),
+        1 => {
+            let https = read_bool(bytes, offset, "invalid webdav scheme")?;
+            let host = read_string(bytes, offset)?;
+            let port = read_u16(bytes, offset)?;
+            let root = read_string(bytes, offset)?;
+            let username = read_string(bytes, offset)?;
+            let connection_id = read_u64(bytes, offset)?;
+            let revision = read_u64(bytes, offset)?;
+            if host.is_empty() || root.is_empty() || username.is_empty() || port == 0 {
+                return Err(invalid_data("invalid webdav connection"));
+            }
+            Ok(NetworkTarget::WebDav(crate::network::WebDavConnection {
+                connection_id,
+                revision,
+                https,
+                host,
+                port,
+                root,
+                username,
+            }))
+        }
+        _ => Err(invalid_data("invalid network location target")),
     }
 }
 
@@ -905,6 +979,12 @@ fn read_navigation_location(bytes: &[u8], offset: &mut usize) -> io::Result<Navi
             ),
         )),
         2 => Ok(NavigationLocation::Home),
+        3 => Ok(NavigationLocation::WebDav(crate::domain::WebDavPlace {
+            connection_id: read_u64(bytes, offset)?,
+            revision: read_u64(bytes, offset)?,
+            root: read_string(bytes, offset)?,
+            path: read_string(bytes, offset)?,
+        })),
         _ => Err(invalid_data("invalid navigation location kind")),
     }
 }
@@ -996,7 +1076,7 @@ fn read_units(bytes: &[u8], offset: &mut usize) -> io::Result<Vec<u16>> {
         .filter(|end| *end <= bytes.len())
         .ok_or_else(|| invalid_data("truncated session data"))?;
     let mut units = Vec::with_capacity(count);
-    for pair in bytes[*offset..end].chunks_exact(2) {
+    for pair in bytes[*offset..end].as_chunks::<2>().0 {
         units.push(u16::from_le_bytes([pair[0], pair[1]]));
     }
     *offset = end;
@@ -1026,6 +1106,10 @@ fn read_u8(bytes: &[u8], offset: &mut usize) -> io::Result<u8> {
         .ok_or_else(|| invalid_data("truncated session data"))?;
     *offset += 1;
     Ok(value)
+}
+
+fn read_u16(bytes: &[u8], offset: &mut usize) -> io::Result<u16> {
+    read_array::<2>(bytes, offset).map(u16::from_le_bytes)
 }
 
 fn read_i32(bytes: &[u8], offset: &mut usize) -> io::Result<i32> {
@@ -1068,6 +1152,7 @@ fn decode_os(value: &[u16]) -> OsString {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::WebDavConnection;
 
     fn sample_state() -> SessionState {
         let mut columns = ColumnLayout::default();
@@ -1292,7 +1377,42 @@ mod tests {
         state.search_view.view_mode = ViewMode::Icons(120);
         state.directory_views[0].1.view_mode = ViewMode::Icons(184);
         let bytes = encode(&state).unwrap();
-        assert_eq!(&bytes[..6], b"ASTF17");
+        assert_eq!(&bytes[..6], b"ASTF18");
+        assert_eq!(decode(&bytes).unwrap(), state);
+    }
+
+    #[test]
+    fn issue_157_webdav_session_round_trip_omits_password_and_signed_query() {
+        let mut state = sample_state();
+        let connection = WebDavConnection {
+            connection_id: 0x1570_0157,
+            revision: 3,
+            https: true,
+            host: "nas.example".to_owned(),
+            port: 5244,
+            root: "/dav/挂载".to_owned(),
+            username: "reader".to_owned(),
+        };
+        state.network_locations.push(NetworkLocation {
+            id: connection.connection_id,
+            source: NetworkLocationSource::AsterOwned,
+            display_name: "OpenList".to_owned(),
+            sort_order: 1,
+            target: NetworkTarget::WebDav(connection.clone()),
+            shell_path: None,
+        });
+        state.windows[0]
+            .tab_locations
+            .push(NavigationLocation::WebDav(crate::domain::WebDavPlace {
+                connection_id: connection.connection_id,
+                revision: connection.revision,
+                root: connection.root.clone(),
+                path: "/dav/挂载/子目录".to_owned(),
+            }));
+        let bytes = encode(&state).unwrap();
+        let secret = b"super-secret-password";
+        assert!(!bytes.windows(secret.len()).any(|window| window == secret));
+        assert!(!bytes.windows(4).any(|window| window == b"sig="));
         assert_eq!(decode(&bytes).unwrap(), state);
     }
 
@@ -1606,7 +1726,7 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let session_path = directory.join("session.bin");
         let diagnostic_path = directory.join("session-persistence.jsonl");
-        fs::write(&session_path, b"ASTF17").unwrap();
+        fs::write(&session_path, b"ASTF18").unwrap();
         let error = load_with_diagnostics_at(&session_path, &diagnostic_path).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("session decode failed"));

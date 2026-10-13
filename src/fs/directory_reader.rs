@@ -115,6 +115,7 @@ fn file_entry(
         folder_size: crate::domain::FolderSizeState::Unknown,
         modified: metadata.modified().ok(),
         created: metadata.created().ok(),
+        webdav: None,
     }
 }
 

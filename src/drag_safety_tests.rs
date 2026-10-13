@@ -29,6 +29,7 @@ fn memory_app() -> AppState {
         folder_size: FolderSizeState::Unknown,
         modified: None,
         created: None,
+        webdav: None,
     }];
     assert!(tab.accept_directory_batch(request, entries, DirectoryViewPreference::default()));
     assert!(tab.finish_directory_navigation(
@@ -82,7 +83,7 @@ fn issue_93_valid_native_drag_authorizes_original_paths_exactly_once() {
     assert_eq!(drag.request_id, app.active().latest_request());
     assert_eq!(
         drag.entries,
-        vec![(
+        vec![DraggedEntry::Local(
             EntryId(7),
             PathBuf::from("C:/issue-93-memory/source/Bridge")
         )]

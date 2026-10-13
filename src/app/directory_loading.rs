@@ -23,6 +23,19 @@ pub(super) struct DirectoryRequest {
     pub(super) unavailable_library_sources: usize,
     pub(super) visibility: crate::domain::FileVisibility,
     pub(super) cancel: Arc<std::sync::atomic::AtomicBool>,
+    pub(super) webdav: Option<WebDavListTarget>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct WebDavListTarget {
+    pub(super) connection_id: u64,
+    pub(super) revision: u64,
+    pub(super) https: bool,
+    pub(super) host: String,
+    pub(super) port: u16,
+    pub(super) root: String,
+    pub(super) username: String,
+    pub(super) directory: String,
 }
 
 struct NetworkDirectoryCompletion {
@@ -86,6 +99,7 @@ pub(super) fn network_directory_request(path: &str) -> DirectoryRequest {
         unavailable_library_sources: 0,
         visibility: crate::domain::FileVisibility::default(),
         cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        webdav: None,
     }
 }
 
@@ -119,6 +133,15 @@ pub(super) enum DirectoryEvent {
         tab_id: TabId,
         request_id: RequestId,
     },
+    WebDavFinished {
+        tab_id: TabId,
+        request_id: RequestId,
+        connection_id: u64,
+        revision: u64,
+        root: String,
+        path: String,
+        incomplete: Option<String>,
+    },
 }
 
 impl DirectoryEvent {
@@ -134,7 +157,10 @@ impl DirectoryEvent {
             | Self::Failed {
                 tab_id, request_id, ..
             }
-            | Self::Slow { tab_id, request_id } => (*tab_id, *request_id),
+            | Self::Slow { tab_id, request_id }
+            | Self::WebDavFinished {
+                tab_id, request_id, ..
+            } => (*tab_id, *request_id),
         }
     }
 }
@@ -164,10 +190,14 @@ pub(super) fn spawn_directory_workers_with_library_reader(
         mpsc::sync_channel::<DirectoryRequest>(network_worker_count.saturating_mul(32));
     let (event_sender, event_receiver) = mpsc::sync_channel::<DirectoryEvent>(32);
     let (local_sender, local_receiver) = mpsc::channel();
+    let (webdav_sender, webdav_receiver) = mpsc::channel();
     let library_sender = super::library_loading::start(event_sender.clone(), library_reader).0;
+    spawn_webdav_directory_workers(event_sender.clone(), webdav_receiver);
     thread::spawn(move || {
         while let Ok(request) = request_receiver.recv() {
-            let sender = if request.library_sources.is_some() {
+            let sender = if request.webdav.is_some() {
+                &webdav_sender
+            } else if request.library_sources.is_some() {
                 &library_sender
             } else {
                 &local_sender
@@ -376,6 +406,7 @@ fn read_network_root_batches(
                     folder_size: FolderSizeState::NotIndexed,
                     modified: None,
                     created: None,
+                    webdav: None,
                 }
             })
             .collect();
@@ -505,6 +536,209 @@ pub(super) fn send_event(
                 return Err(io::ErrorKind::BrokenPipe.into());
             }
         }
+    }
+}
+
+fn spawn_webdav_directory_workers(
+    events: mpsc::SyncSender<DirectoryEvent>,
+    requests: mpsc::Receiver<DirectoryRequest>,
+) {
+    let requests = Arc::new(Mutex::new(requests));
+    for _ in 0..2 {
+        let requests = requests.clone();
+        let events = events.clone();
+        thread::spawn(move || {
+            loop {
+                let request = requests
+                    .lock()
+                    .expect("webdav directory receiver mutex is not poisoned")
+                    .recv();
+                let Ok(request) = request else {
+                    break;
+                };
+                run_webdav_directory_request(request, &events);
+            }
+        });
+    }
+}
+
+fn listing_slots() -> Arc<crate::webdav::SlotPool> {
+    static SLOTS: std::sync::OnceLock<Arc<crate::webdav::SlotPool>> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(crate::webdav::SlotPool::new).clone()
+}
+
+fn run_webdav_directory_request(
+    request: DirectoryRequest,
+    events: &mpsc::SyncSender<DirectoryEvent>,
+) {
+    let Some(target) = request.webdav.clone() else {
+        return;
+    };
+    if request.cancelled() {
+        let _ = send_event(
+            &request.cancel,
+            events,
+            DirectoryEvent::Cancelled {
+                tab_id: request.tab_id,
+                request_id: request.request_id,
+            },
+        );
+        return;
+    }
+    let _slot = listing_slots().acquire(target.connection_id, &request.cancel);
+    if request.cancelled() || _slot.is_none() {
+        let _ = send_event(
+            &request.cancel,
+            events,
+            DirectoryEvent::Cancelled {
+                tab_id: request.tab_id,
+                request_id: request.request_id,
+            },
+        );
+        return;
+    }
+    let password = crate::webdav::load_password(target.connection_id)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if password.is_empty() {
+        let _ = send_event(
+            &request.cancel,
+            events,
+            DirectoryEvent::Failed {
+                tab_id: request.tab_id,
+                request_id: request.request_id,
+                kind: io::ErrorKind::PermissionDenied,
+                message: "webdav:unauthorized".to_owned(),
+            },
+        );
+        return;
+    }
+    let Ok(root) = crate::webdav::ResourcePath::parse_root(&target.root) else {
+        let _ = send_event(
+            &request.cancel,
+            events,
+            DirectoryEvent::Failed {
+                tab_id: request.tab_id,
+                request_id: request.request_id,
+                kind: io::ErrorKind::InvalidInput,
+                message: "webdav:invalid_root".to_owned(),
+            },
+        );
+        return;
+    };
+    let Ok(directory) = crate::webdav::ResourcePath::parse_root(&target.directory) else {
+        let _ = send_event(
+            &request.cancel,
+            events,
+            DirectoryEvent::Failed {
+                tab_id: request.tab_id,
+                request_id: request.request_id,
+                kind: io::ErrorKind::InvalidInput,
+                message: "webdav:invalid_path".to_owned(),
+            },
+        );
+        return;
+    };
+    let endpoint = crate::webdav::Endpoint {
+        connection_id: target.connection_id,
+        revision: target.revision,
+        https: target.https,
+        host: target.host.clone(),
+        port: target.port,
+        root,
+        username: target.username.clone(),
+        display_name: String::new(),
+    };
+    let mut next_id = 1_u32;
+    let listed = crate::webdav::list_children(
+        &endpoint,
+        &password,
+        &directory,
+        &request.cancel,
+        &mut |items| {
+            let entries = items
+                .into_iter()
+                .map(|item| {
+                    let id = EntryId(next_id);
+                    next_id = next_id.saturating_add(1);
+                    webdav_file_entry(&target, id, &item)
+                })
+                .collect();
+            deliver_directory_batch(&request, events, entries)
+        },
+    );
+    match listed {
+        Ok(finish) => {
+            let _ = send_event(
+                &request.cancel,
+                events,
+                DirectoryEvent::WebDavFinished {
+                    tab_id: request.tab_id,
+                    request_id: request.request_id,
+                    connection_id: target.connection_id,
+                    revision: target.revision,
+                    root: target.root,
+                    path: target.directory,
+                    incomplete: finish.incomplete,
+                },
+            );
+        }
+        Err(crate::webdav::Failure::Cancelled) => {
+            let _ = send_event(
+                &request.cancel,
+                events,
+                DirectoryEvent::Cancelled {
+                    tab_id: request.tab_id,
+                    request_id: request.request_id,
+                },
+            );
+        }
+        Err(error) => {
+            let _ = send_event(
+                &request.cancel,
+                events,
+                DirectoryEvent::Failed {
+                    tab_id: request.tab_id,
+                    request_id: request.request_id,
+                    kind: io::ErrorKind::Other,
+                    message: format!("webdav:{}", error.code()),
+                },
+            );
+        }
+    }
+}
+
+fn webdav_file_entry(
+    target: &WebDavListTarget,
+    id: EntryId,
+    item: &crate::webdav::ListedItem,
+) -> FileEntry {
+    let name = item.name.clone();
+    FileEntry {
+        id,
+        original_name: name.clone().into(),
+        display_name: name,
+        name_highlights: Vec::new(),
+        path: PathBuf::new(),
+        kind: if item.is_directory {
+            crate::domain::EntryKind::Directory
+        } else {
+            crate::domain::EntryKind::File
+        },
+        open_target: None,
+        library_source_index: None,
+        parent_display: target.directory.clone(),
+        size_bytes: item.size,
+        folder_size: crate::domain::FolderSizeState::NotIndexed,
+        modified: item.modified,
+        created: None,
+        webdav: Some(crate::domain::WebDavEntry {
+            connection_id: target.connection_id,
+            revision: target.revision,
+            root: target.root.clone(),
+            path: item.path.canonical(),
+        }),
     }
 }
 

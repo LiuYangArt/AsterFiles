@@ -779,7 +779,9 @@ fn get_wide(b: &[u8], c: &mut usize) -> Result<OsString, EverythingError> {
         return protocol("unterminated string");
     }
     let units = data[..len * 2]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|x| u16::from_le_bytes([x[0], x[1]]))
         .collect::<Vec<_>>();
     *c = end;
@@ -1452,7 +1454,9 @@ mod tests {
         let b = encode_query(123usize as HWND, "中文 😀", 2, 10, REQ_FULL, 1);
         assert_eq!(get32(&b, 0).unwrap(), 123);
         let u = b[HEADER..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|x| u16::from_le_bytes([x[0], x[1]]))
             .take_while(|x| *x != 0)
             .collect::<Vec<_>>();

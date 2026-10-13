@@ -82,9 +82,7 @@ impl WindowDpiState {
         self.baseline = None;
         // Keep depth until each nested WM_DPICHANGED unwinds, but invalidate every
         // pending rectangle so a completed move cannot rewrite a later request.
-        for placement in &mut self.placements {
-            *placement = None;
-        }
+        self.placements.fill(None);
     }
 
     fn scaled_candidate(&mut self, dpi: u32) -> Option<(i32, i32)> {

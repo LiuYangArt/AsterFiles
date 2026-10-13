@@ -1,14 +1,14 @@
 use std::{
     cell::RefCell,
     ffi::{OsString, c_void},
-    io::{self, Write},
+    io::{self, Read, Write},
     mem::ManuallyDrop,
     os::windows::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
     ptr,
     sync::{
         Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
 };
@@ -19,15 +19,11 @@ use windows_sys::Win32::{
     UI::WindowsAndMessaging::GetClientRect,
 };
 
-#[cfg(test)]
-use windows::Win32::System::Com::{
-    ISequentialStream_Impl, IStream_Impl, LOCKTYPE, STATFLAG, STATSTG, STGC, STREAM_SEEK,
-};
 use windows::{
     Win32::{
         Foundation::{
             COLORREF, DATA_S_SAMEFORMATETC, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP,
-            DRAGDROP_S_USEDEFAULTCURSORS, DV_E_FORMATETC, E_NOTIMPL, HWND,
+            DRAGDROP_S_USEDEFAULTCURSORS, DV_E_FORMATETC, E_FAIL, E_NOTIMPL, HWND,
             OLE_E_ADVISENOTSUPPORTED, POINT, POINTL, RECT as WinRect, SIZE,
         },
         Graphics::Gdi::{
@@ -39,8 +35,10 @@ use windows::{
         System::{
             Com::{
                 CLSCTX_INPROC_SERVER, CoCreateInstance, DATADIR_GET, DVASPECT_CONTENT, FORMATETC,
-                IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, IStream,
-                STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL, TYMED_ISTREAM, Urlmon::CopyStgMedium,
+                IAdviseSink, IBindCtx, IDataObject, IDataObject_Impl, IEnumFORMATETC,
+                IEnumSTATDATA, ISequentialStream_Impl, IStream, IStream_Impl, LOCKTYPE, STATFLAG,
+                STATSTG, STGC, STGMEDIUM, STGMEDIUM_0, STREAM_SEEK, TYMED_HGLOBAL, TYMED_ISTREAM,
+                Urlmon::CopyStgMedium,
             },
             DataExchange::RegisterClipboardFormatW,
             Memory::{
@@ -55,7 +53,8 @@ use windows::{
         },
         UI::Shell::{
             CLSID_DragDropHelper, Common::ITEMIDLIST, DROPFILES, DragQueryFileW, HDROP,
-            IDragSourceHelper, IDropTargetHelper, ILClone, ILFindLastID, ILIsEqual, ILRemoveLastID,
+            IDataObjectAsyncCapability, IDataObjectAsyncCapability_Impl, IDragSourceHelper,
+            IDropTargetHelper, ILClone, ILFindLastID, ILIsEqual, ILRemoveLastID,
             SHCreateDataObject, SHCreateStdEnumFmtEtc, SHDRAGIMAGE, SHGetDesktopFolder,
             SHGetIDListFromObject, SHParseDisplayName,
         },
@@ -70,6 +69,8 @@ const MK_ALT: u32 = 0x20;
 const TAB_DRAG_FORMAT: &str = "AsterFiles.TabDrag.v1";
 const TAB_DRAG_MAGIC: [u8; 8] = *b"ASTFTAB1";
 const FD_ATTRIBUTES: u32 = 0x4;
+const FD_FILESIZE: u32 = 0x40;
+const FD_PROGRESSUI: u32 = 0x4000;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const DESCRIPTOR_NAME_OFFSET: usize = 72;
 const WIDE_DESCRIPTOR_SIZE: usize = 592;
@@ -1335,7 +1336,9 @@ fn parse_descriptors(medium: &STGMEDIUM, wide: bool) -> io::Result<Vec<VirtualEn
 fn wide_descriptor_name(descriptor: &[u8]) -> Option<String> {
     let bytes = descriptor.get(DESCRIPTOR_NAME_OFFSET..DESCRIPTOR_NAME_OFFSET + 520)?;
     let units = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|unit| u16::from_ne_bytes([unit[0], unit[1]]))
         .take_while(|unit| *unit != 0)
         .collect::<Vec<_>>();
@@ -1700,7 +1703,7 @@ impl NativeDragBitmap {
         let bytes = unsafe {
             std::slice::from_raw_parts_mut(pixels.cast::<u8>(), (width * height * 4) as usize)
         };
-        for pixel in bytes.chunks_exact_mut(4) {
+        for pixel in bytes.as_chunks_mut::<4>().0 {
             pixel[3] = 255;
         }
         unsafe { SelectObject(dc, old_brush) };
@@ -1834,6 +1837,362 @@ pub fn begin_outbound_drag(
         dropped,
         performed_effect_reported: reported.is_some(),
     })
+}
+
+pub struct VirtualOutboundFile {
+    pub name: String,
+    pub size: Option<u64>,
+    pub open: Arc<dyn Fn() -> io::Result<Box<dyn Read + Send>> + Send + Sync>,
+}
+
+pub fn begin_virtual_outbound_drag(
+    files: Vec<VirtualOutboundFile>,
+) -> io::Result<OutboundDropResult> {
+    if files.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "outbound drag file list is empty",
+        ));
+    }
+    let _ole = OleApartment::initialize()?;
+    let data = virtual_outbound_object(files)?;
+    let drop_source = IDropSource::from(NativeDropSource {
+        feedback: DragCursorFeedback::System,
+    });
+    let mut native_effect = DROPEFFECT_NONE;
+    let result = unsafe { DoDragDrop(&data, &drop_source, DROPEFFECT_COPY, &mut native_effect) };
+    if result.is_err() {
+        return Err(windows_error(WindowsError::from(result)));
+    }
+    let dropped = result == DRAGDROP_S_DROP;
+    Ok(OutboundDropResult {
+        effect: if dropped {
+            DropEffect::from_native(native_effect)
+        } else {
+            DropEffect::None
+        },
+        dropped,
+        performed_effect_reported: false,
+    })
+}
+
+fn virtual_outbound_object(files: Vec<VirtualOutboundFile>) -> io::Result<IDataObject> {
+    let formats =
+        virtual_formats().ok_or_else(|| io::Error::other("virtual file format is unavailable"))?;
+    let preferred_format = clipboard_format("Preferred DropEffect")?;
+    Ok(IDataObject::from(VirtualOutboundObject {
+        descriptor: encode_wide_descriptors(&files)?,
+        files,
+        descriptor_format: formats.descriptor_w,
+        contents_format: formats.contents,
+        preferred_format,
+        preferred: DROPEFFECT_COPY.0.to_ne_bytes().to_vec(),
+        async_mode: AtomicBool::new(true),
+        in_operation: AtomicBool::new(false),
+    }))
+}
+
+fn encode_wide_descriptors(files: &[VirtualOutboundFile]) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(4 + files.len() * WIDE_DESCRIPTOR_SIZE);
+    bytes.extend_from_slice(&(u32::try_from(files.len()).unwrap_or(u32::MAX)).to_ne_bytes());
+    for file in files {
+        if safe_relative(&file.name).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "drag file name is not a relative path",
+            ));
+        }
+        let mut descriptor = vec![0u8; WIDE_DESCRIPTOR_SIZE];
+        let mut flags = FD_PROGRESSUI;
+        if let Some(size) = file.size {
+            flags |= FD_FILESIZE;
+            descriptor[64..68].copy_from_slice(&((size >> 32) as u32).to_ne_bytes());
+            descriptor[68..72].copy_from_slice(&(size as u32).to_ne_bytes());
+        }
+        descriptor[..4].copy_from_slice(&flags.to_ne_bytes());
+        let mut units = file.name.encode_utf16().collect::<Vec<_>>();
+        if units.len() >= 260 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "drag file name is too long",
+            ));
+        }
+        units.push(0);
+        let encoded = units
+            .into_iter()
+            .flat_map(u16::to_ne_bytes)
+            .collect::<Vec<_>>();
+        descriptor[DESCRIPTOR_NAME_OFFSET..DESCRIPTOR_NAME_OFFSET + encoded.len()]
+            .copy_from_slice(&encoded);
+        bytes.extend_from_slice(&descriptor);
+    }
+    Ok(bytes)
+}
+
+#[implement(IDataObject, IDataObjectAsyncCapability)]
+struct VirtualOutboundObject {
+    descriptor: Vec<u8>,
+    files: Vec<VirtualOutboundFile>,
+    descriptor_format: u16,
+    contents_format: u16,
+    preferred_format: u16,
+    preferred: Vec<u8>,
+    async_mode: AtomicBool,
+    in_operation: AtomicBool,
+}
+
+#[allow(non_snake_case)]
+impl IDataObject_Impl for VirtualOutboundObject_Impl {
+    fn GetData(&self, format: *const FORMATETC) -> windows::core::Result<STGMEDIUM> {
+        let format = unsafe { format.as_ref() }.ok_or_else(|| WindowsError::from(E_NOTIMPL))?;
+        if supports_format(format, self.descriptor_format) {
+            return allocate_medium(&self.descriptor);
+        }
+        if supports_format(format, self.preferred_format) {
+            return allocate_medium(&self.preferred);
+        }
+        if let Some(index) = self.contents_index(format) {
+            let stream = IStream::from(PullStream {
+                open: Arc::clone(&self.files[index].open),
+                reader: Mutex::new(None),
+                failed: AtomicBool::new(false),
+            });
+            return Ok(STGMEDIUM {
+                tymed: TYMED_ISTREAM.0 as u32,
+                u: STGMEDIUM_0 {
+                    pstm: ManuallyDrop::new(Some(stream)),
+                },
+                pUnkForRelease: ManuallyDrop::new(None),
+            });
+        }
+        Err(DV_E_FORMATETC.into())
+    }
+
+    fn GetDataHere(
+        &self,
+        _format: *const FORMATETC,
+        _medium: *mut STGMEDIUM,
+    ) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn QueryGetData(&self, format: *const FORMATETC) -> HRESULT {
+        let Some(format) = (unsafe { format.as_ref() }) else {
+            return DV_E_FORMATETC;
+        };
+        if supports_format(format, self.descriptor_format)
+            || supports_format(format, self.preferred_format)
+            || self.contents_index(format).is_some()
+            || (format.cfFormat == self.contents_format
+                && format.lindex == -1
+                && format.tymed & TYMED_ISTREAM.0 as u32 != 0)
+        {
+            HRESULT(0)
+        } else {
+            DV_E_FORMATETC
+        }
+    }
+
+    fn GetCanonicalFormatEtc(&self, _input: *const FORMATETC, output: *mut FORMATETC) -> HRESULT {
+        if let Some(output) = unsafe { output.as_mut() } {
+            output.ptd = ptr::null_mut();
+        }
+        DATA_S_SAMEFORMATETC
+    }
+
+    fn SetData(
+        &self,
+        _format: *const FORMATETC,
+        medium: *const STGMEDIUM,
+        release: windows::core::BOOL,
+    ) -> windows::core::Result<()> {
+        if release.as_bool()
+            && let Some(medium) = unsafe { medium.as_ref() }
+        {
+            let mut owned = medium.clone();
+            unsafe { ReleaseStgMedium(&mut owned) };
+        }
+        Ok(())
+    }
+
+    fn EnumFormatEtc(&self, direction: u32) -> windows::core::Result<IEnumFORMATETC> {
+        if direction != DATADIR_GET.0 as u32 {
+            return Err(E_NOTIMPL.into());
+        }
+        let formats = [
+            format_etc(self.descriptor_format),
+            FORMATETC {
+                cfFormat: self.contents_format,
+                ptd: ptr::null_mut(),
+                dwAspect: DVASPECT_CONTENT.0,
+                lindex: -1,
+                tymed: TYMED_ISTREAM.0 as u32,
+            },
+            format_etc(self.preferred_format),
+        ];
+        unsafe { SHCreateStdEnumFmtEtc(&formats) }
+    }
+
+    fn DAdvise(
+        &self,
+        _format: *const FORMATETC,
+        _flags: u32,
+        _sink: Ref<IAdviseSink>,
+    ) -> windows::core::Result<u32> {
+        Err(OLE_E_ADVISENOTSUPPORTED.into())
+    }
+
+    fn DUnadvise(&self, _connection: u32) -> windows::core::Result<()> {
+        Err(OLE_E_ADVISENOTSUPPORTED.into())
+    }
+
+    fn EnumDAdvise(&self) -> windows::core::Result<IEnumSTATDATA> {
+        Err(OLE_E_ADVISENOTSUPPORTED.into())
+    }
+}
+
+impl VirtualOutboundObject_Impl {
+    fn contents_index(&self, format: &FORMATETC) -> Option<usize> {
+        if format.cfFormat != self.contents_format
+            || format.dwAspect != DVASPECT_CONTENT.0
+            || format.lindex < 0
+            || format.tymed & TYMED_ISTREAM.0 as u32 == 0
+        {
+            return None;
+        }
+        let index = usize::try_from(format.lindex).ok()?;
+        (index < self.files.len()).then_some(index)
+    }
+}
+
+#[allow(non_snake_case)]
+impl IDataObjectAsyncCapability_Impl for VirtualOutboundObject_Impl {
+    fn SetAsyncMode(&self, enabled: windows::core::BOOL) -> windows::core::Result<()> {
+        self.async_mode.store(enabled.as_bool(), Ordering::Release);
+        Ok(())
+    }
+
+    fn GetAsyncMode(&self) -> windows::core::Result<windows::core::BOOL> {
+        Ok(self.async_mode.load(Ordering::Acquire).into())
+    }
+
+    fn StartOperation(&self, _context: Ref<IBindCtx>) -> windows::core::Result<()> {
+        self.in_operation.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn InOperation(&self) -> windows::core::Result<windows::core::BOOL> {
+        Ok(self.in_operation.load(Ordering::Acquire).into())
+    }
+
+    fn EndOperation(
+        &self,
+        _result: HRESULT,
+        _context: Ref<IBindCtx>,
+        _effects: u32,
+    ) -> windows::core::Result<()> {
+        self.in_operation.store(false, Ordering::Release);
+        Ok(())
+    }
+}
+
+#[implement(IStream)]
+struct PullStream {
+    open: Arc<dyn Fn() -> io::Result<Box<dyn Read + Send>> + Send + Sync>,
+    reader: Mutex<Option<Box<dyn Read + Send>>>,
+    failed: AtomicBool,
+}
+
+#[allow(non_snake_case)]
+impl ISequentialStream_Impl for PullStream_Impl {
+    fn Read(&self, pv: *mut c_void, cb: u32, pcbread: *mut u32) -> HRESULT {
+        if pv.is_null() || self.failed.load(Ordering::Acquire) {
+            return E_FAIL;
+        }
+        let mut reader = match self.reader.lock() {
+            Ok(reader) => reader,
+            Err(_) => return E_FAIL,
+        };
+        if reader.is_none() {
+            match (self.open)() {
+                Ok(opened) => *reader = Some(opened),
+                Err(_) => {
+                    self.failed.store(true, Ordering::Release);
+                    return E_FAIL;
+                }
+            }
+        }
+        let Some(reader) = reader.as_mut() else {
+            return E_FAIL;
+        };
+        let buffer = unsafe { std::slice::from_raw_parts_mut(pv.cast::<u8>(), cb as usize) };
+        match reader.read(buffer) {
+            Ok(count) => {
+                if !pcbread.is_null() {
+                    unsafe { *pcbread = count as u32 };
+                }
+                HRESULT(0)
+            }
+            Err(_) => {
+                self.failed.store(true, Ordering::Release);
+                E_FAIL
+            }
+        }
+    }
+
+    fn Write(&self, _pv: *const c_void, _cb: u32, _pcbwritten: *mut u32) -> HRESULT {
+        E_NOTIMPL
+    }
+}
+
+#[allow(non_snake_case)]
+impl IStream_Impl for PullStream_Impl {
+    fn Seek(
+        &self,
+        _move: i64,
+        _origin: STREAM_SEEK,
+        _position: *mut u64,
+    ) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn SetSize(&self, _size: u64) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn CopyTo(
+        &self,
+        _stream: Ref<IStream>,
+        _count: u64,
+        _read: *mut u64,
+        _written: *mut u64,
+    ) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn Commit(&self, _flags: &STGC) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn Revert(&self) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn LockRegion(&self, _offset: u64, _count: u64, _kind: &LOCKTYPE) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn UnlockRegion(&self, _offset: u64, _count: u64, _kind: u32) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn Stat(&self, _stat: *mut STATSTG, _flags: &STATFLAG) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn Clone(&self) -> windows::core::Result<IStream> {
+        Err(E_NOTIMPL.into())
+    }
 }
 
 fn shell_data_object(paths: &[PathBuf], supplemental: &IDataObject) -> io::Result<IDataObject> {
@@ -3248,6 +3607,36 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(staged_file).unwrap(), b"extracted");
         assert_eq!(std::fs::read(staged_dir.join("wood.png")).unwrap(), b"wood");
+        let _ = std::fs::remove_dir_all(intent.staging_root.unwrap());
+        let _ = std::fs::remove_dir_all(destination);
+    }
+
+    #[test]
+    fn virtual_outbound_drag_copies_file_contents() {
+        let _ole = OleApartment::initialize().unwrap();
+        let destination =
+            std::env::temp_dir().join(format!("aster-virtual-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&destination);
+        std::fs::create_dir_all(&destination).unwrap();
+        let data = super::virtual_outbound_object(vec![super::VirtualOutboundFile {
+            name: "demo.jpg".to_owned(),
+            size: Some(9),
+            open: std::sync::Arc::new(|| {
+                Ok(Box::new(std::io::Cursor::new(b"extracted".to_vec()))
+                    as Box<dyn std::io::Read + Send>)
+            }),
+        }])
+        .unwrap();
+
+        let (effect, intent) = drop_onto(&data, &destination);
+
+        assert_eq!(effect, DROPEFFECT_COPY);
+        let staged = intent
+            .paths
+            .iter()
+            .find(|path| path.file_name() == Some(std::ffi::OsStr::new("demo.jpg")))
+            .unwrap();
+        assert_eq!(std::fs::read(staged).unwrap(), b"extracted");
         let _ = std::fs::remove_dir_all(intent.staging_root.unwrap());
         let _ = std::fs::remove_dir_all(destination);
     }

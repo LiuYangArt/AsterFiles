@@ -573,6 +573,11 @@ fn take_shell_string(value: PWSTR) -> OsString {
         result
     }
 }
+pub(crate) fn downloads_directory() -> io::Result<PathBuf> {
+    const FOLDERID_DOWNLOADS: GUID = GUID::from_u128(0x374DE290_123F_4565_9164_39C4925E467B);
+    known_folder_path(&FOLDERID_DOWNLOADS)
+}
+
 fn known_folder_path(id: &GUID) -> io::Result<PathBuf> {
     let result =
         unsafe { SHGetKnownFolderPath(id, windows::Win32::UI::Shell::KNOWN_FOLDER_FLAG(0), None) };

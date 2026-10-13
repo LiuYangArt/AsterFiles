@@ -345,7 +345,9 @@ fn parse_notifications(buffer: &[u8]) -> io::Result<Vec<RawNotification>> {
         }
         let name_start = offset + 12;
         let name = buffer[name_start..name_start + name_bytes]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
             .collect::<Vec<_>>();
         notifications.push(RawNotification {

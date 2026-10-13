@@ -46,7 +46,7 @@ fn location_contains(app: &AppState, location: &NavigationLocation, parent: &Pat
                     .iter()
                     .any(|source| source.path.as_deref() == Some(parent))
             }),
-        NavigationLocation::Home => false,
+        NavigationLocation::Home | NavigationLocation::WebDav(_) => false,
     }
 }
 
@@ -454,6 +454,7 @@ mod tests {
             folder_size: FolderSizeState::Unknown,
             modified: None,
             created: None,
+            webdav: None,
         }
     }
 

@@ -479,7 +479,9 @@ fn read_string(path: &str, name: &str) -> io::Result<Option<OsString>> {
     }
     let mut units = value
         .data
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
         .collect::<Vec<_>>();
     while units.last() == Some(&0) {

@@ -37,7 +37,7 @@ impl ReadSlots {
             }
             if self
                 .active
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                     (count < self.limit).then_some(count + 1)
                 })
                 .is_ok()

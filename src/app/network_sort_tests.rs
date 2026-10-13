@@ -21,6 +21,7 @@ fn entry(id: u32, name: &str) -> FileEntry {
         folder_size: FolderSizeState::NotIndexed,
         modified: None,
         created: None,
+        webdav: None,
     }
 }
 

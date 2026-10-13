@@ -16,6 +16,7 @@ fn entry(id: u32, path: PathBuf) -> FileEntry {
         folder_size: FolderSizeState::Unknown,
         modified: None,
         created: None,
+        webdav: None,
     }
 }
 

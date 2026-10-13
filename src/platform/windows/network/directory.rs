@@ -501,6 +501,7 @@ fn read_batch(reader: impl Read) -> io::Result<(Vec<FileEntry>, usize, bool)> {
             },
             modified,
             created,
+            webdav: None,
         });
     }
     if offset != bytes.len() {
@@ -536,6 +537,7 @@ mod tests {
             folder_size: FolderSizeState::NotIndexed,
             modified: None,
             created: None,
+            webdav: None,
         }
     }
 

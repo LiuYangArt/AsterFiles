@@ -15,11 +15,23 @@ pub enum NetworkLocationSource {
     AsterOwned,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebDavConnection {
+    pub connection_id: u64,
+    pub revision: u64,
+    pub https: bool,
+    pub host: String,
+    pub port: u16,
+    pub root: String,
+    pub username: String,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkTarget {
     WindowsPath(PathBuf),
     ShellItemId(PathBuf),
+    WebDav(WebDavConnection),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +126,72 @@ impl NetworkLocationCatalog {
             shell_path: None,
         });
         Ok(id)
+    }
+
+    pub fn add_webdav(
+        &mut self,
+        display_name: impl Into<String>,
+        connection: WebDavConnection,
+    ) -> Result<u64, NetworkLocationCatalogError> {
+        let display_name = display_name.into();
+        if display_name.trim().is_empty() {
+            return Err(NetworkLocationCatalogError::EmptyName);
+        }
+        if self.locations.iter().any(|location| {
+            matches!(&location.target, NetworkTarget::WebDav(current) if current.connection_id == connection.connection_id)
+        }) {
+            return Err(NetworkLocationCatalogError::DuplicateTarget);
+        }
+        let id = connection.connection_id.max(1);
+        let sort_order = self
+            .locations
+            .iter()
+            .map(|location| location.sort_order)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(u32::from(!self.locations.is_empty()));
+        self.locations.push(NetworkLocation {
+            id,
+            source: NetworkLocationSource::AsterOwned,
+            display_name,
+            sort_order,
+            target: NetworkTarget::WebDav(connection),
+            shell_path: None,
+        });
+        Ok(id)
+    }
+
+    pub fn update_webdav(
+        &mut self,
+        id: u64,
+        display_name: impl Into<String>,
+        connection: WebDavConnection,
+    ) -> Result<(), NetworkLocationCatalogError> {
+        let display_name = display_name.into();
+        if display_name.trim().is_empty() {
+            return Err(NetworkLocationCatalogError::EmptyName);
+        }
+        if self.locations.iter().any(|location| {
+            location.id != id
+                && matches!(&location.target, NetworkTarget::WebDav(current) if current.connection_id == connection.connection_id)
+        }) {
+            return Err(NetworkLocationCatalogError::DuplicateTarget);
+        }
+        let location = self
+            .locations
+            .iter_mut()
+            .find(|location| location.id == id)
+            .ok_or(NetworkLocationCatalogError::NotFound)?;
+        if location.source != NetworkLocationSource::AsterOwned {
+            return Err(NetworkLocationCatalogError::ImportedReadOnly);
+        }
+        if !matches!(location.target, NetworkTarget::WebDav(_)) {
+            return Err(NetworkLocationCatalogError::NotFound);
+        }
+        location.display_name = display_name;
+        location.id = connection.connection_id.max(1);
+        location.target = NetworkTarget::WebDav(connection);
+        Ok(())
     }
 
     pub fn rename(

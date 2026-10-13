@@ -2105,7 +2105,9 @@ fn decode_hex_bytes(value: &str) -> Option<Vec<u8>> {
     }
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             Some((((pair[0] as char).to_digit(16)? << 4) | (pair[1] as char).to_digit(16)?) as u8)
         })
@@ -2129,7 +2131,9 @@ fn decode_path(value: &str) -> Option<PathBuf> {
         return None;
     }
     let wide = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect::<Vec<_>>();
     Some(PathBuf::from(OsString::from_wide(&wide)))
@@ -4568,7 +4572,7 @@ mod tests {
         .unwrap();
 
         let events = events.into_inner();
-        assert!(events.chunks_exact(2).all(|pair| {
+        assert!(events.as_chunks::<2>().0.iter().all(|pair| {
             pair[0].0 == "discovered" && pair[1].0 == "completed" && pair[0].1 == pair[1].1
         }));
         for path in [source.join("first.txt"), source.join("second.txt")] {

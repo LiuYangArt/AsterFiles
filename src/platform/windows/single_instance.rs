@@ -371,7 +371,9 @@ fn deliver_messages(
 fn acknowledgement(kind: u32) -> [u8; ACK_BYTES] {
     let mut bytes = [0; ACK_BYTES];
     for (chunk, word) in bytes
-        .chunks_exact_mut(4)
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
         .zip([IPC_MAGIC, ACK_MESSAGE, kind])
     {
         chunk.copy_from_slice(&word.to_le_bytes());
@@ -633,7 +635,9 @@ fn decode_path(bytes: &[u8], offset: &mut usize) -> io::Result<PathBuf> {
         .get(*offset..end)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid path length"))?;
     let units = raw
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect::<Vec<_>>();
     *offset = end;
