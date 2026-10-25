@@ -219,7 +219,9 @@ fn actual_file_view_release_cancels_after_model_rebuild(mode: i32, grouped: bool
             .is_some()
         {
             native_starts.set(native_starts.get() + 1);
+            return true;
         }
+        false
     });
     let activated_app = app.clone();
     let activated_events = events.clone();

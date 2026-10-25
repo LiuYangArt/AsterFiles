@@ -78,6 +78,10 @@ CI 只有仓库读取权限，不发布、不创建标签；同一 PR/引用的�
 
 `python tools/build.py test --locked webdav -- --nocapture` 检查路径身份、流式目录、取消与背压、HTTP 错误、跨源下载剥离凭据、冲突和会话往返。随后运行完整 `python tools/verify.py`，包含 Debug 构建。专项日志位于 `artifacts/logs/webdav/`，机器结果位于 `artifacts/state/webdav/`，统一汇总为 `artifacts/verify/summary.json`。真实连接、浏览、下载和重启由用户手动验收，不自动操作 UI，不执行本地 Release 构建，也不对用户 NAS 发起探针。
 
+## 文件右键拖拽专项验证（#160）
+
+`python tools/build.py test --locked issue_160 -- --nocapture` 在四类视图的真实条目控件上检查右键短点击释放开菜单、阈值前后移动、越过阈值只拖拽一次、取消与来源变化清除菜单，以及原生事件映射。随后运行 `issue_133` 与 `python tools/verify.py --quick`，包含 Debug 构建。日志位于 `artifacts/logs/issue-160/`。真实 OLE 右键放下菜单与跨应用拖放由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
+
 ## UI 操作与验证
 
 - 禁止 Codex 操作、自动化或尝试控制 AsterFiles 的 UI，包括通过内置浏览器、Chrome、Computer Use、Playwright、agent-browser、截图点击或键鼠模拟等方式。

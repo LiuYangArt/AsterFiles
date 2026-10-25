@@ -9727,6 +9727,12 @@ enum DraggedEntry {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DragButton {
+    Left,
+    Right,
+}
+
 #[derive(Debug)]
 struct InternalDrag {
     origin_tab: TabId,
@@ -9736,10 +9742,21 @@ struct InternalDrag {
     start_y: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DeferredEntryMenu {
+    origin_tab: TabId,
+    request_id: RequestId,
+    entry_id: i32,
+    x: f32,
+    y: f32,
+}
+
 #[derive(Default)]
 struct FileDragGesture {
-    press: Option<(f32, f32)>,
+    press: Option<(f32, f32, DragButton)>,
     pending: Option<InternalDrag>,
+    // A right press may still become a drag, so its entry menu waits for the native release.
+    entry_menu: Option<DeferredEntryMenu>,
 }
 
 impl FileDragGesture {
@@ -9751,19 +9768,61 @@ impl FileDragGesture {
             );
         }
         self.press = None;
+        self.entry_menu = None;
     }
 
     fn arm(&mut self, x: f32, y: f32) {
+        self.arm_button(x, y, DragButton::Left);
+    }
+
+    fn arm_right(&mut self, x: f32, y: f32) {
+        self.arm_button(x, y, DragButton::Right);
+    }
+
+    fn arm_button(&mut self, x: f32, y: f32, button: DragButton) {
         self.cancel("new_pointer_press");
         if x.is_finite() && y.is_finite() {
-            self.press = Some((x, y));
+            self.press = Some((x, y, button));
         }
     }
 
     fn bind_entry(&mut self, app: &AppState, id: EntryId) {
-        let Some((start_x, start_y)) = self.press.take() else {
+        self.bind_button(app, id, DragButton::Left);
+    }
+
+    /// Returns false when no native right press authorized this gesture, so the menu opens at once.
+    fn bind_right_press(&mut self, app: &AppState, entry_id: i32, x: f32, y: f32) -> bool {
+        if !matches!(self.press, Some((_, _, DragButton::Right))) || entry_id < 0 {
+            return false;
+        }
+        let tab = app.active();
+        self.entry_menu = Some(DeferredEntryMenu {
+            origin_tab: tab.id,
+            request_id: tab.latest_request(),
+            entry_id,
+            x,
+            y,
+        });
+        self.bind_button(app, EntryId(entry_id as u32), DragButton::Right);
+        true
+    }
+
+    /// A native right release that never crossed the drag threshold becomes the ordinary entry menu.
+    fn release_right(&mut self, app: &AppState) -> Option<DeferredEntryMenu> {
+        let menu = self.entry_menu.take();
+        self.cancel("right_release");
+        let menu = menu?;
+        let tab = app.active();
+        (tab.id == menu.origin_tab && tab.latest_request() == menu.request_id).then_some(menu)
+    }
+
+    fn bind_button(&mut self, app: &AppState, id: EntryId, button: DragButton) {
+        let Some((start_x, start_y, pressed)) = self.press.take() else {
             return;
         };
+        if pressed != button {
+            return;
+        }
         let tab = app.active();
         let Some(entry) = tab.visible_entry(id) else {
             return;
@@ -9812,7 +9871,7 @@ impl FileDragGesture {
             start_x,
             start_y,
         };
-        crate::operation_audit::record("drag_armed", format!("{drag:?}"));
+        crate::operation_audit::record("drag_armed", format!("button={button:?} {drag:?}"));
         self.pending = Some(drag);
     }
 
@@ -9837,17 +9896,16 @@ impl FileDragGesture {
         if !x.is_finite() || !y.is_finite() || (x - drag.start_x).hypot(y - drag.start_y) < 4.0 {
             return None;
         }
+        self.entry_menu = None;
         self.pending.take()
     }
 }
 
-fn wire_internal_drag_drop(
+fn wire_file_drag_gesture(
     ui: &AppWindow,
-    directory_sender: mpsc::Sender<DirectoryRequest>,
-    network_directory_sender: mpsc::SyncSender<DirectoryRequest>,
     state: WindowSessions,
+    gesture: Rc<RefCell<FileDragGesture>>,
 ) {
-    let gesture = Rc::new(RefCell::new(FileDragGesture::default()));
     let for_arm = gesture.clone();
     ui.on_arm_internal_drag(move |x, y| for_arm.borrow_mut().arm(x, y));
     let for_begin = gesture.clone();
@@ -9859,16 +9917,55 @@ fn wire_internal_drag_drop(
                 .bind_entry(&app, EntryId(entry_id as u32));
         }
     });
-    let for_cancel = gesture.clone();
-    ui.on_cancel_internal_drag(move || for_cancel.borrow_mut().cancel("release_or_context_change"));
+    let for_arm_right = gesture.clone();
+    ui.on_arm_internal_right_drag(move |x, y| for_arm_right.borrow_mut().arm_right(x, y));
+    let for_right = gesture.clone();
+    let state_for_right = state.clone();
+    let weak = ui.as_weak();
+    ui.on_begin_internal_right_drag(move |entry_id, x, y| {
+        let deferred = state_for_right.lock().is_ok_and(|app| {
+            for_right
+                .borrow_mut()
+                .bind_right_press(&app, entry_id, x, y)
+        });
+        if !deferred && let Some(ui) = weak.upgrade() {
+            ui.invoke_show_entry_menu(entry_id, x, y);
+        }
+    });
+    let for_release_right = gesture.clone();
+    let weak = ui.as_weak();
+    ui.on_release_internal_right_drag(move || {
+        let menu = state
+            .lock()
+            .ok()
+            .and_then(|app| for_release_right.borrow_mut().release_right(&app));
+        if let Some(menu) = menu
+            && let Some(ui) = weak.upgrade()
+        {
+            ui.invoke_show_entry_menu(menu.entry_id, menu.x, menu.y);
+        }
+    });
+    ui.on_cancel_internal_drag(move || gesture.borrow_mut().cancel("release_or_context_change"));
+}
+
+fn wire_internal_drag_drop(
+    ui: &AppWindow,
+    directory_sender: mpsc::Sender<DirectoryRequest>,
+    network_directory_sender: mpsc::SyncSender<DirectoryRequest>,
+    state: WindowSessions,
+) {
+    let gesture = Rc::new(RefCell::new(FileDragGesture::default()));
+    wire_file_drag_gesture(ui, state.clone(), gesture.clone());
     let weak = ui.as_weak();
     ui.on_update_internal_drag(move |x, y| {
-        let Some(ui) = weak.upgrade() else { return };
+        let Some(ui) = weak.upgrade() else {
+            return false;
+        };
         let drag = state
             .lock()
             .ok()
             .and_then(|app| gesture.borrow_mut().take_native_start(&app, x, y));
-        let Some(drag) = drag else { return };
+        let Some(drag) = drag else { return false };
         if drag
             .entries
             .iter()
@@ -9898,7 +9995,7 @@ fn wire_internal_drag_drop(
                     app.operation_errors
                         .push("webdav drag could not start".to_owned());
                 }
-                return;
+                return true;
             };
             let files = prepared
                 .into_iter()
@@ -9908,7 +10005,9 @@ fn wire_internal_drag_drop(
                     open: file.open,
                 })
                 .collect();
-            match platform::windows::drag_drop::begin_virtual_outbound_drag(files) {
+            match run_outbound_ole(&ui, || {
+                platform::windows::drag_drop::begin_virtual_outbound_drag(files)
+            }) {
                 Ok(_) => {}
                 Err(error) => {
                     if let Ok(mut app) = state.lock() {
@@ -9917,7 +10016,7 @@ fn wire_internal_drag_drop(
                     }
                 }
             }
-            return;
+            return true;
         }
         let paths = drag
             .entries
@@ -9935,10 +10034,12 @@ fn wire_internal_drag_drop(
         ui.invoke_release_internal_drag_pointer();
         ui.set_drop_hover_entry_id(-1);
         crate::operation_audit::record("drag_ole_started", format!("{drag:?} pointer=({x},{y})"));
-        let result = platform::windows::drag_drop::begin_outbound_drag(
-            &paths,
-            platform::windows::drag_drop::DropEffect::Move,
-        );
+        let result = run_outbound_ole(&ui, || {
+            platform::windows::drag_drop::begin_outbound_drag(
+                &paths,
+                platform::windows::drag_drop::DropEffect::Move,
+            )
+        });
         crate::operation_audit::record(
             "drag_ole_finished",
             format!("source={paths:?} result={result:?}"),
@@ -9960,7 +10061,21 @@ fn wire_internal_drag_drop(
                 }
             }
         }
+        true
     });
+}
+
+/// Runs a file drag from inside the winit cursor callback that authorized it.
+fn run_outbound_ole<T>(ui: &AppWindow, drag: impl FnOnce() -> T) -> T {
+    // OLE owns the pointer until the drop, so Slint would keep the source row hovered and open
+    // its tooltip; the caller also swallows the stale cursor move that started the drag.
+    ui.window()
+        .dispatch_event(slint::platform::WindowEvent::PointerExited);
+    let result = drag();
+    // DoDragDrop pumps messages inside this callback, and winit buffers events posted there
+    // (such as our own right-drop menu) until another event arrives. A fresh post drains them.
+    let _ = slint::invoke_from_event_loop(|| {});
+    result
 }
 
 fn wire_address_drag(ui: &AppWindow, state: WindowSessions) {
@@ -14085,6 +14200,47 @@ fn wire_callbacks(
         }
     });
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeFileDragAction {
+    Arm(DragButton),
+    ReleaseRight,
+    Cancel,
+}
+
+/// Only native presses may authorize a file drag; Slint item events merely bind the pressed entry.
+fn native_file_drag_action(event: &winit::event::WindowEvent) -> Option<NativeFileDragAction> {
+    use winit::event::{ElementState, MouseButton, WindowEvent};
+    match event {
+        WindowEvent::MouseInput {
+            state: ElementState::Pressed,
+            button: MouseButton::Left,
+            ..
+        } => Some(NativeFileDragAction::Arm(DragButton::Left)),
+        WindowEvent::MouseInput {
+            state: ElementState::Pressed,
+            button: MouseButton::Right,
+            ..
+        } => Some(NativeFileDragAction::Arm(DragButton::Right)),
+        // Explorer opens the entry menu on release; handling it at the native entry keeps the
+        // menu independent of a Slint item that window activation may rebuild (#53).
+        WindowEvent::MouseInput {
+            state: ElementState::Released,
+            button: MouseButton::Right,
+            ..
+        } => Some(NativeFileDragAction::ReleaseRight),
+        WindowEvent::MouseInput { .. }
+        | WindowEvent::Focused(false)
+        | WindowEvent::CloseRequested
+        | WindowEvent::Occluded(true)
+        | WindowEvent::CursorLeft { .. }
+        | WindowEvent::Resized(_)
+        | WindowEvent::ScaleFactorChanged { .. }
+        | WindowEvent::MouseWheel { .. }
+        | WindowEvent::KeyboardInput { .. } => Some(NativeFileDragAction::Cancel),
+        _ => None,
+    }
+}
+
 fn should_close_context_menu(event: &winit::event::WindowEvent) -> bool {
     matches!(
         event,
@@ -14183,27 +14339,23 @@ fn wire_mouse_navigation(
     ui.window().on_winit_window_event(move |window, event| {
         handle_window_adaptation(window, event, &mut installed_hwnd);
         if let Some(ui) = weak.upgrade() {
-            match event {
-                WindowEvent::MouseInput {
-                    state: ElementState::Pressed,
-                    button: winit::event::MouseButton::Left,
-                    ..
-                } => {
-                    let position = cursor_position
-                        .get()
-                        .to_logical::<f32>(f64::from(ui.window().scale_factor()));
+            let position = || {
+                cursor_position
+                    .get()
+                    .to_logical::<f32>(f64::from(ui.window().scale_factor()))
+            };
+            match native_file_drag_action(event) {
+                Some(NativeFileDragAction::Arm(DragButton::Left)) => {
+                    let position = position();
                     ui.invoke_arm_internal_drag(position.x, position.y);
                 }
-                WindowEvent::MouseInput { .. }
-                | WindowEvent::Focused(false)
-                | WindowEvent::CloseRequested
-                | WindowEvent::Occluded(true)
-                | WindowEvent::CursorLeft { .. }
-                | WindowEvent::Resized(_)
-                | WindowEvent::ScaleFactorChanged { .. }
-                | WindowEvent::MouseWheel { .. }
-                | WindowEvent::KeyboardInput { .. } => ui.invoke_cancel_internal_drag(),
-                _ => {}
+                Some(NativeFileDragAction::Arm(DragButton::Right)) => {
+                    let position = position();
+                    ui.invoke_arm_internal_right_drag(position.x, position.y);
+                }
+                Some(NativeFileDragAction::ReleaseRight) => ui.invoke_release_internal_right_drag(),
+                Some(NativeFileDragAction::Cancel) => ui.invoke_cancel_internal_drag(),
+                None => {}
             }
         }
         if matches!(event, WindowEvent::Focused(true)) {
@@ -14466,8 +14618,12 @@ fn wire_mouse_navigation(
             WindowEvent::CursorMoved { position, .. } => {
                 cursor_position.set(*position);
                 let logical = position.to_logical::<f32>(f64::from(ui.window().scale_factor()));
-                ui.invoke_update_internal_drag(logical.x, logical.y);
-                EventResult::Propagate
+                if ui.invoke_update_internal_drag(logical.x, logical.y) {
+                    // This move predates the drop; replaying it would re-hover the source row.
+                    EventResult::PreventDefault
+                } else {
+                    EventResult::Propagate
+                }
             }
             WindowEvent::MouseWheel { delta, .. } if !ui.get_active_is_settings() => {
                 let logical = cursor_position

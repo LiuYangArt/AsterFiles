@@ -1486,7 +1486,12 @@ export component AppWindow inherits Window {
     callback arm-internal-drag(float, float);
     callback begin-internal-drag(int);
     callback cancel-internal-drag();
-    callback update-internal-drag(float, float);
+    // Right press arms a drag candidate; the native release opens the entry menu if no drag started.
+    callback arm-internal-right-drag(float, float);
+    callback begin-internal-right-drag(int, float, float);
+    callback release-internal-right-drag();
+    // Returns true when the native move started a file drag and must not reach Slint.
+    callback update-internal-drag(float, float) -> bool;
     public function release-internal-drag-pointer() {
         root.cancel-internal-drag();
     }
@@ -2508,7 +2513,7 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                                         self.click-control = event.modifiers.control;
                                         self.click-shift = event.modifiers.shift;
                                         if event.button == PointerEventButton.right {
-                                            root.show-entry-menu(
+                                            root.begin-internal-right-drag(
                                                 entry.id,
                                                 (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
                                                 (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px
@@ -2685,7 +2690,7 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                                                 self.click-control = event.modifiers.control;
                                                 self.click-shift = event.modifiers.shift;
                                                 if event.button == PointerEventButton.right {
-                                                    root.show-entry-menu(
+                                                    root.begin-internal-right-drag(
                                                         entry.id,
                                                         (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
                                                         (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px
@@ -2786,7 +2791,7 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                                             self.click-control = event.modifiers.control;
                                             self.click-shift = event.modifiers.shift;
                                             if event.button == PointerEventButton.right {
-                                                root.show-entry-menu(
+                                                root.begin-internal-right-drag(
                                                     entry.id,
                                                     (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px,
                                                     (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px
