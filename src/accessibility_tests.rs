@@ -375,3 +375,80 @@ fn issue_154_single_line_cursor_scrolls_to_end_and_returns_home() {
         assert_eq!(ui.get_rename_input().as_str(), name);
     }
 }
+
+#[test]
+fn issue_132_conflict_apply_all_is_a_standard_checkbox() {
+    use crate::app::ConfirmationWindow;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    i_slint_backend_testing::init_no_event_loop();
+    let ui = ConfirmationWindow::new().unwrap();
+    ui.set_kind(1);
+    ui.set_apply_all_text("对这类冲突全部应用".into());
+    ui.set_source_text(r"C:\示例\源文件.txt".into());
+    ui.set_destination_text(r"D:\目标\源文件.txt".into());
+    let actions = Rc::new(Cell::new(0));
+    for register in [
+        ConfirmationWindow::on_primary_action,
+        ConfirmationWindow::on_secondary_action,
+        ConfirmationWindow::on_tertiary_action,
+        ConfirmationWindow::on_safe_cancel,
+    ] {
+        let actions = actions.clone();
+        register(&ui, move || actions.set(actions.get() + 1));
+    }
+
+    let apply_all = by_id(&ui, "confirmation-apply-all");
+    assert_eq!(apply_all.accessible_checkable(), Some(true));
+    assert_eq!(apply_all.accessible_checked(), Some(false));
+    let label = apply_all.accessible_label().unwrap_or_default();
+    assert!(!label.contains('☐') && !label.contains('☑'), "{label}");
+    apply_all.invoke_accessible_default_action();
+    assert!(ui.get_apply_all());
+    assert_eq!(apply_all.accessible_checked(), Some(true));
+    apply_all.invoke_accessible_default_action();
+    assert!(!ui.get_apply_all());
+    assert_eq!(actions.get(), 0, "toggling must not resolve the conflict");
+}
+
+#[test]
+fn issue_132_delete_and_exit_dialogs_keep_their_controls() {
+    use crate::app::ConfirmationWindow;
+
+    i_slint_backend_testing::init_no_event_loop();
+    for kind in [0, 2] {
+        let ui = ConfirmationWindow::new().unwrap();
+        ui.set_kind(kind);
+        by_id(&ui, "confirmation-primary");
+        for id in [
+            "confirmation-apply-all",
+            "confirmation-source",
+            "confirmation-destination",
+            "confirmation-tertiary",
+        ] {
+            assert!(
+                ui.root_element()
+                    .query_descendants()
+                    .match_predicate(move |element| element.accessible_id().as_deref() == Some(id))
+                    .find_all()
+                    .is_empty(),
+                "kind {kind} must not show {id}"
+            );
+        }
+    }
+}
+
+#[test]
+fn issue_132_conflict_shows_full_paths_without_interaction() {
+    use crate::app::ConfirmationWindow;
+
+    i_slint_backend_testing::init_no_event_loop();
+    let ui = ConfirmationWindow::new().unwrap();
+    ui.set_kind(1);
+    let long = r"\server\share\很长的目录\更深一层\非常非常长的文件名称.tar.gz";
+    ui.set_source_text(long.into());
+    let source = by_id(&ui, "confirmation-source");
+    assert_eq!(source.accessible_label().as_deref(), Some(long));
+    assert_ne!(source.accessible_expandable(), Some(true));
+}
