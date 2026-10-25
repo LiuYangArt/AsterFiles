@@ -129,3 +129,7 @@ UI/交互参考 Files， 源码： F:\CodeProjects\Files
 ## 文件名与缩略图专项验证（#154、#155、#156）
 
 运行 `python tools/verify.py --quick`，覆盖无窗口名称编辑、局部改名与缓存保留、目录监听并发、内容和详细信息视图缩略图，并更新 Debug 程序。专项回归可用 `python tools/build.py test --locked issue_154 -- --nocapture`、`issue_155` 和 `issue_156`（替换过滤词）。日志位于 `artifacts/logs/issue-154-156/`、`artifacts/logs/issue-155/` 和 `artifacts/logs/verify-test.log`，汇总为 `artifacts/verify/summary.json`。真实折行、选区、光标、缩略图及窗口边缘由用户验收；不自动操作 AsterFiles UI，不构建本地 Release。步骤见 `docs/agent/debug-validation.md`。
+
+## 文件夹大小排序显示顺序专项验证（#134）
+
+`python tools/build.py test --locked issue_134 -- --nocapture` 使用无窗口后端经真实大小回填入口完成大小排序，核对详情、列表、内容、网格和分组视图的显示顺序、与完整重绘一致、键盘与范围选择位置、选择身份、滚动和模型复用，以及新导航、关闭标签和过期投影的隔离。随后运行完整 `python tools/verify.py`，包含 Debug 构建。日志位于 `artifacts/logs/issue-134/`，统一汇总为 `artifacts/verify/summary.json`。真实排序与手势由用户手动验收，步骤见 `docs/agent/debug-validation.md`。

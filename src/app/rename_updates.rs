@@ -185,6 +185,7 @@ fn same_row(left: &FileRow, right: &FileRow) -> bool {
     left.id == right.id
         && left.name == right.name
         && left.kind == right.kind
+        && left.size == right.size
         && left.group_header == right.group_header
         && left.group_label == right.group_label
         && left.group_detail == right.group_detail

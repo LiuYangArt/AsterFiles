@@ -65,6 +65,8 @@ mod directory_loading;
 mod directory_watch_refresh;
 mod file_operation_coordinator;
 mod file_operation_worker;
+#[cfg(test)]
+mod folder_size_sort_tests;
 #[path = "library_loading.rs"]
 mod library_loading;
 mod loading_hint;
@@ -4376,6 +4378,7 @@ pub fn run(
         everything_receiver,
         everything_sender.clone(),
         thumbnail_scheduler.clone(),
+        shortcut_sender.clone(),
         state.clone(),
     );
     let _ = everything_sender.send(if should_discover_everything {
@@ -20126,17 +20129,85 @@ fn apply_search_page_event(
     tab.merge_search_page(offset, entries, total, file_total, SEARCH_PAGE_LIMIT);
     Some(())
 }
+enum FolderSizeProjection {
+    Rows(HashSet<EntryId>),
+    Resorted,
+}
+
+fn folder_size_projection(
+    app: &mut AppState,
+    tab_id: TabId,
+    commit: FolderSizeCommit,
+) -> Option<FolderSizeProjection> {
+    match commit {
+        FolderSizeCommit::Visible(entry_id) => {
+            Some(FolderSizeProjection::Rows(HashSet::from([entry_id])))
+        }
+        FolderSizeCommit::CompleteSort => {
+            app.tab_mut(tab_id)?.resort_entries();
+            Some(FolderSizeProjection::Resorted)
+        }
+        FolderSizeCommit::Staged => Some(FolderSizeProjection::Rows(HashSet::new())),
+        FolderSizeCommit::Ignored => None,
+    }
+}
+
+/// Returns the projected request when rows moved, so newly visible shortcuts can be resolved.
+fn present_folder_size_projection(
+    ui: &AppWindow,
+    state: &SharedSessions,
+    tab_id: TabId,
+    projection: FolderSizeProjection,
+    images: &ThumbnailScheduler,
+) -> Option<RequestId> {
+    let moved = match projection {
+        FolderSizeProjection::Rows(changed) => {
+            update_file_rows(ui, state, tab_id, &changed);
+            None
+        }
+        FolderSizeProjection::Resorted => reproject_resorted_rows(ui, state, tab_id, images),
+    };
+    update_tab_status(ui, state, tab_id);
+    moved
+}
+
+/// A completed size sort reorders entries, so rows are re-projected by position. Existing
+/// models are patched in place so delegates, scroll position and pointer gestures survive.
+fn reproject_resorted_rows(
+    ui: &AppWindow,
+    state: &SharedSessions,
+    tab_id: TabId,
+    images: &ThumbnailScheduler,
+) -> Option<RequestId> {
+    let (window_id, request_id) = {
+        let app = state.lock().expect("app state mutex is not poisoned");
+        let window_id = app.window_for_tab(tab_id)?;
+        let window = app.window(window_id)?;
+        let tab = window.tabs.get(&tab_id)?;
+        let request_id = tab.latest_request();
+        (window.active_tab == tab_id
+            && tab.page_source == PageSource::Directory
+            && ui.get_projected_file_tab_id() == tab_id.0 as i32
+            && ui.get_projected_file_request_id() == request_id.0 as i32)
+            .then_some((window_id, request_id))?
+    };
+    rename_updates::refresh_projection(ui, state, window_id, images);
+    Some(request_id)
+}
+
 fn start_everything_event_pump(
     ui: &AppWindow,
     receiver: mpsc::Receiver<EverythingEvent>,
     search_sender: mpsc::Sender<EverythingRequest>,
     images: ThumbnailScheduler,
+    shortcuts: mpsc::SyncSender<ShortcutRequest>,
     state: SharedSessions,
 ) {
     let weak = ui.as_weak();
     thread::spawn(move || {
         while let Ok(event) = receiver.recv() {
             let state = state.clone();
+            let shortcuts = shortcuts.clone();
             let sender_for_search_consistency = search_sender.clone();
             let images = images.clone();
             if weak.upgrade_in_event_loop(move |ui| {
@@ -20310,24 +20381,8 @@ fn start_everything_event_pump(
                             );
                         }
                     }
-                    match commit {
-                        FolderSizeCommit::Visible(entry_id) => {
-                            folder_size_update = Some((tab_id, HashSet::from([entry_id])));
-                        }
-                        FolderSizeCommit::CompleteSort => {
-                            if let Some(tab) = app.tab_mut(tab_id) {
-                                tab.resort_entries();
-                                folder_size_update = Some((
-                                    tab_id,
-                                    tab.entries.iter().map(|entry| entry.id).collect(),
-                                ));
-                            }
-                        }
-                        FolderSizeCommit::Staged => {
-                            folder_size_update = Some((tab_id, HashSet::new()));
-                        }
-                        FolderSizeCommit::Ignored => {}
-                    }
+                    folder_size_update = folder_size_projection(&mut app, tab_id, commit)
+                        .map(|projection| (tab_id, projection));
                 }
                 EverythingEvent::Status { generation, result }
                     if generation == app.everything_generation =>
@@ -20379,12 +20434,13 @@ fn start_everything_event_pump(
                 | EverythingEvent::ExecutablePicked { .. } => {}
             }
             drop(app);
-            if let Some((tab_id, changed)) = folder_size_update {
+            if let Some((tab_id, projection)) = folder_size_update {
                 if let Some(window_id) = state.lock().ok().and_then(|app| app.window_for_tab(tab_id))
                     && let Some(target_ui) = window_ui(window_id)
+                    && let Some(request_id) =
+                        present_folder_size_projection(&target_ui, &state, tab_id, projection, &images)
                 {
-                    update_file_rows(&target_ui, &state, tab_id, &changed);
-                    update_tab_status(&target_ui, &state, tab_id);
+                    submit_visible_shortcuts(&shortcuts, &state, &target_ui, tab_id, request_id);
                 }
                 return;
             }
