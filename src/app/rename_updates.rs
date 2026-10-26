@@ -478,7 +478,7 @@ mod tests {
             entry(1, r"C:\photos\a.png"),
             entry(2, r"C:\photos\b.png"),
         ]);
-        tab.selected = vec![EntryId(1)];
+        tab.selected = vec![EntryId(1)].into();
         tab.focused = Some(EntryId(1));
         tab.selection_anchor = Some(EntryId(1));
         for name in ["a.png", "b.png"] {

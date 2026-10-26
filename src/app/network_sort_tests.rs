@@ -319,7 +319,7 @@ fn issue_141_completion_keeps_only_selection_ids_in_the_final_directory() {
     {
         let mut app = state.lock().unwrap();
         let tab = app.tab_mut(TabId(1)).unwrap();
-        tab.selected = vec![EntryId(1), EntryId(99)];
+        tab.selected = vec![EntryId(1), EntryId(99)].into();
         tab.focused = Some(EntryId(99));
         tab.selection_anchor = Some(EntryId(99));
     }

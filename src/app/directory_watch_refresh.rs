@@ -481,7 +481,7 @@ mod tests {
             let tab = app.tab_mut(TabId(1)).unwrap();
             tab.replace_entries(entries);
             tab.load_state = LoadState::Complete;
-            tab.selected = vec![EntryId(1)];
+            tab.selected = vec![EntryId(1)].into();
             tab.focused = Some(EntryId(1));
             Arc::new(Mutex::new(app))
         }
@@ -693,7 +693,7 @@ mod tests {
                 DirectoryViewPreference::default(),
                 None
             ));
-            tab.selected = vec![EntryId(1)];
+            tab.selected = vec![EntryId(1)].into();
             tab.focused = Some(EntryId(1));
         }
         assert!(!run_probe(&state, pending).changed);

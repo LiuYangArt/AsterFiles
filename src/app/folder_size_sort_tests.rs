@@ -319,7 +319,7 @@ fn issue_134_range_selection_after_resort_follows_displayed_order() {
     let tab = app.tab_mut(TabId(1)).unwrap();
     let anchor = shown.iter().position(|id| *id == EntryId(2)).unwrap();
     tab.select_entry(shown[anchor - 3], false, true);
-    let mut selected = tab.selected.clone();
+    let mut selected = tab.selected.to_vec();
     selected.sort_by_key(|id| shown.iter().position(|shown| shown == id));
     assert_eq!(selected, shown[anchor - 3..=anchor]);
 }

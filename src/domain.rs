@@ -6,6 +6,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::OsString,
     hash::{Hash, Hasher},
+    ops::Deref,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -570,11 +571,132 @@ pub enum RectangleSelectionMode {
     Toggle,
 }
 
+/// Selected entries in selection order. Row projection asks for membership once per visible
+/// row, so membership comes from a hash set; a linear scan made whole-directory selections
+/// quadratic on the UI thread (#161). The order is kept for drag sources and copied paths.
+#[derive(Debug, Clone, Default)]
+pub struct Selection {
+    order: Vec<EntryId>,
+    members: HashSet<EntryId>,
+}
+
+impl Selection {
+    pub fn contains(&self, id: &EntryId) -> bool {
+        self.members.contains(id)
+    }
+
+    pub fn members(&self) -> &HashSet<EntryId> {
+        &self.members
+    }
+
+    /// Appends `id` after the current selection unless it is already selected.
+    pub fn insert(&mut self, id: EntryId) -> bool {
+        let added = self.members.insert(id);
+        if added {
+            self.order.push(id);
+        }
+        added
+    }
+
+    pub fn remove(&mut self, id: EntryId) -> bool {
+        if !self.members.remove(&id) {
+            return false;
+        }
+        if let Some(index) = self.order.iter().position(|selected| *selected == id) {
+            self.order.remove(index);
+        }
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.order.clear();
+        self.members.clear();
+    }
+
+    pub fn retain(&mut self, mut keep: impl FnMut(&EntryId) -> bool) {
+        let members = &mut self.members;
+        self.order.retain(|id| {
+            let kept = keep(id);
+            if !kept {
+                members.remove(id);
+            }
+            kept
+        });
+    }
+}
+
+impl Deref for Selection {
+    type Target = [EntryId];
+
+    fn deref(&self) -> &[EntryId] {
+        &self.order
+    }
+}
+
+impl FromIterator<EntryId> for Selection {
+    fn from_iter<I: IntoIterator<Item = EntryId>>(ids: I) -> Self {
+        let ids = ids.into_iter();
+        let capacity = ids.size_hint().0;
+        let mut selection = Self {
+            order: Vec::with_capacity(capacity),
+            members: HashSet::with_capacity(capacity),
+        };
+        for id in ids {
+            selection.insert(id);
+        }
+        selection
+    }
+}
+
+impl From<Vec<EntryId>> for Selection {
+    fn from(ids: Vec<EntryId>) -> Self {
+        ids.into_iter().collect()
+    }
+}
+
+impl IntoIterator for Selection {
+    type Item = EntryId;
+    type IntoIter = std::vec::IntoIter<EntryId>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.order.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Selection {
+    type Item = &'a EntryId;
+    type IntoIter = std::slice::Iter<'a, EntryId>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.order.iter()
+    }
+}
+
+impl PartialEq for Selection {
+    fn eq(&self, other: &Self) -> bool {
+        self.order == other.order
+    }
+}
+
+impl Eq for Selection {}
+
+impl PartialEq<Vec<EntryId>> for Selection {
+    fn eq(&self, other: &Vec<EntryId>) -> bool {
+        self.order == *other
+    }
+}
+
+impl<const N: usize> PartialEq<[EntryId; N]> for Selection {
+    fn eq(&self, other: &[EntryId; N]) -> bool {
+        self.order.as_slice() == other
+    }
+}
+
 #[derive(Debug)]
 struct DirectorySnapshot {
     entries: Arc<Vec<FileEntry>>,
     error: Option<String>,
-    selected: Vec<EntryId>,
+    selected: Selection,
     focused: Option<EntryId>,
     selection_anchor: Option<EntryId>,
 }
@@ -608,7 +730,7 @@ pub struct TabSession {
     entry_indices: HashMap<EntryId, usize>,
     pub load_state: LoadState,
     pub error: Option<String>,
-    pub selected: Vec<EntryId>,
+    pub selected: Selection,
     pub focused: Option<EntryId>,
     pub selection_anchor: Option<EntryId>,
     pub sort_field: SortField,
@@ -650,7 +772,7 @@ impl TabSession {
             entry_indices: HashMap::new(),
             load_state: LoadState::Idle,
             error: None,
-            selected: Vec::new(),
+            selected: Selection::default(),
             focused: None,
             selection_anchor: None,
             sort_field: SortField::Name,
@@ -1547,24 +1669,19 @@ impl TabSession {
             let range = self.range_ids(anchor, entry_id);
             if toggle {
                 for id in range {
-                    if !self.selected.contains(&id) {
-                        self.selected.push(id);
-                    }
+                    self.selected.insert(id);
                 }
             } else {
-                self.selected = range;
+                self.selected = range.into();
             }
             self.selection_anchor = Some(anchor);
         } else if toggle {
-            if let Some(index) = self.selected.iter().position(|id| *id == entry_id) {
-                self.selected.remove(index);
-            } else {
-                self.selected.push(entry_id);
+            if !self.selected.remove(entry_id) {
+                self.selected.insert(entry_id);
             }
             self.selection_anchor = Some(entry_id);
         } else {
-            self.selected.clear();
-            self.selected.push(entry_id);
+            self.selected = vec![entry_id].into();
             self.selection_anchor = Some(entry_id);
         }
     }
@@ -1583,9 +1700,10 @@ impl TabSession {
             }
         };
         selected.retain(|id| self.entry_indices.contains_key(id));
-        self.selected = selected.into_iter().collect();
-        self.selected
+        let mut ordered = selected.into_iter().collect::<Vec<_>>();
+        ordered
             .sort_unstable_by_key(|id| self.entry_indices.get(id).copied().unwrap_or(usize::MAX));
+        self.selected = ordered.into();
         self.focused = hits
             .iter()
             .filter(|id| self.entry_indices.contains_key(id))
@@ -1613,9 +1731,9 @@ impl TabSession {
                 .selection_anchor
                 .unwrap_or_else(|| self.entries[current].id);
             self.selection_anchor = Some(anchor);
-            self.selected = self.range_ids(anchor, id);
+            self.selected = self.range_ids(anchor, id).into();
         } else {
-            self.selected = vec![id];
+            self.selected = vec![id].into();
             self.selection_anchor = Some(id);
         }
     }
@@ -1634,10 +1752,10 @@ impl TabSession {
         if extend {
             let anchor = self.selection_anchor.or(self.focused).unwrap_or(id);
             self.selection_anchor = Some(anchor);
-            self.selected = self.range_ids(anchor, id);
+            self.selected = self.range_ids(anchor, id).into();
             self.focused = Some(id);
         } else {
-            self.selected = vec![id];
+            self.selected = vec![id].into();
             self.focused = Some(id);
             self.selection_anchor = Some(id);
         }
@@ -3188,6 +3306,25 @@ mod tests {
             session.current_location,
             Some(NavigationLocation::Directory(PathBuf::from("C:\\成功")))
         );
+    }
+
+    #[test]
+    fn issue_161_selection_keeps_order_and_membership_in_step() {
+        let mut selection = Selection::from(vec![EntryId(3), EntryId(1), EntryId(3), EntryId(2)]);
+        assert_eq!(selection, vec![EntryId(3), EntryId(1), EntryId(2)]);
+        assert!(!selection.insert(EntryId(1)));
+        assert!(selection.insert(EntryId(4)));
+        assert!(selection.remove(EntryId(1)));
+        assert!(!selection.remove(EntryId(1)));
+        assert!(!selection.contains(&EntryId(1)));
+        assert_eq!(selection, [EntryId(3), EntryId(2), EntryId(4)]);
+        selection.retain(|id| *id != EntryId(2));
+        assert!(!selection.contains(&EntryId(2)));
+        assert_eq!(selection.members().len(), selection.len());
+        assert!(selection.insert(EntryId(2)));
+        assert_eq!(selection, [EntryId(3), EntryId(4), EntryId(2)]);
+        selection.clear();
+        assert!(selection.is_empty() && selection.members().is_empty());
     }
 
     #[test]

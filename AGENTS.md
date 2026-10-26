@@ -137,3 +137,7 @@ UI/交互参考 Files， 源码： F:\CodeProjects\Files
 ## 文件夹大小排序显示顺序专项验证（#134）
 
 `python tools/build.py test --locked issue_134 -- --nocapture` 使用无窗口后端经真实大小回填入口完成大小排序，核对详情、列表、内容、网格和分组视图的显示顺序、与完整重绘一致、键盘与范围选择位置、选择身份、滚动和模型复用，以及新导航、关闭标签和过期投影的隔离。随后运行完整 `python tools/verify.py`，包含 Debug 构建。日志位于 `artifacts/logs/issue-134/`，统一汇总为 `artifacts/verify/summary.json`。真实排序与手势由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
+
+## 大目录全选与选择查询专项验证（#161）
+
+`python tools/build.py test --locked issue_161 -- --nocapture` 使用无窗口后端，在十万条目中测量全选、整窗重绘、Ctrl 点选、全部取消、Shift 与 Ctrl+Shift 范围选择，并设耗时与增长倍数上限。随后运行 `python tools/verify.py --quick`，包含 Debug 构建。日志位于 `artifacts/logs/issue-161/`，修复前后耗时位于 `artifacts/perf/issue-161/`。真实 Ctrl+A 响应由用户手动验收，步骤见 `docs/agent/debug-validation.md`。

@@ -186,7 +186,7 @@ fn issue_133_completed_selection_reveals_real_projected_list_and_grid() {
                     .collect(),
             );
             tab.load_state = LoadState::Complete;
-            tab.selected = vec![EntryId(118), EntryId(2), EntryId(116)];
+            tab.selected = vec![EntryId(118), EntryId(2), EntryId(116)].into();
             let request_id = tab.latest_request();
             focus_bottom_selected_entry(&mut app, tab_id);
             let state = Arc::new(Mutex::new(app));

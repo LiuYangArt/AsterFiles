@@ -27,7 +27,8 @@ use crate::{
         FolderSizeState, GroupField, LibraryLocationId, LoadState, MAX_DIRECTORY_VIEW_PREFERENCES,
         NameHighlightSegment, NavigationKind, NavigationLocation, PageSource,
         RectangleSelectionMode, RequestId, SearchDepth, SearchScope, SearchState,
-        SearchViewPreference, SortDirection, SortField, TabId, TabKind, TabSession, ViewMode,
+        SearchViewPreference, Selection, SortDirection, SortField, TabId, TabKind, TabSession,
+        ViewMode,
         file_operations::{
             FileOperationKind, ItemState, OperationId, OperationItem, OperationManager,
             OperationResource, OperationState, PermanentDeletePhase, PermanentDeleteStage,
@@ -73,6 +74,8 @@ mod loading_hint;
 #[cfg(test)]
 mod network_sort_tests;
 mod rename_updates;
+#[cfg(test)]
+mod selection_scale_tests;
 #[cfg(test)]
 mod test_support;
 mod webdav_ui;
@@ -10475,10 +10478,9 @@ fn cancel_rectangle_selection(
             if tab.latest_request() != request_id {
                 None
             } else {
-                let before = selection_projection_ids(tab);
-                restore_rectangle_selection_snapshot(tab, snapshot.as_ref(), focused, anchor);
-                let mut changed = before;
-                changed.extend(selection_projection_ids(tab));
+                let changed = mutate_selection(tab, |tab| {
+                    restore_rectangle_selection_snapshot(tab, snapshot.as_ref(), focused, anchor);
+                });
                 Some((tab_id, changed))
             }
         }
@@ -10669,7 +10671,7 @@ fn wire_rectangle_selection(ui: &AppWindow, state: WindowSessions) -> Rc<slint::
                 pointer_x: x,
                 pointer_y: y,
                 snapshot: Arc::new(tab.selected.iter().copied().collect()),
-                snapshot_order: tab.selected.clone(),
+                snapshot_order: tab.selected.to_vec(),
                 focused: tab.focused,
                 anchor: tab.selection_anchor,
                 mode: selection_mode(control, shift),
@@ -11575,15 +11577,7 @@ fn wire_callbacks(
             let Some(tab) = app.active_window_state_mut().tabs.get_mut(&tab_id) else {
                 return;
             };
-            let previous_selected = tab.selected.clone();
-            let previous_focused = tab.focused;
-            tab.select_entry(entry_id, toggle, extend);
-            previous_selected
-                .into_iter()
-                .chain(tab.selected.iter().copied())
-                .chain(previous_focused)
-                .chain(tab.focused)
-                .collect::<std::collections::HashSet<_>>()
+            mutate_selection(tab, |tab| tab.select_entry(entry_id, toggle, extend))
         };
         if let Some(ui) = weak.upgrade() {
             update_file_rows(&ui, &state_for_activate_entry, tab_id, &changed_rows);
@@ -11622,13 +11616,9 @@ fn wire_callbacks(
             .lock()
             .ok()
             .and_then(|app| {
-                app.tab(target.tab_id).map(|tab| {
-                    previous
-                        .into_iter()
-                        .flat_map(|(selected, focused)| selected.into_iter().chain(focused))
-                        .chain(tab.selected.iter().copied())
-                        .chain(tab.focused)
-                        .collect::<HashSet<_>>()
+                app.tab(target.tab_id).map(|tab| match &previous {
+                    Some((selected, focused)) => selection_changed_rows(selected, *focused, tab),
+                    None => tab.selected.iter().copied().chain(tab.focused).collect(),
                 })
             })
             .unwrap_or_default();
@@ -18964,11 +18954,10 @@ fn start_event_pump(
 
 fn focus_bottom_selected_entry(app: &mut AppState, tab_id: TabId) {
     let focused = app.tab(tab_id).and_then(|tab| {
-        let selected = tab.selected.iter().copied().collect::<HashSet<_>>();
         directory_group_projections(app, tab, &tab.entries)
             .into_iter()
             .flat_map(|group| group.entries)
-            .rfind(|id| selected.contains(id))
+            .rfind(|id| tab.selected.contains(id))
     });
     if let Some(focused) = focused
         && let Some(tab) = app.tab_mut(tab_id)
@@ -19074,7 +19063,7 @@ fn visible_selection_before_reorder(
         VisibleSelectionBeforeReorder {
             tab_id,
             request_id,
-            selected: tab.selected.clone(),
+            selected: tab.selected.to_vec(),
         }
     })
 }
@@ -19394,7 +19383,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> DirectoryEventC
                         })
                         .collect::<Vec<_>>();
                     if let Some(focused) = ids.last().copied() {
-                        tab.selected = ids;
+                        tab.selected = ids.into();
                         tab.focused = Some(focused);
                         tab.selection_anchor = Some(focused);
                     } else {
@@ -19408,7 +19397,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> DirectoryEventC
                     && focus.is_none()
                     && let Some(entry) = tab.entries.iter().find(|entry| entry.path == *target)
                 {
-                    tab.selected = vec![entry.id];
+                    tab.selected = vec![entry.id].into();
                     tab.focused = Some(entry.id);
                     tab.selection_anchor = Some(entry.id);
                 }
@@ -22490,8 +22479,31 @@ fn update_icon_row(ui: &AppWindow, state: &SharedSessions, update: IconUpdate) {
     update_file_rows(ui, state, update.tab_id, &HashSet::from([entry_id]));
 }
 
-fn selection_projection_ids(tab: &TabSession) -> HashSet<EntryId> {
-    tab.selected.iter().copied().chain(tab.focused).collect()
+/// Rows whose selected or focused flag differs from `before`. Members kept across a mutation
+/// keep their row, so a Ctrl-click inside a 100k selection patches only the toggled and focus
+/// rows instead of every selected row (#161).
+fn selection_changed_rows(
+    before: &Selection,
+    before_focus: Option<EntryId>,
+    tab: &TabSession,
+) -> HashSet<EntryId> {
+    before
+        .members()
+        .symmetric_difference(tab.selected.members())
+        .copied()
+        .chain(before_focus)
+        .chain(tab.focused)
+        .collect()
+}
+
+fn mutate_selection(
+    tab: &mut TabSession,
+    mutate: impl FnOnce(&mut TabSession),
+) -> HashSet<EntryId> {
+    let before = tab.selected.clone();
+    let before_focus = tab.focused;
+    mutate(tab);
+    selection_changed_rows(&before, before_focus, tab)
 }
 
 fn mutate_active_selection(
@@ -22501,11 +22513,7 @@ fn mutate_active_selection(
     let mut app = state.lock().ok()?;
     let tab_id = app.active_window_state().active_tab;
     let tab = app.active_window_state_mut().tabs.get_mut(&tab_id)?;
-    let before = selection_projection_ids(tab);
-    mutate(tab);
-    let mut changed = before;
-    changed.extend(selection_projection_ids(tab));
-    Some((tab_id, changed))
+    Some((tab_id, mutate_selection(tab, mutate)))
 }
 fn mutate_window_selection(
     state: &SharedSessions,
@@ -22516,11 +22524,7 @@ fn mutate_window_selection(
     let window = app.windows.get_mut(&window_id)?;
     let tab_id = window.active_tab;
     let tab = window.tabs.get_mut(&tab_id)?;
-    let before = selection_projection_ids(tab);
-    mutate(tab);
-    let mut changed = before;
-    changed.extend(selection_projection_ids(tab));
-    Some((tab_id, changed))
+    Some((tab_id, mutate_selection(tab, mutate)))
 }
 
 fn update_tab_status(ui: &AppWindow, state: &SharedSessions, tab_id: TabId) {
@@ -27689,7 +27693,7 @@ mod tests {
         app.tab_mut(TabId(1))
             .unwrap()
             .replace_entries(vec![focus_entry(1, r"C:\folder\selected.txt")]);
-        app.tab_mut(TabId(1)).unwrap().selected = vec![EntryId(1)];
+        app.tab_mut(TabId(1)).unwrap().selected = vec![EntryId(1)].into();
         let shared = Arc::new(Mutex::new(app));
         let state = WindowSessions::new(shared.clone(), WindowId(1));
 
@@ -30778,7 +30782,7 @@ mod tests {
                 NavigationKind::Back,
             );
             tab.replace_entries(vec![focus_entry(7, "a/current/item.txt")]);
-            tab.selected = vec![EntryId(7)];
+            tab.selected = vec![EntryId(7)].into();
             tab.focused = Some(EntryId(7));
             tab.selection_anchor = Some(EntryId(7));
             tab.sort_field = SortField::Size;
@@ -30905,12 +30909,12 @@ mod tests {
         {
             let tab = app.tab_mut(first_tab).unwrap();
             tab.replace_entries(vec![focus_entry(1, r"C:\WindowA\first.txt")]);
-            tab.selected = vec![EntryId(1)];
+            tab.selected = vec![EntryId(1)].into();
         }
         {
             let tab = app.tab_mut(second_tab).unwrap();
             tab.replace_entries(vec![focus_entry(2, r"C:\WindowB\second.txt")]);
-            tab.selected = vec![EntryId(2)];
+            tab.selected = vec![EntryId(2)].into();
         }
         app.active_window = second_window;
         let shared = Arc::new(Mutex::new(app));
@@ -30944,7 +30948,7 @@ mod tests {
         app.tab_mut(first_tab)
             .unwrap()
             .replace_entries(vec![focus_entry(1, r"C:\WindowA\first.txt")]);
-        app.tab_mut(first_tab).unwrap().selected = vec![EntryId(1)];
+        app.tab_mut(first_tab).unwrap().selected = vec![EntryId(1)].into();
         let second_window = app.register_window(
             vec![NavigationLocation::Directory(PathBuf::from(r"C:\WindowB"))],
             0,
@@ -30961,7 +30965,7 @@ mod tests {
         app.tab_mut(second_tab)
             .unwrap()
             .replace_entries(vec![focus_entry(2, r"C:\WindowB\second.txt")]);
-        app.tab_mut(second_tab).unwrap().selected = vec![EntryId(2)];
+        app.tab_mut(second_tab).unwrap().selected = vec![EntryId(2)].into();
         drop(app);
 
         let (origin_tab, items) = pending_permanent_delete(&second).unwrap();
@@ -32006,7 +32010,7 @@ mod tests {
         let tab = app.tab_mut(TabId(1)).unwrap();
         tab.page_source = PageSource::Search;
         tab.replace_entries(vec![focus_entry(257, r"D:\one\same.txt")]);
-        tab.selected = vec![EntryId(257)];
+        tab.selected = vec![EntryId(257)].into();
 
         let (rows, _) = built_in_context_rows(&app, false, false);
         assert_eq!(rows[0].id, CMD_OPEN_FILE_LOCATION);
@@ -32023,7 +32027,7 @@ mod tests {
 
         app.language = Language::English;
         app.tab_mut(TabId(1)).unwrap().page_source = PageSource::Search;
-        app.tab_mut(TabId(1)).unwrap().selected = vec![EntryId(257)];
+        app.tab_mut(TabId(1)).unwrap().selected = vec![EntryId(257)].into();
         let (rows, _) = built_in_context_rows(&app, false, false);
         assert_eq!(rows[0].label.as_str(), "Open file location");
     }
@@ -32432,12 +32436,12 @@ mod tests {
             let shared = Arc::new(Mutex::new(app));
             let state = WindowSessions::new(shared.clone(), window_id);
             for selected in [vec![], vec![EntryId(1), EntryId(2)]] {
-                shared.lock().unwrap().tab_mut(tab_id).unwrap().selected = selected;
+                shared.lock().unwrap().tab_mut(tab_id).unwrap().selected = selected.into();
                 begin_rename_ui(&ui.as_weak(), &state);
                 assert!(!ui.get_rename_editing(), "mode {mode}");
                 assert!(shared.lock().unwrap().rename_targets.is_empty());
             }
-            shared.lock().unwrap().tab_mut(tab_id).unwrap().selected = vec![EntryId(1)];
+            shared.lock().unwrap().tab_mut(tab_id).unwrap().selected = vec![EntryId(1)].into();
             begin_rename_ui(&ui.as_weak(), &state);
             assert!(ui.get_rename_editing(), "mode {mode}");
             assert_eq!(ui.get_rename_entry_id(), 1);
@@ -32461,7 +32465,7 @@ mod tests {
             let ui = AppWindow::new().unwrap();
             let state = issue_98_state();
             let sessions = WindowSessions::new(state.clone(), WindowId(1));
-            state.lock().unwrap().tab_mut(TabId(1)).unwrap().selected = vec![EntryId(1)];
+            state.lock().unwrap().tab_mut(TabId(1)).unwrap().selected = vec![EntryId(1)].into();
             begin_rename_ui(&ui.as_weak(), &sessions);
             dismiss_stale_rename(&ui, &state, WindowId(1));
             assert!(ui.get_rename_editing());
@@ -32542,7 +32546,7 @@ mod tests {
             let tab = app.tab_mut(tab_id).unwrap();
             tab.replace_entries(vec![focus_entry(1, source)]);
             tab.load_state = LoadState::Complete;
-            tab.selected = vec![EntryId(1)];
+            tab.selected = vec![EntryId(1)].into();
             let request_id = app.tab(tab_id).unwrap().latest_request();
             app.rename_targets.insert(
                 window_id,

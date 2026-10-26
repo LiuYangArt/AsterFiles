@@ -130,10 +130,9 @@ impl InputFixture {
             let changed = {
                 let mut app = selected_state.lock().unwrap();
                 let tab = app.tab_mut(tab_id).unwrap();
-                let mut changed = selection_projection_ids(tab);
-                tab.select_entry(EntryId(id as u32), toggle, extend);
-                changed.extend(selection_projection_ids(tab));
-                changed
+                mutate_selection(tab, |tab| {
+                    tab.select_entry(EntryId(id as u32), toggle, extend)
+                })
             };
             if let Some(ui) = weak.upgrade() {
                 update_file_rows(&ui, &selected_state, tab_id, &changed);
@@ -216,7 +215,7 @@ impl InputFixture {
     }
 
     fn selected(&self) -> Vec<EntryId> {
-        self.state.lock().unwrap().active().selected.clone()
+        self.state.lock().unwrap().active().selected.to_vec()
     }
 }
 

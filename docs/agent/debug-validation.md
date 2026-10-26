@@ -540,3 +540,17 @@ Slint 无窗口后端在详细信息、列表、网格和分组网格的真实�
 2. 排序完成前选中一项并滚离，完成后确认选中项不变、视图不被拉回；随后用方向键和 Shift+方向键检查移动与范围选择符合可见顺序。
 3. 在详细信息、列表、网格和按大小分组视图各检查一次。
 4. 大小计算期间持续单击、双击、Ctrl/Shift 选择或拖动条目，确认手势不被中断；计算期间导航到其他目录或关闭标签，确认新页面不被旧结果改变。
+
+## Issue #161 大目录全选与选择查询
+
+专项命令：`python tools/build.py test --locked issue_161 -- --nocapture`，随后运行 `python tools/verify.py --quick`（包含 Debug 构建）。日志位于 `artifacts/logs/issue-161/`；`before-fix-tests.log` 保留旧实现下同一测试的耗时。耗时写入 `artifacts/perf/issue-161/`：`before-fix.json` 为修复前，`after-fix.json` 为修复后，`latest.json` 为最近一次运行。
+
+测试使用无窗口后端和十万条目的详细信息视图，经 `mutate_active_selection` 与 `update_file_rows` 走选择回调的同一路径，测量全选、全选后整窗重绘、200 次 Ctrl 点选、全部取消、Shift 全范围和 Ctrl+Shift 扩展，并检查选择顺序、焦点和锚点。`select_all_scale` 比较 25k、50k、100k 条目的全选耗时，用增长倍数判断复杂度：线性约 4 倍，平方约 16 倍。全选、整窗重绘和范围选择上限各 1000 ms，单次 Ctrl 点选峰值上限 250 ms，增长倍数上限 8。剩余耗时是逐行生成 `FileRow` 和扫描文件模型，属于 #162、#165。
+
+用户手动验收：
+
+1. 由 Agent 预先创建十万个空文件的测试目录，不要求用户手动准备：`$d = "$env:TEMP\asterfiles-161"; New-Item -ItemType Directory -Force $d | Out-Null; 1..100000 | ForEach-Object { [IO.File]::Create("$d\item-$($_.ToString('000000')).txt").Dispose() }`。
+2. 用 `target/debug/asterfiles.exe` 打开该目录，等待加载完成，按 Ctrl+A，确认所有行立即显示为选中，状态栏显示“已选择 100000 项”，界面没有明显停顿。
+3. 全选后 Ctrl 单击几项取消再选回，然后单击一项、Shift 单击最后一项，确认每次操作都即时响应。
+4. 全选后缩放窗口、切换到列表和网格视图，确认选中状态保持且没有明显卡顿；拖动多选条目到另一个文件夹的预期顺序不变。
+5. 验收后删除临时目录：`Remove-Item -Recurse -Force "$env:TEMP\asterfiles-161"`。
