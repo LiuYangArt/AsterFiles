@@ -398,6 +398,16 @@ python tools/verify.py
 
 定向日志保存至 `artifacts/logs/issue-103/`；完整验证汇总仍为 `artifacts/verify/summary.json`。日志中的首批/完成毫秒数来自本机夹具，不代表 NAS 性能。真实验收由用户打开大于 4096 项的共享目录对照总数，并检查慢连接先出现内容、读取途中切换本地标签/关闭网络标签和断网后可重试。
 
+## Issue #153 空闲时限的时序断言
+
+```powershell
+python tools/build.py test --locked issue_153 -- --nocapture
+python tools/build.py test --locked network::directory -- --nocapture
+python tools/verify.py
+```
+
+慢进展测试不断言从启动到首批的墙钟耗时：该值包含创建 Job、启动测试子进程和 libtest 初始化，默认并发下可能超过空闲时限，与空闲时限语义无关。时限规则改用注入时间的确定性测试检查：低于时限的持续进展不过期，停止进展后恰好在时限处过期。真实子进程测试只测首批到末批的跨度：子进程收到上一帧确认后再等待 100 ms 才发布下一帧，跨度至少 1100 ms，大于 1000 ms 时限，且成功完成。失败时断言消息包含启动耗时、跨度、最大间隔和结果。挂起子进程在时限前不得回收。日志位于 `artifacts/logs/issue-153/`。
+
 ## Issue #104 库来源隔离
 
 专项命令：`cargo test issue_104_ -- --nocapture`；完整验证：`python tools/verify.py`，包含 Debug 构建。

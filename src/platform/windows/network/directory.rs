@@ -81,6 +81,30 @@ fn cancelled() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "network directory cancelled")
 }
 
+/// Silence is measured from helper creation and restarts at every acknowledged frame, so
+/// start-up counts against the limit while steady progress never expires.
+struct IdleDeadline {
+    timeout: Duration,
+    last_progress: Instant,
+}
+
+impl IdleDeadline {
+    fn start(timeout: Duration, now: Instant) -> Self {
+        Self {
+            timeout,
+            last_progress: now,
+        }
+    }
+
+    fn progress(&mut self, now: Instant) {
+        self.last_progress = now;
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_progress) >= self.timeout
+    }
+}
+
 fn receive_stream(
     mut command: Command,
     output: &Path,
@@ -99,7 +123,7 @@ fn receive_stream(
     let mut child = command.spawn()?;
     let result = (|| {
         job.assign(&child)?;
-        let mut last_progress = Instant::now();
+        let mut deadline = IdleDeadline::start(timeout, Instant::now());
         let mut skipped = 0_usize;
         let mut next_id = 1_u32;
         let mut completed = false;
@@ -142,7 +166,7 @@ fn receive_stream(
                     // Removing the slot acknowledges UI consumption, not merely queue delivery.
                     std::fs::remove_file(output)?;
                     completed = done;
-                    last_progress = Instant::now();
+                    deadline.progress(Instant::now());
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
@@ -156,7 +180,7 @@ fn receive_stream(
                     )))
                 };
             }
-            if last_progress.elapsed() >= timeout {
+            if deadline.expired(Instant::now()) {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "network directory helper made no progress",
@@ -1064,31 +1088,73 @@ mod tests {
     }
 
     #[test]
+    fn issue_153_idle_deadline_extends_on_progress_and_expires_at_limit() {
+        let timeout = Duration::from_millis(700);
+        let start = Instant::now();
+        let mut deadline = IdleDeadline::start(timeout, start);
+        assert!(!deadline.expired(start + timeout - Duration::from_millis(1)));
+        assert!(deadline.expired(start + timeout));
+        let mut now = start;
+        for _ in 0..12 {
+            now += Duration::from_millis(600);
+            assert!(
+                !deadline.expired(now),
+                "progress gap below the limit expired"
+            );
+            deadline.progress(now);
+        }
+        assert!(now - start > timeout * 10);
+        assert!(!deadline.expired(now + timeout - Duration::from_millis(1)));
+        assert!(deadline.expired(now + timeout));
+        // A clock sample older than the last progress must not underflow into expiry.
+        assert!(!deadline.expired(start));
+    }
+
+    #[test]
     fn issue_103_slow_progress_extends_idle_deadline() {
+        // The helper publishes the next frame only after this side acknowledges the previous one
+        // and then sleeps 100 ms, so first→last receipt spans at least 11 × 100 ms regardless of
+        // process start-up or scheduling. Start-up stays outside the measured span.
+        let timeout = Duration::from_millis(1000);
+        let minimum_span = Duration::from_millis(1100);
         let files = StreamFiles::create().unwrap();
         let started = Instant::now();
-        let mut first = None;
+        let mut receipts = Vec::new();
         let mut count = 0;
-        receive_stream(
+        let result = receive_stream(
             child_command(&files, "slow"),
             &files.output(),
             &AtomicBool::new(false),
-            Duration::from_millis(700),
+            timeout,
             |entries| {
-                first.get_or_insert(started.elapsed());
+                receipts.push(Instant::now());
                 count += entries.len();
                 Ok(())
             },
-        )
-        .unwrap();
-        assert_eq!(count, 12);
-        assert!(started.elapsed() > Duration::from_millis(700));
-        assert!(first.unwrap() < Duration::from_millis(700));
-        eprintln!(
-            "#103 slow first_ms={} complete_ms={} idle_timeout_ms=700 helper_reaped=true",
-            first.unwrap().as_millis(),
-            started.elapsed().as_millis()
         );
+        let startup_ms = receipts
+            .first()
+            .map(|first| first.duration_since(started).as_millis());
+        let span = match (receipts.first(), receipts.last()) {
+            (Some(first), Some(last)) => last.duration_since(*first),
+            _ => Duration::ZERO,
+        };
+        let max_gap_ms = receipts
+            .windows(2)
+            .map(|pair| pair[1].duration_since(pair[0]).as_millis())
+            .max()
+            .unwrap_or(0);
+        let report = format!(
+            "#153 slow startup_ms={startup_ms:?} span_ms={} max_gap_ms={max_gap_ms} complete_ms={} idle_timeout_ms={} batches={} result={result:?}",
+            span.as_millis(),
+            started.elapsed().as_millis(),
+            timeout.as_millis(),
+            receipts.len()
+        );
+        eprintln!("{report}");
+        assert!(result.is_ok(), "{report}");
+        assert_eq!(count, 12, "{report}");
+        assert!(span >= minimum_span && span > timeout, "{report}");
     }
 
     #[test]
@@ -1135,6 +1201,10 @@ mod tests {
             )
             .unwrap_err();
             assert_eq!(error.kind(), expected);
+            if mode == "hang" {
+                // The idle clock starts after spawn, so a silent helper cannot be reaped early.
+                assert!(started.elapsed() >= Duration::from_millis(700));
+            }
             assert!(started.elapsed() < Duration::from_secs(5));
             eprintln!(
                 "#103 mode={mode} error={expected:?} elapsed_ms={} helper_reaped=true",

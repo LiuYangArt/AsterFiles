@@ -62,6 +62,10 @@ CI 只有仓库读取权限，不发布、不创建标签；同一 PR/引用的�
 
 `python tools/build.py test --locked issue_138 -- --nocapture` 验证删除并发、拒绝访问期间的背压、持续拒绝访问时的取消和超时回收，以及完成帧后异常退出的标准错误与栈。随后运行默认并发 `python tools/verify.py`，包含 Debug 构建。专项日志位于 `artifacts/logs/issue-138/`，统一汇总为 `artifacts/verify/summary.json`。子进程失败的非空原始错误保留在父进程日志指向的 `%TEMP%/asterfiles-directory-*/batch.stderr`。根因和证据见 `docs/postmortem/postmortem-2026-10-07-directory-frame-race.md`。
 
+## 目录空闲时限时序专项验证（#153）
+
+`python tools/build.py test --locked issue_153 -- --nocapture` 用注入时间检查持续进展延长空闲时限、停止进展后按期限过期；`network::directory` 过滤运行真实子进程慢进展与挂起回收测试，只测首批到末批的受控跨度，不测启动耗时。随后运行默认并发 `python tools/verify.py`。日志位于 `artifacts/logs/issue-153/`。
+
 ## 复制执行上下文专项验证（#149）
 
 `python tools/build.py test --locked issue_149 -- --nocapture` 验证本地无需登记、隔离缺登记拒绝、跨线程与并发上下文隔离、递归复制和移动的登记失败保护，以及恢复结束复位。随后运行 `python tools/build.py test --locked issue_137 -- --nocapture`、完整 `python tools/verify.py`，并复用 #137 的慢源、真实 NAS 暂停续传和取消探针。日志位于 `artifacts/logs/issue-149/`，独立汇总位于 `artifacts/state/issue-149/`。不执行 UI 自动化或本地 Release 构建。
