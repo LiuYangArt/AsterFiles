@@ -574,11 +574,24 @@ python tools/verify.py
 
 日志保存至 `artifacts/logs/issue-175/`，完整验证汇总仍为 `artifacts/verify/summary.json`。性能数据写入 `artifacts/perf/issue-175/`：`before-fix.json` 为修复前基线，`after-fix.json` 为验收用修复后数据，`latest.json` 为最近一次运行。比较时使用相同夹具和构建配置，保留首批、总耗时及单次峰值。
 
+图标管线另运行：
+
+```powershell
+python tools/build.py test --locked app::file_images_tests -- --nocapture --test-threads=1
+python tools/verify.py
+```
+
+三个 `issue_175` 图标测试调用真实 Shell，并在十万空 TXT 夹具上写入实际像素结果。检查类型和尺寸共享、跨标签请求合并、导航后共享结果复用、私有预览过期拒收、多结果合并通知及 UI 图片复用；搜索窗口的回填以真实驻留条目为准。共享回填和单次滚动峰值上限均为 16 ms。专项日志为 `artifacts/logs/issue-175/icons-tests.log`，完整验证日志为 `artifacts/logs/issue-175/icons-full-verify.log`。性能数据写入 `artifacts/perf/issue-175/icons-after-fix.json`。
+
+系统图标按类型和尺寸共享，普通空文件不请求内容预览。后台查询 Windows 注册的预览能力，支持预览的非空文件仍逐文件提取；单文件失败不禁用整个类型。原始像素和 UI 图片分别复用，类型回包只更新各窗口当前驻留条目。结果队列上限为 96，每个 UI 回调最多合并 32 个结果，处理完成后再投递下一批。图片更新不重置选择或编辑器，其他字段更新沿用原入口。
+
 用户手动验收：
 
 1. 用 `target/debug/asterfiles.exe` 打开 `%TEMP%\asterfiles-161`，切到详细信息视图。退出再进入目录，确认首批及时出现、后续内容持续补齐，加载期间能切换标签或导航。
 2. 等待加载完成，从空白处框选、反向缩小选区，再把指针保持在列表下缘触发滚动。确认矩形和选中状态跟随输入，放开后选择正确。
 3. 连续把滚动条从顶部拖到底部，再快速往返中间位置，确认列表跟随且没有明显停顿；滚动后单击和 Ctrl/Shift 选择仍对应当前文件。
 4. 启用类型分组，重复框选和拖动滚动条；重命名一个临时文件使其改变排序位置，再选择、滚动和框选，确认没有错行。文件夹大小排序的人工检查沿用 #134 步骤。
+5. 在空 TXT 目录中反复拖动滚动条，离开后返回同一段，确认同类图标稳定显示，没有重复补图造成的停顿。再打开含 PNG/JPG 的临时目录，检查真实预览仍会替换系统图标。
+6. 切换详细信息、内容和不同图标尺寸，确认图片清晰度与尺寸一致。检查 EXE、快捷方式及自定义文件夹仍显示自己的图标；打开第二个窗口并快速切换目录，确认图片不串位。
 
 以上步骤由用户执行。Agent 不操作 AsterFiles UI，也不执行本地 Release 构建。

@@ -466,7 +466,7 @@ mod tests {
         platform::windows::shell_icons::ShellIconRgba {
             width: px,
             height: px,
-            pixels: vec![255; (px * px * 4) as usize],
+            pixels: vec![255; (px * px * 4) as usize].into(),
         }
     }
 

@@ -77,7 +77,7 @@ fn lowercase_extension(extension: &std::ffi::OsStr) -> OsString {
 pub struct ShellIconRgba {
     pub width: u32,
     pub height: u32,
-    pub pixels: Vec<u8>,
+    pub pixels: std::sync::Arc<[u8]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,7 +125,7 @@ impl ShellIconRgba {
         Ok(Self {
             width,
             height,
-            pixels,
+            pixels: pixels.into(),
         })
     }
 }
@@ -136,7 +136,9 @@ mod windows_impl {
 
     use windows::{
         Win32::{
-            Foundation::RPC_E_CHANGED_MODE,
+            Foundation::{
+                ERROR_FILE_NOT_FOUND, ERROR_NO_ASSOCIATION, ERROR_NOT_FOUND, RPC_E_CHANGED_MODE,
+            },
             Graphics::Gdi::{
                 BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection,
                 DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDIBits, GetObjectW, HBITMAP, HGDIOBJ,
@@ -147,9 +149,12 @@ mod windows_impl {
             },
             System::Ole::{OleInitialize, OleUninitialize},
             UI::{
+                Controls::{IImageList, ILD_TRANSPARENT},
                 Shell::{
+                    ASSOCF_NOTRUNCATE, ASSOCSTR_SHELLEXTENSION, AssocQueryStringW,
                     IShellItemImageFactory, SHCreateItemFromParsingName, SHFILEINFOW, SHGFI_ICON,
-                    SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SIIGBF_BIGGERSIZEOK,
+                    SHGFI_LARGEICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW,
+                    SHGetImageList, SHIL_EXTRALARGE, SHIL_JUMBO, SHIL_LARGE, SIIGBF_BIGGERSIZEOK,
                     SIIGBF_ICONONLY, SIIGBF_INCACHEONLY, SIIGBF_SCALEUP, SIIGBF_THUMBNAILONLY,
                 },
                 WindowsAndMessaging::{
@@ -158,7 +163,7 @@ mod windows_impl {
                 },
             },
         },
-        core::PCWSTR,
+        core::{HRESULT, PCWSTR, PWSTR},
     };
 
     use super::{
@@ -246,6 +251,100 @@ mod windows_impl {
             return Err(io::Error::other("Windows Shell type icon unavailable"));
         }
         ShellIcon(file_info.hIcon).to_rgba()
+    }
+
+    /// Resolves a type's shared image-list icon without opening any directory entry.
+    pub fn shell_type_icon_rgba_at_size(
+        key: &ShellTypeIconKey,
+        size: u32,
+    ) -> io::Result<ShellIconRgba> {
+        let size = i32::try_from(size)
+            .ok()
+            .filter(|size| *size > 0)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid Shell icon size")
+            })?;
+        let (lookup_name, attributes) = key.lookup();
+        let wide_name = wide_null(&lookup_name);
+        let mut file_info = SHFILEINFOW::default();
+        let result = unsafe {
+            SHGetFileInfoW(
+                PCWSTR(wide_name.as_ptr()),
+                attributes,
+                Some(&mut file_info),
+                size_of::<SHFILEINFOW>() as u32,
+                SHGFI_SYSICONINDEX | SHGFI_USEFILEATTRIBUTES,
+            )
+        };
+        if result == 0 {
+            return Err(io::Error::other(
+                "Windows Shell type icon index unavailable",
+            ));
+        }
+        for list_id in [SHIL_LARGE, SHIL_EXTRALARGE, SHIL_JUMBO] {
+            let images: IImageList =
+                unsafe { SHGetImageList(list_id as i32) }.map_err(windows_error)?;
+            let (mut width, mut height) = (0, 0);
+            unsafe { images.GetIconSize(&mut width, &mut height) }.map_err(windows_error)?;
+            if width <= 0 || height <= 0 {
+                return Err(io::Error::other(
+                    "Windows Shell image list has invalid dimensions",
+                ));
+            }
+            if width.min(height) >= size || list_id == SHIL_JUMBO {
+                let icon = unsafe { images.GetIcon(file_info.iIcon, ILD_TRANSPARENT.0) }
+                    .map_err(windows_error)?;
+                // Downsample a native larger image; never manufacture detail by scaling up.
+                return ShellIcon(icon).to_rgba_at_size(size.min(width), size.min(height));
+            }
+        }
+        unreachable!("the jumbo list terminates the image-list search")
+    }
+
+    /// Reads installed association handlers, not the success of one particular file's preview.
+    pub fn supports_content_thumbnail(key: &ShellTypeIconKey) -> io::Result<bool> {
+        let association = match key {
+            ShellTypeIconKey::Directory => return Ok(true),
+            ShellTypeIconKey::Extension(extension) => {
+                let mut association = std::ffi::OsString::from(".");
+                association.push(extension);
+                association
+            }
+            ShellTypeIconKey::GenericFile => "*".into(),
+        };
+        let association = wide_null(&association);
+        // Windows still accepts legacy IExtractImage registrations alongside IThumbnailProvider.
+        for handler in [
+            "{E357FCCD-A995-4576-B01F-234630154E96}",
+            "{BB2E617C-0920-11D1-9A0B-00C04FC2D6C1}",
+        ] {
+            let handler = wide_null(OsStr::new(handler));
+            let mut output = [0_u16; 128];
+            let mut length = output.len() as u32;
+            let result = unsafe {
+                AssocQueryStringW(
+                    ASSOCF_NOTRUNCATE,
+                    ASSOCSTR_SHELLEXTENSION,
+                    PCWSTR(association.as_ptr()),
+                    PCWSTR(handler.as_ptr()),
+                    Some(PWSTR(output.as_mut_ptr())),
+                    &mut length,
+                )
+            };
+            if result.is_ok() {
+                if output[0] != 0 {
+                    return Ok(true);
+                }
+            } else if ![ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, ERROR_NO_ASSOCIATION]
+                .iter()
+                .any(|error| result == HRESULT::from_win32(error.0))
+            {
+                return Err(io::Error::other(format!(
+                    "Windows Shell thumbnail association query failed: {result:?}"
+                )));
+            }
+        }
+        Ok(false)
     }
 
     pub fn shell_thumbnail_rgba(
@@ -420,6 +519,10 @@ mod windows_impl {
                 )));
             }
 
+            self.to_rgba_at_size(width, height)
+        }
+
+        fn to_rgba_at_size(&self, width: i32, height: i32) -> io::Result<ShellIconRgba> {
             let byte_len = usize::try_from(width)
                 .ok()
                 .and_then(|width| {
@@ -547,7 +650,7 @@ mod windows_impl {
 #[cfg(windows)]
 pub use windows_impl::{
     initialize_shell_worker, shell_grid_image_rgba, shell_icon_rgba, shell_icon_rgba_at_size,
-    shell_type_icon_rgba,
+    shell_type_icon_rgba, shell_type_icon_rgba_at_size, supports_content_thumbnail,
 };
 
 #[cfg(test)]
@@ -592,11 +695,45 @@ mod tests {
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         }
     }
+    #[cfg(windows)]
+    #[test]
+    fn issue_175_shared_type_icon_sizes_and_registered_preview_capabilities() {
+        let _apartment = super::initialize_shell_worker().unwrap();
+        for extension in ["txt", "png"] {
+            let key = ShellTypeIconKey::Extension(extension.into());
+            let supported = super::supports_content_thumbnail(&key).unwrap();
+            eprintln!("#175 extension={extension} registered_thumbnail_provider={supported}");
+            for size in [32, 48, 128, 256] {
+                let image = super::shell_type_icon_rgba_at_size(&key, size).unwrap();
+                assert!(image.width > 0 && image.width <= size);
+                assert!(image.height > 0 && image.height <= size);
+                assert_eq!(
+                    image.pixels.len(),
+                    (image.width * image.height * 4) as usize
+                );
+                eprintln!(
+                    "#175 extension={extension} requested_px={size} shared_icon={}x{}",
+                    image.width, image.height
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn issue_175_shared_type_icon_rejects_invalid_dimensions_without_shell_access() {
+        for size in [0, i32::MAX as u32 + 1, u32::MAX] {
+            let error = super::shell_type_icon_rgba_at_size(&ShellTypeIconKey::GenericFile, size)
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
     #[test]
     fn converts_bgra_pixels_to_rgba() {
         let icon = ShellIconRgba::from_bgra(2, 1, vec![1, 2, 3, 4, 10, 20, 30, 40]).unwrap();
 
-        assert_eq!(icon.pixels, vec![3, 2, 1, 4, 30, 20, 10, 40]);
+        assert_eq!(icon.pixels.as_ref(), &[3, 2, 1, 4, 30, 20, 10, 40]);
     }
 
     #[test]

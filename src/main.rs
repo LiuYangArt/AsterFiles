@@ -574,7 +574,7 @@ fn shell_probe_json_string(value: &str) -> String {
 }
 fn thumbnail_fingerprint(image: &platform::windows::shell_icons::ShellIconRgba) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
-    for byte in &image.pixels {
+    for byte in image.pixels.iter() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
