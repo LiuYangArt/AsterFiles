@@ -1,9 +1,10 @@
 use super::*;
 use std::{io::Read, time::Instant};
 
-const MAX_BATCH_ITEMS: usize = 256;
+const MAX_BATCH_ITEMS: usize = 2048;
 const MAX_BATCH_BYTES: usize = 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const BATCH_INTERVAL: Duration = Duration::from_millis(100);
 
 pub fn isolated_directory(
@@ -81,6 +82,26 @@ fn cancelled() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "network directory cancelled")
 }
 
+/// Frame hand-off polls quickly right after progress and backs off to `POLL_INTERVAL` while idle.
+/// A fixed 10 ms wait on both sides capped a 100k-entry local load at about 80 frames per second
+/// (#175); slow sources still settle at the original idle cost.
+struct FramePoll(Duration);
+
+impl FramePoll {
+    fn new() -> Self {
+        Self(ACTIVE_POLL_INTERVAL)
+    }
+
+    fn progress(&mut self) {
+        self.0 = ACTIVE_POLL_INTERVAL;
+    }
+
+    fn wait(&mut self) {
+        std::thread::sleep(self.0);
+        self.0 = (self.0 * 2).min(POLL_INTERVAL);
+    }
+}
+
 /// Silence is measured from helper creation and restarts at every acknowledged frame, so
 /// start-up counts against the limit while steady progress never expires.
 struct IdleDeadline {
@@ -124,6 +145,7 @@ fn receive_stream(
     let result = (|| {
         job.assign(&child)?;
         let mut deadline = IdleDeadline::start(timeout, Instant::now());
+        let mut poll = FramePoll::new();
         let mut skipped = 0_usize;
         let mut next_id = 1_u32;
         let mut completed = false;
@@ -167,6 +189,7 @@ fn receive_stream(
                     std::fs::remove_file(output)?;
                     completed = done;
                     deadline.progress(Instant::now());
+                    poll.progress();
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
@@ -186,7 +209,7 @@ fn receive_stream(
                     "network directory helper made no progress",
                 ));
             }
-            std::thread::sleep(POLL_INTERVAL);
+            poll.wait();
         }
     })();
     // Reap on every path, including callback/protocol errors and failed Job assignment.
@@ -245,8 +268,9 @@ fn publish_frame_with_probe(
     };
     std::fs::write(&pending, bytes).map_err(|error| report("write", error))?;
     std::fs::rename(&pending, output).map_err(|error| report("publish", error))?;
+    let mut poll = FramePoll::new();
     while slot_exists(output).map_err(|error| report("acknowledge", error))? {
-        std::thread::sleep(POLL_INTERVAL);
+        poll.wait();
     }
     Ok(())
 }

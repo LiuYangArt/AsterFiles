@@ -279,7 +279,7 @@ cargo test issue_82_fast_delete_performance_evidence -- --ignored --nocapture
 cargo test issue_64_ -- --nocapture
 ```
 
-目录枚举直接复用 Windows 枚举返回的普通条目元数据，只对符号链接和 junction 等重解析点进行一次跟随读取。`.lnk` 不再阻塞首批目录批次，而由独立有界单工作线程队列处理；只请求当前可见范围及前后一屏，执行前和回填时均校验 `TabId + RequestId + EntryId + 原始路径`，成功后只更新对应条目和行。首批 32、后续 256 的批次大小保持不变。
+目录枚举直接复用 Windows 枚举返回的普通条目元数据，只对符号链接和 junction 等重解析点进行一次跟随读取。`.lnk` 不再阻塞首批目录批次，而由独立有界单工作线程队列处理；只请求当前可见范围及前后一屏，执行前和回填时均校验 `TabId + RequestId + EntryId + 原始路径`，成功后只更新对应条目和行。该读取器的首批 32、后续 256 规则用于自身专项测试。应用目录加载现统一经过辅助进程（#150），首条立即交付，后续批次使用 2048 项、1 MiB 或 100 ms 的上限（#175）。
 
 10 万普通文件与大量快捷方式的显式性能测量写入 `artifacts/perf/directory-loading/`，记录首批耗时、完整枚举耗时、跟随元数据读取数、快捷方式提交数和完成数。该测量不进入日常统一验证，也不得自动操作 AsterFiles UI。
 
@@ -545,7 +545,7 @@ Slint 无窗口后端在详细信息、列表、网格和分组网格的真实�
 
 专项命令：`python tools/build.py test --locked issue_161 -- --nocapture`，随后运行 `python tools/verify.py --quick`（包含 Debug 构建）。日志位于 `artifacts/logs/issue-161/`；`before-fix-tests.log` 保留旧实现下同一测试的耗时。耗时写入 `artifacts/perf/issue-161/`：`before-fix.json` 为修复前，`after-fix.json` 为修复后，`latest.json` 为最近一次运行。
 
-测试使用无窗口后端和十万条目的详细信息视图，经 `mutate_active_selection` 与 `update_file_rows` 走选择回调的同一路径，测量全选、全选后整窗重绘、200 次 Ctrl 点选、全部取消、Shift 全范围和 Ctrl+Shift 扩展，并检查选择顺序、焦点和锚点。`select_all_scale` 比较 25k、50k、100k 条目的全选耗时，用增长倍数判断复杂度：线性约 4 倍，平方约 16 倍。全选、整窗重绘和范围选择上限各 1000 ms，单次 Ctrl 点选峰值上限 250 ms，增长倍数上限 8。剩余耗时是逐行生成 `FileRow` 和扫描文件模型，属于 #162、#165。
+测试使用无窗口后端和十万条目的详细信息视图，经 `mutate_active_selection` 与 `update_file_rows` 走选择回调的同一路径，测量全选、全选后整窗重绘、200 次 Ctrl 点选、全部取消、Shift 全范围和 Ctrl+Shift 扩展，并检查选择顺序、焦点和锚点。`select_all_scale` 比较 25k、50k、100k 条目的全选耗时，用增长倍数判断复杂度：线性约 4 倍，平方约 16 倍。全选、整窗重绘和范围选择上限各 1000 ms，单次 Ctrl 点选峰值上限 250 ms，增长倍数上限 8。全量 `FileRow` 投影归入 #165，全窗口刷新拆分归入 #162；后续单行更新的整表扫描由 #175 的行索引消除。
 
 用户手动验收：
 
@@ -554,3 +554,31 @@ Slint 无窗口后端在详细信息、列表、网格和分组网格的真实�
 3. 全选后 Ctrl 单击几项取消再选回，然后单击一项、Shift 单击最后一项，确认每次操作都即时响应。
 4. 全选后缩放窗口、切换到列表和网格视图，确认选中状态保持且没有明显卡顿；拖动多选条目到另一个文件夹的预期顺序不变。
 5. 验收后删除临时目录：`Remove-Item -Recurse -Force "$env:TEMP\asterfiles-161"`。
+
+## Issue #175 十万条目目录加载、框选与滚动
+
+在可见终端中运行，自动验证不打开 AsterFiles 窗口：
+
+```powershell
+python tools/build.py test --locked issue_175 -- --nocapture --test-threads=1
+python tools/build.py test --locked issue_134 -- --nocapture
+python tools/build.py test --locked issue_141 -- --nocapture --test-threads=1
+python tools/build.py test --locked issue_150 -- --nocapture
+python tools/build.py test --locked issue_161 -- --nocapture
+python tools/verify.py
+```
+
+专项使用真实辅助进程读取 `%TEMP%\asterfiles-161` 的十万个空文件；缺少文件时自动补齐。加载记录首批行和完整加载耗时，并拆分辅助进程传输、批次合并排序、行投影与可见区工作。框选记录命中、选择更新、行更新、指针移动和边缘滚动；滚动记录 Rust 回调耗时及图片、文件夹大小和快捷方式请求数。测量只覆盖详细信息视图，包含未分组、类型分组和含文件夹的滚动夹具。
+
+几何对照检查不同高度的分组标题、行边界和列表外范围。批次回归核对前插、交错和末尾追加的行顺序；原地重命名和大小排序后同步重建索引，防止后续框选、图片和选择更新使用旧位置。性能测试设置耗时和请求数量上限。全窗口刷新拆分见 #162，完整行投影和网格按需生成模型见 #165。
+
+日志保存至 `artifacts/logs/issue-175/`，完整验证汇总仍为 `artifacts/verify/summary.json`。性能数据写入 `artifacts/perf/issue-175/`：`before-fix.json` 为修复前基线，`after-fix.json` 为验收用修复后数据，`latest.json` 为最近一次运行。比较时使用相同夹具和构建配置，保留首批、总耗时及单次峰值。
+
+用户手动验收：
+
+1. 用 `target/debug/asterfiles.exe` 打开 `%TEMP%\asterfiles-161`，切到详细信息视图。退出再进入目录，确认首批及时出现、后续内容持续补齐，加载期间能切换标签或导航。
+2. 等待加载完成，从空白处框选、反向缩小选区，再把指针保持在列表下缘触发滚动。确认矩形和选中状态跟随输入，放开后选择正确。
+3. 连续把滚动条从顶部拖到底部，再快速往返中间位置，确认列表跟随且没有明显停顿；滚动后单击和 Ctrl/Shift 选择仍对应当前文件。
+4. 启用类型分组，重复框选和拖动滚动条；重命名一个临时文件使其改变排序位置，再选择、滚动和框选，确认没有错行。文件夹大小排序的人工检查沿用 #134 步骤。
+
+以上步骤由用户执行。Agent 不操作 AsterFiles UI，也不执行本地 Release 构建。

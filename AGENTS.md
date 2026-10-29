@@ -141,3 +141,9 @@ UI/交互参考 Files， 源码： F:\CodeProjects\Files
 ## 大目录全选与选择查询专项验证（#161）
 
 `python tools/build.py test --locked issue_161 -- --nocapture` 使用无窗口后端，在十万条目中测量全选、整窗重绘、Ctrl 点选、全部取消、Shift 与 Ctrl+Shift 范围选择，并设耗时与增长倍数上限。随后运行 `python tools/verify.py --quick`，包含 Debug 构建。日志位于 `artifacts/logs/issue-161/`，修复前后耗时位于 `artifacts/perf/issue-161/`。真实 Ctrl+A 响应由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
+
+## 十万条目加载、框选与滚动专项验证（#175）
+
+`python tools/build.py test --locked issue_175 -- --nocapture --test-threads=1` 使用无窗口后端和 `%TEMP%\asterfiles-161` 的十万个空文件，测量首批、完整加载、批次传输、合并排序、行投影、框选和滚动回调。缺少夹具文件时测试自动补齐。性能覆盖详细信息视图，包含未分组和类型分组；不自动操作 UI。
+
+随后分别运行 `issue_134`、`issue_150`、`issue_161` 专项；`issue_141` 加 `--test-threads=1`。最后运行完整 `python tools/verify.py`，包含 Debug 构建。专项和完整验证日志保存到 `artifacts/logs/issue-175/`，统一汇总为 `artifacts/verify/summary.json`。性能目录为 `artifacts/perf/issue-175/`：`before-fix.json` 保留修复前基线，`after-fix.json` 保留验收用修复后数据，`latest.json` 由最近一次测量更新。真实加载、框选和拖动滚动条由用户手动验收，步骤见 `docs/agent/debug-validation.md`；不执行本地 Release 构建。

@@ -228,6 +228,9 @@ fn patch_rows(model: &ModelRc<FileRow>, next: Vec<FileRow>) {
             rows.push(row);
         }
     }
+    file_row_index::reindex(rows, |row| {
+        group_header_height_for_detail(row.group_detail.as_str()) as f32
+    });
 }
 
 fn patch_grid(model: &ModelRc<GridRow>, next: Vec<GridRow>) {
@@ -487,6 +490,55 @@ mod tests {
             app.thumbnail_cache_order.push_back(key);
         }
         app
+    }
+
+    #[test]
+    fn issue_175_rename_reindexes_in_place_rows_and_group_geometry() {
+        i_slint_backend_testing::init_no_event_loop();
+        for group in [GroupField::None, GroupField::Kind] {
+            let mut app = state();
+            app.update_directory_preference(PathBuf::from(r"C:\photos"), |view| {
+                view.view_mode = ViewMode::Details;
+                view.group_field = group;
+            });
+            let state = Arc::new(Mutex::new(app));
+            let ui = AppWindow::new().unwrap();
+            ui.window().set_size(slint::LogicalSize::new(1180.0, 760.0));
+            refresh_ui(&ui, &WindowSessions::new(state.clone(), WindowId(1)));
+            let original = ui.get_files();
+            let (sender, _) = mpsc::channel();
+            let scheduler = ThumbnailScheduler::new(sender);
+            for (old, new) in [("a.png", "z.jpg"), ("b.png", "b.jpg")] {
+                apply_completed(
+                    &mut state.lock().unwrap(),
+                    &PathBuf::from(r"C:\photos").join(old),
+                    &PathBuf::from(r"C:\photos").join(new),
+                );
+                refresh_projection(&ui, &state, WindowId(1), &scheduler);
+                let files = ui.get_files();
+                assert!(std::ptr::eq(original.as_any(), files.as_any()));
+                let rows = files.as_any().downcast_ref::<VecModel<FileRow>>().unwrap();
+                let app = state.lock().unwrap();
+                let tab = app.tab(TabId(1)).unwrap();
+                let located = file_row_index::locate(rows, tab, [EntryId(1), EntryId(2)]);
+                assert_eq!(located.len(), 2);
+                for (id, index) in located {
+                    assert_eq!(rows.row_data(index).unwrap().id, id.0 as i32);
+                }
+                let height = file_row_height(ViewMode::Details);
+                let mut top = 0.0;
+                for (index, row) in rows.iter().enumerate() {
+                    assert_eq!(file_row_index::top_of(rows, height, index), Some(top));
+                    top += if row.group_header {
+                        group_header_height_for_detail(row.group_detail.as_str()) as f32
+                    } else {
+                        height
+                    };
+                }
+                assert_eq!(file_row_index::extent(rows, height), Some(top));
+                assert_eq!(file_row_index::projected_entries(rows), Some(2));
+            }
+        }
     }
 
     #[test]

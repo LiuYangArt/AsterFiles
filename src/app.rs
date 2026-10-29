@@ -66,8 +66,11 @@ mod directory_loading;
 mod directory_watch_refresh;
 mod file_operation_coordinator;
 mod file_operation_worker;
+mod file_row_index;
 #[cfg(test)]
 mod folder_size_sort_tests;
+#[cfg(test)]
+mod large_directory_tests;
 #[path = "library_loading.rs"]
 mod library_loading;
 mod loading_hint;
@@ -1677,21 +1680,24 @@ fn rebuild_grid_entry_positions(ui: &AppWindow, window_id: WindowId) {
     });
 }
 
-fn update_grid_thumbnail_residents(ui: &AppWindow, window_id: WindowId, wanted: &HashSet<EntryId>) {
+fn update_grid_thumbnail_residents(
+    ui: &AppWindow,
+    state: &SharedSessions,
+    window_id: WindowId,
+    wanted: &HashSet<EntryId>,
+) {
     let removed = GRID_THUMBNAIL_RESIDENTS.with_borrow_mut(|by_window| {
         let resident = by_window.entry(window_id).or_default();
         let removed = resident.difference(wanted).copied().collect::<Vec<_>>();
         *resident = wanted.clone();
         removed
     });
-    let positions = GRID_ENTRY_POSITIONS
-        .with_borrow(|by_window| by_window.get(&window_id).cloned().unwrap_or_default());
     let list = ui.get_files();
-    if let Some(rows) = list.as_any().downcast_ref::<VecModel<FileRow>>() {
-        let removed_ids = removed.iter().copied().collect::<HashSet<_>>();
-        for index in 0..rows.row_count() {
+    if !removed.is_empty()
+        && let Some(rows) = list.as_any().downcast_ref::<VecModel<FileRow>>()
+    {
+        for (_, index) in locate_list_rows(rows, state, window_id, removed.iter().copied()) {
             if let Some(mut row) = rows.row_data(index)
-                && removed_ids.contains(&EntryId(row.id as u32))
                 && matches!(row.thumbnail_state, 2 | 4)
             {
                 row.icon = Image::default();
@@ -1702,7 +1708,11 @@ fn update_grid_thumbnail_residents(ui: &AppWindow, window_id: WindowId, wanted: 
     }
     let grid = ui.get_grid_rows();
     for entry_id in removed {
-        let Some((row_index, entry_index)) = positions.get(&entry_id).copied() else {
+        let Some((row_index, entry_index)) = GRID_ENTRY_POSITIONS.with_borrow(|by_window| {
+            by_window
+                .get(&window_id)
+                .and_then(|positions| positions.get(&entry_id).copied())
+        }) else {
             continue;
         };
         let Some(row) = grid.row_data(row_index) else {
@@ -1722,6 +1732,19 @@ fn update_grid_thumbnail_residents(ui: &AppWindow, window_id: WindowId, wanted: 
             entries.set_row_data(entry_index, entry);
         }
     }
+}
+
+fn locate_list_rows(
+    rows: &VecModel<FileRow>,
+    state: &SharedSessions,
+    window_id: WindowId,
+    ids: impl IntoIterator<Item = EntryId>,
+) -> Vec<(EntryId, usize)> {
+    let app = state.lock().expect("app state mutex is not poisoned");
+    app.window(window_id)
+        .and_then(|window| window.tabs.get(&window.active_tab))
+        .map(|tab| file_row_index::locate(rows, tab, ids))
+        .unwrap_or_default()
 }
 
 fn native_tab_drag_image(
@@ -1872,27 +1895,44 @@ fn list_icon_plan(
     let visible_top = (-ui.get_file_viewport_y()).max(0.0);
     let request_top = (visible_top - height).max(0.0);
     let request_bottom = visible_top + height * 2.0;
-    let mut row_top = 0.0;
     let mut entries = Vec::new();
-    for row in rows.iter() {
-        if row_top > request_bottom {
-            break;
-        }
-        let row_bottom = row_top
-            + if row.group_header {
-                group_header_height_for_detail(row.group_detail.as_str()) as f32
-            } else {
-                row_height
-            };
-        if row_bottom >= request_top
-            && row.loaded
+    let mut add = |row: FileRow| {
+        if row.loaded
             && !row.group_header
             && row.id > 0
             && let Some(entry) = tab.visible_entry(EntryId(row.id as u32))
         {
             entries.push(entry.clone());
         }
-        row_top = row_bottom;
+    };
+    let indexed = rows
+        .as_any()
+        .downcast_ref::<VecModel<FileRow>>()
+        .and_then(|model| {
+            file_row_index::rows_between(model, row_height, request_top, request_bottom)
+                .map(|range| (model, range))
+        });
+    if let Some((model, range)) = indexed {
+        range
+            .filter_map(|index| model.row_data(index))
+            .for_each(add);
+    } else {
+        let mut row_top = 0.0;
+        for row in rows.iter() {
+            if row_top > request_bottom {
+                break;
+            }
+            let row_bottom = row_top
+                + if row.group_header {
+                    group_header_height_for_detail(row.group_detail.as_str()) as f32
+                } else {
+                    row_height
+                };
+            if row_bottom >= request_top {
+                add(row);
+            }
+            row_top = row_bottom;
+        }
     }
     let residents = entries.iter().map(|entry| entry.id).collect();
     let requested_px = file_thumbnail_request_px(view_mode, ui.window().scale_factor());
@@ -2041,7 +2081,7 @@ fn request_visible_file_images(
     let (list_residents, list_requests) = list_icon_plan(ui, state, window_id);
     resident_ids.extend(list_residents);
     requests.extend(list_requests);
-    update_grid_thumbnail_residents(ui, window_id, &resident_ids);
+    update_grid_thumbnail_residents(ui, state, window_id, &resident_ids);
     if tab_id.0 != 0 {
         update_file_rows(ui, state, tab_id, &resident_ids);
         scheduler.replace(tab_id, requests);
@@ -3358,8 +3398,15 @@ fn projected_scroll_maximum(ui: &AppWindow, view_mode: ViewMode, visible_height:
             .sum::<f32>();
         (extent - visible_height).max(0.0)
     } else {
-        let extent = ui
-            .get_files()
+        let files = ui.get_files();
+        if let Some(extent) = files
+            .as_any()
+            .downcast_ref::<VecModel<FileRow>>()
+            .and_then(|model| file_row_index::extent(model, file_row_height(view_mode)))
+        {
+            return (extent - visible_height).max(0.0);
+        }
+        let extent = files
             .iter()
             .map(|row| {
                 if row.group_header {
@@ -10320,6 +10367,7 @@ fn rectangle_selection_hits_for_app(
     details_viewport_x: f32,
     details_columns_width: f32,
     rect: SelectionRect,
+    shown_rows: Option<&VecModel<FileRow>>,
 ) -> HashSet<EntryId> {
     let Some(tab) = app.tab(tab_id) else {
         return HashSet::new();
@@ -10340,10 +10388,10 @@ fn rectangle_selection_hits_for_app(
             rect,
         );
     }
-    let groups = directory_group_projections(app, tab, tab.visible_entries());
     let geometry = file_layout_geometry(view_mode);
     let mut hits = HashSet::new();
     if geometry.grid {
+        let groups = directory_group_projections(app, tab, tab.visible_entries());
         let projection = IconProjection::from_groups(
             &groups,
             grid_columns,
@@ -10382,6 +10430,34 @@ fn rectangle_selection_hits_for_app(
         if right <= left {
             return hits;
         }
+        // Shown grouped rows already carry the projection; walk only rows inside the rectangle.
+        if let Some(model) = shown_rows
+            && let Some(range) =
+                file_row_index::rows_between(model, geometry.row_height, rect.top, rect.bottom)
+            && let Some(mut top) = file_row_index::top_of(model, geometry.row_height, range.start)
+        {
+            for row in range.filter_map(|index| model.row_data(index)) {
+                let height = if row.group_header {
+                    group_header_height_for_detail(row.group_detail.as_str()) as f32
+                } else {
+                    geometry.row_height
+                };
+                if !row.group_header
+                    && row.id > 0
+                    && rect.intersects(SelectionRect {
+                        left,
+                        top,
+                        right,
+                        bottom: top + geometry.row_height,
+                    })
+                {
+                    hits.insert(EntryId(row.id as u32));
+                }
+                top += height;
+            }
+            return hits;
+        }
+        let groups = directory_group_projections(app, tab, tab.visible_entries());
         let projection = ListProjection::from_groups(
             &groups,
             group_header_height(&groups),
@@ -10590,6 +10666,14 @@ fn update_rectangle_selection(
             let grid_columns = ui.get_grid_column_count().max(1) as usize;
             let viewport_width = ui.get_file_viewport_width();
 
+            let files = ui.get_files();
+            let shown_rows = app
+                .tab(tab_id)
+                .filter(|tab| {
+                    ui.get_projected_file_tab_id() == tab_id.0 as i32
+                        && ui.get_projected_file_request_id() == tab.latest_request().0 as i32
+                })
+                .and_then(|_| files.as_any().downcast_ref::<VecModel<FileRow>>());
             let hits = rectangle_selection_hits_for_app(
                 &app,
                 tab_id,
@@ -10599,6 +10683,7 @@ fn update_rectangle_selection(
                 ui.get_file_viewport_x(),
                 ui.get_details_hit_width(),
                 rect,
+                shown_rows,
             );
             let tab = app.active_window_state_mut().tabs.get_mut(&tab_id).unwrap();
             if tab.latest_request() != request_id {
@@ -20758,10 +20843,29 @@ fn visible_shortcut_entry_ids(ui: &AppWindow, app: &AppState, tab: &TabSession) 
             .map(|entry| entry.id)
             .collect();
     }
-    let groups = directory_group_projections(app, tab, tab.visible_entries());
     let row_height = file_row_height(view_mode);
     let viewport_top = (-ui.get_file_viewport_y()).max(0.0);
     let viewport_height = ui.get_file_viewport_height().max(row_height);
+    let files = ui.get_files();
+    if !view_mode.uses_grid_layout()
+        && ui.get_projected_file_tab_id() == tab.id.0 as i32
+        && ui.get_projected_file_request_id() == tab.latest_request().0 as i32
+        && let Some(model) = files.as_any().downcast_ref::<VecModel<FileRow>>()
+        && let Some(range) = file_row_index::rows_between(
+            model,
+            row_height,
+            (viewport_top - viewport_height).max(0.0),
+            viewport_top + viewport_height * 2.0,
+        )
+    {
+        // The shown rows already carry the grouped order; no projection rebuild per scroll.
+        return range
+            .filter_map(|index| model.row_data(index))
+            .filter(|row| !row.group_header && row.id > 0)
+            .map(|row| EntryId(row.id as u32))
+            .collect();
+    }
+    let groups = directory_group_projections(app, tab, tab.visible_entries());
     let request_top = (viewport_top - viewport_height).max(0.0) as u64;
     let request_bottom = (viewport_top + viewport_height * 2.0) as u64;
     let mut ids = Vec::new();
@@ -22294,6 +22398,16 @@ fn classify_error(kind: io::ErrorKind) -> LoadState {
     }
 }
 
+/// Shows a freshly projected list and indexes it so later patches skip full scans (#175).
+fn set_file_rows(ui: &AppWindow, rows: Vec<FileRow>, visible_order: bool) {
+    let layout = file_row_index::RowLayout::build(&rows, visible_order, |row| {
+        group_header_height_for_detail(row.group_detail.as_str()) as f32
+    });
+    let model = Rc::new(VecModel::from(rows));
+    file_row_index::install(&model, layout);
+    ui.set_files(ModelRc::from(model));
+}
+
 fn should_rebuild_projection(projected_entries: usize, pending_entries: usize) -> bool {
     projected_entries == 0
         || pending_entries.saturating_sub(projected_entries) >= REBUILT_PROJECTION_BATCH_SIZE
@@ -22347,10 +22461,12 @@ fn append_active_file_rows(
                 .map(|row| row.entries.row_count())
                 .sum()
         } else {
-            (0..model.row_count())
-                .filter_map(|index| model.row_data(index))
-                .filter(|row| row.loaded && !row.group_header)
-                .count()
+            file_row_index::projected_entries(model).unwrap_or_else(|| {
+                (0..model.row_count())
+                    .filter_map(|index| model.row_data(index))
+                    .filter(|row| row.loaded && !row.group_header)
+                    .count()
+            })
         };
         let pending_entries = tab.pending_entries().len();
         let should_refresh = should_rebuild_projection(projected_entries, pending_entries);
@@ -22382,13 +22498,17 @@ fn append_active_file_rows(
                 );
                 rebuild_grid_entry_positions(ui, app.active_window);
             } else {
-                ui.set_files(ModelRc::new(VecModel::from(projected_directory_rows(
-                    tab.pending_entries(),
-                    tab,
-                    texts,
-                    &app,
-                    file_thumbnail_request_px(mode, ui.window().scale_factor()),
-                ))));
+                set_file_rows(
+                    ui,
+                    projected_directory_rows(
+                        tab.pending_entries(),
+                        tab,
+                        texts,
+                        &app,
+                        file_thumbnail_request_px(mode, ui.window().scale_factor()),
+                    ),
+                    false,
+                );
             }
             restore_zoom_anchor(ui, anchor);
         }
@@ -22413,23 +22533,50 @@ fn append_active_file_rows(
                 viewport_y + anchor_index as f32 * row_height,
             )
         });
-    for (index, entry) in tab.pending_entries().iter().enumerate() {
-        if model
-            .row_data(index)
-            .is_some_and(|row| row.id == entry.id.0 as i32)
-        {
-            continue;
+    let requested_px =
+        file_thumbnail_request_px(app.active_view_mode(), ui.window().scale_factor());
+    let pending = tab.pending_entries();
+    // Rows are an order-preserving subsequence of `pending`: when the last row still sits at
+    // its old position, every new entry sorts after it, so a batch costs O(batch), not O(rows).
+    let tail_only = start == 0
+        || model
+            .row_data(start - 1)
+            .is_some_and(|row| row.id == pending[start - 1].id.0 as i32);
+    let added = if tail_only {
+        Some((start..pending.len()).collect::<Vec<_>>())
+    } else {
+        file_row_index::unprojected(model, pending)
+    };
+    if let Some(added) = added
+        && (tail_only || file_row_index::projected_entries(model) == Some(start))
+    {
+        if tail_only {
+            model.extend(
+                added
+                    .iter()
+                    .map(|index| file_row(&pending[*index], tab, texts, &app, requested_px)),
+            );
+        } else {
+            // Ascending final positions: earlier insertions already sit where they belong.
+            for index in &added {
+                model.insert(
+                    *index,
+                    file_row(&pending[*index], tab, texts, &app, requested_px),
+                );
+            }
         }
-        model.insert(
-            index,
-            file_row(
-                entry,
-                tab,
-                texts,
-                &app,
-                file_thumbnail_request_px(app.active_view_mode(), ui.window().scale_factor()),
-            ),
-        );
+        file_row_index::mark_projected(model, added.iter().map(|index| pending[*index].id));
+    } else {
+        for (index, entry) in pending.iter().enumerate() {
+            if model
+                .row_data(index)
+                .is_some_and(|row| row.id == entry.id.0 as i32)
+            {
+                continue;
+            }
+            model.insert(index, file_row(entry, tab, texts, &app, requested_px));
+        }
+        file_row_index::reset_visible_order(model, pending.iter().map(|entry| entry.id));
     }
     if let Some((id, screen_y)) = anchor
         && let Some(index) = tab.visible_entry_index(id)
@@ -22598,20 +22745,17 @@ fn update_file_rows(
     let Some(model) = model.as_any().downcast_ref::<VecModel<FileRow>>() else {
         return;
     };
-    for index in 0..model.row_count() {
-        let Some(existing) = model.row_data(index) else {
-            continue;
-        };
-        if let Some(updated) = rows.get(&EntryId(existing.id as u32)) {
-            model.set_row_data(index, updated.clone());
-        }
+    for (entry_id, index) in file_row_index::locate(model, tab, rows.keys().copied()) {
+        model.set_row_data(index, rows[&entry_id].clone());
     }
 
-    let positions = GRID_ENTRY_POSITIONS
-        .with_borrow(|by_window| by_window.get(&window_id).cloned().unwrap_or_default());
     let grid_model = ui.get_grid_rows();
     for (entry_id, updated) in rows {
-        let Some((row_index, entry_index)) = positions.get(&entry_id).copied() else {
+        let Some((row_index, entry_index)) = GRID_ENTRY_POSITIONS.with_borrow(|by_window| {
+            by_window
+                .get(&window_id)
+                .and_then(|positions| positions.get(&entry_id).copied())
+        }) else {
             continue;
         };
         let Some(grid_row) = grid_model.row_data(row_index) else {
@@ -23887,7 +24031,8 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
         };
         (file_rows, Vec::new())
     };
-    ui.set_files(ModelRc::new(VecModel::from(file_rows)));
+    let visible_order = tab.page_source == PageSource::Directory;
+    set_file_rows(ui, file_rows, visible_order);
     ui.set_grid_column_count(grid_columns as i32);
     ui.set_grid_rows(ModelRc::new(VecModel::from(grid_rows)));
     let grouped_grid_enabled = view_mode.uses_grid_layout()
