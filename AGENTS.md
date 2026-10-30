@@ -149,3 +149,7 @@ UI/交互参考 Files， 源码： F:\CodeProjects\Files
 随后分别运行 `issue_134`、`issue_150`、`issue_161` 专项；`issue_141` 加 `--test-threads=1`。最后运行完整 `python tools/verify.py`，包含 Debug 构建。专项和完整验证日志保存到 `artifacts/logs/issue-175/`，统一汇总为 `artifacts/verify/summary.json`。性能目录为 `artifacts/perf/issue-175/`：`before-fix.json` 保留修复前基线，`after-fix.json` 保留验收用修复后数据，`latest.json` 由最近一次测量更新。真实加载、框选和拖动滚动条由用户手动验收，步骤见 `docs/agent/debug-validation.md`；不执行本地 Release 构建。
 
 图标专项运行 `python tools/build.py test --locked app::file_images_tests -- --nocapture --test-threads=1`，随后运行完整 `python tools/verify.py`。三个 `issue_175` 测试覆盖真实 Shell 类型图标、十万空 TXT 的实际像素回填、类型与尺寸去重、导航隔离和预览结果合并。日志为 `artifacts/logs/issue-175/icons-tests.log`、`icons-full-verify.log`；性能记录为 `artifacts/perf/issue-175/icons-after-fix.json`。用户重复拖动滚动条，并检查 PNG/JPG 预览、不同图标尺寸和快捷方式的独立图标。
+
+## 地址栏退出编辑专项验证（#177）
+
+`python tools/build.py test --locked issue_177 -- --nocapture` 使用无窗口后端检查 Enter 相同／不同目录、UNC、无效路径搜索、外部点击边界、原生左键与菜单清理顺序、首次目标动作、失焦、Escape 和迟到校验。随后分别运行 `issue_145`、`issue_151` 专项及 `python tools/verify.py --quick`（包含 Debug 构建）。日志位于 `artifacts/logs/issue-177/`，统一汇总为 `artifacts/verify/summary.json`。真实点击与焦点由用户手动验收，步骤见 `docs/agent/debug-validation.md`。

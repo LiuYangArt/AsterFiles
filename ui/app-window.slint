@@ -866,7 +866,10 @@ component AddressEditor inherits Rectangle {
     background: VisualStyle.cffffff;
     forward-focus: editor;
     property <bool> editor-has-focus: editor.has-focus;
-
+    callback focus-lost();
+    changed editor-has-focus => {
+        if root.visible && !root.editor-has-focus { root.focus-lost(); }
+    }
 
 
     Rectangle {
@@ -1712,6 +1715,16 @@ export component AppWindow inherits Window {
     changed active-tab-index => { root.reveal-tab(root.active-tab-index); }
 
     public function focus-address-editor() { address-editor.focus-at-end(); }
+    callback dismiss-address-edit();
+    public function dismiss-address-edit-outside(x: float, y: float) {
+        if !root.address-editing { return; }
+        let left = address-bar.absolute-position.x - root.absolute-position.x;
+        let top = address-bar.absolute-position.y - root.absolute-position.y;
+        if x * 1px < left || x * 1px >= left + address-bar.width
+            || y * 1px < top || y * 1px >= top + address-bar.height {
+            root.dismiss-address-edit();
+        }
+    }
     in-out property <bool> sidebar-keyboard-active: false;
     in-out property <int> sidebar-keyboard-group: -1;
     in-out property <string> sidebar-keyboard-stable-id: "";
@@ -1917,7 +1930,7 @@ export component AppWindow inherits Window {
                 if !root.minimal: ContextMenuArea { width: 38px; height: 38px; IconButton { accessible-id: "navigation-forward"; icon-source: IconMap.action-forward; tip: root.text-forward + " (Alt+Right)"; enabled: root.can-navigate-forward; button-label: root.text-forward; clicked => { root.navigate-forward(); } } Menu { for history in root.forward-history: MenuItem { title: history.label; activated => { root.navigate-history(false, history.index); } } } }
                 IconButton { accessible-id: "navigation-up"; icon-source: IconMap.action-up; tip: root.text-up + " (Alt+Up)"; enabled: root.can-navigate-up; button-label: root.text-up; clicked => { root.navigate-up(); } }
                 if !root.compact: IconButton { accessible-id: "navigation-refresh"; icon-source: IconMap.action-refresh; tip: root.text-refresh + " (F5)"; enabled: root.can-refresh; button-label: root.text-refresh; clicked => { root.refresh(); } }
-                Rectangle {
+                address-bar := Rectangle {
                     height: 38px; min-width: 0px; horizontal-stretch: 1; background: VisualStyle.dark-theme && address-hover.has-hover ? #282828 : VisualStyle.cffffff; border-width: root.address-editing ? 1px : 0px; border-color: VisualStyle.c4f6bed; border-radius: 5px;
                     address-hover := TouchArea {
                         breadcrumb-view := Rectangle {
@@ -1971,7 +1984,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
-                        address-editor := AddressEditor { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: parent.height - 4px; text <=> root.address-input; address-label: root.search-mode ? root.text-parent-path : root.text-address; cancel-label: root.text-cancel-edit; depth-enabled: root.search-mode && root.search-depth-enabled; recursive: root.search-recursive; depth-label: !root.search-depth-enabled ? root.text-search-global-disabled : (root.search-recursive ? root.text-search-recursive : root.text-search-current); changed(value) => { root.address-input-changed(value); } accepted(value) => { root.navigate-path(value); } cancelled => { root.cancel-address-edit(); } toggle-depth => { root.toggle-search-depth(); } }
+                        address-editor := AddressEditor { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: parent.height - 4px; text <=> root.address-input; address-label: root.search-mode ? root.text-parent-path : root.text-address; cancel-label: root.text-cancel-edit; depth-enabled: root.search-mode && root.search-depth-enabled; recursive: root.search-recursive; depth-label: !root.search-depth-enabled ? root.text-search-global-disabled : (root.search-recursive ? root.text-search-recursive : root.text-search-current); changed(value) => { root.address-input-changed(value); } accepted(value) => { root.navigate-path(value); } cancelled => { root.cancel-address-edit(); } focus-lost => { if root.address-editing { root.dismiss-address-edit(); } } toggle-depth => { root.toggle-search-depth(); } }
                     }
 
                 }

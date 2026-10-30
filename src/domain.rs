@@ -874,6 +874,9 @@ impl TabSession {
     }
     pub fn begin_smart_address_edit(&mut self) {
         self.address_editing = true;
+        if self.page_source == PageSource::Search {
+            return;
+        }
         self.address_mode = AddressMode::Smart;
         self.search_scope = match self.visible_location() {
             Some(NavigationLocation::Directory(path)) => SearchScope::Directory(path.clone()),
@@ -1063,6 +1066,15 @@ impl TabSession {
     }
     pub fn accepts_page(&self, request_id: RequestId, source: PageSource) -> bool {
         self.page_source == source && self.accepts(request_id)
+    }
+
+    pub fn dismiss_address_edit(&mut self) {
+        self.address_editing = false;
+        if self.page_source == PageSource::Directory {
+            self.address_mode = AddressMode::Normal;
+            self.address_input.clear();
+            self.search_query.clear();
+        }
     }
 
     pub fn cancel_address_edit(&mut self) {

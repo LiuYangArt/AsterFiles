@@ -56,6 +56,7 @@ use crate::platform::windows::address_path::{
 
 pub(crate) mod action_scenario;
 mod actions;
+mod address_edit;
 mod breadcrumb;
 mod breadcrumb_layout;
 #[cfg(test)]
@@ -11069,6 +11070,7 @@ fn wire_callbacks(
     };
     wire_system_integration(ui, &state);
     breadcrumb::wire_resize(ui);
+    address_edit::wire_dismissal(ui, &state);
     let weak_for_network = ui.as_weak();
     let discovery_sender_for_ui = network_discovery_sender.clone();
     let discovery_state_for_ui = state.clone();
@@ -11139,35 +11141,24 @@ fn wire_callbacks(
         let state_for_validation = state_for_path.clone();
         let workers_for_validation = path_workers.clone();
         let everything_for_validation = everything_for_accept.clone();
+        let weak = weak.clone();
         thread::spawn(move || {
             let target =
                 platform::windows::network::network_drive_to_unc(&target).unwrap_or(target);
-            if crate::network::is_unc_path(&target) || target.is_dir() {
-                let _ = slint::invoke_from_event_loop(move || {
-                    let _ = actions::execute(
-                        &state_for_validation.shared,
-                        &workers_for_validation,
-                        actions::Action::OpenDirectory {
-                            target: action_target,
-                            path: target,
-                        },
-                    );
-                });
-            } else {
-                let _ = slint::invoke_from_event_loop(move || {
-                    submit_search(
-                        &everything_for_validation,
-                        &state_for_validation,
-                        None,
-                        tab_id,
-                        query,
-                    );
-                });
-            }
+            let directory =
+                (crate::network::is_unc_path(&target) || target.is_dir()).then_some(target);
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                address_edit::finish_validation(
+                    &ui,
+                    &state_for_validation,
+                    &workers_for_validation,
+                    &everything_for_validation,
+                    action_target,
+                    directory,
+                    query,
+                );
+            });
         });
-        if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state_for_path);
-        }
     });
 
     let state_for_folder_range = state.clone();
@@ -14313,6 +14304,25 @@ fn native_file_drag_action(event: &winit::event::WindowEvent) -> Option<NativeFi
     }
 }
 
+fn prepare_context_menu_event(
+    ui: &AppWindow,
+    event: &winit::event::WindowEvent,
+    cursor_position: winit::dpi::PhysicalPosition<f64>,
+) -> bool {
+    // Menu cleanup returns early for every left press, even when no menu is open.
+    if matches!(
+        event,
+        winit::event::WindowEvent::MouseInput {
+            state: winit::event::ElementState::Pressed,
+            ..
+        }
+    ) {
+        let logical = cursor_position.to_logical::<f32>(f64::from(ui.window().scale_factor()));
+        ui.invoke_dismiss_address_edit_outside(logical.x, logical.y);
+    }
+    should_close_context_menu(event)
+}
+
 fn should_close_context_menu(event: &winit::event::WindowEvent) -> bool {
     matches!(
         event,
@@ -14483,11 +14493,11 @@ fn wire_mouse_navigation(
             // Retire the popup here so the same click can reach that control.
             dismiss_quick_menu_session(window_id, false);
         }
-        if should_close_context_menu(event) {
-            if weak
-                .upgrade()
-                .is_some_and(|ui| platform::windows::has_pointer_capture(native_window_handle(&ui)))
-            {
+        let Some(ui) = weak.upgrade() else {
+            return EventResult::Propagate;
+        };
+        if prepare_context_menu_event(&ui, event, cursor_position.get()) {
+            if platform::windows::has_pointer_capture(native_window_handle(&ui)) {
                 platform::windows::release_pointer_capture();
             }
             if let Some(ui) = weak.upgrade() {
@@ -14564,9 +14574,6 @@ fn wire_mouse_navigation(
             type_select.borrow_mut().clear();
             return EventResult::Propagate;
         }
-        let Some(ui) = weak.upgrade() else {
-            return EventResult::Propagate;
-        };
         if matches!(
             event,
             WindowEvent::Focused(false) | WindowEvent::Occluded(true)
@@ -20623,7 +20630,9 @@ fn schedule_search(
             let window = app.window(state.window_id)?;
             (window.active_tab == tab_id).then_some(())?;
             let tab = window.tabs.get(&tab_id)?;
-            (tab.address_input == input && tab.address_mode == AddressMode::Smart)
+            (tab.address_editing
+                && tab.address_input == input
+                && tab.address_mode == AddressMode::Smart)
                 .then(|| tab.search_query.clone())
         });
         if let Some(query) = query {
