@@ -12,7 +12,7 @@ pub(super) fn wire_dismissal(ui: &AppWindow, state: &WindowSessions) {
             }
         }
         if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state);
+            refresh_regions(&ui, &state, RefreshRegions::NAVIGATION);
         }
     });
 }

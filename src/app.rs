@@ -80,6 +80,8 @@ mod library_loading;
 mod loading_hint;
 #[cfg(test)]
 mod network_sort_tests;
+#[cfg(test)]
+mod refresh_tests;
 mod rename_updates;
 #[cfg(test)]
 mod scrollbar_tests;
@@ -87,6 +89,7 @@ mod scrollbar_tests;
 mod selection_scale_tests;
 #[cfg(test)]
 mod test_support;
+mod ui_refresh;
 mod webdav_ui;
 mod window_sessions;
 
@@ -99,6 +102,7 @@ use file_operation_worker::{
     FileOperationEvent, FileOperationRequest, cleanup_record_root, spawn_file_operation_worker,
     uses_local_recycle_batch,
 };
+use ui_refresh::{RefreshRegions, refresh_window_regions};
 use window_sessions::external_tab_insertion_slot;
 
 slint::include_modules!();
@@ -2119,7 +2123,7 @@ fn defer_thumbnail_retry(state: SharedSessions, tab_id: TabId, scheduler: Thumbn
     });
 }
 
-fn refresh_all_windows(state: &SharedSessions) {
+fn refresh_all_windows(state: &SharedSessions, regions: RefreshRegions) {
     let windows = WINDOW_RUNTIMES.with_borrow(|runtimes| {
         runtimes
             .iter()
@@ -2131,7 +2135,40 @@ fn refresh_all_windows(state: &SharedSessions) {
             .lock()
             .is_ok_and(|app| app.window(window_id).is_some())
         {
-            refresh_window_ui(&ui, state, window_id);
+            refresh_window_regions(&ui, state, window_id, regions);
+        }
+    }
+}
+
+fn refresh_view_windows(state: &WindowSessions, owner: Option<&AppWindow>) {
+    let targets = {
+        let Ok(app) = state.lock() else { return };
+        let source = app.active();
+        app.windows
+            .iter()
+            .filter_map(|(window_id, window)| {
+                let tab = window.tabs.get(&window.active_tab)?;
+                let affected = if source.page_source == PageSource::Search {
+                    tab.page_source == PageSource::Search
+                } else if let Some(path) = source.visible_path() {
+                    tab.page_source == PageSource::Directory && tab.visible_path() == Some(path)
+                } else {
+                    tab.id == source.id
+                };
+                affected.then_some(*window_id)
+            })
+            .collect::<Vec<_>>()
+    };
+    for window_id in targets {
+        let ui = if window_id == state.window_id {
+            owner
+                .map(|ui| ui.clone_strong())
+                .or_else(|| window_ui(window_id))
+        } else {
+            window_ui(window_id)
+        };
+        if let Some(ui) = ui {
+            refresh_window_regions(&ui, state, window_id, RefreshRegions::CONTENT);
         }
     }
 }
@@ -2155,11 +2192,19 @@ fn refresh_operation_badges(state: &SharedSessions) {
 }
 
 fn refresh_tab_window(state: &SharedSessions, tab_id: TabId) {
-    let window_id = state.lock().ok().and_then(|app| app.window_for_tab(tab_id));
-    if let Some(window_id) = window_id
+    let target = state.lock().ok().and_then(|app| {
+        let window_id = app.window_for_tab(tab_id)?;
+        Some((window_id, app.window(window_id)?.active_tab == tab_id))
+    });
+    if let Some((window_id, active)) = target
         && let Some(ui) = window_ui(window_id)
     {
-        refresh_window_ui(&ui, state, window_id);
+        let regions = if active {
+            RefreshRegions::CONTENT
+        } else {
+            RefreshRegions::TABS
+        };
+        refresh_window_regions(&ui, state, window_id, regions);
     }
 }
 
@@ -4863,6 +4908,7 @@ fn apply_late_shell_select_reveal(
     if target.parent() != Some(context.directory.as_path()) {
         return;
     }
+    let mut changed = HashSet::new();
     let scroll_target = {
         let mut app = match state.lock() {
             Ok(app) => app,
@@ -4877,7 +4923,10 @@ fn apply_late_shell_select_reveal(
             return;
         }
         // A late Shell reply belongs to the original navigation, not today's active tab.
-        let is_active = app.active_window_state().active_tab == tab_id;
+        let is_active = app
+            .window_for_tab(tab_id)
+            .and_then(|id| app.window(id))
+            .is_some_and(|window| window.active_tab == tab_id);
         if tab.load_state != LoadState::Complete {
             queue_external_reveal(
                 &mut app,
@@ -4896,7 +4945,7 @@ fn apply_late_shell_select_reveal(
                 .find(|entry| entry.path == target)
                 .cloned()
             {
-                tab.select_entry(entry.id, false, false);
+                changed = mutate_selection(tab, |tab| tab.select_entry(entry.id, false, false));
                 is_active.then_some((tab_id, request_id, entry.id))
             } else {
                 tab.error = Some(format!(
@@ -4907,7 +4956,16 @@ fn apply_late_shell_select_reveal(
             }
         }
     };
-    refresh_all_windows(state);
+    let window_id = state
+        .lock()
+        .ok()
+        .and_then(|app| app.window_for_tab(context.tab_id));
+    if let Some(window_id) = window_id
+        && let Some(ui) = window_ui(window_id)
+    {
+        update_file_rows(&ui, state, context.tab_id, &changed);
+        refresh_window_regions(&ui, state, window_id, RefreshRegions::STATUS);
+    }
     if let Some((tab_id, request_id, entry_id)) = scroll_target {
         reveal_late_shell_select(state, tab_id, request_id, entry_id);
     }
@@ -4965,9 +5023,11 @@ fn open_classified_external_launches(
             start_late_shell_select_pump(receiver, state.clone(), context);
         }
     }
-    refresh_all_windows(state);
     let active_window = state.lock().ok().map(|app| app.active_window);
-    if let Some(ui) = active_window.and_then(window_ui) {
+    if let Some(window_id) = active_window
+        && let Some(ui) = window_ui(window_id)
+    {
+        refresh_window_regions(&ui, state, window_id, RefreshRegions::CONTENT);
         ui.window().request_redraw();
         platform::windows::restore_and_focus_window(native_window_handle(&ui));
     }
@@ -5858,7 +5918,7 @@ fn finish_native_tab_drag(
         }
         project_native_insertion_indicator(None, state);
         source_ui.invoke_clear_tab_drag();
-        refresh_window_ui(source_ui, state, source_window);
+        refresh_window_regions(source_ui, state, source_window, RefreshRegions::TABS);
         return false;
     };
     let screen_x = drop_point.screen_x;
@@ -5916,7 +5976,7 @@ fn finish_native_tab_drag(
     project_native_insertion_indicator(None, state);
     source_ui.invoke_clear_tab_drag();
     if !moved && !detached {
-        refresh_window_ui(source_ui, state, source_window);
+        refresh_window_regions(source_ui, state, source_window, RefreshRegions::TABS);
     }
     finished || moved || moved_source_window || detached
 }
@@ -10923,7 +10983,7 @@ fn update_network_discovery(
         app.network_discovery_errors
             .insert(window_id, "Windows 网络发现正忙，请稍后重试".to_owned());
     }
-    refresh_all_windows(state);
+    refresh_all_windows(state, RefreshRegions::SIDEBAR | RefreshRegions::HOME);
 }
 
 fn network_discovery_needed(app: &AppState, window_id: WindowId) -> bool {
@@ -10985,7 +11045,7 @@ fn refresh_system_integration_state(state: SharedSessions) {
                 app.folder_integration_status = folder.ok();
                 app.win_e_integration_status = win_e.ok();
             }
-            refresh_all_windows(&state);
+            refresh_all_windows(&state, RefreshRegions::SETTINGS);
         });
     });
 }
@@ -11000,7 +11060,7 @@ fn run_system_integration_action(state: SharedSessions, action: SystemIntegratio
             app.system_integration_generation.wrapping_add(1).max(1);
         *action.error_slot(&mut app) = None;
     }
-    refresh_all_windows(&state);
+    refresh_all_windows(&state, RefreshRegions::SETTINGS);
     thread::spawn(move || {
         let result = action.run();
 
@@ -11013,7 +11073,7 @@ fn run_system_integration_action(state: SharedSessions, action: SystemIntegratio
                 app.folder_integration_status = folder.ok();
                 app.win_e_integration_status = win_e.ok();
             }
-            refresh_all_windows(&state);
+            refresh_all_windows(&state, RefreshRegions::SETTINGS);
         });
     });
 }
@@ -11221,7 +11281,7 @@ fn wire_callbacks(
         }
         drop(app);
         if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state_for_search_edit);
+            refresh_regions(&ui, &state_for_search_edit, RefreshRegions::NAVIGATION);
             ui.invoke_focus_address_editor();
         }
     });
@@ -11368,7 +11428,12 @@ fn wire_callbacks(
         {
             webdav_ui::open_entry(&state_for_entry, &sender_for_entry, *tab_id, entry);
             if let Some(ui) = weak.upgrade() {
-                refresh_ui(&ui, &state_for_entry);
+                let regions = if entry.kind == crate::domain::EntryKind::Directory {
+                    RefreshRegions::CONTENT
+                } else {
+                    RefreshRegions::STATUS
+                };
+                refresh_regions(&ui, &state_for_entry, regions);
             }
             return;
         }
@@ -11391,7 +11456,7 @@ fn wire_callbacks(
                     }
                 });
             }
-            if let Some(ui) = weak.upgrade() {
+            if is_directory && let Some(ui) = weak.upgrade() {
                 refresh_ui(&ui, &state_for_entry);
             }
         }
@@ -11614,6 +11679,7 @@ fn wire_callbacks(
                     .map(|entry| (app.active_window_state().active_tab, entry.clone()))
             };
             if let Some((tab_id, entry)) = target {
+                let is_directory = entry.kind == crate::domain::EntryKind::Directory;
                 if entry.webdav.is_some() {
                     webdav_ui::open_entry(
                         &state_for_activate_entry,
@@ -11639,7 +11705,12 @@ fn wire_callbacks(
                     });
                 }
                 if let Some(ui) = weak.upgrade() {
-                    refresh_ui(&ui, &state_for_activate_entry);
+                    let regions = if is_directory {
+                        RefreshRegions::CONTENT
+                    } else {
+                        RefreshRegions::STATUS
+                    };
+                    refresh_regions(&ui, &state_for_activate_entry, regions);
                 }
             }
             return;
@@ -11823,7 +11894,7 @@ fn wire_callbacks(
             );
         }
         if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state_for_sort);
+            refresh_view_windows(&state_for_sort, Some(&ui));
         }
     });
 
@@ -11842,7 +11913,7 @@ fn wire_callbacks(
             .and_then(|ui| capture_zoom_anchor(&ui, 16.0, 0.0));
         set_view_mode(&state_for_view, mode);
         if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state_for_view);
+            refresh_view_windows(&state_for_view, Some(&ui));
             restore_zoom_anchor(&ui, anchor);
             request_visible_file_images(
                 &ui,
@@ -11879,7 +11950,7 @@ fn wire_callbacks(
         if let Some(ui) = weak.upgrade() {
             ui.invoke_clear_column_drag();
             if changed {
-                refresh_ui(&ui, &state_for_columns);
+                refresh_regions(&ui, &state_for_columns, RefreshRegions::COLUMNS);
             }
         }
     });
@@ -11984,7 +12055,7 @@ fn wire_callbacks(
             }
         }
         if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state_for_home_section);
+            refresh_regions(&ui, &state_for_home_section, RefreshRegions::HOME);
         }
     });
 
@@ -12055,12 +12126,19 @@ fn wire_callbacks(
         } else {
             TabId(tab_id as u32)
         };
+        let before = app.active_window_state().active_tab;
         if app.active_window_state().tabs.contains_key(&target) {
             app.close_tab(target);
         }
+        let active_changed = before != app.active_window_state().active_tab;
         drop(app);
         if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state_for_close);
+            let regions = if active_changed {
+                RefreshRegions::CONTENT
+            } else {
+                RefreshRegions::TABS
+            };
+            refresh_regions(&ui, &state_for_close, regions);
         }
     });
 
@@ -12458,7 +12536,6 @@ fn wire_callbacks(
         }
     });
 
-    let weak = ui.as_weak();
     let delete_weak_for_language = delete_ui.as_weak();
     let conflict_weak_for_language = conflict_ui.as_weak();
     let exit_weak_for_language = exit_ui.as_weak();
@@ -12474,9 +12551,7 @@ fn wire_callbacks(
             Language::Chinese
         };
         drop(app);
-        if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state_for_language);
-        }
+        refresh_all_windows(&state_for_language, RefreshRegions::ALL);
         if let (Some(delete_ui), Some(conflict_ui), Some(exit_ui)) = (
             delete_weak_for_language.upgrade(),
             conflict_weak_for_language.upgrade(),
@@ -12506,15 +12581,12 @@ fn wire_callbacks(
     let state_for_visibility = state.clone();
     let sender_for_visibility = sender.clone();
     let network_sender_for_visibility = network_sender.clone();
-    let weak_for_quick_search = ui.as_weak();
     let state_for_quick_search = state.clone();
     ui.on_change_file_list_quick_search(move |enabled| {
         if let Ok(mut app) = state_for_quick_search.lock() {
             app.file_list_quick_search = enabled;
         }
-        if let Some(ui) = weak_for_quick_search.upgrade() {
-            refresh_ui(&ui, &state_for_quick_search);
-        }
+        refresh_all_windows(&state_for_quick_search, RefreshRegions::SETTINGS);
     });
 
     let state_for_new_tab_setting = state.clone();
@@ -12522,29 +12594,23 @@ fn wire_callbacks(
         if let Ok(mut app) = state_for_new_tab_setting.lock() {
             app.new_tab_opens_home = enabled;
         }
-        refresh_all_windows(&state_for_new_tab_setting);
+        refresh_all_windows(&state_for_new_tab_setting, RefreshRegions::SETTINGS);
     });
 
-    let weak_for_menu_backdrop = ui.as_weak();
     let state_for_menu_backdrop = state.clone();
     ui.on_change_quick_menu_backdrop(move |enabled| {
         if let Ok(mut app) = state_for_menu_backdrop.lock() {
             app.quick_menu_backdrop = enabled;
         }
-        if let Some(ui) = weak_for_menu_backdrop.upgrade() {
-            refresh_ui(&ui, &state_for_menu_backdrop);
-        }
+        refresh_all_windows(&state_for_menu_backdrop, RefreshRegions::SETTINGS);
     });
 
-    let weak_for_menu_opacity = ui.as_weak();
     let state_for_menu_opacity = state.clone();
     ui.on_change_quick_menu_backdrop_opacity(move |opacity| {
         if let Ok(mut app) = state_for_menu_opacity.lock() {
             app.quick_menu_backdrop_opacity = normalized_quick_menu_backdrop_opacity(opacity);
         }
-        if let Some(ui) = weak_for_menu_opacity.upgrade() {
-            refresh_ui(&ui, &state_for_menu_opacity);
-        }
+        refresh_all_windows(&state_for_menu_opacity, RefreshRegions::SETTINGS);
     });
 
     ui.on_change_file_visibility(move |show_hidden, show_system| {
@@ -12572,11 +12638,11 @@ fn wire_callbacks(
                 NavigationKind::Refresh,
             );
         }
+        refresh_all_windows(&state_for_visibility, RefreshRegions::SETTINGS);
         if let Some(ui) = weak_for_visibility.upgrade() {
             refresh_ui(&ui, &state_for_visibility);
         }
     });
-    let weak = ui.as_weak();
     let delete_weak_for_theme = delete_ui.as_weak();
     let conflict_weak_for_theme = conflict_ui.as_weak();
     let exit_weak_for_theme = exit_ui.as_weak();
@@ -12592,9 +12658,7 @@ fn wire_callbacks(
             _ => session_store::ThemeMode::System,
         };
         drop(app);
-        if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state_for_theme);
-        }
+        refresh_all_windows(&state_for_theme, RefreshRegions::SETTINGS);
         if let (Some(delete_ui), Some(conflict_ui), Some(exit_ui)) = (
             delete_weak_for_theme.upgrade(),
             conflict_weak_for_theme.upgrade(),
@@ -12631,7 +12695,7 @@ fn wire_callbacks(
         drop(app);
         let _ = everything_for_config.send(EverythingRequest::Configure(config));
         if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state_for_everything_config);
+            refresh_regions(&ui, &state_for_everything_config, RefreshRegions::SETTINGS);
         }
     });
     let weak = ui.as_weak();
@@ -12644,7 +12708,7 @@ fn wire_callbacks(
             return;
         };
         if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state_for_test);
+            refresh_regions(&ui, &state_for_test, RefreshRegions::SETTINGS);
         }
         let _ = everything_for_test.send(EverythingRequest::TestConnection(generation));
     });
@@ -12658,7 +12722,7 @@ fn wire_callbacks(
             return;
         };
         if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state_for_start);
+            refresh_regions(&ui, &state_for_start, RefreshRegions::SETTINGS);
         }
         let _ = everything_for_start.send(EverythingRequest::Start(generation));
     });
@@ -12672,7 +12736,7 @@ fn wire_callbacks(
             return;
         };
         if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state_for_discover);
+            refresh_regions(&ui, &state_for_discover, RefreshRegions::SETTINGS);
         }
         let _ = everything_for_discover.send(EverythingRequest::Discover(generation));
     });
@@ -12686,7 +12750,7 @@ fn wire_callbacks(
             return;
         };
         let owner_window = weak.upgrade().map_or(0, |ui| {
-            refresh_ui(&ui, &state_for_picker);
+            refresh_regions(&ui, &state_for_picker, RefreshRegions::SETTINGS);
             native_window_handle(&ui)
         });
         let _ = everything_for_picker.send(EverythingRequest::PickExecutable {
@@ -12703,7 +12767,7 @@ fn wire_callbacks(
                 .expect("app state mutex is not poisoned")
                 .everything_status = error.to_string();
             if let Some(ui) = weak.upgrade() {
-                refresh_ui(&ui, &state_for_download);
+                refresh_regions(&ui, &state_for_download, RefreshRegions::SETTINGS);
             }
         }
     });
@@ -13530,6 +13594,7 @@ fn wire_callbacks(
     let shell_menu_for_command = shell_menu_worker.clone();
     let everything_for_context_command = everything_sender.clone();
     ui.on_invoke_context_command(move |command| {
+        let mut regions = RefreshRegions::STATUS | RefreshRegions::COLUMNS;
         match command {
             1 => {
                 let current = quick_menu_for_command
@@ -13566,6 +13631,7 @@ fn wire_callbacks(
                 }
             }
             CMD_OPEN_FILE_LOCATION => {
+                regions = regions | RefreshRegions::CONTENT;
                 let target = quick_menu_for_command
                     .lock()
                     .ok()
@@ -13592,7 +13658,7 @@ fn wire_callbacks(
                             ));
                         }
                         if let Some(ui) = weak.upgrade() {
-                            refresh_ui(&ui, &state_for_context_command);
+                            refresh_regions(&ui, &state_for_context_command, RefreshRegions::STATUS);
                         }
                         return;
                     };
@@ -13621,7 +13687,7 @@ fn wire_callbacks(
                 {
                     toggle_sidebar_visibility(&mut app.sidebar_visibility, command);
                 }
-                refresh_all_windows(&state_for_context_command.shared);
+                refresh_all_windows(&state_for_context_command.shared, RefreshRegions::SIDEBAR | RefreshRegions::HOME);
             }
             CMD_QUICK_ACCESS_PIN | CMD_QUICK_ACCESS_UNPIN => {
                 let path = current_sidebar_menu_target(&state_for_context_command, &quick_menu_for_command)
@@ -13658,6 +13724,7 @@ fn wire_callbacks(
                         .then(|| (app.active_window_state().active_tab, entries))
                 });
                 if let Some((tab_id, entries)) = opened {
+                    regions = regions | RefreshRegions::CONTENT;
                     webdav_ui::open_entry(
                         &state_for_context_command,
                         &sender,
@@ -13690,8 +13757,10 @@ fn wire_callbacks(
                             .push(format!("Failed to add network location: {error:?}")),
                     }
                 }
+                refresh_all_windows(&state_for_context_command, RefreshRegions::SIDEBAR | RefreshRegions::HOME);
             }
             CMD_NETWORK_LOCATION_OPEN => {
+                regions = regions | RefreshRegions::CONTENT;
                 let sidebar = current_sidebar_menu_target(&state_for_context_command, &quick_menu_for_command);
                 if let Some(sidebar) = sidebar {
                     match sidebar.destination {
@@ -13711,6 +13780,7 @@ fn wire_callbacks(
                             }
                         }
                     }
+                    if let Some(ui) = weak.upgrade() { refresh_regions(&ui, &state_for_context_command, regions); }
                     return;
                 }
                 let target = selected_network_location_target(&state_for_context_command, &quick_menu_for_command);
@@ -13762,6 +13832,7 @@ fn wire_callbacks(
                 }
             }
             CMD_NETWORK_LOCATION_OPEN_NEW_TAB => {
+                regions = regions | RefreshRegions::CONTENT;
                 let sidebar = current_sidebar_menu_target(&state_for_context_command, &quick_menu_for_command);
                 if let Some(sidebar) = sidebar {
                     match sidebar.destination {
@@ -13789,6 +13860,7 @@ fn wire_callbacks(
                         }
                         SidebarDestination::External(_) => {}
                     }
+                    if let Some(ui) = weak.upgrade() { refresh_regions(&ui, &state_for_context_command, regions); }
                     return;
                 }
                 let path = selected_network_location_path(&state_for_context_command, &quick_menu_for_command);
@@ -13939,13 +14011,13 @@ fn wire_callbacks(
                             .push(format!("Failed to manage network location: {error:?}")),
                     }
                 }
-                refresh_all_windows(&state_for_context_command.shared);
+                refresh_all_windows(&state_for_context_command.shared, RefreshRegions::SIDEBAR | RefreshRegions::HOME);
             }
             command if (CMD_VIEW_BASE..CMD_VIEW_BASE + 8).contains(&command) => {
                 if let Some(mode) = ViewMode::from_storage_code((command - CMD_VIEW_BASE) as u8) {
                     let anchor = weak.upgrade().and_then(|ui| capture_zoom_anchor(&ui, 16.0, 0.0));
                     set_view_mode(&state_for_context_command, mode);
-                    refresh_all_windows(&state_for_context_command.shared);
+                    refresh_view_windows(&state_for_context_command, weak.upgrade().as_ref());
                     if let Some(ui) = weak.upgrade() {
                         restore_zoom_anchor(&ui, anchor);
                         request_visible_file_images(
@@ -13974,7 +14046,7 @@ fn wire_callbacks(
                             query,
                         );
                     }
-                    refresh_all_windows(&state_for_context_command.shared);
+                    refresh_view_windows(&state_for_context_command, weak.upgrade().as_ref());
                 }
             }
             CMD_SORT_ASC | CMD_SORT_DESC => {
@@ -14000,14 +14072,14 @@ fn wire_callbacks(
                         query,
                     );
                 }
-                refresh_all_windows(&state_for_context_command.shared);
+                refresh_view_windows(&state_for_context_command, weak.upgrade().as_ref());
             }
             command
                 if ((CMD_GROUP_BASE..CMD_GROUP_BASE + 6).contains(&command)
                     || matches!(command, CMD_GROUP_ASC | CMD_GROUP_DESC))
                     && apply_group_command(&state_for_context_command, command) =>
             {
-                refresh_all_windows(&state_for_context_command.shared);
+                refresh_view_windows(&state_for_context_command, weak.upgrade().as_ref());
             }
             CMD_COLUMN_FIT | CMD_COLUMNS_FIT => {
                 if let Ok(mut app) = state_for_context_command.lock() {
@@ -14031,9 +14103,6 @@ fn wire_callbacks(
                         });
                     }
                 }
-                if let Some(ui) = weak.upgrade() {
-                    refresh_ui(&ui, &state_for_context_command);
-                }
             }
             command
                 if (CMD_COLUMN_TOGGLE_BASE..CMD_COLUMN_TOGGLE_BASE + ColumnKind::COUNT as i32)
@@ -14048,9 +14117,6 @@ fn wire_callbacks(
                         app.update_active_column_layout(|layout| {
                             layout.visible[index] = !layout.visible[index]
                         });
-                    }
-                    if let Some(ui) = weak.upgrade() {
-                        refresh_ui(&ui, &state_for_context_command);
                     }
                 }
             }
@@ -14133,7 +14199,7 @@ fn wire_callbacks(
             _ => {}
         }
         if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state_for_context_command);
+            refresh_regions(&ui, &state_for_context_command, regions);
         }
     });
 
@@ -14178,7 +14244,7 @@ fn wire_callbacks(
             if let Some(ui) = weak.upgrade() {
                 ui.set_rename_submitting(false);
                 ui.set_rename_submit_generation(ui.get_rename_submit_generation() + 1);
-                refresh_ui(&ui, &state_for_commit_rename);
+                refresh_regions(&ui, &state_for_commit_rename, RefreshRegions::STATUS);
             }
         }
     });
@@ -14192,7 +14258,7 @@ fn wire_callbacks(
         if let Some(ui) = weak.upgrade() {
             ui.set_rename_submitting(false);
             ui.set_rename_editing(false);
-            refresh_ui(&ui, &state_for_cancel_rename);
+            refresh_regions(&ui, &state_for_cancel_rename, RefreshRegions::STATUS);
         }
     });
 
@@ -14214,7 +14280,7 @@ fn wire_callbacks(
     ui.on_cancel_operation(move |id| {
         if webdav_ui::cancel_transfer(id as u64) {
             if let Some(ui) = weak.upgrade() {
-                refresh_ui(&ui, &state_for_cancel_operation);
+                refresh_regions(&ui, &state_for_cancel_operation, RefreshRegions::STATUS);
             }
             return;
         }
@@ -14224,7 +14290,7 @@ fn wire_callbacks(
             OperationId(id as u64),
         );
         if let Some(ui) = weak.upgrade() {
-            refresh_ui(&ui, &state_for_cancel_operation);
+            refresh_regions(&ui, &state_for_cancel_operation, RefreshRegions::STATUS);
         }
     });
     let state_for_retry = state.clone();
@@ -14791,7 +14857,7 @@ fn wire_mouse_navigation(
                                 logical.y - ui.get_file_list_top(),
                             );
                             set_view_mode(&state, next);
-                            refresh_all_windows(&shared_state);
+                            refresh_view_windows(&state, Some(&ui));
                             restore_zoom_anchor(&ui, anchor);
                             request_visible_file_images(
                                 &ui,
@@ -15022,7 +15088,7 @@ fn wire_mouse_navigation(
                             typed.and_then(|typed| begin_file_list_quick_search(&state, typed))
                         {
                             type_select.borrow_mut().clear();
-                            refresh_ui(&ui, &state);
+                            refresh_regions(&ui, &state, RefreshRegions::NAVIGATION);
                             ui.invoke_focus_address_editor();
                             schedule_search(
                                 senders.everything.clone(),
@@ -15284,7 +15350,10 @@ fn submit_quick_access_change(state: SharedSessions, path: PathBuf, pin: bool) {
                     path, result
                 );
             }
-            refresh_all_windows(&state_for_ui);
+            refresh_all_windows(
+                &state_for_ui,
+                RefreshRegions::SIDEBAR | RefreshRegions::HOME,
+            );
         });
     });
 }
@@ -15937,7 +16006,7 @@ fn wire_confirmation_windows(
             conflict_ui.set_operation_id("".into());
             let _ = conflict_ui.hide();
         }
-        refresh_all_windows(&state_for_conflict);
+        refresh_all_windows(&state_for_conflict, RefreshRegions::STATUS);
     });
     for (action_index, action) in [
         crate::domain::file_operations::ConflictAction::Replace,
@@ -15971,7 +16040,7 @@ fn wire_confirmation_windows(
                 conflict_ui.set_operation_id("".into());
                 let _ = conflict_ui.hide();
             }
-            refresh_all_windows(&state_for_conflict);
+            refresh_all_windows(&state_for_conflict, RefreshRegions::STATUS);
         };
         match action_index {
             0 => conflict_ui.on_primary_action(callback),
@@ -16317,7 +16386,7 @@ fn wire_network_location_rename_window(ui: &NetworkLocationRenameWindow, state: 
             ui.set_location_id("".into());
             let _ = ui.hide();
         }
-        refresh_all_windows(&state);
+        refresh_all_windows(&state, RefreshRegions::SIDEBAR | RefreshRegions::HOME);
     });
 }
 
@@ -17359,7 +17428,7 @@ fn scan_cleanup_diagnostics(
             for request in requests {
                 let _ = operation_sender.send(request);
             }
-            refresh_all_windows(&state_for_ui);
+            refresh_all_windows(&state_for_ui, RefreshRegions::STATUS);
         });
     });
 }
@@ -17812,7 +17881,7 @@ fn start_shell_menu_event_pump(
                                             );
                                         }
                                     }
-                                    refresh_all_windows(&state);
+                                    refresh_all_windows(&state, RefreshRegions::CONTENT);
                                 }
                                 QuickMenuScope::SidebarBackground => {}
                             }
@@ -19019,7 +19088,7 @@ fn start_event_pump(
                             if let Some(tab_id) = routed_tab {
                                 refresh_tab_window(&state, tab_id);
                             } else {
-                                refresh_all_windows(&state);
+                                refresh_all_windows(&state, RefreshRegions::CONTENT);
                             }
                             if let Some((target, anchor)) = network_scroll {
                                 restore_zoom_anchor(&target, anchor);
@@ -20571,7 +20640,7 @@ fn start_everything_event_pump(
                 refresh_tab_window(&state, tab_id);
                 defer_visible_file_images(state.clone(), tab_id, images);
             } else {
-                refresh_all_windows(&state);
+                refresh_all_windows(&state, RefreshRegions::SETTINGS);
             }
         }).is_err() { break; }
         }
@@ -21421,7 +21490,7 @@ fn start_sidebar_icon_loader(ui: &AppWindow, state: SharedSessions) {
                         .expect("app state mutex is not poisoned")
                         .sidebar_icons
                         .insert(path, icon);
-                    refresh_all_windows(&state);
+                    refresh_all_windows(&state, RefreshRegions::SIDEBAR | RefreshRegions::HOME);
                 })
                 .is_err()
             {
@@ -21692,7 +21761,10 @@ fn reload_quick_access(weak: slint::Weak<AppWindow>, state: SharedSessions) {
                 replace_quick_access_projection(&mut app, generation, locations)
             });
             if accepted {
-                refresh_all_windows(&state_for_ui);
+                refresh_all_windows(
+                    &state_for_ui,
+                    RefreshRegions::SIDEBAR | RefreshRegions::HOME,
+                );
             }
             if accepted && let Some(owner) = weak_for_icons.upgrade() {
                 start_sidebar_icon_loader(&owner, state_for_ui.clone());
@@ -21719,7 +21791,10 @@ fn reload_drives(weak: slint::Weak<AppWindow>, state: SharedSessions) {
                 .is_ok_and(|mut app| replace_drive_projection(&mut app, generation, drives));
             if accepted {
                 begin_drive_capacity_refresh(&state_for_ui, None, Duration::ZERO);
-                refresh_all_windows(&state_for_ui);
+                refresh_all_windows(
+                    &state_for_ui,
+                    RefreshRegions::SIDEBAR | RefreshRegions::HOME,
+                );
             }
             if accepted && let Some(owner) = weak_for_icons.upgrade() {
                 start_sidebar_icon_loader(&owner, state_for_ui.clone());
@@ -21767,7 +21842,7 @@ fn begin_drive_capacity_refresh(
         requests
     };
     if !requests.is_empty() {
-        refresh_all_windows(state);
+        refresh_all_windows(state, RefreshRegions::SIDEBAR | RefreshRegions::HOME);
     }
     for (root, generation) in requests {
         let timeout_state = state.clone();
@@ -21796,7 +21871,10 @@ fn begin_drive_capacity_refresh(
                     "{{\"event\":\"drive_capacity_timed_out\",\"root\":{:?},\"generation\":{generation}}}",
                     timeout_root
                 );
-                refresh_all_windows(&timeout_state);
+                refresh_all_windows(
+                    &timeout_state,
+                    RefreshRegions::SIDEBAR | RefreshRegions::HOME,
+                );
             }
         });
         let state_for_result = state.clone();
@@ -21830,7 +21908,10 @@ fn begin_drive_capacity_refresh(
                         "{{\"event\":\"drive_capacity_updated\",\"root\":{:?},\"generation\":{generation}}}",
                         root_for_log
                     );
-                    refresh_all_windows(&state_for_result);
+                    refresh_all_windows(
+                        &state_for_result,
+                        RefreshRegions::SIDEBAR | RefreshRegions::HOME,
+                    );
                 }
             });
         });
@@ -21927,7 +22008,10 @@ fn reload_libraries(
                     })
                     .collect::<Vec<_>>()
             };
-            refresh_all_windows(&state_for_ui);
+            refresh_all_windows(
+                &state_for_ui,
+                RefreshRegions::SIDEBAR | RefreshRegions::HOME,
+            );
             for (tab_id, library) in targets {
                 submit_library_navigation(
                     &directory_sender,
@@ -22010,7 +22094,7 @@ fn publish_imported_network_locations(
             true
         });
         if changed {
-            refresh_all_windows(&state);
+            refresh_all_windows(&state, RefreshRegions::SIDEBAR | RefreshRegions::HOME);
         }
     })
     .is_ok()
@@ -22269,7 +22353,7 @@ fn start_network_discovery_event_pump(
                         window_id.0, kind
                     );
                 }
-                refresh_all_windows(&state);
+                refresh_all_windows(&state, RefreshRegions::SIDEBAR | RefreshRegions::HOME);
             });
         }
     });
@@ -22909,28 +22993,8 @@ fn project_column_layout(ui: &AppWindow, tab: &TabSession, app: &AppState) {
             .collect::<Vec<_>>(),
     )));
 }
-fn update_selection_summary(ui: &AppWindow, state: &SharedSessions) {
-    let app = state.lock().expect("app state mutex is not poisoned");
-    let tab = app.active();
-
-    project_column_layout(ui, tab, &app);
-    let operation_rows = operation_rows(&app);
-    ui.set_operations(ModelRc::new(VecModel::from(operation_rows)));
-    ui.set_operation_error(
-        app.operation_notice
-            .as_ref()
-            .map(|(_, message)| message.clone())
-            .or_else(|| {
-                ui.get_rename_editing()
-                    .then(|| app.operation_errors.last().cloned())
-                    .flatten()
-            })
-            .unwrap_or_default()
-            .into(),
-    );
-    ui.set_selected_count(tab.selected.len() as i32);
-    ui.set_context_menu_has_entry(!tab.selected.is_empty() || tab.focused.is_some());
-    ui.set_status_text(status_text(tab, Texts::new(app.language)).into());
+fn update_selection_summary(ui: &AppWindow, state: &WindowSessions) {
+    refresh_regions(ui, state, RefreshRegions::COLUMNS | RefreshRegions::STATUS);
 }
 
 fn undo_failure_message(
@@ -23544,28 +23608,44 @@ fn format_remaining_time(language: Language, seconds: f64) -> String {
         Language::English => format!("About {minutes}min {seconds}s remaining"),
     }
 }
+fn refresh_regions(ui: &AppWindow, state: &WindowSessions, regions: RefreshRegions) {
+    refresh_window_regions(ui, &state.shared, state.window_id, regions);
+}
+
 fn refresh_window_ui(ui: &AppWindow, state: &SharedSessions, window_id: WindowId) {
-    if !state
-        .lock()
-        .is_ok_and(|app| app.windows.contains_key(&window_id))
-    {
-        return;
-    }
-    refresh_ui_inner(ui, state, window_id);
-    apply_pending_rename_ui(ui, state, window_id);
+    let regions = if ui.get_projected_file_tab_id() < 0 {
+        RefreshRegions::ALL
+    } else {
+        RefreshRegions::CONTENT
+    };
+    refresh_window_regions(ui, state, window_id, regions);
 }
 
 fn reflow_after_window_resize(ui: &AppWindow, state: &SharedSessions, window_id: WindowId) {
+    let old_home_columns = ui.get_home_column_count();
     let logical_width = logical_window_width(ui);
     ui.set_window_width(logical_width);
     ui.set_home_content_width(home_content_width_for_window(logical_width));
-    let anchor = if ui.get_active_is_home() || !projected_view_mode(ui).uses_grid_layout() {
-        None
-    } else {
-        capture_zoom_anchor(ui, 16.0, 0.0)
-    };
-    refresh_window_ui(ui, state, window_id);
-    restore_zoom_anchor(ui, anchor);
+    let mode = projected_view_mode(ui);
+    let columns_changed = !ui.get_active_is_home()
+        && !ui.get_active_is_settings()
+        && mode.uses_grid_layout()
+        && ui.get_grid_column_count() != grid_column_count_for_view(ui, mode) as i32;
+    let anchor = columns_changed
+        .then(|| capture_zoom_anchor(ui, 16.0, 0.0))
+        .flatten();
+    // Geometry and breadcrumb width are cheap; only a changed grid topology needs new rows.
+    let mut regions = RefreshRegions::LAYOUT;
+    if columns_changed {
+        regions = regions | RefreshRegions::FILES;
+    }
+    if ui.get_active_is_home() && old_home_columns != ui.get_home_column_count() {
+        regions = regions | RefreshRegions::HOME;
+    }
+    refresh_window_regions(ui, state, window_id, regions);
+    if columns_changed {
+        restore_zoom_anchor(ui, anchor);
+    }
 }
 
 fn apply_pending_rename_ui(ui: &AppWindow, state: &SharedSessions, window_id: WindowId) {
@@ -23903,643 +23983,6 @@ fn dismiss_stale_rename(ui: &AppWindow, state: &SharedSessions, window_id: Windo
         ui.set_rename_editing(false);
         ui.set_rename_submitting(false);
     }
-}
-
-fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId) {
-    dismiss_stale_rename(ui, state, window_id);
-    ui.invoke_cancel_internal_drag();
-    let app = state.lock().expect("app state mutex is not poisoned");
-    let texts = Texts::new(app.language);
-    let Some(window) = app.window(window_id) else {
-        return;
-    };
-    let Some(tab) = window.tabs.get(&window.active_tab) else {
-        return;
-    };
-    ui.set_accessibility_window_id(format!("window/{}", window_id.0).into());
-    ui.set_accessibility_context(
-        format!(
-            "window/{}/tab/{}/request/{}",
-            window_id.0,
-            tab.id.0,
-            tab.latest_request().0
-        )
-        .into(),
-    );
-    if let Some(window_id) = window_id_for_ui(ui) {
-        let request_id = tab.latest_request();
-        let invalidated = WINDOW_RUNTIMES.with_borrow_mut(|runtimes| {
-            runtimes.get_mut(&window_id).is_some_and(|runtime| {
-                runtime
-                    .quick_menu_popup
-                    .session
-                    .invalidate_request(window_id, tab.id, request_id)
-            })
-        });
-        if invalidated {
-            let _ = ui;
-            drop(app);
-            dismiss_quick_menu_session(window_id, false);
-            return;
-        }
-    }
-    let (folder_enabled, folder_needs_repair, folder_status, folder_path) =
-        shell_integration_projection(app.folder_integration_status.as_ref(), app.language);
-    let (win_e_enabled, win_e_needs_repair, win_e_status, win_e_path) =
-        shell_integration_projection(app.win_e_integration_status.as_ref(), app.language);
-    ui.set_folder_integration_enabled(folder_enabled);
-    ui.set_folder_integration_needs_repair(folder_needs_repair);
-    ui.set_win_e_integration_enabled(win_e_enabled);
-    ui.set_win_e_integration_needs_repair(win_e_needs_repair);
-    ui.set_system_integration_busy(app.system_integration_busy);
-    ui.set_folder_integration_status(
-        app.folder_integration_error
-            .as_deref()
-            .unwrap_or(&folder_status)
-            .into(),
-    );
-    ui.set_win_e_integration_status(
-        app.win_e_integration_error
-            .as_deref()
-            .unwrap_or(&win_e_status)
-            .into(),
-    );
-    ui.set_folder_integration_bound_path(
-        folder_path
-            .map(|path| display_path(&path))
-            .unwrap_or_default()
-            .into(),
-    );
-    ui.set_win_e_integration_bound_path(
-        win_e_path
-            .map(|path| display_path(&path))
-            .unwrap_or_default()
-            .into(),
-    );
-    let logical_width = logical_window_width(ui);
-    ui.set_window_width(logical_width);
-    ui.set_home_content_width(home_content_width_for_window(logical_width));
-    let active_is_settings = tab.kind == TabKind::Settings;
-    let active_is_home = matches!(tab.visible_location(), Some(NavigationLocation::Home));
-    ui.set_active_is_settings(active_is_settings);
-    ui.set_active_is_home(active_is_home);
-    let home_page = app
-        .home_pages
-        .get(&tab.id)
-        .cloned()
-        .unwrap_or_else(HomePageState::expanded);
-    ui.set_home_quick_access_expanded(home_page.quick_access_expanded);
-    ui.set_home_drives_expanded(home_page.drives_expanded);
-    ui.set_home_network_locations_expanded(home_page.network_locations_expanded);
-    let home_columns = ui.get_home_column_count().max(1) as usize;
-    let quick_access = app
-        .sidebar
-        .iter()
-        .filter(|location| location.kind == KnownLocationKind::Pinned)
-        .cloned()
-        .collect::<Vec<_>>();
-    let drives = app
-        .sidebar
-        .iter()
-        .filter(|location| location.kind == KnownLocationKind::Drive)
-        .cloned()
-        .collect::<Vec<_>>();
-    ui.set_home_quick_access_items(ModelRc::new(VecModel::from(home_item_rows(
-        &app,
-        tab.id,
-        &quick_access,
-        0,
-        home_columns,
-    ))));
-    ui.set_home_drive_items(ModelRc::new(VecModel::from(home_item_rows(
-        &app,
-        tab.id,
-        &drives,
-        1,
-        home_columns,
-    ))));
-    ui.set_home_network_locations_items(ModelRc::new(VecModel::from(home_network_rows(
-        &app,
-        tab.id,
-        home_columns,
-    ))));
-    ui.set_home_selected_id(home_page.selected.unwrap_or_default().into());
-    let view_mode = app
-        .view_mode_for_tab(tab.id)
-        .unwrap_or(app.default_directory_view.view_mode);
-    project_file_geometry(ui, view_mode);
-    ui.set_view_mode(view_mode_to_ui(view_mode));
-    let projected_tab_id = tab.id.0 as i32;
-    let projected_request_id = tab.latest_request().0 as i32;
-    let projection_changed = ui.get_projected_file_tab_id() != projected_tab_id
-        || ui.get_projected_file_request_id() != projected_request_id;
-    if projection_changed {
-        if ui.get_rectangle_selection_pointer_active() {
-            ui.invoke_cancel_rectangle_selection();
-        }
-        if ui.get_projected_file_tab_id() != projected_tab_id || !tab.retains_directory_view() {
-            ui.set_file_viewport_y(0.0);
-            ui.set_search_scroll_y(0.0);
-        }
-        ui.set_projected_file_tab_id(projected_tab_id);
-        ui.set_projected_file_request_id(projected_request_id);
-    }
-    let display_entries = directory_display_entries(tab);
-    let grid_columns = grid_column_count_for_view(ui, view_mode);
-    let total = tab.search_total.unwrap_or(tab.entries.len() as u32);
-    let search_index =
-        search_result_index_at_scroll(ui.get_search_scroll_y(), total, view_mode, grid_columns);
-    let search_window = search_window_for_index(search_index, total, grid_columns);
-    if tab.page_source == PageSource::Search {
-        ui.set_file_viewport_y(search_window_viewport_y(
-            ui.get_search_scroll_y(),
-            search_window,
-            view_mode,
-            grid_columns,
-        ));
-    }
-    let (file_rows, grid_rows) = if view_mode.uses_grid_layout() {
-        let requested_px = grid_thumbnail_request_px(view_mode, ui.window().scale_factor());
-        let grid_rows = if tab.page_source == PageSource::Search {
-            search_window_rows(tab, &app, search_window, Some(requested_px))
-                .chunks(grid_columns)
-                .map(|entries| GridRow {
-                    group_header: false,
-                    group_label: "".into(),
-                    group_detail: "".into(),
-                    group_count: 0,
-                    entries: ModelRc::new(VecModel::from(entries.to_vec())),
-                })
-                .collect::<Vec<_>>()
-        } else {
-            projected_directory_grid_rows(
-                display_entries,
-                tab,
-                texts,
-                &app,
-                grid_columns,
-                requested_px,
-            )
-        };
-        (Vec::new(), grid_rows)
-    } else {
-        let file_rows = if tab.page_source == PageSource::Search {
-            search_window_rows(
-                tab,
-                &app,
-                search_window,
-                file_thumbnail_request_px(view_mode, ui.window().scale_factor()),
-            )
-        } else {
-            projected_directory_rows(
-                display_entries,
-                tab,
-                texts,
-                &app,
-                file_thumbnail_request_px(view_mode, ui.window().scale_factor()),
-            )
-        };
-        (file_rows, Vec::new())
-    };
-    let visible_order = tab.page_source == PageSource::Directory;
-    set_file_rows(ui, file_rows, visible_order);
-    ui.set_grid_column_count(grid_columns as i32);
-    ui.set_grid_rows(ModelRc::new(VecModel::from(grid_rows)));
-    let grouped_grid_enabled = view_mode.uses_grid_layout()
-        && tab.page_source == PageSource::Directory
-        && matches!(
-            tab.visible_location(),
-            Some(NavigationLocation::Directory(_))
-        )
-        && tab
-            .visible_path()
-            .is_some_and(|path| app.directory_preference(path).group_field != GroupField::None);
-    rebuild_grouped_grid_layout(ui, grouped_grid_enabled);
-    rebuild_grid_entry_positions(ui, window_id);
-    let preference_revision = if tab.page_source == PageSource::Search {
-        0
-    } else {
-        tab.visible_path()
-            .map(|path| app.directory_preference(path).group_field.storage_code() as i32)
-            .unwrap_or(0)
-    };
-    ui.set_projected_content_revision(
-        projected_request_id
-            .wrapping_mul(31)
-            .wrapping_add(preference_revision),
-    );
-    ui.set_search_total_items(total.min(i32::MAX as u32) as i32);
-    let visible_path = tab
-        .visible_location()
-        .map(|location| navigation_display_name(location, app.language))
-        .unwrap_or_default();
-    let address_input = if tab.address_editing {
-        tab.address_input.clone()
-    } else {
-        visible_path.clone()
-    };
-    let current_location_path = tab.visible_path();
-    ui.set_current_location_icon(
-        tab.visible_location()
-            .and_then(|location| match location {
-                NavigationLocation::Home | NavigationLocation::WebDav(_) => None,
-                NavigationLocation::Directory(path) => app.icon_cache.get(path),
-                NavigationLocation::Library(library) => app.library_icons.get(&library.identity),
-            })
-            .map(shell_icon_image)
-            .unwrap_or_default(),
-    );
-    ui.set_current_location_is_drive(current_location_path.is_some_and(is_drive_root));
-    ui.set_address_input(address_input.into());
-    ui.set_address_editing(tab.address_editing);
-    ui.set_search_mode(tab.address_mode == AddressMode::Smart);
-    ui.set_search_results_mode(tab.page_source == PageSource::Search);
-    ui.set_search_depth_enabled(matches!(tab.search_scope, SearchScope::Directory(_)));
-    ui.set_search_recursive(tab.search_depth == SearchDepth::Recursive);
-
-    ui.set_status_text(status_text(tab, texts).into());
-    let network_permission = tab.load_state == LoadState::PermissionDenied
-        && tab
-            .requested_location()
-            .as_ref()
-            .and_then(NavigationLocation::directory_path)
-            .is_some_and(crate::network::is_unc_path);
-    let library_failed = tab.load_state == LoadState::Failed
-        && matches!(
-            tab.requested_location(),
-            Some(NavigationLocation::Library(_))
-        );
-    let (error_page_title, error_page_description) = if library_failed {
-        match app.language {
-            Language::Chinese => ("无法打开此库", texts.library_all_sources_failed()),
-            Language::English => (
-                "This library could not be opened",
-                texts.library_all_sources_failed(),
-            ),
-        }
-    } else if network_permission {
-        match app.language {
-            Language::Chinese => (
-                "需要登录此网络位置",
-                "Windows 当前凭据无法访问此位置。登录后会重新读取当前标签页。",
-            ),
-            Language::English => (
-                "Sign-in required",
-                "The current Windows credentials cannot access this location. The tab will retry after sign-in.",
-            ),
-        }
-    } else if tab.page_source == PageSource::Search {
-        search_error_page_text(tab.search_state, texts)
-    } else {
-        error_page_text(tab.load_state, texts)
-    };
-    ui.set_error_page_title(error_page_title.into());
-    ui.set_error_page_description(error_page_description.into());
-    ui.set_active_tab_index(
-        window
-            .tab_order
-            .iter()
-            .position(|id| *id == window.active_tab)
-            .unwrap_or(0) as i32,
-    );
-    ui.set_tabs(ModelRc::new(VecModel::from(
-        window
-            .tab_order
-            .iter()
-            .filter_map(|id| window.tabs.get(id))
-            .map(|tab| TabRow {
-                id: tab.id.0 as i32,
-                title: if tab.kind == TabKind::Settings {
-                    texts.settings().to_owned()
-                } else {
-                    tab.visible_location()
-                        .map(|location| navigation_display_name(location, app.language))
-                        .unwrap_or_else(|| display_path(Path::new("C:\\")))
-                }
-                .into(),
-                active: tab.id == window.active_tab,
-                loading: matches!(tab.load_state, LoadState::Loading | LoadState::Partial),
-                icon: tab
-                    .visible_path()
-                    .and_then(|path| app.icon_cache.get(path))
-                    .map(shell_icon_image)
-                    .unwrap_or_default(),
-                is_drive: tab.visible_path().is_some_and(is_drive_root),
-                is_home: matches!(tab.visible_location(), Some(NavigationLocation::Home)),
-                is_settings: tab.kind == TabKind::Settings,
-            })
-            .collect::<Vec<_>>(),
-    )));
-    breadcrumb::project(ui, tab, app.language);
-    ui.set_back_history(ModelRc::new(VecModel::from(
-        tab.back_history()
-            .iter()
-            .rev()
-            .enumerate()
-            .map(|(index, path)| HistoryRow {
-                index: index as i32,
-                label: navigation_display_name(path, app.language).into(),
-            })
-            .collect::<Vec<_>>(),
-    )));
-    ui.set_forward_history(ModelRc::new(VecModel::from(
-        tab.forward_history()
-            .iter()
-            .rev()
-            .enumerate()
-            .map(|(index, path)| HistoryRow {
-                index: index as i32,
-                label: navigation_display_name(path, app.language).into(),
-            })
-            .collect::<Vec<_>>(),
-    )));
-    let mut sidebar_rows = app
-        .sidebar
-        .iter()
-        .enumerate()
-        .map(|(index, location)| {
-            let (drive_progress, drive_state, drive_status) =
-                if let Some(root) = location.drive_root.as_deref() {
-                    drive_projection(app.language, app.drive_capacity.get(root))
-                } else {
-                    (0.0, 3, String::new())
-                };
-            SidebarRow {
-                index: index as i32,
-                stable_id: format!("location:{index}").into(),
-                label: location.label.as_str().into(),
-                icon_kind: match location.kind {
-                    KnownLocationKind::Drive => 7,
-                    KnownLocationKind::Pinned => 3,
-                },
-                is_drive: location.kind == KnownLocationKind::Drive,
-                drive_progress,
-                drive_state,
-                drive_status: drive_status.into(),
-                group_kind: if location.kind == KnownLocationKind::Drive {
-                    1
-                } else {
-                    0
-                },
-                source_kind: 0,
-                icon: app
-                    .sidebar_icons
-                    .get(&location.path)
-                    .map(shell_icon_image)
-                    .unwrap_or_default(),
-            }
-        })
-        .collect::<Vec<_>>();
-    sidebar_rows.insert(
-        0,
-        SidebarRow {
-            index: -1,
-            stable_id: "".into(),
-            label: match app.language {
-                Language::Chinese => "主页",
-                Language::English => "Home",
-            }
-            .into(),
-            icon_kind: 0,
-            group_kind: 0,
-            source_kind: 0,
-            is_drive: false,
-            icon: Image::default(),
-            drive_progress: 0.0,
-            drive_state: 3,
-            drive_status: "".into(),
-        },
-    );
-    for (row, location) in sidebar_rows.iter_mut().skip(1).zip(app.sidebar.iter()) {
-        if location.kind == KnownLocationKind::Pinned {
-            row.source_kind = 3;
-        }
-    }
-    for library in &app.libraries {
-        sidebar_rows.push(SidebarRow {
-            index: -1,
-            stable_id: library_stable_id(library.id.as_os_str()).into(),
-            label: library.display_name.to_string_lossy().into_owned().into(),
-            icon_kind: 9,
-            group_kind: 4,
-            source_kind: 0,
-            is_drive: false,
-            drive_progress: 0.0,
-            drive_state: 3,
-            drive_status: "".into(),
-            icon: app
-                .library_icons
-                .get(library.id.as_os_str())
-                .map(shell_icon_image)
-                .unwrap_or_default(),
-        });
-    }
-    let mut network_row_index = app.sidebar.len();
-    for location in sorted_network_locations(&app) {
-        let index = network_row_index;
-        network_row_index += 1;
-        sidebar_rows.push(SidebarRow {
-            index: index as i32,
-            stable_id: format!("network-location:{}", location.id).into(),
-            label: location.display_name.clone().into(),
-            icon_kind: 7,
-            group_kind: 2,
-            source_kind: if location.source == NetworkLocationSource::WindowsImported {
-                1
-            } else {
-                2
-            },
-            is_drive: false,
-            drive_progress: 0.0,
-            drive_state: 3,
-            drive_status: "".into(),
-            icon: match &location.target {
-                NetworkTarget::WindowsPath(path) | NetworkTarget::ShellItemId(path) => app
-                    .sidebar_icons
-                    .get(path)
-                    .map(shell_icon_image)
-                    .unwrap_or_default(),
-                NetworkTarget::WebDav(_) => Image::default(),
-            },
-        });
-    }
-    if let Some(discovery) = app.network_discovery.get(&window_id) {
-        for device in discovery.devices() {
-            let Some(_path) = crate::network::device_root_target(device) else {
-                continue;
-            };
-            let index = network_row_index;
-            network_row_index += 1;
-            sidebar_rows.push(SidebarRow {
-                index: index as i32,
-                stable_id: format!("network-device:{index}").into(),
-                label: device.display_name.clone().into(),
-                icon_kind: 7,
-                group_kind: 3,
-                source_kind: 0,
-                is_drive: false,
-                drive_progress: 0.0,
-                drive_state: 3,
-                drive_status: "".into(),
-                icon: Image::default(),
-            });
-        }
-    }
-    ui.set_sidebar_items(ModelRc::new(VecModel::from(sidebar_rows)));
-    let sidebar_visibility_changed = (0..5).any(|index| {
-        let projected = match index {
-            0 => ui.get_quick_access_visible(),
-            1 => ui.get_libraries_visible(),
-            2 => ui.get_drives_visible(),
-            3 => ui.get_network_locations_visible(),
-            _ => ui.get_network_visible(),
-        };
-        projected != app.sidebar_visibility.is_visible(index)
-    });
-    ui.set_quick_access_visible(app.sidebar_visibility.is_visible(0));
-    ui.set_libraries_visible(app.sidebar_visibility.is_visible(1));
-    ui.set_drives_visible(app.sidebar_visibility.is_visible(2));
-    ui.set_network_locations_visible(app.sidebar_visibility.is_visible(3));
-    ui.set_network_visible(app.sidebar_visibility.is_visible(4));
-    if sidebar_visibility_changed {
-        ui.set_sidebar_viewport_y(0.0);
-    }
-
-    let discovery_state = app
-        .network_discovery
-        .get(&window_id)
-        .map(DiscoveryCoordinator::state)
-        .unwrap_or(DiscoveryState::Idle);
-    ui.set_network_discovery_loading(discovery_state == DiscoveryState::Discovering);
-    ui.set_network_discovery_empty(discovery_state == DiscoveryState::Empty);
-    ui.set_network_discovery_error(
-        app.network_discovery_errors
-            .get(&window_id)
-            .cloned()
-            .unwrap_or_default()
-            .into(),
-    );
-    ui.set_selected_count(tab.selected.len() as i32);
-    project_column_layout(ui, tab, &app);
-    let (sort_field, sort_direction) = if tab.page_source == PageSource::Search {
-        (tab.search_sort_field, tab.search_sort_direction)
-    } else {
-        (tab.sort_field, tab.sort_direction)
-    };
-    ui.set_sort_field(sort_field_ui_value(sort_field));
-    ui.set_sort_descending(sort_direction == crate::domain::SortDirection::Descending);
-    let page_projection =
-        agent_debug::page_projection(tab.displayed_load_state(), tab.entries.is_empty());
-    let page_state = if tab.page_source == PageSource::Search {
-        match tab.search_state {
-            SearchState::Searching if tab.entries.is_empty() => 1,
-            SearchState::NoResults => 3,
-            SearchState::NotConfigured
-            | SearchState::Disconnected
-            | SearchState::NotIndexed
-            | SearchState::UnsupportedVersion
-            | SearchState::UnsupportedArchitecture
-            | SearchState::SyntaxError
-            | SearchState::TimedOut
-            | SearchState::Failed => 9,
-            _ => 4,
-        }
-    } else if tab.load_state == LoadState::Failed
-        && !tab.entries.is_empty()
-        && matches!(tab.visible_location(), Some(NavigationLocation::WebDav(_)))
-    {
-        4
-    } else {
-        page_projection.index
-    };
-    loading_hint::project_page_state(ui, state, window_id, tab, projection_changed, page_state);
-    let show_request_access = page_projection
-        .visible_page_operations
-        .contains(&agent_debug::PageOperation::RequestWindowsAccess);
-    ui.set_show_request_access(show_request_access);
-    if show_request_access
-        && tab
-            .requested_location()
-            .as_ref()
-            .and_then(NavigationLocation::directory_path)
-            .is_some_and(crate::network::is_unc_path)
-    {
-        ui.set_text_request_access(
-            match app.language {
-                Language::Chinese => "登录网络位置",
-                Language::English => "Sign in to network location",
-            }
-            .into(),
-        );
-    }
-    ui.set_show_everything_help(
-        tab.page_source == PageSource::Search
-            && matches!(
-                tab.search_state,
-                SearchState::NotConfigured
-                    | SearchState::Disconnected
-                    | SearchState::NotIndexed
-                    | SearchState::UnsupportedVersion
-                    | SearchState::UnsupportedArchitecture
-                    | SearchState::Failed
-            ),
-    );
-    ui.set_show_start_everything(
-        tab.page_source == PageSource::Search && tab.search_state == SearchState::Disconnected,
-    );
-    ui.set_can_navigate_back(
-        !active_is_settings && (tab.has_failed_location() || !tab.back_history().is_empty()),
-    );
-    ui.set_can_navigate_forward(!active_is_settings && !tab.forward_history().is_empty());
-    ui.set_can_navigate_up(
-        !active_is_settings && tab.visible_path().and_then(Path::parent).is_some(),
-    );
-    ui.set_can_refresh(
-        !active_is_settings && !matches!(tab.load_state, LoadState::Loading | LoadState::Partial),
-    );
-    if tab.retains_directory_view() {
-        let maximum = projected_scroll_maximum(ui, view_mode, ui.get_file_viewport_height());
-        ui.set_file_viewport_y(ui.get_file_viewport_y().clamp(-maximum, 0.0));
-    }
-    ui.set_can_close_tab(window.tab_order.len() > 1);
-    ui.set_can_restore_tab(!window.closed_tabs.is_empty());
-    ui.set_language_mode(match app.language {
-        Language::Chinese => 0,
-        Language::English => 1,
-    });
-    ui.set_show_hidden_files(app.file_visibility.show_hidden);
-    ui.set_show_system_files(app.file_visibility.show_system);
-    ui.set_file_list_quick_search(app.file_list_quick_search);
-    ui.set_new_tab_opens_home(app.new_tab_opens_home);
-    ui.set_quick_menu_backdrop(app.quick_menu_backdrop);
-    ui.set_quick_menu_backdrop_opacity(f32::from(app.quick_menu_backdrop_opacity));
-    ui.set_everything_path(
-        app.everything_config
-            .executable_path
-            .as_deref()
-            .map(display_path)
-            .unwrap_or_default()
-            .into(),
-    );
-    ui.set_everything_instance(app.everything_config.instance_name.clone().into());
-    ui.set_everything_status(app.everything_status.clone().into());
-    ui.set_everything_busy(app.everything_busy);
-    ui.set_app_version(env!("CARGO_PKG_VERSION").into());
-    ui.set_theme_mode(match app.theme_mode {
-        session_store::ThemeMode::System => 0,
-        session_store::ThemeMode::Light => 1,
-        session_store::ThemeMode::Dark => 2,
-    });
-    let dark_theme = app.dark_theme();
-    ui.set_dark_theme(dark_theme);
-    ui.set_insertion_indicator_width(platform::windows::tab_insertion_indicator::INDICATOR_WIDTH);
-    let accent = if dark_theme {
-        platform::windows::tab_insertion_indicator::DARK_ACCENT_ARGB
-    } else {
-        platform::windows::tab_insertion_indicator::LIGHT_ACCENT_ARGB
-    };
-    ui.set_insertion_indicator_color(Color::from_argb_encoded(accent));
-    apply_ui_texts(ui, app.language);
 }
 
 fn operation_state_index(state: OperationState) -> i32 {
@@ -33484,7 +32927,7 @@ mod tests {
         tab.load_state = LoadState::Complete;
         tab.select_entry(EntryId(80), false, false);
         let state = Arc::new(Mutex::new(app));
-        refresh_ui_inner(&ui, &state, window_id);
+        refresh_window_ui(&ui, &state, window_id);
         ui.set_file_viewport_y(-1500.0);
         let (sender, receiver) = mpsc::channel();
         assert!(submit_navigation(
@@ -33549,7 +32992,7 @@ mod tests {
                 library: None,
             },
         );
-        refresh_ui_inner(&ui, &state, window_id);
+        refresh_window_ui(&ui, &state, window_id);
         assert_eq!(ui.get_file_viewport_y(), -1500.0);
         assert_eq!(state.lock().unwrap().active().selected, vec![EntryId(120)]);
         // A shorter snapshot clamps the old viewport; navigating away still starts at the top.
@@ -33573,7 +33016,7 @@ mod tests {
                 library: None,
             },
         );
-        refresh_ui_inner(&ui, &state, window_id);
+        refresh_window_ui(&ui, &state, window_id);
         assert_eq!(ui.get_file_viewport_y(), 0.0);
         ui.set_file_viewport_y(-200.0);
         assert!(submit_navigation(
@@ -33584,7 +33027,7 @@ mod tests {
             NavigationKind::Normal,
             None
         ));
-        refresh_ui_inner(&ui, &state, window_id);
+        refresh_window_ui(&ui, &state, window_id);
         assert_eq!(ui.get_file_viewport_y(), 0.0);
     }
 
@@ -33608,7 +33051,7 @@ mod tests {
         tab.select_entry(EntryId(80), false, false);
         let request_id = tab.latest_request();
         let state = Arc::new(Mutex::new(app));
-        refresh_ui_inner(&ui, &state, window_id);
+        refresh_window_ui(&ui, &state, window_id);
         ui.set_file_viewport_y(-1_500.0);
         let target = ShellMenuBackgroundTarget::FileSystem(path.clone());
         let (local, requests) = mpsc::channel();
@@ -33639,7 +33082,7 @@ mod tests {
                 network_requests.try_recv(),
                 Err(mpsc::TryRecvError::Empty)
             ));
-            refresh_ui_inner(&ui, &state, window_id);
+            refresh_window_ui(&ui, &state, window_id);
             assert_eq!(ui.get_file_viewport_y(), -1_500.0);
             let app = state.lock().unwrap();
             let tab = app.tab(tab_id).unwrap();

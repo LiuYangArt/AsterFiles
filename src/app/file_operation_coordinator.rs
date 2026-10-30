@@ -4,8 +4,8 @@ use super::file_operation_worker::{
     FileOperationEvent, FileOperationRequest, undo_source_kind, uses_local_recycle_batch,
 };
 use super::{
-    AppState, SharedSessions, WindowId, queue_completed_focus, queue_completed_rename,
-    refresh_all_windows, refresh_operation_badges, undo_failure_message,
+    AppState, RefreshRegions, SharedSessions, WindowId, queue_completed_focus,
+    queue_completed_rename, refresh_all_windows, refresh_operation_badges, undo_failure_message,
 };
 use crate::{
     domain::{
@@ -295,7 +295,7 @@ fn schedule_operation_notice_clear(state: SharedSessions, generation: u64) {
             {
                 app.operation_notice = None;
             }
-            refresh_all_windows(&state);
+            refresh_all_windows(&state, RefreshRegions::STATUS);
         });
     });
 }
@@ -307,7 +307,7 @@ fn show_operation_notice(state: &SharedSessions, message: String) {
         app.operation_notice = Some((generation, message));
         generation
     };
-    refresh_all_windows(state);
+    refresh_all_windows(state, RefreshRegions::STATUS);
     schedule_operation_notice_clear(state.clone(), generation);
 }
 pub(super) fn request_undo(

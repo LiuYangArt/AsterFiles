@@ -190,7 +190,7 @@ fn issue_133_completed_selection_reveals_real_projected_list_and_grid() {
             let request_id = tab.latest_request();
             focus_bottom_selected_entry(&mut app, tab_id);
             let state = Arc::new(Mutex::new(app));
-            refresh_ui_inner(&ui, &state, window_id);
+            refresh_window_ui(&ui, &state, window_id);
             use i_slint_backend_testing::ElementRoot;
             let _ = ui.root_element().query_descendants().find_all();
             reveal_completed_selection(&ui, &state, tab_id, request_id);
@@ -452,7 +452,7 @@ fn issue_176_delete_completion_fills_the_gap_without_rewinding_any_view() {
                 let state = Arc::new(Mutex::new(app));
                 let ui = AppWindow::new().unwrap();
                 ui.window().set_size(slint::LogicalSize::new(1180.0, 760.0));
-                refresh_ui_inner(&ui, &state, window_id);
+                refresh_window_ui(&ui, &state, window_id);
                 ui.set_file_viewport_y(-800.0);
                 let completion = finish_file_operation(
                     &state,
@@ -475,7 +475,7 @@ fn issue_176_delete_completion_fills_the_gap_without_rewinding_any_view() {
                 let (network_sender, _network_requests) = mpsc::sync_channel(1);
                 refresh_affected_tabs(&sender, &network_sender, &state, &completion.affected);
                 let request = requests.try_recv().unwrap();
-                refresh_ui_inner(&ui, &state, window_id);
+                refresh_window_ui(&ui, &state, window_id);
                 assert_eq!(
                     ui.get_file_viewport_y(),
                     -800.0,
@@ -511,7 +511,7 @@ fn issue_176_delete_completion_fills_the_gap_without_rewinding_any_view() {
                         library: None,
                     },
                 );
-                refresh_ui_inner(&ui, &state, window_id);
+                refresh_window_ui(&ui, &state, window_id);
                 assert_eq!(
                     ui.get_file_viewport_y(),
                     -800.0,

@@ -161,3 +161,7 @@ UI/交互参考 Files， 源码： F:\CodeProjects\Files
 ## 滚动条离窗释放专项验证（#178）
 
 `python tools/build.py test --locked issue_178 -- --nocapture` 使用无窗口后端，检查八种视图及分组中的滚动条拖动、离窗释放、窗外松开或保持按住后回窗，以及重新按下。另检查失焦、遮挡、关闭、显式取消、普通抬起、轨道翻页、横向滚动条、设置页和普通点击、滚轮。随后运行 `python tools/verify.py --quick`，包含 Debug 构建。日志位于 `artifacts/logs/issue-178/`，专项退出码位于 `artifacts/state/issue-178/tests-result.json`，统一汇总为 `artifacts/verify/summary.json`。真实窗口边界、失焦和 Esc 由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
+
+## 窗口区域刷新专项验证（#162）
+
+`python tools/build.py test --locked issue_162 -- --nocapture --test-threads=1` 检查八种视图和类型分组的非内容刷新模型身份、任务进度、跨列重排锚点、选择和重命名，以及后台标签和过期请求隔离。随后分别运行 `issue_141`（加 `--test-threads=1`）、`issue_134`、`issue_146`、`issue_154`、`issue_155`、`issue_156` 专项及完整 `python tools/verify.py`，包含 Debug 构建。日志位于 `artifacts/logs/issue-162/`，性能前后对比位于 `artifacts/perf/issue-162/`，统一汇总为 `artifacts/verify/summary.json`。真实缩放、视图、重命名和大目录加载由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
