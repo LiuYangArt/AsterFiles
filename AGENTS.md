@@ -157,3 +157,7 @@ UI/交互参考 Files， 源码： F:\CodeProjects\Files
 ## Temp 监听循环与刷新保留专项验证（#176）
 
 `python tools/build.py test --locked issue_176 -- --nocapture` 检查内部工作目录过滤、真实辅助进程、刷新期间的旧列表、按原始路径恢复最新选择、焦点与范围起点，以及八种视图和分组中的应用内删除补位、滚动保留、连续后台刷新隔离、通知合并和完成后 1 秒间隔。随后分别运行 `issue_133`、`issue_138`、`issue_150`、`issue_153` 专项及完整 `python tools/verify.py`，包含 Debug 构建。日志位于 `artifacts/logs/issue-176/`，统一汇总为 `artifacts/verify/summary.json`。真实 Temp 浏览和外部变化由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
+
+## 滚动条离窗释放专项验证（#178）
+
+`python tools/build.py test --locked issue_178 -- --nocapture` 使用无窗口后端，检查八种视图及分组中的滚动条拖动、离窗释放、窗外松开或保持按住后回窗，以及重新按下。另检查失焦、遮挡、关闭、显式取消、普通抬起、轨道翻页、横向滚动条、设置页和普通点击、滚轮。随后运行 `python tools/verify.py --quick`，包含 Debug 构建。日志位于 `artifacts/logs/issue-178/`，专项退出码位于 `artifacts/state/issue-178/tests-result.json`，统一汇总为 `artifacts/verify/summary.json`。真实窗口边界、失焦和 Esc 由用户手动验收，步骤见 `docs/agent/debug-validation.md`。

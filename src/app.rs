@@ -82,6 +82,8 @@ mod loading_hint;
 mod network_sort_tests;
 mod rename_updates;
 #[cfg(test)]
+mod scrollbar_tests;
+#[cfg(test)]
 mod selection_scale_tests;
 #[cfg(test)]
 mod test_support;
@@ -14308,6 +14310,31 @@ fn native_file_drag_action(event: &winit::event::WindowEvent) -> Option<NativeFi
     }
 }
 
+fn cancel_scrollbar_pointer(ui: &AppWindow) -> bool {
+    if !ui.get_scrollbar_pointer_active() {
+        return false;
+    }
+    // Slint keeps its mouse grab on Windows CursorLeft while a button is held (#178).
+    // Exit cancels that grab without synthesizing a click or affecting other gestures.
+    ui.window()
+        .dispatch_event(slint::platform::WindowEvent::PointerExited);
+    true
+}
+
+fn prepare_scrollbar_event(ui: &AppWindow, event: &winit::event::WindowEvent) {
+    use winit::event::WindowEvent;
+    if matches!(
+        event,
+        WindowEvent::CursorLeft { .. }
+            | WindowEvent::Focused(false)
+            | WindowEvent::Occluded(true)
+            | WindowEvent::CloseRequested
+            | WindowEvent::Destroyed
+    ) {
+        cancel_scrollbar_pointer(ui);
+    }
+}
+
 fn prepare_context_menu_event(
     ui: &AppWindow,
     event: &winit::event::WindowEvent,
@@ -14425,6 +14452,7 @@ fn wire_mouse_navigation(
     ui.window().on_winit_window_event(move |window, event| {
         handle_window_adaptation(window, event, &mut installed_hwnd);
         if let Some(ui) = weak.upgrade() {
+            prepare_scrollbar_event(&ui, event);
             let position = || {
                 cursor_position
                     .get()
@@ -14630,7 +14658,7 @@ fn wire_mouse_navigation(
                     && matches!(event.logical_key, Key::Named(NamedKey::Escape))
         ) {
             let type_select_active = type_select.borrow_mut().clear();
-            let mut cancelled = false;
+            let mut cancelled = cancel_scrollbar_pointer(&ui);
             if ui.get_rectangle_selection_pointer_active() {
                 ui.invoke_cancel_rectangle_selection();
                 cancelled = true;

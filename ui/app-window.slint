@@ -760,6 +760,7 @@ component LightScrollBar inherits Rectangle {
     in property <length> maximum;
     in property <length> page-size;
     callback scrolled(length);
+    callback pointer-active-changed(bool);
 
     width: 12px;
     visible: root.maximum > 0px;
@@ -786,6 +787,8 @@ component LightScrollBar inherits Rectangle {
         property <bool> dragging-thumb;
         pointer-event(event) => {
             if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                root.pointer-active-changed(true);
+                self.dragging-thumb = false;
                 if self.mouse-y < thumb.y {
                     root.scrolled(min(0px, root.value + root.page-size));
                 } else if self.mouse-y > thumb.y + thumb.height {
@@ -796,8 +799,9 @@ component LightScrollBar inherits Rectangle {
                     self.dragging-thumb = true;
                 }
             }
-            if event.button == PointerEventButton.left && event.kind == PointerEventKind.up {
+            if event.kind == PointerEventKind.cancel || (event.button == PointerEventButton.left && event.kind == PointerEventKind.up) {
                 self.dragging-thumb = false;
+                root.pointer-active-changed(false);
             }
         }
         moved => {
@@ -1574,6 +1578,7 @@ export component AppWindow inherits Window {
     private property <length> rectangle-selection-y: 0px;
     private property <length> rectangle-selection-width: 0px;
     private property <length> rectangle-selection-height: 0px;
+    in-out property <bool> scrollbar-pointer-active: false;
     in-out property <length> file-viewport-x: 0px;
     in-out property <length> normal-name-width: 480px;
     in-out property <length> normal-kind-width: 160px;
@@ -2589,8 +2594,12 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                             private property <length> press-value;
                             pointer-event(event) => {
                                 if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                                    root.scrollbar-pointer-active = true;
                                     self.press-x = self.mouse-x;
                                     self.press-value = root.file-viewport-x;
+                                }
+                                if event.kind == PointerEventKind.cancel || (event.button == PointerEventButton.left && event.kind == PointerEventKind.up) {
+                                    root.scrollbar-pointer-active = false;
                                 }
                             }
                             moved => {
@@ -2835,6 +2844,7 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                         border-width: 1px;
                     }
                     LightScrollBar {
+                        pointer-active-changed(active) => { root.scrollbar-pointer-active = active; }
                         x: parent.width - self.width - 9px;
                         height: parent.height;
                         value: root.search-results-mode ? root.search-scroll-y : root.file-viewport-y;
@@ -3187,6 +3197,7 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                         }
                     }
                     LightScrollBar {
+                        pointer-active-changed(active) => { root.scrollbar-pointer-active = active; }
                         x: parent.width - self.width;
                         height: parent.height;
                         value: settings-scroll.viewport-y;
