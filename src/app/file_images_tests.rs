@@ -57,6 +57,74 @@ fn icon_event(request: IconRequest, value: u8) -> IconEvent {
 }
 
 #[test]
+fn issue_176_retained_refresh_does_not_reuse_independent_icons_by_old_id() {
+    i_slint_backend_testing::init_no_event_loop();
+    let (state, _ui) = fixture(1, "exe", 1);
+    let old = state.lock().unwrap().active().entries[0].clone();
+    let path = old.path.parent().unwrap().to_path_buf();
+    let (sender, receiver) = mpsc::channel();
+    assert!(submit_navigation(
+        &sender,
+        &state,
+        TabId(1),
+        path.clone(),
+        NavigationKind::BackgroundRefresh,
+        None
+    ));
+    let request = receiver.try_recv().unwrap();
+    let icon = ordinary_icon_request(
+        &mut state.lock().unwrap(),
+        TabId(1),
+        request.request_id,
+        &old,
+    )
+    .unwrap();
+    assert!(apply_icon_event(&state, icon_event(icon, 176)).is_some());
+    assert!(
+        state
+            .lock()
+            .unwrap()
+            .icons
+            .contains_key(&(TabId(1), request.request_id, EntryId(1)))
+    );
+    let mut replacement = entry(1, "exe", 1);
+    replacement.path = path.join("replacement.exe");
+    apply_event(
+        &state,
+        DirectoryEvent::Batch {
+            tab_id: TabId(1),
+            request_id: request.request_id,
+            entries: vec![replacement],
+            acknowledgement: mpsc::channel().0,
+        },
+    );
+    apply_event(
+        &state,
+        DirectoryEvent::Finished {
+            tab_id: TabId(1),
+            request_id: request.request_id,
+            path,
+            skipped: 0,
+            source_failures: 0,
+            library: None,
+        },
+    );
+    let app = state.lock().unwrap();
+    assert!(
+        !app.icons
+            .contains_key(&(TabId(1), request.request_id, EntryId(1)))
+    );
+    assert!(app.icon_cache.contains_key(&old.path));
+    assert_eq!(
+        file_images::row_image(&app.active().entries[0], app.active(), &app, None)
+            .0
+            .size()
+            .width,
+        0
+    );
+}
+
+#[test]
 fn issue_175_icons_real_shell_and_pixel_updates_stay_viewport_bounded() {
     i_slint_backend_testing::init_no_event_loop();
     let (state, ui) = fixture(100_000, "txt", 0);

@@ -46,7 +46,10 @@ impl StreamFiles {
             .unwrap_or_default()
             .as_nanos();
         let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().join(crate::fs::DIRECTORY_WORK_ROOT);
+        // Keep the shared root: creating/removing a sibling per load feeds Temp's watcher.
+        std::fs::create_dir_all(&root)?;
+        let path = root.join(format!(
             "asterfiles-directory-{}-{stamp}-{sequence}",
             std::process::id()
         ));
@@ -569,6 +572,45 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[test]
+    fn issue_176_real_directory_stream_in_work_parent_has_no_visible_work_changes() {
+        let files = StreamFiles::create().unwrap();
+        let parent = files.0.parent().unwrap().to_path_buf();
+        assert_eq!(
+            parent,
+            std::env::temp_dir().join(crate::fs::DIRECTORY_WORK_ROOT)
+        );
+        assert!(
+            crate::fs::read_path_entry(
+                &parent,
+                FileVisibility {
+                    show_hidden: true,
+                    show_system: true
+                },
+                1
+            )
+            .unwrap()
+            .is_none()
+        );
+        // Exercise the real helper against its own work parent without enumerating user Temp.
+        let mut entries = Vec::new();
+        isolated_directory(
+            &parent,
+            FileVisibility::default(),
+            &AtomicBool::new(false),
+            |batch| {
+                entries.extend(batch);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(entries.is_empty());
+        let work_path = files.0.clone();
+        drop(files);
+        assert!(!work_path.exists());
+        assert!(parent.is_dir());
+    }
+
     fn entry(id: u32) -> FileEntry {
         let name = OsString::from(format!("file-{id}"));
         FileEntry {
@@ -994,7 +1036,8 @@ mod tests {
     #[test]
     fn issue_104_library_stream_preserves_cleanup_filter_and_local_folder_size_queries() {
         let fixture = StreamFiles::create().unwrap();
-        let data = fixture.0.join("data");
+        // Source fixtures are ordinary folders, not part of the reserved protocol workspace.
+        let data = std::env::temp_dir().join(fixture.0.file_name().unwrap());
         std::fs::create_dir(&data).unwrap();
         for name in [".asterfiles-cleanup", ".ASTERFILES-CLEANUP-copy", "folder"] {
             std::fs::create_dir(data.join(name)).unwrap();
@@ -1050,7 +1093,8 @@ mod tests {
     #[test]
     fn issue_103_streams_4096_4097_and_8193_real_files_without_duplicates() {
         let fixture = StreamFiles::create().unwrap();
-        let data = fixture.0.join("data");
+        // Source fixtures are ordinary folders, not part of the reserved protocol workspace.
+        let data = std::env::temp_dir().join(fixture.0.file_name().unwrap());
         std::fs::create_dir(&data).unwrap();
         let mut created = 0;
         for count in [4096, 4097, 8193] {

@@ -4992,7 +4992,9 @@ fn submit_navigation(
     kind: NavigationKind,
     reveal: Option<PathBuf>,
 ) -> bool {
-    if crate::domain::folder_size_scheduler::is_internal_cleanup_path(&path) {
+    if crate::domain::folder_size_scheduler::is_internal_cleanup_path(&path)
+        || crate::fs::is_directory_work_path(&path)
+    {
         return false;
     }
     let request = {
@@ -5053,7 +5055,9 @@ fn submit_network_navigation(
     kind: NavigationKind,
     reveal: Option<PathBuf>,
 ) -> bool {
-    if crate::domain::folder_size_scheduler::is_internal_cleanup_path(&path) {
+    if crate::domain::folder_size_scheduler::is_internal_cleanup_path(&path)
+        || crate::fs::is_directory_work_path(&path)
+    {
         return false;
     }
     let request = {
@@ -18786,12 +18790,15 @@ fn refresh_affected_tabs(
             state,
             tab,
             location,
-            NavigationKind::Refresh,
-        ) && let Some(mut pending) = pending
-            && let Ok(mut app) = state.lock()
-        {
-            pending.request_id = app.tab(tab).map(|session| session.latest_request());
-            app.focus_after_refresh.insert(tab, pending);
+            NavigationKind::BackgroundRefresh,
+        ) {
+            if let Some(mut pending) = pending
+                && let Ok(mut app) = state.lock()
+            {
+                pending.request_id = app.tab(tab).map(|session| session.latest_request());
+                app.focus_after_refresh.insert(tab, pending);
+            }
+            refresh_tab_window(state, tab);
         }
     }
 }
@@ -18865,6 +18872,12 @@ fn start_event_pump(
                                 app.tab(tab_id)
                                     .and_then(TabSession::visible_path)
                                     .is_some_and(crate::network::is_unc_path)
+                            })
+                        });
+                        let retained_refresh = finished.is_some_and(|(tab_id, _)| {
+                            state.lock().ok().is_some_and(|app| {
+                                app.tab(tab_id)
+                                    .is_some_and(TabSession::retains_directory_view)
                             })
                         });
                         let network_root_finished = finished.is_some_and(|(tab_id, request_id)| {
@@ -18999,9 +19012,9 @@ fn start_event_pump(
                                     reveal_completed_selection(
                                         &target_ui, &state, tab_id, request_id,
                                     );
-                                } else if let Some(entry_id) =
-                                    focused.filter(|_| !network_tab || focus_action.is_some())
-                                {
+                                } else if let Some(entry_id) = focused.filter(|_| {
+                                    focus_action.is_some() || (!network_tab && !retained_refresh)
+                                }) {
                                     reveal_entry(&target_ui, &state, tab_id, request_id, entry_id);
                                 }
                                 submit_visible_shortcuts(
@@ -19443,6 +19456,13 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> DirectoryEventC
                 .as_ref()
                 .map(|_| app.default_directory_view)
                 .unwrap_or_else(|| app.directory_preference(&path));
+            if app
+                .tab(tab_id)
+                .is_some_and(TabSession::retains_directory_view)
+            {
+                // The retained snapshot used this request ID with different entry IDs.
+                app.icons.retain(|(icon_tab, _, _), _| *icon_tab != tab_id);
+            }
             let (location_path, shell_created) = {
                 let tab = app.tab_mut(tab_id).expect("accepted tab exists");
                 let warning = if source_failures > 0 {
@@ -20825,7 +20845,9 @@ fn visible_shortcut_entry_ids(ui: &AppWindow, app: &AppState, tab: &TabSession) 
     let view_mode = app
         .view_mode_for_tab(tab.id)
         .unwrap_or(app.default_directory_view.view_mode);
-    if matches!(tab.load_state, LoadState::Loading | LoadState::Partial) {
+    if matches!(tab.load_state, LoadState::Loading | LoadState::Partial)
+        && !tab.retains_directory_view()
+    {
         let columns = if view_mode.uses_grid_layout() {
             ui.get_grid_column_count().max(1) as usize
         } else {
@@ -21039,7 +21061,8 @@ fn apply_shortcut_event(state: &SharedSessions, event: ShortcutEvent) -> Option<
     if !tab.accepts(event.request.request_id) || tab.page_source != PageSource::Directory {
         return None;
     }
-    let was_partial = matches!(tab.load_state, LoadState::Loading | LoadState::Partial);
+    let was_partial = matches!(tab.load_state, LoadState::Loading | LoadState::Partial)
+        && !tab.retains_directory_view();
     let changed = tab.apply_shortcut_target(
         event.request.entry_id,
         &event.request.path,
@@ -22431,6 +22454,18 @@ fn append_active_file_rows(
     if tab.latest_request() != request_id || tab.load_state != LoadState::Partial {
         return;
     }
+    if tab.retains_directory_view() {
+        let projection_current = ui.get_projected_file_tab_id() == tab_id.0 as i32
+            && ui.get_projected_file_request_id() == request_id.0 as i32;
+        if projection_current {
+            ui.set_status_text(status_text(tab, Texts::new(app.language)).into());
+        } else {
+            let window_id = app.active_window;
+            drop(app);
+            refresh_window_ui(ui, state, window_id);
+        }
+        return;
+    }
     let model = ui.get_files();
     let Some(model) = model.as_any().downcast_ref::<VecModel<FileRow>>() else {
         drop(app);
@@ -23750,7 +23785,9 @@ fn projected_directory_grid_rows(
     .collect()
 }
 fn directory_display_entries(tab: &TabSession) -> &[FileEntry] {
-    if matches!(tab.load_state, LoadState::Loading | LoadState::Partial) {
+    if tab.retains_directory_view() {
+        &tab.entries
+    } else if matches!(tab.load_state, LoadState::Loading | LoadState::Partial) {
         tab.pending_entries()
     } else if tab.has_failed_location() {
         &[]
@@ -23972,8 +24009,10 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
         if ui.get_rectangle_selection_pointer_active() {
             ui.invoke_cancel_rectangle_selection();
         }
-        ui.set_file_viewport_y(0.0);
-        ui.set_search_scroll_y(0.0);
+        if ui.get_projected_file_tab_id() != projected_tab_id || !tab.retains_directory_view() {
+            ui.set_file_viewport_y(0.0);
+            ui.set_search_scroll_y(0.0);
+        }
         ui.set_projected_file_tab_id(projected_tab_id);
         ui.set_projected_file_request_id(projected_request_id);
     }
@@ -24361,7 +24400,8 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     };
     ui.set_sort_field(sort_field_ui_value(sort_field));
     ui.set_sort_descending(sort_direction == crate::domain::SortDirection::Descending);
-    let page_projection = agent_debug::page_projection(tab.load_state, tab.entries.is_empty());
+    let page_projection =
+        agent_debug::page_projection(tab.displayed_load_state(), tab.entries.is_empty());
     let page_state = if tab.page_source == PageSource::Search {
         match tab.search_state {
             SearchState::Searching if tab.entries.is_empty() => 1,
@@ -24429,6 +24469,10 @@ fn refresh_ui_inner(ui: &AppWindow, state: &SharedSessions, window_id: WindowId)
     ui.set_can_refresh(
         !active_is_settings && !matches!(tab.load_state, LoadState::Loading | LoadState::Partial),
     );
+    if tab.retains_directory_view() {
+        let maximum = projected_scroll_maximum(ui, view_mode, ui.get_file_viewport_height());
+        ui.set_file_viewport_y(ui.get_file_viewport_y().clamp(-maximum, 0.0));
+    }
     ui.set_can_close_tab(window.tab_order.len() > 1);
     ui.set_can_restore_tab(!window.closed_tabs.is_empty());
     ui.set_language_mode(match app.language {
@@ -24623,7 +24667,7 @@ fn status_text(tab: &TabSession, texts: Texts) -> String {
             Language::English => format!("{} selected", tab.selected.len()),
         };
     }
-    match tab.load_state {
+    match tab.displayed_load_state() {
         LoadState::Complete => texts.items(
             tab.entries.len(),
             tab.error
@@ -33395,6 +33439,127 @@ mod tests {
             Color::from_argb_u8(0xff, 0x32, 0x34, 0x37)
         );
     }
+    #[test]
+    fn issue_176_refresh_projection_keeps_rows_selection_and_scroll() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().unwrap();
+        let path = PathBuf::from(r"C:\files");
+        let mut app = AppState::new_for_test(vec![path.clone()], 0, [0, 1, 2, 3]);
+        let tab_id = app.active_window_state().active_tab;
+        let window_id = app.active_window;
+        let tab = app.tab_mut(tab_id).unwrap();
+        tab.replace_entries(
+            (1..=200)
+                .map(|id| focus_entry(id, &format!(r"C:\files\file{id:03}.txt")))
+                .collect(),
+        );
+        tab.load_state = LoadState::Complete;
+        tab.select_entry(EntryId(80), false, false);
+        let state = Arc::new(Mutex::new(app));
+        refresh_ui_inner(&ui, &state, window_id);
+        ui.set_file_viewport_y(-1500.0);
+        let (sender, receiver) = mpsc::channel();
+        assert!(submit_navigation(
+            &sender,
+            &state,
+            tab_id,
+            path.clone(),
+            NavigationKind::BackgroundRefresh,
+            None
+        ));
+        let request = receiver.try_recv().unwrap();
+        assert_eq!(ui.get_file_viewport_y(), -1500.0);
+        assert_eq!(ui.get_files().row_count(), 200);
+        assert!(!ui.get_loading_hint_visible());
+        assert!(!ui.get_status_text().contains("Loading"));
+        apply_event(
+            &state,
+            DirectoryEvent::Batch {
+                tab_id,
+                request_id: request.request_id,
+                entries: (1..=200)
+                    .map(|id| focus_entry(201 - id, &format!(r"C:\files\file{id:03}.txt")))
+                    .collect(),
+                acknowledgement: mpsc::channel().0,
+            },
+        );
+        append_active_file_rows(&ui, &state, tab_id, request.request_id);
+        assert_eq!(
+            ui.get_projected_file_request_id(),
+            request.request_id.0 as i32
+        );
+        let (_, changed) = mutate_window_selection(&state, window_id, |tab| {
+            tab.select_entry(EntryId(81), false, false)
+        })
+        .unwrap();
+        update_file_rows(&ui, &state, tab_id, &changed);
+        assert!(
+            ui.get_files()
+                .iter()
+                .any(|row| row.id == 81 && row.selected)
+        );
+        assert_eq!(ui.get_file_viewport_y(), -1500.0);
+        assert_eq!(ui.get_files().row_count(), 200);
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .active()
+                .visible_entry(EntryId(80))
+                .unwrap()
+                .path,
+            path.join("file080.txt")
+        );
+        apply_event(
+            &state,
+            DirectoryEvent::Finished {
+                tab_id,
+                request_id: request.request_id,
+                path: path.clone(),
+                skipped: 0,
+                source_failures: 0,
+                library: None,
+            },
+        );
+        refresh_ui_inner(&ui, &state, window_id);
+        assert_eq!(ui.get_file_viewport_y(), -1500.0);
+        assert_eq!(state.lock().unwrap().active().selected, vec![EntryId(120)]);
+        // A shorter snapshot clamps the old viewport; navigating away still starts at the top.
+        assert!(submit_navigation(
+            &sender,
+            &state,
+            tab_id,
+            path.clone(),
+            NavigationKind::BackgroundRefresh,
+            None
+        ));
+        let request = receiver.try_recv().unwrap();
+        apply_event(
+            &state,
+            DirectoryEvent::Finished {
+                tab_id,
+                request_id: request.request_id,
+                path,
+                skipped: 0,
+                source_failures: 0,
+                library: None,
+            },
+        );
+        refresh_ui_inner(&ui, &state, window_id);
+        assert_eq!(ui.get_file_viewport_y(), 0.0);
+        ui.set_file_viewport_y(-200.0);
+        assert!(submit_navigation(
+            &sender,
+            &state,
+            tab_id,
+            PathBuf::from(r"C:\other"),
+            NavigationKind::Normal,
+            None
+        ));
+        refresh_ui_inner(&ui, &state, window_id);
+        assert_eq!(ui.get_file_viewport_y(), 0.0);
+    }
+
     #[test]
     fn issue_125_open_with_completion_keeps_list_position_and_selection() {
         use platform::windows::context_menu::{ClassicMenuInvocation, ShellMenuBackgroundTarget};

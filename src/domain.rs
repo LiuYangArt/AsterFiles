@@ -48,6 +48,7 @@ pub enum NavigationKind {
     Back,
     Forward,
     Refresh,
+    BackgroundRefresh,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -723,6 +724,7 @@ pub struct TabSession {
     pub search_page_retries: HashMap<u32, u8>,
     directory_snapshot: Option<DirectorySnapshot>,
     navigation_kind: NavigationKind,
+    retain_directory_view: bool,
     back_history: Vec<NavigationLocation>,
     forward_history: Vec<NavigationLocation>,
     pub entries: Arc<Vec<FileEntry>>,
@@ -765,6 +767,7 @@ impl TabSession {
             search_page_retries: HashMap::new(),
             directory_snapshot: None,
             navigation_kind: NavigationKind::Normal,
+            retain_directory_view: false,
             back_history: Vec::new(),
             forward_history: Vec::new(),
             entries: Arc::new(Vec::new()),
@@ -803,6 +806,20 @@ impl TabSession {
 
     pub fn requested_location(&self) -> &Option<NavigationLocation> {
         &self.requested_location
+    }
+
+    pub fn retains_directory_view(&self) -> bool {
+        self.retain_directory_view && self.page_source == PageSource::Directory
+    }
+
+    pub fn displayed_load_state(&self) -> LoadState {
+        if self.retains_directory_view()
+            && matches!(self.load_state, LoadState::Loading | LoadState::Partial)
+        {
+            LoadState::Complete
+        } else {
+            self.load_state
+        }
     }
 
     pub fn navigation_kind(&self) -> NavigationKind {
@@ -854,6 +871,7 @@ impl TabSession {
             search_page_retries: HashMap::new(),
             directory_snapshot: None,
             navigation_kind: NavigationKind::Normal,
+            retain_directory_view: false,
             back_history: source.back_history.clone(),
             forward_history: source.forward_history.clone(),
             entries: source.entries.clone(),
@@ -1039,6 +1057,7 @@ impl TabSession {
             });
         }
         self.page_source = PageSource::Search;
+        self.retain_directory_view = false;
         self.address_mode = AddressMode::Smart;
         self.address_editing = true;
         self.search_scope = scope;
@@ -1121,6 +1140,13 @@ impl TabSession {
                 self.visible_location()
             ),
         );
+        self.retain_directory_view = kind == NavigationKind::BackgroundRefresh
+            && (self.load_state == LoadState::Complete || self.retain_directory_view)
+            && self.page_source == PageSource::Directory
+            && self.current_location.as_ref() == Some(&location)
+            && location
+                .directory_path()
+                .is_some_and(|path| !crate::network::is_unc_path(path));
         self.requested_location = Some(location);
         self.page_source = PageSource::Directory;
         self.directory_snapshot = None;
@@ -1152,6 +1178,7 @@ impl TabSession {
         self.cancel_pending();
         self.latest_request.0 += 1;
         self.navigation_kind = kind;
+        self.retain_directory_view = false;
         self.commit_location(NavigationLocation::Home);
         self.page_source = PageSource::Directory;
         self.directory_snapshot = None;
@@ -1232,6 +1259,24 @@ impl TabSession {
             self.sort_direction = preference.sort_direction;
             self.sort_pending();
         }
+        // Enumeration IDs are request-local. Resolve the user's latest choices by raw path.
+        let retained = self.retains_directory_view().then(|| {
+            let selected = self
+                .selected
+                .iter()
+                .filter_map(|id| self.visible_entry(*id))
+                .map(|entry| entry.path.clone())
+                .collect::<HashSet<_>>();
+            let focused = self
+                .focused
+                .and_then(|id| self.visible_entry(id))
+                .map(|entry| entry.path.clone());
+            let anchor = self
+                .selection_anchor
+                .and_then(|id| self.visible_entry(id))
+                .map(|entry| entry.path.clone());
+            (selected, focused, anchor)
+        });
         self.commit_pending();
         let selection = preserve_selection
             .then(|| (self.selected.clone(), self.focused, self.selection_anchor));
@@ -1240,6 +1285,24 @@ impl TabSession {
             self.selected = selected;
             self.focused = focused;
             self.selection_anchor = anchor;
+        }
+        if let Some((selected, focused, anchor)) = retained {
+            self.selected = self
+                .entries
+                .iter()
+                .filter(|entry| selected.contains(&entry.path))
+                .map(|entry| entry.id)
+                .collect();
+            self.focused = self
+                .entries
+                .iter()
+                .find(|entry| Some(&entry.path) == focused.as_ref())
+                .map(|entry| entry.id);
+            self.selection_anchor = self
+                .entries
+                .iter()
+                .find(|entry| Some(&entry.path) == anchor.as_ref())
+                .map(|entry| entry.id);
         }
         self.error = warning;
         true
@@ -1324,7 +1387,7 @@ impl TabSession {
             } else if self.page_source == PageSource::Directory
                 && matches!(self.load_state, LoadState::Loading | LoadState::Partial)
             {
-                if self.load_state == LoadState::Partial {
+                if self.load_state == LoadState::Partial && !self.retains_directory_view() {
                     self.clear_selection();
                 }
                 self.discard_pending();
@@ -1370,6 +1433,7 @@ impl TabSession {
 
     fn append_pending(&mut self, mut entries: Vec<FileEntry>) -> usize {
         let previous_len = self.pending_entries.len();
+        let retain_view = self.retains_directory_view();
         let field = self.sort_field;
         let direction = self.sort_direction;
         entries.sort_unstable_by(|left, right| compare_entries(left, right, field, direction));
@@ -1381,8 +1445,10 @@ impl TabSession {
                     compare_entries(last, first, field, direction) != Ordering::Greater
                 });
         if append_only {
-            for (offset, entry) in entries.iter().enumerate() {
-                self.entry_indices.insert(entry.id, previous_len + offset);
+            if !retain_view {
+                for (offset, entry) in entries.iter().enumerate() {
+                    self.entry_indices.insert(entry.id, previous_len + offset);
+                }
             }
             self.pending_entries.append(&mut entries);
         } else {
@@ -1406,12 +1472,14 @@ impl TabSession {
             }
             merged.extend(existing);
             self.pending_entries = merged;
-            self.entry_indices = self
-                .pending_entries
-                .iter()
-                .enumerate()
-                .map(|(index, entry)| (entry.id, index))
-                .collect();
+            if !retain_view {
+                self.entry_indices = self
+                    .pending_entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| (entry.id, index))
+                    .collect();
+            }
         }
         if self.page_source == PageSource::Search {
             self.search_state = SearchState::Partial;
@@ -1597,7 +1665,7 @@ impl TabSession {
                     self.back_history.extend(traversed.into_iter().skip(1));
                 }
             }
-            NavigationKind::Refresh => {}
+            NavigationKind::Refresh | NavigationKind::BackgroundRefresh => {}
         }
         self.current_location = Some(location);
         self.requested_location = None;
@@ -1625,7 +1693,7 @@ impl TabSession {
     }
 
     pub fn visible_entries(&self) -> &[FileEntry] {
-        if matches!(self.load_state, LoadState::Partial) {
+        if self.load_state == LoadState::Partial && !self.retains_directory_view() {
             &self.pending_entries
         } else {
             &self.entries
@@ -1647,7 +1715,9 @@ impl TabSession {
         let Some(index) = self.visible_entry_index(entry_id) else {
             return false;
         };
-        if matches!(self.load_state, LoadState::Loading | LoadState::Partial) {
+        if matches!(self.load_state, LoadState::Loading | LoadState::Partial)
+            && !self.retains_directory_view()
+        {
             return self.pending_entries.get_mut(index).is_some_and(|entry| {
                 entry.set_shortcut_target(entry_id, original_path, target, is_directory)
             });
@@ -1808,17 +1878,21 @@ impl TabSession {
         let direction = self.sort_direction;
         self.pending_entries
             .sort_unstable_by(|left, right| compare_entries(left, right, field, direction));
-        self.entry_indices = self
-            .pending_entries
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| (entry.id, index))
-            .collect();
+        if !self.retains_directory_view() {
+            self.entry_indices = self
+                .pending_entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (entry.id, index))
+                .collect();
+        }
     }
     pub fn resort_entries(&mut self) {
         if matches!(self.load_state, LoadState::Loading | LoadState::Partial) {
             self.sort_pending();
-            return;
+            if !self.retains_directory_view() {
+                return;
+            }
         }
         let field = self.sort_field;
         let direction = self.sort_direction;
@@ -2260,6 +2334,125 @@ mod tests {
         assert!(tab.back_target().is_none());
         assert_eq!(tab.forward_target(), Some(location));
         assert!(tab.error.is_none());
+    }
+
+    #[test]
+    fn issue_176_local_refresh_keeps_snapshot_and_remaps_latest_selection_by_path() {
+        let location = NavigationLocation::Directory(r"C:\fixture".into());
+        let mut tab = TabSession::new_at(TabId(1), location.clone());
+        tab.replace_entries(vec![
+            entry(1, "a", EntryKind::File, None),
+            entry(2, "b", EntryKind::File, None),
+        ]);
+        tab.load_state = LoadState::Complete;
+        tab.select_entry(EntryId(1), false, false);
+        let preference = DirectoryViewPreference::default();
+        let (request, _) =
+            tab.begin_navigation(location.clone(), NavigationKind::BackgroundRefresh);
+        assert!(tab.retains_directory_view());
+        assert_eq!(tab.displayed_load_state(), LoadState::Complete);
+        assert!(tab.accept_directory_batch(
+            request,
+            vec![entry(1, "b", EntryKind::File, None)],
+            preference
+        ));
+        assert_eq!(tab.visible_entry(EntryId(1)).unwrap().display_name, "a");
+        assert_eq!(tab.visible_entry(EntryId(2)).unwrap().display_name, "b");
+        // A user choice made while the next snapshot loads wins over the pre-refresh choice.
+        tab.select_entry(EntryId(2), false, false);
+        assert!(tab.accept_directory_batch(
+            request,
+            vec![entry(2, "a", EntryKind::File, None)],
+            preference
+        ));
+        tab.set_sort(SortField::Name);
+        assert_eq!(tab.visible_entry(EntryId(2)).unwrap().display_name, "b");
+        assert!(tab.finish_directory_navigation(
+            request,
+            location,
+            DirectoryViewPreference {
+                sort_direction: SortDirection::Descending,
+                ..preference
+            },
+            None
+        ));
+        assert_eq!(tab.selected, vec![EntryId(1)]);
+        assert_eq!(tab.focused, Some(EntryId(1)));
+        assert_eq!(tab.selection_anchor, Some(EntryId(1)));
+        assert!(tab.back_history().is_empty());
+    }
+
+    #[test]
+    fn issue_176_deleted_selection_does_not_follow_reused_ids() {
+        let location = NavigationLocation::Directory(r"C:\fixture".into());
+        let mut tab = TabSession::new_at(TabId(1), location.clone());
+        tab.replace_entries(vec![
+            entry(1, "gone", EntryKind::File, None),
+            entry(2, "stay", EntryKind::File, None),
+        ]);
+        tab.load_state = LoadState::Complete;
+        tab.select_all();
+        let preference = DirectoryViewPreference::default();
+        let (request, _) =
+            tab.begin_navigation(location.clone(), NavigationKind::BackgroundRefresh);
+        assert!(tab.accept_directory_batch(
+            request,
+            vec![
+                entry(1, "new", EntryKind::File, None),
+                entry(3, "stay", EntryKind::File, None)
+            ],
+            preference
+        ));
+        assert!(tab.finish_directory_navigation(request, location.clone(), preference, None));
+        assert_eq!(tab.selected, vec![EntryId(3)]);
+        assert_eq!(tab.focused, None);
+        assert_eq!(tab.selection_anchor, None);
+        let (request, _) =
+            tab.begin_navigation(location.clone(), NavigationKind::BackgroundRefresh);
+        assert!(tab.finish_directory_navigation(request, location, preference, None));
+        assert!(tab.selected.is_empty());
+        assert!(tab.entries.is_empty());
+    }
+
+    #[test]
+    fn issue_176_refresh_cancel_failure_and_navigation_keep_identities_separate() {
+        for failure in [false, true] {
+            let location = NavigationLocation::Directory(r"C:\fixture".into());
+            let mut tab = TabSession::new_at(TabId(1), location.clone());
+            tab.replace_entries(vec![entry(1, "old", EntryKind::File, None)]);
+            tab.load_state = LoadState::Complete;
+            tab.select_entry(EntryId(1), false, false);
+            let preference = DirectoryViewPreference::default();
+            let (request, _) =
+                tab.begin_navigation(location.clone(), NavigationKind::BackgroundRefresh);
+            assert!(tab.accept_directory_batch(
+                request,
+                vec![entry(1, "other", EntryKind::File, None)],
+                preference
+            ));
+            if failure {
+                assert!(tab.fail_directory_navigation(
+                    request,
+                    LoadState::PermissionDenied,
+                    "denied".into()
+                ));
+            } else {
+                assert!(tab.cancel_directory_navigation(request));
+            }
+            assert_eq!(tab.selected, vec![EntryId(1)]);
+            assert_eq!(tab.visible_entry(EntryId(1)).unwrap().display_name, "old");
+            assert!(!tab.finish_directory_navigation(request, location, preference, None));
+            let (next, _) =
+                tab.begin_directory_navigation(r"C:\other".into(), NavigationKind::Normal);
+            assert!(!tab.retains_directory_view());
+            assert!(tab.finish_directory_navigation(
+                next,
+                NavigationLocation::Directory(r"C:\other".into()),
+                preference,
+                None
+            ));
+            assert!(tab.selected.is_empty());
+        }
     }
 
     #[test]

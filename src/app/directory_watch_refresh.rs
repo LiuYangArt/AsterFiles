@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use super::{AppState, DirectoryRequest, SharedSessions, submit_navigation};
@@ -17,6 +17,36 @@ use crate::{
 };
 
 const COALESCE_DELAY: Duration = Duration::from_millis(120);
+const REFRESH_IDLE_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct RefreshGate(HashMap<WatchKey, Option<Instant>>);
+
+impl RefreshGate {
+    fn started(&mut self, key: WatchKey) {
+        self.0.insert(key, None);
+    }
+
+    fn update(&mut self, app: &AppState, now: Instant) {
+        self.0.retain(|(tab_id, root), ready_at| {
+            let Some(tab) = app.tab(*tab_id).filter(|tab| {
+                tab.page_source == PageSource::Directory
+                    && tab.visible_path() == Some(root.as_path())
+            }) else {
+                return false;
+            };
+            if matches!(tab.load_state, LoadState::Loading | LoadState::Partial) {
+                return true;
+            }
+            let deadline = ready_at.get_or_insert(now + REFRESH_IDLE_INTERVAL);
+            now < *deadline
+        });
+    }
+
+    fn waiting(&self, key: &WatchKey) -> bool {
+        self.0.contains_key(key)
+    }
+}
 
 type WatchKey = (TabId, PathBuf);
 
@@ -55,6 +85,7 @@ struct ProbeResult {
 struct Delivery {
     key: WatchKey,
     retry: Option<PendingWatch>,
+    refreshed: bool,
 }
 
 struct CompletedSample {
@@ -141,7 +172,15 @@ fn coalesce(events: Vec<DirectoryWatchEvent>) -> Vec<WatchBatch> {
             }
         }
     }
-    batches.into_values().collect()
+    batches
+        .into_values()
+        .filter_map(|mut batch| {
+            batch
+                .paths
+                .retain(|path| !crate::fs::is_directory_work_path(path));
+            (batch.uncertain || !batch.paths.is_empty()).then_some(batch)
+        })
+        .collect()
 }
 
 fn merge_pending(queue: &mut HashMap<WatchKey, PendingWatch>, pending: PendingWatch) {
@@ -175,7 +214,10 @@ fn disposition(app: &AppState, pending: &PendingWatch) -> Disposition {
         || tab.visible_path() != Some(pending.batch.root.as_path())
         || (tab.latest_request() != pending.observed_request
             && matches!(tab.load_state, LoadState::Loading | LoadState::Partial)
-            && tab.navigation_kind() != NavigationKind::Refresh)
+            && !matches!(
+                tab.navigation_kind(),
+                NavigationKind::Refresh | NavigationKind::BackgroundRefresh
+            ))
     {
         return Disposition::Drop;
     }
@@ -326,15 +368,17 @@ fn apply_probe_result(
             ),
         );
     }
-    if changed {
-        submit_navigation(
+    if changed
+        && submit_navigation(
             sender,
             state,
             pending.tab_id,
             pending.batch.root,
-            NavigationKind::Refresh,
+            NavigationKind::BackgroundRefresh,
             None,
-        );
+        )
+    {
+        super::refresh_tab_window(state, pending.tab_id);
     }
     None
 }
@@ -351,6 +395,7 @@ pub(super) fn start_watch_refresh_pump(
         let mut pending = HashMap::new();
         let mut in_flight = HashSet::new();
         let mut sampling_roots = HashSet::new();
+        let mut refresh_gate = RefreshGate::default();
         loop {
             let mut events = match receiver.recv_timeout(COALESCE_DELAY) {
                 Ok(first) => {
@@ -371,6 +416,9 @@ pub(super) fn start_watch_refresh_pump(
             }
             for delivery in delivery_receiver.try_iter() {
                 in_flight.remove(&delivery.key);
+                if delivery.refreshed {
+                    refresh_gate.started(delivery.key);
+                }
                 if let Some(retry) = delivery.retry {
                     merge_pending(&mut pending, retry);
                 }
@@ -383,8 +431,23 @@ pub(super) fn start_watch_refresh_pump(
                     let delivered = delivery_sender.clone();
                     if slint::invoke_from_event_loop(move || {
                         let key = result.probe.pending.key();
+                        let request_id = result.probe.request_id;
+                        let changed = result.changed;
                         let retry = apply_probe_result(&state, &sender, result);
-                        let _ = delivered.send(Delivery { key, retry });
+                        let refreshed = changed
+                            && retry.is_none()
+                            && state.lock().ok().is_some_and(|app| {
+                                app.tab(key.0).is_some_and(|tab| {
+                                    tab.latest_request() != request_id
+                                        && tab.navigation_kind()
+                                            == NavigationKind::BackgroundRefresh
+                                })
+                            });
+                        let _ = delivered.send(Delivery {
+                            key,
+                            retry,
+                            refreshed,
+                        });
                     })
                     .is_err()
                     {
@@ -395,6 +458,7 @@ pub(super) fn start_watch_refresh_pump(
             let batches = coalesce(events);
             let probes = {
                 let Ok(mut app) = state.lock() else { break };
+                refresh_gate.update(&app, Instant::now());
                 for batch in batches {
                     if app.active_operation_directories.contains_key(&batch.root)
                         && !rename_is_active(&app, &batch.root)
@@ -429,7 +493,8 @@ pub(super) fn start_watch_refresh_pump(
                             waiting.insert(key, watch);
                         }
                         Disposition::Probe
-                            if in_flight.contains(&key)
+                            if refresh_gate.waiting(&key)
+                                || in_flight.contains(&key)
                                 || sampling_roots.contains(&watch.batch.root) =>
                         {
                             waiting.insert(key, watch);
@@ -506,6 +571,217 @@ mod tests {
     fn run_probe(state: &SharedSessions, pending: PendingWatch) -> ProbeResult {
         let probe = prepare_probe(&state.lock().unwrap(), pending);
         probe_changes(vec![probe]).pop().unwrap()
+    }
+
+    #[test]
+    fn issue_176_work_notifications_are_ignored_but_external_renames_survive() {
+        let root = std::env::temp_dir();
+        let work = root.join(crate::fs::DIRECTORY_WORK_ROOT);
+        let batch = |changes| {
+            coalesce(vec![DirectoryWatchEvent::Changes {
+                root: root.clone(),
+                changes,
+            }])
+        };
+        assert!(
+            batch(vec![
+                DirectoryChange::Added(work.clone()),
+                DirectoryChange::Modified(work.clone()),
+                DirectoryChange::Removed(work.join("batch"))
+            ])
+            .is_empty()
+        );
+        for (from, to) in [
+            (work.clone(), root.join("outside")),
+            (root.join("outside"), work.clone()),
+        ] {
+            let batches = batch(vec![DirectoryChange::Renamed { from, to }]);
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].paths, HashSet::from([root.join("outside")]));
+        }
+        let similar = root.join(".asterfiles-directory-other");
+        assert_eq!(
+            batch(vec![DirectoryChange::Added(similar.clone())])[0].paths,
+            HashSet::from([similar])
+        );
+    }
+
+    #[test]
+    fn issue_176_native_work_notifications_do_not_request_refresh() {
+        use crate::platform::windows::directory_watch::DirectoryWatch;
+
+        let fixture = Fixture::new();
+        let sentinel = fixture.0.join("watch-ready.txt");
+        let (sender, receiver) = mpsc::channel();
+        let mut watcher = DirectoryWatch::start(&fixture.0, sender).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut attempt = 0;
+        loop {
+            fs::write(&sentinel, attempt.to_string()).unwrap();
+            attempt += 1;
+            match receiver.recv_timeout(Duration::from_millis(50)) {
+                Ok(DirectoryWatchEvent::Changes { changes, .. })
+                    if changes.iter().any(|change| match change {
+                        DirectoryChange::Added(path)
+                        | DirectoryChange::Removed(path)
+                        | DirectoryChange::Modified(path) => path == &sentinel,
+                        DirectoryChange::Renamed { from, to } => {
+                            from == &sentinel || to == &sentinel
+                        }
+                    }) =>
+                {
+                    break;
+                }
+                Ok(event) => panic!("unexpected readiness event: {event:?}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "native watcher did not become ready"
+                    );
+                }
+                Err(error) => panic!("native watcher disconnected: {error}"),
+            }
+        }
+        // A readiness write can produce several native deliveries; none belongs to the probe.
+        let receive_changes = |deadline: Instant| loop {
+            let event = receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("native watcher did not deliver the expected change");
+            let DirectoryWatchEvent::Changes { root, mut changes } = event else {
+                panic!("native watcher failed: {event:?}");
+            };
+            assert_eq!(root, fixture.0);
+            changes.retain(|change| match change {
+                DirectoryChange::Added(path)
+                | DirectoryChange::Removed(path)
+                | DirectoryChange::Modified(path) => path != &sentinel,
+                DirectoryChange::Renamed { from, to } => from != &sentinel && to != &sentinel,
+            });
+            if !changes.is_empty() {
+                return DirectoryWatchEvent::Changes { root, changes };
+            }
+        };
+        let work = fixture.0.join(crate::fs::DIRECTORY_WORK_ROOT);
+        fs::create_dir(&work).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut internal_events = Vec::new();
+        loop {
+            let event = receive_changes(deadline);
+            let added = matches!(&event, DirectoryWatchEvent::Changes { changes, .. }
+                if changes.contains(&DirectoryChange::Added(work.clone())));
+            internal_events.push(event);
+            if added {
+                break;
+            }
+        }
+        let child = work.join("asterfiles-directory-probe");
+        fs::create_dir(&child).unwrap();
+        let input = child.join("input");
+        fs::write(&input, b"initial").unwrap();
+        fs::write(&input, b"modified protocol content").unwrap();
+        fs::remove_file(&input).unwrap();
+        fs::remove_dir(&child).unwrap();
+        fs::remove_dir(&work).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let event = receive_changes(deadline);
+            let removed = matches!(&event, DirectoryWatchEvent::Changes { changes, .. }
+                if changes.contains(&DirectoryChange::Removed(work.clone())));
+            internal_events.push(event);
+            if removed {
+                break;
+            }
+        }
+        assert!(coalesce(internal_events).is_empty());
+
+        let external = fixture.0.join("external.txt");
+        fs::write(&external, b"external change").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut external_events = Vec::new();
+        loop {
+            let event = receive_changes(deadline);
+            let added = matches!(&event, DirectoryWatchEvent::Changes { changes, .. }
+                if changes.contains(&DirectoryChange::Added(external.clone())));
+            external_events.push(event);
+            if added {
+                break;
+            }
+        }
+        let mut batches = coalesce(external_events);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].paths, HashSet::from([external]));
+        let state = fixture.state(Vec::new());
+        let result = run_probe(
+            &state,
+            PendingWatch {
+                tab_id: TabId(1),
+                observed_request: RequestId(0),
+                batch: batches.pop().unwrap(),
+            },
+        );
+        assert!(result.changed);
+        let (sender, requests) = mpsc::channel();
+        assert!(apply_probe_result(&state, &sender, result).is_none());
+        assert!(requests.try_recv().is_ok());
+        watcher.cancel();
+    }
+
+    #[test]
+    fn issue_176_busy_notifications_merge_and_wait_after_refresh_completion() {
+        let fixture = Fixture::new();
+        let state = fixture.state(vec![]);
+        let mut pending = HashMap::new();
+        let mut gate = RefreshGate::default();
+        let now = Instant::now();
+        let key = fixture.pending(&[]).key();
+        gate.started(key.clone());
+        let request = state
+            .lock()
+            .unwrap()
+            .tab_mut(TabId(1))
+            .unwrap()
+            .begin_directory_navigation(fixture.0.clone(), NavigationKind::Refresh)
+            .0;
+        for _ in 0..100 {
+            merge_pending(&mut pending, fixture.pending(&["a", "b"]));
+        }
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[&key].batch.paths.len(), 2);
+        gate.update(&state.lock().unwrap(), now + Duration::from_secs(30));
+        assert!(gate.waiting(&key));
+        assert_eq!(
+            disposition(&state.lock().unwrap(), &pending[&key]),
+            Disposition::Wait
+        );
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .tab_mut(TabId(1))
+                .unwrap()
+                .finish_directory_navigation(
+                    request,
+                    NavigationLocation::Directory(fixture.0.clone()),
+                    DirectoryViewPreference::default(),
+                    None
+                )
+        );
+        gate.update(&state.lock().unwrap(), now + Duration::from_secs(31));
+        gate.update(&state.lock().unwrap(), now + Duration::from_millis(31_999));
+        assert!(gate.waiting(&key));
+        gate.update(&state.lock().unwrap(), now + Duration::from_secs(32));
+        assert!(!gate.waiting(&key));
+        // Changes already reflected in the committed snapshot do not cause another refresh.
+        assert!(!run_probe(&state, pending.remove(&key).unwrap()).changed);
+        gate.started(key.clone());
+        state
+            .lock()
+            .unwrap()
+            .tab_mut(TabId(1))
+            .unwrap()
+            .begin_directory_navigation(fixture.0.join("elsewhere"), NavigationKind::Normal);
+        gate.update(&state.lock().unwrap(), now);
+        assert!(!gate.waiting(&key));
     }
 
     #[test]

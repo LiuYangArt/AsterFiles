@@ -400,3 +400,245 @@ fn issue_133_background_reveal_rejects_stale_request_and_changed_selection() {
         }
     }
 }
+
+#[test]
+fn issue_176_delete_completion_fills_the_gap_without_rewinding_any_view() {
+    use crate::domain::file_operations::{ItemState, OperationResult};
+
+    i_slint_backend_testing::init_no_event_loop();
+    let root = PathBuf::from(r"C:\delete-position-176");
+    for mode in [
+        ViewMode::Details,
+        ViewMode::List,
+        ViewMode::SmallIcons,
+        ViewMode::MediumIcons,
+        ViewMode::LargeIcons,
+        ViewMode::ExtraLargeIcons,
+        ViewMode::Tiles,
+        ViewMode::Content,
+    ] {
+        for grouping in [GroupField::None, GroupField::Kind] {
+            for kind in [
+                FileOperationKind::RecycleDelete,
+                FileOperationKind::PermanentDelete,
+            ] {
+                let mut app = AppState::new_for_test(vec![root.clone()], 0, [0, 1, 2, 3]);
+                app.update_directory_preference(root.clone(), |view| {
+                    view.view_mode = mode;
+                    view.group_field = grouping;
+                });
+                let window_id = app.active_window;
+                let tab_id = app.active().id;
+                let item = |id| entry(id, root.join(format!("file-{id:03}.txt")));
+                let tab = app.tab_mut(tab_id).unwrap();
+                tab.replace_entries((1..=400).map(item).collect());
+                tab.load_state = LoadState::Complete;
+                tab.select_entry(EntryId(80), false, false);
+                tab.select_entry(EntryId(90), true, false);
+                let deleted = item(80).path;
+                let operation_id = app.operations.submit(
+                    OperationResource::Local,
+                    kind,
+                    Some(tab_id),
+                    vec![OperationItem::pending(Some(deleted.clone()), None)],
+                );
+                app.operations.start_next(OperationResource::Local).unwrap();
+                app.operations.mark_running(operation_id).unwrap();
+                register_operation_directories(
+                    &mut app,
+                    kind,
+                    &[OperationItem::pending(Some(deleted.clone()), None)],
+                );
+                let state = Arc::new(Mutex::new(app));
+                let ui = AppWindow::new().unwrap();
+                ui.window().set_size(slint::LogicalSize::new(1180.0, 760.0));
+                refresh_ui_inner(&ui, &state, window_id);
+                ui.set_file_viewport_y(-800.0);
+                let completion = finish_file_operation(
+                    &state,
+                    FileOperationEvent::Finished {
+                        id: operation_id,
+                        result: OperationResult {
+                            succeeded: vec![deleted.clone()],
+                            skipped: vec![],
+                            failed: vec![],
+                            affected_directories: vec![root.clone()],
+                        },
+                        item_states: vec![(0, ItemState::Succeeded, None)],
+                        completed_targets: vec![],
+                        undo_items: None,
+                        failed_undo_items: vec![],
+                    },
+                )
+                .unwrap();
+                let (sender, requests) = mpsc::channel();
+                let (network_sender, _network_requests) = mpsc::sync_channel(1);
+                refresh_affected_tabs(&sender, &network_sender, &state, &completion.affected);
+                let request = requests.try_recv().unwrap();
+                refresh_ui_inner(&ui, &state, window_id);
+                assert_eq!(
+                    ui.get_file_viewport_y(),
+                    -800.0,
+                    "{mode:?}/{grouping:?}/{kind:?} start"
+                );
+                assert!(state.lock().unwrap().active().retains_directory_view());
+                apply_event(
+                    &state,
+                    DirectoryEvent::Batch {
+                        tab_id,
+                        request_id: request.request_id,
+                        entries: (1..=400)
+                            .filter(|id| *id != 80)
+                            .map(|id| {
+                                let mut entry = item(id);
+                                entry.id = EntryId(1000 - id);
+                                entry
+                            })
+                            .collect(),
+                        acknowledgement: mpsc::channel().0,
+                    },
+                );
+                append_active_file_rows(&ui, &state, tab_id, request.request_id);
+                assert_eq!(ui.get_file_viewport_y(), -800.0);
+                apply_event(
+                    &state,
+                    DirectoryEvent::Finished {
+                        tab_id,
+                        request_id: request.request_id,
+                        path: root.clone(),
+                        skipped: 0,
+                        source_failures: 0,
+                        library: None,
+                    },
+                );
+                refresh_ui_inner(&ui, &state, window_id);
+                assert_eq!(
+                    ui.get_file_viewport_y(),
+                    -800.0,
+                    "{mode:?}/{grouping:?}/{kind:?} finish"
+                );
+                let app = state.lock().unwrap();
+                let tab = app.active();
+                assert_eq!(tab.entries.len(), 399);
+                assert_eq!(tab.entries[79].path, item(81).path);
+                assert_eq!(tab.selected, vec![EntryId(910)]);
+                assert_eq!(tab.focused, Some(EntryId(910)));
+                assert_eq!(tab.selection_anchor, Some(EntryId(910)));
+                let expected = tab
+                    .entries
+                    .iter()
+                    .map(|entry| entry.id.0 as i32)
+                    .collect::<Vec<_>>();
+                let projected = if mode.uses_grid_layout() {
+                    ui.get_grid_rows()
+                        .iter()
+                        .filter(|row| !row.group_header)
+                        .flat_map(|row| {
+                            row.entries.iter().map(|entry| entry.id).collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    ui.get_files()
+                        .iter()
+                        .filter(|row| !row.group_header)
+                        .map(|row| row.id)
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(projected, expected, "{mode:?}/{grouping:?}/{kind:?} gap");
+            }
+        }
+    }
+}
+
+#[test]
+fn issue_176_repeated_operation_refresh_rejects_old_results_and_keeps_latest_choices() {
+    let root = PathBuf::from(r"C:\delete-position-176");
+    let mut app = AppState::new_for_test(vec![root.clone()], 0, [0, 1, 2, 3]);
+    let tab_id = app.active().id;
+    let tab = app.tab_mut(tab_id).unwrap();
+    tab.replace_entries(vec![
+        entry(1, root.join("gone.txt")),
+        entry(2, root.join("stay.txt")),
+    ]);
+    tab.load_state = LoadState::Complete;
+    tab.select_entry(EntryId(2), false, false);
+    let state = Arc::new(Mutex::new(app));
+    let (sender, requests) = mpsc::channel();
+    let (network_sender, _network_requests) = mpsc::sync_channel(1);
+    let refresh = || {
+        refresh_affected_tabs(
+            &sender,
+            &network_sender,
+            &state,
+            std::slice::from_ref(&root),
+        );
+        requests.try_recv().unwrap()
+    };
+    let early = refresh();
+    apply_event(
+        &state,
+        DirectoryEvent::Batch {
+            tab_id,
+            request_id: early.request_id,
+            entries: vec![entry(1, root.join("stay.txt"))],
+            acknowledgement: mpsc::channel().0,
+        },
+    );
+    let committed = refresh();
+    assert!(early.cancelled());
+    assert!(
+        !apply_event(
+            &state,
+            DirectoryEvent::Finished {
+                tab_id,
+                request_id: early.request_id,
+                path: root.clone(),
+                skipped: 0,
+                source_failures: 0,
+                library: None
+            }
+        )
+        .accepted
+    );
+    assert_eq!(
+        state
+            .lock()
+            .unwrap()
+            .active()
+            .visible_entry(EntryId(2))
+            .unwrap()
+            .path,
+        root.join("stay.txt")
+    );
+    apply_event(
+        &state,
+        DirectoryEvent::Batch {
+            tab_id,
+            request_id: committed.request_id,
+            entries: vec![entry(3, root.join("stay.txt"))],
+            acknowledgement: mpsc::channel().0,
+        },
+    );
+    apply_event(
+        &state,
+        DirectoryEvent::Finished {
+            tab_id,
+            request_id: committed.request_id,
+            path: root.clone(),
+            skipped: 0,
+            source_failures: 0,
+            library: None,
+        },
+    );
+    assert_eq!(state.lock().unwrap().active().selected, vec![EntryId(3)]);
+    let cancelled = refresh();
+    assert!(
+        state
+            .lock()
+            .unwrap()
+            .tab_mut(tab_id)
+            .unwrap()
+            .cancel_directory_navigation(cancelled.request_id)
+    );
+    assert_eq!(state.lock().unwrap().active().selected, vec![EntryId(3)]);
+}

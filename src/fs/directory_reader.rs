@@ -23,7 +23,7 @@ pub(crate) fn read_directory_entry(
     id: u32,
 ) -> io::Result<Option<FileEntry>> {
     let path = entry.path();
-    if is_internal_cleanup_path(&path) {
+    if is_internal_cleanup_path(&path) || super::is_directory_work_path(&path) {
         return Ok(None);
     }
     Ok(entry_from_metadata(
@@ -40,7 +40,7 @@ pub(crate) fn read_path_entry(
     visibility: FileVisibility,
     id: u32,
 ) -> io::Result<Option<FileEntry>> {
-    if is_internal_cleanup_path(path) {
+    if is_internal_cleanup_path(path) || super::is_directory_work_path(path) {
         return Ok(None);
     }
     let metadata = match fs::symlink_metadata(path) {

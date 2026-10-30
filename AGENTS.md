@@ -60,7 +60,7 @@ CI 只有仓库读取权限，不发布、不创建标签；同一 PR/引用的�
 
 ## 目录帧删除竞争专项验证（#138）
 
-`python tools/build.py test --locked issue_138 -- --nocapture` 验证删除并发、拒绝访问期间的背压、持续拒绝访问时的取消和超时回收，以及完成帧后异常退出的标准错误与栈。随后运行默认并发 `python tools/verify.py`，包含 Debug 构建。专项日志位于 `artifacts/logs/issue-138/`，统一汇总为 `artifacts/verify/summary.json`。子进程失败的非空原始错误保留在父进程日志指向的 `%TEMP%/asterfiles-directory-*/batch.stderr`。根因和证据见 `docs/postmortem/postmortem-2026-10-07-directory-frame-race.md`。
+`python tools/build.py test --locked issue_138 -- --nocapture` 验证删除并发、拒绝访问期间的背压、持续拒绝访问时的取消和超时回收，以及完成帧后异常退出的标准错误与栈。随后运行默认并发 `python tools/verify.py`，包含 Debug 构建。专项日志位于 `artifacts/logs/issue-138/`，统一汇总为 `artifacts/verify/summary.json`。子进程失败的非空原始错误保留在父进程日志指向的 `%TEMP%/.asterfiles-directory/asterfiles-directory-*/batch.stderr`。根因和证据见 `docs/postmortem/postmortem-2026-10-07-directory-frame-race.md`。
 
 ## 目录空闲时限时序专项验证（#153）
 
@@ -153,3 +153,7 @@ UI/交互参考 Files， 源码： F:\CodeProjects\Files
 ## 地址栏退出编辑专项验证（#177）
 
 `python tools/build.py test --locked issue_177 -- --nocapture` 使用无窗口后端检查 Enter 相同／不同目录、UNC、无效路径搜索、外部点击边界、原生左键与菜单清理顺序、首次目标动作、失焦、Escape 和迟到校验。随后分别运行 `issue_145`、`issue_151` 专项及 `python tools/verify.py --quick`（包含 Debug 构建）。日志位于 `artifacts/logs/issue-177/`，统一汇总为 `artifacts/verify/summary.json`。真实点击与焦点由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
+
+## Temp 监听循环与刷新保留专项验证（#176）
+
+`python tools/build.py test --locked issue_176 -- --nocapture` 检查内部工作目录过滤、真实辅助进程、刷新期间的旧列表、按原始路径恢复最新选择、焦点与范围起点，以及八种视图和分组中的应用内删除补位、滚动保留、连续后台刷新隔离、通知合并和完成后 1 秒间隔。随后分别运行 `issue_133`、`issue_138`、`issue_150`、`issue_153` 专项及完整 `python tools/verify.py`，包含 Debug 构建。日志位于 `artifacts/logs/issue-176/`，统一汇总为 `artifacts/verify/summary.json`。真实 Temp 浏览和外部变化由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
