@@ -52,7 +52,7 @@ SMB 使用标准句柄身份，本地保留完整身份。扫描与传输通过�
 
 ## 网络问题排查入口
 
-完整验证使用 `python tools/verify.py`，汇总位于 `artifacts/verify/summary.json`。网络复制专项命令见根目录 `AGENTS.md`。慢源、完整复制的日志和结果位于 `artifacts/state/issue-137/`。自动重试的源、目标、错误、次数和等待时长写入 `artifacts/logs/file-operation-audit.jsonl`，事件名为 `network-copy-retry`。
+完整验证使用 `python tools/verify.py`，汇总位于 `artifacts/verify/summary.json`。网络复制专项命令见 [#137 验证入口](../agent/debug-validation.md#issue-137)。慢源、完整复制的日志和结果位于 `artifacts/state/issue-137/`。自动重试的源、目标、错误、次数和等待时长写入 `artifacts/logs/file-operation-audit.jsonl`，事件名为 `network-copy-retry`。
 
 ## 跳过文件的进度与窗口收尾（#139）
 

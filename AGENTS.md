@@ -12,79 +12,18 @@ python tools/verify.py         # Issue 完整 Debug 验证
 python tools/verify.py --release # 用户确认 Issue 后的本地 Release 构建验证；不发布
 ```
 
-验证默认首个失败即停止，并在开始前关闭由本仓库 Debug/Release 程序启动的 AsterFiles；诊断全部失败时显式加 `--keep-going`。验证开始和结束时执行 `tools/build.py` 的构建缓存维护。`target` 预算 8 GiB，kache 数据预算 4 GiB，两者连同工具和索引的收尾总预算 13 GiB。工具链、依赖或构建配置变化时退休旧 `target`，保留最终程序；超预算同样清理整个旧输出，依赖从 kache 恢复。查看占用使用 `python tools/build.py status`，主动退休编译输出使用 `python tools/build.py clean`。具体边界见 `docs/agent/build-cache.md`。完整验证只构建一次 Debug，随后直接复用程序运行全部无界面场景。`--release` 仅在本机生成并验证 `target/release/asterfiles.exe`，不会更新版本、提交、打标签、推送或创建 GitHub Release；工作树内容未变化时复用最近成功的完整验证，只补本地 Release 构建。Issue 收尾使用 `./tools/finish-issue.ps1 <编号> -Message '<提交说明>' -Paths <本 Issue 文件>`，依次验证、提交、回写 Issue、设为 Done 并关闭；任一步失败立即停止，且不会带入未明确列出的改动。机器可读汇总位于 `artifacts/verify/summary.json`；详细规则和确定性 UI 场景见 `docs/agent/debug-validation.md`。UI 截图写入 `artifacts/ui/`，日志写入 `artifacts/logs/`，状态导出写入 `artifacts/state/`，性能 artifacts 写入 `artifacts/perf/`。
+首次验证需 Python 3.13+、Rustup、Visual Studio C++/Windows SDK 和 Pester 4.10.1。安装 Pester：`Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser -Force -SkipPublisherCheck`。工具链版本只在 `rust-toolchain.toml` 维护，Cargo 命令使用 `--locked`。
 
-本地正式发布默认使用 `./tools/publish.ps1`：它读取上一个 GitHub Release 之后关闭且恰好带一个 `type: *` 标签的 Issue；只要包含 `type: feature` 就升级 feature 版本，否则升级 bugfix 版本，并把这些 Issue 按类型写入中文 Release Note。没有已完成 Issue 或 Issue 类型标签不合规时停止发布。确需人工覆盖时才使用 `./tools/publish.ps1 major|feature|bugfix`；`-DryRun` 仅预演。脚本负责递增 `Cargo.toml` 版本、验证、提交、将 Release Note 写入标签并原子推送。用户只要求“更新版本并让 GitHub Action 打 Release 包”时，运行脚本并确认其成功触发 Action 后立即结束，不等待 Action 构建完成，也不重复执行脚本已覆盖的检查；只有用户明确要求确认云端发布结果时才等待。发布包可使用 `./tools/release.ps1 -Tag v<版本>` 在本地生成，输出位于 `artifacts/release/`；GitHub Release 由 `.github/workflows/release.yml` 读取标签说明并发布。版本唯一来源是 `Cargo.toml`。
+验证默认首个失败即停止，并关闭本仓库 Debug/Release 程序；集中诊断才加 `--keep-going`。完整验证只构建一次 Debug，再复用程序执行全部无界面场景。汇总：`artifacts/verify/summary.json`；日志：`artifacts/logs/`；状态：`artifacts/state/`；截图：`artifacts/ui/`；性能：`artifacts/perf/`。
 
-## Windows 持续验证（#106）
+## 文档与收尾入口
 
-主线 push、面向 main 的 PR 和手动运行触发 `.github/workflows/ci.yml`，在 Windows Server 2025 / PowerShell 7 上运行完整 `python tools/verify.py`。提交说明以 `chore: release ` 开头的版本提交不跑 Windows CI：本地 `publish.ps1` 已经验证过，标签推送只走 Release 打包。不要在提交说明里写 `[skip ci]`，否则 Release 工作流也会被跳过。本地、CI 和标签打包共同读取 `rust-toolchain.toml`；Rust 版本只在该文件维护。首次本地验证需安装 Python 3.13+、Rustup、Visual Studio C++/Windows SDK，运行 `python tools/build.py setup`，以及 `Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser -Force -SkipPublisherCheck`。验证显式导入该 Pester 版本；Cargo 检查、测试和构建均使用 `--locked`。
-
-CI 只有仓库读取权限，不发布、不创建标签；同一 PR/引用的新运行取消旧运行，单次超时 60 分钟。日志、状态和汇总上传到 `windows-verification-<run-id>-<attempt>`，保存 14 天。成功与失败路径的云端复验命令及下载入口见 `docs/agent/debug-validation.md`；受控失败只修改 runner 的临时 checkout。
-
-## 网络复制专项验证（#136）
-
-`target/debug/asterfiles.exe --agent-network-copy-probe '<至少 128 MiB 的源文件路径>'` 运行真实父进程与网络辅助进程，无应用界面。探针只读取来源，在 `artifacts/state/issue-136/parent-probe/` 创建独占目标，验证实际暂停、保持 12 秒不增长、继续及暂停中取消，随后回收进程并清理目标。结果写入该目录的 `result.json`。请使用足够大的文件，避免传输在请求暂停前完成；来源不会被删除或修改。单元回归使用 `cargo test --locked issue_136 -- --nocapture`，真实界面仍由用户验收。
-
-## HybridMount 慢源专项验证（#137）
-
-`target/debug/asterfiles.exe --agent-network-copy-probe --stall` 验证未暂停且连续 15 秒无进度后仍完成复制，以及等待中取消在 3 秒内回收辅助进程。结果位于 `artifacts/state/issue-137/stall-probe/result.json`。
-
-`target/debug/asterfiles.exe --agent-network-copy-probe --complete '<源文件路径>'` 通过真实父进程和辅助进程完整复制，再逐字节比较内容并清理测试副本。比较会再次读取来源；来源始终只读。进度、结果及错误位于 `artifacts/state/issue-137/complete-probe/`。受控中断恢复测试使用 `cargo test --locked robocopy -- --nocapture`，快照并发测试使用 `cargo test --locked issue_137 -- --nocapture`。受控测试不等于真实断开 NAS 网络。 Windows 已请求终止但退出事件未触发的回归使用 `cargo test --locked issue_137_pending -- --nocapture`；退出等待上限为 250 ms，旧暂存文件退休隔离。`artifacts/state/issue-137/disconnect-live/` 保存真实挂起现场的线程栈和进程等待信号；`network-copy-retired` / `network-copy-cleanup-deferred` 审计保存尚未完成系统回收的精确路径。
-
-`target/debug/asterfiles.exe --agent-network-copy-probe --resume-complete '<至少 256 MiB 的源文件路径>'` 在真实传输达到 128 MiB 后暂停，确认后保持 2 秒，再继续到完整复制并逐字节比较。结果仍写入 `artifacts/state/issue-137/complete-probe/` 的独占运行目录；`network-copy-block-start` 审计记录恢复读取的位置。NAS→本地块续传回归使用 `cargo test --locked issue_137_block_download -- --nocapture`，槽位上限回归使用 `cargo test --locked issue_137_read_limit -- --nocapture`。恢复仅覆盖当前任务，不覆盖应用退出或崩溃。读取与元数据查询共用 4 个槽位，旧 Windows I/O 必须真正退出才释放槽位；槽位耗尽时仍可暂停取消。
-
-## 网络目录排序专项验证（#141）
-
-`python tools/build.py test --locked issue_141 -- --nocapture --test-threads=1` 验证首批排序、多批合并、加载中切换排序、选择与滚动保留、迟到结果隔离和网络等待期间的取消/本地导航；十万条目场景输出合并与显示模型耗时。测试使用无窗口后端，日志为 `artifacts/logs/issue-141-tests.log`。完整验证使用 `python tools/verify.py`，日志为 `artifacts/logs/issue-141-full-verify.log`，汇总为 `artifacts/verify/summary.json`；真实慢网络交互由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
-
-## 网络加载提示专项验证（#143）
-
-`python tools/build.py test --locked issue_143 -- --nocapture` 使用无窗口后端和模拟时间检查 500 ms 提示延迟、首批与终态即时显示、导航和关闭后的旧计时隔离。统一验证为 `python tools/verify.py --quick`，日志位于 `artifacts/logs/issue-143-verify.log` 和 `artifacts/logs/verify-test.log`。真实文字闪现由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
-
-## 深层面包屑专项验证（#145）
-
-`python tools/build.py test --locked issue_145 -- --nocapture` 使用无窗口后端验证实测字宽、首尾保留、祖先折叠顺序、窄宽度边界和过期导航拒收，日志为 `artifacts/logs/issue-145-tests.log`。统一验证使用 `python tools/verify.py --quick`，日志为 `artifacts/logs/issue-145-verify.log`，汇总为 `artifacts/verify/summary.json`。真实缩放、悬停与菜单跳转由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
-
-## 各视图重命名专项验证（#146）
-
-运行 `python tools/verify.py --quick` 检查八种视图及分组布局的唯一编辑框、提交状态、单选限制和目标身份，并更新 Debug 程序。日志为 `artifacts/logs/issue-146-verify.log`、`artifacts/logs/verify-test.log`，汇总为 `artifacts/verify/summary.json`。真实焦点、输入、提交和取消由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
-
-## 无界面验证可信度（#147）
-
-`cargo test --locked issue_147 -- --nocapture` 检查必要失败的报告保留、键盘输入保护和编译后的陈列室属性。完整验证必须运行 `python tools/verify.py`，其中包含全部 Agent 场景及 `cargo build --locked`；`--quick` 不覆盖场景退出码。专项日志位于 `artifacts/logs/issue-147/`，受控失败及恢复结果位于 `artifacts/state/issue-147/`。场景报告中的 `checks` 是必要条件；普通状态字段为 false 不代表失败。约定见 `docs/agent/debug-validation.md`。
-
-## 网络运行时异步日志专项验证（#148）
-
-`cargo test --locked operation_audit -- --nocapture` 检查阻塞写入器下的独立入队、启动失败、队列断开、文件打开失败、退出冲刷与诊断字段。随后运行 `python tools/verify.py --quick` 和 `cargo build --locked`。日志位于 `artifacts/logs/issue-148/`，机器结果位于 `artifacts/state/issue-148/result.json`，统一汇总为 `artifacts/verify/summary.json`。网络运行时记录复用 `file-operation-audit.jsonl`。
-
-## 目录帧删除竞争专项验证（#138）
-
-`python tools/build.py test --locked issue_138 -- --nocapture` 验证删除并发、拒绝访问期间的背压、持续拒绝访问时的取消和超时回收，以及完成帧后异常退出的标准错误与栈。随后运行默认并发 `python tools/verify.py`，包含 Debug 构建。专项日志位于 `artifacts/logs/issue-138/`，统一汇总为 `artifacts/verify/summary.json`。子进程失败的非空原始错误保留在父进程日志指向的 `%TEMP%/.asterfiles-directory/asterfiles-directory-*/batch.stderr`。根因和证据见 `docs/postmortem/postmortem-2026-10-07-directory-frame-race.md`。
-
-## 目录空闲时限时序专项验证（#153）
-
-`python tools/build.py test --locked issue_153 -- --nocapture` 用注入时间检查持续进展延长空闲时限、停止进展后按期限过期；`network::directory` 过滤运行真实子进程慢进展与挂起回收测试，只测首批到末批的受控跨度，不测启动耗时。随后运行默认并发 `python tools/verify.py`。日志位于 `artifacts/logs/issue-153/`。
-
-## 复制执行上下文专项验证（#149）
-
-`python tools/build.py test --locked issue_149 -- --nocapture` 验证本地无需登记、隔离缺登记拒绝、跨线程与并发上下文隔离、递归复制和移动的登记失败保护，以及恢复结束复位。随后运行 `python tools/build.py test --locked issue_137 -- --nocapture`、完整 `python tools/verify.py`，并复用 #137 的慢源、真实 NAS 暂停续传和取消探针。日志位于 `artifacts/logs/issue-149/`，独立汇总位于 `artifacts/state/issue-149/`。不执行 UI 自动化或本地 Release 构建。
-
-## 目录加载隔离与背压专项验证（#150）
-
-`python tools/build.py test --locked issue_150 -- --nocapture` 检查本地慢消费者、满队列取消、接收端关闭、重解析路径身份、十万条目真实进程传输和事件泵单回调确认。随后运行 `python tools/build.py test --locked issue_141 -- --nocapture --test-threads=1` 和完整 `python tools/verify.py`（包含 `cargo build --locked`）。专项日志位于 `artifacts/logs/issue-150/`，机器结果和完整验证副本位于 `artifacts/state/issue-150/`。真实 SMB 断网和视觉交互仍由用户验收，不执行 UI 自动化或本地 Release 构建。
-
-## 标签导航状态转换专项验证（#151）
-
-`python tools/build.py test --locked issue_151 -- --nocapture` 检查成功、部分成功、失败、取消、迟到与重复终态、位置身份、历史和网络选择。随后运行 `python tools/verify.py --quick`，包含 Debug 构建。专项日志位于 `artifacts/logs/issue-151/`，机器结果及统一汇总副本位于 `artifacts/state/issue-151/`。真实视觉和交互由用户手动验收，不自动操作 UI，不执行本地 Release 构建。
-
-## OpenList WebDAV 专项验证（#157）
-
-`python tools/build.py test --locked webdav -- --nocapture` 检查路径身份、流式目录、取消与背压、HTTP 错误、跨源下载剥离凭据、冲突和会话往返。随后运行完整 `python tools/verify.py`，包含 Debug 构建。专项日志位于 `artifacts/logs/webdav/`，机器结果位于 `artifacts/state/webdav/`，统一汇总为 `artifacts/verify/summary.json`。真实连接、浏览、下载和重启由用户手动验收，不自动操作 UI，不执行本地 Release 构建，也不对用户 NAS 发起探针。
-
-## 文件右键拖拽专项验证（#160）
-
-`python tools/build.py test --locked issue_160 -- --nocapture` 在四类视图的真实条目控件上检查右键短点击释放开菜单、阈值前后移动、越过阈值只拖拽一次、取消与来源变化清除菜单，以及原生事件映射。随后运行 `issue_133` 与 `python tools/verify.py --quick`，包含 Debug 构建。日志位于 `artifacts/logs/issue-160/`。真实 OLE 右键放下菜单与跨应用拖放由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
+- [调试与验证](docs/agent/debug-validation.md)：统一验证、Windows CI、按 Issue 编号索引的专项命令与人工步骤。新增专项只写在这里，不追加到本文件。
+- [构建缓存](docs/agent/build-cache.md)：预算和退休规则；查看占用用 `python tools/build.py status`，主动清理用 `python tools/build.py clean`。
+- [架构索引](docs/architecture.md)与[长期边界](docs/foundation-plan.md)：模块职责、路径、标签、后台加载、文件操作与网络约束。
+- 用户确认 Issue 后运行 `./tools/finish-issue.ps1 <编号> -Message '<提交说明>' -Paths @('<本 Issue 文件>')`；验证、提交、回写 Issue、设为 Done 并关闭，任一步失败立即停止。
+- 正式发布默认用 `./tools/publish.ps1`；人工覆盖才指定 `major|feature|bugfix`，`-DryRun` 仅预演。版本唯一来源为 `Cargo.toml`。流程见[发布与本地打包](docs/agent/debug-validation.md#正式发布与本地打包)。
+- 用户只要求更新版本并触发 GitHub Action 打包时，确认脚本已触发后结束，不等待云端构建。提交说明不用 `[skip ci]`；版本提交前缀 `chore: release ` 只跳过 Windows CI，不跳过标签打包。
 
 ## UI 操作与验证
 
@@ -104,7 +43,6 @@ CI 只有仓库读取权限，不发布、不创建标签；同一 PR/引用的�
 - 注释说明目的、性能约束或 Windows 平台决策，不复述代码。
 - 修改完成后至少运行与变更范围相符的最小验证，并保留可读取的错误输出。
 - 每个开发任务完成后必须运行 `cargo build`，确保 `target/debug/asterfiles.exe` 已更新，供用户直接测试。日常本地开发不计算或报告 SHA-256、文件时间等构建指纹。只有用户明确要求正式构建、发布验证；本地 Release 构建不等于发布，回复中必须明确称为“本地 Release 构建”，不得简称“发布”。如果有正在运行的 AsterFiles 进程阻挡打包，直接关闭进程。
-
 
 ## Issue 与任务状态
 
@@ -129,43 +67,3 @@ CI 只有仓库读取权限，不发布、不创建标签；同一 PR/引用的�
 
 UI/交互参考 Files， 源码： F:\CodeProjects\Files
 网络部分参考WinSCP https://github.com/LiuYangArt/winscp
-
-## 文件名与缩略图专项验证（#154、#155、#156）
-
-运行 `python tools/verify.py --quick`，覆盖无窗口名称编辑、局部改名与缓存保留、目录监听并发、内容和详细信息视图缩略图，并更新 Debug 程序。专项回归可用 `python tools/build.py test --locked issue_154 -- --nocapture`、`issue_155` 和 `issue_156`（替换过滤词）。日志位于 `artifacts/logs/issue-154-156/`、`artifacts/logs/issue-155/` 和 `artifacts/logs/verify-test.log`，汇总为 `artifacts/verify/summary.json`。真实折行、选区、光标、缩略图及窗口边缘由用户验收；不自动操作 AsterFiles UI，不构建本地 Release。步骤见 `docs/agent/debug-validation.md`。
-
-## 文件夹大小排序显示顺序专项验证（#134）
-
-`python tools/build.py test --locked issue_134 -- --nocapture` 使用无窗口后端经真实大小回填入口完成大小排序，核对详情、列表、内容、网格和分组视图的显示顺序、与完整重绘一致、键盘与范围选择位置、选择身份、滚动和模型复用，以及新导航、关闭标签和过期投影的隔离。随后运行完整 `python tools/verify.py`，包含 Debug 构建。日志位于 `artifacts/logs/issue-134/`，统一汇总为 `artifacts/verify/summary.json`。真实排序与手势由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
-
-## 大目录全选与选择查询专项验证（#161）
-
-`python tools/build.py test --locked issue_161 -- --nocapture` 使用无窗口后端，在十万条目中测量全选、整窗重绘、Ctrl 点选、全部取消、Shift 与 Ctrl+Shift 范围选择，并设耗时与增长倍数上限。随后运行 `python tools/verify.py --quick`，包含 Debug 构建。日志位于 `artifacts/logs/issue-161/`，修复前后耗时位于 `artifacts/perf/issue-161/`。真实 Ctrl+A 响应由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
-
-## 十万条目加载、框选与滚动专项验证（#175）
-
-`python tools/build.py test --locked issue_175 -- --nocapture --test-threads=1` 使用无窗口后端和 `%TEMP%\asterfiles-161` 的十万个空文件，测量首批、完整加载、批次传输、合并排序、行投影、框选和滚动回调。缺少夹具文件时测试自动补齐。性能覆盖详细信息视图，包含未分组和类型分组；不自动操作 UI。
-
-随后分别运行 `issue_134`、`issue_150`、`issue_161` 专项；`issue_141` 加 `--test-threads=1`。最后运行完整 `python tools/verify.py`，包含 Debug 构建。专项和完整验证日志保存到 `artifacts/logs/issue-175/`，统一汇总为 `artifacts/verify/summary.json`。性能目录为 `artifacts/perf/issue-175/`：`before-fix.json` 保留修复前基线，`after-fix.json` 保留验收用修复后数据，`latest.json` 由最近一次测量更新。真实加载、框选和拖动滚动条由用户手动验收，步骤见 `docs/agent/debug-validation.md`；不执行本地 Release 构建。
-
-图标专项运行 `python tools/build.py test --locked app::file_images_tests -- --nocapture --test-threads=1`，随后运行完整 `python tools/verify.py`。三个 `issue_175` 测试覆盖真实 Shell 类型图标、十万空 TXT 的实际像素回填、类型与尺寸去重、导航隔离和预览结果合并。日志为 `artifacts/logs/issue-175/icons-tests.log`、`icons-full-verify.log`；性能记录为 `artifacts/perf/issue-175/icons-after-fix.json`。用户重复拖动滚动条，并检查 PNG/JPG 预览、不同图标尺寸和快捷方式的独立图标。
-
-## 地址栏退出编辑专项验证（#177）
-
-`python tools/build.py test --locked issue_177 -- --nocapture` 使用无窗口后端检查 Enter 相同／不同目录、UNC、无效路径搜索、外部点击边界、原生左键与菜单清理顺序、首次目标动作、失焦、Escape 和迟到校验。随后分别运行 `issue_145`、`issue_151` 专项及 `python tools/verify.py --quick`（包含 Debug 构建）。日志位于 `artifacts/logs/issue-177/`，统一汇总为 `artifacts/verify/summary.json`。真实点击与焦点由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
-
-## Temp 监听循环与刷新保留专项验证（#176）
-
-`python tools/build.py test --locked issue_176 -- --nocapture` 检查内部工作目录过滤、真实辅助进程、刷新期间的旧列表、按原始路径恢复最新选择、焦点与范围起点，以及八种视图和分组中的应用内删除补位、滚动保留、连续后台刷新隔离、通知合并和完成后 1 秒间隔。随后分别运行 `issue_133`、`issue_138`、`issue_150`、`issue_153` 专项及完整 `python tools/verify.py`，包含 Debug 构建。日志位于 `artifacts/logs/issue-176/`，统一汇总为 `artifacts/verify/summary.json`。真实 Temp 浏览和外部变化由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
-
-## 滚动条离窗释放专项验证（#178）
-
-`python tools/build.py test --locked issue_178 -- --nocapture` 使用无窗口后端，检查八种视图及分组中的滚动条拖动、离窗释放、窗外松开或保持按住后回窗，以及重新按下。另检查失焦、遮挡、关闭、显式取消、普通抬起、轨道翻页、横向滚动条、设置页和普通点击、滚轮。随后运行 `python tools/verify.py --quick`，包含 Debug 构建。日志位于 `artifacts/logs/issue-178/`，专项退出码位于 `artifacts/state/issue-178/tests-result.json`，统一汇总为 `artifacts/verify/summary.json`。真实窗口边界、失焦和 Esc 由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
-
-## 窗口区域刷新专项验证（#162）
-
-`python tools/build.py test --locked issue_162 -- --nocapture --test-threads=1` 检查八种视图和类型分组的非内容刷新模型身份、任务进度、跨列重排锚点、选择和重命名，以及后台标签和过期请求隔离。随后分别运行 `issue_141`（加 `--test-threads=1`）、`issue_134`、`issue_146`、`issue_154`、`issue_155`、`issue_156` 专项及完整 `python tools/verify.py`，包含 Debug 构建。日志位于 `artifacts/logs/issue-162/`，性能前后对比位于 `artifacts/perf/issue-162/`，统一汇总为 `artifacts/verify/summary.json`。真实缩放、视图、重命名和大目录加载由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
-
-## 应用协调层拆分验证（#163）
-
-运行 `python tools/build.py test --locked -- --list` 保存修改前后的测试清单，再运行完整 `python tools/verify.py`，包含 Debug 构建与全部无界面场景。测试数量及名称必须一致；`src/app.rs` 和新增运行时模块不得出现超过 1000 行的函数。日志位于 `artifacts/logs/issue-163/`，清单与结构对比位于 `artifacts/state/issue-163/`，统一汇总为 `artifacts/verify/summary.json`。职责入口见 `docs/architecture.md`；本任务不操作 UI。

@@ -23,7 +23,7 @@ Rust 文件核心
 
 任务范围与完成状态以 [GitHub Issues](https://github.com/LiuYangArt/AsterFiles/issues) 为准，实施状态和顺序由 [AsterFiles Development](https://github.com/users/LiuYangArt/projects/2) 管理。本文只记录当前有效的架构边界，不维护任务清单。
 
-路径身份、标签会话、后台加载、文件操作、Windows 集成和网络边界统一见 [foundation-plan.md](foundation-plan.md)。项目执行约束、验证命令和产物路径见仓库根目录的 `AGENTS.md`。
+路径身份、标签会话、后台加载、文件操作、Windows 集成和网络边界统一见 [foundation-plan.md](foundation-plan.md)。项目执行约束和常用命令见仓库根目录的 [AGENTS.md](../AGENTS.md)；专项命令与证据路径见 [调试与验证索引](agent/debug-validation.md#issue-验证索引)。
 
 ## 应用操作与 Agent 状态（#111）
 
