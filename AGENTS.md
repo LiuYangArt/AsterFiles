@@ -165,3 +165,7 @@ UI/交互参考 Files， 源码： F:\CodeProjects\Files
 ## 窗口区域刷新专项验证（#162）
 
 `python tools/build.py test --locked issue_162 -- --nocapture --test-threads=1` 检查八种视图和类型分组的非内容刷新模型身份、任务进度、跨列重排锚点、选择和重命名，以及后台标签和过期请求隔离。随后分别运行 `issue_141`（加 `--test-threads=1`）、`issue_134`、`issue_146`、`issue_154`、`issue_155`、`issue_156` 专项及完整 `python tools/verify.py`，包含 Debug 构建。日志位于 `artifacts/logs/issue-162/`，性能前后对比位于 `artifacts/perf/issue-162/`，统一汇总为 `artifacts/verify/summary.json`。真实缩放、视图、重命名和大目录加载由用户手动验收，步骤见 `docs/agent/debug-validation.md`。
+
+## 应用协调层拆分验证（#163）
+
+运行 `python tools/build.py test --locked -- --list` 保存修改前后的测试清单，再运行完整 `python tools/verify.py`，包含 Debug 构建与全部无界面场景。测试数量及名称必须一致；`src/app.rs` 和新增运行时模块不得出现超过 1000 行的函数。日志位于 `artifacts/logs/issue-163/`，清单与结构对比位于 `artifacts/state/issue-163/`，统一汇总为 `artifacts/verify/summary.json`。职责入口见 `docs/architecture.md`；本任务不操作 UI。

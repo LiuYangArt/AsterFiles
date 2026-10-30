@@ -319,7 +319,9 @@ Content 图标依据 #97 用户同屏对照截图由实际18逻辑像素修正�
 
 文件操作由 `src/app/file_operation_coordinator.rs` 处理准备、排队、重试和完成；`src/app/file_operation_worker.rs` 执行文件系统工作并产生任务事件。本地、网络、后台清理的队列及冲突互斥保持原边界；撤销记录与任务中心继续由 app 唯一共享状态持有，不通过展示文案重建文件身份。目录监听的合并、采样和过期结果处理位于 `src/app/directory_watch_refresh.rs`，只读取带标签和请求身份的已提交快照，不维护另一份选择状态。
 
-窗口和标签生命周期规则位于 `src/app/window_sessions.rs`，统一使用 app 私有窗口注册表和全局标签分配器。关闭、分离和跨窗口迁移保留原取消、请求重启和活动标签规则。原生窗口、Slint 回调和界面模型投影留在 app；模块拆分不改变 UI 线程边界、语言资源或网络能力。
+窗口和标签生命周期规则位于 `src/app/window_sessions.rs`，统一使用 app 私有窗口注册表和全局标签分配器。关闭、分离和跨窗口迁移保留原取消、请求重启和活动标签规则。原生窗口与界面模型投影留在 app。Slint 回调由 `src/app/callbacks.rs` 组装，按地址栏、文件列表、导航、侧栏、标签、设置、菜单和任务分文件注册（#163）；仍复用原工作通道、窗口和标签身份，注册顺序不变。模块拆分不改变 UI 线程边界、语言资源或网络能力。
+
+图像缓存集中在 `src/app/icon_cache.rs`，查询与系统集成状态集中在 `src/app/app_state.rs`，都由 `AppState` 沿用原共享锁持有（#163）。缓存按原规则淘汰，改名迁移继续使用 Rust 原始路径。Agent 状态导出位于 `src/app/agent_exports.rs`，跨职责测试位于 `src/app/tests.rs`，报告与测试身份保持不变。
 
 ## Issue #102 复制与移动的真实目录边界
 

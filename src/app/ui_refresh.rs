@@ -131,22 +131,24 @@ pub(super) fn refresh_window_regions(
 
 fn project_settings(ui: &AppWindow, app: &AppState) {
     let (folder_enabled, folder_needs_repair, folder_status, folder_path) =
-        shell_integration_projection(app.folder_integration_status.as_ref(), app.language);
+        shell_integration_projection(app.integration.folder_status.as_ref(), app.language);
     let (win_e_enabled, win_e_needs_repair, win_e_status, win_e_path) =
-        shell_integration_projection(app.win_e_integration_status.as_ref(), app.language);
+        shell_integration_projection(app.integration.win_e_status.as_ref(), app.language);
     ui.set_folder_integration_enabled(folder_enabled);
     ui.set_folder_integration_needs_repair(folder_needs_repair);
     ui.set_win_e_integration_enabled(win_e_enabled);
     ui.set_win_e_integration_needs_repair(win_e_needs_repair);
-    ui.set_system_integration_busy(app.system_integration_busy);
+    ui.set_system_integration_busy(app.integration.busy);
     ui.set_folder_integration_status(
-        app.folder_integration_error
+        app.integration
+            .folder_error
             .as_deref()
             .unwrap_or(&folder_status)
             .into(),
     );
     ui.set_win_e_integration_status(
-        app.win_e_integration_error
+        app.integration
+            .win_e_error
             .as_deref()
             .unwrap_or(&win_e_status)
             .into(),
@@ -174,16 +176,17 @@ fn project_settings(ui: &AppWindow, app: &AppState) {
     ui.set_quick_menu_backdrop(app.quick_menu_backdrop);
     ui.set_quick_menu_backdrop_opacity(f32::from(app.quick_menu_backdrop_opacity));
     ui.set_everything_path(
-        app.everything_config
+        app.everything
+            .config
             .executable_path
             .as_deref()
             .map(display_path)
             .unwrap_or_default()
             .into(),
     );
-    ui.set_everything_instance(app.everything_config.instance_name.clone().into());
-    ui.set_everything_status(app.everything_status.clone().into());
-    ui.set_everything_busy(app.everything_busy);
+    ui.set_everything_instance(app.everything.config.instance_name.clone().into());
+    ui.set_everything_status(app.everything.status.clone().into());
+    ui.set_everything_busy(app.everything.busy);
     ui.set_app_version(env!("CARGO_PKG_VERSION").into());
     ui.set_theme_mode(match app.theme_mode {
         session_store::ThemeMode::System => 0,
@@ -387,7 +390,7 @@ fn project_navigation(
         tab.visible_location()
             .and_then(|location| match location {
                 NavigationLocation::Home | NavigationLocation::WebDav(_) => None,
-                NavigationLocation::Directory(path) => app.icon_cache.get(path),
+                NavigationLocation::Directory(path) => app.image_cache.ordinary.get(path),
                 NavigationLocation::Library(library) => app.library_icons.get(&library.identity),
             })
             .map(shell_icon_image)
@@ -570,7 +573,7 @@ fn project_tabs(ui: &AppWindow, app: &AppState, window: &WindowState) {
                 loading: matches!(tab.load_state, LoadState::Loading | LoadState::Partial),
                 icon: tab
                     .visible_path()
-                    .and_then(|path| app.icon_cache.get(path))
+                    .and_then(|path| app.image_cache.ordinary.get(path))
                     .map(shell_icon_image)
                     .unwrap_or_default(),
                 is_drive: tab.visible_path().is_some_and(is_drive_root),

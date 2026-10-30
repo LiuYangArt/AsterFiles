@@ -114,7 +114,7 @@ fn issue_176_retained_refresh_does_not_reuse_independent_icons_by_old_id() {
         !app.icons
             .contains_key(&(TabId(1), request.request_id, EntryId(1)))
     );
-    assert!(app.icon_cache.contains_key(&old.path));
+    assert!(app.image_cache.ordinary.contains_key(&old.path));
     assert_eq!(
         file_images::row_image(&app.active().entries[0], app.active(), &app, None)
             .0
@@ -285,7 +285,8 @@ fn issue_175_icons_type_identity_size_navigation_and_preview_capabilities() {
         state
             .lock()
             .unwrap()
-            .type_icon_cache
+            .image_cache
+            .types
             .contains_key(&(ShellTypeIconKey::Extension("txt".into()), 256))
     );
 }

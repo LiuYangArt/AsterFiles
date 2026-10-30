@@ -46,12 +46,13 @@ pub(super) fn shared_icon_request(
     let type_key = entry_type_icon_key(&entry.path, entry.kind);
     let path = if let Some(key) = &type_key {
         let identity = (key.clone(), size);
-        if app.type_icon_cache.contains_key(&identity) || !app.type_icon_requests.insert(identity) {
+        if app.image_cache.types.contains_key(&identity) || !app.type_icon_requests.insert(identity)
+        {
             return None;
         }
         key.query_path()
     } else {
-        if app.icon_cache.contains_key(&entry.path)
+        if app.image_cache.ordinary.contains_key(&entry.path)
             || !app
                 .ordinary_icon_requests
                 .insert((tab_id, request_id, entry.path.clone()))
@@ -120,17 +121,23 @@ pub(super) fn row_image(
     app: &AppState,
     grid_requested_px: Option<u32>,
 ) -> (Image, i32) {
-    let grid_image = grid_requested_px
-        .and_then(|requested_px| app.thumbnail_cache.get(&(entry.path.clone(), requested_px)));
-    let grid_icon = grid_requested_px
-        .and_then(|requested_px| app.grid_icon_cache.get(&(entry.path.clone(), requested_px)));
+    let grid_image = grid_requested_px.and_then(|requested_px| {
+        app.image_cache
+            .thumbnails
+            .get(&(entry.path.clone(), requested_px))
+    });
+    let grid_icon = grid_requested_px.and_then(|requested_px| {
+        app.image_cache
+            .grid_icons
+            .get(&(entry.path.clone(), requested_px))
+    });
     let shared_icon = entry_type_icon_key(&entry.path, entry.kind).and_then(|key| {
         let size = if crate::network::is_unc_path(&entry.path) {
             0
         } else {
             grid_requested_px.unwrap_or(0)
         };
-        app.type_icon_cache.get(&(key, size))
+        app.image_cache.types.get(&(key, size))
     });
     let image = grid_image.or(grid_icon).or(shared_icon).or_else(|| {
         if grid_requested_px.is_some() {
@@ -138,7 +145,7 @@ pub(super) fn row_image(
         }
         app.icons
             .get(&(tab.id, tab.latest_request(), entry.id))
-            .or_else(|| app.icon_cache.get(&entry.path))
+            .or_else(|| app.image_cache.ordinary.get(&entry.path))
     });
     let state = grid_requested_px.map_or(0, |requested_px| {
         if grid_image.is_some() {

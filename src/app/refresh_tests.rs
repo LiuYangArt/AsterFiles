@@ -150,7 +150,7 @@ fn issue_162_non_content_regions_preserve_all_view_models_and_edits() {
                 let mut app = state.lock().unwrap();
                 app.theme_mode = session_store::ThemeMode::Dark;
                 app.file_list_quick_search = true;
-                app.everything_status = "issue-162-ready".to_owned();
+                app.everything.status = "issue-162-ready".to_owned();
                 app.sidebar.push(KnownLocation {
                     kind: KnownLocationKind::Pinned,
                     label: "issue-162-pin".to_owned(),

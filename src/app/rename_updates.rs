@@ -50,31 +50,6 @@ fn location_contains(app: &AppState, location: &NavigationLocation, parent: &Pat
     }
 }
 
-fn migrate_images(
-    cache: &mut HashMap<(PathBuf, u32), platform::windows::shell_icons::ShellIconRgba>,
-    order: &mut VecDeque<(PathBuf, u32)>,
-    old: &Path,
-    new: &Path,
-    retain: bool,
-) {
-    let keys = cache
-        .keys()
-        .filter(|(path, _)| path == old || path == new)
-        .cloned()
-        .collect::<Vec<_>>();
-    let images = keys
-        .iter()
-        .filter_map(|key| {
-            let image = cache.remove(key)?;
-            (retain && key.0 == old).then_some(((new.to_path_buf(), key.1), image))
-        })
-        .collect::<Vec<_>>();
-    order.retain(|(path, _)| path != old && path != new);
-    for (key, image) in images {
-        insert_bounded_image(cache, order, key, image, THUMBNAIL_CACHE_CAPACITY);
-    }
-}
-
 pub(super) fn apply_completed(app: &mut AppState, old: &Path, new: &Path) -> RenameUpdate {
     let mut update = RenameUpdate::default();
     let Some(parent) = old.parent() else {
@@ -150,25 +125,7 @@ pub(super) fn apply_completed(app: &mut AppState, old: &Path, new: &Path) -> Ren
             update.reload_tabs.push((tab_id, location));
         }
     }
-    migrate_images(
-        &mut app.thumbnail_cache,
-        &mut app.thumbnail_cache_order,
-        old,
-        new,
-        retain_images,
-    );
-    migrate_images(
-        &mut app.grid_icon_cache,
-        &mut app.grid_icon_cache_order,
-        old,
-        new,
-        retain_images,
-    );
-    let old_icon = app.icon_cache.remove(old);
-    app.icon_cache.remove(new);
-    if retain_images && let Some(icon) = old_icon {
-        app.icon_cache.insert(new.to_path_buf(), icon);
-    }
+    app.image_cache.rename_paths(old, new, retain_images);
     app.thumbnail_failures
         .retain(|(_, _, path, _), _| path != old && path != new);
     app.ordinary_icon_requests
@@ -486,8 +443,7 @@ mod tests {
         tab.selection_anchor = Some(EntryId(1));
         for name in ["a.png", "b.png"] {
             let key = (PathBuf::from(r"C:\photos").join(name), 48);
-            app.thumbnail_cache.insert(key.clone(), image(48));
-            app.thumbnail_cache_order.push_back(key);
+            app.image_cache.thumbnails.insert(key, image(48));
         }
         app
     }
@@ -581,15 +537,18 @@ mod tests {
         assert!(!Arc::ptr_eq(&before_entries, &tab.entries));
         assert_eq!(before_entries[0].display_name, "a.png");
         assert!(
-            app.thumbnail_cache
+            app.image_cache
+                .thumbnails
                 .contains_key(&(PathBuf::from(r"C:\photos\z.png"), 48))
         );
         assert!(
-            app.thumbnail_cache
+            app.image_cache
+                .thumbnails
                 .contains_key(&(PathBuf::from(r"C:\photos\b.png"), 48))
         );
         assert!(
-            !app.thumbnail_cache
+            !app.image_cache
+                .thumbnails
                 .contains_key(&(PathBuf::from(r"C:\photos\a.png"), 48))
         );
         let stale = IconEvent {
@@ -659,7 +618,7 @@ mod tests {
         let unchanged = tab.visible_entry(EntryId(2)).unwrap().clone();
         assert!(thumbnail_request(&mut app, TabId(1), request, &renamed, 48).is_some());
         assert!(thumbnail_request(&mut app, TabId(1), request, &unchanged, 48).is_none());
-        assert_eq!(app.thumbnail_cache.len(), 1);
+        assert_eq!(app.image_cache.thumbnails.len(), 1);
     }
 
     #[test]
@@ -868,7 +827,8 @@ mod tests {
             });
             let px = grid_thumbnail_request_px(mode, 1.0);
             for name in ["a.png", "b.png"] {
-                app.thumbnail_cache
+                app.image_cache
+                    .thumbnails
                     .insert((PathBuf::from(r"C:\photos").join(name), px), image(px));
             }
             let state = Arc::new(Mutex::new(app));
