@@ -72,6 +72,7 @@
 | [#163](#issue-163) | 应用协调层拆分验证（#163） |
 | [#165](#issue-165) | 目录按需生成行的模型（#165） |
 | [#166](#issue-166) | Cargo 工作区与依赖边界（#166） |
+| [#167](#issue-167) | Windows 系统绑定版本（#167） |
 | [#175](#issue-175) | Issue #175 十万条目目录加载、框选与滚动 |
 | [#176](#issue-176) | Temp 监听循环与本地刷新（#176） |
 | [#177](#issue-177) | Issue #177 地址栏退出编辑 |
@@ -971,6 +972,25 @@ Windows 下，Slint 在鼠标按住离窗时保留抓取。原生事件入口仅
 专项测试可用 `python tools/build.py test --workspace --locked <名称> -- --nocapture`。WebDAV 包内测试用 `-p asterfiles-webdav` 选择，不再用迁移前的 `webdav` 模块名前缀过滤。平台跨包测试辅助仅通过开发依赖的 `test-support` 启用，普通程序构建不包含故障注入；目录测试子进程仍实际运行共享的生产枚举与批次协议。
 
 CI 使用同一完整验证入口。云端运行链接、测试结果和构建比较摘要回写 GitHub Issue，不在本文件维护完成状态。
+
+<a id="issue-167"></a>
+
+## Windows 系统绑定版本（#167）
+
+根应用的测试依赖与 Windows 平台包的正式依赖统一使用 `windows-sys 0.61.2`，与 Tokio、mio 使用的版本一致。更新只调整绑定版本和锁文件，保留原有功能开关与 Windows API 调用。
+
+```powershell
+cargo tree -d --locked
+cargo tree -i windows-sys@0.60.2 --locked
+cargo tree -i windows-sys@0.61.2 --locked
+python tools/verify.py
+```
+
+旧版本查询应显示“未匹配到包”，退出码为 101；同时检查锁文件中没有 `windows-sys 0.60.2`。完整验证覆盖全部工作区测试，包括网络复制、取消、目录加载及批次消费确认，最后更新 Debug 程序。
+
+当前 Windows 依赖树仍有 `0.52.0` 和 `0.59.0`：前者来自 Slint 使用的 glutin、winit，后者来自 `embed-resource` 使用的 winreg。锁文件还保留可选依赖 `io-lifetimes` 引入的 `0.48.0`，当前 Windows 依赖树没有启用它；本专项不强制升级间接依赖。
+
+重复依赖的原始输出保存到 `artifacts/state/issue-167/duplicates-before.txt` 和 `duplicates-after.txt`，各版本来源及检查汇总放在同目录。完整验证日志为 `artifacts/logs/verify-*.log`，汇总为 `artifacts/verify/summary.json`。验收结果回写 GitHub Issue，本文不保存完成状态。
 
 ## 文件操作人工验证矩阵
 
