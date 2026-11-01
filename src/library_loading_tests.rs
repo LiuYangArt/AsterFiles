@@ -641,3 +641,8 @@ fn issue_150_full_output_input_close_reclaims_pending_batch_and_terminal() {
         result.unwrap().unwrap();
     }
 }
+
+#[test]
+fn issue_166_directory_child_entry() {
+    platform::windows::network::run_test_directory_child();
+}

@@ -81,6 +81,34 @@ class BuildPolicyTests(unittest.TestCase):
             build.prepare()
         self.assertFalse(fresh.exists())
 
+    def test_workspace_manifest_changes_retire_obsolete_build_outputs(self):
+        member = build.ROOT / "crates" / "domain" / "Cargo.toml"
+        member.parent.mkdir(parents=True)
+        member.write_text("member", encoding="utf-8")
+        with mock.patch.object(build, "run", return_value=mock.Mock(stdout="kache test\n")):
+            build.prepare()
+            for change in ("changed", None):
+                fresh = build.TARGET / "debug" / "fresh.o"
+                fresh.parent.mkdir(parents=True, exist_ok=True)
+                fresh.write_bytes(b"fresh")
+                build.prepare()
+                self.assertTrue(fresh.exists())
+                if change is None:
+                    member.unlink()
+                else:
+                    member.write_text(change, encoding="utf-8")
+                build.prepare()
+                self.assertFalse(fresh.exists())
+
+    def test_workspace_manifest_addition_changes_build_inputs(self):
+        before = build.build_inputs()
+        member = build.ROOT / "crates" / "domain" / "Cargo.toml"
+        member.parent.mkdir(parents=True)
+        member.write_text("member", encoding="utf-8")
+        after = build.build_inputs()
+        self.assertNotEqual(before, after)
+        self.assertIn("crates/domain/Cargo.toml", after)
+
     def test_safe_tree_accepts_short_names_that_resolve_inside_the_root(self):
         build.TARGET.mkdir()
         original = Path.resolve

@@ -114,7 +114,7 @@ use file_operation_worker::{
 use ui_refresh::{RefreshRegions, refresh_window_regions};
 use window_sessions::external_tab_insertion_slot;
 
-slint::include_modules!();
+pub use asterfiles_ui::*;
 
 const WORKER_COUNT: usize = 4;
 const NETWORK_WORKER_COUNT: usize = 2;
@@ -5494,7 +5494,7 @@ fn begin_rename_ui(weak: &slint::Weak<AppWindow>, state: &WindowSessions) {
 
 fn rename_validation_message(
     language: Language,
-    error: crate::fs::file_operations::NameValidationError,
+    error: crate::domain::name_validation::NameValidationError,
 ) -> String {
     Texts::new(language).rename_validation(error)
 }
@@ -5509,7 +5509,7 @@ fn submit_rename(
             .shared
             .lock()
             .expect("app state mutex is not poisoned");
-        crate::fs::file_operations::validate_name(std::ffi::OsStr::new(name))
+        crate::domain::name_validation::validate_name(std::ffi::OsStr::new(name))
             .map_err(|error| rename_validation_message(app.language, error))?;
         (
             app.rename_targets.get(&state.window_id).copied(),
@@ -16921,7 +16921,7 @@ fn spawn_shortcut_worker(
         mpsc::sync_channel::<ShortcutRequest>(SHORTCUT_QUEUE_CAPACITY);
     let (event_sender, event_receiver) = mpsc::channel::<ShortcutEvent>();
     thread::spawn(move || {
-        set_current_thread_low_priority();
+        platform::set_current_thread_low_priority();
         while let Ok(request) = request_receiver.recv() {
             let current = state.lock().ok().is_some_and(|app| {
                 app.tab(request.tab_id).is_some_and(|tab| {
@@ -16958,20 +16958,6 @@ fn spawn_shortcut_worker(
     });
     (request_sender, event_receiver)
 }
-
-#[cfg(windows)]
-fn set_current_thread_low_priority() {
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
-    };
-
-    unsafe {
-        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    }
-}
-
-#[cfg(not(windows))]
-fn set_current_thread_low_priority() {}
 
 fn apply_shortcut_event(state: &SharedSessions, event: ShortcutEvent) -> Option<(TabId, EntryId)> {
     let mut app = state.lock().ok()?;
@@ -19354,23 +19340,6 @@ fn refresh_ui(ui: &AppWindow, state: &WindowSessions) {
     refresh_window_ui(ui, &state.shared, state.window_id);
 }
 
-fn local_utc_offset_seconds() -> i32 {
-    use windows_sys::Win32::System::Time::{
-        GetTimeZoneInformation, TIME_ZONE_ID_INVALID, TIME_ZONE_INFORMATION,
-    };
-    let mut information = TIME_ZONE_INFORMATION::default();
-    let state = unsafe { GetTimeZoneInformation(&mut information) };
-    if state == TIME_ZONE_ID_INVALID {
-        return 0;
-    }
-    let seasonal_bias = match state {
-        1 => information.StandardBias,
-        2 => information.DaylightBias,
-        _ => 0,
-    };
-    -(information.Bias.saturating_add(seasonal_bias)).saturating_mul(60)
-}
-
 fn type_select_context(app: &AppState, tab: &TabSession) -> TypeSelectContext {
     let (group_field, group_direction) = if tab.page_source == PageSource::Search {
         (GroupField::None, SortDirection::Ascending)
@@ -19441,7 +19410,7 @@ fn directory_group_projections(
         GroupProjectionContext {
             language: app.language,
             now: std::time::SystemTime::now(),
-            utc_offset_seconds: local_utc_offset_seconds(),
+            utc_offset_seconds: platform::local_utc_offset_seconds(),
         },
     )
 }

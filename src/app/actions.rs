@@ -473,7 +473,7 @@ pub(super) fn rename(
     target: EntryTarget,
     name: OsString,
 ) -> Result<ActionReceipt, ActionError> {
-    crate::fs::file_operations::validate_name(&name).map_err(|_| ActionError::InvalidName)?;
+    crate::domain::name_validation::validate_name(&name).map_err(|_| ActionError::InvalidName)?;
     let item = {
         let app = state.lock().map_err(|_| ActionError::WindowClosed)?;
         let tab = checked_tab(&app, target.tab)?;

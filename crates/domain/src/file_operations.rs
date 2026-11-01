@@ -1,0 +1,1827 @@
+#![allow(dead_code)]
+
+use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant, SystemTime},
+};
+
+use crate::domain::TabId;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OperationId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileOperationKind {
+    CreateFolder,
+    Rename,
+    Copy,
+    Move,
+    RecycleDelete,
+    PermanentDelete,
+    FastRemove,
+    Undo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UndoSourceKind {
+    CreateFolder,
+    Rename,
+    Copy,
+    Move,
+    RecycleDelete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UndoItem {
+    RemoveCreated {
+        path: PathBuf,
+        manifest: Vec<(PathBuf, FileIdentity)>,
+    },
+    RemoveEmptyDirectory {
+        path: PathBuf,
+        identity: FileIdentity,
+        quarantined: bool,
+    },
+    RemoveQuarantined {
+        path: PathBuf,
+        manifest: Vec<(PathBuf, FileIdentity)>,
+    },
+    MoveBack {
+        current: PathBuf,
+        original: PathBuf,
+        manifest: Vec<(PathBuf, FileIdentity)>,
+        manifest_complete: bool,
+    },
+    MoveBackQuarantined {
+        current: PathBuf,
+        original: PathBuf,
+        manifest: Vec<(PathBuf, FileIdentity)>,
+        manifest_complete: bool,
+    },
+    RestoreRecycled {
+        original: PathBuf,
+        absolute_pidl: Vec<u8>,
+    },
+    FinalizeRestore {
+        temporary: PathBuf,
+        original: PathBuf,
+        identity: FileIdentity,
+    },
+}
+
+impl UndoItem {
+    pub fn directories(&self) -> Vec<PathBuf> {
+        match self {
+            Self::RemoveCreated { path, .. }
+            | Self::RemoveEmptyDirectory { path, .. }
+            | Self::RemoveQuarantined { path, .. } => {
+                path.parent().map(Path::to_path_buf).into_iter().collect()
+            }
+            Self::MoveBack {
+                current, original, ..
+            }
+            | Self::MoveBackQuarantined {
+                current, original, ..
+            } => [current.parent(), original.parent()]
+                .into_iter()
+                .flatten()
+                .map(Path::to_path_buf)
+                .collect(),
+            Self::RestoreRecycled { original, .. } => original
+                .parent()
+                .map(Path::to_path_buf)
+                .into_iter()
+                .collect(),
+            Self::FinalizeRestore {
+                temporary,
+                original,
+                ..
+            } => [temporary.parent(), original.parent()]
+                .into_iter()
+                .flatten()
+                .map(Path::to_path_buf)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub volume_serial: u64,
+    pub file_index: [u8; 16],
+    pub is_directory: bool,
+    pub size_bytes: u64,
+    pub modified: Option<SystemTime>,
+    pub change_time: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoEntry {
+    pub source_kind: UndoSourceKind,
+    pub items: Vec<UndoItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UndoBeginError {
+    Empty,
+    Busy,
+}
+
+#[derive(Debug, Default)]
+pub struct UndoHistory {
+    entries: VecDeque<UndoEntry>,
+    in_progress: Option<UndoEntry>,
+    last_failure: Option<String>,
+}
+
+impl UndoHistory {
+    pub const MAX_ENTRIES: usize = 32;
+    pub const MAX_SNAPSHOT_ITEMS: usize = 100_000;
+
+    pub fn push(&mut self, entry: UndoEntry) {
+        let snapshot_items = entry
+            .items
+            .iter()
+            .map(|item| match item {
+                UndoItem::RemoveCreated { manifest, .. }
+                | UndoItem::RemoveQuarantined { manifest, .. }
+                | UndoItem::MoveBack { manifest, .. }
+                | UndoItem::MoveBackQuarantined { manifest, .. } => manifest.len(),
+                UndoItem::RemoveEmptyDirectory { .. }
+                | UndoItem::RestoreRecycled { .. }
+                | UndoItem::FinalizeRestore { .. } => 1,
+            })
+            .sum::<usize>();
+        if entry.items.is_empty() || snapshot_items > Self::MAX_SNAPSHOT_ITEMS {
+            return;
+        }
+        self.entries.push_back(entry);
+        while self.entries.len() > Self::MAX_ENTRIES {
+            self.entries.pop_front();
+        }
+        while self
+            .entries
+            .iter()
+            .flat_map(|entry| &entry.items)
+            .map(|item| match item {
+                UndoItem::RemoveCreated { manifest, .. }
+                | UndoItem::RemoveQuarantined { manifest, .. }
+                | UndoItem::MoveBack { manifest, .. }
+                | UndoItem::MoveBackQuarantined { manifest, .. } => manifest.len(),
+                UndoItem::RemoveEmptyDirectory { .. }
+                | UndoItem::RestoreRecycled { .. }
+                | UndoItem::FinalizeRestore { .. } => 1,
+            })
+            .sum::<usize>()
+            > Self::MAX_SNAPSHOT_ITEMS
+        {
+            self.entries.pop_front();
+        }
+        self.last_failure = None;
+    }
+
+    pub fn begin(&mut self, local_operation_busy: bool) -> Result<UndoEntry, UndoBeginError> {
+        if local_operation_busy || self.in_progress.is_some() {
+            return Err(UndoBeginError::Busy);
+        }
+        let entry = self.entries.pop_back().ok_or(UndoBeginError::Empty)?;
+        self.in_progress = Some(entry.clone());
+        self.last_failure = None;
+        Ok(entry)
+    }
+
+    pub fn finish(&mut self, failed_items: Vec<UndoItem>, failure: Option<String>) {
+        let Some(mut entry) = self.in_progress.take() else {
+            return;
+        };
+        if failed_items.is_empty() {
+            self.last_failure = None;
+            return;
+        }
+        entry.items = failed_items;
+        self.entries.push_back(entry);
+        self.last_failure = failure;
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_available(&self) -> bool {
+        !self.entries.is_empty() && self.in_progress.is_none()
+    }
+
+    pub fn in_progress(&self) -> bool {
+        self.in_progress.is_some()
+    }
+
+    pub fn latest_kind(&self) -> Option<UndoSourceKind> {
+        self.entries.back().map(|entry| entry.source_kind)
+    }
+
+    pub fn last_failure(&self) -> Option<&str> {
+        self.last_failure.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationState {
+    Queued,
+    Preflight,
+    Running,
+    Paused,
+    WaitingConflict,
+    Cancelling,
+    Completed,
+    Cancelled,
+    PartiallyCompleted,
+    Failed,
+}
+
+impl OperationState {
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Queued
+                | Self::Preflight
+                | Self::Running
+                | Self::Paused
+                | Self::WaitingConflict
+                | Self::Cancelling
+        )
+    }
+    pub fn is_terminal(self) -> bool {
+        !self.is_active()
+    }
+    pub fn can_transition_to(self, next: Self) -> bool {
+        use OperationState::*;
+        matches!(
+            (self, next),
+            (Queued, Preflight | Cancelling | Cancelled | Failed)
+                | (Preflight, Running | Cancelling | Completed | Failed)
+                | (
+                    Running,
+                    Paused | WaitingConflict | Cancelling | Completed | PartiallyCompleted | Failed
+                )
+                | (Paused, Running | Cancelling)
+                | (
+                    WaitingConflict,
+                    Running | Cancelling | PartiallyCompleted | Failed
+                )
+                | (Cancelling, Cancelled | PartiallyCompleted | Failed)
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConflictCategory {
+    ExistingFile,
+    ExistingDirectory,
+    TypeMismatch,
+    DestinationReadOnly,
+    SourceInsideDestination,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictAction {
+    Replace,
+    Skip,
+    KeepBoth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConflictDecision {
+    pub action: ConflictAction,
+    pub apply_to_all: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSnapshot {
+    pub path: PathBuf,
+    pub is_directory: bool,
+    pub size_bytes: Option<u64>,
+    pub modified: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationConflict {
+    pub category: ConflictCategory,
+    pub source: FileSnapshot,
+    pub destination: FileSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemState {
+    Pending,
+    Running,
+    Succeeded,
+    Skipped,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermanentDeletePhase {
+    Original,
+    CleanupPending,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationItem {
+    pub source: Option<PathBuf>,
+    pub destination: Option<PathBuf>,
+    pub state: ItemState,
+    pub error: Option<String>,
+    pub permanent_delete_phase: PermanentDeletePhase,
+    pub cleanup_record: Option<PathBuf>,
+}
+
+impl OperationItem {
+    pub fn pending(source: Option<PathBuf>, destination: Option<PathBuf>) -> Self {
+        Self {
+            source,
+            destination,
+            state: ItemState::Pending,
+            error: None,
+            permanent_delete_phase: PermanentDeletePhase::Original,
+            cleanup_record: None,
+        }
+    }
+
+    pub fn cleanup_pending(original: PathBuf, pending: PathBuf, cleanup_record: PathBuf) -> Self {
+        Self {
+            source: Some(original),
+            destination: Some(pending),
+            state: ItemState::Pending,
+            error: None,
+            permanent_delete_phase: PermanentDeletePhase::CleanupPending,
+            cleanup_record: Some(cleanup_record),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermanentDeleteStage {
+    RemovingOriginal,
+    SourceRemoved,
+    ReleasingSpace,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OperationProgress {
+    pub total_items: usize,
+    pub completed_items: usize,
+    pub total_files: Option<usize>,
+    pub completed_files: usize,
+    pub skipped_files: usize,
+    pub discovered_files: usize,
+    pub processed_bytes: u64,
+    pub skipped_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub discovered_bytes: u64,
+    pub scanning_complete: bool,
+    pub prepared_items: usize,
+    pub current_item: Option<PathBuf>,
+    pub recent_speed_bps: Option<u64>,
+    pub copy_recovering: bool,
+}
+
+impl OperationProgress {
+    pub fn accounted_bytes(&self) -> u64 {
+        self.processed_bytes.saturating_add(self.skipped_bytes)
+    }
+
+    pub fn accounted_files(&self) -> usize {
+        self.completed_files.saturating_add(self.skipped_files)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct TransferRateEstimator {
+    samples: VecDeque<(Duration, u64)>,
+    epoch: u64,
+}
+
+impl TransferRateEstimator {
+    const WINDOW: Duration = Duration::from_secs(5);
+    const MIN_SPAN: Duration = Duration::from_millis(500);
+
+    pub fn record(&mut self, active_elapsed: Duration, processed_bytes: u64, epoch: u64) {
+        if self.epoch != epoch
+            || self
+                .samples
+                .back()
+                .is_some_and(|(_, previous)| processed_bytes < *previous)
+        {
+            self.samples.clear();
+            self.epoch = epoch;
+        }
+        if self
+            .samples
+            .back()
+            .is_some_and(|(elapsed, _)| active_elapsed <= *elapsed)
+        {
+            return;
+        }
+        self.samples.push_back((active_elapsed, processed_bytes));
+        let cutoff = active_elapsed.saturating_sub(Self::WINDOW);
+        while self.samples.len() > 2
+            && self
+                .samples
+                .get(1)
+                .is_some_and(|(elapsed, _)| *elapsed <= cutoff)
+        {
+            self.samples.pop_front();
+        }
+    }
+
+    pub fn bytes_per_second(&self) -> Option<u64> {
+        let (first_elapsed, first_bytes) = self.samples.front()?;
+        let (last_elapsed, last_bytes) = self.samples.back()?;
+        let elapsed = last_elapsed.saturating_sub(*first_elapsed);
+        if elapsed < Self::MIN_SPAN {
+            return None;
+        }
+        if last_bytes == first_bytes {
+            return (elapsed >= Self::WINDOW).then_some(0);
+        }
+        Some((last_bytes - first_bytes).saturating_mul(1_000) / elapsed.as_millis() as u64)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationResult {
+    pub succeeded: Vec<PathBuf>,
+    pub skipped: Vec<PathBuf>,
+    pub failed: Vec<(PathBuf, String)>,
+    pub affected_directories: Vec<PathBuf>,
+}
+
+#[derive(Debug, Default)]
+struct PauseState {
+    paused: bool,
+    started: Option<Instant>,
+    accumulated: Duration,
+}
+
+#[derive(Debug)]
+struct OperationControl {
+    cancelled: AtomicBool,
+    windows_cancelled: std::sync::atomic::AtomicI32,
+    pause_acknowledged: AtomicBool,
+    rate_epoch: std::sync::atomic::AtomicU64,
+    pause: Mutex<PauseState>,
+    wake: Condvar,
+}
+
+#[derive(Debug, Clone)]
+pub struct CancellationToken(Arc<OperationControl>);
+impl Default for CancellationToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self(Arc::new(OperationControl {
+            cancelled: AtomicBool::new(false),
+            windows_cancelled: std::sync::atomic::AtomicI32::new(0),
+            pause_acknowledged: AtomicBool::new(false),
+            rate_epoch: std::sync::atomic::AtomicU64::new(0),
+            pause: Mutex::new(PauseState::default()),
+            wake: Condvar::new(),
+        }))
+    }
+    pub fn cancel(&self) {
+        self.0.cancelled.store(true, Ordering::Release);
+        self.0.windows_cancelled.store(1, Ordering::Release);
+        self.0.wake.notify_all();
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.cancelled.load(Ordering::Acquire)
+    }
+    pub fn cancellation_flag(&self) -> &AtomicBool {
+        &self.0.cancelled
+    }
+    pub fn windows_cancellation_flag(&self) -> &std::sync::atomic::AtomicI32 {
+        &self.0.windows_cancelled
+    }
+    pub fn pause(&self) {
+        if let Ok(mut state) = self.0.pause.lock()
+            && !state.paused
+        {
+            self.0.pause_acknowledged.store(false, Ordering::Release);
+            state.paused = true;
+            state.started = Some(Instant::now());
+            self.0.rate_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    pub fn resume(&self) {
+        if let Ok(mut state) = self.0.pause.lock()
+            && state.paused
+        {
+            state.paused = false;
+            self.0.pause_acknowledged.store(false, Ordering::Release);
+            if let Some(started) = state.started.take() {
+                state.accumulated += started.elapsed();
+            }
+            self.0.rate_epoch.fetch_add(1, Ordering::AcqRel);
+            self.0.wake.notify_all();
+        }
+    }
+    pub fn is_paused(&self) -> bool {
+        self.0.pause.lock().is_ok_and(|state| state.paused)
+    }
+    pub fn acknowledge_pause(&self) {
+        self.0.pause_acknowledged.store(true, Ordering::Release);
+    }
+    pub fn is_pause_acknowledged(&self) -> bool {
+        self.0.pause_acknowledged.load(Ordering::Acquire)
+    }
+    pub fn wait_if_paused(&self) {
+        let Ok(mut state) = self.0.pause.lock() else {
+            return;
+        };
+        if state.paused {
+            self.acknowledge_pause();
+        }
+        while state.paused && !self.is_cancelled() {
+            let Ok(next) = self.0.wake.wait(state) else {
+                return;
+            };
+            state = next;
+        }
+    }
+    pub fn active_elapsed(&self, started: Instant) -> Duration {
+        let elapsed = started.elapsed();
+        let paused = self.0.pause.lock().map_or(Duration::ZERO, |state| {
+            state.accumulated
+                + state
+                    .started
+                    .map_or(Duration::ZERO, |value| value.elapsed())
+        });
+        elapsed.saturating_sub(paused)
+    }
+    pub fn rate_epoch(&self) -> u64 {
+        self.0.rate_epoch.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OperationResource {
+    Local,
+    Network,
+    Cleanup,
+}
+
+impl OperationResource {
+    const fn index(self) -> usize {
+        match self {
+            Self::Local => 0,
+            Self::Network => 1,
+            Self::Cleanup => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OperationTask {
+    pub id: OperationId,
+    pub kind: FileOperationKind,
+    pub resource: OperationResource,
+    pub created_at: SystemTime,
+    pub started_at: Instant,
+    pub finished_at: Option<Instant>,
+    pub origin_tab: Option<TabId>,
+    pub state: OperationState,
+    pub execution_round: u32,
+    pub permanent_delete_stage: Option<PermanentDeleteStage>,
+    pub source_removed_at: Option<Instant>,
+    pub cleanup_started_at: Option<Instant>,
+    pub recovered_cleanup: bool,
+    pub items: Vec<OperationItem>,
+    pub undo_items: Vec<UndoItem>,
+    pub undo_source_manifests: Vec<Option<Vec<(PathBuf, FileIdentity)>>>,
+    pub undo_source_kind: Option<UndoSourceKind>,
+    pub progress: OperationProgress,
+    pub conflict: Option<OperationConflict>,
+    pub result: Option<OperationResult>,
+    pub cancellation: CancellationToken,
+    conflict_defaults: HashMap<ConflictCategory, ConflictAction>,
+}
+
+impl OperationTask {
+    fn new(
+        id: OperationId,
+        resource: OperationResource,
+        kind: FileOperationKind,
+        origin_tab: Option<TabId>,
+        items: Vec<OperationItem>,
+    ) -> Self {
+        Self {
+            id,
+            kind,
+            resource,
+            created_at: SystemTime::now(),
+            started_at: Instant::now(),
+            finished_at: None,
+            origin_tab,
+            state: OperationState::Queued,
+            execution_round: 1,
+            permanent_delete_stage: (kind == FileOperationKind::PermanentDelete)
+                .then_some(PermanentDeleteStage::RemovingOriginal),
+            source_removed_at: None,
+            cleanup_started_at: None,
+            recovered_cleanup: false,
+            progress: OperationProgress {
+                total_items: items.len(),
+                discovered_files: 0,
+                discovered_bytes: 0,
+                scanning_complete: false,
+                ..Default::default()
+            },
+            items,
+            undo_items: Vec::new(),
+            undo_source_manifests: Vec::new(),
+            undo_source_kind: None,
+            conflict: None,
+            result: None,
+            cancellation: CancellationToken::new(),
+            conflict_defaults: HashMap::new(),
+        }
+    }
+
+    pub fn set_permanent_delete_stage(&mut self, stage: PermanentDeleteStage) {
+        if self.kind == FileOperationKind::PermanentDelete {
+            self.permanent_delete_stage = Some(stage);
+        }
+    }
+    pub fn transition(&mut self, next: OperationState) -> Result<(), StateTransitionError> {
+        if !self.state.can_transition_to(next) {
+            return Err(StateTransitionError {
+                from: self.state,
+                to: next,
+            });
+        }
+        self.state = next;
+        Ok(())
+    }
+    pub fn conflict_default(&self, category: ConflictCategory) -> Option<ConflictAction> {
+        self.conflict_defaults.get(&category).copied()
+    }
+    pub fn set_conflict(
+        &mut self,
+        conflict: OperationConflict,
+    ) -> Result<(), StateTransitionError> {
+        self.transition(OperationState::WaitingConflict)?;
+        self.cancellation.pause();
+        self.progress.recent_speed_bps = None;
+        self.conflict = Some(conflict);
+        Ok(())
+    }
+    pub fn resolve_conflict(
+        &mut self,
+        decision: ConflictDecision,
+    ) -> Result<(), StateTransitionError> {
+        let Some(conflict) = self.conflict.take() else {
+            return Err(StateTransitionError {
+                from: self.state,
+                to: OperationState::Running,
+            });
+        };
+        if decision.apply_to_all {
+            self.conflict_defaults
+                .insert(conflict.category, decision.action);
+        }
+        self.cancellation.resume();
+        self.progress.recent_speed_bps = None;
+        self.transition(OperationState::Running)
+    }
+    pub fn request_cancel(&mut self) -> Result<(), StateTransitionError> {
+        self.cancellation.cancel();
+        match self.state {
+            OperationState::Queued => self.transition(OperationState::Cancelled),
+            OperationState::Preflight
+            | OperationState::Running
+            | OperationState::Paused
+            | OperationState::WaitingConflict => self.transition(OperationState::Cancelling),
+            OperationState::Cancelling => Ok(()),
+            _ => Err(StateTransitionError {
+                from: self.state,
+                to: OperationState::Cancelling,
+            }),
+        }
+    }
+    pub fn set_paused(&mut self, paused: bool) -> Result<(), StateTransitionError> {
+        match (self.state, paused) {
+            (OperationState::Running, true) => {
+                self.cancellation.pause();
+                self.progress.recent_speed_bps = None;
+                self.transition(OperationState::Paused)
+            }
+            (OperationState::Paused, false) => {
+                self.cancellation.resume();
+                self.progress.recent_speed_bps = None;
+                self.transition(OperationState::Running)
+            }
+            (OperationState::Paused, true) | (OperationState::Running, false) => Ok(()),
+            _ => Err(StateTransitionError {
+                from: self.state,
+                to: if paused {
+                    OperationState::Paused
+                } else {
+                    OperationState::Running
+                },
+            }),
+        }
+    }
+    fn prepare_retry(&mut self) -> bool {
+        let mut retry_count = 0;
+        for item in &mut self.items {
+            if matches!(
+                item.state,
+                ItemState::Failed | ItemState::Cancelled | ItemState::Pending | ItemState::Running
+            ) {
+                item.state = ItemState::Pending;
+                item.error = None;
+                retry_count += 1;
+            }
+        }
+        if retry_count == 0 {
+            return false;
+        }
+        self.execution_round += 1;
+        self.state = OperationState::Queued;
+        self.progress = OperationProgress {
+            total_items: retry_count,
+            discovered_files: 0,
+            discovered_bytes: 0,
+            scanning_complete: false,
+            ..Default::default()
+        };
+        self.conflict = None;
+        self.result = None;
+        self.started_at = Instant::now();
+        self.finished_at = None;
+        self.cancellation = CancellationToken::new();
+        self.conflict_defaults.clear();
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StateTransitionError {
+    pub from: OperationState,
+    pub to: OperationState,
+}
+
+#[derive(Debug, Default)]
+pub struct OperationManager {
+    next_id: u64,
+    tasks: BTreeMap<OperationId, OperationTask>,
+    queues: [VecDeque<OperationId>; 3],
+    active: [Option<OperationId>; 3],
+}
+
+impl OperationManager {
+    pub fn new() -> Self {
+        Self {
+            next_id: 1,
+            queues: [VecDeque::new(), VecDeque::new(), VecDeque::new()],
+            active: [None, None, None],
+            ..Default::default()
+        }
+    }
+    pub fn submit(
+        &mut self,
+        resource: OperationResource,
+        kind: FileOperationKind,
+        origin_tab: Option<TabId>,
+        items: Vec<OperationItem>,
+    ) -> OperationId {
+        let id = OperationId(self.next_id);
+        self.next_id += 1;
+        self.insert_task(OperationTask::new(id, resource, kind, origin_tab, items));
+        id
+    }
+
+    // Preparation cannot occupy a resource queue before mapped paths identify that resource.
+    pub fn submit_preparing(
+        &mut self,
+        origin_tab: TabId,
+        items: Vec<OperationItem>,
+    ) -> OperationId {
+        let id = OperationId(self.next_id);
+        self.next_id += 1;
+        self.tasks.insert(
+            id,
+            OperationTask::new(
+                id,
+                OperationResource::Local,
+                FileOperationKind::Rename,
+                Some(origin_tab),
+                items,
+            ),
+        );
+        id
+    }
+    pub fn complete_preparation(
+        &mut self,
+        id: OperationId,
+        resource: OperationResource,
+        items: Vec<OperationItem>,
+        manifests: Vec<Option<Vec<(PathBuf, FileIdentity)>>>,
+    ) -> bool {
+        if self.queues.iter().any(|queue| queue.contains(&id)) {
+            return false;
+        }
+        let Some(task) = self.tasks.get_mut(&id) else {
+            return false;
+        };
+        if task.state != OperationState::Queued || task.cancellation.is_cancelled() {
+            return false;
+        }
+        task.resource = resource;
+        task.items = items;
+        task.undo_source_manifests = manifests;
+        self.queues[resource.index()].push_back(id);
+        true
+    }
+
+    pub fn submit_recovered_cleanup(
+        &mut self,
+        origin_tab: Option<TabId>,
+        items: Vec<OperationItem>,
+    ) -> OperationId {
+        let id = self.submit(
+            OperationResource::Cleanup,
+            FileOperationKind::PermanentDelete,
+            origin_tab,
+            items,
+        );
+        let task = self
+            .tasks
+            .get_mut(&id)
+            .expect("submitted cleanup task exists");
+        task.permanent_delete_stage = Some(PermanentDeleteStage::ReleasingSpace);
+        task.source_removed_at = Some(Instant::now());
+        task.recovered_cleanup = true;
+        id
+    }
+
+    fn insert_task(&mut self, task: OperationTask) {
+        let id = task.id;
+        let resource = task.resource;
+        self.tasks.insert(id, task);
+        self.queues[resource.index()].push_back(id);
+    }
+    pub fn set_undo_source_manifests(
+        &mut self,
+        id: OperationId,
+        manifests: Vec<Option<Vec<(PathBuf, FileIdentity)>>>,
+    ) {
+        if let Some(task) = self.tasks.get_mut(&id) {
+            task.undo_source_manifests = manifests;
+        }
+    }
+    pub fn submit_undo(
+        &mut self,
+        origin_tab: Option<TabId>,
+        source_kind: UndoSourceKind,
+        undo_items: Vec<UndoItem>,
+    ) -> OperationId {
+        let items = undo_items
+            .iter()
+            .map(|item| match item {
+                UndoItem::RemoveCreated { path, .. }
+                | UndoItem::RemoveEmptyDirectory { path, .. }
+                | UndoItem::RemoveQuarantined { path, .. } => {
+                    OperationItem::pending(Some(path.clone()), None)
+                }
+                UndoItem::MoveBack {
+                    current, original, ..
+                }
+                | UndoItem::MoveBackQuarantined {
+                    current, original, ..
+                } => OperationItem::pending(Some(current.clone()), Some(original.clone())),
+                UndoItem::RestoreRecycled { original, .. } => {
+                    OperationItem::pending(None, Some(original.clone()))
+                }
+                UndoItem::FinalizeRestore {
+                    temporary,
+                    original,
+                    ..
+                } => OperationItem::pending(Some(temporary.clone()), Some(original.clone())),
+            })
+            .collect();
+        let id = self.submit(
+            OperationResource::Local,
+            FileOperationKind::Undo,
+            origin_tab,
+            items,
+        );
+        self.tasks
+            .get_mut(&id)
+            .expect("submitted undo task exists")
+            .undo_items = undo_items;
+        self.tasks
+            .get_mut(&id)
+            .expect("submitted undo task exists")
+            .undo_source_kind = Some(source_kind);
+        id
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &OperationTask> {
+        self.tasks.values()
+    }
+    pub fn task(&self, id: OperationId) -> Option<&OperationTask> {
+        self.tasks.get(&id)
+    }
+    pub fn task_mut(&mut self, id: OperationId) -> Option<&mut OperationTask> {
+        self.tasks.get_mut(&id)
+    }
+    pub fn active_id(&self, resource: OperationResource) -> Option<OperationId> {
+        self.active[resource.index()]
+    }
+    pub fn queue_position(&self, id: OperationId) -> Option<usize> {
+        let task = self.tasks.get(&id)?;
+        if task.state != OperationState::Queued {
+            return None;
+        }
+        self.queues[task.resource.index()]
+            .iter()
+            .position(|queued| *queued == id)
+            .map(|position| position + 1)
+    }
+    pub fn has_active_tasks(&self) -> bool {
+        self.tasks.values().any(|task| task.state.is_active())
+    }
+    pub fn has_foreground_active_tasks(&self) -> bool {
+        self.tasks
+            .values()
+            .any(|task| task.resource != OperationResource::Cleanup && task.state.is_active())
+    }
+    pub fn start_next(
+        &mut self,
+        resource: OperationResource,
+    ) -> Result<Option<OperationId>, StateTransitionError> {
+        let slot = resource.index();
+        if self.active[slot].is_some() {
+            return Ok(None);
+        }
+        while let Some(id) = self.queues[slot].pop_front() {
+            let task = self.tasks.get_mut(&id).expect("queued task must exist");
+            if task.state != OperationState::Queued {
+                continue;
+            }
+            task.transition(OperationState::Preflight)?;
+            self.active[slot] = Some(id);
+            return Ok(Some(id));
+        }
+        Ok(None)
+    }
+    pub fn mark_running(&mut self, id: OperationId) -> Result<(), StateTransitionError> {
+        let task = self.require_active_mut(id)?;
+        task.transition(OperationState::Running)?;
+        task.started_at = Instant::now();
+        Ok(())
+    }
+    pub fn finish(
+        &mut self,
+        id: OperationId,
+        state: OperationState,
+        result: OperationResult,
+    ) -> Result<(), StateTransitionError> {
+        let task = self.require_active_mut(id)?;
+        task.transition(state)?;
+        task.result = Some(result);
+        task.finished_at = Some(Instant::now());
+        self.active[task.resource.index()] = None;
+        Ok(())
+    }
+    pub fn prune_transient(&mut self, minimum_age: Duration) -> usize {
+        self.prune_transient_with_retained_cleanup(minimum_age, minimum_age)
+    }
+    pub fn prune_transient_with_retained_cleanup(
+        &mut self,
+        minimum_age: Duration,
+        cleanup_completed_age: Duration,
+    ) -> usize {
+        let before = self.tasks.len();
+        self.tasks.retain(|_, task| {
+            if !matches!(
+                task.state,
+                OperationState::Completed | OperationState::Cancelled
+            ) {
+                return true;
+            }
+
+            let required_age = if task.resource == OperationResource::Cleanup
+                && task.kind == FileOperationKind::PermanentDelete
+                && task.state == OperationState::Completed
+                && !task.recovered_cleanup
+            {
+                cleanup_completed_age
+            } else {
+                minimum_age
+            };
+            task.finished_at
+                .is_none_or(|finished| finished.elapsed() < required_age)
+        });
+        before - self.tasks.len()
+    }
+    pub fn cancel(&mut self, id: OperationId) -> Result<(), StateTransitionError> {
+        let resource =
+            self.tasks
+                .get(&id)
+                .map(|task| task.resource)
+                .ok_or(StateTransitionError {
+                    from: OperationState::Failed,
+                    to: OperationState::Cancelling,
+                })?;
+        let was_active = self.active[resource.index()] == Some(id);
+        let task = self.tasks.get_mut(&id).expect("operation must exist");
+        task.request_cancel()?;
+        if !was_active {
+            self.queues[resource.index()].retain(|queued| *queued != id);
+        }
+        Ok(())
+    }
+    pub fn set_paused(
+        &mut self,
+        id: OperationId,
+        paused: bool,
+    ) -> Result<(), StateTransitionError> {
+        self.tasks
+            .get_mut(&id)
+            .expect("operation must exist")
+            .set_paused(paused)
+    }
+    pub fn abort_before_dispatch(&mut self, id: OperationId) -> bool {
+        let Some(resource) = self.tasks.get(&id).map(|task| task.resource) else {
+            return false;
+        };
+        if self.active[resource.index()] == Some(id) {
+            self.active[resource.index()] = None;
+        }
+        self.queues[resource.index()].retain(|queued| *queued != id);
+        self.tasks.remove(&id).is_some()
+    }
+
+    pub fn remove_terminal(&mut self, id: OperationId) -> bool {
+        let Some(resource) = self
+            .tasks
+            .get(&id)
+            .filter(|task| task.state.is_terminal())
+            .map(|task| task.resource)
+        else {
+            return false;
+        };
+        self.tasks.remove(&id);
+        self.queues[resource.index()].retain(|queued| *queued != id);
+        true
+    }
+    pub fn retry(&mut self, id: OperationId) -> bool {
+        let resource = self.tasks.get(&id).map(|task| task.resource);
+        if resource.is_some_and(|resource| self.active[resource.index()] == Some(id)) {
+            return false;
+        }
+        let Some(task) = self.tasks.get_mut(&id) else {
+            return false;
+        };
+        if !task.state.is_terminal() || !task.prepare_retry() {
+            return false;
+        }
+        self.queues[task.resource.index()].push_back(id);
+        true
+    }
+    fn require_active_mut(
+        &mut self,
+        id: OperationId,
+    ) -> Result<&mut OperationTask, StateTransitionError> {
+        let resource = self.tasks.get(&id).map(|task| task.resource);
+        if resource.is_none_or(|resource| self.active[resource.index()] != Some(id)) {
+            let from = self
+                .tasks
+                .get(&id)
+                .map(|task| task.state)
+                .unwrap_or(OperationState::Failed);
+            return Err(StateTransitionError {
+                from,
+                to: OperationState::Running,
+            });
+        }
+        Ok(self.tasks.get_mut(&id).expect("active task must exist"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn item(name: &str) -> OperationItem {
+        OperationItem::pending(Some(PathBuf::from(name)), None)
+    }
+    fn identity(seed: u8) -> FileIdentity {
+        FileIdentity {
+            volume_serial: 1,
+            file_index: [seed; 16],
+            is_directory: false,
+            size_bytes: 1,
+            modified: None,
+            change_time: 0,
+        }
+    }
+
+    fn undo_entry(seed: u8, snapshot_count: usize) -> UndoEntry {
+        UndoEntry {
+            source_kind: UndoSourceKind::Copy,
+            items: vec![UndoItem::RemoveCreated {
+                path: PathBuf::from(format!("copy-{seed}")),
+                manifest: (0..snapshot_count)
+                    .map(|index| {
+                        (
+                            PathBuf::from(format!("copy-{seed}/{index}")),
+                            identity(seed),
+                        )
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    #[test]
+    fn rename_preparation_enters_only_the_resolved_resource_queue() {
+        let mut manager = OperationManager::new();
+        let id = manager.submit_preparing(
+            TabId(1),
+            vec![OperationItem::pending(Some(PathBuf::from("Z:\\old")), None)],
+        );
+        assert_eq!(manager.start_next(OperationResource::Local).unwrap(), None);
+        assert!(manager.complete_preparation(id, OperationResource::Network, vec![], vec![]));
+        assert!(!manager.complete_preparation(id, OperationResource::Network, vec![], vec![]));
+        assert_eq!(manager.start_next(OperationResource::Local).unwrap(), None);
+        assert_eq!(
+            manager.start_next(OperationResource::Network).unwrap(),
+            Some(id)
+        );
+    }
+    #[test]
+    fn cancellation_during_rename_preparation_never_requeues_the_task() {
+        let mut manager = OperationManager::new();
+        let id = manager.submit_preparing(TabId(1), vec![]);
+        manager.cancel(id).unwrap();
+        assert_eq!(manager.task(id).unwrap().state, OperationState::Cancelled);
+        assert!(!manager.complete_preparation(id, OperationResource::Network, vec![], vec![]));
+        assert_eq!(
+            manager.start_next(OperationResource::Network).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn issue_83_undo_history_is_lifo_and_requeues_only_failed_items() {
+        let mut history = UndoHistory::default();
+        history.push(undo_entry(1, 1));
+        history.push(undo_entry(2, 2));
+
+        let latest = history.begin(false).unwrap();
+        assert_eq!(latest.items, undo_entry(2, 2).items);
+        let remaining = vec![latest.items[0].clone()];
+        history.finish(remaining.clone(), Some("locked".to_owned()));
+
+        assert_eq!(history.entry_count(), 2);
+        assert_eq!(history.last_failure(), Some("locked"));
+        assert_eq!(history.begin(false).unwrap().items, remaining);
+    }
+
+    #[test]
+    fn issue_83_undo_history_rejects_busy_and_bounds_entries() {
+        let mut history = UndoHistory::default();
+        assert_eq!(history.begin(false), Err(UndoBeginError::Empty));
+        for seed in 0..=(UndoHistory::MAX_ENTRIES as u8) {
+            history.push(undo_entry(seed, 1));
+        }
+        assert_eq!(history.entry_count(), UndoHistory::MAX_ENTRIES);
+        assert_eq!(history.begin(true), Err(UndoBeginError::Busy));
+    }
+
+    #[test]
+    fn issue_83_undo_history_rejects_an_oversized_snapshot() {
+        let mut history = UndoHistory::default();
+        history.push(undo_entry(
+            1,
+            UndoHistory::MAX_SNAPSHOT_ITEMS.saturating_add(1),
+        ));
+        assert!(!history.is_available());
+    }
+
+    #[test]
+    fn issue_83_history_accepts_stage_aware_retry_items() {
+        let mut history = UndoHistory::default();
+        history.push(UndoEntry {
+            source_kind: UndoSourceKind::RecycleDelete,
+            items: vec![UndoItem::FinalizeRestore {
+                temporary: PathBuf::from("temporary.txt"),
+                original: PathBuf::from("original.txt"),
+                identity: identity(9),
+            }],
+        });
+        let entry = history.begin(false).unwrap();
+        history.finish(entry.items.clone(), Some("occupied".to_owned()));
+        assert_eq!(history.entry_count(), 1);
+        assert_eq!(history.begin(false).unwrap().items, entry.items);
+    }
+    #[test]
+    fn issue_83_operation_manager_projects_undo_items() {
+        let mut manager = OperationManager::new();
+        let entry = undo_entry(3, 1);
+        let id = manager.submit_undo(None, entry.source_kind, entry.items.clone());
+        let task = manager.task(id).unwrap();
+
+        assert_eq!(task.kind, FileOperationKind::Undo);
+        assert_eq!(task.undo_items, entry.items);
+        assert_eq!(task.items.len(), 1);
+    }
+
+    #[test]
+    fn issue_82_recovered_cleanup_is_retryable_without_using_the_original_path() {
+        let mut manager = OperationManager::new();
+        let original = PathBuf::from(r"C:\source\large");
+        let pending = PathBuf::from(r"C:\.asterfiles-cleanup\task\payload");
+        let record = PathBuf::from(r"C:\records\task");
+        let id = manager.submit_recovered_cleanup(
+            None,
+            vec![OperationItem::cleanup_pending(
+                original.clone(),
+                pending.clone(),
+                record.clone(),
+            )],
+        );
+
+        let task = manager.task(id).unwrap();
+        assert_eq!(task.state, OperationState::Queued);
+        assert_eq!(task.resource, OperationResource::Cleanup);
+        assert_eq!(
+            task.items[0].permanent_delete_phase,
+            PermanentDeletePhase::CleanupPending
+        );
+        assert_eq!(task.items[0].source.as_deref(), Some(original.as_path()));
+        assert_eq!(
+            task.items[0].destination.as_deref(),
+            Some(pending.as_path())
+        );
+        assert_eq!(
+            task.items[0].cleanup_record.as_deref(),
+            Some(record.as_path())
+        );
+        assert_eq!(
+            manager.start_next(OperationResource::Cleanup).unwrap(),
+            Some(id)
+        );
+        manager.mark_running(id).unwrap();
+        assert_eq!(manager.task(id).unwrap().state, OperationState::Running);
+    }
+    #[test]
+    fn issue_61_new_task_starts_with_unknown_scan_totals() {
+        let task = OperationTask::new(
+            OperationId(1),
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![item("a")],
+        );
+
+        assert_eq!(task.progress.discovered_files, 0);
+        assert_eq!(task.progress.discovered_bytes, 0);
+        assert!(!task.progress.scanning_complete);
+        assert_eq!(task.progress.total_files, None);
+        assert_eq!(task.progress.total_bytes, None);
+    }
+    #[test]
+    fn issue_62_recent_rate_uses_a_bounded_window_and_requires_enough_time() {
+        let mut estimator = TransferRateEstimator::default();
+        estimator.record(Duration::from_millis(0), 1_000, 0);
+        estimator.record(Duration::from_millis(300), 4_000, 0);
+        assert_eq!(estimator.bytes_per_second(), None);
+        estimator.record(Duration::from_millis(1_000), 11_000, 0);
+        assert_eq!(estimator.bytes_per_second(), Some(10_000));
+        estimator.record(Duration::from_millis(7_000), 41_000, 0);
+        assert_eq!(estimator.bytes_per_second(), Some(5_000));
+    }
+
+    #[test]
+    fn issue_137_idle_rate_ticks_expire_stale_speed_and_recover() {
+        let mut estimator = TransferRateEstimator::default();
+        estimator.record(Duration::ZERO, 0, 0);
+        estimator.record(Duration::from_secs(1), 10_000, 0);
+        assert_eq!(estimator.bytes_per_second(), Some(10_000));
+        for second in 2..=6 {
+            estimator.record(Duration::from_secs(second), 10_000, 0);
+        }
+        assert_eq!(estimator.bytes_per_second(), Some(0));
+        estimator.record(Duration::from_secs(7), 20_000, 0);
+        assert_eq!(estimator.bytes_per_second(), Some(2_000));
+        estimator.record(Duration::from_secs(7), 20_000, 1);
+        assert_eq!(estimator.bytes_per_second(), None);
+    }
+
+    #[test]
+    fn issue_62_pause_epoch_discards_old_rate_samples() {
+        let token = CancellationToken::new();
+        let mut estimator = TransferRateEstimator::default();
+        estimator.record(Duration::ZERO, 1_000, token.rate_epoch());
+        estimator.record(Duration::from_secs(1), 11_000, token.rate_epoch());
+        assert_eq!(estimator.bytes_per_second(), Some(10_000));
+        token.pause();
+        token.resume();
+        estimator.record(Duration::from_secs(2), 12_000, token.rate_epoch());
+        assert_eq!(estimator.bytes_per_second(), None);
+    }
+
+    #[test]
+    fn issue_62_queue_position_is_scoped_to_each_resource() {
+        let mut manager = OperationManager::new();
+        let local_first = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![item("a")],
+        );
+        let local_second = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![item("b")],
+        );
+        let network_first = manager.submit(
+            OperationResource::Network,
+            FileOperationKind::Copy,
+            None,
+            vec![item("n")],
+        );
+        assert_eq!(manager.queue_position(local_first), Some(1));
+        assert_eq!(manager.queue_position(local_second), Some(2));
+        assert_eq!(manager.queue_position(network_first), Some(1));
+        manager.start_next(OperationResource::Local).unwrap();
+        assert_eq!(manager.queue_position(local_first), None);
+        assert_eq!(manager.queue_position(local_second), Some(1));
+    }
+    #[test]
+    fn manager_runs_only_one_write_task() {
+        let mut manager = OperationManager::new();
+        let first = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![item("a")],
+        );
+        let second = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::Move,
+            None,
+            vec![item("b")],
+        );
+        assert_eq!(
+            manager.start_next(OperationResource::Local).unwrap(),
+            Some(first)
+        );
+        assert_eq!(manager.start_next(OperationResource::Local).unwrap(), None);
+        manager.mark_running(first).unwrap();
+        manager
+            .finish(
+                first,
+                OperationState::Completed,
+                OperationResult {
+                    succeeded: vec![PathBuf::from("a")],
+                    skipped: vec![],
+                    failed: vec![],
+                    affected_directories: vec![],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            manager.start_next(OperationResource::Local).unwrap(),
+            Some(second)
+        );
+    }
+    #[test]
+    fn local_and_network_tasks_run_in_parallel_but_same_resource_is_serial() {
+        let mut manager = OperationManager::new();
+        let local = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![item("local")],
+        );
+        let network = manager.submit(
+            OperationResource::Network,
+            FileOperationKind::Copy,
+            None,
+            vec![item("network")],
+        );
+        let queued_network = manager.submit(
+            OperationResource::Network,
+            FileOperationKind::Move,
+            None,
+            vec![item("network-2")],
+        );
+        assert_eq!(
+            manager.start_next(OperationResource::Local).unwrap(),
+            Some(local)
+        );
+        assert_eq!(
+            manager.start_next(OperationResource::Network).unwrap(),
+            Some(network)
+        );
+        assert_eq!(manager.active_id(OperationResource::Local), Some(local));
+        assert_eq!(manager.active_id(OperationResource::Network), Some(network));
+        assert_eq!(
+            manager.start_next(OperationResource::Network).unwrap(),
+            None
+        );
+        manager.mark_running(local).unwrap();
+        manager.mark_running(network).unwrap();
+        manager
+            .finish(
+                local,
+                OperationState::Completed,
+                OperationResult {
+                    succeeded: vec![],
+                    skipped: vec![],
+                    failed: vec![],
+                    affected_directories: vec![],
+                },
+            )
+            .unwrap();
+        assert_eq!(manager.active_id(OperationResource::Network), Some(network));
+        manager
+            .finish(
+                network,
+                OperationState::Completed,
+                OperationResult {
+                    succeeded: vec![],
+                    skipped: vec![],
+                    failed: vec![],
+                    affected_directories: vec![],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            manager.start_next(OperationResource::Network).unwrap(),
+            Some(queued_network)
+        );
+    }
+
+    #[test]
+    fn issue_82_background_cleanup_does_not_block_application_exit() {
+        let mut manager = OperationManager::new();
+        let cleanup = manager.submit(
+            OperationResource::Cleanup,
+            FileOperationKind::PermanentDelete,
+            None,
+            vec![item("cleanup")],
+        );
+        manager.start_next(OperationResource::Cleanup).unwrap();
+        manager.mark_running(cleanup).unwrap();
+
+        assert!(manager.has_active_tasks());
+        assert!(!manager.has_foreground_active_tasks());
+
+        let local = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![item("local")],
+        );
+        manager.start_next(OperationResource::Local).unwrap();
+        manager.mark_running(local).unwrap();
+        assert!(manager.has_foreground_active_tasks());
+    }
+    #[test]
+    fn issue_82_cleanup_runs_beside_local_work_but_remains_serial() {
+        let mut manager = OperationManager::new();
+        let local = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::PermanentDelete,
+            None,
+            vec![item("local")],
+        );
+        let cleanup = manager.submit(
+            OperationResource::Cleanup,
+            FileOperationKind::PermanentDelete,
+            None,
+            vec![item("cleanup")],
+        );
+        let queued_cleanup = manager.submit(
+            OperationResource::Cleanup,
+            FileOperationKind::PermanentDelete,
+            None,
+            vec![item("cleanup-2")],
+        );
+
+        assert_eq!(
+            manager.start_next(OperationResource::Cleanup).unwrap(),
+            Some(cleanup)
+        );
+        assert_eq!(
+            manager.start_next(OperationResource::Local).unwrap(),
+            Some(local)
+        );
+        assert_eq!(manager.active_id(OperationResource::Cleanup), Some(cleanup));
+        assert_eq!(manager.active_id(OperationResource::Local), Some(local));
+        assert_eq!(
+            manager.start_next(OperationResource::Cleanup).unwrap(),
+            None
+        );
+        assert_eq!(manager.queue_position(queued_cleanup), Some(1));
+    }
+    #[test]
+    fn cancelling_queued_network_task_removes_only_network_queue_entry() {
+        let mut manager = OperationManager::new();
+        let local = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![item("local")],
+        );
+        let network = manager.submit(
+            OperationResource::Network,
+            FileOperationKind::Copy,
+            None,
+            vec![item("network")],
+        );
+        let queued_network = manager.submit(
+            OperationResource::Network,
+            FileOperationKind::Move,
+            None,
+            vec![item("network-2")],
+        );
+        manager.start_next(OperationResource::Local).unwrap();
+        manager.start_next(OperationResource::Network).unwrap();
+        manager.mark_running(local).unwrap();
+        manager.mark_running(network).unwrap();
+        manager.cancel(queued_network).unwrap();
+        assert_eq!(
+            manager.task(queued_network).unwrap().state,
+            OperationState::Cancelled
+        );
+        manager
+            .finish(
+                network,
+                OperationState::Completed,
+                OperationResult {
+                    succeeded: vec![],
+                    skipped: vec![],
+                    failed: vec![],
+                    affected_directories: vec![],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            manager.start_next(OperationResource::Network).unwrap(),
+            None
+        );
+    }
+    #[test]
+    fn invalid_state_transition_is_rejected() {
+        let mut task = OperationTask::new(
+            OperationId(1),
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![item("a")],
+        );
+        assert_eq!(
+            task.transition(OperationState::Completed),
+            Err(StateTransitionError {
+                from: OperationState::Queued,
+                to: OperationState::Completed
+            })
+        );
+    }
+    #[test]
+    fn conflict_default_is_scoped_to_category() {
+        let mut task = OperationTask::new(
+            OperationId(1),
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![item("a")],
+        );
+        task.transition(OperationState::Preflight).unwrap();
+        task.transition(OperationState::Running).unwrap();
+        let snapshot = FileSnapshot {
+            path: PathBuf::from("a"),
+            is_directory: false,
+            size_bytes: Some(1),
+            modified: None,
+        };
+        task.set_conflict(OperationConflict {
+            category: ConflictCategory::ExistingFile,
+            source: snapshot.clone(),
+            destination: snapshot,
+        })
+        .unwrap();
+        task.resolve_conflict(ConflictDecision {
+            action: ConflictAction::Skip,
+            apply_to_all: true,
+        })
+        .unwrap();
+        assert_eq!(
+            task.conflict_default(ConflictCategory::ExistingFile),
+            Some(ConflictAction::Skip)
+        );
+        assert_eq!(task.conflict_default(ConflictCategory::TypeMismatch), None);
+    }
+    #[test]
+    fn conflict_wait_is_excluded_from_active_elapsed_time() {
+        let mut task = OperationTask::new(
+            OperationId(1),
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![item("a")],
+        );
+        task.transition(OperationState::Preflight).unwrap();
+        task.transition(OperationState::Running).unwrap();
+        task.started_at = Instant::now() - Duration::from_millis(700);
+        let snapshot = FileSnapshot {
+            path: PathBuf::from("a"),
+            is_directory: false,
+            size_bytes: Some(1),
+            modified: None,
+        };
+
+        task.set_conflict(OperationConflict {
+            category: ConflictCategory::ExistingFile,
+            source: snapshot.clone(),
+            destination: snapshot,
+        })
+        .unwrap();
+        assert_eq!(task.state, OperationState::WaitingConflict);
+        assert!(task.cancellation.is_paused());
+        let before = task.cancellation.active_elapsed(task.started_at);
+        std::thread::sleep(Duration::from_millis(30));
+        let during = task.cancellation.active_elapsed(task.started_at);
+        assert!(during.saturating_sub(before) < Duration::from_millis(10));
+
+        task.resolve_conflict(ConflictDecision {
+            action: ConflictAction::Replace,
+            apply_to_all: false,
+        })
+        .unwrap();
+        assert_eq!(task.state, OperationState::Running);
+        assert!(!task.cancellation.is_paused());
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            task.cancellation.active_elapsed(task.started_at) >= during + Duration::from_millis(15)
+        );
+    }
+
+    #[test]
+    fn cancelling_queued_task_removes_it_from_queue() {
+        let mut manager = OperationManager::new();
+        let first = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![item("a")],
+        );
+        let second = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::Move,
+            None,
+            vec![item("b")],
+        );
+        manager.cancel(first).unwrap();
+        assert_eq!(
+            manager.task(first).unwrap().state,
+            OperationState::Cancelled
+        );
+        assert_eq!(
+            manager.start_next(OperationResource::Local).unwrap(),
+            Some(second)
+        );
+    }
+    #[test]
+    fn running_task_can_pause_resume_and_cancel() {
+        let mut manager = OperationManager::new();
+        let id = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![item("a")],
+        );
+        manager.start_next(OperationResource::Local).unwrap();
+        manager.mark_running(id).unwrap();
+
+        manager.set_paused(id, true).unwrap();
+        assert_eq!(manager.task(id).unwrap().state, OperationState::Paused);
+        assert!(manager.task(id).unwrap().cancellation.is_paused());
+
+        manager.set_paused(id, false).unwrap();
+        assert_eq!(manager.task(id).unwrap().state, OperationState::Running);
+        assert!(!manager.task(id).unwrap().cancellation.is_paused());
+
+        manager.set_paused(id, true).unwrap();
+        manager.cancel(id).unwrap();
+        assert_eq!(manager.task(id).unwrap().state, OperationState::Cancelling);
+        assert!(manager.task(id).unwrap().cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn issue_62_repeated_pause_request_is_idempotent() {
+        let mut manager = OperationManager::new();
+        let id = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![item("a")],
+        );
+        manager.start_next(OperationResource::Local).unwrap();
+        manager.mark_running(id).unwrap();
+
+        manager.set_paused(id, true).unwrap();
+        manager.set_paused(id, true).unwrap();
+
+        assert_eq!(manager.task(id).unwrap().state, OperationState::Paused);
+        assert!(manager.task(id).unwrap().cancellation.is_paused());
+    }
+
+    #[test]
+    fn issue_83_abort_before_dispatch_releases_the_resource_lane() {
+        let mut manager = OperationManager::new();
+        let id = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::Undo,
+            None,
+            vec![item("undo")],
+        );
+        assert_eq!(
+            manager.start_next(OperationResource::Local).unwrap(),
+            Some(id)
+        );
+        manager.mark_running(id).unwrap();
+
+        assert!(manager.abort_before_dispatch(id));
+        assert_eq!(manager.active_id(OperationResource::Local), None);
+        assert!(manager.task(id).is_none());
+
+        let next = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![item("next")],
+        );
+        assert_eq!(
+            manager.start_next(OperationResource::Local).unwrap(),
+            Some(next)
+        );
+    }
+    #[test]
+    fn issue_61_retry_resets_scan_discovery_and_keeps_successes() {
+        let mut manager = OperationManager::new();
+        let id = manager.submit(
+            OperationResource::Local,
+            FileOperationKind::Copy,
+            None,
+            vec![item("ok"), item("failed"), item("pending")],
+        );
+        manager.start_next(OperationResource::Local).unwrap();
+        manager.mark_running(id).unwrap();
+        {
+            let task = manager.task_mut(id).unwrap();
+            task.items[0].state = ItemState::Succeeded;
+            task.items[1].state = ItemState::Failed;
+            task.progress.discovered_files = 3;
+            task.progress.discovered_bytes = 4_096;
+            task.progress.scanning_complete = true;
+        }
+        manager
+            .finish(
+                id,
+                OperationState::PartiallyCompleted,
+                OperationResult {
+                    succeeded: vec![PathBuf::from("ok")],
+                    skipped: vec![],
+                    failed: vec![(PathBuf::from("failed"), "locked".into())],
+                    affected_directories: vec![],
+                },
+            )
+            .unwrap();
+        assert!(manager.retry(id));
+        let task = manager.task(id).unwrap();
+        assert_eq!(task.execution_round, 2);
+        assert_eq!(task.progress.total_items, 2);
+        assert_eq!(task.progress.discovered_files, 0);
+        assert_eq!(task.progress.discovered_bytes, 0);
+        assert!(!task.progress.scanning_complete);
+        assert_eq!(task.items[0].state, ItemState::Succeeded);
+        assert_eq!(task.items[1].state, ItemState::Pending);
+    }
+}

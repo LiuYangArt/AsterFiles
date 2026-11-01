@@ -20,6 +20,52 @@ verify = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(verify)
 
 
+WORKSPACE_SPEC = importlib.util.spec_from_file_location("workspace_check", MODULE_PATH.with_name("check_workspace.py"))
+assert WORKSPACE_SPEC and WORKSPACE_SPEC.loader
+workspace_check = importlib.util.module_from_spec(WORKSPACE_SPEC)
+WORKSPACE_SPEC.loader.exec_module(workspace_check)
+
+
+class WorkspaceBoundaryTests(unittest.TestCase):
+    def fixture(self):
+        names = ["asterfiles", "asterfiles-domain", "asterfiles-platform-windows",
+                 "asterfiles-webdav", "asterfiles-ui", "windows", "slint", "helper"]
+        return {
+            "packages": [{"id": name, "name": name, "version": "1.0.0"} for name in names],
+            "workspace_members": names[:5],
+            "resolve": {"nodes": [{"id": name, "deps": []} for name in names]},
+        }
+
+    def connect(self, data, source, destination, kind=None):
+        node = next(node for node in data["resolve"]["nodes"] if node["id"] == source)
+        node["deps"].append({"pkg": destination, "dep_kinds": [{"kind": kind}]})
+
+    def test_normal_graph_ignores_dev_and_build_dependencies(self):
+        data = self.fixture()
+        self.connect(data, "asterfiles-domain", "windows", "dev")
+        self.connect(data, "asterfiles-domain", "slint", "build")
+        self.connect(data, "asterfiles-platform-windows", "windows")
+        self.connect(data, "asterfiles-ui", "slint")
+        self.assertEqual(workspace_check.inspect(data)["status"], "passed")
+
+    def test_transitive_domain_and_ui_dependencies_are_rejected(self):
+        data = self.fixture()
+        self.connect(data, "asterfiles-domain", "helper")
+        self.connect(data, "helper", "windows")
+        self.connect(data, "asterfiles-ui", "asterfiles-webdav")
+        report = workspace_check.inspect(data)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(len(report["violations"]), 2)
+
+    def test_missing_members_and_direct_application_bindings_are_rejected(self):
+        data = self.fixture()
+        data["workspace_members"].remove("asterfiles-ui")
+        self.connect(data, "asterfiles", "windows")
+        report = workspace_check.inspect(data)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(len(report["violations"]), 2)
+
+
 class VerifyTests(unittest.TestCase):
     def test_real_failure_writes_log_summary_and_returns_nonzero(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -64,6 +110,20 @@ class VerifyTests(unittest.TestCase):
         for name, command in verify.validation_steps(False, True):
             if name in {"clippy", "test", "debug", "release"}:
                 self.assertIn("--locked", command)
+
+    def test_validation_checks_all_workspace_members(self) -> None:
+        for quick in (True, False):
+            steps = dict(verify.validation_steps(quick, True))
+            self.assertEqual(steps["format"], ["cargo", "fmt", "--all", "--check"])
+            self.assertIn("--workspace", steps["clippy"])
+            self.assertIn("--workspace", steps["test"])
+            self.assertEqual(steps["debug"], ["cargo", "build", "--locked"])
+            self.assertEqual(steps["release"], ["cargo", "build", "--release", "--locked"])
+
+    def test_workspace_architecture_is_checked_in_every_mode(self) -> None:
+        for quick in (True, False):
+            steps = dict(verify.validation_steps(quick, True))
+            self.assertEqual(steps["architecture"], [verify.sys.executable, str(verify.ROOT / "tools" / "check_workspace.py")])
 
     def test_modes_are_mutually_exclusive(self) -> None:
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

@@ -86,8 +86,8 @@ Windows 文件资源管理器中，“大小”标题左对齐，数值右对齐
 
 - 文件列表列几何与交互：`ui/app-window.slint`
 - UI 状态、回调和异步文件夹大小：`src/app.rs`
-- 排序规则与可见列表索引：`src/domain.rs`
-- Everything 排序映射：`src/platform/windows/everything.rs`
+- 排序规则与可见列表索引：`crates/domain/src/lib.rs`
+- Everything 排序映射：`crates/platform-windows/src/windows/everything.rs`
 - 会话列宽格式：`src/session_store.rs`
 - 交互设计：`docs/ui-interaction-design.md`
 - 验证任务记录：GitHub Issue #1

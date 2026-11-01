@@ -68,9 +68,9 @@
 ## 长期排查入口
 
 - 两阶段协调、任务窗口与恢复：`src/app.rs`
-- 任务资源与状态：`src/domain/file_operations.rs`
-- 清理记录、认领、递归删除和进度：`src/fs/file_operations.rs`
-- 内部路径过滤：`src/fs/directory_reader.rs`、`src/domain/folder_size_scheduler.rs`
+- 任务资源与状态：`crates/domain/src/file_operations.rs`
+- 清理记录、认领、递归删除和进度：`crates/platform-windows/src/fs/file_operations.rs`
+- 内部路径过滤：`crates/platform-windows/src/fs/directory_reader.rs`、`crates/domain/src/folder_size_scheduler.rs`
 - 窗口布局：`ui/app-window.slint`
 - 诊断日志：`artifacts/logs/window-interaction-diagnostic.jsonl`
 - 任务记录：GitHub Issue #82

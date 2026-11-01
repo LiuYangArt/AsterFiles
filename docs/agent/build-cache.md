@@ -6,7 +6,7 @@
 
 ```powershell
 python tools/build.py build --locked
-python tools/build.py test --locked
+python tools/build.py test --workspace --locked
 python tools/build.py run --locked
 python tools/verify.py
 python tools/build.py status
@@ -16,6 +16,12 @@ python tools/build.py clean
 `build.py` 的 Cargo 入口在构建前和结束后维护缓存，Cargo 失败时也执行收尾。完整验证只在整轮开始、结束维护，不在每个检查之间清理。日志位于 `artifacts/logs/verify-*.log`；空间报告位于 `artifacts/verify/build-cache-*.json`，GC 输出位于 `artifacts/verify/kache-gc.json`。
 
 普通 `cargo build --locked` 仍通过项目 `.cargo/config.toml` 使用 kache，产物仍为 `target/debug/asterfiles.exe`。直接 Cargo 不执行前后空间维护，日常使用上面的统一入口；临时直接 Cargo 后执行 `python tools/build.py finish`。不要覆盖 `CARGO_TARGET_DIR`、`RUSTC_WRAPPER`，以免绕开项目管理范围。
+
+## 工作区与单文件构建（#166）
+
+根应用、领域、Windows 平台、WebDAV 和 Slint UI 分别编译。`cargo build --locked` 默认构建根应用及其依赖，可执行文件名和输出位置不变。全量检查使用 `cargo fmt --all --check`、`cargo clippy --workspace --locked --all-targets --all-features -- -D warnings` 和 `cargo test --workspace --locked`，统一由 `tools/verify.py` 执行。
+
+UI 包独立持有 Slint 生成代码。修改应用或领域单文件时，Cargo 按包依赖复用未变化的输出；不依靠启用 Rust 增量编译获得这部分收益。拆分前后的同配置热构建耗时与原始日志写入 `artifacts/perf/issue-166/`，测量方式见 [#166 验证](debug-validation.md#issue-166)。
 
 ## 存储与预算
 
@@ -30,7 +36,7 @@ python tools/build.py clean
 
 Debug/Test 的 Cargo 增量编译与 kache 自适应增量均关闭，避免两套增量数据长期累积。保留应用的行号调试信息及现有优化设置。Debug 和本地 Release 使用同一个 target 根下的标准子目录，不按日期、分支或验证步骤复制构建树。
 
-Rust 工具链、Cargo.lock、Cargo.toml、Cargo 配置或 kache 配置变化时，脚本退休旧 target。超过 target 预算时也退休整个编译树，而不是只清理本包。最终 Debug/Release 的 EXE 与 PDB 会保留，供手动测试；其他输出可重建。正在运行的 Cargo/rustc 会阻止清理。受管目录中的目录联接和符号链接会使操作失败，不追踪到外部路径。
+Rust 工具链、Cargo.lock、根目录或成员的 Cargo.toml、Cargo 配置或 kache 配置变化时，脚本退休旧 target。成员清单位于 `crates/*/Cargo.toml`，新增、删除或修改都会进入构建输入记录。超过 target 预算时也退休整个编译树，而不是只清理本包。最终 Debug/Release 的 EXE 与 PDB 会保留，供手动测试；其他输出可重建。正在运行的 Cargo/rustc 会阻止清理。受管目录中的目录联接和符号链接会使操作失败，不追踪到外部路径。
 
 空间报告分别记录文件逻辑总量、按文件身份去重的逻辑总量，以及 Windows `FileStandardInfo.AllocationSize` 分配量。预算采用分配量。文件系统元数据和其他软件缓存不在报告中。先前截图 65.2 GB 与现场约 18.61 GiB 逻辑总量不一致，不能据此推断为硬链接、稀疏文件或磁盘损坏。
 
@@ -46,6 +52,6 @@ Windows 可执行文件缓存默认关闭，最终程序仍由 Cargo 正常编�
 
 ## CI 与标签打包
 
-Windows CI 与标签构建先执行同一个 setup，再恢复或使用 Cargo 下载缓存与 kache。云端不保存 target，避免不断上传历史构建树。尚未创建的 `target` 按空目录统计，首次 checkout 不会因此失败。缓存键包含工具链、构建配置、依赖锁文件和提交；CI 仅 main 保存。版本发布提交不跑 Windows CI，标签打包通过 `release.ps1` 调用受管构建入口。
+Windows CI 与标签构建先执行同一个 setup，再恢复或使用 Cargo 下载缓存与 kache。云端不保存 target，避免不断上传历史构建树。尚未创建的 `target` 按空目录统计，首次 checkout 不会因此失败。缓存键包含工具链、根目录及成员构建清单、构建配置、依赖锁文件和提交；CI 仅 main 保存。版本发布提交不跑 Windows CI，标签打包通过 `release.ps1` 调用受管构建入口。
 
 本地 Release 构建仍只在用户明确要求或确认 Issue 完成后执行。工具链升级与缓存配置修改不触发发布，也不改变版本、标签或推送行为。

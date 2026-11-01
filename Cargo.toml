@@ -6,23 +6,34 @@ license = "GPL-3.0-only"
 description = "A fast, modern Windows file manager built with Rust and Slint"
 build = "build.rs"
 
-[dependencies]
-ib-pinyin = "0.3.1"
-percent-encoding = "2.3.2"
-quick-xml = "0.41.0"
-reqwest = { version = "0.12.28", default-features = false, features = ["charset", "http2", "native-tls"] }
-slint = { version = "1.17.1", default-features = false, features = ["std", "backend-winit", "renderer-skia", "accessibility", "compat-1-2", "unstable-winit-030"] }
-tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "sync", "time"] }
-url = "2.5.8"
+[workspace]
+resolver = "3"
+members = ["crates/domain", "crates/platform-windows", "crates/webdav", "crates/ui"]
 
-[target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", default-features = false, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_EnhancedStorage", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Com_Urlmon", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_Variant", "Win32_UI_Controls", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Shell_PropertiesSystem", "Win32_UI_WindowsAndMessaging"] }
-windows-core = "0.62.2"
-windows-sys = { version = "0.60.2", features = ["Wdk_System_Threading", "Win32_Foundation", "Win32_NetworkManagement_WNet", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Environment", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_Threading", "Win32_System_Time", "Win32_System_WindowsProgramming", "Win32_Security", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+[workspace.dependencies]
+asterfiles-domain = { path = "crates/domain" }
+asterfiles-platform-windows = { path = "crates/platform-windows" }
+asterfiles-webdav = { path = "crates/webdav" }
+asterfiles-ui = { path = "crates/ui" }
+slint = { version = "1.17.1", default-features = false, features = ["std", "backend-winit", "renderer-skia", "accessibility", "compat-1-2", "unstable-winit-030"] }
+
+[dependencies]
+asterfiles-domain.workspace = true
+asterfiles-platform-windows.workspace = true
+asterfiles-webdav.workspace = true
+asterfiles-ui.workspace = true
+ib-pinyin = "0.3.1"
+slint.workspace = true
 
 [build-dependencies]
 embed-resource = "3.0.11"
-slint-build = "1.17.1"
+
+[dev-dependencies]
+asterfiles-platform-windows = { workspace = true, features = ["test-support"] }
+i-slint-backend-testing = "1.17.1"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.60.2", features = ["Wdk_System_Threading", "Win32_Foundation", "Win32_NetworkManagement_WNet", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Environment", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_Threading", "Win32_System_Time", "Win32_System_WindowsProgramming", "Win32_Security", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.dev]
 opt-level = 1
@@ -35,12 +46,6 @@ opt-level = 2
 [profile.test]
 debug = "line-tables-only"
 incremental = false
-
-[dev-dependencies]
-i-slint-backend-testing = "1.17.1"
-rcgen = "0.13.2"
-rustls = { version = "0.23.31", default-features = false, features = ["ring", "std"] }
-tokio-rustls = "0.26.2"
 
 [profile.release]
 lto = "thin"

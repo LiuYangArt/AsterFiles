@@ -152,7 +152,7 @@ Everything 适配层：发现、连接、查询、结果转换、超时
 Windows Everything SDK / IPC 与已运行的 1.5 实例
 ```
 
-新增独立的 Everything 适配层，Windows 实现放在 `platform/windows` 边界内。UI 不直接加载 DLL、发送 IPC、探测进程、检查路径或读取索引。
+新增独立的 Everything 适配层，Windows 实现放在 `crates/platform-windows/src/windows` 边界内。UI 不直接加载 DLL、发送 IPC、探测进程、检查路径或读取索引。
 
 建议核心模型：
 

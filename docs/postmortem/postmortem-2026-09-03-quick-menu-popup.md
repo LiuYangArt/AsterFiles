@@ -107,8 +107,8 @@ Firefox 的 popup 布局层也把锚点、屏幕翻转和窗口承载分开，�
 
 - 菜单业务、窗口协调和异步接收：`src/app.rs`
 - popup 几何与窗口链状态：`src/quick_menu_popup.rs`
-- Windows owner、样式、工作区、cloak 和焦点：`src/platform/windows/quick_menu_window.rs`
+- Windows owner、样式、工作区、cloak 和焦点：`crates/platform-windows/src/windows/quick_menu_window.rs`
 - 独立菜单视觉与鼠标/键盘状态：`ui/quick-menu.slint`
-- Shell HMENU 枚举与动态子菜单：`src/platform/windows/context_menu.rs`
+- Shell HMENU 枚举与动态子菜单：`crates/platform-windows/src/windows/context_menu.rs`
 - 长期设计边界：`docs/windows-shell-menu-feature.md`
 - 自动验证汇总：`artifacts/verify/summary.json`

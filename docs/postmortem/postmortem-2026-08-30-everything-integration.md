@@ -116,8 +116,8 @@ Slint 中覆盖内容区的透明 `TouchArea` 和 `AddressEditor` 失焦回调�
 
 ## 长期排查入口
 
-- Everything 平台适配：`src/platform/windows/everything.rs`
-- 搜索状态与条目身份：`src/domain.rs`
+- Everything 平台适配：`crates/platform-windows/src/windows/everything.rs`
+- 搜索状态与条目身份：`crates/domain/src/lib.rs`
 - 应用协调、分页和 UI 投影：`src/app.rs`
 - 文件列表与地址栏：`ui/app-window.slint`
 - 正式设计：`docs/everything-integration-design.md`

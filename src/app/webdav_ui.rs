@@ -245,7 +245,8 @@ pub(super) fn save_from_dialog(ui: &super::WebDavLocationWindow, app: &mut AppSt
     };
     if password.is_empty()
         && let Some(previous) = previous.as_ref()
-        && let Ok(Some(existing)) = webdav::load_password(previous.connection_id)
+        && let Ok(Some(existing)) =
+            crate::platform::windows::webdav_credentials::load(previous.connection_id)
     {
         password = existing;
     }
@@ -288,7 +289,12 @@ pub(super) fn save_from_dialog(ui: &super::WebDavLocationWindow, app: &mut AppSt
     }
     if (typed_password || endpoint_changed)
         && !password.is_empty()
-        && webdav::store_password(endpoint.connection_id, &endpoint.username, &password).is_err()
+        && crate::platform::windows::webdav_credentials::store(
+            endpoint.connection_id,
+            &endpoint.username,
+            &password,
+        )
+        .is_err()
     {
         ui.set_error_text(match app.language {
             Language::Chinese => "密码没有写入 Windows 凭据".into(),
@@ -321,7 +327,7 @@ pub(super) fn save_from_dialog(ui: &super::WebDavLocationWindow, app: &mut AppSt
         .as_ref()
         .filter(|connection| connection.connection_id != endpoint.connection_id)
     {
-        let _ = webdav::delete_password(previous.connection_id);
+        let _ = crate::platform::windows::webdav_credentials::delete(previous.connection_id);
     }
     app.network_locations = catalog.locations().to_vec();
     app.network_location_generation = app.network_location_generation.wrapping_add(1).max(1);
@@ -360,7 +366,7 @@ pub(super) fn prepare_remote_drag(
         if identity.connection_id != endpoint.connection_id {
             continue;
         }
-        if crate::fs::file_operations::validate_name(std::ffi::OsStr::new(name)).is_err() {
+        if crate::domain::name_validation::validate_name(std::ffi::OsStr::new(name)).is_err() {
             continue;
         }
         let Ok(source) = webdav::ResourcePath::parse_root(&identity.path) else {
@@ -413,7 +419,7 @@ fn stored_endpoint(app: &AppState, connection_id: u64) -> Option<(webdav::Endpoi
             _ => None,
         })?;
     let root = webdav::ResourcePath::parse_root(&connection.root).ok()?;
-    let password = webdav::load_password(connection.connection_id)
+    let password = crate::platform::windows::webdav_credentials::load(connection.connection_id)
         .ok()
         .flatten()?;
     if password.is_empty() {
@@ -471,7 +477,9 @@ pub(super) fn start_download(
             username: connection.username,
             display_name: String::new(),
         };
-        let Ok(Some(password)) = webdav::load_password(connection.connection_id) else {
+        let Ok(Some(password)) =
+            crate::platform::windows::webdav_credentials::load(connection.connection_id)
+        else {
             if let Ok(mut jobs) = transfers().lock() {
                 jobs.push(Transfer {
                     id: next_transfer_id(),

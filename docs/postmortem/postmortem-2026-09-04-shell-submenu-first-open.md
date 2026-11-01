@@ -105,9 +105,9 @@ reason=attach_owner:popup owner is unavailable
 ## 长期排查入口
 
 - 菜单协调、窗口重试和异步投影：`src/app.rs`
-- Windows owner、cloak、句柄和焦点：`src/platform/windows/quick_menu_window.rs`
-- Shell HMENU 枚举、token 与命令调用：`src/platform/windows/context_menu.rs`
-- 窗口与菜单诊断日志：`src/platform/windows/window_trace.rs`
+- Windows owner、cloak、句柄和焦点：`crates/platform-windows/src/windows/quick_menu_window.rs`
+- Shell HMENU 枚举、token 与命令调用：`crates/platform-windows/src/windows/context_menu.rs`
+- 窗口与菜单诊断日志：`crates/platform-windows/src/windows/window_trace.rs`
 - 弹窗会话与分支状态：`src/quick_menu_popup.rs`
 - 菜单长期设计边界：`docs/windows-shell-menu-feature.md`
 - 任务记录：GitHub Issue #46

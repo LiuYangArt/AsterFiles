@@ -56,9 +56,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             .cache/kache
-          key: windows-release-cargo-kache-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', '.kache.toml', 'tools/build.py', 'Cargo.lock') }}-${{ github.sha }}
+          key: windows-release-cargo-kache-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', '.kache.toml', 'tools/build.py', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
-            windows-release-cargo-kache-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', '.kache.toml', 'tools/build.py', 'Cargo.lock') }}-
+            windows-release-cargo-kache-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', '.kache.toml', 'tools/build.py', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml') }}-
             windows-release-cargo-kache-
 
       - name: Install repository toolchain and kache

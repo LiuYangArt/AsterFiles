@@ -69,7 +69,7 @@ P0 任务清单把窗口快捷键和 Windows 风格多选标记为完成，但�
 ## 长期排查入口
 
 - 窗口事件与 UI 回调：`src/app.rs`
-- 选择状态与范围规则：`src/domain.rs`
+- 选择状态与范围规则：`crates/domain/src/lib.rs`
 - 行指针事件：`ui/app-window.slint`
 - 相关任务验收记录：GitHub Issues
 - Release 程序：`F:\CodeProjects\AsterFiles\target\release\asterfiles.exe`

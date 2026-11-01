@@ -341,12 +341,13 @@ def validation_steps(quick: bool, include_release: bool) -> list[tuple[str, list
                 "Import-Module Pester -RequiredVersion 4.10.1 -ErrorAction Stop; Invoke-Pester -Script '.\\tools\\test_finish_issue.ps1' -EnableExit",
             ],
         ),
-        ("format", ["cargo", "fmt", "--check"]),
+        ("architecture", [sys.executable, str(ROOT / "tools" / "check_workspace.py")]),
+        ("format", ["cargo", "fmt", "--all", "--check"]),
         (
             "clippy",
-            ["cargo", "clippy", "--locked", "--all-targets", "--all-features", "--", "-D", "warnings"],
+            ["cargo", "clippy", "--workspace", "--locked", "--all-targets", "--all-features", "--", "-D", "warnings"],
         ),
-        ("test", ["cargo", "test", "--locked"]),
+        ("test", ["cargo", "test", "--workspace", "--locked"]),
         ("debug", ["cargo", "build", "--locked"]),
     ]
     if not quick:

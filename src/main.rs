@@ -4,19 +4,18 @@
 mod accessibility_tests;
 mod agent_debug;
 mod app;
-mod domain;
-mod fs;
 mod group_projection;
 mod i18n;
 #[cfg(test)]
 mod input_order_tests;
-mod network;
-mod operation_audit;
-mod platform;
 mod quick_menu_popup;
 mod session_store;
-mod webdav;
 
+use asterfiles_domain as domain;
+use asterfiles_domain::{network, operation_audit};
+use asterfiles_platform_windows as platform;
+use asterfiles_platform_windows::fs;
+use asterfiles_webdav as webdav;
 use std::path::PathBuf;
 
 #[cfg(windows)]

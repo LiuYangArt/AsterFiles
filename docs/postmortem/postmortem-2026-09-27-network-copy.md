@@ -71,6 +71,6 @@ SMB 使用标准句柄身份，本地保留完整身份。扫描与传输通过�
 长期排查入口：
 
 - 任务窗口收尾与可见行判断：`src/app.rs`
-- 任务清理时机：`src/domain/file_operations.rs`
+- 任务清理时机：`crates/domain/src/file_operations.rs`
 - 跳过进度回归：`src/app/issue_139_tests.rs`、`src/app/file_operation_worker/issue_139_tests.rs`
 - 收尾验证：`artifacts/logs/issue-139/completion-window/result.json`

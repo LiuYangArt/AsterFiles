@@ -292,22 +292,52 @@ dependencies = [
 name = "asterfiles"
 version = "0.9.1"
 dependencies = [
+ "asterfiles-domain",
+ "asterfiles-platform-windows",
+ "asterfiles-ui",
+ "asterfiles-webdav",
  "embed-resource",
  "i-slint-backend-testing",
  "ib-pinyin",
+ "slint",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "asterfiles-domain"
+version = "0.1.0"
+
+[[package]]
+name = "asterfiles-platform-windows"
+version = "0.1.0"
+dependencies = [
+ "asterfiles-domain",
+ "windows",
+ "windows-core",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "asterfiles-ui"
+version = "0.1.0"
+dependencies = [
+ "slint",
+ "slint-build",
+]
+
+[[package]]
+name = "asterfiles-webdav"
+version = "0.1.0"
+dependencies = [
+ "asterfiles-domain",
  "percent-encoding",
  "quick-xml",
  "rcgen",
  "reqwest",
  "rustls",
- "slint",
- "slint-build",
  "tokio",
  "tokio-rustls",
  "url",
- "windows",
- "windows-core",
- "windows-sys 0.60.2",
 ]
 
 [[package]]

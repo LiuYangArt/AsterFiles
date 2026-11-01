@@ -54,7 +54,7 @@ Windows 错误报告和 `CrashDumps` 更适合记录原生访问冲突。此次�
 
 ## 长期排查入口
 
-- 文件夹大小可见范围调度：`src/domain/folder_size_scheduler.rs`
+- 文件夹大小可见范围调度：`crates/domain/src/folder_size_scheduler.rs`
 - 滚动位置与视图换算：`src/app.rs`
 - 缩略图网格与滚动视口：`ui/app-window.slint`
 - 调试与证据规范：`docs/agent/debug-validation.md`

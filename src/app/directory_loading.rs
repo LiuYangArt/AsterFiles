@@ -451,9 +451,14 @@ pub(super) fn read_source(
     cancel: &std::sync::atomic::AtomicBool,
     on_batch: &mut dyn FnMut(Vec<FileEntry>) -> io::Result<()>,
 ) -> io::Result<usize> {
+    #[cfg(not(test))]
+    use platform::windows::network::isolated_directory;
+    #[cfg(test)]
+    use platform::windows::network::test_isolated_directory as isolated_directory;
+
     // Local spelling cannot prove locality: ancestors and children can cross into SMB.
     // Probe and enumeration therefore share the same terminable process boundary.
-    platform::windows::network::isolated_directory(path, visibility, cancel, on_batch)
+    isolated_directory(path, visibility, cancel, on_batch)
 }
 
 fn read_directory_batches(
@@ -597,7 +602,7 @@ fn run_webdav_directory_request(
         );
         return;
     }
-    let password = crate::webdav::load_password(target.connection_id)
+    let password = crate::platform::windows::webdav_credentials::load(target.connection_id)
         .ok()
         .flatten()
         .unwrap_or_default();

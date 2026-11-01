@@ -52,9 +52,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             .cache/kache
-          key: windows-cargo-kache-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', '.kache.toml', 'tools/build.py', 'Cargo.lock') }}-${{ github.sha }}
+          key: windows-cargo-kache-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', '.kache.toml', 'tools/build.py', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
-            windows-cargo-kache-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', '.kache.toml', 'tools/build.py', 'Cargo.lock') }}-
+            windows-cargo-kache-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', '.kache.toml', 'tools/build.py', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml') }}-
             windows-cargo-kache-
 
       - name: Install verification dependencies and kache

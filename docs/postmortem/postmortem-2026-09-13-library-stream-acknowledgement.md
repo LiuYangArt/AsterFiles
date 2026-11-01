@@ -20,4 +20,4 @@
 
 `cargo test issue_104_ -- --nocapture` 包含持有允许删除共享的旧槽句柄、删除槽后确认可完成的 Windows 测试，以及注入完成帧传输失败、断言不会产生第二个终态的回归。完整检查使用 `python tools/verify.py --release`，验证记录位于 `artifacts/verify/summary.json` 和 `artifacts/logs/issue-104/`。
 
-以后遇到完成后多帧、来源偶发无权限或辅助进程异常退出，先核对来源错误与传输错误的边界、批次消费确认顺序及原始 Windows 错误码。相关实现集中在 `src/platform/windows/network/directory.rs`，库聚合位于 `src/library_loading.rs`。
+以后遇到完成后多帧、来源偶发无权限或辅助进程异常退出，先核对来源错误与传输错误的边界、批次消费确认顺序及原始 Windows 错误码。相关实现集中在 `crates/platform-windows/src/windows/network/directory.rs`，库聚合位于 `src/library_loading.rs`。

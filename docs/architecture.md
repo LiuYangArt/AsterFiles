@@ -3,14 +3,30 @@
 ## 当前边界
 
 ```text
-Slint UI
-   ↓ 事件和只读模型
-应用协调层
-   ↓
-Rust 文件核心
+asterfiles（应用组装与协调）
+  ├─→ asterfiles-ui（Slint 控件与只读展示模型）
+  ├─→ asterfiles-platform-windows ─→ asterfiles-domain
+  ├─→ asterfiles-webdav ──────────→ asterfiles-domain
+  └─→ asterfiles-domain
 ```
 
 界面不直接执行磁盘、Shell、COM 或网络访问；后台结果按窗口、标签和请求身份隔离。
+
+## Cargo 工作区边界（#166）
+
+| 包 | 实现入口 | 职责与依赖 |
+| --- | --- | --- |
+| `asterfiles` | `src/main.rs`、`src/app.rs` | 应用组装、会话保存、本地化和界面投影；通过平台包访问 Windows，普通依赖不包含 Windows API 包 |
+| `asterfiles-domain` | `crates/domain/src/lib.rs` | 标签、条目、路径和网络身份、任务规则与调度；共享名称校验、物理几何和异步审计；不依赖 Windows API 或 Slint 包 |
+| `asterfiles-platform-windows` | `crates/platform-windows/src/lib.rs`、`windows/`、`fs/` | Windows Shell、COM、文件读写、目录辅助进程和凭据；依赖领域包，不依赖 UI 或应用 |
+| `asterfiles-webdav` | `crates/webdav/src/lib.rs` | WebDAV 路径、HTTP、XML、下载与槽位调度；依赖领域包，不访问 Windows 凭据管理器 |
+| `asterfiles-ui` | `crates/ui/src/lib.rs`、`crates/ui/build.rs` | 单独编译 `ui/app-window.slint`；只依赖 Slint，不依赖应用、领域、平台或 WebDAV |
+
+文件操作与 Windows 辅助进程互相配合，统一归属平台包，避免包之间循环依赖。WebDAV 凭据由 `windows/webdav_credentials.rs` 提供，应用负责连接客户端与凭据来源。工作线程优先级和时区读取也集中在平台包。
+
+根包继续使用 `Cargo.toml` 中的应用版本，输出仍为 `target/debug/asterfiles.exe` 和 `target/release/asterfiles.exe`。Slint 生成代码只在 UI 包中编译，修改应用协调代码不再重编生成代码。kache 与 Rust 增量编译策略保持不变，详见 [构建缓存](agent/build-cache.md)。
+
+`tools/check_workspace.py` 根据 Cargo 实际依赖图检查领域包的传递依赖，并检查应用的直接依赖和 UI 的传递依赖方向。统一验证同时检查、测试全部工作区成员，入口及证据见 [#166 验证](agent/debug-validation.md#issue-166)。
 
 ## 路径与文字约束
 
@@ -61,7 +77,7 @@ Slint 语义使用与语言无关的控件标识。条目标识包含窗口、�
 
 网络辅助入口组装隔离请求，再调用文件核心。请求明确持有取消控制、临时文件登记、扫描进度、传输进度和恢复状态。文件核心沿递归复制及跨卷移动传递同一执行上下文；普通本地入口创建本地上下文，无需网络登记。
 
-`platform/windows/copy_execution.rs` 定义本地与隔离执行。隔离执行缺少登记路径时直接失败；隔离文件传输创建 `.asterfiles-copy` 文件或 Robocopy 暂存目录前，必须成功登记。登记对象可以随执行上下文跨线程传递，同一对象的登记更新串行完成，各任务互不共享所有权记录。恢复状态显式共享给进度监视器，查询结束时恢复进入查询前的状态，任务结束时清零。
+`crates/platform-windows/src/windows/copy_execution.rs` 定义本地与隔离执行。隔离执行缺少登记路径时直接失败；隔离文件传输创建 `.asterfiles-copy` 文件或 Robocopy 暂存目录前，必须成功登记。登记对象可以随执行上下文跨线程传递，同一对象的登记更新串行完成，各任务互不共享所有权记录。恢复状态显式共享给进度监视器，查询结束时恢复进入查询前的状态，任务结束时清零。
 
 依赖方向为网络辅助入口 → 文件核心 → Windows 复制能力。复制能力不调用网络业务入口；临时文件所有权位于 `copy_execution/temporary_copy.rs`，进程隔离和快照工具分别位于 `process_job.rs`、`network_snapshot.rs`。这些工具沿用已有 Windows Job Object、文件锁和二进制格式，不建立通用后端框架。
 
@@ -75,7 +91,7 @@ Slint 语义使用与语言无关的控件标识。条目标识包含窗口、�
 
 ## 标签导航状态转换（#151）
 
-`src/domain.rs` 的 `TabSession` 负责目录请求的完整状态转换。批次经 `accept_directory_batch` 接受；完成经 `finish_directory_navigation` 一次提交排序、条目、位置、历史和选择；失败、取消分别经 `fail_directory_navigation`、`cancel_directory_navigation` 收尾。请求代号、位置、历史、待提交条目和索引只在标签内部修改，外部只读。
+`crates/domain/src/lib.rs` 的 `TabSession` 负责目录请求的完整状态转换。批次经 `accept_directory_batch` 接受；完成经 `finish_directory_navigation` 一次提交排序、条目、位置、历史和选择；失败、取消分别经 `fail_directory_navigation`、`cancel_directory_navigation` 收尾。请求代号、位置、历史、待提交条目和索引只在标签内部修改，外部只读。
 
 入口核对当前请求、目录来源和加载阶段，完成时额外核对原始位置。失败和取消保留上次成功的位置与条目；重复终态、过期请求以及切换搜索后的目录事件均拒收。UNC 分批期间的选择在成功提交后保留，本地和库沿用原有完成选择规则。
 

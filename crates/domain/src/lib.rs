@@ -1,0 +1,3736 @@
+use crate as domain;
+
+pub mod file_operations;
+pub mod folder_size_scheduler;
+pub mod geometry;
+pub mod name_validation;
+pub mod network;
+pub mod operation_audit;
+pub mod thumbnail_scheduler;
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet, VecDeque},
+    ffi::OsString,
+    hash::{Hash, Hasher},
+    ops::Deref,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TabId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RequestId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EntryId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabKind {
+    Files,
+    Settings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadState {
+    Idle,
+    Loading,
+    Partial,
+    Complete,
+    Cancelled,
+    NotFound,
+    PermissionDenied,
+    Disconnected,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavigationKind {
+    Normal,
+    Back,
+    Forward,
+    Refresh,
+    BackgroundRefresh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressMode {
+    Normal,
+    Smart,
+}
+
+#[derive(Debug, Clone)]
+pub struct LibraryLocationId {
+    pub identity: OsString,
+    pub display_name: String,
+}
+
+impl LibraryLocationId {
+    pub fn new(identity: OsString, display_name: String) -> Self {
+        Self {
+            identity,
+            display_name,
+        }
+    }
+}
+impl PartialEq for LibraryLocationId {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+
+impl Eq for LibraryLocationId {}
+
+impl Hash for LibraryLocationId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.identity.hash(state);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WebDavPlace {
+    pub connection_id: u64,
+    pub revision: u64,
+    pub root: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebDavEntry {
+    pub connection_id: u64,
+    pub revision: u64,
+    pub root: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum NavigationLocation {
+    Home,
+    Directory(PathBuf),
+    Library(LibraryLocationId),
+    WebDav(WebDavPlace),
+}
+
+impl NavigationLocation {
+    pub fn directory_path(&self) -> Option<&Path> {
+        match self {
+            Self::Directory(path) => Some(path),
+            Self::Home | Self::Library(_) | Self::WebDav(_) => None,
+        }
+    }
+
+    pub fn webdav_place(&self) -> Option<&WebDavPlace> {
+        match self {
+            Self::WebDav(place) => Some(place),
+            Self::Home | Self::Directory(_) | Self::Library(_) => None,
+        }
+    }
+
+    pub fn display_name(&self) -> String {
+        match self {
+            Self::Home => "Home".to_owned(),
+            Self::Directory(path) => display_path(path),
+            Self::Library(library) => library.display_name.clone(),
+            Self::WebDav(place) => webdav_label(&place.path),
+        }
+    }
+}
+
+impl PartialEq<PathBuf> for NavigationLocation {
+    fn eq(&self, other: &PathBuf) -> bool {
+        self.directory_path() == Some(other.as_path())
+    }
+}
+
+impl PartialEq<NavigationLocation> for PathBuf {
+    fn eq(&self, other: &NavigationLocation) -> bool {
+        other == self
+    }
+}
+impl From<PathBuf> for NavigationLocation {
+    fn from(path: PathBuf) -> Self {
+        Self::Directory(path)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchScope {
+    Global,
+    Directory(PathBuf),
+    Library {
+        display_name: String,
+        sources: Vec<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchDepth {
+    CurrentFolder,
+    Recursive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageSource {
+    Directory,
+    Search,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum SearchState {
+    Waiting,
+    Searching,
+    Partial,
+    Complete,
+    NoResults,
+    NotConfigured,
+    Disconnected,
+    NotIndexed,
+    UnsupportedVersion,
+    UnsupportedArchitecture,
+    SyntaxError,
+    TimedOut,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderSizeState {
+    Unknown,
+    Querying,
+    Value(u64),
+    NotIndexed,
+    NotFound,
+    TimedOut,
+    Disconnected,
+    ProtocolError,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameHighlightSegment {
+    pub text: String,
+    pub highlighted: bool,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileVisibility {
+    pub show_hidden: bool,
+    pub show_system: bool,
+}
+
+impl Default for FileVisibility {
+    fn default() -> Self {
+        Self {
+            show_hidden: true,
+            show_system: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EverythingConfig {
+    pub executable_path: Option<PathBuf>,
+    pub instance_name: String,
+    pub verified_version: Option<String>,
+    pub allow_launch: bool,
+}
+
+impl Default for EverythingConfig {
+    fn default() -> Self {
+        Self {
+            executable_path: None,
+            instance_name: "1.5a".to_owned(),
+            verified_version: None,
+            allow_launch: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortField {
+    Name,
+    Kind,
+    Size,
+    Modified,
+    Created,
+}
+
+impl SortField {
+    pub const fn storage_code(self) -> u8 {
+        match self {
+            Self::Name => 0,
+            Self::Kind => 1,
+            Self::Size => 2,
+            Self::Modified => 3,
+            Self::Created => 4,
+        }
+    }
+
+    pub const fn from_storage_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Name),
+            1 => Some(Self::Kind),
+            2 => Some(Self::Size),
+            3 => Some(Self::Modified),
+            4 => Some(Self::Created),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+impl SortDirection {
+    pub const fn storage_code(self) -> u8 {
+        match self {
+            Self::Ascending => 0,
+            Self::Descending => 1,
+        }
+    }
+
+    pub const fn from_storage_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Ascending),
+            1 => Some(Self::Descending),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Details,
+    List,
+    Icons(u16),
+    Tiles,
+    Content,
+}
+
+impl ViewMode {
+    #[allow(non_upper_case_globals)]
+    pub const SmallIcons: Self = Self::Icons(16);
+    #[allow(non_upper_case_globals)]
+    pub const MediumIcons: Self = Self::Icons(48);
+    #[allow(non_upper_case_globals)]
+    pub const LargeIcons: Self = Self::Icons(96);
+    #[allow(non_upper_case_globals)]
+    pub const ExtraLargeIcons: Self = Self::Icons(256);
+
+    pub const fn icon_size(self) -> u16 {
+        match self {
+            Self::Icons(size) => size,
+            _ => 0,
+        }
+    }
+
+    pub const fn is_valid(self) -> bool {
+        match self {
+            Self::Icons(size) => size >= 16 && size <= 256,
+            _ => true,
+        }
+    }
+
+    pub const fn uses_grid_layout(self) -> bool {
+        matches!(self, Self::Icons(_) | Self::Tiles)
+    }
+    pub const CTRL_WHEEL_ORDER: [Self; 8] = [
+        Self::Content,
+        Self::Tiles,
+        Self::Details,
+        Self::List,
+        Self::SmallIcons,
+        Self::MediumIcons,
+        Self::LargeIcons,
+        Self::ExtraLargeIcons,
+    ];
+
+    pub const fn storage_code(self) -> u8 {
+        match self {
+            Self::Details => 0,
+            Self::List => 1,
+            Self::Icons(16) => 3,
+            Self::Icons(17..=95) => 2,
+            Self::Icons(96..=255) => 4,
+            Self::Icons(_) => 5,
+            Self::Tiles => 6,
+            Self::Content => 7,
+        }
+    }
+
+    pub const fn from_storage_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Details),
+            1 => Some(Self::List),
+            2 => Some(Self::MediumIcons),
+            3 => Some(Self::SmallIcons),
+            4 => Some(Self::LargeIcons),
+            5 => Some(Self::ExtraLargeIcons),
+            6 => Some(Self::Tiles),
+            7 => Some(Self::Content),
+            _ => None,
+        }
+    }
+
+    pub fn step_ctrl_wheel(self, toward_larger: bool) -> Self {
+        if let Self::Icons(size) = self {
+            let size = size.clamp(16, 256);
+            return if toward_larger {
+                Self::Icons(size.saturating_add(8).min(256))
+            } else if size == 16 {
+                Self::List
+            } else {
+                Self::Icons(size.saturating_sub(8).max(16))
+            };
+        }
+        let index = Self::CTRL_WHEEL_ORDER
+            .iter()
+            .position(|mode| *mode == self)
+            .expect("all view modes are present in the Ctrl+wheel order");
+        let next = if toward_larger {
+            index
+                .saturating_add(1)
+                .min(Self::CTRL_WHEEL_ORDER.len() - 1)
+        } else {
+            index.saturating_sub(1)
+        };
+        Self::CTRL_WHEEL_ORDER[next]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupField {
+    None,
+    Name,
+    Modified,
+    Created,
+    Kind,
+    Size,
+}
+
+impl GroupField {
+    pub const fn storage_code(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Name => 1,
+            Self::Modified => 2,
+            Self::Created => 3,
+            Self::Kind => 4,
+            Self::Size => 5,
+        }
+    }
+
+    pub const fn from_storage_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::None),
+            1 => Some(Self::Name),
+            2 => Some(Self::Modified),
+            3 => Some(Self::Created),
+            4 => Some(Self::Kind),
+            5 => Some(Self::Size),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnKind {
+    Name,
+    Kind,
+    Size,
+    Modified,
+    Created,
+}
+
+impl ColumnKind {
+    pub const COUNT: usize = 5;
+
+    pub const fn storage_code(self) -> u8 {
+        match self {
+            Self::Name => 0,
+            Self::Kind => 1,
+            Self::Size => 2,
+            Self::Modified => 3,
+            Self::Created => 4,
+        }
+    }
+
+    pub const fn from_storage_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Name),
+            1 => Some(Self::Kind),
+            2 => Some(Self::Size),
+            3 => Some(Self::Modified),
+            4 => Some(Self::Created),
+            _ => None,
+        }
+    }
+}
+
+pub const MIN_COLUMN_WIDTH: u32 = 64;
+pub const MAX_COLUMN_WIDTH: u32 = 4_096;
+pub const MAX_DIRECTORY_VIEW_PREFERENCES: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnLayout {
+    pub order: [ColumnKind; ColumnKind::COUNT],
+    pub widths: [u32; ColumnKind::COUNT],
+    pub visible: [bool; ColumnKind::COUNT],
+}
+
+impl Default for ColumnLayout {
+    fn default() -> Self {
+        Self {
+            order: [
+                ColumnKind::Name,
+                ColumnKind::Modified,
+                ColumnKind::Kind,
+                ColumnKind::Size,
+                ColumnKind::Created,
+            ],
+            widths: [480, 160, 120, 200, 200],
+            visible: [true, true, true, true, false],
+        }
+    }
+}
+
+impl ColumnLayout {
+    pub fn is_valid(&self) -> bool {
+        let mut seen = [false; ColumnKind::COUNT];
+        for column in self.order {
+            let index = usize::from(column.storage_code());
+            if seen[index] {
+                return false;
+            }
+            seen[index] = true;
+        }
+        self.visible[usize::from(ColumnKind::Name.storage_code())]
+            && self
+                .widths
+                .iter()
+                .all(|width| (MIN_COLUMN_WIDTH..=MAX_COLUMN_WIDTH).contains(width))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectoryViewPreference {
+    pub view_mode: ViewMode,
+    pub sort_field: SortField,
+    pub sort_direction: SortDirection,
+    pub group_field: GroupField,
+    pub group_direction: SortDirection,
+    pub columns: ColumnLayout,
+}
+
+impl Default for DirectoryViewPreference {
+    fn default() -> Self {
+        Self {
+            view_mode: ViewMode::Details,
+            sort_field: SortField::Name,
+            sort_direction: SortDirection::Ascending,
+            group_field: GroupField::None,
+            group_direction: SortDirection::Ascending,
+            columns: ColumnLayout::default(),
+        }
+    }
+}
+
+impl DirectoryViewPreference {
+    pub fn is_valid(&self) -> bool {
+        self.view_mode.is_valid() && self.columns.is_valid()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchViewPreference {
+    pub view_mode: ViewMode,
+    pub sort_field: SortField,
+    pub sort_direction: SortDirection,
+    pub columns: ColumnLayout,
+}
+
+impl Default for SearchViewPreference {
+    fn default() -> Self {
+        Self {
+            view_mode: ViewMode::Details,
+            sort_field: SortField::Name,
+            sort_direction: SortDirection::Ascending,
+            columns: ColumnLayout::default(),
+        }
+    }
+}
+
+impl SearchViewPreference {
+    pub fn is_valid(&self) -> bool {
+        self.view_mode.is_valid() && self.columns.is_valid()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RectangleSelectionMode {
+    Replace,
+    Extend,
+    Toggle,
+}
+
+/// Selected entries in selection order. Row projection asks for membership once per visible
+/// row, so membership comes from a hash set; a linear scan made whole-directory selections
+/// quadratic on the UI thread (#161). The order is kept for drag sources and copied paths.
+#[derive(Debug, Clone, Default)]
+pub struct Selection {
+    order: Vec<EntryId>,
+    members: HashSet<EntryId>,
+}
+
+impl Selection {
+    pub fn contains(&self, id: &EntryId) -> bool {
+        self.members.contains(id)
+    }
+
+    pub fn members(&self) -> &HashSet<EntryId> {
+        &self.members
+    }
+
+    /// Appends `id` after the current selection unless it is already selected.
+    pub fn insert(&mut self, id: EntryId) -> bool {
+        let added = self.members.insert(id);
+        if added {
+            self.order.push(id);
+        }
+        added
+    }
+
+    pub fn remove(&mut self, id: EntryId) -> bool {
+        if !self.members.remove(&id) {
+            return false;
+        }
+        if let Some(index) = self.order.iter().position(|selected| *selected == id) {
+            self.order.remove(index);
+        }
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.order.clear();
+        self.members.clear();
+    }
+
+    pub fn retain(&mut self, mut keep: impl FnMut(&EntryId) -> bool) {
+        let members = &mut self.members;
+        self.order.retain(|id| {
+            let kept = keep(id);
+            if !kept {
+                members.remove(id);
+            }
+            kept
+        });
+    }
+}
+
+impl Deref for Selection {
+    type Target = [EntryId];
+
+    fn deref(&self) -> &[EntryId] {
+        &self.order
+    }
+}
+
+impl FromIterator<EntryId> for Selection {
+    fn from_iter<I: IntoIterator<Item = EntryId>>(ids: I) -> Self {
+        let ids = ids.into_iter();
+        let capacity = ids.size_hint().0;
+        let mut selection = Self {
+            order: Vec::with_capacity(capacity),
+            members: HashSet::with_capacity(capacity),
+        };
+        for id in ids {
+            selection.insert(id);
+        }
+        selection
+    }
+}
+
+impl From<Vec<EntryId>> for Selection {
+    fn from(ids: Vec<EntryId>) -> Self {
+        ids.into_iter().collect()
+    }
+}
+
+impl IntoIterator for Selection {
+    type Item = EntryId;
+    type IntoIter = std::vec::IntoIter<EntryId>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.order.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Selection {
+    type Item = &'a EntryId;
+    type IntoIter = std::slice::Iter<'a, EntryId>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.order.iter()
+    }
+}
+
+impl PartialEq for Selection {
+    fn eq(&self, other: &Self) -> bool {
+        self.order == other.order
+    }
+}
+
+impl Eq for Selection {}
+
+impl PartialEq<Vec<EntryId>> for Selection {
+    fn eq(&self, other: &Vec<EntryId>) -> bool {
+        self.order == *other
+    }
+}
+
+impl<const N: usize> PartialEq<[EntryId; N]> for Selection {
+    fn eq(&self, other: &[EntryId; N]) -> bool {
+        self.order.as_slice() == other
+    }
+}
+
+#[derive(Debug)]
+struct DirectorySnapshot {
+    entries: Arc<Vec<FileEntry>>,
+    error: Option<String>,
+    selected: Selection,
+    focused: Option<EntryId>,
+    selection_anchor: Option<EntryId>,
+}
+#[derive(Debug)]
+pub struct TabSession {
+    pub id: TabId,
+    pub kind: TabKind,
+    latest_request: RequestId,
+    current_location: Option<NavigationLocation>,
+    requested_location: Option<NavigationLocation>,
+    pub address_editing: bool,
+    pub address_input: String,
+    pub address_mode: AddressMode,
+    pub search_scope: SearchScope,
+    pub search_depth: SearchDepth,
+    pub search_query: String,
+    pub page_source: PageSource,
+    pub search_state: SearchState,
+    pub search_total: Option<u32>,
+    pub search_file_total: Option<u32>,
+    pub search_requested_pages: HashSet<u32>,
+    pub search_pending_pages: VecDeque<u32>,
+    pub search_cached_pages: VecDeque<u32>,
+    pub search_page_retries: HashMap<u32, u8>,
+    directory_snapshot: Option<DirectorySnapshot>,
+    navigation_kind: NavigationKind,
+    retain_directory_view: bool,
+    back_history: Vec<NavigationLocation>,
+    forward_history: Vec<NavigationLocation>,
+    pub entries: Arc<Vec<FileEntry>>,
+    pending_entries: Vec<FileEntry>,
+    entry_indices: HashMap<EntryId, usize>,
+    pub load_state: LoadState,
+    pub error: Option<String>,
+    pub selected: Selection,
+    pub focused: Option<EntryId>,
+    pub selection_anchor: Option<EntryId>,
+    pub sort_field: SortField,
+    pub sort_direction: SortDirection,
+    pub search_sort_field: SortField,
+    pub search_sort_direction: SortDirection,
+    pub folder_sizes: folder_size_scheduler::FolderSizeScheduler,
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+impl TabSession {
+    pub fn new(id: TabId) -> Self {
+        Self {
+            id,
+            kind: TabKind::Files,
+            latest_request: RequestId(0),
+            current_location: None,
+            requested_location: None,
+            address_editing: false,
+            address_input: String::new(),
+            address_mode: AddressMode::Normal,
+            search_scope: SearchScope::Global,
+            search_depth: SearchDepth::Recursive,
+            search_query: String::new(),
+            page_source: PageSource::Directory,
+            search_state: SearchState::Waiting,
+            search_total: None,
+            search_file_total: None,
+            search_requested_pages: HashSet::new(),
+            search_pending_pages: VecDeque::new(),
+            search_cached_pages: VecDeque::new(),
+            search_page_retries: HashMap::new(),
+            directory_snapshot: None,
+            navigation_kind: NavigationKind::Normal,
+            retain_directory_view: false,
+            back_history: Vec::new(),
+            forward_history: Vec::new(),
+            entries: Arc::new(Vec::new()),
+            pending_entries: Vec::new(),
+            entry_indices: HashMap::new(),
+            load_state: LoadState::Idle,
+            error: None,
+            selected: Selection::default(),
+            focused: None,
+            selection_anchor: None,
+            sort_field: SortField::Name,
+            sort_direction: SortDirection::Ascending,
+            search_sort_field: SortField::Name,
+            search_sort_direction: SortDirection::Descending,
+            folder_sizes: folder_size_scheduler::FolderSizeScheduler::new(),
+            cancel: None,
+        }
+    }
+
+    pub fn new_at(id: TabId, location: NavigationLocation) -> Self {
+        let mut tab = Self::new(id);
+        if location == NavigationLocation::Home {
+            tab.load_state = LoadState::Complete;
+        }
+        tab.current_location = Some(location);
+        tab
+    }
+
+    pub fn latest_request(&self) -> RequestId {
+        self.latest_request
+    }
+
+    pub fn current_location(&self) -> &Option<NavigationLocation> {
+        &self.current_location
+    }
+
+    pub fn requested_location(&self) -> &Option<NavigationLocation> {
+        &self.requested_location
+    }
+
+    pub fn retains_directory_view(&self) -> bool {
+        self.retain_directory_view && self.page_source == PageSource::Directory
+    }
+
+    pub fn displayed_load_state(&self) -> LoadState {
+        if self.retains_directory_view()
+            && matches!(self.load_state, LoadState::Loading | LoadState::Partial)
+        {
+            LoadState::Complete
+        } else {
+            self.load_state
+        }
+    }
+
+    pub fn navigation_kind(&self) -> NavigationKind {
+        self.navigation_kind
+    }
+
+    pub fn back_history(&self) -> &Vec<NavigationLocation> {
+        &self.back_history
+    }
+
+    pub fn forward_history(&self) -> &Vec<NavigationLocation> {
+        &self.forward_history
+    }
+
+    pub fn pending_entries(&self) -> &Vec<FileEntry> {
+        &self.pending_entries
+    }
+    pub fn new_home(id: TabId) -> Self {
+        Self::new_at(id, NavigationLocation::Home)
+    }
+
+    pub fn new_settings(id: TabId) -> Self {
+        let mut tab = Self::new(id);
+        tab.kind = TabKind::Settings;
+        tab
+    }
+
+    pub fn duplicate_complete(id: TabId, source: &Self) -> Self {
+        debug_assert_eq!(source.load_state, LoadState::Complete);
+        Self {
+            id,
+            kind: TabKind::Files,
+            latest_request: source.latest_request,
+            current_location: source.current_location.clone(),
+            requested_location: None,
+            address_editing: false,
+            address_input: String::new(),
+            address_mode: AddressMode::Normal,
+            search_scope: SearchScope::Global,
+            search_depth: SearchDepth::Recursive,
+            search_query: String::new(),
+            page_source: PageSource::Directory,
+            search_state: SearchState::Waiting,
+            search_total: None,
+            search_file_total: None,
+            search_requested_pages: HashSet::new(),
+            search_pending_pages: VecDeque::new(),
+            search_cached_pages: VecDeque::new(),
+            search_page_retries: HashMap::new(),
+            directory_snapshot: None,
+            navigation_kind: NavigationKind::Normal,
+            retain_directory_view: false,
+            back_history: source.back_history.clone(),
+            forward_history: source.forward_history.clone(),
+            entries: source.entries.clone(),
+            pending_entries: Vec::new(),
+            entry_indices: source.entry_indices.clone(),
+            load_state: LoadState::Complete,
+            error: source.error.clone(),
+            selected: source.selected.clone(),
+            focused: source.focused,
+            selection_anchor: source.selection_anchor,
+            sort_field: source.sort_field,
+            sort_direction: source.sort_direction,
+            search_sort_field: source.search_sort_field,
+            search_sort_direction: source.search_sort_direction,
+            folder_sizes: folder_size_scheduler::FolderSizeScheduler::new(),
+            cancel: None,
+        }
+    }
+    pub fn begin_smart_address_edit(&mut self) {
+        self.address_editing = true;
+        if self.page_source == PageSource::Search {
+            return;
+        }
+        self.address_mode = AddressMode::Smart;
+        self.search_scope = match self.visible_location() {
+            Some(NavigationLocation::Directory(path)) => SearchScope::Directory(path.clone()),
+            Some(NavigationLocation::Library(library)) => SearchScope::Library {
+                display_name: library.display_name.clone(),
+                sources: Vec::new(),
+            },
+            Some(NavigationLocation::Home | NavigationLocation::WebDav(_)) | None => {
+                SearchScope::Global
+            }
+        };
+        self.search_depth = SearchDepth::Recursive;
+        self.search_query.clear();
+        self.address_input = search_address_text(&self.search_scope, &self.search_query);
+        self.search_state = SearchState::Waiting;
+    }
+
+    pub fn visible_location(&self) -> Option<&NavigationLocation> {
+        if matches!(
+            self.load_state,
+            LoadState::Loading
+                | LoadState::Partial
+                | LoadState::Cancelled
+                | LoadState::NotFound
+                | LoadState::PermissionDenied
+                | LoadState::Disconnected
+                | LoadState::Failed
+        ) {
+            self.requested_location
+                .as_ref()
+                .or(self.current_location.as_ref())
+        } else {
+            self.current_location.as_ref()
+        }
+    }
+
+    pub fn visible_path(&self) -> Option<&Path> {
+        self.visible_location()
+            .and_then(NavigationLocation::directory_path)
+    }
+
+    pub fn has_failed_location(&self) -> bool {
+        self.requested_location.is_some()
+            && matches!(
+                self.load_state,
+                LoadState::Cancelled
+                    | LoadState::NotFound
+                    | LoadState::PermissionDenied
+                    | LoadState::Disconnected
+                    | LoadState::Failed
+            )
+    }
+
+    pub fn restore_successful_location(&mut self) -> bool {
+        if !self.has_failed_location() || self.current_location.is_none() {
+            return false;
+        }
+        if let Some(failed_path) = self.requested_location.take()
+            && self.forward_history.last() != Some(&failed_path)
+        {
+            self.forward_history.push(failed_path);
+        }
+        self.pending_entries.clear();
+        self.load_state = LoadState::Complete;
+        self.error = None;
+        self.navigation_kind = NavigationKind::Normal;
+        self.address_editing = false;
+        self.address_input.clear();
+        self.cancel = None;
+        true
+    }
+
+    pub fn breadcrumb_paths(&self) -> Vec<(String, NavigationLocation)> {
+        let Some(location) = self.visible_location() else {
+            return Vec::new();
+        };
+        let path = match location {
+            NavigationLocation::Directory(path) => path,
+            NavigationLocation::WebDav(place) => return webdav_breadcrumbs(place),
+            NavigationLocation::Home | NavigationLocation::Library(_) => {
+                return vec![(location.display_name(), location.clone())];
+            }
+        };
+        let mut segments = Vec::new();
+        let mut cursor = PathBuf::new();
+        for component in path.components() {
+            cursor.push(component.as_os_str());
+            let label = match component {
+                std::path::Component::Prefix(_) => continue,
+                std::path::Component::RootDir => display_path(&cursor),
+                _ => component.as_os_str().to_string_lossy().into_owned(),
+            };
+            let location = NavigationLocation::Directory(cursor.clone());
+            if !label.is_empty()
+                && segments
+                    .last()
+                    .is_none_or(|(_, previous)| previous != &location)
+            {
+                segments.push((label, location));
+            }
+        }
+        if segments.is_empty() && !path.as_os_str().is_empty() {
+            segments.push((display_path(path), location.clone()));
+        }
+        segments
+    }
+
+    pub fn update_address_input(&mut self, input: String) {
+        if self.address_mode == AddressMode::Smart {
+            match &self.search_scope {
+                SearchScope::Directory(path) => {
+                    let prefix = search_scope_prefix(path);
+                    if let Some(query) = input.strip_prefix(&prefix) {
+                        self.search_query = query.to_owned();
+                    } else {
+                        self.search_scope = SearchScope::Global;
+                        self.search_query = input.clone();
+                    }
+                }
+                SearchScope::Library { display_name, .. } => {
+                    let prefix = library_search_scope_prefix(display_name);
+                    if let Some(query) = input.strip_prefix(&prefix) {
+                        self.search_query = query.to_owned();
+                    } else {
+                        self.search_scope = SearchScope::Global;
+                        self.search_query = input.clone();
+                    }
+                }
+                SearchScope::Global => self.search_query.clone_from(&input),
+            }
+        }
+        self.address_input = input;
+    }
+
+    pub fn toggle_search_depth(&mut self) -> bool {
+        if matches!(self.search_scope, SearchScope::Global) {
+            return false;
+        }
+        self.search_depth = match self.search_depth {
+            SearchDepth::CurrentFolder => SearchDepth::Recursive,
+            SearchDepth::Recursive => SearchDepth::CurrentFolder,
+        };
+        true
+    }
+
+    pub fn begin_search(
+        &mut self,
+        scope: SearchScope,
+        query: String,
+    ) -> (RequestId, Arc<AtomicBool>) {
+        self.cancel_pending();
+        self.latest_request.0 += 1;
+        if self.page_source == PageSource::Directory {
+            self.directory_snapshot = Some(DirectorySnapshot {
+                entries: self.entries.clone(),
+                error: self.error.clone(),
+                selected: self.selected.clone(),
+                focused: self.focused,
+                selection_anchor: self.selection_anchor,
+            });
+        }
+        self.page_source = PageSource::Search;
+        self.retain_directory_view = false;
+        self.address_mode = AddressMode::Smart;
+        self.address_editing = true;
+        self.search_scope = scope;
+        self.search_query = query;
+        self.address_input = search_address_text(&self.search_scope, &self.search_query);
+        self.search_state = SearchState::Searching;
+        self.search_total = None;
+        self.search_file_total = None;
+        self.search_requested_pages.clear();
+        self.search_requested_pages.insert(0);
+        self.search_pending_pages.clear();
+        self.search_cached_pages.clear();
+        self.search_page_retries.clear();
+        self.error = None;
+        self.pending_entries.clear();
+        self.replace_entries(Vec::new());
+        self.clear_selection();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(cancel.clone());
+        (self.latest_request, cancel)
+    }
+
+    pub fn search_cancel_token(&self) -> Option<Arc<AtomicBool>> {
+        self.cancel.clone()
+    }
+    pub fn accepts_page(&self, request_id: RequestId, source: PageSource) -> bool {
+        self.page_source == source && self.accepts(request_id)
+    }
+
+    pub fn dismiss_address_edit(&mut self) {
+        self.address_editing = false;
+        if self.page_source == PageSource::Directory {
+            self.address_mode = AddressMode::Normal;
+            self.address_input.clear();
+            self.search_query.clear();
+        }
+    }
+
+    pub fn cancel_address_edit(&mut self) {
+        let was_search = self.page_source == PageSource::Search;
+        self.cancel_pending();
+        if was_search {
+            self.latest_request.0 += 1;
+        }
+        if let Some(snapshot) = self.directory_snapshot.take() {
+            self.entries = snapshot.entries;
+            self.error = snapshot.error;
+            self.selected = snapshot.selected;
+            self.focused = snapshot.focused;
+            self.selection_anchor = snapshot.selection_anchor;
+            self.rebuild_entry_indices();
+        }
+        self.page_source = PageSource::Directory;
+        self.address_editing = false;
+        self.address_mode = AddressMode::Normal;
+        self.address_input.clear();
+        self.search_query.clear();
+        self.search_total = None;
+        self.search_file_total = None;
+        self.search_requested_pages.clear();
+        self.search_pending_pages.clear();
+        self.search_cached_pages.clear();
+        self.search_page_retries.clear();
+        self.search_state = SearchState::Waiting;
+    }
+
+    pub fn begin_navigation(
+        &mut self,
+        location: NavigationLocation,
+        kind: NavigationKind,
+    ) -> (RequestId, Arc<AtomicBool>) {
+        self.cancel_pending();
+        self.latest_request.0 += 1;
+        crate::operation_audit::record(
+            "navigation",
+            format!(
+                "tab={:?} request={:?} from={:?} to={location:?} kind={kind:?}",
+                self.id,
+                self.latest_request,
+                self.visible_location()
+            ),
+        );
+        self.retain_directory_view = kind == NavigationKind::BackgroundRefresh
+            && (self.load_state == LoadState::Complete || self.retain_directory_view)
+            && self.page_source == PageSource::Directory
+            && self.current_location.as_ref() == Some(&location)
+            && location
+                .directory_path()
+                .is_some_and(|path| !crate::network::is_unc_path(path));
+        self.requested_location = Some(location);
+        self.page_source = PageSource::Directory;
+        self.directory_snapshot = None;
+        self.search_total = None;
+        self.search_file_total = None;
+        self.search_requested_pages.clear();
+        self.search_pending_pages.clear();
+        self.search_cached_pages.clear();
+        self.search_page_retries.clear();
+        self.address_mode = AddressMode::Normal;
+        self.navigation_kind = kind;
+        self.load_state = LoadState::Loading;
+        self.error = None;
+        self.pending_entries.clear();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(cancel.clone());
+        (self.latest_request, cancel)
+    }
+
+    pub fn begin_directory_navigation(
+        &mut self,
+        path: PathBuf,
+        kind: NavigationKind,
+    ) -> (RequestId, Arc<AtomicBool>) {
+        self.begin_navigation(NavigationLocation::Directory(path), kind)
+    }
+
+    pub fn navigate_home(&mut self, kind: NavigationKind) -> RequestId {
+        self.cancel_pending();
+        self.latest_request.0 += 1;
+        self.navigation_kind = kind;
+        self.retain_directory_view = false;
+        self.commit_location(NavigationLocation::Home);
+        self.page_source = PageSource::Directory;
+        self.directory_snapshot = None;
+        self.search_scope = SearchScope::Global;
+        self.search_depth = SearchDepth::Recursive;
+        self.search_query.clear();
+        self.search_state = SearchState::Waiting;
+        self.search_total = None;
+        self.search_file_total = None;
+        self.search_requested_pages.clear();
+        self.search_pending_pages.clear();
+        self.search_cached_pages.clear();
+        self.search_page_retries.clear();
+        self.pending_entries.clear();
+        self.replace_entries(Vec::new());
+        self.folder_sizes.cancel(self.latest_request);
+        self.load_state = LoadState::Complete;
+        self.error = None;
+        self.cancel = None;
+        self.latest_request
+    }
+
+    pub fn accepts(&self, request_id: RequestId) -> bool {
+        self.latest_request == request_id
+            && !self
+                .cancel
+                .as_ref()
+                .is_some_and(|cancel| cancel.load(AtomicOrdering::Acquire))
+    }
+
+    pub fn accepts_directory(&self, request_id: RequestId) -> bool {
+        self.page_source == PageSource::Directory
+            && self.requested_location.is_some()
+            && matches!(self.load_state, LoadState::Loading | LoadState::Partial)
+            && self.accepts(request_id)
+    }
+
+    pub fn accept_directory_batch(
+        &mut self,
+        request_id: RequestId,
+        entries: Vec<FileEntry>,
+        preference: DirectoryViewPreference,
+    ) -> bool {
+        if !self.accepts_directory(request_id) {
+            return false;
+        }
+        if self.pending_entries.is_empty() {
+            self.sort_field = preference.sort_field;
+            self.sort_direction = preference.sort_direction;
+            if self.visible_path().is_some_and(crate::network::is_unc_path) {
+                self.clear_selection();
+            }
+        }
+        self.append_pending(entries);
+        true
+    }
+
+    pub fn finish_directory_navigation(
+        &mut self,
+        request_id: RequestId,
+        location: NavigationLocation,
+        preference: DirectoryViewPreference,
+        warning: Option<String>,
+    ) -> bool {
+        if !self.accepts_directory(request_id)
+            || self.requested_location.as_ref() != Some(&location)
+        {
+            return false;
+        }
+        let preserve_selection = self.load_state == LoadState::Partial
+            && location
+                .directory_path()
+                .is_some_and(crate::network::is_unc_path);
+        if self.sort_field != preference.sort_field
+            || self.sort_direction != preference.sort_direction
+        {
+            self.sort_field = preference.sort_field;
+            self.sort_direction = preference.sort_direction;
+            self.sort_pending();
+        }
+        // Enumeration IDs are request-local. Resolve the user's latest choices by raw path.
+        let retained = self.retains_directory_view().then(|| {
+            let selected = self
+                .selected
+                .iter()
+                .filter_map(|id| self.visible_entry(*id))
+                .map(|entry| entry.path.clone())
+                .collect::<HashSet<_>>();
+            let focused = self
+                .focused
+                .and_then(|id| self.visible_entry(id))
+                .map(|entry| entry.path.clone());
+            let anchor = self
+                .selection_anchor
+                .and_then(|id| self.visible_entry(id))
+                .map(|entry| entry.path.clone());
+            (selected, focused, anchor)
+        });
+        self.commit_pending();
+        let selection = preserve_selection
+            .then(|| (self.selected.clone(), self.focused, self.selection_anchor));
+        self.commit_location(location);
+        if let Some((selected, focused, anchor)) = selection {
+            self.selected = selected;
+            self.focused = focused;
+            self.selection_anchor = anchor;
+        }
+        if let Some((selected, focused, anchor)) = retained {
+            self.selected = self
+                .entries
+                .iter()
+                .filter(|entry| selected.contains(&entry.path))
+                .map(|entry| entry.id)
+                .collect();
+            self.focused = self
+                .entries
+                .iter()
+                .find(|entry| Some(&entry.path) == focused.as_ref())
+                .map(|entry| entry.id);
+            self.selection_anchor = self
+                .entries
+                .iter()
+                .find(|entry| Some(&entry.path) == anchor.as_ref())
+                .map(|entry| entry.id);
+        }
+        self.error = warning;
+        true
+    }
+
+    pub fn finish_remote_directory(
+        &mut self,
+        request_id: RequestId,
+        location: NavigationLocation,
+        preference: DirectoryViewPreference,
+        incomplete: Option<String>,
+    ) -> bool {
+        if !self.finish_directory_navigation(request_id, location, preference, incomplete.clone()) {
+            return false;
+        }
+        if let Some(message) = incomplete {
+            self.load_state = LoadState::Failed;
+            self.error = Some(message);
+        }
+        true
+    }
+
+    pub fn fail_directory_navigation(
+        &mut self,
+        request_id: RequestId,
+        state: LoadState,
+        error: String,
+    ) -> bool {
+        if !self.accepts_directory(request_id)
+            || !matches!(
+                state,
+                LoadState::NotFound
+                    | LoadState::PermissionDenied
+                    | LoadState::Disconnected
+                    | LoadState::Failed
+            )
+        {
+            return false;
+        }
+        self.cancel_pending();
+        self.load_state = state;
+        self.error = Some(error);
+        true
+    }
+
+    pub fn cancel_directory_navigation(&mut self, request_id: RequestId) -> bool {
+        if self.page_source != PageSource::Directory
+            || self.latest_request != request_id
+            || self.requested_location.is_none()
+        {
+            return false;
+        }
+        if self.load_state == LoadState::Cancelled {
+            return self
+                .cancel
+                .as_ref()
+                .is_some_and(|cancel| cancel.load(AtomicOrdering::Acquire));
+        }
+        if !matches!(self.load_state, LoadState::Loading | LoadState::Partial) {
+            return false;
+        }
+        self.cancel_pending();
+        true
+    }
+    pub fn mark_directory_slow(&mut self, request_id: RequestId) -> bool {
+        if !self.accepts_directory(request_id) || self.load_state != LoadState::Loading {
+            return false;
+        }
+        self.error = Some("network_slow".to_owned());
+        true
+    }
+    pub fn cancel_pending(&mut self) {
+        if let Some(cancel) = self.cancel.as_ref() {
+            cancel.store(true, AtomicOrdering::Release);
+            if self.page_source == PageSource::Search
+                && matches!(
+                    self.search_state,
+                    SearchState::Searching | SearchState::Partial
+                )
+            {
+                self.search_state = SearchState::Cancelled;
+            } else if self.page_source == PageSource::Directory
+                && matches!(self.load_state, LoadState::Loading | LoadState::Partial)
+            {
+                if self.load_state == LoadState::Partial && !self.retains_directory_view() {
+                    self.clear_selection();
+                }
+                self.discard_pending();
+                self.reconcile_selection();
+                self.load_state = LoadState::Cancelled;
+                self.error = None;
+            }
+        }
+    }
+
+    pub fn rename_loaded_entry(&mut self, old: &Path, new: &Path) -> Option<EntryId> {
+        if self.page_source != PageSource::Directory || self.load_state != LoadState::Complete {
+            return None;
+        }
+        let index = self.entries.iter().position(|entry| entry.path == old)?;
+        let name = new.file_name()?.to_owned();
+        let entry = &mut Arc::make_mut(&mut self.entries)[index];
+        let id = entry.id;
+        if old.extension().map(|ext| ext.to_ascii_lowercase())
+            != new.extension().map(|ext| ext.to_ascii_lowercase())
+            && entry.open_target.is_some()
+        {
+            entry.open_target = None;
+            entry.kind = EntryKind::File;
+        }
+        entry.path = new.to_path_buf();
+        entry.original_name = name;
+        entry.display_name = entry.original_name.to_string_lossy().into_owned();
+        entry.name_highlights.clear();
+        self.resort_entries();
+        Some(id)
+    }
+
+    pub fn replace_entries(&mut self, entries: Vec<FileEntry>) {
+        self.entry_indices = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.id, index))
+            .collect();
+        self.entries = Arc::new(entries);
+        self.reconcile_selection();
+    }
+
+    fn append_pending(&mut self, mut entries: Vec<FileEntry>) -> usize {
+        let previous_len = self.pending_entries.len();
+        let retain_view = self.retains_directory_view();
+        let field = self.sort_field;
+        let direction = self.sort_direction;
+        entries.sort_unstable_by(|left, right| compare_entries(left, right, field, direction));
+        let append_only =
+            self.pending_entries
+                .last()
+                .zip(entries.first())
+                .is_none_or(|(last, first)| {
+                    compare_entries(last, first, field, direction) != Ordering::Greater
+                });
+        if append_only {
+            if !retain_view {
+                for (offset, entry) in entries.iter().enumerate() {
+                    self.entry_indices.insert(entry.id, previous_len + offset);
+                }
+            }
+            self.pending_entries.append(&mut entries);
+        } else {
+            // Binary searches compare only new entries; the growing directory is moved once.
+            let positions = entries
+                .iter()
+                .map(|entry| {
+                    self.pending_entries.partition_point(|existing| {
+                        compare_entries(existing, entry, field, direction) != Ordering::Greater
+                    })
+                })
+                .collect::<Vec<_>>();
+            let existing = std::mem::take(&mut self.pending_entries);
+            let mut merged = Vec::with_capacity(existing.len() + entries.len());
+            let mut existing = existing.into_iter();
+            let mut copied = 0;
+            for (entry, position) in entries.into_iter().zip(positions) {
+                merged.extend(existing.by_ref().take(position - copied));
+                copied = position;
+                merged.push(entry);
+            }
+            merged.extend(existing);
+            self.pending_entries = merged;
+            if !retain_view {
+                self.entry_indices = self
+                    .pending_entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| (entry.id, index))
+                    .collect();
+            }
+        }
+        if self.page_source == PageSource::Search {
+            self.search_state = SearchState::Partial;
+        } else {
+            self.load_state = LoadState::Partial;
+        }
+        previous_len
+    }
+
+    pub fn merge_search_page(
+        &mut self,
+        offset: u32,
+        entries: Vec<FileEntry>,
+        total: u32,
+        file_total: u32,
+        page_size: u32,
+    ) {
+        const CACHE_PAGE_LIMIT: usize = 7;
+        let selected_paths = self
+            .selected
+            .iter()
+            .filter_map(|id| {
+                self.visible_entry(*id)
+                    .map(|entry| (*id, entry.path.clone()))
+            })
+            .collect::<HashMap<_, _>>();
+        let focused_path = self
+            .focused
+            .and_then(|id| self.visible_entry(id).map(|entry| (id, entry.path.clone())));
+        let anchor_path = self
+            .selection_anchor
+            .and_then(|id| self.visible_entry(id).map(|entry| (id, entry.path.clone())));
+        let current = Arc::make_mut(&mut self.entries);
+        for entry in entries {
+            if let Some(index) = current.iter().position(|existing| existing.id == entry.id) {
+                current[index] = entry;
+            } else {
+                current.push(entry);
+            }
+        }
+        self.search_page_retries.remove(&offset);
+        self.search_cached_pages.retain(|cached| *cached != offset);
+        self.search_cached_pages.push_back(offset);
+
+        while self.search_cached_pages.len() > CACHE_PAGE_LIMIT {
+            let Some(position) = self.search_cached_pages.iter().position(|cached| {
+                let end = cached.saturating_add(page_size);
+                let protects_page = |id: EntryId| id.0 > *cached && id.0 <= end;
+                !self.selected.iter().copied().any(protects_page)
+                    && self.focused.is_none_or(|id| !protects_page(id))
+                    && self.selection_anchor.is_none_or(|id| !protects_page(id))
+            }) else {
+                break;
+            };
+            let cached = self.search_cached_pages.remove(position).unwrap();
+            let end = cached.saturating_add(page_size);
+            current.retain(|entry| entry.id.0 <= cached || entry.id.0 > end);
+        }
+        current.sort_unstable_by_key(|entry| entry.id.0);
+        self.rebuild_entry_indices();
+        let entry_paths = self
+            .entries
+            .iter()
+            .map(|entry| (entry.id, entry.path.clone()))
+            .collect::<HashMap<_, _>>();
+        self.selected.retain(|id| {
+            selected_paths
+                .get(id)
+                .is_none_or(|expected_path| entry_paths.get(id) == Some(expected_path))
+        });
+        if focused_path
+            .as_ref()
+            .is_some_and(|(id, expected_path)| entry_paths.get(id) != Some(expected_path))
+        {
+            self.focused = None;
+        }
+        if anchor_path
+            .as_ref()
+            .is_some_and(|(id, expected_path)| entry_paths.get(id) != Some(expected_path))
+        {
+            self.selection_anchor = None;
+        }
+        self.search_total = Some(total);
+        self.search_file_total = Some(file_total);
+        let loaded = self.entries.len().try_into().unwrap_or(u32::MAX);
+        self.search_state = if total == 0 {
+            SearchState::NoResults
+        } else if loaded >= total {
+            SearchState::Complete
+        } else {
+            SearchState::Partial
+        };
+    }
+
+    pub fn retry_unexpected_search_page(&mut self, offset: u32) -> bool {
+        const MAX_RETRIES: u8 = 2;
+        self.search_requested_pages.remove(&offset);
+        self.search_pending_pages
+            .retain(|pending| *pending != offset);
+        let retries = self.search_page_retries.entry(offset).or_default();
+        if *retries >= MAX_RETRIES {
+            return false;
+        }
+        *retries += 1;
+        self.search_requested_pages.insert(offset);
+        true
+    }
+    pub fn queue_search_pages(&mut self, offsets: &[u32], page_size: u32) -> Option<u32> {
+        if self.page_source != PageSource::Search {
+            return None;
+        }
+        let mut candidates = offsets
+            .iter()
+            .map(|offset| offset / page_size * page_size)
+            .filter(|offset| self.search_total.is_none_or(|total| *offset < total))
+            .filter(|offset| !self.search_cached_pages.contains(offset))
+            .filter(|offset| !self.search_requested_pages.contains(offset))
+            .collect::<VecDeque<_>>();
+        let mut seen = HashSet::new();
+        candidates.retain(|offset| seen.insert(*offset));
+        self.search_pending_pages.clear();
+        if !self.search_requested_pages.is_empty() {
+            self.search_pending_pages = candidates;
+            return None;
+        }
+        let offset = candidates.pop_front()?;
+        self.search_requested_pages.insert(offset);
+        self.search_pending_pages = candidates;
+        Some(offset)
+    }
+
+    pub fn finish_search_page_request(&mut self, offset: u32) -> Option<u32> {
+        self.search_requested_pages.remove(&offset);
+        while let Some(next) = self.search_pending_pages.pop_front() {
+            if self.search_cached_pages.contains(&next)
+                || self.search_total.is_some_and(|total| next >= total)
+            {
+                continue;
+            }
+            self.search_requested_pages.insert(next);
+            return Some(next);
+        }
+        None
+    }
+    fn commit_pending(&mut self) {
+        let entries = std::mem::take(&mut self.pending_entries);
+        self.replace_entries(entries);
+        self.load_state = LoadState::Complete;
+        self.cancel = None;
+    }
+
+    fn commit_location(&mut self, location: NavigationLocation) {
+        let previous = self.current_location.clone();
+        match self.navigation_kind {
+            NavigationKind::Normal => {
+                if let Some(previous) = previous.as_ref()
+                    && previous != &location
+                {
+                    self.back_history.push(previous.clone());
+                    self.forward_history.clear();
+                }
+            }
+            NavigationKind::Back => {
+                if let Some(position) = self.back_history.iter().rposition(|item| item == &location)
+                {
+                    let traversed = self.back_history.drain(position..).collect::<Vec<_>>();
+                    if let Some(previous) = previous {
+                        self.forward_history.push(previous);
+                    }
+                    self.forward_history.extend(traversed.into_iter().skip(1));
+                }
+            }
+            NavigationKind::Forward => {
+                if let Some(position) = self
+                    .forward_history
+                    .iter()
+                    .rposition(|item| item == &location)
+                {
+                    let traversed = self.forward_history.drain(position..).collect::<Vec<_>>();
+                    if let Some(previous) = previous {
+                        self.back_history.push(previous);
+                    }
+                    self.back_history.extend(traversed.into_iter().skip(1));
+                }
+            }
+            NavigationKind::Refresh | NavigationKind::BackgroundRefresh => {}
+        }
+        self.current_location = Some(location);
+        self.requested_location = None;
+        self.address_editing = false;
+        self.address_input.clear();
+        self.navigation_kind = NavigationKind::Normal;
+        self.clear_selection();
+    }
+
+    pub fn back_target(&self) -> Option<NavigationLocation> {
+        self.back_history.last().cloned()
+    }
+    pub fn forward_target(&self) -> Option<NavigationLocation> {
+        self.forward_history.last().cloned()
+    }
+
+    fn discard_pending(&mut self) {
+        self.pending_entries.clear();
+        self.entry_indices = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.id, index))
+            .collect();
+    }
+
+    pub fn visible_entries_snapshot(&self) -> Arc<Vec<FileEntry>> {
+        if matches!(self.load_state, LoadState::Loading | LoadState::Partial)
+            && !self.retains_directory_view()
+        {
+            Arc::new(self.pending_entries.clone())
+        } else {
+            self.entries.clone()
+        }
+    }
+
+    pub fn visible_entries(&self) -> &[FileEntry] {
+        if self.load_state == LoadState::Partial && !self.retains_directory_view() {
+            &self.pending_entries
+        } else {
+            &self.entries
+        }
+    }
+
+    pub fn visible_entry(&self, entry_id: EntryId) -> Option<&FileEntry> {
+        self.visible_entry_index(entry_id)
+            .and_then(|index| self.visible_entries().get(index))
+    }
+
+    pub fn apply_shortcut_target(
+        &mut self,
+        entry_id: EntryId,
+        original_path: &Path,
+        target: PathBuf,
+        is_directory: Option<bool>,
+    ) -> bool {
+        let Some(index) = self.visible_entry_index(entry_id) else {
+            return false;
+        };
+        if matches!(self.load_state, LoadState::Loading | LoadState::Partial)
+            && !self.retains_directory_view()
+        {
+            return self.pending_entries.get_mut(index).is_some_and(|entry| {
+                entry.set_shortcut_target(entry_id, original_path, target, is_directory)
+            });
+        }
+        Arc::make_mut(&mut self.entries)
+            .get_mut(index)
+            .is_some_and(|entry| {
+                entry.set_shortcut_target(entry_id, original_path, target, is_directory)
+            })
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected.clear();
+        self.focused = None;
+        self.selection_anchor = None;
+    }
+
+    pub fn select_all(&mut self) {
+        self.selected = self.entries.iter().map(|entry| entry.id).collect();
+        self.focused = self.entries.first().map(|entry| entry.id);
+        self.selection_anchor = self.focused;
+    }
+
+    pub fn select_entry(&mut self, entry_id: EntryId, toggle: bool, extend: bool) {
+        if !self.entry_indices.contains_key(&entry_id) {
+            return;
+        }
+        self.focused = Some(entry_id);
+        if extend {
+            let anchor = self.selection_anchor.unwrap_or(entry_id);
+            let range = self.range_ids(anchor, entry_id);
+            if toggle {
+                for id in range {
+                    self.selected.insert(id);
+                }
+            } else {
+                self.selected = range.into();
+            }
+            self.selection_anchor = Some(anchor);
+        } else if toggle {
+            if !self.selected.remove(entry_id) {
+                self.selected.insert(entry_id);
+            }
+            self.selection_anchor = Some(entry_id);
+        } else {
+            self.selected = vec![entry_id].into();
+            self.selection_anchor = Some(entry_id);
+        }
+    }
+
+    pub fn apply_rectangle_selection(
+        &mut self,
+        snapshot: &HashSet<EntryId>,
+        hits: &HashSet<EntryId>,
+        mode: RectangleSelectionMode,
+    ) {
+        let mut selected = match mode {
+            RectangleSelectionMode::Replace => hits.clone(),
+            RectangleSelectionMode::Extend => snapshot.union(hits).copied().collect(),
+            RectangleSelectionMode::Toggle => {
+                snapshot.symmetric_difference(hits).copied().collect()
+            }
+        };
+        selected.retain(|id| self.entry_indices.contains_key(id));
+        let mut ordered = selected.into_iter().collect::<Vec<_>>();
+        ordered
+            .sort_unstable_by_key(|id| self.entry_indices.get(id).copied().unwrap_or(usize::MAX));
+        self.selected = ordered.into();
+        self.focused = hits
+            .iter()
+            .filter(|id| self.entry_indices.contains_key(id))
+            .copied()
+            .max_by_key(|id| self.entry_indices.get(id).copied())
+            .or_else(|| self.selected.last().copied());
+        self.selection_anchor = self.focused;
+    }
+
+    pub fn move_focus(&mut self, delta: isize, extend: bool) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let current = self
+            .focused
+            .and_then(|id| self.entry_index(id))
+            .unwrap_or(0);
+        let next = current
+            .saturating_add_signed(delta)
+            .min(self.entries.len() - 1);
+        let id = self.entries[next].id;
+        self.focused = Some(id);
+        if extend {
+            let anchor = self
+                .selection_anchor
+                .unwrap_or_else(|| self.entries[current].id);
+            self.selection_anchor = Some(anchor);
+            self.selected = self.range_ids(anchor, id).into();
+        } else {
+            self.selected = vec![id].into();
+            self.selection_anchor = Some(id);
+        }
+    }
+
+    pub fn focus_boundary(&mut self, last: bool, extend: bool) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let id = if last {
+            self.entries.last()
+        } else {
+            self.entries.first()
+        }
+        .expect("non-empty")
+        .id;
+        if extend {
+            let anchor = self.selection_anchor.or(self.focused).unwrap_or(id);
+            self.selection_anchor = Some(anchor);
+            self.selected = self.range_ids(anchor, id).into();
+            self.focused = Some(id);
+        } else {
+            self.selected = vec![id].into();
+            self.focused = Some(id);
+            self.selection_anchor = Some(id);
+        }
+    }
+
+    pub fn toggle_focused(&mut self) {
+        if let Some(id) = self.focused {
+            self.select_entry(id, true, false);
+        }
+    }
+
+    pub fn set_sort(&mut self, field: SortField) {
+        if self.sort_field == field {
+            self.sort_direction = match self.sort_direction {
+                SortDirection::Ascending => SortDirection::Descending,
+                SortDirection::Descending => SortDirection::Ascending,
+            };
+        } else {
+            self.sort_field = field;
+            self.sort_direction = SortDirection::Ascending;
+        }
+        self.resort_entries();
+    }
+
+    pub fn set_search_sort(&mut self, field: SortField) {
+        if self.search_sort_field == field {
+            self.search_sort_direction = match self.search_sort_direction {
+                SortDirection::Ascending => SortDirection::Descending,
+                SortDirection::Descending => SortDirection::Ascending,
+            };
+        } else {
+            self.search_sort_field = field;
+            self.search_sort_direction = SortDirection::Ascending;
+        }
+    }
+    pub fn sort_pending(&mut self) {
+        let field = self.sort_field;
+        let direction = self.sort_direction;
+        self.pending_entries
+            .sort_unstable_by(|left, right| compare_entries(left, right, field, direction));
+        if !self.retains_directory_view() {
+            self.entry_indices = self
+                .pending_entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (entry.id, index))
+                .collect();
+        }
+    }
+    pub fn resort_entries(&mut self) {
+        if matches!(self.load_state, LoadState::Loading | LoadState::Partial) {
+            self.sort_pending();
+            if !self.retains_directory_view() {
+                return;
+            }
+        }
+        let field = self.sort_field;
+        let direction = self.sort_direction;
+        Arc::make_mut(&mut self.entries)
+            .sort_unstable_by(|left, right| compare_entries(left, right, field, direction));
+        self.rebuild_entry_indices();
+    }
+
+    fn range_ids(&self, left: EntryId, right: EntryId) -> Vec<EntryId> {
+        let Some(left) = self.entry_index(left) else {
+            return Vec::new();
+        };
+        let Some(right) = self.entry_index(right) else {
+            return Vec::new();
+        };
+        let (start, end) = if left <= right {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        self.visible_entries()[start..=end]
+            .iter()
+            .map(|entry| entry.id)
+            .collect()
+    }
+
+    pub fn visible_entry_index(&self, id: EntryId) -> Option<usize> {
+        self.entry_indices.get(&id).copied()
+    }
+
+    fn entry_index(&self, id: EntryId) -> Option<usize> {
+        self.entry_indices.get(&id).copied()
+    }
+
+    fn rebuild_entry_indices(&mut self) {
+        self.entry_indices = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.id, index))
+            .collect();
+    }
+
+    fn reconcile_selection(&mut self) {
+        self.selected
+            .retain(|id| self.entry_indices.contains_key(id));
+        if self
+            .focused
+            .is_some_and(|id| !self.entry_indices.contains_key(&id))
+        {
+            self.focused = None;
+        }
+        if self
+            .selection_anchor
+            .is_some_and(|id| !self.entry_indices.contains_key(&id))
+        {
+            self.selection_anchor = None;
+        }
+    }
+}
+
+fn entry_type_key(entry: &FileEntry) -> String {
+    if entry.kind == EntryKind::Directory {
+        return "folder".to_owned();
+    }
+    let name = entry
+        .webdav
+        .as_ref()
+        .map(|identity| Path::new(&identity.path))
+        .unwrap_or(entry.path.as_path());
+    name.extension()
+        .map(|extension| extension.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+
+fn entry_size_key(entry: &FileEntry) -> (u8, u64) {
+    match (entry.kind, entry.folder_size, entry.size_bytes) {
+        (EntryKind::Directory, FolderSizeState::Value(size), _) => (0, size),
+        (EntryKind::Directory, _, _) => (1, 0),
+        (_, _, Some(size)) => (0, size),
+        _ => (1, 0),
+    }
+}
+fn compare_entries(
+    left: &FileEntry,
+    right: &FileEntry,
+    field: SortField,
+    direction: SortDirection,
+) -> Ordering {
+    if field != SortField::Kind {
+        let directory_order =
+            (left.kind != EntryKind::Directory).cmp(&(right.kind != EntryKind::Directory));
+        if directory_order != Ordering::Equal {
+            return directory_order;
+        }
+    }
+    let value_order = match field {
+        SortField::Name => {
+            if left.webdav.is_some() || right.webdav.is_some() {
+                left.display_name.cmp(&right.display_name)
+            } else {
+                left.display_name
+                    .to_lowercase()
+                    .cmp(&right.display_name.to_lowercase())
+            }
+        }
+        SortField::Kind => entry_type_key(left).cmp(&entry_type_key(right)),
+        SortField::Size => entry_size_key(left).cmp(&entry_size_key(right)),
+        SortField::Modified => left.modified.cmp(&right.modified),
+        SortField::Created => left.created.cmp(&right.created),
+    };
+    let value_order = match direction {
+        SortDirection::Ascending => value_order,
+        SortDirection::Descending => {
+            if field == SortField::Size && entry_size_key(left).0 != entry_size_key(right).0 {
+                value_order
+            } else {
+                value_order.reverse()
+            }
+        }
+    };
+    value_order
+        .then_with(|| {
+            left.display_name
+                .to_lowercase()
+                .cmp(&right.display_name.to_lowercase())
+        })
+        .then_with(|| match (&left.webdav, &right.webdav) {
+            (Some(left_entry), Some(right_entry)) => left_entry.path.cmp(&right_entry.path),
+            _ => left.path.cmp(&right.path),
+        })
+}
+
+fn webdav_label(path: &str) -> String {
+    path.rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(path)
+        .to_owned()
+}
+
+fn webdav_breadcrumbs(place: &WebDavPlace) -> Vec<(String, NavigationLocation)> {
+    let root = if place.root.is_empty() {
+        "/"
+    } else {
+        place.root.as_str()
+    };
+    let path = if place.path.is_empty() {
+        "/"
+    } else {
+        place.path.as_str()
+    };
+    let root_trimmed = root.trim_end_matches('/');
+    let within = path == root
+        || path
+            .strip_prefix(root_trimmed)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+    if !within {
+        return vec![(
+            webdav_label(path),
+            NavigationLocation::WebDav(place.clone()),
+        )];
+    }
+    let mut crumbs = Vec::new();
+    let mut cursor = if root_trimmed.is_empty() {
+        "/"
+    } else {
+        root_trimmed
+    }
+    .to_owned();
+    crumbs.push((
+        webdav_label(&cursor),
+        NavigationLocation::WebDav(WebDavPlace {
+            path: if cursor == "/" {
+                "/".to_owned()
+            } else {
+                cursor.clone()
+            },
+            ..place.clone()
+        }),
+    ));
+    let suffix = path
+        .strip_prefix(root_trimmed)
+        .unwrap_or("")
+        .trim_start_matches('/');
+    if !suffix.is_empty() {
+        for segment in suffix.split('/').filter(|segment| !segment.is_empty()) {
+            if cursor == "/" {
+                cursor = format!("/{segment}");
+            } else {
+                cursor = format!("{cursor}/{segment}");
+            }
+            crumbs.push((
+                segment.to_owned(),
+                NavigationLocation::WebDav(WebDavPlace {
+                    path: cursor.clone(),
+                    ..place.clone()
+                }),
+            ));
+        }
+    }
+    crumbs
+}
+
+fn search_scope_prefix(path: &Path) -> String {
+    format!("{} ", display_path(path))
+}
+
+fn library_search_scope_prefix(display_name: &str) -> String {
+    format!("{display_name} ")
+}
+
+pub fn search_address_text(scope: &SearchScope, query: &str) -> String {
+    match scope {
+        SearchScope::Directory(path) => format!("{}{}", search_scope_prefix(path), query),
+        SearchScope::Library { display_name, .. } => {
+            format!("{}{}", library_search_scope_prefix(display_name), query)
+        }
+        SearchScope::Global => query.to_owned(),
+    }
+}
+fn display_path(path: &Path) -> String {
+    path.as_os_str().to_string_lossy().into_owned()
+}
+
+impl Drop for TabSession {
+    fn drop(&mut self) {
+        self.cancel_pending();
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FileEntry {
+    pub id: EntryId,
+    pub original_name: OsString,
+    pub display_name: String,
+    pub name_highlights: Vec<NameHighlightSegment>,
+    pub path: PathBuf,
+    pub kind: EntryKind,
+    pub open_target: Option<PathBuf>,
+    pub library_source_index: Option<usize>,
+    pub parent_display: String,
+    pub size_bytes: Option<u64>,
+    pub folder_size: FolderSizeState,
+    pub modified: Option<std::time::SystemTime>,
+    pub created: Option<std::time::SystemTime>,
+    pub webdav: Option<WebDavEntry>,
+}
+
+impl FileEntry {
+    pub fn accepts_folder_size(&self, entry_id: EntryId, original_path: &Path) -> bool {
+        self.webdav.is_none() && self.id == entry_id && self.path == original_path
+    }
+
+    pub fn set_folder_size(
+        &mut self,
+        entry_id: EntryId,
+        original_path: &Path,
+        state: FolderSizeState,
+    ) -> bool {
+        if !self.accepts_folder_size(entry_id, original_path) {
+            return false;
+        }
+        self.folder_size = state;
+        true
+    }
+
+    pub fn set_shortcut_target(
+        &mut self,
+        entry_id: EntryId,
+        original_path: &Path,
+        target: PathBuf,
+        is_directory: Option<bool>,
+    ) -> bool {
+        if self.id != entry_id || self.path != original_path || is_directory == Some(false) {
+            return false;
+        }
+        self.kind = EntryKind::Directory;
+        self.open_target = Some(target);
+        true
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EntryKind {
+    Directory,
+    File,
+    Other,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: u32, name: &str, kind: EntryKind, size: Option<u64>) -> FileEntry {
+        FileEntry {
+            id: EntryId(id),
+            original_name: name.into(),
+            display_name: name.into(),
+            name_highlights: Vec::new(),
+            path: PathBuf::from(name),
+            kind,
+            open_target: None,
+            library_source_index: None,
+            parent_display: String::new(),
+            size_bytes: size,
+            folder_size: FolderSizeState::Unknown,
+            modified: None,
+            created: None,
+            webdav: None,
+        }
+    }
+
+    #[test]
+    fn issue_157_webdav_breadcrumbs_stay_inside_the_connection_root() {
+        let place = WebDavPlace {
+            connection_id: 7,
+            revision: 1,
+            root: "/dav/挂载".into(),
+            path: "/dav/挂载/子 目录/#".into(),
+        };
+        let mut tab = TabSession::new_home(TabId(1));
+        tab.begin_navigation(NavigationLocation::WebDav(place), NavigationKind::Normal);
+        let crumbs = tab.breadcrumb_paths();
+        assert_eq!(
+            crumbs
+                .iter()
+                .map(|(label, _)| label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["挂载", "子 目录", "#"]
+        );
+        match &crumbs[0].1 {
+            NavigationLocation::WebDav(crumb) => assert_eq!(crumb.path, "/dav/挂载"),
+            other => panic!("unexpected breadcrumb {other:?}"),
+        }
+        match &crumbs[2].1 {
+            NavigationLocation::WebDav(crumb) => assert_eq!(crumb.path, "/dav/挂载/子 目录/#"),
+            other => panic!("unexpected breadcrumb {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issue_157_incomplete_listing_keeps_entries_and_is_not_complete() {
+        let mut tab = TabSession::new_home(TabId(1));
+        let location = NavigationLocation::WebDav(WebDavPlace {
+            connection_id: 7,
+            revision: 1,
+            root: "/dav".into(),
+            path: "/dav".into(),
+        });
+        let preference = DirectoryViewPreference::default();
+        let (request, _) = tab.begin_navigation(location.clone(), NavigationKind::Normal);
+        assert!(tab.accept_directory_batch(
+            request,
+            vec![entry(1, "a", EntryKind::File, None)],
+            preference
+        ));
+        assert!(tab.finish_remote_directory(
+            request,
+            location,
+            preference,
+            Some("部分条目无法读取".into())
+        ));
+        assert_eq!(tab.load_state, LoadState::Failed);
+        assert_eq!(tab.entries.len(), 1);
+        assert_eq!(tab.error.as_deref(), Some("部分条目无法读取"));
+    }
+
+    #[test]
+    fn issue_151_directory_commit_checks_identity_location_and_terminal_state() {
+        let mut tab = TabSession::new_home(TabId(1));
+        let location = NavigationLocation::Directory(r"C:\target".into());
+        let preference = DirectoryViewPreference::default();
+        let (request, _) = tab.begin_navigation(location.clone(), NavigationKind::Normal);
+        assert!(!tab.accept_directory_batch(RequestId(request.0 + 1), vec![], preference));
+        assert!(tab.mark_directory_slow(request));
+        assert!(tab.accept_directory_batch(
+            request,
+            vec![
+                entry(2, "z", EntryKind::File, None),
+                entry(1, "a", EntryKind::File, None),
+            ],
+            preference
+        ));
+        assert_eq!(tab.load_state, LoadState::Partial);
+        assert!(!tab.mark_directory_slow(request));
+        assert_eq!(tab.visible_entries()[0].id, EntryId(1));
+        assert!(!tab.finish_directory_navigation(
+            request,
+            NavigationLocation::Home,
+            preference,
+            None
+        ));
+        assert_eq!(tab.load_state, LoadState::Partial);
+        assert!(tab.finish_directory_navigation(request, location.clone(), preference, None));
+        assert_eq!(tab.current_location, Some(location.clone()));
+        assert_eq!(tab.back_target(), Some(NavigationLocation::Home));
+        assert_eq!(tab.visible_entry(EntryId(2)).unwrap().display_name, "z");
+        assert!(!tab.finish_directory_navigation(request, location, preference, None));
+        assert!(!tab.accept_directory_batch(request, vec![], preference));
+        assert!(!tab.cancel_directory_navigation(request));
+        assert!(!tab.fail_directory_navigation(request, LoadState::Failed, "late".into()));
+    }
+
+    #[test]
+    fn issue_151_finished_navigation_cannot_be_revived_by_load_state() {
+        let mut tab = TabSession::new_home(TabId(1));
+        let preference = DirectoryViewPreference::default();
+        let location = NavigationLocation::Directory(r"C:\target".into());
+        let (request, _) = tab.begin_navigation(location.clone(), NavigationKind::Normal);
+        assert!(tab.finish_directory_navigation(request, location, preference, None));
+        tab.load_state = LoadState::Loading;
+        assert!(!tab.accepts_directory(request));
+        assert!(!tab.accept_directory_batch(request, vec![], preference));
+        assert!(!tab.cancel_directory_navigation(request));
+    }
+    #[test]
+    fn issue_151_empty_library_warning_and_history_commit_atomically() {
+        let mut tab = TabSession::new_home(TabId(1));
+        let location = NavigationLocation::Library(LibraryLocationId::new(
+            "library::documents".into(),
+            "Documents".into(),
+        ));
+        let preference = DirectoryViewPreference::default();
+        let (request, _) = tab.begin_navigation(location.clone(), NavigationKind::Normal);
+        assert!(tab.finish_directory_navigation(
+            request,
+            location.clone(),
+            preference,
+            Some("library_sources:1".into())
+        ));
+        assert_eq!(tab.error.as_deref(), Some("library_sources:1"));
+        assert!(tab.visible_entries().is_empty());
+        let (request, _) = tab.begin_navigation(NavigationLocation::Home, NavigationKind::Back);
+        assert!(tab.finish_directory_navigation(
+            request,
+            NavigationLocation::Home,
+            preference,
+            None
+        ));
+        assert!(tab.back_target().is_none());
+        assert_eq!(tab.forward_target(), Some(location));
+        assert!(tab.error.is_none());
+    }
+
+    #[test]
+    fn issue_176_local_refresh_keeps_snapshot_and_remaps_latest_selection_by_path() {
+        let location = NavigationLocation::Directory(r"C:\fixture".into());
+        let mut tab = TabSession::new_at(TabId(1), location.clone());
+        tab.replace_entries(vec![
+            entry(1, "a", EntryKind::File, None),
+            entry(2, "b", EntryKind::File, None),
+        ]);
+        tab.load_state = LoadState::Complete;
+        tab.select_entry(EntryId(1), false, false);
+        let preference = DirectoryViewPreference::default();
+        let (request, _) =
+            tab.begin_navigation(location.clone(), NavigationKind::BackgroundRefresh);
+        assert!(tab.retains_directory_view());
+        assert_eq!(tab.displayed_load_state(), LoadState::Complete);
+        assert!(tab.accept_directory_batch(
+            request,
+            vec![entry(1, "b", EntryKind::File, None)],
+            preference
+        ));
+        assert_eq!(tab.visible_entry(EntryId(1)).unwrap().display_name, "a");
+        assert_eq!(tab.visible_entry(EntryId(2)).unwrap().display_name, "b");
+        // A user choice made while the next snapshot loads wins over the pre-refresh choice.
+        tab.select_entry(EntryId(2), false, false);
+        assert!(tab.accept_directory_batch(
+            request,
+            vec![entry(2, "a", EntryKind::File, None)],
+            preference
+        ));
+        tab.set_sort(SortField::Name);
+        assert_eq!(tab.visible_entry(EntryId(2)).unwrap().display_name, "b");
+        assert!(tab.finish_directory_navigation(
+            request,
+            location,
+            DirectoryViewPreference {
+                sort_direction: SortDirection::Descending,
+                ..preference
+            },
+            None
+        ));
+        assert_eq!(tab.selected, vec![EntryId(1)]);
+        assert_eq!(tab.focused, Some(EntryId(1)));
+        assert_eq!(tab.selection_anchor, Some(EntryId(1)));
+        assert!(tab.back_history().is_empty());
+    }
+
+    #[test]
+    fn issue_176_deleted_selection_does_not_follow_reused_ids() {
+        let location = NavigationLocation::Directory(r"C:\fixture".into());
+        let mut tab = TabSession::new_at(TabId(1), location.clone());
+        tab.replace_entries(vec![
+            entry(1, "gone", EntryKind::File, None),
+            entry(2, "stay", EntryKind::File, None),
+        ]);
+        tab.load_state = LoadState::Complete;
+        tab.select_all();
+        let preference = DirectoryViewPreference::default();
+        let (request, _) =
+            tab.begin_navigation(location.clone(), NavigationKind::BackgroundRefresh);
+        assert!(tab.accept_directory_batch(
+            request,
+            vec![
+                entry(1, "new", EntryKind::File, None),
+                entry(3, "stay", EntryKind::File, None)
+            ],
+            preference
+        ));
+        assert!(tab.finish_directory_navigation(request, location.clone(), preference, None));
+        assert_eq!(tab.selected, vec![EntryId(3)]);
+        assert_eq!(tab.focused, None);
+        assert_eq!(tab.selection_anchor, None);
+        let (request, _) =
+            tab.begin_navigation(location.clone(), NavigationKind::BackgroundRefresh);
+        assert!(tab.finish_directory_navigation(request, location, preference, None));
+        assert!(tab.selected.is_empty());
+        assert!(tab.entries.is_empty());
+    }
+
+    #[test]
+    fn issue_176_refresh_cancel_failure_and_navigation_keep_identities_separate() {
+        for failure in [false, true] {
+            let location = NavigationLocation::Directory(r"C:\fixture".into());
+            let mut tab = TabSession::new_at(TabId(1), location.clone());
+            tab.replace_entries(vec![entry(1, "old", EntryKind::File, None)]);
+            tab.load_state = LoadState::Complete;
+            tab.select_entry(EntryId(1), false, false);
+            let preference = DirectoryViewPreference::default();
+            let (request, _) =
+                tab.begin_navigation(location.clone(), NavigationKind::BackgroundRefresh);
+            assert!(tab.accept_directory_batch(
+                request,
+                vec![entry(1, "other", EntryKind::File, None)],
+                preference
+            ));
+            if failure {
+                assert!(tab.fail_directory_navigation(
+                    request,
+                    LoadState::PermissionDenied,
+                    "denied".into()
+                ));
+            } else {
+                assert!(tab.cancel_directory_navigation(request));
+            }
+            assert_eq!(tab.selected, vec![EntryId(1)]);
+            assert_eq!(tab.visible_entry(EntryId(1)).unwrap().display_name, "old");
+            assert!(!tab.finish_directory_navigation(request, location, preference, None));
+            let (next, _) =
+                tab.begin_directory_navigation(r"C:\other".into(), NavigationKind::Normal);
+            assert!(!tab.retains_directory_view());
+            assert!(tab.finish_directory_navigation(
+                next,
+                NavigationLocation::Directory(r"C:\other".into()),
+                preference,
+                None
+            ));
+            assert!(tab.selected.is_empty());
+        }
+    }
+
+    #[test]
+    fn issue_151_network_selection_and_sort_survive_complete_commit() {
+        let mut tab = TabSession::new_home(TabId(1));
+        let location = NavigationLocation::Directory(r"\\server\share".into());
+        let preference = DirectoryViewPreference::default();
+        let (request, _) = tab.begin_navigation(location.clone(), NavigationKind::Normal);
+        assert!(tab.accept_directory_batch(
+            request,
+            vec![entry(1, "a", EntryKind::File, None)],
+            preference
+        ));
+        tab.select_entry(EntryId(1), false, false);
+        assert!(tab.accept_directory_batch(
+            request,
+            vec![entry(2, "z", EntryKind::File, None)],
+            preference
+        ));
+        let descending = DirectoryViewPreference {
+            sort_direction: SortDirection::Descending,
+            ..preference
+        };
+        assert!(tab.finish_directory_navigation(request, location, descending, Some("1".into())));
+        assert_eq!(tab.visible_entries()[0].id, EntryId(2));
+        assert_eq!(tab.selected, vec![EntryId(1)]);
+        assert_eq!(tab.focused, Some(EntryId(1)));
+        assert_eq!(tab.selection_anchor, Some(EntryId(1)));
+        assert_eq!(tab.error.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn issue_151_failure_and_cancel_restore_committed_indices_without_pending_selection() {
+        for failure in [None, Some(LoadState::PermissionDenied)] {
+            let mut tab = TabSession::new_home(TabId(1));
+            let preference = DirectoryViewPreference::default();
+            let original = NavigationLocation::Directory(r"C:\original".into());
+            let (request, _) = tab.begin_navigation(original.clone(), NavigationKind::Normal);
+            assert!(tab.accept_directory_batch(
+                request,
+                vec![entry(1, "old", EntryKind::File, None)],
+                preference
+            ));
+            assert!(tab.finish_directory_navigation(request, original.clone(), preference, None));
+            let destination = NavigationLocation::Directory(r"C:\next".into());
+            let (request, token) =
+                tab.begin_navigation(destination.clone(), NavigationKind::Normal);
+            assert!(tab.accept_directory_batch(
+                request,
+                vec![entry(1, "new", EntryKind::File, None)],
+                preference
+            ));
+            tab.select_entry(EntryId(1), false, false);
+            if let Some(state) = failure {
+                assert!(tab.fail_directory_navigation(request, state, "denied".into()));
+                assert_eq!(tab.load_state, state);
+            } else {
+                assert!(tab.cancel_directory_navigation(request));
+                assert_eq!(tab.load_state, LoadState::Cancelled);
+            }
+            assert!(token.load(AtomicOrdering::Acquire));
+            assert!(tab.pending_entries.is_empty());
+            assert!(tab.selected.is_empty());
+            assert_eq!(tab.focused, None);
+            assert_eq!(tab.visible_entry(EntryId(1)).unwrap().display_name, "old");
+            assert_eq!(tab.current_location, Some(original.clone()));
+            assert_eq!(tab.visible_location(), Some(&destination));
+            assert!(!tab.finish_directory_navigation(request, destination, preference, None));
+            assert!(!tab.accept_directory_batch(request, vec![], preference));
+            assert!(tab.restore_successful_location());
+            assert_eq!(tab.visible_location(), Some(&original));
+        }
+    }
+
+    #[test]
+    fn issue_151_navigation_replacement_and_search_reject_old_directory_events() {
+        let mut tab = TabSession::new_home(TabId(1));
+        let preference = DirectoryViewPreference::default();
+        let (old, token) = tab.begin_directory_navigation(r"C:\old".into(), NavigationKind::Normal);
+        assert!(tab.accept_directory_batch(
+            old,
+            vec![entry(1, "old", EntryKind::File, None)],
+            preference
+        ));
+        let (current, _) = tab.begin_directory_navigation(r"C:\new".into(), NavigationKind::Normal);
+        assert!(token.load(AtomicOrdering::Acquire));
+        assert!(!tab.cancel_directory_navigation(old));
+        assert!(!tab.fail_directory_navigation(old, LoadState::Failed, "late".into()));
+        assert!(!tab.accept_directory_batch(old, vec![], preference));
+        assert_eq!(tab.load_state, LoadState::Loading);
+        tab.cancel_pending();
+        assert!(!tab.accept_directory_batch(current, vec![], preference));
+        let (search, _) = tab.begin_search(SearchScope::Global, "query".into());
+        assert!(!tab.accept_directory_batch(search, vec![], preference));
+        assert!(!tab.cancel_directory_navigation(search));
+    }
+    #[test]
+    fn view_mode_storage_codes_and_ctrl_wheel_order_are_stable() {
+        let expected = [
+            (ViewMode::Details, 0),
+            (ViewMode::List, 1),
+            (ViewMode::MediumIcons, 2),
+            (ViewMode::SmallIcons, 3),
+            (ViewMode::LargeIcons, 4),
+            (ViewMode::ExtraLargeIcons, 5),
+            (ViewMode::Tiles, 6),
+            (ViewMode::Content, 7),
+        ];
+        for (mode, code) in expected {
+            assert_eq!(mode.storage_code(), code);
+            assert_eq!(ViewMode::from_storage_code(code), Some(mode));
+        }
+        assert_eq!(ViewMode::from_storage_code(8), None);
+        assert_eq!(ViewMode::Content.step_ctrl_wheel(false), ViewMode::Content);
+        assert_eq!(ViewMode::Content.step_ctrl_wheel(true), ViewMode::Tiles);
+        assert_eq!(
+            ViewMode::LargeIcons.step_ctrl_wheel(true),
+            ViewMode::Icons(104)
+        );
+        assert_eq!(
+            ViewMode::ExtraLargeIcons.step_ctrl_wheel(true),
+            ViewMode::ExtraLargeIcons
+        );
+    }
+
+    #[test]
+    fn issue_97_ctrl_wheel_visits_intermediate_sizes_and_clamps() {
+        let mut mode = ViewMode::List;
+        for size in (16..=256).step_by(8) {
+            mode = mode.step_ctrl_wheel(true);
+            assert_eq!(mode, ViewMode::Icons(size));
+        }
+        assert_eq!(mode.step_ctrl_wheel(true), ViewMode::ExtraLargeIcons);
+        for size in (16..=248).step_by(8).rev() {
+            mode = mode.step_ctrl_wheel(false);
+            assert_eq!(mode, ViewMode::Icons(size));
+        }
+        assert_eq!(mode.step_ctrl_wheel(false), ViewMode::List);
+        assert_eq!(
+            ViewMode::Icons(19).step_ctrl_wheel(false),
+            ViewMode::SmallIcons
+        );
+        assert_eq!(
+            ViewMode::Icons(253).step_ctrl_wheel(true),
+            ViewMode::ExtraLargeIcons
+        );
+        assert_eq!(ViewMode::Icons(80).storage_code(), 2);
+        assert_eq!(ViewMode::Icons(128).storage_code(), 4);
+        assert_eq!(ViewMode::Details.icon_size(), 0);
+        for size in [0, 15, 257, u16::MAX] {
+            let mode = ViewMode::Icons(size);
+            assert!(!mode.is_valid());
+            assert!(
+                !DirectoryViewPreference {
+                    view_mode: mode,
+                    ..Default::default()
+                }
+                .is_valid()
+            );
+            assert!(
+                !SearchViewPreference {
+                    view_mode: mode,
+                    ..Default::default()
+                }
+                .is_valid()
+            );
+        }
+    }
+
+    #[test]
+    fn default_columns_keep_name_visible_and_created_hidden() {
+        let columns = ColumnLayout::default();
+        assert!(columns.is_valid());
+        assert!(columns.visible[usize::from(ColumnKind::Name.storage_code())]);
+        assert!(!columns.visible[usize::from(ColumnKind::Created.storage_code())]);
+
+        let mut invalid = columns;
+        invalid.visible[usize::from(ColumnKind::Name.storage_code())] = false;
+        assert!(!invalid.is_valid());
+    }
+
+    #[test]
+    fn created_sort_uses_path_as_stable_tie_breaker() {
+        use std::time::{Duration, SystemTime};
+
+        let mut older = entry(1, "same", EntryKind::File, Some(1));
+        older.path = PathBuf::from(r"C:\b\same");
+        older.created = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        let mut newer = entry(2, "same", EntryKind::File, Some(1));
+        newer.path = PathBuf::from(r"C:\a\same");
+        newer.created = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2));
+        let mut session = TabSession::new(TabId(1));
+        session.replace_entries(vec![newer, older]);
+        session.set_sort(SortField::Created);
+        assert_eq!(session.entries[0].id, EntryId(1));
+        session.set_sort(SortField::Created);
+        assert_eq!(session.entries[0].id, EntryId(2));
+    }
+    fn library(identity: &str, display_name: &str) -> NavigationLocation {
+        NavigationLocation::Library(LibraryLocationId::new(
+            OsString::from(identity),
+            display_name.to_owned(),
+        ))
+    }
+
+    #[test]
+    fn issue_86_home_has_independent_identity_and_no_directory_path() {
+        let home = NavigationLocation::Home;
+        assert_eq!(home.display_name(), "Home");
+        assert_eq!(home.directory_path(), None);
+        assert_ne!(home, NavigationLocation::Directory(PathBuf::from("Home")));
+
+        let tab = TabSession::new_home(TabId(86));
+        assert_eq!(tab.current_location, Some(NavigationLocation::Home));
+        assert_eq!(tab.load_state, LoadState::Complete);
+        assert!(tab.entries.is_empty());
+        assert!(tab.back_history.is_empty());
+    }
+
+    #[test]
+    fn issue_86_home_and_directory_participate_in_back_forward_history() {
+        let mut session = TabSession::new_home(TabId(86));
+        let directory = NavigationLocation::Directory(PathBuf::from(r"C:\work"));
+
+        session.begin_navigation(directory.clone(), NavigationKind::Normal);
+        assert!(session.finish_directory_navigation(
+            session.latest_request,
+            directory.clone(),
+            DirectoryViewPreference::default(),
+            None
+        ));
+        assert_eq!(session.back_target(), Some(NavigationLocation::Home));
+
+        session.navigate_home(NavigationKind::Back);
+        assert_eq!(session.current_location, Some(NavigationLocation::Home));
+        assert_eq!(session.forward_target(), Some(directory.clone()));
+
+        session.begin_navigation(directory.clone(), NavigationKind::Forward);
+        assert!(session.finish_directory_navigation(
+            session.latest_request,
+            directory.clone(),
+            DirectoryViewPreference::default(),
+            None
+        ));
+        assert_eq!(session.current_location, Some(directory));
+        assert_eq!(session.back_target(), Some(NavigationLocation::Home));
+    }
+
+    #[test]
+    fn issue_86_duplicate_complete_preserves_home_identity() {
+        let source = TabSession::new_home(TabId(1));
+        let duplicate = TabSession::duplicate_complete(TabId(2), &source);
+        assert_eq!(duplicate.current_location, Some(NavigationLocation::Home));
+        assert_eq!(duplicate.load_state, LoadState::Complete);
+    }
+    #[test]
+    fn library_identity_is_lossless_and_independent_from_display_name() {
+        let first = LibraryLocationId::new(OsString::from("library::stable"), "Documents".into());
+        let renamed = LibraryLocationId::new(OsString::from("library::stable"), "文档".into());
+        let other = LibraryLocationId::new(OsString::from("library::other"), "Documents".into());
+
+        assert_eq!(first, renamed);
+        assert_ne!(first, other);
+    }
+
+    #[test]
+    fn library_navigation_cancels_old_request_and_rejects_late_results() {
+        let mut session = TabSession::new(TabId(7));
+        let library = library("library::documents", "文档");
+        let (first, first_cancel) = session.begin_navigation(library, NavigationKind::Normal);
+        let (second, _) = session
+            .begin_directory_navigation(PathBuf::from(r"C:\Users\DevUser"), NavigationKind::Normal);
+
+        assert!(first_cancel.load(AtomicOrdering::Acquire));
+        assert!(!session.accepts(first));
+        assert!(session.accepts(second));
+    }
+
+    #[test]
+    fn library_history_refresh_and_breadcrumb_keep_stable_identity() {
+        let mut session = TabSession::new(TabId(1));
+        let documents = library("library::documents", "文档");
+        let renamed = library("library::documents", "Documents");
+        session.current_location = Some(NavigationLocation::Directory(PathBuf::from(r"C:\Users")));
+
+        session.begin_navigation(documents.clone(), NavigationKind::Normal);
+        assert!(session.finish_directory_navigation(
+            session.latest_request,
+            renamed.clone(),
+            DirectoryViewPreference::default(),
+            None
+        ));
+        assert_eq!(session.current_location, Some(documents.clone()));
+        assert_eq!(
+            session.back_target(),
+            Some(NavigationLocation::Directory(PathBuf::from(r"C:\Users")))
+        );
+        assert_eq!(
+            session.breadcrumb_paths(),
+            vec![("Documents".into(), renamed.clone())]
+        );
+        assert_eq!(session.visible_path(), None);
+
+        session.begin_navigation(renamed.clone(), NavigationKind::Refresh);
+        assert!(session.finish_directory_navigation(
+            session.latest_request,
+            renamed.clone(),
+            DirectoryViewPreference::default(),
+            None
+        ));
+        assert_eq!(session.current_location, Some(documents));
+        assert_eq!(session.back_history.len(), 1);
+    }
+
+    #[test]
+    fn library_search_address_uses_display_name_and_preserves_sources() {
+        let sources = vec![PathBuf::from(r"C:\Docs"), PathBuf::from(r"D:\Archive")];
+        let scope = SearchScope::Library {
+            display_name: "文档".into(),
+            sources: sources.clone(),
+        };
+        let mut session = TabSession::new(TabId(1));
+        session.begin_search(scope.clone(), "*.pdf".into());
+
+        assert_eq!(session.address_input, "文档 *.pdf");
+        session.update_address_input("文档 report".into());
+        assert_eq!(session.search_query, "report");
+        assert_eq!(session.search_scope, scope);
+        assert_eq!(
+            session.search_scope,
+            SearchScope::Library {
+                display_name: "文档".into(),
+                sources
+            }
+        );
+    }
+    #[test]
+    fn search_requests_are_isolated_by_request_and_page_source() {
+        let mut session = TabSession::new(TabId(7));
+        let (first, first_cancel) = session.begin_search(
+            SearchScope::Directory(PathBuf::from(r"C:\范围 (一)")),
+            "*.blend size:>100mb".to_owned(),
+        );
+        assert!(session.accepts_page(first, PageSource::Search));
+        assert!(!session.accepts_page(first, PageSource::Directory));
+
+        let (second, _) = session.begin_search(SearchScope::Global, "ext:png|jpg".to_owned());
+        assert!(first_cancel.load(AtomicOrdering::Acquire));
+        assert!(!session.accepts_page(first, PageSource::Search));
+        assert!(session.accepts_page(second, PageSource::Search));
+        assert_eq!(session.search_scope, SearchScope::Global);
+        assert_eq!(session.search_query, "ext:png|jpg");
+    }
+
+    #[test]
+    fn search_address_keeps_directory_prefix_for_drive_path() {
+        let mut session = TabSession::new(TabId(1));
+        session.current_location = Some(NavigationLocation::Directory(PathBuf::from(r"D:\Assets")));
+        session.begin_smart_address_edit();
+        assert_eq!(session.address_input, r"D:\Assets ");
+        session.update_address_input(r"D:\Assets *.blend".to_owned());
+        assert_eq!(
+            session.search_scope,
+            SearchScope::Directory(PathBuf::from(r"D:\Assets"))
+        );
+        assert_eq!(session.search_query, "*.blend");
+        let (_, _) =
+            session.begin_search(session.search_scope.clone(), session.search_query.clone());
+        assert_eq!(session.address_input, r"D:\Assets *.blend");
+    }
+
+    #[test]
+    fn smart_address_search_depth_defaults_to_recursive_and_only_toggles_for_a_directory() {
+        let mut session = TabSession::new(TabId(1));
+        session.current_location = Some(NavigationLocation::Directory(PathBuf::from(r"D:\Assets")));
+        session.load_state = LoadState::Complete;
+        session.begin_smart_address_edit();
+        assert_eq!(session.search_depth, SearchDepth::Recursive);
+        assert!(session.toggle_search_depth());
+        assert_eq!(session.search_depth, SearchDepth::CurrentFolder);
+        assert_eq!(session.address_input, r"D:\Assets ");
+
+        session.update_address_input("*.blend".to_owned());
+        assert_eq!(session.search_scope, SearchScope::Global);
+        assert!(!session.toggle_search_depth());
+        assert_eq!(session.search_depth, SearchDepth::CurrentFolder);
+    }
+
+    #[test]
+    fn search_address_does_not_split_paths_containing_spaces() {
+        let scope = SearchScope::Directory(PathBuf::from(r"D:\My Assets (A)!|"));
+        let mut session = TabSession::new(TabId(1));
+        session.begin_search(scope.clone(), "ext:png|jpg".to_owned());
+        assert_eq!(session.address_input, r"D:\My Assets (A)!| ext:png|jpg");
+        session.update_address_input(r"D:\My Assets (A)!| ext:png|jpg size:>1mb".to_owned());
+        assert_eq!(session.search_scope, scope);
+        assert_eq!(session.search_query, "ext:png|jpg size:>1mb");
+    }
+
+    #[test]
+    fn search_address_keeps_unc_prefix_until_the_complete_prefix_is_deleted() {
+        let path = PathBuf::from(r"\\LiuYanghomeNAS\Multimedia");
+        let mut session = TabSession::new(TabId(1));
+        session.begin_search(SearchScope::Directory(path.clone()), "*.mkv".to_owned());
+        assert_eq!(session.address_input, r"\\LiuYanghomeNAS\Multimedia *.mkv");
+        session.update_address_input(r"\\LiuYanghomeNAS\Multimedia *.mp4".to_owned());
+        assert_eq!(session.search_scope, SearchScope::Directory(path));
+        assert_eq!(session.search_query, "*.mp4");
+        session.update_address_input("*.mkv".to_owned());
+        assert_eq!(session.search_scope, SearchScope::Global);
+        assert_eq!(session.search_query, "*.mkv");
+    }
+    #[test]
+    fn search_first_page_is_visible_bounded_and_cancel_restores_directory() {
+        let mut session = TabSession::new(TabId(1));
+        session.current_location = Some(NavigationLocation::Directory(PathBuf::from(
+            r"F:\CodeProjects\AsterFiles",
+        )));
+        session.replace_entries(vec![entry(90, "directory-row", EntryKind::File, Some(1))]);
+        session.select_entry(EntryId(90), false, false);
+        let (request, _) = session.begin_search(SearchScope::Global, ".md".to_owned());
+
+        let first_page = (1..=256)
+            .map(|id| entry(id, &format!("result-{id}.md"), EntryKind::File, Some(1)))
+            .collect();
+        session.merge_search_page(0, first_page, 133_186, 100_000, 256);
+        assert_eq!(session.entries.len(), 256);
+        assert_eq!(session.search_total, Some(133_186));
+        assert_eq!(session.page_source, PageSource::Search);
+        assert_eq!(session.search_state, SearchState::Partial);
+
+        session.cancel_address_edit();
+        assert_eq!(session.page_source, PageSource::Directory);
+        assert_eq!(session.entries.len(), 1);
+        assert_eq!(session.entries[0].display_name, "directory-row");
+        assert_eq!(session.selected, vec![EntryId(90)]);
+        assert_eq!(session.search_total, None);
+        assert!(!session.accepts_page(request, PageSource::Search));
+        let late_page = vec![entry(999, "late.md", EntryKind::File, Some(1))];
+        if session.accepts_page(request, PageSource::Search) {
+            session.merge_search_page(768, late_page, 133_186, 100_000, 256);
+        }
+        assert_eq!(session.entries[0].display_name, "directory-row");
+    }
+    #[test]
+    fn requesting_search_pages_keeps_identity_and_deduplicates_each_offset() {
+        let mut session = TabSession::new(TabId(1));
+        let (request, _) = session.begin_search(SearchScope::Global, ".md".into());
+        session.merge_search_page(
+            0,
+            (1..=256)
+                .map(|id| entry(id, &format!("result-{id}.md"), EntryKind::File, Some(1)))
+                .collect(),
+            133_186,
+            100_000,
+            256,
+        );
+        session.finish_search_page_request(0);
+        assert_eq!(session.entries.len(), 256);
+        assert_eq!(session.search_state, SearchState::Partial);
+        assert_eq!(session.queue_search_pages(&[256, 0, 512], 256), Some(256));
+        assert_eq!(session.queue_search_pages(&[1024, 768, 1280], 256), None);
+        assert!(session.accepts_page(request, PageSource::Search));
+        assert_eq!(session.finish_search_page_request(256), Some(1024));
+        session.merge_search_page(
+            256,
+            (257..=512)
+                .map(|id| entry(id, &format!("result-{id}.md"), EntryKind::File, Some(1)))
+                .collect(),
+            133_186,
+            100_000,
+            256,
+        );
+        assert_eq!(session.entries.len(), 512);
+        assert_eq!(session.search_state, SearchState::Partial);
+    }
+
+    #[test]
+    fn unselected_search_focus_survives_loading_another_page() {
+        let mut session = TabSession::new(TabId(1));
+        session.begin_search(SearchScope::Global, ".md".into());
+        session.merge_search_page(
+            0,
+            vec![entry(1, "one.md", EntryKind::File, Some(1))],
+            512,
+            512,
+            256,
+        );
+        session.select_entry(EntryId(1), false, false);
+        session.select_entry(EntryId(1), true, false);
+        assert!(session.selected.is_empty());
+        assert_eq!(session.focused, Some(EntryId(1)));
+        assert_eq!(session.selection_anchor, Some(EntryId(1)));
+
+        session.merge_search_page(
+            256,
+            vec![entry(257, "later.md", EntryKind::File, Some(1))],
+            512,
+            512,
+            256,
+        );
+
+        assert_eq!(session.focused, Some(EntryId(1)));
+        assert_eq!(session.selection_anchor, Some(EntryId(1)));
+    }
+    #[test]
+    fn search_page_replacement_clears_focus_when_result_identity_changes() {
+        let mut session = TabSession::new(TabId(1));
+        session.begin_search(SearchScope::Global, ".md".into());
+        session.merge_search_page(
+            0,
+            vec![entry(1, "old.md", EntryKind::File, Some(1))],
+            256,
+            256,
+            256,
+        );
+        session.select_entry(EntryId(1), false, false);
+        session.select_entry(EntryId(1), true, false);
+
+        session.merge_search_page(
+            0,
+            vec![entry(1, "new.md", EntryKind::File, Some(1))],
+            256,
+            256,
+            256,
+        );
+
+        assert!(session.selected.is_empty());
+        assert_eq!(session.focused, None);
+        assert_eq!(session.selection_anchor, None);
+    }
+    #[test]
+    fn search_cache_keeps_page_with_unselected_focus_and_anchor() {
+        let mut session = TabSession::new(TabId(1));
+        session.begin_search(SearchScope::Global, ".md".into());
+        session.merge_search_page(
+            0,
+            vec![entry(1, "focused.md", EntryKind::File, Some(1))],
+            100_000,
+            80_000,
+            256,
+        );
+        session.select_entry(EntryId(1), false, false);
+        session.select_entry(EntryId(1), true, false);
+
+        for page in 1..=8 {
+            let offset = page * 256;
+            session.merge_search_page(
+                offset,
+                vec![entry(
+                    offset + 1,
+                    &format!("result-{page}.md"),
+                    EntryKind::File,
+                    Some(1),
+                )],
+                100_000,
+                80_000,
+                256,
+            );
+        }
+
+        assert_eq!(session.search_cached_pages.len(), 7);
+        assert!(session.search_cached_pages.contains(&0));
+        assert!(session.visible_entry(EntryId(1)).is_some());
+        assert_eq!(session.focused, Some(EntryId(1)));
+        assert_eq!(session.selection_anchor, Some(EntryId(1)));
+    }
+    #[test]
+    fn random_search_pages_merge_by_absolute_result_position() {
+        let mut session = TabSession::new(TabId(1));
+        session.begin_search(SearchScope::Global, ".blend".into());
+        session.merge_search_page(
+            512,
+            (513..=514)
+                .map(|id| entry(id, &format!("result-{id}.blend"), EntryKind::File, Some(1)))
+                .collect(),
+            100_000,
+            80_000,
+            256,
+        );
+        session.merge_search_page(
+            0,
+            (1..=2)
+                .map(|id| entry(id, &format!("result-{id}.blend"), EntryKind::File, Some(1)))
+                .collect(),
+            100_000,
+            80_000,
+            256,
+        );
+        assert_eq!(
+            session
+                .entries
+                .iter()
+                .map(|entry| entry.id.0)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 513, 514]
+        );
+        assert_eq!(session.entries.len(), 4);
+        assert_eq!(session.search_total, Some(100_000));
+    }
+
+    #[test]
+    fn deep_search_offsets_and_last_page_keep_absolute_result_identity() {
+        const PAGE_SIZE: u32 = 256;
+        const TOTAL: u32 = 133_796;
+        let mut session = TabSession::new(TabId(1));
+        session.begin_search(SearchScope::Global, ".md".into());
+        session.merge_search_page(
+            0,
+            vec![entry(1, "result-1.md", EntryKind::File, Some(1))],
+            TOTAL,
+            100_000,
+            PAGE_SIZE,
+        );
+        assert_eq!(session.finish_search_page_request(0), None);
+
+        for offset in [65_024, 65_536, 66_816] {
+            assert_eq!(
+                session.queue_search_pages(&[offset], PAGE_SIZE),
+                Some(offset)
+            );
+            session.merge_search_page(
+                offset,
+                vec![entry(
+                    offset + 1,
+                    &format!("result-{}.md", offset + 1),
+                    EntryKind::File,
+                    Some(1),
+                )],
+                TOTAL,
+                100_000,
+                PAGE_SIZE,
+            );
+            assert_eq!(session.finish_search_page_request(offset), None);
+            assert!(session.visible_entry(EntryId(offset + 1)).is_some());
+        }
+
+        let last_offset = TOTAL / PAGE_SIZE * PAGE_SIZE;
+        assert_eq!(last_offset, 133_632);
+        assert_eq!(
+            session.queue_search_pages(&[TOTAL - 1], PAGE_SIZE),
+            Some(last_offset)
+        );
+        session.merge_search_page(
+            last_offset,
+            (last_offset + 1..=TOTAL)
+                .map(|id| entry(id, &format!("result-{id}.md"), EntryKind::File, Some(1)))
+                .collect(),
+            TOTAL,
+            100_000,
+            PAGE_SIZE,
+        );
+        assert_eq!(session.finish_search_page_request(last_offset), None);
+        assert!(session.visible_entry(EntryId(TOTAL)).is_some());
+        assert!(session.search_cached_pages.contains(&last_offset));
+    }
+
+    #[test]
+    fn unexpected_empty_search_page_retries_twice_then_stops() {
+        const PAGE_SIZE: u32 = 256;
+        const TOTAL: u32 = 133_796;
+        const OFFSET: u32 = 65_536;
+        let mut session = TabSession::new(TabId(1));
+        session.begin_search(SearchScope::Global, ".md".into());
+        session.merge_search_page(
+            0,
+            vec![entry(1, "result-1.md", EntryKind::File, Some(1))],
+            TOTAL,
+            100_000,
+            PAGE_SIZE,
+        );
+        assert_eq!(session.finish_search_page_request(0), None);
+
+        assert_eq!(
+            session.queue_search_pages(&[OFFSET], PAGE_SIZE),
+            Some(OFFSET)
+        );
+        for attempt in 0..2 {
+            assert!(session.retry_unexpected_search_page(OFFSET));
+            assert!(
+                session.search_requested_pages.contains(&OFFSET),
+                "retry {attempt} should remain in flight"
+            );
+            assert!(!session.search_cached_pages.contains(&OFFSET));
+        }
+        assert!(!session.retry_unexpected_search_page(OFFSET));
+        assert!(!session.search_requested_pages.contains(&OFFSET));
+        assert_eq!(
+            session.queue_search_pages(&[OFFSET], PAGE_SIZE),
+            Some(OFFSET)
+        );
+    }
+    #[test]
+    fn search_page_cache_evicts_the_oldest_unselected_page() {
+        let mut session = TabSession::new(TabId(1));
+        session.begin_search(SearchScope::Global, ".blend".into());
+        for page in 0..8 {
+            let offset = page * 256;
+            session.merge_search_page(
+                offset,
+                vec![entry(
+                    offset + 1,
+                    &format!("result-{page}.blend"),
+                    EntryKind::File,
+                    Some(1),
+                )],
+                100_000,
+                80_000,
+                256,
+            );
+        }
+        assert_eq!(session.search_cached_pages.len(), 7);
+        assert!(session.visible_entry(EntryId(1)).is_none());
+        assert!(session.visible_entry(EntryId(257)).is_some());
+    }
+    #[test]
+    fn folder_size_update_requires_entry_identity_and_original_path() {
+        let original = PathBuf::from(r"\\server\共享\零字节");
+        let mut item = FileEntry {
+            id: EntryId(3),
+            original_name: "零字节".into(),
+            display_name: "零字节".into(),
+            name_highlights: Vec::new(),
+            path: original.clone(),
+            kind: EntryKind::Directory,
+            open_target: None,
+            library_source_index: None,
+            parent_display: r"\\server\共享".into(),
+            size_bytes: None,
+            folder_size: FolderSizeState::Querying,
+            modified: None,
+            created: None,
+            webdav: None,
+        };
+        assert!(!item.set_folder_size(EntryId(4), &original, FolderSizeState::Value(0)));
+        assert!(!item.set_folder_size(
+            EntryId(3),
+            Path::new(r"\\server\共享\别处"),
+            FolderSizeState::Value(0)
+        ));
+        assert!(item.set_folder_size(EntryId(3), &original, FolderSizeState::Value(0)));
+        assert_eq!(item.folder_size, FolderSizeState::Value(0));
+    }
+    #[test]
+    fn issue_64_shortcut_update_requires_entry_identity_path_and_directory_target() {
+        let original = PathBuf::from(r"C:\links\docs.lnk");
+        let target = PathBuf::from(r"C:\docs");
+        let mut item = entry(3, "docs.lnk", EntryKind::File, Some(4));
+        item.path = original.clone();
+        assert!(!item.set_shortcut_target(EntryId(4), &original, target.clone(), Some(true)));
+        assert!(!item.set_shortcut_target(
+            EntryId(3),
+            Path::new(r"C:\links\other.lnk"),
+            target.clone(),
+            Some(true)
+        ));
+        assert!(!item.set_shortcut_target(EntryId(3), &original, target.clone(), Some(false)));
+        assert!(item.set_shortcut_target(EntryId(3), &original, target.clone(), None));
+        assert_eq!(item.kind, EntryKind::Directory);
+        assert_eq!(item.open_target, Some(target));
+    }
+
+    #[test]
+    fn issue_64_shortcut_update_applies_to_partial_and_committed_models() {
+        let path = PathBuf::from(r"C:\links\docs.lnk");
+        let target = PathBuf::from(r"C:\docs");
+        let mut pending = entry(1, "docs.lnk", EntryKind::File, Some(4));
+        pending.path = path.clone();
+        let mut session = TabSession::new(TabId(1));
+        let (request, _) =
+            session.begin_directory_navigation(r"C:\links".into(), NavigationKind::Normal);
+        assert!(session.accept_directory_batch(
+            request,
+            vec![pending],
+            DirectoryViewPreference::default()
+        ));
+        assert!(session.apply_shortcut_target(EntryId(1), &path, target.clone(), Some(true)));
+        assert_eq!(
+            session.visible_entry(EntryId(1)).unwrap().kind,
+            EntryKind::Directory
+        );
+        assert!(session.finish_directory_navigation(
+            session.latest_request,
+            session.requested_location.clone().unwrap(),
+            DirectoryViewPreference::default(),
+            None
+        ));
+        assert!(!session.apply_shortcut_target(
+            EntryId(1),
+            Path::new(r"C:\links\stale.lnk"),
+            target.clone(),
+            Some(true)
+        ));
+        assert!(session.apply_shortcut_target(EntryId(1), &path, target.clone(), Some(true)));
+        assert_eq!(
+            session.visible_entry(EntryId(1)).unwrap().open_target,
+            Some(target)
+        );
+    }
+    #[test]
+    fn issue_64_pending_sort_keeps_entry_indices_current() {
+        let mut directory_link = entry(1, "z-folder.lnk", EntryKind::File, Some(4));
+        directory_link.path = PathBuf::from(r"C:\links\z-folder.lnk");
+        let mut other = entry(2, "a-file.txt", EntryKind::File, Some(4));
+        other.path = PathBuf::from(r"C:\links\a-file.txt");
+        let mut session = TabSession::new(TabId(1));
+        let (request, _) =
+            session.begin_directory_navigation(r"C:\links".into(), NavigationKind::Normal);
+        assert!(session.accept_directory_batch(
+            request,
+            vec![directory_link, other],
+            DirectoryViewPreference::default()
+        ));
+        assert!(session.apply_shortcut_target(
+            EntryId(1),
+            Path::new(r"C:\links\z-folder.lnk"),
+            PathBuf::from(r"C:\target"),
+            Some(true)
+        ));
+        session.sort_pending();
+        assert_eq!(
+            session.visible_entry(EntryId(1)).unwrap().display_name,
+            "z-folder.lnk"
+        );
+        assert_eq!(
+            session.visible_entry(EntryId(2)).unwrap().display_name,
+            "a-file.txt"
+        );
+    }
+    #[test]
+    fn partial_selection_uses_the_visible_batch_indices() {
+        let mut session = TabSession::new(TabId(1));
+        session.replace_entries(vec![entry(1, "old", EntryKind::File, Some(1))]);
+        let (request, _) =
+            session.begin_directory_navigation(r"C:\links".into(), NavigationKind::Normal);
+        assert!(session.accept_directory_batch(
+            request,
+            vec![
+                entry(2, "new-a", EntryKind::File, Some(2)),
+                entry(3, "new-b", EntryKind::File, Some(3)),
+            ],
+            DirectoryViewPreference::default()
+        ));
+
+        session.select_entry(EntryId(2), false, false);
+        session.select_entry(EntryId(3), false, true);
+
+        assert_eq!(session.selected, vec![EntryId(2), EntryId(3)]);
+    }
+    #[test]
+    fn visible_entry_uses_pending_entries_during_partial_load() {
+        let mut session = TabSession::new(TabId(1));
+        let old = entry(1, "old", EntryKind::Directory, None);
+        let pending = entry(1, "pending", EntryKind::Directory, None);
+        session.replace_entries(vec![old]);
+        let (request, _) =
+            session.begin_directory_navigation(r"C:\links".into(), NavigationKind::Normal);
+        assert!(session.accept_directory_batch(
+            request,
+            vec![pending],
+            DirectoryViewPreference::default()
+        ));
+
+        assert_eq!(
+            session
+                .visible_entry(EntryId(1))
+                .map(|entry| entry.display_name.as_str()),
+            Some("pending")
+        );
+        assert!(session.finish_directory_navigation(
+            session.latest_request,
+            session.requested_location.clone().unwrap(),
+            DirectoryViewPreference::default(),
+            None
+        ));
+        assert_eq!(
+            session
+                .visible_entry(EntryId(1))
+                .map(|entry| entry.display_name.as_str()),
+            Some("pending")
+        );
+    }
+
+    #[test]
+    fn session_only_accepts_latest_request() {
+        let mut session = TabSession::new(TabId(7));
+        let (first, first_cancel) =
+            session.begin_directory_navigation("first".into(), NavigationKind::Normal);
+        let (second, _) =
+            session.begin_directory_navigation("second".into(), NavigationKind::Normal);
+        assert!(first_cancel.load(AtomicOrdering::Acquire));
+        assert!(!session.accepts(first));
+        assert!(session.accepts(second));
+    }
+
+    #[test]
+    fn normal_navigation_commit_clears_selection() {
+        let mut session = TabSession::new(TabId(1));
+        session.current_location = Some(NavigationLocation::Directory(PathBuf::from(r"C:\source")));
+        session.replace_entries(vec![entry(1, "old.txt", EntryKind::File, Some(1))]);
+        session.select_entry(EntryId(1), false, false);
+
+        session.begin_directory_navigation(PathBuf::from(r"C:\target"), NavigationKind::Normal);
+        assert!(session.accept_directory_batch(
+            session.latest_request,
+            vec![entry(2, "new.txt", EntryKind::File, Some(1))],
+            DirectoryViewPreference::default()
+        ));
+        assert!(session.finish_directory_navigation(
+            session.latest_request,
+            NavigationLocation::Directory(r"C:\target".into()),
+            DirectoryViewPreference::default(),
+            None
+        ));
+
+        assert!(session.selected.is_empty());
+        assert_eq!(session.focused, None);
+        assert_eq!(session.selection_anchor, None);
+    }
+    #[test]
+    fn failed_location_is_visible_and_can_return_to_successful_content() {
+        let mut session = TabSession::new(TabId(1));
+        session.current_location = Some(NavigationLocation::Directory(PathBuf::from(r"C:\Users")));
+        session.replace_entries(vec![entry(1, "DevUser", EntryKind::Directory, None)]);
+        session
+            .begin_directory_navigation(PathBuf::from(r"C:\Users\DevUser"), NavigationKind::Normal);
+        assert!(session.fail_directory_navigation(
+            session.latest_request,
+            LoadState::PermissionDenied,
+            "denied".into()
+        ));
+
+        assert_eq!(session.visible_path(), Some(Path::new(r"C:\Users\DevUser")));
+        assert!(session.has_failed_location());
+        assert!(session.restore_successful_location());
+        assert_eq!(session.visible_path(), Some(Path::new(r"C:\Users")));
+        assert_eq!(session.entries.len(), 1);
+        assert_eq!(
+            session.forward_target(),
+            Some(NavigationLocation::Directory(PathBuf::from(
+                r"C:\Users\DevUser"
+            )))
+        );
+    }
+    #[test]
+    fn retrying_failed_location_can_commit_it_normally() {
+        let mut session = TabSession::new(TabId(1));
+        session.current_location = Some(NavigationLocation::Directory(PathBuf::from(r"C:\Users")));
+        session
+            .begin_directory_navigation(PathBuf::from(r"C:\Users\DevUser"), NavigationKind::Normal);
+        assert!(session.fail_directory_navigation(
+            session.latest_request,
+            LoadState::PermissionDenied,
+            "denied".into()
+        ));
+
+        let requested = session
+            .requested_location
+            .clone()
+            .expect("failed target exists");
+        let requested_path = requested
+            .directory_path()
+            .expect("failed directory target exists")
+            .to_path_buf();
+        session.begin_directory_navigation(requested_path.clone(), NavigationKind::Normal);
+        assert!(session.finish_directory_navigation(
+            session.latest_request,
+            requested,
+            DirectoryViewPreference::default(),
+            None
+        ));
+
+        assert_eq!(session.visible_path(), Some(requested_path.as_path()));
+        assert_eq!(
+            session.back_target(),
+            Some(NavigationLocation::Directory(PathBuf::from(r"C:\Users")))
+        );
+        assert!(session.requested_location.is_none());
+        assert_eq!(session.load_state, LoadState::Complete);
+    }
+    #[test]
+    fn failed_navigation_keeps_successful_page_and_history() {
+        let mut session = TabSession::new(TabId(1));
+        session.current_location = Some(NavigationLocation::Directory("good".into()));
+        session.back_history = vec![NavigationLocation::Directory("older".into())];
+        session.begin_directory_navigation("missing".into(), NavigationKind::Normal);
+        assert!(session.fail_directory_navigation(
+            session.latest_request,
+            LoadState::NotFound,
+            "missing".into()
+        ));
+        assert_eq!(
+            session.current_location,
+            Some(NavigationLocation::Directory("good".into()))
+        );
+        assert_eq!(
+            session.back_history,
+            vec![NavigationLocation::Directory(PathBuf::from("older"))]
+        );
+    }
+
+    #[test]
+    fn history_moves_only_after_success_and_supports_jumps() {
+        let mut session = TabSession::new(TabId(1));
+        session.current_location = Some(NavigationLocation::Directory("three".into()));
+        session.back_history = vec![
+            NavigationLocation::Directory("one".into()),
+            NavigationLocation::Directory("two".into()),
+        ];
+        session.begin_directory_navigation("one".into(), NavigationKind::Back);
+        assert_eq!(session.back_history.len(), 2);
+        assert!(session.finish_directory_navigation(
+            session.latest_request,
+            NavigationLocation::Directory("one".into()),
+            DirectoryViewPreference::default(),
+            None
+        ));
+        assert!(session.back_history.is_empty());
+        assert_eq!(
+            session.forward_history,
+            vec![
+                NavigationLocation::Directory(PathBuf::from("three")),
+                NavigationLocation::Directory(PathBuf::from("two"))
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_root_breadcrumb_is_visible_without_duplicate_drive_prefix() {
+        let mut session = TabSession::new(TabId(1));
+        session.current_location = Some(NavigationLocation::Directory(PathBuf::from(r"F:\")));
+        let breadcrumbs = session.breadcrumb_paths();
+        assert_eq!(
+            breadcrumbs,
+            vec![(
+                r"F:\".to_owned(),
+                NavigationLocation::Directory(PathBuf::from(r"F:\"))
+            )]
+        );
+    }
+    #[test]
+    fn address_edit_cancel_restores_successful_path() {
+        let mut session = TabSession::new(TabId(1));
+        session.current_location = Some(NavigationLocation::Directory(PathBuf::from("C:\\成功")));
+        session.begin_smart_address_edit();
+        session.update_address_input("C:\\不存在📁".to_owned());
+        session.begin_directory_navigation(PathBuf::from("C:\\不存在📁"), NavigationKind::Normal);
+        assert!(session.fail_directory_navigation(
+            session.latest_request,
+            LoadState::NotFound,
+            "missing".into()
+        ));
+        session.cancel_address_edit();
+        assert!(!session.address_editing);
+        assert_eq!(
+            session.current_location,
+            Some(NavigationLocation::Directory(PathBuf::from("C:\\成功")))
+        );
+    }
+
+    #[test]
+    fn issue_161_selection_keeps_order_and_membership_in_step() {
+        let mut selection = Selection::from(vec![EntryId(3), EntryId(1), EntryId(3), EntryId(2)]);
+        assert_eq!(selection, vec![EntryId(3), EntryId(1), EntryId(2)]);
+        assert!(!selection.insert(EntryId(1)));
+        assert!(selection.insert(EntryId(4)));
+        assert!(selection.remove(EntryId(1)));
+        assert!(!selection.remove(EntryId(1)));
+        assert!(!selection.contains(&EntryId(1)));
+        assert_eq!(selection, [EntryId(3), EntryId(2), EntryId(4)]);
+        selection.retain(|id| *id != EntryId(2));
+        assert!(!selection.contains(&EntryId(2)));
+        assert_eq!(selection.members().len(), selection.len());
+        assert!(selection.insert(EntryId(2)));
+        assert_eq!(selection, [EntryId(3), EntryId(4), EntryId(2)]);
+        selection.clear();
+        assert!(selection.is_empty() && selection.members().is_empty());
+    }
+
+    #[test]
+    fn selection_supports_single_toggle_range_and_keyboard() {
+        let mut session = TabSession::new(TabId(1));
+        session.replace_entries(vec![
+            entry(1, "a", EntryKind::File, Some(1)),
+            entry(2, "b", EntryKind::File, Some(2)),
+            entry(3, "c", EntryKind::File, Some(3)),
+        ]);
+        session.select_entry(EntryId(1), false, false);
+        session.select_entry(EntryId(3), false, true);
+        assert_eq!(session.selected, vec![EntryId(1), EntryId(2), EntryId(3)]);
+        session.select_entry(EntryId(2), true, false);
+        assert!(!session.selected.contains(&EntryId(2)));
+        session.move_focus(-1, false);
+        assert_eq!(session.focused, Some(EntryId(1)));
+    }
+
+    #[test]
+    fn rectangle_selection_uses_the_starting_snapshot_for_each_modifier() {
+        let mut session = TabSession::new(TabId(1));
+        session.replace_entries(
+            (1..=4)
+                .map(|id| entry(id, &format!("{id}.txt"), EntryKind::File, Some(1)))
+                .collect(),
+        );
+        let snapshot = HashSet::from([EntryId(1), EntryId(3)]);
+        let hits = HashSet::from([EntryId(2), EntryId(3)]);
+
+        session.apply_rectangle_selection(&snapshot, &hits, RectangleSelectionMode::Replace);
+        assert_eq!(session.selected, vec![EntryId(2), EntryId(3)]);
+        session.apply_rectangle_selection(&snapshot, &hits, RectangleSelectionMode::Extend);
+        assert_eq!(session.selected, vec![EntryId(1), EntryId(2), EntryId(3)]);
+        session.apply_rectangle_selection(&snapshot, &hits, RectangleSelectionMode::Toggle);
+        assert_eq!(session.selected, vec![EntryId(1), EntryId(2)]);
+    }
+
+    #[test]
+    fn control_shift_range_adds_to_existing_selection_and_keeps_anchor() {
+        let mut session = TabSession::new(TabId(1));
+        session.replace_entries(vec![
+            entry(1, "a", EntryKind::File, Some(1)),
+            entry(2, "b", EntryKind::File, Some(2)),
+            entry(3, "c", EntryKind::Directory, None),
+            entry(4, "d", EntryKind::File, Some(4)),
+            entry(5, "e", EntryKind::File, Some(5)),
+        ]);
+
+        session.select_entry(EntryId(1), false, false);
+        session.select_entry(EntryId(5), true, false);
+        session.select_entry(EntryId(3), true, true);
+
+        assert_eq!(
+            session.selected,
+            vec![EntryId(1), EntryId(5), EntryId(3), EntryId(4)]
+        );
+        assert_eq!(session.selection_anchor, Some(EntryId(5)));
+        assert_eq!(session.focused, Some(EntryId(3)));
+    }
+    #[test]
+    fn sorting_keeps_directories_first_in_both_directions() {
+        let mut session = TabSession::new(TabId(1));
+        session.replace_entries(vec![
+            entry(1, "small", EntryKind::File, Some(1)),
+            entry(2, "folder", EntryKind::Directory, None),
+            entry(3, "large", EntryKind::File, Some(10)),
+        ]);
+        session.set_sort(SortField::Size);
+        assert_eq!(session.entries[0].kind, EntryKind::Directory);
+        session.set_sort(SortField::Size);
+        assert_eq!(session.entries[0].kind, EntryKind::Directory);
+        assert_eq!(session.entries[1].display_name, "large");
+    }
+    #[test]
+    fn type_sort_includes_folders_in_the_type_order() {
+        let mut session = TabSession::new(TabId(1));
+        session.replace_entries(vec![
+            entry(1, "folder", EntryKind::Directory, None),
+            entry(2, "readme", EntryKind::File, Some(1)),
+            entry(3, "notes.txt", EntryKind::File, Some(1)),
+        ]);
+
+        session.set_sort(SortField::Kind);
+        assert_eq!(
+            session
+                .entries
+                .iter()
+                .map(|entry| entry.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["readme", "folder", "notes.txt"]
+        );
+        session.set_sort(SortField::Kind);
+        assert_eq!(
+            session
+                .entries
+                .iter()
+                .map(|entry| entry.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["notes.txt", "folder", "readme"]
+        );
+    }
+    #[test]
+    fn size_sort_reorders_indexed_folders_within_the_folder_group() {
+        let mut session = TabSession::new(TabId(1));
+        let mut large_folder = entry(1, "large-folder", EntryKind::Directory, None);
+        large_folder.folder_size = FolderSizeState::Value(20);
+        let mut small_folder = entry(2, "small-folder", EntryKind::Directory, None);
+        small_folder.folder_size = FolderSizeState::Value(5);
+        session.replace_entries(vec![
+            large_folder,
+            entry(3, "file", EntryKind::File, Some(1)),
+            small_folder,
+        ]);
+
+        session.set_sort(SortField::Size);
+        assert_eq!(session.entries[0].display_name, "small-folder");
+        assert_eq!(session.entries[1].display_name, "large-folder");
+        session.set_sort(SortField::Size);
+        assert_eq!(session.entries[0].display_name, "large-folder");
+        assert_eq!(session.entries[1].display_name, "small-folder");
+    }
+
+    #[test]
+    fn size_sort_places_unknown_folders_after_indexed_folders_and_can_resort_updates() {
+        let mut session = TabSession::new(TabId(1));
+        let mut indexed = entry(1, "indexed", EntryKind::Directory, None);
+        indexed.folder_size = FolderSizeState::Value(20);
+        session.replace_entries(vec![
+            entry(2, "unknown", EntryKind::Directory, None),
+            indexed,
+        ]);
+        session.set_sort(SortField::Size);
+        assert_eq!(session.entries[0].display_name, "indexed");
+        session.set_sort(SortField::Size);
+        assert_eq!(session.entries[0].display_name, "indexed");
+        assert_eq!(session.entries[1].display_name, "unknown");
+        session.set_sort(SortField::Size);
+        session.entries = Arc::new(vec![session.entries[0].clone(), {
+            let mut updated = session.entries[1].clone();
+            updated.folder_size = FolderSizeState::Value(5);
+            updated
+        }]);
+        session.resort_entries();
+        assert_eq!(session.entries[0].display_name, "unknown");
+    }
+
+    #[test]
+    fn size_sort_uses_path_after_equal_size_and_name() {
+        let mut left = entry(1, "same", EntryKind::Directory, None);
+        left.path = PathBuf::from(r"C:\b\same");
+        left.folder_size = FolderSizeState::Value(7);
+        let mut right = entry(2, "same", EntryKind::Directory, None);
+        right.path = PathBuf::from(r"C:\a\same");
+        right.folder_size = FolderSizeState::Value(7);
+        let mut session = TabSession::new(TabId(1));
+        session.replace_entries(vec![left, right]);
+        session.set_sort(SortField::Size);
+        assert_eq!(session.entries[0].path, PathBuf::from(r"C:\a\same"));
+    }
+    #[test]
+    fn entry_id_resolves_original_unicode_path() {
+        let mut session = TabSession::new(TabId(1));
+        let original = PathBuf::from("中文").join("📁");
+        session.replace_entries(vec![FileEntry {
+            id: EntryId(9),
+            original_name: "📁".into(),
+            display_name: "📁".into(),
+            name_highlights: Vec::new(),
+            path: original.clone(),
+            kind: EntryKind::Directory,
+            open_target: None,
+            library_source_index: None,
+            parent_display: "中文".into(),
+            size_bytes: None,
+            folder_size: FolderSizeState::Unknown,
+            modified: None,
+            created: None,
+            webdav: None,
+        }]);
+        assert_eq!(
+            session
+                .visible_entry(EntryId(9))
+                .map(|entry| entry.path.clone()),
+            Some(original)
+        );
+    }
+}

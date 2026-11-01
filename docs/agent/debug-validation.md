@@ -71,6 +71,7 @@
 | [#162](#issue-162) | 窗口区域刷新（#162） |
 | [#163](#issue-163) | 应用协调层拆分验证（#163） |
 | [#165](#issue-165) | 目录按需生成行的模型（#165） |
+| [#166](#issue-166) | Cargo 工作区与依赖边界（#166） |
 | [#175](#issue-175) | Issue #175 十万条目目录加载、框选与滚动 |
 | [#176](#issue-176) | Temp 监听循环与本地刷新（#176） |
 | [#177](#issue-177) | Issue #177 地址栏退出编辑 |
@@ -115,7 +116,7 @@ gh run download <失败演练编号> --dir artifacts/ci-failure-probe
 
 专项证据写入 `artifacts/state/issue-147/` 和 `artifacts/logs/issue-147/`。受控失败验证应确认：报告包含 `passed: false` 和失败检查，场景进程返回非零，完整验证汇总将该场景标为 `failed`；恢复生产代码后重新运行完整验证。
 
-专项命令：`cargo test --locked issue_147 -- --nocapture`。完整验证包含 `cargo build --locked`；`--quick` 不覆盖场景退出码。
+专项命令：`cargo test --workspace --locked issue_147 -- --nocapture`。完整验证包含 `cargo build --locked`；`--quick` 不覆盖场景退出码。
 
 ## 正式发布与本地打包
 
@@ -161,7 +162,7 @@ python tools/verify.py --release     # 收尾：复用未过期的完整验证�
 
 ## 深层面包屑折叠（#145）
 
-`python tools/build.py test --locked issue_145 -- --nocapture` 使用无窗口后端，验证实际文字测量、宽度分配、首尾保留、祖先顺序、全名恢复、UNC 与虚拟位置，以及导航或标签变化后的旧动作拒收。纯布局覆盖 0～1999 逻辑像素，组件投影覆盖 640、900、1280 和 4000 逻辑像素窗口宽度。测试不访问网络或打开应用窗口。
+`python tools/build.py test --workspace --locked issue_145 -- --nocapture` 使用无窗口后端，验证实际文字测量、宽度分配、首尾保留、祖先顺序、全名恢复、UNC 与虚拟位置，以及导航或标签变化后的旧动作拒收。纯布局覆盖 0～1999 逻辑像素，组件投影覆盖 640、900、1280 和 4000 逻辑像素窗口宽度。测试不访问网络或打开应用窗口。
 
 专项日志为 `artifacts/logs/issue-145-tests.log`。统一检查使用 `python tools/verify.py --quick`，日志为 `artifacts/logs/issue-145-verify.log`，汇总为 `artifacts/verify/summary.json`。
 
@@ -180,7 +181,7 @@ Debug 验证和 Issue 收尾都执行 Cargo 测试。此前应用的 Windows GUI
 
 应用继续使用 GUI 子系统，测试程序使用控制台子系统；目录联接测试的 PowerShell 显式使用 CREATE_NO_WINDOW。不要仅因闪窗而统一让 Cargo 脱离控制台，编译与验证仍在一个可见终端内运行。单独 cargo build 不执行这些测试，不能把本次测试根因直接推广到所有编译启动方式。
 
-复验使用 cargo test --locked issue_102 -- --nocapture 和 cargo build --locked；完整小改动验证使用 python tools/verify.py --quick。诊断证据位于 artifacts/logs/issue-131/process-comparison.json、before.log 和 after.log，包含测试程序 PID、PE 子系统及新增终端进程。采样结果用于解释进程关系，最终是否仍有闪窗由用户观察。后续再现时先区分纯构建与包含测试的验证，保留进程父子关系；conhost 本身也可承载无窗口控制台，不能仅以出现 conhost 判定出现可见窗口。
+复验使用 cargo test --workspace --locked issue_102 -- --nocapture 和 cargo build --locked；完整小改动验证使用 python tools/verify.py --quick。诊断证据位于 artifacts/logs/issue-131/process-comparison.json、before.log 和 after.log，包含测试程序 PID、PE 子系统及新增终端进程。采样结果用于解释进程关系，最终是否仍有闪窗由用户观察。后续再现时先区分纯构建与包含测试的验证，保留进程父子关系；conhost 本身也可承载无窗口控制台，不能仅以出现 conhost 判定出现可见窗口。
 
 <a id="issue-110"></a>
 <a id="issue-117"></a>
@@ -193,7 +194,7 @@ Debug 验证和 Issue 收尾都执行 Cargo 测试。此前应用的 Windows GUI
 
 ## 外部文件夹打开与前台激活（#110 / #117 / #118 / #119 / #120 / #121 / #122 / #123）
 
-无界面回归包含 `issue_110_authorizes_each_packet_before_delivery_even_when_permission_is_denied`：使用真实本机命名管道核对接收 PID，模拟授权成功与拒绝，确认调用授权且拒绝不丢失含中文、空格与 UNC 的请求；发送前授权的严格顺序另由源码审查确认，接收线程中的标志检查不作为确定性的时序证明。既有 `external_tabs_are_created_in_the_most_recent_window` 与 `external_paths_open_as_new_tabs_in_the_active_window` 覆盖多窗口路由及连续新标签语义；`normalize_external_launch_path` / 启动参数测试覆盖盘符根 `D:"`、裸盘符与 `"%1\."` 尾缀修复。#118 覆盖 `/select` 与 `-select` 解析、文件路径分类为父目录 reveal、select 标志经命名管道保留，目录完成提交后按完整原始路径选中，以及 `SHOpenFolderAndSelectItems` 经启动进程的 `IShellWindows` 注册把子项补为 reveal；Shell 解析名展开 8.3 短名时仍接回 Folder Open 原始父路径。#120 / #122 对齐 Files 的双阶段入口：外部启动进程主线程先接收最多 500ms，选中立即交付；未收到则交付目录并继续接收最多 10s，该存活上限不阻塞主应用。旧 #121 的后台接收实现被替换，避免转发进程先退出而丢失选择；不再根据父进程跳过 Shell 请求，也不扫描或关闭其他 Explorer 窗口。真实 `SHOpenFolderAndSelectItems` 集成测试覆盖“单个完整目标”与“父目录＋子项数组”两种调用，并要求收到选择后两秒内返回（接收寿命四秒，防止再次等到超时）。状态测试覆盖同目录双标签、关闭标签、同目录重新导航与加载中补选中。#119 覆盖状态键丢失但 HKCU Folder 命令仍指向 AsterFiles 时的修复/恢复，不得把残留 AsterFiles 命令备份成「原先的资源管理器」。#123 在独立 HKCU 测试命名空间中覆盖 Windows/Files 的 `REG_EXPAND_SZ` 命令，核对状态、启用、重复启用、原始类型与字节恢复，以及外部应用接管后不被覆盖；不改动用户实际默认关联。统一运行 `python tools/verify.py`。针对选择链路可运行 `cargo test --locked issue_122 -- --nocapture` 与 `cargo test --locked issue_118 -- --nocapture`。
+无界面回归包含 `issue_110_authorizes_each_packet_before_delivery_even_when_permission_is_denied`：使用真实本机命名管道核对接收 PID，模拟授权成功与拒绝，确认调用授权且拒绝不丢失含中文、空格与 UNC 的请求；发送前授权的严格顺序另由源码审查确认，接收线程中的标志检查不作为确定性的时序证明。既有 `external_tabs_are_created_in_the_most_recent_window` 与 `external_paths_open_as_new_tabs_in_the_active_window` 覆盖多窗口路由及连续新标签语义；`normalize_external_launch_path` / 启动参数测试覆盖盘符根 `D:"`、裸盘符与 `"%1\."` 尾缀修复。#118 覆盖 `/select` 与 `-select` 解析、文件路径分类为父目录 reveal、select 标志经命名管道保留，目录完成提交后按完整原始路径选中，以及 `SHOpenFolderAndSelectItems` 经启动进程的 `IShellWindows` 注册把子项补为 reveal；Shell 解析名展开 8.3 短名时仍接回 Folder Open 原始父路径。#120 / #122 对齐 Files 的双阶段入口：外部启动进程主线程先接收最多 500ms，选中立即交付；未收到则交付目录并继续接收最多 10s，该存活上限不阻塞主应用。旧 #121 的后台接收实现被替换，避免转发进程先退出而丢失选择；不再根据父进程跳过 Shell 请求，也不扫描或关闭其他 Explorer 窗口。真实 `SHOpenFolderAndSelectItems` 集成测试覆盖“单个完整目标”与“父目录＋子项数组”两种调用，并要求收到选择后两秒内返回（接收寿命四秒，防止再次等到超时）。状态测试覆盖同目录双标签、关闭标签、同目录重新导航与加载中补选中。#119 覆盖状态键丢失但 HKCU Folder 命令仍指向 AsterFiles 时的修复/恢复，不得把残留 AsterFiles 命令备份成「原先的资源管理器」。#123 在独立 HKCU 测试命名空间中覆盖 Windows/Files 的 `REG_EXPAND_SZ` 命令，核对状态、启用、重复启用、原始类型与字节恢复，以及外部应用接管后不被覆盖；不改动用户实际默认关联。统一运行 `python tools/verify.py`。针对选择链路可运行 `cargo test --workspace --locked issue_122 -- --nocapture` 与 `cargo test --workspace --locked issue_118 -- --nocapture`。
 
 `target/debug/asterfiles.exe --agent-shell-launch-probe artifacts/state/shell-launcher/state.json` 是独立进程、无应用界面的入口探针，完整验证自动运行它。探针启动真实可执行文件的专用无界面接收角色，通过系统 Shell 集合找到该进程窗口，核对所属进程/初始主线程及真实程序路径；调用方 PIDL 使用独立的 `ILCreateFromPathW`，接收方使用与 Files 相同的桌面 `IShellFolder::ParseDisplayName`，并覆盖普通临时目录、真实 Downloads 子目录、500ms 内的选择、超过旧 3s 寿命才到达的选择，以及纯目录 500ms 后交付并在约 10.5s 回收。选择直接发送给已确认的隐藏接收窗口，失败不调用用户默认文件管理器。此探针验证启动进程接收和双阶段时序，命名管道另由隔离的真实 IPC 测试覆盖乱序、断开、前台授权、逐阶段确认和快速连续连接；两者不能替代 P4V/FDM/Lark 冷/热启动的用户验收。
 
@@ -227,7 +228,7 @@ Debug 自动记录 `artifacts/logs/window-interaction-diagnostic.jsonl`；可用
 
 winit 尺寸/DPI 事件过滤器先传播事件，再通过每个窗口复用的单次定时器合并业务重排与缩略图视口刷新。普通数据刷新也读取同一个逻辑宽度；不能只延后一个事件而保留其它入口的混合换算。
 
-`cargo test --locked issue_130_` 使用无窗口后端覆盖 100%/125%/150% 多次往返、缩放通知早于尺寸通知时的后台刷新、侧栏存在与宽度、选中项/目录请求不变，以及 899/900/999/1000 逻辑像素附近的真实调整。`python tools/verify.py --quick` 包含现有首页和分组网格回归及 Debug 构建。验证汇总为 `artifacts/verify/summary.json`。
+`cargo test --workspace --locked issue_130_` 使用无窗口后端覆盖 100%/125%/150% 多次往返、缩放通知早于尺寸通知时的后台刷新、侧栏存在与宽度、选中项/目录请求不变，以及 899/900/999/1000 逻辑像素附近的真实调整。`python tools/verify.py --quick` 包含现有首页和分组网格回归及 Debug 构建。验证汇总为 `artifacts/verify/summary.json`。
 
 用户手动保持鼠标按下，在上述两条屏幕边界分别往返五次；观察侧栏是否突然收窄、消失或直到松手才恢复，并确认窗口不累积变大。随后在同一屏幕主动缩窄/放宽窗口，确认侧栏原有收起与恢复仍正常；首页和文件网格各检查一次。系统正常 DPI 比例变化仍会发生，无界面测试不能证明实际拖动观感。
 
@@ -235,7 +236,7 @@ winit 尺寸/DPI 事件过滤器先传播事件，再通过每个窗口复用的
 
 ## Debug 优化配置（#100）
 
-日常 Debug 构建对应用代码使用一级优化，对第三方依赖使用二级优化；保留行号调试信息、增量编译、调试断言和溢出检查。测试继承相同优化等级。第三方构建依赖和过程宏也受二级优化影响，因此首次切换配置需要重编依赖；后续通常可复用缓存。优化可能影响逐行调试和局部变量可见性。
+日常 Debug 构建对应用代码使用一级优化，对第三方依赖使用二级优化；保留行号调试信息、调试断言和溢出检查。Rust 增量编译沿用 [构建缓存策略](build-cache.md) 的关闭设置。测试继承相同优化等级。第三方构建依赖和过程宏也受二级优化影响，因此首次切换配置需要重编依赖；后续通常可复用缓存。优化可能影响逐行调试和局部变量可见性。
 
 性能比较可复用 `thumbnail-scheduler` 和 `folder-size-scheduler` 的 `--no-ui` 场景，比较相同输入的状态一致性与重复运行耗时。整进程计时包含启动和状态文件写入，不能代替真实渲染、滚动和标签切换的用户手动验收。性能证据保存至 `artifacts/perf/issue-100/`。
 
@@ -275,7 +276,7 @@ cargo run -- --agent-scenario drag-drop-foundation --no-ui
 
 ```powershell
 cargo run -- --agent-scenario drive-capacity --no-ui --agent-state-out artifacts/state/drives/capacity.json
-cargo test issue_16_ -- --nocapture
+cargo test --workspace --locked issue_16_ -- --nocapture
 ```
 
 无界面场景只使用确定性内存夹具，不启动窗口、不读取真实磁盘容量，也不访问 Shell、网络或目录。产物覆盖占用比例、零容量、防溢出、10% 警戒阈值、查询中与不可用状态、侧栏加载代次，以及文件任务完成后只刷新受影响卷。真实容量与 Windows 属性页对照、光驱无介质、断开映射盘、移动盘热插拔、窗口重新激活刷新、浅色/深色和 100%/125%/150% DPI 由用户手动验收；结构化运行日志写入 `artifacts/logs/drives/`，性能证据写入 `artifacts/perf/drives/`。
@@ -285,7 +286,7 @@ cargo test issue_16_ -- --nocapture
 
 ```powershell
 cargo run -- --agent-scenario quick-access --no-ui --agent-state-out artifacts/state/quick-access/state.json
-cargo test quick_access --quiet
+cargo test --workspace --locked quick_access --quiet
 ```
 
 无界面场景只验证原始路径身份、独立投放目标、单文件夹限制、文件任务隔离、加载代次和多窗口共享投影，不修改真实 Windows Shell。真实 Explorer 双向同步、文件列表拖入、地址栏图标拖入、Escape 与 100%/125%/150% DPI 由用户手动验收；结构化运行日志整理到 `artifacts/logs/quick-access/`。
@@ -324,8 +325,8 @@ cargo run -- --agent-scenario quick-menu-search --no-ui --agent-state-out artifa
 产物记录大小写搜索、中文搜索、空结果、原始 Shell command ID 保留，以及过滤不会发起 Shell 查询。专项单元测试：
 
 ```powershell
-cargo test quick_menu --quiet
-cargo test context_menu --quiet
+cargo test --workspace --locked quick_menu --quiet
+cargo test --workspace --locked context_menu --quiet
 ```
 
 真实窗口的中文输入法、第三方扩展、动态/自绘菜单、DPI、多屏和边缘定位禁止 Agent 自动操作，由用户手动验证。菜单加载、迟到结果、调用和错误写入程序日志；实测耗时汇总放在 `artifacts/perf/`，用户截图放在 `artifacts/ui/`。
@@ -338,7 +339,7 @@ cargo test context_menu --quiet
 
 ```powershell
 cargo run -- --agent-scenario quick-menu-popup --no-ui --agent-state-out artifacts/state/context-menu/popup.json
-cargo test quick_menu_popup --quiet
+cargo test --workspace --locked quick_menu_popup --quiet
 ```
 
 产物覆盖负坐标显示器、根菜单双向翻转、加载态切换后根矩形稳定、子菜单独立重定位与工作区限高、多层 branch、同层分支替换、旧身份拒绝、跨窗口事件拒绝和请求过期 close-all；首帧屏障由 `hidden → cloaked → shown → presented` 运行状态与真实桌面人工验收共同确认。附属窗创建时直接携带 owner 与 popup/tool-window 样式；每个子菜单深度只创建一个可复用槽，同层悬停只换内容和位置，隐藏槽不参与焦点判断。真实首次/重复显示无白闪、连续同层悬停只有一个高亮、同一 Shell 子菜单重复打开不重新加载、多级 Left/Escape、任务栏/Alt+Tab、外部点击、中文输入法、100%/150% 双屏和 owner 关闭只能由用户手动验证；结构化运行日志包含 `quick_menu_popup_opened`、`quick_menu_popup_repositioned`、`quick_menu_submenus_repositioned`、`quick_menu_submenu_opened`（含 `depth`、`branch`、`reused`）和 `quick_menu_popup_closed`，整理后写入 `artifacts/perf/`。
@@ -349,7 +350,7 @@ cargo test quick_menu_popup --quiet
 
 ```powershell
 cargo run -- --agent-scenario windows-libraries --no-ui --agent-state-out artifacts/state/windows-libraries/foundation.json
-cargo test windows_libraries --quiet
+cargo test --workspace --locked windows_libraries --quiet
 ```
 
 该场景只运行确定性内存夹具，不启动窗口、不读写真实 Windows Library，也不访问来源目录。产物记录 Shell 顺序与固定状态映射、库稳定身份、多来源分批合并、同名条目的独立 `EntryId` 与原始路径、Shell 默认保存目录、无默认保存目录错误、部分来源失败、取消以及迟到批次和终态拒收。纯 Rust 投影测试另验证来源组严格保持 Shell 顺序、同名来源以稳定身份区分、组头展示来源名与真实路径、空来源保留组头，以及增量批次合并后不产生重复组。真实 Explorer 的系统库与自定义库名称、顺序、固定状态、图标、外部增删改名、多窗口同步、聚合浏览、列表/网格分组布局和 100%/125%/150% DPI 必须由用户手动验收；结构化运行日志写入 `artifacts/logs/`，用户截图写入 `artifacts/ui/`。
@@ -370,7 +371,7 @@ cargo run -- --agent-scenario network-foundation --no-ui --agent-state-out artif
 
 ```powershell
 cargo run -- --agent-scenario file-list-type-select --no-ui --agent-state-out artifacts/state/file-list/type-select.json
-cargo test issue_20 --quiet
+cargo test --workspace --locked issue_20 --quiet
 ```
 
 场景只操作已加载的内存模型，不打开窗口、不访问文件系统、Shell/COM、网络或 Everything。产物记录单字符、连续前缀、同字符循环、稀疏结果身份和请求隔离；超时、上下文清理、分组投影、滚入可见区与输入分流由专项测试覆盖。真实键盘手感、中文输入法、各视图、分组和 DPI 只能由用户手动验证。
@@ -382,25 +383,25 @@ cargo test issue_20 --quiet
 
 ```powershell
 cargo run -- --agent-scenario file-operation-center --no-ui --agent-state-out artifacts/state/file-operations/task-center.json
-cargo test issue_62_ -- --nocapture
+cargo test --workspace --locked issue_62_ -- --nocapture
 ```
 
 产物一次覆盖本地与网络运行任务、各资源域排队、冲突等待、暂停、部分完成和失败重试，并记录逐项操作能力、失败摘要、速度/剩余时间准备状态及“关闭窗口仅收起任务中心、后台任务保持不变”语义。真实视觉、键盘和无障碍交互仍由用户手动验收。
 
-Issue #83 将该场景契约升级为 schema 2，并增加应用级撤销状态：是否可撤销、历史深度、最近操作类型、执行中状态和最近失败。专项无界面验证使用 `cargo test issue_83 -- --nocapture`，覆盖后进先出、有界历史、阶段化重试、强身份校验、独占复制根、隔离删除、目录外部新增和原路径占用；回收站条目身份由 Shell 的删除完成回调保存为绝对 PIDL，恢复时先落入同目录唯一临时名再无覆盖地移回原名。
+Issue #83 将该场景契约升级为 schema 2，并增加应用级撤销状态：是否可撤销、历史深度、最近操作类型、执行中状态和最近失败。专项无界面验证使用 `cargo test --workspace --locked issue_83 -- --nocapture`，覆盖后进先出、有界历史、阶段化重试、强身份校验、独占复制根、隔离删除、目录外部新增和原路径占用；回收站条目身份由 Shell 的删除完成回调保存为绝对 PIDL，恢复时先落入同目录唯一临时名再无覆盖地移回原名。
 
-Issue #81 的专项验证使用 `cargo test issue_81_ -- --nocapture`，通过临时目录与纯内存回调覆盖回收站准备计数、与 Shell 回收并行的递归项目/字节统计、重解析点边界、准备与执行阶段切换、Windows Shell 总体工作量、未知总量、当前项目、约 8 Hz 的进度合并及终态立即提交。测试不启动窗口、不操作真实回收站；无可靠百分比时任务条使用持续运动的不定进度，真实 Shell 行为、视觉反馈和 Explorer 对照基线由用户按人工验收清单执行。
+Issue #81 的专项验证使用 `cargo test --workspace --locked issue_81_ -- --nocapture`，通过临时目录与纯内存回调覆盖回收站准备计数、与 Shell 回收并行的递归项目/字节统计、重解析点边界、准备与执行阶段切换、Windows Shell 总体工作量、未知总量、当前项目、约 8 Hz 的进度合并及终态立即提交。测试不启动窗口、不操作真实回收站；无可靠百分比时任务条使用持续运动的不定进度，真实 Shell 行为、视觉反馈和 Explorer 对照基线由用户按人工验收清单执行。
 <a id="issue-82"></a>
 
 ## Issue #82 大目录永久删除
 
 ```powershell
-cargo test issue_82_ -- --nocapture
+cargo test --workspace --locked issue_82_ -- --nocapture
 ```
 性能证据单独运行：
 
 ```powershell
-cargo test issue_82_fast_delete_performance_evidence -- --ignored --nocapture
+cargo test --workspace --locked issue_82_fast_delete_performance_evidence -- --ignored --nocapture
 ```
 
 专项测试使用临时目录和纯内存状态，不启动窗口。它覆盖无递归成本扫描的同卷目录原子移动、连续批次在上一批清理完成前移走、清理通道与普通本地通道隔离、全局清理串行、多选共享载荷根、记录认领与崩溃恢复、内部路径过滤和文件夹大小隔离，以及失败、取消、链接、UNC 和受保护路径边界。永久删除各阶段不触发任务窗口自动打开，其他慢任务仍遵守原有自动打开规则；`file-operation-center` 无界面场景同时导出两阶段任务文案与遗留位置投影。
@@ -415,7 +416,7 @@ cargo test issue_82_fast_delete_performance_evidence -- --ignored --nocapture
 专项自动测试不打开窗口：
 
 ```powershell
-cargo test issue_64_ -- --nocapture
+cargo test --workspace --locked issue_64_ -- --nocapture
 ```
 
 目录枚举直接复用 Windows 枚举返回的普通条目元数据，只对符号链接和 junction 等重解析点进行一次跟随读取。`.lnk` 不再阻塞首批目录批次，而由独立有界单工作线程队列处理；只请求当前可见范围及前后一屏，执行前和回填时均校验 `TabId + RequestId + EntryId + 原始路径`，成功后只更新对应条目和行。该读取器的首批 32、后续 256 规则用于自身专项测试。应用目录加载现统一经过辅助进程（#150），首条立即交付，后续批次使用 2048 项、1 MiB 或 100 ms 的上限（#175）。
@@ -423,7 +424,7 @@ cargo test issue_64_ -- --nocapture
 10 万普通文件与大量快捷方式的显式性能测量写入 `artifacts/perf/directory-loading/`，记录首批耗时、完整枚举耗时、跟随元数据读取数、快捷方式提交数和完成数。该测量不进入日常统一验证，也不得自动操作 AsterFiles UI。
 
 ```powershell
-cargo test fs::directory_reader::tests::issue_64_directory_loading_performance_evidence -- --ignored --exact --nocapture
+cargo test --workspace --locked fs::directory_reader::tests::issue_64_directory_loading_performance_evidence -- --ignored --exact --nocapture
 ```
 
 <a id="issue-61"></a>
@@ -433,7 +434,7 @@ cargo test fs::directory_reader::tests::issue_64_directory_loading_performance_e
 专项无界面测试运行：
 
 ```powershell
-cargo test issue_61_
+cargo test --workspace --locked issue_61_
 ```
 
 测试使用临时目录或内存事件，不启动 AsterFiles 窗口。验证内容包括：扫描未完成时总文件数与总字节数保持未知且不生成百分比；发现数量单调增长并只计一次；首个文件在扫描终态前开始复制；稳定进度按时间与累计字节或文件门槛合并到约 5–10 Hz；完成、失败、冲突、暂停、继续、取消和扫描终态立即提交；暂停与取消能在扫描、文件和块边界生效；普通进度只更新任务中心，不重建其他主窗口模型。
@@ -447,16 +448,16 @@ cargo test issue_61_
 自动回归不启动窗口：
 
 ```powershell
-cargo test issue_60_ -- --nocapture
-cargo test fs::file_operations::tests:: -- --nocapture
+cargo test --workspace --locked issue_60_ -- --nocapture
+cargo test --workspace --locked fs::file_operations::tests:: -- --nocapture
 ```
 
-专项测试覆盖 CopyFile2 的内容、修改时间、Windows 属性、NTFS 备用数据流、取消清理，以及暂停后对同一临时目标恢复。统一验证继续通过 `cargo test` 纳入这些测试。
+专项测试覆盖 CopyFile2 的内容、修改时间、Windows 属性、NTFS 备用数据流、取消清理，以及暂停后对同一临时目标恢复。统一验证继续通过 `cargo test --workspace --locked` 纳入这些测试。
 
 真实卷与 SMB 性能证据写入 `artifacts/perf/file-operations/`。每份记录系统版本、源/目标卷类型、数据集、复制模式、首个进度时间、吞吐、CPU、暂停/取消延迟、重试次数、临时项清理、是否从恢复状态继续和结果属性。10 GiB、跨卷、SMB 双向、限速/断网/NAS 重启、压缩/稀疏/符号链接等测试不进入日常验证；它们依赖真实设备，由用户按人工验收清单执行。Issue #42 将所有 UNC 复制、移动、永久删除和回收站操作放入受 Job Object 约束的辅助进程；取消立即终止，连续 10 秒无进度或冲突活动则超时终止，CopyFile2 的可重试网络错误最多自动重试一次。真实设备指标仍须由用户验收后写入产物。
 
 ```powershell
-cargo test app::tests::issue_61_100k_small_files_performance_evidence -- --ignored --exact
+cargo test --workspace --locked app::tests::issue_61_100k_small_files_performance_evidence -- --ignored --exact
 ```
 
 
@@ -464,7 +465,7 @@ cargo test app::tests::issue_61_100k_small_files_performance_evidence -- --ignor
 
 ## Issue #93 普通点击不得移动文件
 
-专项命令：`cargo test issue_93 -- --nocapture`、`cargo test native_file_drop -- --nocapture`、`cargo test operation_audit -- --nocapture`；统一检查使用 `python tools/verify.py --quick`，包含 Debug 构建。
+专项命令：`cargo test --workspace --locked issue_93 -- --nocapture`、`cargo test --workspace --locked native_file_drop -- --nocapture`、`cargo test --workspace --locked operation_audit -- --nocapture`；统一检查使用 `python tools/verify.py --quick`，包含 Debug 构建。
 
 Slint testing 后端验证真实 clicked/pressed/Up 顺序、释放期间布局位移，以及实际列表/网格重建模型后的取消。内存状态与无窗口 COM 测试覆盖原始路径、标签/请求隔离、合法拖动只授权一次、孤立/取消/重复 Drop 零提交，以及复制/移动/快捷方式效果。测试不操作真实 AsterFiles 窗口或工作目录。
 
@@ -479,7 +480,7 @@ Slint testing 后端验证真实 clicked/pressed/Up 顺序、释放期间布局�
 ## Issue #91 普通目录分组网格
 
 ```powershell
-cargo test --bin asterfiles issue_91 -- --nocapture
+cargo test --workspace --locked --bin asterfiles issue_91 -- --nocapture
 python tools/verify.py
 ```
 
@@ -493,7 +494,7 @@ python tools/verify.py
 
 ## Issue #98 无缩略图文件的系统图标
 
-完整验证：`python tools/verify.py`；专项测试：`cargo test issue_98 -- --nocapture`。已有 `shell-thumbnail --no-ui` 场景扩展为 Windows 实际图像提取证据，覆盖临时 PNG、MTL、未知扩展名和文件夹的图片来源、请求/返回尺寸及失败原因。指定 `ASTERFILES_THUMBNAIL_PROBE_PATH` 可只读验证用户样例，禁止修改该文件。结果写入 `artifacts/state/thumbnails/shell-png.json`，统一日志位于 `artifacts/logs/`，汇总为 `artifacts/verify/summary.json`。
+完整验证：`python tools/verify.py`；专项测试：`cargo test --workspace --locked issue_98 -- --nocapture`。已有 `shell-thumbnail --no-ui` 场景扩展为 Windows 实际图像提取证据，覆盖临时 PNG、MTL、未知扩展名和文件夹的图片来源、请求/返回尺寸及失败原因。指定 `ASTERFILES_THUMBNAIL_PROBE_PATH` 可只读验证用户样例，禁止修改该文件。结果写入 `artifacts/state/thumbnails/shell-png.json`，统一日志位于 `artifacts/logs/`，汇总为 `artifacts/verify/summary.json`。
 
 应用异步审计日志中的 `grid_image_extracted` 和 `grid_image_failed` 区分真实缩略图、系统图标和两者均失败，携带原始路径、标签/请求身份和尺寸；系统图标成功不会进入缩略图失败重试。
 
@@ -504,7 +505,7 @@ python tools/verify.py
 
 ## Issue #99 网格切换列表后的图标
 
-专项测试：`cargo test issue_99 -- --nocapture`；统一验证：`python tools/verify.py --quick`，包含 Debug 构建。测试使用内存数据和 Slint 无窗口后端，验证网格切换到 List/Details 后补取普通图标、分组标题与搜索占位过滤、可见范围、缓存和在途去重，以及过期结果隔离。证据位于 `artifacts/logs/verify-test.log` 和 `artifacts/verify/summary.json`。
+专项测试：`cargo test --workspace --locked issue_99 -- --nocapture`；统一验证：`python tools/verify.py --quick`，包含 Debug 构建。测试使用内存数据和 Slint 无窗口后端，验证网格切换到 List/Details 后补取普通图标、分组标题与搜索占位过滤、可见范围、缓存和在途去重，以及过期结果隔离。证据位于 `artifacts/logs/verify-test.log` 和 `artifacts/verify/summary.json`。
 
 用户手动验收：打开原目录，先选网格再切 List，检查文件夹、MTL、OBJ 等系统图标；分别在分组和未分组下滚动、切换 Details、返回网格，再检查搜索结果切换 List。快速导航和关闭标签后，不应出现旧目录图标。Codex 不操作窗口；用户确认前仅更新 Debug 程序。
 
@@ -512,7 +513,7 @@ python tools/verify.py
 
 ## Issue #105 会话与偏好原子保存
 
-专项测试：`cargo test issue_105_ -- --nocapture`；统一验证：`python tools/verify.py`。测试在独立临时目录中覆盖首次保存、已有文件覆盖、截断解码，以及临时写入、落盘和 Windows 原子替换的确定性失败；失败后断言旧字节和旧会话仍可读取，且本次临时文件已清理；成功覆盖和首次保存都实际调用同目录 Windows `MoveFileExW`，覆盖额外使用 `MOVEFILE_REPLACE_EXISTING`。
+专项测试：`cargo test --workspace --locked issue_105_ -- --nocapture`；统一验证：`python tools/verify.py`。测试在独立临时目录中覆盖首次保存、已有文件覆盖、截断解码，以及临时写入、落盘和 Windows 原子替换的确定性失败；失败后断言旧字节和旧会话仍可读取，且本次临时文件已清理；成功覆盖和首次保存都实际调用同目录 Windows `MoveFileExW`，覆盖额外使用 `MOVEFILE_REPLACE_EXISTING`。
 
 Debug 诊断写入 `artifacts/logs/session-persistence.jsonl`，本地 Release 写入 `%LOCALAPPDATA%/AsterFiles/logs/session-persistence.jsonl`。事件区分无旧会话、读取成功、读取/解码失败、保存前校验失败、保存成功与分阶段保存失败，并记录错误类型、Windows 错误码和可读消息。会话及诊断文件访问都由启动/退出专用后台线程执行，不操作 AsterFiles 窗口。
 <a id="issue-111"></a>
@@ -521,7 +522,7 @@ Debug 诊断写入 `artifacts/logs/session-persistence.jsonl`，本地 Release �
 
 ```powershell
 ./target/debug/asterfiles.exe --agent-scenario agent-actions --no-ui --agent-state-out artifacts/state/agent-actions/sequence.json
-cargo test issue_111_ -- --nocapture
+cargo test --workspace --locked issue_111_ -- --nocapture
 ```
 
 场景在本次独占的临时目录创建中文同名文件，复用真实应用状态、统一操作入口、后台目录及文件工作线程，贯通查询、打开目录、等待、选择、重命名、刷新、切换标签和取消。包含失效请求、关闭窗口/标签、重名冲突、缺失源文件与目录、加载中拒绝操作以及迟到结果隔离。取消场景暂缓通道交付以稳定验证“接受取消”与“后台完成取消”的差异，文件操作仍由真实工作线程执行。场景结束清理自己的临时目录；失败也写出检查与轨迹。
@@ -534,7 +535,7 @@ cargo test issue_111_ -- --nocapture
 
 ## 职责拆分的回归入口（#107）
 
-目录队列测试：`cargo test --locked app::directory_loading`；文件执行测试：`cargo test --locked app::file_operation_worker`；任务协调测试：`cargo test --locked app::file_operation_coordinator`；窗口会话测试：`cargo test --locked app::window_sessions`。跨职责、应用动作及界面模型回归使用 `cargo test --locked app::`。每个切片接着运行 `cargo build --locked`，最终统一运行 `python tools/verify.py`。
+目录队列测试：`cargo test --workspace --locked app::directory_loading`；文件执行测试：`cargo test --workspace --locked app::file_operation_worker`；任务协调测试：`cargo test --workspace --locked app::file_operation_coordinator`；窗口会话测试：`cargo test --workspace --locked app::window_sessions`。跨职责、应用动作及界面模型回归使用 `cargo test --workspace --locked app::`。每个切片接着运行 `cargo build --locked`，最终统一运行 `python tools/verify.py`。
 
 拆分对照证据位于 `artifacts/issue-107/`：`baseline-summary.json`、`baseline-state/` 保存拆分前完整验证；各切片的 `*-tests.log` / `*-build.log` 保存测试和 Debug 构建输出。最终汇总仍使用 `artifacts/verify/summary.json`，场景状态仍使用 `artifacts/state/`。比较无界面输出时仅排除明确随运行变化的时间、临时夹具路径等字段；身份、取消和终态等业务字段必须保留并比较。
 
@@ -551,7 +552,7 @@ cargo test issue_111_ -- --nocapture
 ## Issue #103 网络目录分批与终止
 
 ```powershell
-cargo test issue_103_ -- --nocapture
+cargo test --workspace --locked issue_103_ -- --nocapture
 python tools/verify.py
 ```
 
@@ -564,8 +565,8 @@ python tools/verify.py
 ## Issue #153 空闲时限的时序断言
 
 ```powershell
-python tools/build.py test --locked issue_153 -- --nocapture
-python tools/build.py test --locked network::directory -- --nocapture
+python tools/build.py test --workspace --locked issue_153 -- --nocapture
+python tools/build.py test --workspace --locked network::directory -- --nocapture
 python tools/verify.py
 ```
 
@@ -575,7 +576,7 @@ python tools/verify.py
 
 ## Issue #104 库来源隔离
 
-专项命令：`cargo test issue_104_ -- --nocapture`；完整验证：`python tools/verify.py`，包含 Debug 构建。
+专项命令：`cargo test --workspace --locked issue_104_ -- --nocapture`；完整验证：`python tools/verify.py`，包含 Debug 构建。
 
 测试通过真实辅助进程、临时目录和生产库调度入口验证：四个网络来源确实进入挂起后，健康库来源及普通本地目录仍能交付；取消与退出等待辅助进程回收；来源和批次去重、原始路径与不连续 Shell 来源索引、部分失败、全失败和空库，以及单来源消费确认背压。另验证流错误终态的真实不存在来源、权限错误与损坏记录分类，内部清理目录过滤，以及本地目录的文件夹大小状态。既有 #103 测试继续覆盖导航和关闭标签后迟到批次与终态拒收。专项日志位于 `artifacts/logs/issue-104/`，并发状态证据为 `artifacts/state/windows-libraries/issue-104-isolation.json`；完整验证汇总仍为 `artifacts/verify/summary.json`。自动测试不连接真实 NAS，不操作 AsterFiles 窗口。
 
@@ -587,7 +588,7 @@ python tools/verify.py
 
 ## Issue #125 打开方式保留列表位置
 
-专项无界面回归：`cargo test --locked issue_125_ -- --nocapture`。测试使用内存菜单数据与 Slint testing backend，不显示桌面窗口、不调用真实 Shell 命令；覆盖打开方式直接命令、无动词和多级动态子项、菜单重建后的稳定 token、未知命令继续刷新，以及完成后的请求、选择和滚动位置保留。
+专项无界面回归：`cargo test --workspace --locked issue_125_ -- --nocapture`。测试使用内存菜单数据与 Slint testing backend，不显示桌面窗口、不调用真实 Shell 命令；覆盖打开方式直接命令、无动词和多级动态子项、菜单重建后的稳定 token、未知命令继续刷新，以及完成后的请求、选择和滚动位置保留。
 
 完整验证运行 `python tools/verify.py`，结果见 `artifacts/verify/summary.json` 与 `artifacts/logs/verify-test.log`。人工验收：打开文件较多的目录，滚动到中后部并选中文件，右键 → Open with → 任意程序；回到 AsterFiles 确认列表和选择保持原位。再从“选择其他应用”进入选择器后取消，确认仍保持原位。
 
@@ -596,7 +597,7 @@ python tools/verify.py
 
 ## Issue #133 复制完成后的选中与滚动
 
-专项命令：`cargo test --locked issue_133 -- --nocapture`；完整验证：`python tools/verify.py`，包含 Debug 构建。测试不操作桌面窗口。
+专项命令：`cargo test --workspace --locked issue_133 -- --nocapture`；完整验证：`python tools/verify.py`，包含 Debug 构建。测试不操作桌面窗口。
 
 后台回归使用临时文件与实际应用状态，串起复制临时项改名、最终刷新、分批提交、选中恢复和延迟监听。相同结果不得生成第二次刷新，且列表数据、选择、焦点与锚点保持不变。另覆盖超过两秒的通知、真实外部修改、临时名前缀的真实文件、加载中通知、过期请求、导航与关闭停止后续读取、慢目录隔离、读取失败和目录快捷方式。
 
@@ -616,7 +617,7 @@ Slint 无窗口后端验证各视图及分组中的目标范围滚动，并派�
 
 ## Issue #141 网络目录增量排序
 
-专项命令：`python tools/build.py test --locked issue_141 -- --nocapture --test-threads=1`；完整验证：`python tools/verify.py`，包含 Debug 构建。
+专项命令：`python tools/build.py test --workspace --locked issue_141 -- --nocapture --test-threads=1`；完整验证：`python tools/verify.py`，包含 Debug 构建。
 
 专项测试使用内存数据和 Slint 无窗口后端，覆盖目标目录排序偏好、五种字段与升降序、多批合并、加载中改变排序、完成时顺序与选择保留、列表插入和滚动位置、分组及网格投影、导航和关闭后迟到结果拒收。另验证网络生产者等待消费确认时，本地目录仍可推进且取消能释放等待。既有 #103、#104 测试覆盖实际辅助进程挂起、超时、取消与本地来源隔离。
 
@@ -628,7 +629,7 @@ Slint 无窗口后端验证各视图及分组中的目标范围滚动，并派�
 
 ## Issue #143 网络目录加载文字防闪烁
 
-专项命令：`python tools/build.py test --locked issue_143 -- --nocapture`；统一验证：`python tools/verify.py --quick`，包含 Debug 构建。测试使用 Slint 无窗口后端和模拟时间，覆盖 499/500 ms 显示边界、刷新不重置等待、快速首批、提示显示后首批到达、空目录与错误、取消与关闭、连续导航和切换标签。测试不显示或操作桌面窗口。
+专项命令：`python tools/build.py test --workspace --locked issue_143 -- --nocapture`；统一验证：`python tools/verify.py --quick`，包含 Debug 构建。测试使用 Slint 无窗口后端和模拟时间，覆盖 499/500 ms 显示边界、刷新不重置等待、快速首批、提示显示后首批到达、空目录与错误、取消与关闭、连续导航和切换标签。测试不显示或操作桌面窗口。
 
 日志为 `artifacts/logs/issue-143-verify.log`、`artifacts/logs/verify-test.log`，汇总为 `artifacts/verify/summary.json`。用户手动进入原网络目录，确认快速加载时不闪现中央文字；较慢时在约半秒后显示，文件出现时消失。等待期间切换本地标签或关闭网络标签，确认按钮响应正常。
 
@@ -653,7 +654,7 @@ Slint 无窗口后端验证各视图及分组中的目标范围滚动，并派�
 
 ## Issue #148 网络运行时异步日志
 
-运行 `cargo test --locked operation_audit -- --nocapture`，再运行 `python tools/verify.py --quick` 和 `cargo build --locked`。专项日志为 `artifacts/logs/issue-148/tests.log`、`quick.log`、`build.log`；退出码汇总为 `artifacts/state/issue-148/result.json`，统一验证汇总为 `artifacts/verify/summary.json`。
+运行 `cargo test --workspace --locked operation_audit -- --nocapture`，再运行 `python tools/verify.py --quick` 和 `cargo build --locked`。专项日志为 `artifacts/logs/issue-148/tests.log`、`quick.log`、`build.log`；退出码汇总为 `artifacts/state/issue-148/result.json`，统一验证汇总为 `artifacts/verify/summary.json`。
 
 阻塞写入器测试在后台暂停期间提交 64 条记录，确认提交先完成，再解除阻塞并冲刷，检查顺序、时间、进程号、请求和中文路径转义。故障测试覆盖线程启动失败、接收端断开及文件打开失败；现有落盘测试检查退出冲刷与重复冲刷。
 
@@ -665,7 +666,7 @@ Slint 无窗口后端验证各视图及分组中的目标范围滚动，并派�
 
 ## Issue #138 目录帧删除与确认竞争
 
-先运行 `python tools/build.py test --locked issue_138 -- --nocapture`，再运行默认并发 `python tools/verify.py`。专项日志为 `artifacts/logs/issue-138/regression-final.log`，完整验证日志为 `artifacts/logs/issue-138/full-verify.log`，汇总为 `artifacts/verify/summary.json`。不要设置较低的 `RUST_TEST_THREADS` 掩盖竞争。
+先运行 `python tools/build.py test --workspace --locked issue_138 -- --nocapture`，再运行默认并发 `python tools/verify.py`。专项日志为 `artifacts/logs/issue-138/regression-final.log`，完整验证日志为 `artifacts/logs/issue-138/full-verify.log`，汇总为 `artifacts/verify/summary.json`。不要设置较低的 `RUST_TEST_THREADS` 掩盖竞争。
 
 专项回归检查真实 Windows 并发删除与属性查询、受控拒绝访问期间的槽位保留、恢复后的确认、持续拒绝访问时的超时和取消回收。真实子进程在完成前后主动 panic，父进程必须拒绝成功并保留原始错误和错误栈。既有 #103、#104 回归继续检查大目录多批传输、混合失败来源、背压和取消。
 
@@ -683,7 +684,7 @@ Slint 无窗口后端验证各视图及分组中的目标范围滚动，并派�
 
 用户手动验收：打开大本地目录及指向网络共享的目录链接，确认首批内容逐步出现；加载期间切换目录、关闭标签或取消，确认旧内容不进入新页面。真实断网只在可中断的测试共享进行，确认其他本地标签仍能打开。不自动操作 AsterFiles 窗口。
 
-`python tools/build.py test --locked issue_150 -- --nocapture` 检查本地慢消费者、满队列取消、接收端关闭、重解析路径身份、十万条目真实进程传输和事件泵单回调确认。随后运行 `python tools/build.py test --locked issue_141 -- --nocapture --test-threads=1` 和完整 `python tools/verify.py`（包含 `cargo build --locked`）。专项日志位于 `artifacts/logs/issue-150/`，机器结果和完整验证副本位于 `artifacts/state/issue-150/`。真实 SMB 断网和视觉交互仍由用户验收，不执行 UI 自动化或本地 Release 构建。
+`python tools/build.py test --workspace --locked issue_150 -- --nocapture` 检查本地慢消费者、满队列取消、接收端关闭、重解析路径身份、十万条目真实进程传输和事件泵单回调确认。随后运行 `python tools/build.py test --workspace --locked issue_141 -- --nocapture --test-threads=1` 和完整 `python tools/verify.py`（包含 `cargo build --locked`）。专项日志位于 `artifacts/logs/issue-150/`，机器结果和完整验证副本位于 `artifacts/state/issue-150/`。真实 SMB 断网和视觉交互仍由用户验收，不执行 UI 自动化或本地 Release 构建。
 
 <a id="issue-154"></a>
 <a id="issue-155"></a>
@@ -702,13 +703,13 @@ Slint 无窗口后端验证各视图及分组中的目标范围滚动，并派�
 
 这些步骤由用户执行。无窗口测试不证明真实窗口视觉已经通过；用户确认前，三个 Issue 保持打开。
 
-专项命令：`python tools/build.py test --locked issue_154 -- --nocapture`、`python tools/build.py test --locked issue_155 -- --nocapture`、`python tools/build.py test --locked issue_156 -- --nocapture`。日志位于 `artifacts/logs/issue-154-156/`、`artifacts/logs/issue-155/` 和 `artifacts/logs/verify-test.log`，汇总为 `artifacts/verify/summary.json`。
+专项命令：`python tools/build.py test --workspace --locked issue_154 -- --nocapture`、`python tools/build.py test --workspace --locked issue_155 -- --nocapture`、`python tools/build.py test --workspace --locked issue_156 -- --nocapture`。日志位于 `artifacts/logs/issue-154-156/`、`artifacts/logs/issue-155/` 和 `artifacts/logs/verify-test.log`，汇总为 `artifacts/verify/summary.json`。
 
 <a id="issue-160"></a>
 
 ## Issue #160 文件右键拖拽
 
-专项命令：`python tools/build.py test --locked issue_160 -- --nocapture`，随后运行 `python tools/build.py test --locked issue_133 -- --nocapture` 和 `python tools/verify.py --quick`（包含 Debug 构建）。日志位于 `artifacts/logs/issue-160/`。
+专项命令：`python tools/build.py test --workspace --locked issue_160 -- --nocapture`，随后运行 `python tools/build.py test --workspace --locked issue_133 -- --nocapture` 和 `python tools/verify.py --quick`（包含 Debug 构建）。日志位于 `artifacts/logs/issue-160/`。
 
 Slint 无窗口后端在详细信息、列表、网格和分组网格的真实条目控件上派发右键：短点击与阈值内移动只在原生释放时打开菜单且不改变选择；越过阈值只启动一次拖拽并抑制菜单；取消、来源刷新和标签切换后既不拖拽也不打开菜单；无原生按下时仅打开菜单；拖拽开始后源条目不再弹出提示（同一悬停的对照会弹出）。原生事件映射单测确认右键按下授权、右键释放结算菜单，其余输入取消。放下端 `right_button` 跟踪与右键效果协商由 `drag_drop.rs` 既有测试覆盖。测试不调用 OLE，无法复现 winit 在模态循环中缓冲事件导致的菜单延迟，也不替代真实桌面验收。
 
@@ -725,7 +726,7 @@ Slint 无窗口后端在详细信息、列表、网格和分组网格的真实�
 
 ## Issue #134 文件夹大小排序完成后的显示顺序
 
-专项命令：`python tools/build.py test --locked issue_134 -- --nocapture`，随后运行完整 `python tools/verify.py`（包含 Debug 构建）。日志位于 `artifacts/logs/issue-134/`；`repro-before-fix.log` 保留旧更新路径下同一测试的失败输出（显示仍为名称顺序，内部已按大小排序）。
+专项命令：`python tools/build.py test --workspace --locked issue_134 -- --nocapture`，随后运行完整 `python tools/verify.py`（包含 Debug 构建）。日志位于 `artifacts/logs/issue-134/`；`repro-before-fix.log` 保留旧更新路径下同一测试的失败输出（显示仍为名称顺序，内部已按大小排序）。
 
 测试使用无窗口后端，经 `begin_complete_sort`、`apply_folder_size_event`、`folder_size_projection` 和 `present_folder_size_projection` 走与 Everything 事件泵相同的回填入口。详细信息、列表、内容、网格及按大小分组的列表与网格中，大小全部到达后显示顺序与排序一致，并与同一状态的完整重绘逐行相同（含组标题和大小文字）；键盘索引、Shift 范围选择与显示位置一致；选中和焦点保持原 `EntryId`；滚动位置、列表与嵌套网格模型、分组布局模型不替换，内部拖拽和框选不被取消；网格槽位索引随条目更新。新导航、已关闭标签和已不再投影的请求不改变当前页面。
 
@@ -742,7 +743,7 @@ Slint 无窗口后端在详细信息、列表、网格和分组网格的真实�
 
 ## Issue #161 大目录全选与选择查询
 
-专项命令：`python tools/build.py test --locked issue_161 -- --nocapture`，随后运行 `python tools/verify.py --quick`（包含 Debug 构建）。日志位于 `artifacts/logs/issue-161/`；`before-fix-tests.log` 保留旧实现下同一测试的耗时。耗时写入 `artifacts/perf/issue-161/`：`before-fix.json` 为修复前，`after-fix.json` 为修复后，`latest.json` 为最近一次运行。
+专项命令：`python tools/build.py test --workspace --locked issue_161 -- --nocapture`，随后运行 `python tools/verify.py --quick`（包含 Debug 构建）。日志位于 `artifacts/logs/issue-161/`；`before-fix-tests.log` 保留旧实现下同一测试的耗时。耗时写入 `artifacts/perf/issue-161/`：`before-fix.json` 为修复前，`after-fix.json` 为修复后，`latest.json` 为最近一次运行。
 
 测试使用无窗口后端和十万条目的详细信息视图，经 `mutate_active_selection` 与 `update_file_rows` 走选择回调的同一路径，测量全选、全选后整窗重绘、200 次 Ctrl 点选、全部取消、Shift 全范围和 Ctrl+Shift 扩展，并检查选择顺序、焦点和锚点。`select_all_scale` 比较 25k、50k、100k 条目的全选耗时，用增长倍数判断复杂度：线性约 4 倍，平方约 16 倍。全选、整窗重绘和范围选择上限各 1000 ms，单次 Ctrl 点选峰值上限 250 ms，增长倍数上限 8。按需行模型见 #165，窗口区域刷新见 #162；单行更新使用模型提供的条目位置索引。
 
@@ -761,7 +762,7 @@ Slint 无窗口后端在详细信息、列表、网格和分组网格的真实�
 在可见终端中运行，测试使用 Slint 无窗口后端：
 
 ```powershell
-cargo test --locked issue_165 -- --nocapture --test-threads=1
+cargo test --workspace --locked issue_165 -- --nocapture --test-threads=1
 ```
 
 十万条目夹具覆盖详细信息、列表、内容、平铺和四种图标尺寸。每种视图分别测试无分组与类型分组，检查初次投影及滚动时生成的 `FileRow` 数量。框选、可见区请求、滚动范围与锚点查询走生产入口。小夹具对照所有分组方式的显示内容与几何，并检查嵌套模型身份。
@@ -771,13 +772,13 @@ cargo test --locked issue_165 -- --nocapture --test-threads=1
 再运行 #134、#141、#146、#154、#155、#156 和 #160 专项，最后运行完整验证。`issue_141` 使用单测试线程：
 
 ```powershell
-cargo test --locked issue_134 -- --nocapture
-cargo test --locked issue_141 -- --nocapture --test-threads=1
-cargo test --locked issue_146 -- --nocapture
-cargo test --locked issue_154 -- --nocapture
-cargo test --locked issue_155 -- --nocapture
-cargo test --locked issue_156 -- --nocapture
-cargo test --locked issue_160 -- --nocapture
+cargo test --workspace --locked issue_134 -- --nocapture
+cargo test --workspace --locked issue_141 -- --nocapture --test-threads=1
+cargo test --workspace --locked issue_146 -- --nocapture
+cargo test --workspace --locked issue_154 -- --nocapture
+cargo test --workspace --locked issue_155 -- --nocapture
+cargo test --workspace --locked issue_156 -- --nocapture
+cargo test --workspace --locked issue_160 -- --nocapture
 python tools/verify.py
 ```
 
@@ -807,11 +808,11 @@ python tools/verify.py
 在可见终端中运行，自动验证不打开 AsterFiles 窗口：
 
 ```powershell
-python tools/build.py test --locked issue_175 -- --nocapture --test-threads=1
-python tools/build.py test --locked issue_134 -- --nocapture
-python tools/build.py test --locked issue_141 -- --nocapture --test-threads=1
-python tools/build.py test --locked issue_150 -- --nocapture
-python tools/build.py test --locked issue_161 -- --nocapture
+python tools/build.py test --workspace --locked issue_175 -- --nocapture --test-threads=1
+python tools/build.py test --workspace --locked issue_134 -- --nocapture
+python tools/build.py test --workspace --locked issue_141 -- --nocapture --test-threads=1
+python tools/build.py test --workspace --locked issue_150 -- --nocapture
+python tools/build.py test --workspace --locked issue_161 -- --nocapture
 python tools/verify.py
 ```
 
@@ -824,7 +825,7 @@ python tools/verify.py
 图标管线另运行：
 
 ```powershell
-python tools/build.py test --locked app::file_images_tests -- --nocapture --test-threads=1
+python tools/build.py test --workspace --locked app::file_images_tests -- --nocapture --test-threads=1
 python tools/verify.py
 ```
 
@@ -847,7 +848,7 @@ python tools/verify.py
 
 ## Issue #177 地址栏退出编辑
 
-先运行 `python tools/build.py test --locked issue_177 -- --nocapture`，再分别运行 `issue_145`、`issue_151` 专项，最后运行 `python tools/verify.py --quick`。专项日志保存到 `artifacts/logs/issue-177/`，统一汇总为 `artifacts/verify/summary.json`；快速验证包含 Debug 构建。
+先运行 `python tools/build.py test --workspace --locked issue_177 -- --nocapture`，再分别运行 `issue_145`、`issue_151` 专项，最后运行 `python tools/verify.py --quick`。专项日志保存到 `artifacts/logs/issue-177/`，统一汇总为 `artifacts/verify/summary.json`；快速验证包含 Debug 构建。
 
 测试使用 Slint 无窗口后端，经编译后的编辑器 Enter 绑定及正式地址校验完成入口，覆盖相同本地目录、不同目录、相同 UNC、无效路径和已退出编辑后的迟到校验。外部点击先经过生产共用的原生按下与菜单清理入口，再派发到编译后的列表、侧栏和空白控件。检查地址栏收起，以及首次选择、侧栏导航和框选起点仍生效。边界测试另确认不取消目录加载；焦点离开后保留搜索请求，再次编辑保留查询、范围和深度；Escape 沿用取消行为。后台路径分类以测试输入代替，不访问网络或打开真实窗口。
 
@@ -866,7 +867,7 @@ python tools/verify.py
 
 ## Temp 监听循环与本地刷新（#176）
 
-运行 `python tools/build.py test --locked issue_176 -- --nocapture`，覆盖真实 Windows 监听下的内部工作目录创建与回收、真实目录辅助进程的工作区过滤、外部重命名、通知合并和完成间隔。另用无窗口后端检查监听及文件操作后台刷新前后的列表、选择、焦点、范围起点和滚动；覆盖编号复用、加载中改选、删除、空目录、取消、失败及迟到结果。无窗口测试不操作真实应用界面。
+运行 `python tools/build.py test --workspace --locked issue_176 -- --nocapture`，覆盖真实 Windows 监听下的内部工作目录创建与回收、真实目录辅助进程的工作区过滤、外部重命名、通知合并和完成间隔。另用无窗口后端检查监听及文件操作后台刷新前后的列表、选择、焦点、范围起点和滚动；覆盖编号复用、加载中改选、删除、空目录、取消、失败及迟到结果。无窗口测试不操作真实应用界面。
 
 随后分别运行 `issue_133`、`issue_138`、`issue_150`、`issue_153` 专项，再运行完整 `python tools/verify.py`。日志位于 `artifacts/logs/issue-176/`，统一汇总为 `artifacts/verify/summary.json`。完整验证更新 `target/debug/asterfiles.exe`。
 
@@ -884,7 +885,7 @@ python tools/verify.py
 
 ## 滚动条离窗释放（#178）
 
-运行 `python tools/build.py test --locked issue_178 -- --nocapture`，再运行 `python tools/verify.py --quick`。快速验证包含 Debug 构建。专项日志为 `artifacts/logs/issue-178/tests.log`，快速验证日志为 `artifacts/logs/issue-178/quick.log`；专项退出码位于 `artifacts/state/issue-178/tests-result.json`，统一汇总为 `artifacts/verify/summary.json`。
+运行 `python tools/build.py test --workspace --locked issue_178 -- --nocapture`，再运行 `python tools/verify.py --quick`。快速验证包含 Debug 构建。专项日志为 `artifacts/logs/issue-178/tests.log`，快速验证日志为 `artifacts/logs/issue-178/quick.log`；专项退出码位于 `artifacts/state/issue-178/tests-result.json`，统一汇总为 `artifacts/verify/summary.json`。
 
 Windows 下，Slint 在鼠标按住离窗时保留抓取。原生事件入口仅在滚动条占用鼠标时补发内部退出事件，清除按下和拖动状态；滚动条同时处理取消通知。文件视图、横向滚动条和设置页采用相同释放规则。Esc 先取消滚动条拖动，不继续清除文件选择。
 
@@ -903,7 +904,7 @@ Windows 下，Slint 在鼠标按住离窗时保留抓取。原生事件入口仅
 
 ## 窗口区域刷新（#162）
 
-运行 `python tools/build.py test --locked issue_162 -- --nocapture --test-threads=1`，再分别运行 `issue_141`（加 `--test-threads=1`）、`issue_134`、`issue_146`、`issue_154`、`issue_155`、`issue_156` 专项，最后运行完整 `python tools/verify.py`。日志保存到 `artifacts/logs/issue-162/`，统一汇总为 `artifacts/verify/summary.json`；完整验证更新 Debug 程序。
+运行 `python tools/build.py test --workspace --locked issue_162 -- --nocapture --test-threads=1`，再分别运行 `issue_141`（加 `--test-threads=1`）、`issue_134`、`issue_146`、`issue_154`、`issue_155`、`issue_156` 专项，最后运行完整 `python tools/verify.py`。日志保存到 `artifacts/logs/issue-162/`，统一汇总为 `artifacts/verify/summary.json`；完整验证更新 Debug 程序。
 
 无窗口测试覆盖八种视图及类型分组，检查同列数缩放、主题、侧栏、任务进度、状态和列布局变化后的文件、网格与嵌套模型身份；同时核对选择、焦点、滚动、重命名和拖拽未受干扰。跨列数缩放检查重排后的屏幕锚点；后台标签和旧请求仍遵守身份隔离。十万条目的缩放耗时写入 `artifacts/perf/issue-162/`：`before-fix.json` 为修改前基线，`after-fix.json` 为验收数据，`latest.json` 为最近测量。
 
@@ -919,7 +920,7 @@ Windows 下，Slint 在鼠标按住离窗时保留抓取。原生事件入口仅
 
 ## 网络复制专项验证（#136）
 
-`target/debug/asterfiles.exe --agent-network-copy-probe '<至少 128 MiB 的源文件路径>'` 运行真实父进程与网络辅助进程，无应用界面。探针只读取来源，在 `artifacts/state/issue-136/parent-probe/` 创建独占目标，验证实际暂停、保持 12 秒不增长、继续及暂停中取消，随后回收进程并清理目标。结果写入该目录的 `result.json`。请使用足够大的文件，避免传输在请求暂停前完成；来源不会被删除或修改。单元回归使用 `cargo test --locked issue_136 -- --nocapture`，真实界面仍由用户验收。
+`target/debug/asterfiles.exe --agent-network-copy-probe '<至少 128 MiB 的源文件路径>'` 运行真实父进程与网络辅助进程，无应用界面。探针只读取来源，在 `artifacts/state/issue-136/parent-probe/` 创建独占目标，验证实际暂停、保持 12 秒不增长、继续及暂停中取消，随后回收进程并清理目标。结果写入该目录的 `result.json`。请使用足够大的文件，避免传输在请求暂停前完成；来源不会被删除或修改。单元回归使用 `cargo test --workspace --locked issue_136 -- --nocapture`，真实界面仍由用户验收。
 
 <a id="issue-137"></a>
 
@@ -927,33 +928,49 @@ Windows 下，Slint 在鼠标按住离窗时保留抓取。原生事件入口仅
 
 `target/debug/asterfiles.exe --agent-network-copy-probe --stall` 验证未暂停且连续 15 秒无进度后仍完成复制，以及等待中取消在 3 秒内回收辅助进程。结果位于 `artifacts/state/issue-137/stall-probe/result.json`。
 
-`target/debug/asterfiles.exe --agent-network-copy-probe --complete '<源文件路径>'` 通过真实父进程和辅助进程完整复制，再逐字节比较内容并清理测试副本。比较会再次读取来源；来源始终只读。进度、结果及错误位于 `artifacts/state/issue-137/complete-probe/`。受控中断恢复测试使用 `cargo test --locked robocopy -- --nocapture`，快照并发测试使用 `cargo test --locked issue_137 -- --nocapture`。受控测试不等于真实断开 NAS 网络。 Windows 已请求终止但退出事件未触发的回归使用 `cargo test --locked issue_137_pending -- --nocapture`；退出等待上限为 250 ms，旧暂存文件退休隔离。`artifacts/state/issue-137/disconnect-live/` 保存真实挂起现场的线程栈和进程等待信号；`network-copy-retired` / `network-copy-cleanup-deferred` 审计保存尚未完成系统回收的精确路径。
+`target/debug/asterfiles.exe --agent-network-copy-probe --complete '<源文件路径>'` 通过真实父进程和辅助进程完整复制，再逐字节比较内容并清理测试副本。比较会再次读取来源；来源始终只读。进度、结果及错误位于 `artifacts/state/issue-137/complete-probe/`。受控中断恢复测试使用 `cargo test --workspace --locked robocopy -- --nocapture`，快照并发测试使用 `cargo test --workspace --locked issue_137 -- --nocapture`。受控测试不等于真实断开 NAS 网络。 Windows 已请求终止但退出事件未触发的回归使用 `cargo test --workspace --locked issue_137_pending -- --nocapture`；退出等待上限为 250 ms，旧暂存文件退休隔离。`artifacts/state/issue-137/disconnect-live/` 保存真实挂起现场的线程栈和进程等待信号；`network-copy-retired` / `network-copy-cleanup-deferred` 审计保存尚未完成系统回收的精确路径。
 
-`target/debug/asterfiles.exe --agent-network-copy-probe --resume-complete '<至少 256 MiB 的源文件路径>'` 在真实传输达到 128 MiB 后暂停，确认后保持 2 秒，再继续到完整复制并逐字节比较。结果仍写入 `artifacts/state/issue-137/complete-probe/` 的独占运行目录；`network-copy-block-start` 审计记录恢复读取的位置。NAS→本地块续传回归使用 `cargo test --locked issue_137_block_download -- --nocapture`，槽位上限回归使用 `cargo test --locked issue_137_read_limit -- --nocapture`。恢复仅覆盖当前任务，不覆盖应用退出或崩溃。读取与元数据查询共用 4 个槽位，旧 Windows I/O 必须真正退出才释放槽位；槽位耗尽时仍可暂停取消。
+`target/debug/asterfiles.exe --agent-network-copy-probe --resume-complete '<至少 256 MiB 的源文件路径>'` 在真实传输达到 128 MiB 后暂停，确认后保持 2 秒，再继续到完整复制并逐字节比较。结果仍写入 `artifacts/state/issue-137/complete-probe/` 的独占运行目录；`network-copy-block-start` 审计记录恢复读取的位置。NAS→本地块续传回归使用 `cargo test --workspace --locked issue_137_block_download -- --nocapture`，槽位上限回归使用 `cargo test --workspace --locked issue_137_read_limit -- --nocapture`。恢复仅覆盖当前任务，不覆盖应用退出或崩溃。读取与元数据查询共用 4 个槽位，旧 Windows I/O 必须真正退出才释放槽位；槽位耗尽时仍可暂停取消。
 
 <a id="issue-149"></a>
 
 ## 复制执行上下文专项验证（#149）
 
-`python tools/build.py test --locked issue_149 -- --nocapture` 验证本地无需登记、隔离缺登记拒绝、跨线程与并发上下文隔离、递归复制和移动的登记失败保护，以及恢复结束复位。随后运行 `python tools/build.py test --locked issue_137 -- --nocapture`、完整 `python tools/verify.py`，并复用 #137 的慢源、真实 NAS 暂停续传和取消探针。日志位于 `artifacts/logs/issue-149/`，独立汇总位于 `artifacts/state/issue-149/`。不执行 UI 自动化或本地 Release 构建。
+`python tools/build.py test --workspace --locked issue_149 -- --nocapture` 验证本地无需登记、隔离缺登记拒绝、跨线程与并发上下文隔离、递归复制和移动的登记失败保护，以及恢复结束复位。随后运行 `python tools/build.py test --workspace --locked issue_137 -- --nocapture`、完整 `python tools/verify.py`，并复用 #137 的慢源、真实 NAS 暂停续传和取消探针。日志位于 `artifacts/logs/issue-149/`，独立汇总位于 `artifacts/state/issue-149/`。不执行 UI 自动化或本地 Release 构建。
 
 <a id="issue-151"></a>
 
 ## 标签导航状态转换专项验证（#151）
 
-`python tools/build.py test --locked issue_151 -- --nocapture` 检查成功、部分成功、失败、取消、迟到与重复终态、位置身份、历史和网络选择。随后运行 `python tools/verify.py --quick`，包含 Debug 构建。专项日志位于 `artifacts/logs/issue-151/`，机器结果及统一汇总副本位于 `artifacts/state/issue-151/`。真实视觉和交互由用户手动验收，不自动操作 UI，不执行本地 Release 构建。
+`python tools/build.py test --workspace --locked issue_151 -- --nocapture` 检查成功、部分成功、失败、取消、迟到与重复终态、位置身份、历史和网络选择。随后运行 `python tools/verify.py --quick`，包含 Debug 构建。专项日志位于 `artifacts/logs/issue-151/`，机器结果及统一汇总副本位于 `artifacts/state/issue-151/`。真实视觉和交互由用户手动验收，不自动操作 UI，不执行本地 Release 构建。
 
 <a id="issue-157"></a>
 
 ## OpenList WebDAV 专项验证（#157）
 
-`python tools/build.py test --locked webdav -- --nocapture` 检查路径身份、流式目录、取消与背压、HTTP 错误、跨源下载剥离凭据、冲突和会话往返。随后运行完整 `python tools/verify.py`，包含 Debug 构建。专项日志位于 `artifacts/logs/webdav/`，机器结果位于 `artifacts/state/webdav/`，统一汇总为 `artifacts/verify/summary.json`。真实连接、浏览、下载和重启由用户手动验收，不自动操作 UI，不执行本地 Release 构建，也不对用户 NAS 发起探针。
+`python tools/build.py test --locked -p asterfiles-webdav -- --nocapture` 和 `python tools/build.py test --locked -p asterfiles webdav -- --nocapture` 检查路径身份、流式目录、取消与背压、HTTP 错误、跨源下载剥离凭据、冲突和会话往返。随后运行完整 `python tools/verify.py`，包含 Debug 构建。专项日志位于 `artifacts/logs/webdav/`，机器结果位于 `artifacts/state/webdav/`，统一汇总为 `artifacts/verify/summary.json`。真实连接、浏览、下载和重启由用户手动验收，不自动操作 UI，不执行本地 Release 构建，也不对用户 NAS 发起探针。
 
 <a id="issue-163"></a>
 
 ## 应用协调层拆分验证（#163）
 
-运行 `python tools/build.py test --locked -- --list` 保存修改前后的测试清单，再运行完整 `python tools/verify.py`，包含 Debug 构建与全部无界面场景。测试数量及名称必须一致；`src/app.rs` 和新增运行时模块不得出现超过 1000 行的函数。日志位于 `artifacts/logs/issue-163/`，清单与结构对比位于 `artifacts/state/issue-163/`，统一汇总为 `artifacts/verify/summary.json`。职责入口见 [架构索引](../architecture.md)；本任务不操作 UI。
+运行 `python tools/build.py test --workspace --locked -- --list` 保存修改前后的测试清单，再运行完整 `python tools/verify.py`，包含 Debug 构建与全部无界面场景。测试数量及名称必须一致；`src/app.rs` 和新增运行时模块不得出现超过 1000 行的函数。日志位于 `artifacts/logs/issue-163/`，清单与结构对比位于 `artifacts/state/issue-163/`，统一汇总为 `artifacts/verify/summary.json`。职责入口见 [架构索引](../architecture.md)；本任务不操作 UI。
+
+<a id="issue-166"></a>
+
+## Cargo 工作区与依赖边界（#166）
+
+在仓库根目录运行 `python tools/check_workspace.py`，再运行完整 `python tools/verify.py` 和 `python tools/verify.py --release`。后者执行本地 Release 构建，不发布。统一入口检查全部成员的格式、Clippy 和测试，Debug 及本地 Release 程序继续输出到原来的 `target/` 路径。
+
+依赖检查读取 Cargo 的实际普通依赖图。领域包的全部传递依赖不得包含 `windows`、`windows-sys` 或 `slint`；应用的普通直接依赖不得包含 Windows API 包；UI 包的传递依赖不得包含领域、平台或 WebDAV。报告写入 `artifacts/state/issue-166/workspace.json`，统一验证汇总仍为 `artifacts/verify/summary.json`。
+
+构建比较使用相同工具链、kache 和禁用 Rust 增量编译的配置。先热构建，再分别只修改应用入口或领域文件，运行 `cargo build --locked` 计时；恢复文件后重新构建。拆分前为 `artifacts/perf/issue-166/before.json`，拆分后为 `after.json`，同目录保留各次构建日志。比较单文件改动的构建时间，并从日志确认 Slint 生成代码是否复用。
+
+单文件测量结果（秒）：应用入口由 88.925 降至 11.264，领域由 94.351 降至 16.451。两次改动均复用 UI 包；原始日志与测量条件保留在同目录，汇总为 `comparison.json`。每项测量一次，不包含首次热构建。
+
+专项测试可用 `python tools/build.py test --workspace --locked <名称> -- --nocapture`。WebDAV 包内测试用 `-p asterfiles-webdav` 选择，不再用迁移前的 `webdav` 模块名前缀过滤。平台跨包测试辅助仅通过开发依赖的 `test-support` 启用，普通程序构建不包含故障注入；目录测试子进程仍实际运行共享的生产枚举与批次协议。
+
+CI 使用同一完整验证入口。云端运行链接、测试结果和构建比较摘要回写 GitHub Issue，不在本文件维护完成状态。
 
 ## 文件操作人工验证矩阵
 

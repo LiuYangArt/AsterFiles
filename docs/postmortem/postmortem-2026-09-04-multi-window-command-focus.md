@@ -62,7 +62,7 @@
 ## 长期排查入口
 
 - 窗口作用域、文件命令、异步事件和菜单协调：`src/app.rs`
-- Windows owner 与前台归属判断：`src/platform/windows/quick_menu_window.rs`
+- Windows owner 与前台归属判断：`crates/platform-windows/src/windows/quick_menu_window.rs`
 - 快速菜单窗口链状态：`src/quick_menu_popup.rs`
 - 长期路径、标签和任务身份边界：`docs/foundation-plan.md`
 - Windows 菜单边界：`docs/windows-shell-menu-feature.md`

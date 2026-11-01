@@ -70,7 +70,7 @@ Issue #7 手动验收确认：窗口失焦后，鼠标移回但不先点击，�
 
 - 文件列表 UI：`ui/app-window.slint`
 - 鼠标、导航与打开协调：`src/app.rs`
-- 当前可见列表语义：`src/domain.rs`
-- Windows 双击系统设置：`src/platform.rs`
+- 当前可见列表语义：`crates/domain/src/lib.rs`
+- Windows 双击系统设置：`crates/platform-windows/src/lib.rs`
 - 交互设计：`docs/ui-interaction-design.md`
 - Release：`target/release/asterfiles.exe`

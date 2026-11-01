@@ -7183,9 +7183,13 @@ fn issue_154_rename_is_dismissed_when_target_disappears_or_request_changes() {
 }
 #[test]
 fn rename_validation_keeps_invalid_names_out_of_operation_queue() {
-    assert!(crate::fs::file_operations::validate_name(std::ffi::OsStr::new("")).is_err());
-    assert!(crate::fs::file_operations::validate_name(std::ffi::OsStr::new("bad?.txt")).is_err());
-    assert!(crate::fs::file_operations::validate_name(std::ffi::OsStr::new("valid.txt")).is_ok());
+    assert!(crate::domain::name_validation::validate_name(std::ffi::OsStr::new("")).is_err());
+    assert!(
+        crate::domain::name_validation::validate_name(std::ffi::OsStr::new("bad?.txt")).is_err()
+    );
+    assert!(
+        crate::domain::name_validation::validate_name(std::ffi::OsStr::new("valid.txt")).is_ok()
+    );
     assert!(!keyboard_shortcuts_suppressed(false, false));
     assert!(keyboard_shortcuts_suppressed(true, false));
 }

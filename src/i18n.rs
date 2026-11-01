@@ -42,9 +42,9 @@ impl Texts {
 
     pub fn rename_validation(
         self,
-        error: crate::fs::file_operations::NameValidationError,
+        error: crate::domain::name_validation::NameValidationError,
     ) -> String {
-        use crate::fs::file_operations::NameValidationError;
+        use crate::domain::name_validation::NameValidationError;
         match error {
             NameValidationError::Empty => self
                 .choose("名称不能为空。", "The name cannot be empty.")

@@ -22,7 +22,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ## Files Community Shell selection
 
-The Shell selection receiver lifecycle in src/platform/windows/shell_select_trap.rs is adapted from Files.App.Launcher/OpenInFolder.cpp in Files (https://github.com/files-community/Files).
+The Shell selection receiver lifecycle in crates/platform-windows/src/windows/shell_select_trap.rs is adapted from Files.App.Launcher/OpenInFolder.cpp in Files (https://github.com/files-community/Files).
 
 MIT License
 

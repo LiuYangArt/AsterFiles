@@ -238,7 +238,7 @@ platform/windows：Shell、WNet、凭据和 UNC 系统调用
 fs / OperationManager：共享、目录浏览与完整文件操作
 ```
 
-UI 不调用 `exists`、`is_dir`、目录枚举、Shell、WNet、凭据或网络 API。Windows/SMB 实现集中在 `platform/windows`；未来协议实现不能散落进 UI 或把 URI 塞进 `PathBuf`。
+UI 不调用 `exists`、`is_dir`、目录枚举、Shell、WNet、凭据或网络 API。Windows/SMB 实现集中在 `crates/platform-windows/src/windows`；未来协议实现不能散落进 UI 或把 URI 塞进 `PathBuf`。
 
 ## 12. 持久化
 

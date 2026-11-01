@@ -60,9 +60,9 @@
 ## 长期排查入口
 
 - 任务窗口协调与进度合并：`src/app.rs`
-- 任务状态、暂停和取消：`src/domain/file_operations.rs`
-- 文件操作边界：`src/fs/file_operations.rs`
-- Windows 原生复制取消：`src/platform/windows/copy_file.rs`
+- 任务状态、暂停和取消：`crates/domain/src/file_operations.rs`
+- 文件操作边界：`crates/platform-windows/src/fs/file_operations.rs`
+- Windows 原生复制取消：`crates/platform-windows/src/windows/copy_file.rs`
 - 任务窗口布局：`ui/app-window.slint`
 - 窗口诊断日志：`artifacts/logs/window-interaction-diagnostic.jsonl`
 - 任务记录：GitHub Issue #62

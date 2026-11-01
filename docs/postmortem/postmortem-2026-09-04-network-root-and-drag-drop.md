@@ -82,9 +82,9 @@
 ## 长期排查入口
 
 - 网络导航、结果投影与窗口退出：`src/app.rs`
-- UNC 身份、发现状态与辅助进程：`src/network.rs`
-- Windows 网络命名空间和共享枚举：`src/platform/windows/network.rs`
-- 原生拖放注册生命周期：`src/platform/windows/drag_drop.rs`
+- UNC 身份、发现状态与辅助进程：`crates/domain/src/network.rs`
+- Windows 网络命名空间和共享枚举：`crates/platform-windows/src/windows/network.rs`
+- 原生拖放注册生命周期：`crates/platform-windows/src/windows/drag_drop.rs`
 - 侧栏与文件列表布局：`ui/app-window.slint`
 - 长期网络边界：`docs/network-locations-and-smb-plan.md`
 - 后续完整隔离与兼容性矩阵：[Issue #42](https://github.com/LiuYangArt/AsterFiles/issues/42)

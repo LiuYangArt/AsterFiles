@@ -101,8 +101,8 @@ P3 补充“复制或移动完成后选中最终目标”时，先出现目标�
 
 - 行指针事件：`ui/app-window.slint`
 - 点击、拖动候选和操作完成协调：`src/app.rs`
-- 选择、焦点、锚点与刷新提交：`src/domain.rs`
-- 目录监听：`src/platform/windows/directory_watch.rs`
+- 选择、焦点、锚点与刷新提交：`crates/domain/src/lib.rs`
+- 目录监听：`crates/platform-windows/src/windows/directory_watch.rs`
 - 自动验证汇总：`artifacts/verify/summary.json`
 - 相关提交：`bdb1dca`、`26af40b`
 
@@ -147,6 +147,6 @@ Issue #53 的真实窗口验收又发现两类相关表现：AsterFiles 窗口�
 3. 目录提交后会清除加载取消标志，后续监听采样不能借用该标志。每个路径读取前重新校验标签、请求、目录和显示设置，读盘前释放锁。
 4. 后台重排只维持原本可见的选中结果，不追踪用户已滚离的目标。窗口激活、双击、右键和按下阶段的选择规则单独回归。
 
-本次保留 26 项专项回归，分别位于 `src/app/directory_watch_refresh.rs`、`copy_selection_tests.rs`、`copy_interaction_tests.rs` 和 `src/fs/directory_reader.rs`。完整 Debug 验证曾通过 818 项测试及 21 个无界面场景。另有一次既有库来源测试的辅助进程以 101 退出；独立重跑及随后完整验证通过，原因尚未确定。首次失败和独立复查日志分别为 `artifacts/logs/issue-133-full-test-first-failure.log` 与 `issue-133-library-recheck.log`。
+本次保留 26 项专项回归，分别位于 `src/app/directory_watch_refresh.rs`、`copy_selection_tests.rs`、`copy_interaction_tests.rs` 和 `crates/platform-windows/src/fs/directory_reader.rs`。完整 Debug 验证曾通过 818 项测试及 21 个无界面场景。另有一次既有库来源测试的辅助进程以 101 退出；独立重跑及随后完整验证通过，原因尚未确定。首次失败和独立复查日志分别为 `artifacts/logs/issue-133-full-test-first-failure.log` 与 `issue-133-library-recheck.log`。
 
 收尾简化只合并了监听采样中重复的目录分组代码，移除重复传递的刷新判断值；并发、取消、重试、日志和交互语义保持原样。最终收尾验证及本地 Release 构建记录写入 `artifacts/verify/summary.json`，提交与完成状态只在 Issue 和 Project 中维护。审查发现的既有文件夹大小排序投影问题另由 [Issue #134](https://github.com/LiuYangArt/AsterFiles/issues/134) 跟踪。

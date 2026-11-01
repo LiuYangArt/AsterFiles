@@ -75,7 +75,7 @@ Slint 里留下 `external-tab-dragging`、`external-tab-insertion-index`、`tab-
 ## 长期排查入口
 
 - 拖动状态机：`src/app.rs` 中的 `TabDragSession` 及相关回调。
-- 原生拖动卡片与指示器：`src/platform/windows/tab_drag_indicator.rs`。
+- 原生拖动卡片与指示器：`crates/platform-windows/src/windows/tab_drag_indicator.rs`。
 - 插槽计算：`compute_tab_insertion_slot` / `hit_test_tab_bar`。
 - Slint 标签栏：`ui/app-window.slint`。
 - 自动验证汇总：`artifacts/verify/summary.json`。

@@ -10,6 +10,14 @@
 
 FTP、SFTP 等协议继续后置。WebDAV 首个切片已经接入，可以添加 OpenList 位置、浏览目录，并把文件或选定目录下载到本地。设计见 [WebDAV 网络位置实施方案](network-locations-and-webdav-plan.md)，关联 #157。上传、重命名和删除仍不在这个切片里。远端使用独立身份和后台客户端，不把 URL 伪装成 Windows 路径。
 
+## 工作区依赖边界（#166）
+
+根应用只组装领域、Windows 平台、WebDAV 和 UI 四个包。领域包保存原始路径、条目、标签、任务及网络身份，不依赖 Windows API 或 Slint。平台与 WebDAV 分别依赖领域包，不反向依赖应用或 UI；Slint 生成代码由独立 UI 包编译。
+
+所有 Windows Shell、COM、凭据和系统查询集中在 `crates/platform-windows/src/`。应用通过平台入口调用，不直接依赖 Windows API 包。WebDAV 客户端位于 `crates/webdav/src/`，共享领域名称规则，凭据由应用从平台取出后传入。文件系统执行与隔离辅助进程仍在同一个平台包，维持原有取消、背压及原始路径身份。
+
+包拆分不改变 `TabId + RequestId` 隔离、分批显示、文件操作或本地化语义。目录和网络工作继续在后台执行。包的职责入口见 [架构索引](architecture.md#cargo-工作区边界166)，依赖检查和构建比较见 [#166 验证](agent/debug-validation.md#issue-166)。
+
 ## 必须长期保持的边界
 
 - 文件和目录身份留在 Rust：使用 `PathBuf/OsString` 或稳定 ID。Slint 只接收展示文本和稳定 ID。
@@ -131,7 +139,7 @@ Issue #24 在此边界上增加每窗口短期展示快照和当前上下文预�
 
 拖入 AsterFiles 的真实文件系统对象只产生用户意图和原始路径快照，复制、移动、冲突、取消和进度继续由 P2 窗口级 `OperationManager` 执行；不得建立第二套文件操作引擎。拖出到 Explorer 时，AsterFiles 只提供标准 Shell 数据对象和允许效果，最终复制、移动或创建快捷方式由目标应用执行。
 
-OLE 的 `IDataObject`、`IDropSource`、`IDropTarget`、窗口注册和拖放循环集中在 `platform/windows/drag_drop`。COM 对象遵守 STA 与窗口线程亲和，UI 不枚举目录、读取元数据或执行磁盘操作。拖动开始时由应用协调层把 `TabId + EntryId` 固定为原始路径快照；拖入任务沿用独立 `OperationId`，拖放不得复用导航 `RequestId`。操作后的路径变化继续广播给所有相关标签，外部目标无法返回可靠结果时只定向刷新，不猜测或伪造移动成功。
+OLE 的 `IDataObject`、`IDropSource`、`IDropTarget`、窗口注册和拖放循环集中在 `crates/platform-windows/src/windows/drag_drop`。COM 对象遵守 STA 与窗口线程亲和，UI 不枚举目录、读取元数据或执行磁盘操作。拖动开始时由应用协调层把 `TabId + EntryId` 固定为原始路径快照；拖入任务沿用独立 `OperationId`，拖放不得复用导航 `RequestId`。操作后的路径变化继续广播给所有相关标签，外部目标无法返回可靠结果时只定向刷新，不猜测或伪造移动成功。
 
 P3.D0 已完成：winit 自带的固定 COPY 文件目标在窗口属性阶段关闭，AsterFiles 在首个原生窗口事件到达、真实 HWND 可用后，于同一 winit/STA 线程初始化 OLE 并注册自有 `IDropTarget`，生命周期覆盖 `ui.run()`，退出严格执行 `RevokeDragDrop`、释放目标、`OleUninitialize`。底座记录进入、移动、离开、放下与撤销事件，并由后续 D1 扩展为 `CF_HDROP` 接收和文件任务提交。确定性状态写入 `artifacts/state/drag-drop/foundation.json`。
 
@@ -152,7 +160,7 @@ P3 产品决策汇总见 [P3 Windows 原生集成决策摘要](p3-windows-integr
 
 ## Everything 平台边界（2026-08-30）
 
-Everything 适配统一位于 `platform/windows/everything.rs`，不分发 SDK DLL。搜索、状态、分页和排序使用官方 WM_COPYDATA Query2；文件夹大小使用 Everything 1.5 的 Everything3 命名管道命令 18，直接按完整 UTF-8 原始路径读取索引值。两条官方 IPC 通道严格分工，大小不再通过搜索结果间接推导。
+Everything 适配统一位于 `crates/platform-windows/src/windows/everything.rs`，不分发 SDK DLL。搜索、状态、分页和排序使用官方 WM_COPYDATA Query2；文件夹大小使用 Everything 1.5 的 Everything3 命名管道命令 18，直接按完整 UTF-8 原始路径读取索引值。两条官方 IPC 通道严格分工，大小不再通过搜索结果间接推导。
 
 Everything 使用后台工作线程和 Query2 专用消息窗口，不占目录、Shell 图标或文件操作线程，也不在 Slint UI 线程执行 IPC、进程、路径或索引操作。命名管道只连接已保存实例，跨请求复用；断线后当前请求最多受控重连一次。搜索批次按 `TabId + RequestId + PageSource` 接受，文件夹大小另校验 `EntryId + 原始路径`；所有读写均有有限超时并在超时后取消。UNC 导航仍由目录工作池负责，未索引 UNC 不解析、不计算大小、不递归回退。
 Issue #14 将设置入口明确整理为“连接配置、连接状态与操作、使用说明”三层。程序路径支持通过系统文件选择器选取 `Everything64.exe`；文件选择、路径检查、进程启动、IPC 与有限状态轮询继续通过应用协调层和 Windows 平台层在后台完成，不进入 UI 线程。`1.5a` 明确作为 Everything 实例名而非版本号，配置变化会失效旧验证状态。连接测试与启动必须即时显示进行中状态，并把版本、实例、数据库、文件夹大小索引及失败处理建议映射为完整中英文用户文案。页面同时说明搜索与文件夹大小的依赖边界、后台运行与索引要求，以及普通目录和 UNC 导航不依赖 Everything、未索引位置不递归回退、AsterFiles 不修改索引配置。
@@ -170,11 +178,11 @@ Issue #7 将 `TabSession` 保持为选择、焦点和锚点的唯一状态来源
 Issue #5 将文件夹大小改为标签级双策略调度。普通名称、类型和时间排序只依据 `file-viewport-y / 40px` 选择可见行及前后一屏，每次最多新增 24 项；大小排序冻结 `EntryId + 原始路径` 快照，失败状态也计入完成，全部目录到达终态后才一次写回、稳定排序和刷新。32 项有界队列与 24 项在途窗口避免大目录无界堆积；worker 按小批次优先处理活动标签，并在每次 IPC 前复核 `TabId + RequestId + 调度代次`，导航、刷新、切换排序、关闭标签或退出后的旧工作直接跳过。普通回填仅更新受影响行，完整排序期间条目顺序与选择身份不变，状态栏显示本地化完成进度。
 Issue #6 在这条统一选择投影上增加窗口级框选手势，不保存路径或另建选择状态。空白起点与条目拖放从按下时即分流；选择计算始终以按下快照、稳定 `EntryId` 和视图几何为依据。详情、列表、网格分别使用 40px、34px 与 140px 卡片/148px 行距；Everything 使用稀疏结果身份换算布局位置，只有已经进入 `TabSession` 的真实条目可命中。指针事件即时投影轻量矩形，选择结算与边缘滚动合并到 16ms 节拍；几何命中按覆盖行列枚举，后续只更新命中差异，不扫描或刷新整表。边缘滚动继续使用当前视口并触发搜索分页；标签或 `RequestId` 变化、Escape、失焦统一取消手势，后台字段局部回填不得替换模型或中断框选。
 
-验证命令为 `cargo test --no-fail-fast`、`python tools/verify.py`、`cargo build`；汇总位于 `artifacts/verify/summary.json`，Everything 实证日志写入 `artifacts/logs/`。
+验证命令为 `cargo test --workspace --locked --no-fail-fast`、`python tools/verify.py`、`cargo build`；汇总位于 `artifacts/verify/summary.json`，Everything 实证日志写入 `artifacts/logs/`。
 
 ## Issue #44 Windows Libraries 边界
 
-Windows Library 是 Shell 管理的虚拟容器，不能伪装为普通目录交给 `std::fs::read_dir`，也不解析 `.library-ms` XML 作为主实现。库枚举、固定状态、名称、顺序、图标、来源目录和默认保存目录均以 `FOLDERID_Libraries`、`IShellLibrary`、`IShellItem` 等 Windows Shell 接口为准，并集中在 `src/platform/windows` 的后台链路。库文件路径或 Shell parsing name 是稳定身份；展示名称不得反向用于打开、选择或文件操作。文件列表空白处的 Windows 背景菜单同样以该原始 Shell parsing name 创建，不能退化为默认保存目录、任一来源路径或 `.library-ms` 展示路径；Shell 返回的默认保存目录只可作为 PowerShell 等需要物理工作目录的命令参数。菜单请求继续按窗口、标签和导航代次拒绝迟到结果，失败必须清除加载占位并记录日志。
+Windows Library 是 Shell 管理的虚拟容器，不能伪装为普通目录交给 `std::fs::read_dir`，也不解析 `.library-ms` XML 作为主实现。库枚举、固定状态、名称、顺序、图标、来源目录和默认保存目录均以 `FOLDERID_Libraries`、`IShellLibrary`、`IShellItem` 等 Windows Shell 接口为准，并集中在 `crates/platform-windows/src/windows` 的后台链路。库文件路径或 Shell parsing name 是稳定身份；展示名称不得反向用于打开、选择或文件操作。文件列表空白处的 Windows 背景菜单同样以该原始 Shell parsing name 创建，不能退化为默认保存目录、任一来源路径或 `.library-ms` 展示路径；Shell 返回的默认保存目录只可作为 PowerShell 等需要物理工作目录的命令参数。菜单请求继续按窗口、标签和导航代次拒绝迟到结果，失败必须清除加载占位并记录日志。
 
 侧栏的库列表属于应用级异步状态，使用独立加载代次同步投影到所有窗口；Explorer 创建、修改、删除、重命名和固定状态变化只触发受控重新枚举，迟到结果不得恢复旧列表。点击库后，当前标签保存库身份并继续使用 `TabId + RequestId` 加载；库的多个真实来源分批合并，并强制按 Shell 来源顺序分组。组头使用 Shell 来源显示名和真实路径，稳定 Shell 身份只用于内部区分；每个条目始终保留来源目录下的原始 `PathBuf` 和稳定 `EntryId`，同名来源与同名条目不得合并或覆盖。来源分组同时用于列表、网格、命中和选择，普通“分组依据”不在库页面叠加第二层。刷新、组内排序、选择、搜索、历史、标签关闭和退出沿用普通目录的请求取消与迟到结果拒收规则。
 
@@ -233,7 +241,7 @@ Issue #9 进一步取消十万级搜索结果对 Slint 物理内容高度的依�
 
 ### Issue #60 Windows 原生文件复制（2026-09-07）
 
-Windows 单文件复制统一由 `platform/windows` 的 `CopyFile2` 适配层执行；目录遍历、冲突选择、任务进度和跨卷移动继续由文件操作层负责。每个文件先复制到目标目录内唯一的 `.asterfiles-copy` 临时项，完整成功后再提交；覆盖时旧目标在提交事务中保留至新文件就位，失败和取消不得破坏正式目标。
+Windows 单文件复制统一由 `crates/platform-windows/src/windows` 的 `CopyFile2` 适配层执行；目录遍历、冲突选择、任务进度和跨卷移动继续由文件操作层负责。每个文件先复制到目标目录内唯一的 `.asterfiles-copy` 临时项，完整成功后再提交；覆盖时旧目标在提交事务中保留至新文件就位，失败和取消不得破坏正式目标。
 
 本地普通文件继续使用 CopyFile2。NAS→本地普通文件使用 1 MiB 块的只读线程与单个本地临时文件。读取线程只持有源句柄和有界数据队列；协调线程独占目标写入，整块成功写入后才更新内存续传位置。暂停或超时丢弃旧队列，并请求取消旧同步 I/O，不等待内核回收；恢复从已确认位置读取，旧任务无法覆盖目标。队列最多预取一块，加上协调者与读取者手中的块，应用层最多约 3 MiB 尚未确认的数据需要重读；这不包含系统自身的网络预读。续传只覆盖当前任务，不保证退出或崩溃后恢复。
 
@@ -280,7 +288,7 @@ NAS→本地的临时网络错误持续自动重试，退避从 2 秒增加到�
 
 本地网格在已有后台缩略图队列中依次请求真实缩略图、目标像素尺寸的 Windows Shell 系统图标；两者均失败才显示应用占位。系统图标使用原始路径和请求尺寸作为缓存身份，保留可执行文件、快捷方式及自定义文件夹图标的独立性；不按扩展名猜测可共享的本地图标。真实缩略图与系统图标分开使用现有容量上限的有界缓存，同尺寸真实缩略图始终优先。成功取得系统图标即为该缓存项的完成状态，清除失败记录且不再自动重试缩略图；两者都失败仍沿用延迟及次数上限。图标尺寸预设和滚轮行为保持独立的 #97 边界。
 
-提取继续复用后台工作线程与可见范围调度，按 TabId、RequestId、EntryId、原始路径和当前视口计划校验回填。离屏模型释放图片，滚回时从缓存恢复；目标尺寸改变后重新提取。Shell/COM 图像实现统一位于 `src/platform/windows/shell_icons.rs`。UNC 继续只使用已有的共享类型图标链路，不为图像提取访问远端路径。
+提取继续复用后台工作线程与可见范围调度，按 TabId、RequestId、EntryId、原始路径和当前视口计划校验回填。离屏模型释放图片，滚回时从缓存恢复；目标尺寸改变后重新提取。Shell/COM 图像实现统一位于 `crates/platform-windows/src/windows/shell_icons.rs`。UNC 继续只使用已有的共享类型图标链路，不为图像提取访问远端路径。
 
 无界面 Shell 探针与单元测试记录图片来源、请求和返回尺寸、失败原因及过期结果拒收；运行期 `grid_image_extracted` / `grid_image_failed` 事件进入既有异步审计日志。真实文件关联及视觉效果由用户对照 Explorer 验收。
 
@@ -332,7 +340,7 @@ Content 图标依据 #97 用户同屏对照截图由实际18逻辑像素修正�
 
 ## Issue #102 复制与移动的真实目录边界
 
-复制与移动在后台按卷身份和文件 ID 比较目标及其真实父目录，禁止只用展示字符串、大小写转换或字面前缀判定自包含。目标尚未创建时，从最近存在的祖先解析联接，再沿真实父目录检查；权限、坏链接或身份读取失败直接报错，不放行未知关系。Windows 身份查询集中在 `src/platform/windows/path_relation.rs`，原始 `PathBuf` 继续承担操作身份。
+复制与移动在后台按卷身份和文件 ID 比较目标及其真实父目录，禁止只用展示字符串、大小写转换或字面前缀判定自包含。目标尚未创建时，从最近存在的祖先解析联接，再沿真实父目录检查；权限、坏链接或身份读取失败直接报错，不放行未知关系。Windows 身份查询集中在 `crates/platform-windows/src/windows/path_relation.rs`，原始 `PathBuf` 继续承担操作身份。
 
 Issue #135 按已打开句柄的真实位置选择身份查询：SMB 使用标准句柄的卷号和文件编号，本地继续使用 128 位文件 ID，保留 ReFS 的完整身份。映射盘与目录别名按真实位置归类。本地之间比较完整 ID，涉及 SMB 时比较标准句柄身份，保留本地路径与本机共享别名的保护；不再要求 NAS 支持 `FileIdInfo`。查询失败仍然报错，不跳过路径保护。网络辅助进程将失败路径和系统原因写入结果，异常退出保留诊断，主进程不再只显示退出码。
 
@@ -342,7 +350,7 @@ Issue #135 按已打开句柄的真实位置选择身份查询：SMB 使用标�
 
 该检查保证当前已观察到的路径关系，不锁定其他程序；检查后外部程序并发替换联接或目录仍不属于原子事务保证。目录合并中此前已完成的正常条目也不会因后续危险目标被拒绝而整体回滚，沿用现有部分完成报告。
 
-确定性 Windows 测试使用受控临时联接，先单独断言预检结果，再验证生产复制与移动入口，禁止用无限递归复制复现。运行 `cargo test issue_102 -- --nocapture` 和 `python tools/verify.py`；Issue 证据保存在 `artifacts/logs/issue-102/`，完整验证汇总为 `artifacts/verify/summary.json`。
+确定性 Windows 测试使用受控临时联接，先单独断言预检结果，再验证生产复制与移动入口，禁止用无限递归复制复现。运行 `cargo test --workspace --locked issue_102 -- --nocapture` 和 `python tools/verify.py`；Issue 证据保存在 `artifacts/logs/issue-102/`，完整验证汇总为 `artifacts/verify/summary.json`。
 
 Issue #102 的自包含拒绝在任务完成事件中向发起标签所在窗口显示一次明确警告，批量失败不逐项弹窗；标签已关闭时保留任务记录，不借用其他活动窗口。弹窗与任务中心共用中英文语言资源。复制和移动的拖放准备不提前以字面路径拒绝，而交给后台统一判断，避免只记录错误而不提示。UI 只消费判定结果，不进行文件系统检查。
 

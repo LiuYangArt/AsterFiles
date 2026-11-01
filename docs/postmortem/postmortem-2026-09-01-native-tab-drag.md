@@ -74,8 +74,8 @@ Slint 场景中的拖动卡片受来源窗口裁切，也无法获得桌面级�
 ## 长期排查入口
 
 - 标签状态机、插槽和事务：`src/app.rs`
-- Windows OLE 数据对象与拖放循环：`src/platform/windows/drag_drop.rs`
-- 原生插入指示器：`src/platform/windows/tab_insertion_indicator.rs`
+- Windows OLE 数据对象与拖放循环：`crates/platform-windows/src/windows/drag_drop.rs`
+- 原生插入指示器：`crates/platform-windows/src/windows/tab_insertion_indicator.rs`
 - 标签栏输入：`ui/app-window.slint`
 - 架构边界：`docs/foundation-plan.md`
 - 自动验证汇总：`artifacts/verify/summary.json`

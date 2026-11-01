@@ -96,10 +96,10 @@ winit 0.30.13 在发送非客户区按下消息前先把内部 `dragging` 标记
 
 - 窗口声明与最大化状态：`ui/app-window.slint`
 - 标题栏移动入口：`src/app.rs`
-- 卡住恢复：`src/platform/windows/window_drag_recovery.rs`
-- Windows 消息诊断：`src/platform/windows/window_trace.rs`
+- 卡住恢复：`crates/platform-windows/src/windows/window_drag_recovery.rs`
+- Windows 消息诊断：`crates/platform-windows/src/windows/window_trace.rs`
 - 诊断日志：`artifacts/logs/window-interaction-diagnostic.jsonl`
-- DPI 基准及系统建议矩形：`src/platform/windows/window_dpi.rs`
+- DPI 基准及系统建议矩形：`crates/platform-windows/src/windows/window_dpi.rs`
 - 逻辑布局与响应式投影：`src/app.rs` 的 `logical_window_width` / `reflow_after_window_resize`，`ui/app-window.slint` 的 `layout-width` / `window-width`
 - 验证步骤：`docs/agent/debug-validation.md` 的 #129、#130 节
 - 任务记录：GitHub Issue #2、#126、#129、#130

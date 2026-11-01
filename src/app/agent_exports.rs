@@ -15,7 +15,7 @@ pub fn export_thumbnail_scheduler_state(path: &Path) -> io::Result<()> {
     let mut plan = ThumbnailPlan::default();
     plan.replace((0..2_743).map(key));
     let bounded_initial = plan.pending_len() == THUMBNAIL_QUEUE_CAPACITY;
-    let (_, old_in_flight) = plan.next().expect("initial thumbnail work exists");
+    let (_, old_in_flight) = plan.take_next().expect("initial thumbnail work exists");
     let latest_generation = plan.replace((1_300..1_324).map(key));
     let stale_rejected = !plan.finish(&old_in_flight);
     let latest_visible_scheduled = plan.wanted_keys().contains(&key(1_300));
@@ -1185,7 +1185,7 @@ pub fn export_file_operation_center_state(path: &Path) -> io::Result<()> {
             absolute_pidl: vec![0, 0],
         }],
     });
-    let undo_depth = history.len();
+    let undo_depth = history.entry_count();
     let undo_available = history.is_available();
     let undo_in_progress = history.in_progress();
     let undo_latest_kind = history

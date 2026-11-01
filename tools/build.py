@@ -147,8 +147,11 @@ def clean_target(preserve_outputs: bool = True) -> None:
 
 
 def build_inputs() -> dict[str, str]:
-    return {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
-            for name in ("rust-toolchain.toml", "Cargo.lock", "Cargo.toml", ".cargo/config.toml", ".kache.toml")}
+    paths = [ROOT / name for name in
+             ("rust-toolchain.toml", "Cargo.lock", "Cargo.toml", ".cargo/config.toml", ".kache.toml")]
+    paths.extend(sorted((ROOT / "crates").glob("*/Cargo.toml")))
+    return {path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in paths}
 
 
 def gc() -> None:
