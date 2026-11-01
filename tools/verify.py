@@ -24,6 +24,10 @@ FULL_DEBUG_SUMMARY = VERIFY_DIR / "full-debug-summary.json"
 DEBUG = ROOT / "target" / "debug" / "asterfiles.exe"
 RELEASE = ROOT / "target" / "release" / "asterfiles.exe"
 VALIDATION_STAMP = VERIFY_DIR / "full-debug-success.json"
+LARGE_DIRECTORY_PROFILE = (
+    "app::large_directory_tests::"
+    "issue_175_large_directory_load_selection_and_scroll_profile"
+)
 
 SCENARIOS = [
     ("agent-actions", "agent-actions", STATE_DIR / "agent-actions" / "sequence.json"),
@@ -347,7 +351,15 @@ def validation_steps(quick: bool, include_release: bool) -> list[tuple[str, list
             "clippy",
             ["cargo", "clippy", "--workspace", "--locked", "--all-targets", "--all-features", "--", "-D", "warnings"],
         ),
-        ("test", ["cargo", "test", "--workspace", "--locked"]),
+        # Keep wall-clock measurements out of the parallel functional suite (#184).
+        ("test", ["cargo", "test", "--workspace", "--locked", "--", "--skip", LARGE_DIRECTORY_PROFILE]),
+        (
+            "large-directory-profile",
+            [
+                "cargo", "test", "--locked", "-p", "asterfiles", "--bin", "asterfiles",
+                LARGE_DIRECTORY_PROFILE, "--", "--exact", "--nocapture", "--test-threads=1",
+            ],
+        ),
         ("debug", ["cargo", "build", "--locked"]),
     ]
     if not quick:

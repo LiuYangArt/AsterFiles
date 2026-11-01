@@ -108,7 +108,7 @@ class VerifyTests(unittest.TestCase):
 
     def test_dependency_checks_and_builds_use_lockfile(self) -> None:
         for name, command in verify.validation_steps(False, True):
-            if name in {"clippy", "test", "debug", "release"}:
+            if name in {"clippy", "test", "large-directory-profile", "debug", "release"}:
                 self.assertIn("--locked", command)
 
     def test_validation_checks_all_workspace_members(self) -> None:
@@ -119,6 +119,57 @@ class VerifyTests(unittest.TestCase):
             self.assertIn("--workspace", steps["test"])
             self.assertEqual(steps["debug"], ["cargo", "build", "--locked"])
             self.assertEqual(steps["release"], ["cargo", "build", "--release", "--locked"])
+
+    def test_large_directory_profile_is_isolated_in_every_mode(self) -> None:
+        profile = (
+            "app::large_directory_tests::"
+            "issue_175_large_directory_load_selection_and_scroll_profile"
+        )
+        for quick in (True, False):
+            for release in (True, False):
+                with self.subTest(quick=quick, release=release):
+                    steps = verify.validation_steps(quick, release)
+                    commands = dict(steps)
+                    self.assertEqual(
+                        commands["test"],
+                        ["cargo", "test", "--workspace", "--locked", "--", "--skip", profile],
+                    )
+                    self.assertEqual(
+                        commands["large-directory-profile"],
+                        ["cargo", "test", "--locked", "-p", "asterfiles", "--bin", "asterfiles",
+                         profile, "--", "--exact", "--nocapture", "--test-threads=1"],
+                    )
+                    names = [name for name, _ in steps]
+                    self.assertEqual(names.count("large-directory-profile"), 1)
+                    self.assertLess(names.index("test"), names.index("large-directory-profile"))
+                    self.assertLess(names.index("large-directory-profile"), names.index("debug"))
+
+    def test_profile_failure_stops_build_and_scenarios(self) -> None:
+        calls = []
+
+        def runner(name: str, command: list[str]) -> dict[str, object]:
+            calls.append(name)
+            return {
+                "name": name,
+                "command": command,
+                "status": "failed" if name == "large-directory-profile" else "passed",
+                "exit_code": 1 if name == "large-directory-profile" else 0,
+            }
+
+        with patch.object(verify, "emit"):
+            results = verify.execute_steps(
+                verify.validation_steps(quick=False, include_release=True),
+                keep_going=False,
+                runner=runner,
+            )
+        self.assertEqual(calls[-1], "large-directory-profile")
+        for result in results[len(calls):]:
+            self.assertEqual(result["status"], "skipped")
+            self.assertEqual(result["reason"], "stopped after large-directory-profile")
+
+    def test_ci_uploads_performance_reports(self) -> None:
+        workflow = (verify.ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn("            artifacts/perf/\n", workflow)
 
     def test_workspace_architecture_is_checked_in_every_mode(self) -> None:
         for quick in (True, False):

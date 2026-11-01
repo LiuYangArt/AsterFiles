@@ -81,6 +81,7 @@
 | [#176](#issue-176) | Temp 监听循环与本地刷新（#176） |
 | [#177](#issue-177) | Issue #177 地址栏退出编辑 |
 | [#178](#issue-178) | 滚动条离窗释放（#178） |
+| [#184](#issue-184) | CI 性能测量隔离（#184） |
 
 <a id="issue-171"></a>
 
@@ -128,7 +129,7 @@
 
 Cargo 检查、测试、Debug 和本地 Release 构建均使用 `--locked`，依赖变化必须显式更新并提交 `Cargo.lock`。CI 缓存 Cargo 下载数据与 kache，只允许 main 保存缓存，不缓存 `target` 或 `artifacts/verify` 成功标记。首次准备使用 `python tools/build.py setup`，本地、CI 与标签打包共用固定版本和缓存配置。PR 使用 `pull_request` 事件与只读权限，checkout 不保留凭据。工作流不执行发布；同一 PR/引用的新运行取消旧运行，最长 60 分钟。
 
-在 Actions 的 Windows CI 运行页下载 `windows-verification-<run-id>-<attempt>`：其中包含 `verify/summary.json`、`logs/verify-*.log` 和 `state/`。成功或失败都执行上传，保留 14 天；安装依赖或 checkout 失败时可能没有仓库内验证产物，此时查看对应 Actions 步骤日志。验证入口的前置检查失败、命令启动失败及非零退出均写入日志与失败汇总；验证步骤失败时，后续必要步骤标为 skipped。超时或强制取消可能没有最终汇总，需查看已有日志与 Actions 终止原因。
+在 Actions 的 Windows CI 运行页下载 `windows-verification-<run-id>-<attempt>`：其中包含 `verify/summary.json`、`logs/verify-*.log`、`state/` 和 `perf/`。成功或失败都执行上传，保留 14 天；安装依赖或 checkout 失败时可能没有仓库内验证产物，此时查看对应 Actions 步骤日志。验证入口的前置检查失败、命令启动失败及非零退出均写入日志与失败汇总；验证步骤失败时，后续必要步骤标为 skipped。超时或强制取消可能没有最终汇总，需查看已有日志与 Actions 终止原因。
 
 云端复验（先等待成功运行完成，再触发失败演练，避免互相取消）：
 
@@ -144,6 +145,24 @@ gh run download <失败演练编号> --dir artifacts/ci-failure-probe
 `failure_probe` 默认关闭，只在显式手动运行时向 runner 临时 checkout 的 `src/main.rs` 追加未格式化函数。预期格式检查失败、后续步骤跳过、任务最终失败，但证据上传成功；核对下载汇总中的 `format: failed` 与对应日志。演练不提交文件，不改本地源码，也不创建标签。将正常与演练运行链接回写 Issue。`tools/test_verify.py` 另在独占临时目录实际启动返回 7 的 Python 子进程，验证日志、失败汇总、后续跳过和最终退出码，不操作应用窗口。
 
 完整入口：`python tools/verify.py`。
+
+<a id="issue-184"></a>
+
+## CI 性能测量隔离（#184）
+
+`python tools/verify.py` 的普通工作区测试保持默认并发，只排除 #175 十万条目计时测试。随后 `large-directory-profile` 步骤在独立进程中精确运行该测试。快速、完整 Debug 和未复用的本地 Release 验证均包含此步骤；失败时停止后续构建与场景。直接运行普通 `cargo test` 仍包含该测试。
+
+独立复验命令：
+
+```powershell
+cargo test --locked -p asterfiles --bin asterfiles app::large_directory_tests::issue_175_large_directory_load_selection_and_scroll_profile -- --exact --nocapture --test-threads=1
+python tools/test_verify.py
+python tools/verify.py
+```
+
+性能上限保持不变：首批小于 1 秒，完整加载小于 4 秒，其他界面处理上限见 #175 报告。测试使用无窗口后端，不启动桌面交互。日志为 `artifacts/logs/verify-large-directory-profile.log`，报告为 `artifacts/perf/issue-175/latest.json`，CI 同时上传 `perf/`。
+
+CI 运行 `41298432239` 中完整加载为 5089.7 ms，其中等待辅助进程 4517.6 ms；单批界面处理峰值为 13.6 ms，其他指标通过。原日志不能确定等待来自磁盘、调度还是后台扫描。隔离测量消除与普通测试的资源争用，不靠重试或放宽上限通过检查。
 
 <a id="issue-140"></a>
 
