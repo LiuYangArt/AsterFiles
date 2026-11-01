@@ -1420,7 +1420,7 @@ fn issue_43_file_name_font_size_has_one_semantic_source() {
         .1;
     assert!(details_and_list_name.contains(semantic_font_size));
     assert_eq!(
-        ui.matches("text: entry.name; color: VisualStyle.c24252a; font-size: VisualStyle.file-name-font-size;")
+        ui.matches("text: entry.name; color: VisualStyle.text-strong; font-size: VisualStyle.file-name-font-size;")
             .count(),
         3
     );
@@ -1429,7 +1429,7 @@ fn issue_43_file_name_font_size_has_one_semantic_source() {
         .expect("rename editor must exist")
         .1;
     assert!(rename_editor.contains(semantic_font_size));
-    assert!(!ui.contains("text: entry.name; color: VisualStyle.c24252a; font-size: 14px;"));
+    assert!(!ui.contains("text: entry.name; color: VisualStyle.text-strong; font-size: 14px;"));
 }
 #[test]
 fn issue_14_everything_status_text_covers_progress_success_and_failures() {
@@ -4909,7 +4909,7 @@ fn issue_62_operation_rows_use_flat_single_layer_style() {
     let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
     assert!(!source.contains("background: operation.prominent"));
     assert!(!source.contains(
-        "border-color: VisualStyle.ce0e2e7;\n                    accessible-role: groupbox"
+        "border-color: VisualStyle.border;\n                    accessible-role: groupbox"
     ));
 }
 
@@ -9288,4 +9288,233 @@ fn issue_64_shortcut_event_rejects_stale_request_and_reused_entry_id() {
         )
         .is_none()
     );
+}
+
+#[test]
+fn issue_171_visual_style_uses_semantic_color_names() {
+    for source in [
+        include_str!("../../ui/app-window.slint"),
+        include_str!("../../ui/quick-menu.slint"),
+        include_str!("../../ui/icons/icon-map.slint"),
+    ] {
+        for word in source.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-') {
+            assert!(
+                !(word.len() == 7
+                    && word.starts_with('c')
+                    && word[1..].chars().all(|ch| ch.is_ascii_hexdigit())),
+                "color-value token remains: {word}"
+            );
+        }
+    }
+}
+
+#[test]
+fn issue_171_semantic_palette_preserves_both_themes() {
+    let ui = headless_file_view();
+    let style = VisualStyle::get(&ui);
+    for dark in [false, true] {
+        style.set_dark_theme(dark);
+        for (name, actual, light, dark_color) in [
+            (
+                "text-strong",
+                style.get_text_strong(),
+                0xff24252a,
+                0xfff2f2f2,
+            ),
+            (
+                "text-primary",
+                style.get_text_primary(),
+                0xff30333a,
+                0xfff2f2f2,
+            ),
+            (
+                "navigation-surface-background",
+                style.get_navigation_surface_background(),
+                0xffe9e9e9,
+                0xff323437,
+            ),
+            (
+                "column-divider",
+                style.get_column_divider(),
+                0xff75787c,
+                0xff57595c,
+            ),
+            (
+                "text-navigation",
+                style.get_text_navigation(),
+                0xff4f535d,
+                0xffd0d0d0,
+            ),
+            ("accent", style.get_accent(), 0xff4f6bed, 0xff7fa0ff),
+            (
+                "rectangle-selection-fill",
+                style.get_rectangle_selection_fill(),
+                0x1a4f6bed,
+                0x1a7fa0ff,
+            ),
+            (
+                "rectangle-selection-border",
+                style.get_rectangle_selection_border(),
+                0x994f6bed,
+                0x997fa0ff,
+            ),
+            (
+                "drive-progress-track",
+                style.get_drive_progress_track(),
+                0xffc9ccd1,
+                0xff55585c,
+            ),
+            (
+                "drive-progress-fill",
+                style.get_drive_progress_fill(),
+                0xff4f6bed,
+                0xff7fa0ff,
+            ),
+            (
+                "drive-progress-warning",
+                style.get_drive_progress_warning(),
+                0xffc42b1c,
+                0xffff8c82,
+            ),
+            (
+                "drive-progress-unavailable",
+                style.get_drive_progress_unavailable(),
+                0xffaeb1b6,
+                0xff686868,
+            ),
+            (
+                "text-secondary",
+                style.get_text_secondary(),
+                0xff62656f,
+                0xffc6c6c6,
+            ),
+            ("icon-muted", style.get_icon_muted(), 0xff666a74, 0xffbcbcbc),
+            (
+                "text-detail",
+                style.get_text_detail(),
+                0xff6f717a,
+                0xffbdbdbd,
+            ),
+            (
+                "text-tertiary",
+                style.get_text_tertiary(),
+                0xff72747d,
+                0xffa9a9a9,
+            ),
+            ("text-muted", style.get_text_muted(), 0xff777a84, 0xffb0b0b0),
+            (
+                "text-disabled",
+                style.get_text_disabled(),
+                0xff9a9da3,
+                0xff8a8a8a,
+            ),
+            (
+                "scrollbar-thumb-hover",
+                style.get_scrollbar_thumb_hover(),
+                0xff9a9da3,
+                0xff8a8a8a,
+            ),
+            (
+                "scrollbar-thumb",
+                style.get_scrollbar_thumb(),
+                0xffaeb1b6,
+                0xff737373,
+            ),
+            ("danger", style.get_danger(), 0xffc42b1c, 0xffc42b1c),
+            (
+                "selection-emphasis",
+                style.get_selection_emphasis(),
+                0xffc7d7ff,
+                0xff35548f,
+            ),
+            (
+                "tab-close-pressed",
+                style.get_tab_close_pressed(),
+                0xffd7dae0,
+                0xff4a4a4a,
+            ),
+            (
+                "titlebar-pressed",
+                style.get_titlebar_pressed(),
+                0xffd9dce2,
+                0xff454545,
+            ),
+            ("selection", style.get_selection(), 0xffdce6ff, 0xff263d66),
+            (
+                "surface-pressed",
+                style.get_surface_pressed(),
+                0xffdde3ed,
+                0xff464646,
+            ),
+            ("border", style.get_border(), 0xffe0e2e7, 0xff4b4b4b),
+            (
+                "tab-close-hover",
+                style.get_tab_close_hover(),
+                0xffe1e4ea,
+                0xff4c4c4c,
+            ),
+            (
+                "navigation-hover",
+                style.get_navigation_hover(),
+                0xffe5e9f2,
+                0xff414141,
+            ),
+            (
+                "titlebar-hover",
+                style.get_titlebar_hover(),
+                0xffe8eaf0,
+                0xff3d3d3d,
+            ),
+            (
+                "surface-hover",
+                style.get_surface_hover(),
+                0xffedf1f6,
+                0xff424242,
+            ),
+            (
+                "accent-hover",
+                style.get_accent_hover(),
+                0xffeff4ff,
+                0xff303b4d,
+            ),
+            (
+                "scrollbar-track-hover",
+                style.get_scrollbar_track_hover(),
+                0xfff1f2f5,
+                0xff343434,
+            ),
+            (
+                "tab-strip-background",
+                style.get_tab_strip_background(),
+                0xfff1f2f5,
+                0xff292929,
+            ),
+            (
+                "window-background",
+                style.get_window_background(),
+                0xfff5f6f8,
+                0xff202020,
+            ),
+            (
+                "surface-disabled",
+                style.get_surface_disabled(),
+                0xfff8f8f9,
+                0xff303030,
+            ),
+            (
+                "surface-subtle",
+                style.get_surface_subtle(),
+                0xfffafbfc,
+                0xff272727,
+            ),
+            ("surface", style.get_surface(), 0xffffffff, 0xff252525),
+        ] {
+            let expected = if dark { dark_color } else { light };
+            assert_eq!(
+                actual,
+                Color::from_argb_encoded(expected),
+                "{name}, dark={dark}"
+            );
+        }
+    }
 }

@@ -17,46 +17,44 @@ export struct HomeItemRow { stable-id: string, label: string, detail: string, ic
 export struct HomeCardRow { entries: [HomeItemRow] }
 export global VisualStyle {
     in-out property <bool> dark-theme: false;
-    out property <color> c24252a: dark-theme ? #f2f2f2 : #24252a;
-    out property <color> c303138: dark-theme ? #f2f2f2 : #303138;
-    out property <color> c30333a: dark-theme ? #f2f2f2 : #30333a;
+    out property <color> text-strong: dark-theme ? #f2f2f2 : #24252a;
+    out property <color> text-primary: dark-theme ? #f2f2f2 : #30333a;
     out property <color> navigation-surface-background: dark-theme ? #323437 : #e9e9e9;
-    out property <color> c57595c: dark-theme ? #57595c : #75787c;
-    out property <color> c4f535d: dark-theme ? #d0d0d0 : #4f535d;
-    out property <color> c4f6bed: dark-theme ? #7fa0ff : #4f6bed;
+    out property <color> column-divider: dark-theme ? #57595c : #75787c;
+    out property <color> text-navigation: dark-theme ? #d0d0d0 : #4f535d;
+    out property <color> accent: dark-theme ? #7fa0ff : #4f6bed;
     out property <color> rectangle-selection-fill: dark-theme ? #7fa0ff1a : #4f6bed1a;
     out property <color> rectangle-selection-border: dark-theme ? #7fa0ff99 : #4f6bed99;
     out property <color> drive-progress-track: dark-theme ? #55585c : #c9ccd1;
-    out property <color> drive-progress-fill: dark-theme ? #7fa0ff : #4f6bed;
+    out property <color> drive-progress-fill: accent;
     out property <color> drive-progress-warning: dark-theme ? #ff8c82 : #c42b1c;
     out property <color> drive-progress-unavailable: dark-theme ? #686868 : #aeb1b6;
-    out property <color> c62656f: dark-theme ? #c6c6c6 : #62656f;
-    out property <color> c666a74: dark-theme ? #bcbcbc : #666a74;
-    out property <color> c696b74: dark-theme ? #bdbdbd : #696b74;
-    out property <color> c6f717a: dark-theme ? #bdbdbd : #6f717a;
-    out property <color> c72747d: dark-theme ? #a9a9a9 : #72747d;
-    out property <color> c777a84: dark-theme ? #b0b0b0 : #777a84;
-    out property <color> c777b85: dark-theme ? #b0b0b0 : #777b85;
-    out property <color> c9a9da3: dark-theme ? #8a8a8a : #9a9da3;
-    out property <color> caeb1b6: dark-theme ? #737373 : #aeb1b6;
-    out property <color> cc42b1c: #c42b1c;
-    out property <color> cc7d7ff: dark-theme ? #35548f : #c7d7ff;
-    out property <color> cd7dae0: dark-theme ? #4a4a4a : #d7dae0;
-    out property <color> cd9dce2: dark-theme ? #454545 : #d9dce2;
-    out property <color> cdce6ff: dark-theme ? #263d66 : #dce6ff;
-    out property <color> cdde3ed: dark-theme ? #464646 : #dde3ed;
-    out property <color> ce0e2e7: dark-theme ? #4b4b4b : #e0e2e7;
-    out property <color> ce1e4ea: dark-theme ? #4c4c4c : #e1e4ea;
-    out property <color> ce5e9f2: dark-theme ? #414141 : #e5e9f2;
-    out property <color> ce8eaf0: dark-theme ? #3d3d3d : #e8eaf0;
-    out property <color> cedf1f6: dark-theme ? #424242 : #edf1f6;
-    out property <color> ceff4ff: dark-theme ? #303b4d : #eff4ff;
-    out property <color> cf1f2f4: dark-theme ? #343434 : #f1f2f4;
-    out property <color> cf1f2f5: dark-theme ? #292929 : #f1f2f5;
-    out property <color> cf5f6f8: dark-theme ? #202020 : #f5f6f8;
-    out property <color> cf8f8f9: dark-theme ? #303030 : #f8f8f9;
-    out property <color> cfafbfc: dark-theme ? #272727 : #fafbfc;
-    out property <color> cffffff: dark-theme ? #252525 : #ffffff;
+    out property <color> text-secondary: dark-theme ? #c6c6c6 : #62656f;
+    out property <color> icon-muted: dark-theme ? #bcbcbc : #666a74;
+    out property <color> text-detail: dark-theme ? #bdbdbd : #6f717a;
+    out property <color> text-tertiary: dark-theme ? #a9a9a9 : #72747d;
+    out property <color> text-muted: dark-theme ? #b0b0b0 : #777a84;
+    out property <color> text-disabled: dark-theme ? #8a8a8a : #9a9da3;
+    out property <color> scrollbar-thumb-hover: dark-theme ? #8a8a8a : #9a9da3;
+    out property <color> scrollbar-thumb: dark-theme ? #737373 : #aeb1b6;
+    out property <color> danger: #c42b1c;
+    out property <color> selection-emphasis: dark-theme ? #35548f : #c7d7ff;
+    out property <color> tab-close-pressed: dark-theme ? #4a4a4a : #d7dae0;
+    out property <color> titlebar-pressed: dark-theme ? #454545 : #d9dce2;
+    out property <color> selection: dark-theme ? #263d66 : #dce6ff;
+    out property <color> surface-pressed: dark-theme ? #464646 : #dde3ed;
+    out property <color> border: dark-theme ? #4b4b4b : #e0e2e7;
+    out property <color> tab-close-hover: dark-theme ? #4c4c4c : #e1e4ea;
+    out property <color> navigation-hover: dark-theme ? #414141 : #e5e9f2;
+    out property <color> titlebar-hover: dark-theme ? #3d3d3d : #e8eaf0;
+    out property <color> surface-hover: dark-theme ? #424242 : #edf1f6;
+    out property <color> accent-hover: dark-theme ? #303b4d : #eff4ff;
+    out property <color> scrollbar-track-hover: dark-theme ? #343434 : #f1f2f5;
+    out property <color> tab-strip-background: dark-theme ? #292929 : #f1f2f5;
+    out property <color> window-background: dark-theme ? #202020 : #f5f6f8;
+    out property <color> surface-disabled: dark-theme ? #303030 : #f8f8f9;
+    out property <color> surface-subtle: dark-theme ? #272727 : #fafbfc;
+    out property <color> surface: dark-theme ? #252525 : #ffffff;
     out property <length> tab-corner-radius: 7px;
     out property <length> tab-shoulder-width: tab-corner-radius;
     out property <length> tab-shoulder-span: 2 * tab-corner-radius;
@@ -77,15 +75,15 @@ component StandaloneActionButton inherits Rectangle {
     horizontal-stretch: 0;
     border-radius: 5px;
     border-width: focus-scope.has-focus ? 2px : 1px;
-    border-color: focus-scope.has-focus ? VisualStyle.c4f6bed : root.dangerous ? VisualStyle.cc42b1c : VisualStyle.ce0e2e7;
-    background: !root.enabled ? VisualStyle.cf8f8f9 : button-touch.pressed ? (root.dangerous ? #a4261a : VisualStyle.cdce6ff) : button-touch.has-hover ? (root.dangerous ? VisualStyle.cc42b1c : VisualStyle.ceff4ff) : (root.dangerous ? #b3261e : VisualStyle.cffffff);
+    border-color: focus-scope.has-focus ? VisualStyle.accent : root.dangerous ? VisualStyle.danger : VisualStyle.border;
+    background: !root.enabled ? VisualStyle.surface-disabled : button-touch.pressed ? (root.dangerous ? #a4261a : VisualStyle.selection) : button-touch.has-hover ? (root.dangerous ? VisualStyle.danger : VisualStyle.accent-hover) : (root.dangerous ? #b3261e : VisualStyle.surface);
     opacity: root.enabled ? 1 : 0.5;
     Rectangle {
         x: 10px; width: parent.width - 20px; height: parent.height;
         HorizontalLayout {
             spacing: 6px; alignment: root.center-content ? center : start;
-            if root.icon-source.width != 0: Rectangle { width: 16px; vertical-stretch: 1; Image { width: 16px; height: 16px; y: (parent.height - self.height) / 2; source: root.icon-source; image-fit: contain; colorize: VisualStyle.c303138; } }
-            Text { horizontal-stretch: root.center-content ? 0 : 1; text: root.label; color: root.dangerous ? #ffffff : VisualStyle.c30333a; font-size: 12px; vertical-alignment: center; overflow: elide; }
+            if root.icon-source.width != 0: Rectangle { width: 16px; vertical-stretch: 1; Image { width: 16px; height: 16px; y: (parent.height - self.height) / 2; source: root.icon-source; image-fit: contain; colorize: VisualStyle.text-primary; } }
+            Text { horizontal-stretch: root.center-content ? 0 : 1; text: root.label; color: root.dangerous ? #ffffff : VisualStyle.text-primary; font-size: 12px; vertical-alignment: center; overflow: elide; }
         }
     }
     focus-scope := FocusScope {
@@ -113,12 +111,12 @@ component StandaloneTitleBar inherits Rectangle {
 
     callback drag-window();
     height: 48px;
-    background: VisualStyle.cffffff;
+    background: VisualStyle.surface;
     HorizontalLayout {
         padding-left: root.title-inset;
-        Text { text: root.title; color: VisualStyle.c30333a; font-size: 16px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+        Text { text: root.title; color: VisualStyle.text-primary; font-size: 16px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
 
-        Rectangle { width: 46px; Text { text: "×"; color: VisualStyle.c303138; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; } TouchArea { clicked => { root.close-requested(); } } accessible-role: button; accessible-id: "dialog-close"; accessible-label: root.close-label; accessible-action-default => { root.close-requested(); } }
+        Rectangle { width: 46px; Text { text: "×"; color: VisualStyle.text-primary; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; } TouchArea { clicked => { root.close-requested(); } } accessible-role: button; accessible-id: "dialog-close"; accessible-label: root.close-label; accessible-action-default => { root.close-requested(); } }
     }
     TouchArea { width: parent.width - 46px; pointer-event(event) => { if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) { root.drag-window(); } } }
 }
@@ -134,7 +132,7 @@ export component OperationWindow inherits Window {
     max-width: 580px;
     min-height: 278px;
     max-height: 760px;
-    background: VisualStyle.cffffff;
+    background: VisualStyle.surface;
     default-font-family: "Segoe UI";
 
     in property <[OperationRow]> operations;
@@ -164,45 +162,45 @@ export component OperationWindow inherits Window {
         StandaloneTitleBar { title: root.text-file-operations; close-label: root.text-window-close; close-requested => { root.close(); } drag-window => { root.drag-window(); } }
         Rectangle {
             vertical-stretch: 1;
-            background: VisualStyle.cffffff;
+            background: VisualStyle.surface;
             if root.operations.length == 0: Text {
                 text: root.text-no-operations;
-                color: VisualStyle.c62656f;
+                color: VisualStyle.text-secondary;
                 font-size: 14px;
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
-            if root.demo-mode: Text { x: 20px; y: 8px; width: parent.width - 40px; height: 20px; text: root.demo-notice; color: VisualStyle.c62656f; font-size: 12px; vertical-alignment: center; overflow: elide; }
+            if root.demo-mode: Text { x: 20px; y: 8px; width: parent.width - 40px; height: 20px; text: root.demo-notice; color: VisualStyle.text-secondary; font-size: 12px; vertical-alignment: center; overflow: elide; }
             if root.operations.length > 0: ListView {
                 y: root.demo-mode ? 34px : 0px;
                 width: parent.width;
                 height: root.demo-mode ? parent.height - 34px : parent.height;
                 for operation[index] in root.operations: Rectangle {
                     height: 230px;
-                    background: VisualStyle.cffffff;
+                    background: VisualStyle.surface;
                     accessible-role: groupbox;
                     accessible-id: "operation/" + operation.id;
                     accessible-label: operation.accessible-label;
-                    Text { x: 20px; y: 8px; width: parent.width - 40px; height: 22px; text: operation.title; color: VisualStyle.c30333a; font-size: 14px; font-weight: operation.state == 2 ? 700 : 600; overflow: elide; vertical-alignment: center; }
-                    Text { x: 20px; y: 30px; width: parent.width - 40px; height: 18px; text: operation.status + (operation.queue != "" ? " · " + operation.queue : ""); color: VisualStyle.c62656f; font-size: 12px; overflow: elide; vertical-alignment: center; }
-                    Text { x: 20px; y: 50px; width: parent.width - 40px; height: 18px; text: operation.source-line; color: VisualStyle.c62656f; font-size: 11px; overflow: elide; vertical-alignment: center; }
-                    Text { x: 20px; y: 68px; width: parent.width - 40px; height: 18px; text: operation.destination-line; color: VisualStyle.c62656f; font-size: 11px; overflow: elide; vertical-alignment: center; }
-                    Text { x: 20px; y: 86px; width: parent.width - 40px; height: 18px; text: operation.failure-summary != "" ? operation.failure-summary : operation.current-item-line; color: operation.failure-summary != "" ? VisualStyle.cc42b1c : VisualStyle.c30333a; font-size: 12px; overflow: elide; vertical-alignment: center; }
+                    Text { x: 20px; y: 8px; width: parent.width - 40px; height: 22px; text: operation.title; color: VisualStyle.text-primary; font-size: 14px; font-weight: operation.state == 2 ? 700 : 600; overflow: elide; vertical-alignment: center; }
+                    Text { x: 20px; y: 30px; width: parent.width - 40px; height: 18px; text: operation.status + (operation.queue != "" ? " · " + operation.queue : ""); color: VisualStyle.text-secondary; font-size: 12px; overflow: elide; vertical-alignment: center; }
+                    Text { x: 20px; y: 50px; width: parent.width - 40px; height: 18px; text: operation.source-line; color: VisualStyle.text-secondary; font-size: 11px; overflow: elide; vertical-alignment: center; }
+                    Text { x: 20px; y: 68px; width: parent.width - 40px; height: 18px; text: operation.destination-line; color: VisualStyle.text-secondary; font-size: 11px; overflow: elide; vertical-alignment: center; }
+                    Text { x: 20px; y: 86px; width: parent.width - 40px; height: 18px; text: operation.failure-summary != "" ? operation.failure-summary : operation.current-item-line; color: operation.failure-summary != "" ? VisualStyle.danger : VisualStyle.text-primary; font-size: 12px; overflow: elide; vertical-alignment: center; }
                     Rectangle {
                             x: 20px;
                             y: 110px;
                             width: parent.width - 40px;
                             height: 22px;
                             border-radius: 11px;
-                            background: VisualStyle.ce0e2e7;
+                            background: VisualStyle.border;
                             Rectangle {
                                 x: operation.progress-known ? 0px : -parent.width + (parent.width * mod(animation-tick(), 2s) / 1s);
                                 width: operation.progress-known ? max(0px, min(parent.width, parent.width * operation.progress)) : parent.width;
                                 height: parent.height;
                                 border-radius: 11px;
-                                background: operation.state == 8 || operation.state == 7 ? #b3261e : VisualStyle.cdce6ff;
+                                background: operation.state == 8 || operation.state == 7 ? #b3261e : VisualStyle.selection;
                             }
-                            Text { text: operation.file-progress; color: VisualStyle.c30333a; font-size: 11px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                            Text { text: operation.file-progress; color: VisualStyle.text-primary; font-size: 11px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
                     }
                     HorizontalLayout {
                             x: 20px;
@@ -210,10 +208,10 @@ export component OperationWindow inherits Window {
                             width: parent.width - 40px;
                             height: 20px;
                             spacing: 20px;
-                            Text { text: operation.transferred; color: VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; }
-                            Text { text: operation.speed; color: VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; }
+                            Text { text: operation.transferred; color: VisualStyle.text-tertiary; font-size: 11px; vertical-alignment: center; }
+                            Text { text: operation.speed; color: VisualStyle.text-tertiary; font-size: 11px; vertical-alignment: center; }
                             Rectangle { horizontal-stretch: 1; }
-                            Text { text: operation.eta; color: VisualStyle.c62656f; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+                            Text { text: operation.eta; color: VisualStyle.text-secondary; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
                     }
                     HorizontalLayout {
                             x: parent.width - self.width - 20px;
@@ -225,7 +223,7 @@ export component OperationWindow inherits Window {
                             StandaloneActionButton { accessible-id: "operation/" + operation.id + "/cancel"; visible: operation.can-cancel || operation.cancel-pending; enabled: operation.can-cancel && !operation.cancel-pending; width: 84px; label: operation.cancel-pending ? root.text-cancelling-operation : root.text-cancel-operation; clicked => { if (!root.demo-mode) { root.cancel-operation(operation.id); } } }
                             StandaloneActionButton { accessible-id: "operation/" + operation.id + "/retry"; visible: operation.can-retry; width: 76px; label: root.text-retry-operation; clicked => { if (!root.demo-mode) { root.retry-operation(operation.id); } } }
                     }
-                    Rectangle { visible: index + 1 < root.operations.length; x: 20px; y: parent.height - 1px; width: parent.width - 40px; height: 1px; background: VisualStyle.ce0e2e7; }
+                    Rectangle { visible: index + 1 < root.operations.length; x: 20px; y: parent.height - 1px; width: parent.width - 40px; height: 1px; background: VisualStyle.border; }
                 }
             }
         }
@@ -245,7 +243,7 @@ export component ConfirmationWindow inherits Window {
     max-width: 520px;
     min-height: root.window-height;
     max-height: root.window-height;
-    background: VisualStyle.cffffff;
+    background: VisualStyle.surface;
     default-font-family: "Segoe UI";
 
     in property <int> kind: 0;
@@ -282,10 +280,10 @@ export component ConfirmationWindow inherits Window {
         StandaloneTitleBar { title: root.title-text; close-label: root.close-text; title-inset: root.kind == 1 ? 20px : 16px; close-requested => { root.safe-cancel(); } drag-window => { root.drag-window(); } }
         if root.kind != 1: Rectangle {
             vertical-stretch: 1;
-            background: VisualStyle.cffffff;
+            background: VisualStyle.surface;
             VerticalLayout {
                 padding-left: 20px; padding-right: 20px; padding-top: 12px; padding-bottom: 20px; spacing: 10px;
-                Text { text: root.detail-text; color: VisualStyle.c62656f; font-size: 13px; wrap: word-wrap; }
+                Text { text: root.detail-text; color: VisualStyle.text-secondary; font-size: 13px; wrap: word-wrap; }
                 Rectangle { vertical-stretch: 1; }
                 HorizontalLayout {
                     alignment: end; spacing: 8px;
@@ -300,17 +298,17 @@ export component ConfirmationWindow inherits Window {
             padding-left: 20px; padding-right: 20px; padding-top: 4px; padding-bottom: 20px; spacing: 16px;
             VerticalLayout {
                 spacing: 8px;
-                Text { text: root.detail-text; color: VisualStyle.c62656f; font-size: 13px; wrap: word-wrap; }
+                Text { text: root.detail-text; color: VisualStyle.text-secondary; font-size: 13px; wrap: word-wrap; }
                 GridLayout {
                     spacing-horizontal: 8px; spacing-vertical: 4px;
                     // 完整路径直接换行显示：同名冲突的两行文件名相同，只能靠目录区分，不能省略。
                     Row {
-                        Text { text: root.source-label; color: VisualStyle.c62656f; font-size: 12px; vertical-alignment: top; }
-                        Text { accessible-id: "confirmation-source"; horizontal-stretch: 1; text: root.source-text; color: VisualStyle.c30333a; font-size: 12px; wrap: char-wrap; }
+                        Text { text: root.source-label; color: VisualStyle.text-secondary; font-size: 12px; vertical-alignment: top; }
+                        Text { accessible-id: "confirmation-source"; horizontal-stretch: 1; text: root.source-text; color: VisualStyle.text-primary; font-size: 12px; wrap: char-wrap; }
                     }
                     Row {
-                        Text { text: root.destination-label; color: VisualStyle.c62656f; font-size: 12px; vertical-alignment: top; }
-                        Text { accessible-id: "confirmation-destination"; horizontal-stretch: 1; text: root.destination-text; color: VisualStyle.c30333a; font-size: 12px; wrap: char-wrap; }
+                        Text { text: root.destination-label; color: VisualStyle.text-secondary; font-size: 12px; vertical-alignment: top; }
+                        Text { accessible-id: "confirmation-destination"; horizontal-stretch: 1; text: root.destination-text; color: VisualStyle.text-primary; font-size: 12px; wrap: char-wrap; }
                     }
                 }
             }
@@ -339,7 +337,7 @@ export component NetworkLoginWindow inherits Window {
     max-width: 520px;
     min-height: root.conflict ? 390px : 340px;
     max-height: root.conflict ? 390px : 340px;
-    background: VisualStyle.cffffff;
+    background: VisualStyle.surface;
     default-font-family: "Segoe UI";
 
     in property <bool> dark-theme: false;
@@ -369,20 +367,20 @@ export component NetworkLoginWindow inherits Window {
         StandaloneTitleBar { title: root.title-text; close-label: root.close-text; close-requested => { root.safe-cancel(); } drag-window => { root.drag-window(); } }
         Rectangle {
             vertical-stretch: 1;
-            background: VisualStyle.cffffff;
+            background: VisualStyle.surface;
             VerticalLayout {
                 padding-left: 20px; padding-right: 20px; padding-top: 12px; padding-bottom: 20px; spacing: 8px;
-                Text { text: root.detail-text; color: VisualStyle.c62656f; font-size: 13px; wrap: word-wrap; }
-                Text { text: root.target-text; color: VisualStyle.c30333a; font-size: 12px; overflow: elide; }
-                Text { text: root.user-label; color: VisualStyle.c62656f; font-size: 12px; }
+                Text { text: root.detail-text; color: VisualStyle.text-secondary; font-size: 13px; wrap: word-wrap; }
+                Text { text: root.target-text; color: VisualStyle.text-primary; font-size: 12px; overflow: elide; }
+                Text { text: root.user-label; color: VisualStyle.text-secondary; font-size: 12px; }
                 LineEdit { accessible-id: "network-login-username"; accessible-label: root.user-label; text <=> root.username; enabled: !root.busy; }
-                Text { text: root.password-label; color: VisualStyle.c62656f; font-size: 12px; }
+                Text { text: root.password-label; color: VisualStyle.text-secondary; font-size: 12px; }
                 Rectangle {
-                    height: 34px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cffffff;
+                    height: 34px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface;
                     TextInput { accessible-id: "network-login-password"; accessible-label: root.password-label; x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.password; single-line: true; input-type: InputType.password; enabled: !root.busy; accepted => { if (root.username != "" && root.password != "") { root.login(root.username, root.password, root.remember, root.conflict); } } }
                 }
                 CheckBox { accessible-id: "network-login-remember"; text: root.remember-label; checked <=> root.remember; enabled: !root.busy; }
-                if root.conflict: Text { text: root.conflict-text; color: VisualStyle.cc42b1c; font-size: 12px; wrap: word-wrap; }
+                if root.conflict: Text { text: root.conflict-text; color: VisualStyle.danger; font-size: 12px; wrap: word-wrap; }
                 Rectangle { vertical-stretch: 1; }
                 HorizontalLayout {
                     alignment: end; spacing: 8px;
@@ -405,7 +403,7 @@ export component WebDavLocationWindow inherits Window {
     max-width: 520px;
     min-height: 640px;
     max-height: 640px;
-    background: VisualStyle.cffffff;
+    background: VisualStyle.surface;
     default-font-family: "Segoe UI";
 
     in property <bool> dark-theme: false;
@@ -439,26 +437,26 @@ export component WebDavLocationWindow inherits Window {
         StandaloneTitleBar { title: root.title-text; close-label: root.close-text; close-requested => { root.safe-cancel(); } drag-window => { root.drag-window(); } }
         Rectangle {
             vertical-stretch: 1;
-            background: VisualStyle.cffffff;
+            background: VisualStyle.surface;
             VerticalLayout {
                 padding-left: 20px; padding-right: 20px; padding-top: 12px; padding-bottom: 16px; spacing: 6px;
-                Text { text: root.name-label; color: VisualStyle.c62656f; font-size: 12px; }
+                Text { text: root.name-label; color: VisualStyle.text-secondary; font-size: 12px; }
                 LineEdit { accessible-id: "webdav-name"; text <=> root.name; }
-                Text { text: root.host-label; color: VisualStyle.c62656f; font-size: 12px; }
+                Text { text: root.host-label; color: VisualStyle.text-secondary; font-size: 12px; }
                 LineEdit { accessible-id: "webdav-host"; text <=> root.host; }
-                Text { text: root.port-label; color: VisualStyle.c62656f; font-size: 12px; }
+                Text { text: root.port-label; color: VisualStyle.text-secondary; font-size: 12px; }
                 LineEdit { accessible-id: "webdav-port"; text <=> root.port; }
-                Text { text: root.root-label; color: VisualStyle.c62656f; font-size: 12px; }
+                Text { text: root.root-label; color: VisualStyle.text-secondary; font-size: 12px; }
                 LineEdit { accessible-id: "webdav-root"; text <=> root.root; }
-                Text { text: root.user-label; color: VisualStyle.c62656f; font-size: 12px; }
+                Text { text: root.user-label; color: VisualStyle.text-secondary; font-size: 12px; }
                 LineEdit { accessible-id: "webdav-username"; text <=> root.username; }
-                Text { text: root.password-label; color: VisualStyle.c62656f; font-size: 12px; }
+                Text { text: root.password-label; color: VisualStyle.text-secondary; font-size: 12px; }
                 Rectangle {
-                    height: 34px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cffffff;
+                    height: 34px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface;
                     TextInput { accessible-id: "webdav-password"; x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.password; single-line: true; input-type: InputType.password; }
                 }
                 CheckBox { accessible-id: "webdav-https"; text: root.https-label; checked <=> root.https; }
-                if root.error-text != "": Text { text: root.error-text; color: VisualStyle.cc42b1c; font-size: 12px; wrap: word-wrap; }
+                if root.error-text != "": Text { text: root.error-text; color: VisualStyle.danger; font-size: 12px; wrap: word-wrap; }
                 Rectangle { vertical-stretch: 1; }
                 HorizontalLayout {
                     alignment: end; spacing: 8px;
@@ -481,7 +479,7 @@ export component NetworkLocationRenameWindow inherits Window {
     max-width: 460px;
     min-height: 210px;
     max-height: 210px;
-    background: VisualStyle.cffffff;
+    background: VisualStyle.surface;
     default-font-family: "Segoe UI";
 
     in property <bool> dark-theme: false;
@@ -502,10 +500,10 @@ export component NetworkLocationRenameWindow inherits Window {
         StandaloneTitleBar { title: root.title-text; close-label: root.close-text; close-requested => { root.safe-cancel(); } drag-window => { root.drag-window(); } }
         Rectangle {
             vertical-stretch: 1;
-            background: VisualStyle.cffffff;
+            background: VisualStyle.surface;
             VerticalLayout {
                 padding-left: 20px; padding-right: 20px; padding-top: 12px; padding-bottom: 20px; spacing: 10px;
-                Text { text: root.detail-text; color: VisualStyle.c62656f; font-size: 13px; }
+                Text { text: root.detail-text; color: VisualStyle.text-secondary; font-size: 13px; }
                 LineEdit { accessible-id: "network-location-rename-input"; accessible-label: root.title-text; text <=> root.name; accepted => { if (root.name != "") { root.save(root.name); } } }
                 Rectangle { vertical-stretch: 1; }
                 HorizontalLayout {
@@ -534,8 +532,8 @@ component InlineRenameEditor inherits Rectangle {
     private property <bool> submitted: false;
     private property <bool> editor-has-focus: rename-editor.has-focus;
     height: root.multiline ? min(root.editor-height-limit, max(30px, root.content-height)) : 30px;
-    background: VisualStyle.cffffff;
-    border-color: VisualStyle.c4f6bed;
+    background: VisualStyle.surface;
+    border-color: VisualStyle.accent;
     border-width: 1px;
     border-radius: 3px;
     init => { self.editor-active = true; }
@@ -569,9 +567,9 @@ component InlineRenameEditor inherits Rectangle {
             width: root.multiline ? max(1px, parent.width - self.text-cursor-width) : max(parent.width - self.text-cursor-width, self.preferred-width);
             height: max(parent.height, self.preferred-height);
             text <=> root.text;
-            color: VisualStyle.c24252a;
-            selection-background-color: VisualStyle.cc7d7ff;
-            selection-foreground-color: VisualStyle.c24252a;
+            color: VisualStyle.text-strong;
+            selection-background-color: VisualStyle.selection-emphasis;
+            selection-foreground-color: VisualStyle.text-strong;
             font-size: VisualStyle.file-name-font-size;
             single-line: !root.multiline;
             wrap: root.multiline ? word-wrap : no-wrap;
@@ -668,7 +666,7 @@ component IconButton inherits Rectangle {
     height: 38px;
     border-radius: 5px;
     border-width: 0px;
-    background: !root.enabled ? transparent : icon-touch.pressed ? VisualStyle.cdde3ed : icon-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
+    background: !root.enabled ? transparent : icon-touch.pressed ? VisualStyle.surface-pressed : icon-touch.has-hover ? VisualStyle.surface-hover : transparent;
     opacity: root.enabled ? 1 : 0.46;
     Image {
         width: 20px;
@@ -677,7 +675,7 @@ component IconButton inherits Rectangle {
         y: (parent.height - self.height) / 2;
         source: root.icon-source;
         image-fit: contain;
-        colorize: VisualStyle.c303138;
+        colorize: VisualStyle.text-primary;
     }
     icon-touch := TouchArea {
         enabled: root.enabled;
@@ -696,7 +694,7 @@ component SidebarGroupHeader inherits Rectangle {
     in property <bool> expanded: true;
     callback toggled();
     height: 30px;
-    background: group-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
+    background: group-touch.has-hover ? VisualStyle.navigation-hover : transparent;
     border-radius: 5px;
     HorizontalLayout {
         padding-left: 7px; padding-right: 7px; spacing: 7px;
@@ -706,10 +704,10 @@ component SidebarGroupHeader inherits Rectangle {
                 x: 2px; y: (parent.height - self.height) / 2; width: 8px; height: 8px;
                 viewbox-width: 8; viewbox-height: 8; fit: fill;
                 commands: root.expanded ? "M 1 2.5 L 4 5.5 L 7 2.5" : "M 2.5 1 L 5.5 4 L 2.5 7";
-                stroke: VisualStyle.c666a74; stroke-width: 1.2px; stroke-line-cap: round; stroke-line-join: round; fill: transparent;
+                stroke: VisualStyle.icon-muted; stroke-width: 1.2px; stroke-line-cap: round; stroke-line-join: round; fill: transparent;
             }
         }
-        Text { text: root.label; color: VisualStyle.c777a84; font-size: 12px; font-weight: 700; vertical-alignment: center; }
+        Text { text: root.label; color: VisualStyle.text-muted; font-size: 12px; font-weight: 700; vertical-alignment: center; }
     }
     accessible-expandable: true;
     accessible-expanded: root.expanded;
@@ -726,19 +724,19 @@ component WindowButton inherits Rectangle {
     callback clicked();
     width: 46px;
     height: 40px;
-    background: root.kind == 2 && button-touch.has-hover ? VisualStyle.cc42b1c : button-touch.pressed ? VisualStyle.cd9dce2 : button-touch.has-hover ? VisualStyle.ce8eaf0 : transparent;
+    background: root.kind == 2 && button-touch.has-hover ? VisualStyle.danger : button-touch.pressed ? VisualStyle.titlebar-pressed : button-touch.has-hover ? VisualStyle.titlebar-hover : transparent;
     Rectangle {
         visible: root.kind == 0;
         width: 10px; height: 1px;
         x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-        background: root.kind == 2 && button-touch.has-hover ? VisualStyle.cffffff : VisualStyle.c303138;
+        background: root.kind == 2 && button-touch.has-hover ? VisualStyle.surface : VisualStyle.text-primary;
     }
     Rectangle {
         visible: root.kind == 1;
         width: 9px; height: 9px;
         x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
         border-width: 1px;
-        border-color: VisualStyle.c303138;
+        border-color: VisualStyle.text-primary;
         background: transparent;
     }
     Image {
@@ -747,7 +745,7 @@ component WindowButton inherits Rectangle {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         source: button-touch.has-hover ? IconMap.action-close-hover : IconMap.action-close;
-        colorize: button-touch.has-hover ? #ffffff : VisualStyle.c303138;
+        colorize: button-touch.has-hover ? #ffffff : VisualStyle.text-primary;
     }
     button-touch := TouchArea { clicked => { root.clicked(); } }
     accessible-role: button;
@@ -764,7 +762,7 @@ component LightScrollBar inherits Rectangle {
 
     width: 12px;
     visible: root.maximum > 0px;
-    background: scroll-touch.has-hover ? VisualStyle.cf1f2f4 : transparent;
+    background: scroll-touch.has-hover ? VisualStyle.scrollbar-track-hover : transparent;
     border-radius: 6px;
 
     private property <length> track-padding: 4px;
@@ -778,7 +776,7 @@ component LightScrollBar inherits Rectangle {
         x: parent.width - self.width - 3px;
         y: root.track-padding + root.thumb-travel * (-root.value / root.maximum);
         border-radius: self.width / 2;
-        background: scroll-touch.has-hover ? VisualStyle.c9a9da3 : VisualStyle.caeb1b6;
+        background: scroll-touch.has-hover ? VisualStyle.scrollbar-thumb-hover : VisualStyle.scrollbar-thumb;
     }
 
     scroll-touch := TouchArea {
@@ -820,13 +818,13 @@ component BreadcrumbButton inherits Rectangle {
     height: 30px;
     clip: true;
     border-radius: 4px;
-    background: !root.current && crumb-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
+    background: !root.current && crumb-touch.has-hover ? VisualStyle.surface-hover : transparent;
     Text {
         x: 8px;
         width: max(0px, parent.width - (root.current ? 16px : 29px));
         height: parent.height;
         text: root.label;
-        color: VisualStyle.c30333a;
+        color: VisualStyle.text-primary;
         font-size: 12px;
         font-weight: root.current ? 600 : 400;
         vertical-alignment: center;
@@ -835,7 +833,7 @@ component BreadcrumbButton inherits Rectangle {
     }
     if !root.current: Text {
         x: max(0px, parent.width - 16px); width: 8px; height: parent.height;
-        text: "›"; color: VisualStyle.c777b85; font-size: 14px;
+        text: "›"; color: VisualStyle.text-muted; font-size: 14px;
         vertical-alignment: center;
     }
     crumb-touch := TouchArea {
@@ -867,7 +865,7 @@ component AddressEditor inherits Rectangle {
         editor.set-selection-offsets(2147483647, 2147483647);
     }
 
-    background: VisualStyle.cffffff;
+    background: VisualStyle.surface;
     forward-focus: editor;
     property <bool> editor-has-focus: editor.has-focus;
     callback focus-lost();
@@ -881,13 +879,13 @@ component AddressEditor inherits Rectangle {
         width: 30px;
         height: parent.height;
         border-radius: 4px;
-        background: root.depth-enabled ? (depth-touch.pressed ? VisualStyle.cdde3ed : depth-touch.has-hover ? VisualStyle.cedf1f6 : transparent) : transparent;
+        background: root.depth-enabled ? (depth-touch.pressed ? VisualStyle.surface-pressed : depth-touch.has-hover ? VisualStyle.surface-hover : transparent) : transparent;
         opacity: root.depth-enabled ? 1 : 0.35;
         Image {
             width: 18px; height: 18px;
             x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
             source: root.recursive ? IconMap.action-search-recursive : IconMap.action-search-current;
-            colorize: VisualStyle.c303138;
+            colorize: VisualStyle.text-primary;
         }
         depth-touch := TouchArea {
             enabled: root.depth-enabled;
@@ -908,9 +906,9 @@ component AddressEditor inherits Rectangle {
         width: parent.width - 70px;
         height: parent.height;
         text <=> root.text;
-        color: VisualStyle.c30333a;
-        selection-background-color: VisualStyle.cc7d7ff;
-        selection-foreground-color: VisualStyle.c24252a;
+        color: VisualStyle.text-primary;
+        selection-background-color: VisualStyle.selection-emphasis;
+        selection-foreground-color: VisualStyle.text-strong;
         font-size: 13px;
         single-line: true;
         vertical-alignment: center;
@@ -941,14 +939,14 @@ component AddressEditor inherits Rectangle {
         width: 30px;
         height: parent.height;
         border-radius: 4px;
-        background: dismiss-touch.pressed ? VisualStyle.cdde3ed : dismiss-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
+        background: dismiss-touch.pressed ? VisualStyle.surface-pressed : dismiss-touch.has-hover ? VisualStyle.surface-hover : transparent;
         Image {
             width: 16px;
             height: 16px;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             source: IconMap.action-close;
-            colorize: VisualStyle.c303138;
+            colorize: VisualStyle.text-primary;
         }
         dismiss-touch := TouchArea {
             mouse-cursor: pointer;
@@ -970,7 +968,7 @@ component HomeCard inherits Rectangle {
     height: item.state >= 0 ? 82px : 64px;
     border-radius: 7px;
     border-width: 0px;
-    background: root.selected-id == item.stable-id ? VisualStyle.cdce6ff : card-touch.pressed ? VisualStyle.cdde3ed : card-touch.has-hover ? VisualStyle.cedf1f6 : VisualStyle.cfafbfc;
+    background: root.selected-id == item.stable-id ? VisualStyle.selection : card-touch.pressed ? VisualStyle.surface-pressed : card-touch.has-hover ? VisualStyle.surface-hover : VisualStyle.surface-subtle;
 
     card-focus := FocusScope {
         width: parent.width; height: parent.height;
@@ -986,8 +984,8 @@ component HomeCard inherits Rectangle {
         }
         Rectangle {
             horizontal-stretch: 1;
-            Text { x: 0px; y: 0px; width: parent.width; height: root.item.source-kind == 2 ? parent.height : 20px; text: root.item.label; color: VisualStyle.c30333a; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: root.item.source-kind == 2 ? clip : elide; wrap: root.item.source-kind == 2 ? word-wrap : no-wrap; }
-            Text { visible: root.item.source-kind != 2; x: 0px; y: 21px; width: parent.width; height: 17px; text: root.item.detail; color: VisualStyle.c62656f; font-size: 11px; vertical-alignment: center; overflow: elide; }
+            Text { x: 0px; y: 0px; width: parent.width; height: root.item.source-kind == 2 ? parent.height : 20px; text: root.item.label; color: VisualStyle.text-primary; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: root.item.source-kind == 2 ? clip : elide; wrap: root.item.source-kind == 2 ? word-wrap : no-wrap; }
+            Text { visible: root.item.source-kind != 2; x: 0px; y: 21px; width: parent.width; height: 17px; text: root.item.detail; color: VisualStyle.text-secondary; font-size: 11px; vertical-alignment: center; overflow: elide; }
             if root.item.state >= 0 && root.item.source-kind != 0: Rectangle {
                 x: 0px; y: 43px; width: parent.width; height: 4px; border-radius: 2px; clip: true;
                 background: root.item.state == 3 ? VisualStyle.drive-progress-unavailable : VisualStyle.drive-progress-track;
@@ -1040,17 +1038,17 @@ component HomeSection inherits Rectangle {
         spacing: 8px;
         Rectangle {
             height: 34px; border-radius: 5px;
-            background: header-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
+            background: header-touch.has-hover ? VisualStyle.surface-hover : transparent;
             Rectangle {
                 x: 10px; width: 12px; height: parent.height;
                 Path {
                     x: 2px; y: (parent.height - self.height) / 2; width: 8px; height: 8px;
                     viewbox-width: 8; viewbox-height: 8; fit: fill;
                     commands: root.expanded ? "M 1 2.5 L 4 5.5 L 7 2.5" : "M 2.5 1 L 5.5 4 L 2.5 7";
-                    stroke: VisualStyle.c666a74; stroke-width: 1.2px; stroke-line-cap: round; stroke-line-join: round; fill: transparent;
+                    stroke: VisualStyle.icon-muted; stroke-width: 1.2px; stroke-line-cap: round; stroke-line-join: round; fill: transparent;
                 }
             }
-            Text { x: 34px; width: parent.width - 44px; text: root.title; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; vertical-alignment: center; }
+            Text { x: 34px; width: parent.width - 44px; text: root.title; color: VisualStyle.text-primary; font-size: 15px; font-weight: 600; vertical-alignment: center; }
             header-touch := TouchArea { mouse-cursor: pointer; clicked => { root.toggle-expanded(); } }
             accessible-role: button; accessible-label: root.title; accessible-expanded: root.expanded;
         }
@@ -1062,8 +1060,8 @@ component HomeSection inherits Rectangle {
                 Rectangle { horizontal-stretch: 1; }
             }
             if root.show-empty: Rectangle {
-                height: 58px; border-radius: 7px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
-                Text { x: 16px; width: parent.width - 32px; text: root.empty-text; color: VisualStyle.c62656f; font-size: 12px; vertical-alignment: center; horizontal-alignment: center; wrap: word-wrap; }
+                height: 58px; border-radius: 7px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
+                Text { x: 16px; width: parent.width - 32px; text: root.empty-text; color: VisualStyle.text-secondary; font-size: 12px; vertical-alignment: center; horizontal-alignment: center; wrap: word-wrap; }
             }
         }
     }
@@ -1082,7 +1080,7 @@ export component AppWindow inherits Window {
     preferred-height: 760px;
     min-width: 820px;
     min-height: 520px;
-    background: VisualStyle.cf5f6f8;
+    background: VisualStyle.window-background;
     changed dark-theme => { VisualStyle.dark-theme = root.dark-theme; }
     // Keep responsive constraints independent of the window's intrinsic size calculation.
     out property <length> layout-width: root.width;
@@ -1809,7 +1807,7 @@ export component AppWindow inherits Window {
     VerticalLayout {
         spacing: 0px;
         Rectangle {
-            height: 46px; background: VisualStyle.cf1f2f5;
+            height: 46px; background: VisualStyle.tab-strip-background;
             HorizontalLayout {
                 x: 8px; y: 12px; width: parent.width - 8px - 3 * 46px; height: 34px; spacing: 5px;
                 Rectangle {
@@ -1834,7 +1832,7 @@ export component AppWindow inherits Window {
                                 : index * (root.tab-width + 5px);
                             width: root.tab-width; height: 34px;
                             visible: !root.tab-dragging || index != root.tab-drag-source-index;
-                            background: tab.active ? transparent : (tab-touch.has-hover ? VisualStyle.ce8eaf0 : VisualStyle.cf1f2f5);
+                            background: tab.active ? transparent : (tab-touch.has-hover ? VisualStyle.titlebar-hover : VisualStyle.tab-strip-background);
                             border-radius: VisualStyle.tab-corner-radius;
                             border-width: 0px;
                             ActiveTabShape {
@@ -1881,15 +1879,15 @@ export component AppWindow inherits Window {
                                 width: parent.width - VisualStyle.tab-shoulder-span;
                                 padding-left: 10px; padding-right: 7px; spacing: 6px;
                                 InlineIcon { icon-source: tab.is-settings ? IconMap.action-settings : tab.is-home ? IconMap.location-home : (tab.icon.width != 0 ? tab.icon : (tab.is-drive ? IconMap.location-drive : IconMap.file-folder)); icon-size: 16px; }
-                                Text { text: tab.title; color: VisualStyle.c303138; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
-                                Text { visible: tab.loading && !(root.can-close-tab && tab-touch.has-hover); text: "…"; color: VisualStyle.c4f6bed; vertical-alignment: center; }
+                                Text { text: tab.title; color: VisualStyle.text-primary; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                                Text { visible: tab.loading && !(root.can-close-tab && tab-touch.has-hover); text: "…"; color: VisualStyle.accent; vertical-alignment: center; }
                                 Rectangle {
                                     visible: root.can-close-tab && (tab-touch.has-hover || close-touch.has-hover);
                                     width: 24px; height: 34px;
                                     Rectangle {
                                         width: 24px; height: 24px; y: 5px; border-radius: 4px;
-                                        background: close-touch.pressed ? VisualStyle.cd7dae0 : close-touch.has-hover ? VisualStyle.ce1e4ea : transparent;
-                                        Image { width: 12px; height: 12px; x: 6px; y: 6px; source: IconMap.action-close; colorize: VisualStyle.c303138; }
+                                        background: close-touch.pressed ? VisualStyle.tab-close-pressed : close-touch.has-hover ? VisualStyle.tab-close-hover : transparent;
+                                        Image { width: 12px; height: 12px; x: 6px; y: 6px; source: IconMap.action-close; colorize: VisualStyle.text-primary; }
                                     }
                                     close-touch := TouchArea { mouse-cursor: pointer; clicked => { root.close-tab(tab.id); } }
                                     accessible-role: button; accessible-id: root.accessibility-window-id + "/tab/" + tab.id + "/close"; accessible-label: root.text-close-tab; accessible-enabled: root.can-close-tab; accessible-action-default => { if root.can-close-tab { root.close-tab(tab.id); } }
@@ -1903,13 +1901,13 @@ export component AppWindow inherits Window {
                 Rectangle {
                     visible: root.tabs-overflow;
                     width: self.visible ? 28px : 0px; height: 34px; border-radius: 6px;
-                    background: all-tabs-touch.pressed ? VisualStyle.cd9dce2 : all-tabs-touch.has-hover ? VisualStyle.ce8eaf0 : transparent;
-                    Text { text: "⌄"; color: VisualStyle.c303138; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; }
+                    background: all-tabs-touch.pressed ? VisualStyle.titlebar-pressed : all-tabs-touch.has-hover ? VisualStyle.titlebar-hover : transparent;
+                    Text { text: "⌄"; color: VisualStyle.text-primary; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; }
                     all-tabs-touch := TouchArea { mouse-cursor: pointer; clicked => { root.tabs-menu-open = !root.tabs-menu-open; } }
                     accessible-role: button; accessible-id: "tabs-menu"; accessible-label: root.text-all-tabs; accessible-expandable: true; accessible-expanded: root.tabs-menu-open; accessible-action-default => { root.tabs-menu-open = !root.tabs-menu-open; } accessible-action-expand => { root.tabs-menu-open = true; }
                     Tooltip { text: @markdown("\{root.text-all-tabs}"); }
                 }
-                Rectangle { width: 34px; height: 34px; border-radius: 6px; background: add-touch.pressed ? VisualStyle.cd9dce2 : add-touch.has-hover ? VisualStyle.ce8eaf0 : transparent; Image { width: 20px; height: 20px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; source: IconMap.action-add; colorize: VisualStyle.c303138; } add-touch := TouchArea { mouse-cursor: pointer; clicked => { root.new-tab(); } } accessible-role: button; accessible-id: "tab-new"; accessible-label: root.text-new-tab; accessible-action-default => { root.new-tab(); } Tooltip { text: @markdown("\{root.text-new-tab} (Ctrl+T)"); } }
+                Rectangle { width: 34px; height: 34px; border-radius: 6px; background: add-touch.pressed ? VisualStyle.titlebar-pressed : add-touch.has-hover ? VisualStyle.titlebar-hover : transparent; Image { width: 20px; height: 20px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; source: IconMap.action-add; colorize: VisualStyle.text-primary; } add-touch := TouchArea { mouse-cursor: pointer; clicked => { root.new-tab(); } } accessible-role: button; accessible-id: "tab-new"; accessible-label: root.text-new-tab; accessible-action-default => { root.new-tab(); } Tooltip { text: @markdown("\{root.text-new-tab} (Ctrl+T)"); } }
                 Rectangle {
                     horizontal-stretch: 1;
                     drag-touch := TouchArea {
@@ -1936,7 +1934,7 @@ export component AppWindow inherits Window {
                 IconButton { accessible-id: "navigation-up"; icon-source: IconMap.action-up; tip: root.text-up + " (Alt+Up)"; enabled: root.can-navigate-up; button-label: root.text-up; clicked => { root.navigate-up(); } }
                 if !root.compact: IconButton { accessible-id: "navigation-refresh"; icon-source: IconMap.action-refresh; tip: root.text-refresh + " (F5)"; enabled: root.can-refresh; button-label: root.text-refresh; clicked => { root.refresh(); } }
                 address-bar := Rectangle {
-                    height: 38px; min-width: 0px; horizontal-stretch: 1; background: VisualStyle.dark-theme && address-hover.has-hover ? #282828 : VisualStyle.cffffff; border-width: root.address-editing ? 1px : 0px; border-color: VisualStyle.c4f6bed; border-radius: 5px;
+                    height: 38px; min-width: 0px; horizontal-stretch: 1; background: VisualStyle.dark-theme && address-hover.has-hover ? #282828 : VisualStyle.surface; border-width: root.address-editing ? 1px : 0px; border-color: VisualStyle.accent; border-radius: 5px;
                     address-hover := TouchArea {
                         breadcrumb-view := Rectangle {
                             visible: !root.address-editing;
@@ -2043,16 +2041,16 @@ export component AppWindow inherits Window {
 
                     for location in root.sidebar-items: Rectangle {
                         visible: root.quick-access-visible && location.group-kind == 0 && root.quick-access-expanded;
-                        height: self.visible ? 30px : 0px; border-radius: 5px; background: side-touch.pressed ? VisualStyle.cdde3ed : side-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
-                        HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : (location.icon-kind == 0 ? IconMap.location-home : location.icon-kind == 1 ? IconMap.location-desktop : location.icon-kind == 2 ? IconMap.location-downloads : location.icon-kind == 3 ? IconMap.location-documents : location.icon-kind == 4 ? IconMap.location-pictures : location.icon-kind == 5 ? IconMap.location-music : IconMap.location-videos); } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
+                        height: self.visible ? 30px : 0px; border-radius: 5px; background: side-touch.pressed ? VisualStyle.surface-pressed : side-touch.has-hover ? VisualStyle.navigation-hover : transparent;
+                        HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : (location.icon-kind == 0 ? IconMap.location-home : location.icon-kind == 1 ? IconMap.location-desktop : location.icon-kind == 2 ? IconMap.location-downloads : location.icon-kind == 3 ? IconMap.location-documents : location.icon-kind == 4 ? IconMap.location-pictures : location.icon-kind == 5 ? IconMap.location-music : IconMap.location-videos); } Text { text: location.label; color: VisualStyle.text-navigation; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         side-touch := TouchArea { mouse-cursor: pointer; clicked => { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.width - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.height - root.absolute-position.y) / 1px; root.navigate-sidebar(location.index); } pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.stable-id != "" { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px; root.show-sidebar-menu(location.group-kind, location.stable-id, root.sidebar-keyboard-anchor-x, root.sidebar-keyboard-anchor-y); } } }
                         accessible-role: button; accessible-id: "sidebar/" + location.group-kind + "/" + location.stable-id; accessible-label: location.label;
                     }
                     SidebarGroupHeader { accessible-id: "sidebar-group-libraries"; visible: root.libraries-visible; height: self.visible ? 30px : 0px; label: root.text-libraries; expanded: root.libraries-expanded; toggled => { root.libraries-expanded = !root.libraries-expanded; sidebar-scroll.clamp-viewport(); } }
                     for location in root.sidebar-items: Rectangle {
                         visible: root.libraries-visible && location.group-kind == 4 && root.libraries-expanded;
-                        height: self.visible ? 30px : 0px; border-radius: 5px; background: library-touch.pressed ? VisualStyle.cdde3ed : library-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
-                        HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.file-folder; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
+                        height: self.visible ? 30px : 0px; border-radius: 5px; background: library-touch.pressed ? VisualStyle.surface-pressed : library-touch.has-hover ? VisualStyle.navigation-hover : transparent;
+                        HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.file-folder; } Text { text: location.label; color: VisualStyle.text-navigation; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         library-touch := TouchArea { mouse-cursor: pointer; clicked => { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.width - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.height - root.absolute-position.y) / 1px; root.navigate-library(location.stable-id); } pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.stable-id != "" { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px; root.show-sidebar-menu(location.group-kind, location.stable-id, root.sidebar-keyboard-anchor-x, root.sidebar-keyboard-anchor-y); } } }
                         accessible-role: button; accessible-id: "sidebar/" + location.group-kind + "/" + location.stable-id; accessible-label: location.label;
                     }
@@ -2061,13 +2059,13 @@ export component AppWindow inherits Window {
                         visible: root.drives-visible && location.group-kind == 1 && root.drives-expanded;
                         height: self.visible ? 40px : 0px;
                         border-radius: 5px;
-                        background: drive-touch.pressed ? VisualStyle.cdde3ed : drive-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
+                        background: drive-touch.pressed ? VisualStyle.surface-pressed : drive-touch.has-hover ? VisualStyle.navigation-hover : transparent;
                         HorizontalLayout {
                             padding-left: 8px; padding-right: 8px; spacing: 10px;
                             InlineIcon { icon-size: 16px; icon-source: location.icon.width != 0 ? location.icon : IconMap.location-drive; }
                             Rectangle {
                                 horizontal-stretch: 1;
-                                Text { y: 2px; width: parent.width; height: 21px; text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; }
+                                Text { y: 2px; width: parent.width; height: 21px; text: location.label; color: VisualStyle.text-navigation; font-size: 13px; vertical-alignment: center; overflow: elide; }
                                 drive-track := Rectangle {
                                     y: 28px; width: parent.width; height: 3px; border-radius: 2px; clip: true;
                                     background: location.drive-state == 3 ? VisualStyle.drive-progress-unavailable : VisualStyle.drive-progress-track;
@@ -2091,8 +2089,8 @@ export component AppWindow inherits Window {
                     SidebarGroupHeader { accessible-id: "sidebar-group-network-locations"; visible: root.network-locations-visible; height: self.visible ? 30px : 0px; label: root.text-network-locations; expanded: root.network-locations-expanded; toggled => { root.network-locations-expanded = !root.network-locations-expanded; sidebar-scroll.clamp-viewport(); } }
                     for location in root.sidebar-items: Rectangle {
                         visible: root.network-locations-visible && location.group-kind == 2 && root.network-locations-expanded;
-                        height: self.visible ? 30px : 0px; border-radius: 5px; background: network-location-touch.pressed ? VisualStyle.cdde3ed : network-location-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
-                        HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.location-drive; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
+                        height: self.visible ? 30px : 0px; border-radius: 5px; background: network-location-touch.pressed ? VisualStyle.surface-pressed : network-location-touch.has-hover ? VisualStyle.navigation-hover : transparent;
+                        HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.location-drive; } Text { text: location.label; color: VisualStyle.text-navigation; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         network-location-touch := TouchArea {
                             mouse-cursor: pointer;
                             clicked => { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.width - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.height - root.absolute-position.y) / 1px; root.navigate-network-location(location.stable-id); }
@@ -2108,7 +2106,7 @@ export component AppWindow inherits Window {
                     SidebarGroupHeader { accessible-id: "sidebar-group-network"; visible: root.network-visible; height: self.visible ? 30px : 0px; label: root.text-network; expanded: root.network-expanded; toggled => { root.network-expanded = !root.network-expanded; root.toggle-network(); sidebar-scroll.clamp-viewport(); } }
                     if root.network-visible && root.network-expanded: Rectangle {
                         height: root.network-discovery-loading || root.network-discovery-empty || root.network-discovery-error != "" ? 28px : 0px;
-                        status-text := Text { x: 8px; width: parent.width - 16px; text: root.network-discovery-error != "" ? root.network-discovery-error : root.network-discovery-loading ? root.text-network-discovery-loading : root.network-discovery-empty ? root.text-network-discovery-empty : ""; color: VisualStyle.c777a84; font-size: 11px; vertical-alignment: center; overflow: elide; }
+                        status-text := Text { x: 8px; width: parent.width - 16px; text: root.network-discovery-error != "" ? root.network-discovery-error : root.network-discovery-loading ? root.text-network-discovery-loading : root.network-discovery-empty ? root.text-network-discovery-empty : ""; color: VisualStyle.text-muted; font-size: 11px; vertical-alignment: center; overflow: elide; }
                         status-touch := TouchArea { enabled: !root.network-discovery-loading; mouse-cursor: self.enabled ? pointer : default; clicked => { root.refresh-network(); } }
                         accessible-role: button;
                         accessible-label: root.text-refresh + " " + root.text-network + ": " + status-text.text;
@@ -2116,8 +2114,8 @@ export component AppWindow inherits Window {
                     }
                     for location in root.sidebar-items: Rectangle {
                         visible: root.network-visible && location.group-kind == 3 && root.network-expanded;
-                        height: self.visible ? 30px : 0px; border-radius: 5px; background: network-touch.pressed ? VisualStyle.cdde3ed : network-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
-                        HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.location-drive; } Text { text: location.label; color: VisualStyle.c4f535d; font-size: 13px; vertical-alignment: center; overflow: elide; } }
+                        height: self.visible ? 30px : 0px; border-radius: 5px; background: network-touch.pressed ? VisualStyle.surface-pressed : network-touch.has-hover ? VisualStyle.navigation-hover : transparent;
+                        HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; InlineIcon { icon-source: location.icon.width != 0 ? location.icon : IconMap.location-drive; } Text { text: location.label; color: VisualStyle.text-navigation; font-size: 13px; vertical-alignment: center; overflow: elide; } }
                         network-touch := TouchArea { mouse-cursor: pointer; clicked => { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.width - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.height - root.absolute-position.y) / 1px; root.navigate-sidebar(location.index); } pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.up && location.stable-id != "" { root.sidebar-keyboard-active = true; root.sidebar-keyboard-group = location.group-kind; root.sidebar-keyboard-stable-id = location.stable-id; root.sidebar-keyboard-anchor-x = (self.absolute-position.x + self.mouse-x - root.absolute-position.x) / 1px; root.sidebar-keyboard-anchor-y = (self.absolute-position.y + self.mouse-y - root.absolute-position.y) / 1px; root.show-sidebar-menu(location.group-kind, location.stable-id, root.sidebar-keyboard-anchor-x, root.sidebar-keyboard-anchor-y); } } }
                         accessible-role: button; accessible-id: "sidebar/" + location.group-kind + "/" + location.stable-id; accessible-label: location.label;
                     }
@@ -2149,7 +2147,7 @@ export component AppWindow inherits Window {
                             width: 34px;
                             height: 34px;
                             border-radius: 5px;
-                            background: settings-touch.pressed ? VisualStyle.cdde3ed : settings-touch.has-hover ? VisualStyle.ce5e9f2 : transparent;
+                            background: settings-touch.pressed ? VisualStyle.surface-pressed : settings-touch.has-hover ? VisualStyle.navigation-hover : transparent;
                             InlineIcon {
                                 x: (parent.width - self.width) / 2;
                                 y: (parent.height - self.height) / 2;
@@ -2172,7 +2170,7 @@ export component AppWindow inherits Window {
                 VerticalLayout {
                     spacing: 0px;
                     Rectangle {
-                    height: root.view-mode == 0 && !root.active-is-home ? 38px : 0px; visible: root.view-mode == 0 && !root.active-is-home; background: VisualStyle.cffffff; border-width: 0px; clip: true;
+                    height: root.view-mode == 0 && !root.active-is-home ? 38px : 0px; visible: root.view-mode == 0 && !root.active-is-home; background: VisualStyle.surface; border-width: 0px; clip: true;
                     header-viewport := Rectangle {
                         width: parent.width - 28px; height: parent.height; clip: true;
                         header-columns := Rectangle {
@@ -2183,14 +2181,14 @@ export component AppWindow inherits Window {
                                 for column[index] in root.columns: Rectangle {
                                     visible: column.visible;
                                     width: self.visible ? root.column-width(column.kind) : 0px;
-                                    background: (column-touch.has-hover || resize-touch.has-hover) ? VisualStyle.ceff4ff : transparent;
-                                    Rectangle { x: parent.width - 1px; y: 10px; width: 1px; height: 18px; background: VisualStyle.c57595c; }
+                                    background: (column-touch.has-hover || resize-touch.has-hover) ? VisualStyle.accent-hover : transparent;
+                                    Rectangle { x: parent.width - 1px; y: 10px; width: 1px; height: 18px; background: VisualStyle.column-divider; }
                                     Rectangle { x: 0px; y: 0px; width: parent.width - 16px; height: parent.height; z: 1;
                                     Text {
                                         x: column.content-left + column.icon-slot; width: parent.width - self.x - column.content-right;
                                         horizontal-alignment: left;
                                         text: column.label + (root.sort-field == column.kind ? (root.sort-descending ? " ↓" : " ↑") : "");
-                                        color: VisualStyle.c696b74; overflow: elide;
+                                        color: VisualStyle.text-detail; overflow: elide;
                                         font-size: 12px; font-weight: root.sort-field == column.kind ? 600 : 400; vertical-alignment: center;
                                     }
                                     column-touch := TouchArea {
@@ -2288,7 +2286,7 @@ export component AppWindow inherits Window {
                     y: 0px;
                     width: parent.width;
                     height: parent.height;
-                    background: VisualStyle.cffffff;
+                    background: VisualStyle.surface;
                     home-scroll := ScrollView {
                         width: parent.width; height: parent.height;
                         horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
@@ -2320,7 +2318,7 @@ export component AppWindow inherits Window {
                             padding-left: root.minimal ? 18px : 30px;
                             padding-right: root.minimal ? 18px : 30px;
                             padding-top: 22px; padding-bottom: 30px; spacing: 18px;
-                            Text { text: root.text-home; color: VisualStyle.c30333a; font-size: 24px; font-weight: 600; height: 36px; }
+                            Text { text: root.text-home; color: VisualStyle.text-primary; font-size: 24px; font-weight: 600; height: 36px; }
                             HomeSection {
                                 title: root.text-home-quick-access; rows: root.home-quick-access-items; selected-id: root.home-selected-id; expanded: root.home-quick-access-expanded; column-count: root.home-column-count; card-width: root.home-card-width;
                                 toggle-expanded => { root.toggle-home-section(0); }
@@ -2352,7 +2350,7 @@ export component AppWindow inherits Window {
                     y: 0px;
                     width: parent.width;
                     height: parent.height;
-                    background: VisualStyle.cffffff;
+                    background: VisualStyle.surface;
                     background-touch := TouchArea {
                         pointer-event(event) => {
                             if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
@@ -2404,13 +2402,13 @@ list := ListView {
                             width: root.view-mode == 0 ? max(list.width, root.file-columns-width + 16px) : list.width;
                             x: 0px;
                             height: entry.group-header ? (entry.group-detail == "" ? 32px : 48px) : root.layout-row-height;
-                            background: VisualStyle.cffffff;
+                            background: VisualStyle.surface;
                             opacity: entry.group-header ? 1 : (!entry.loaded ? 0 : (entry.cut ? 0.52 : 1));
                             if entry.group-header: Rectangle {
                                 x: 12px; width: parent.width - 24px; height: parent.height;
-                                Text { x: 4px; y: 5px; width: parent.width - 90px; height: 20px; text: entry.group-label; color: VisualStyle.c30333a; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: elide; }
-                                Text { x: 4px; y: 25px; width: parent.width - 8px; height: 18px; text: entry.group-detail; color: VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; overflow: elide; }
-                                Text { x: parent.width - 82px; y: 5px; width: 78px; height: 20px; text: entry.group-count; color: VisualStyle.c72747d; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+                                Text { x: 4px; y: 5px; width: parent.width - 90px; height: 20px; text: entry.group-label; color: VisualStyle.text-primary; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: elide; }
+                                Text { x: 4px; y: 25px; width: parent.width - 8px; height: 18px; text: entry.group-detail; color: VisualStyle.text-tertiary; font-size: 11px; vertical-alignment: center; overflow: elide; }
+                                Text { x: parent.width - 82px; y: 5px; width: 78px; height: 20px; text: entry.group-count; color: VisualStyle.text-tertiary; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
                             }
                             Rectangle {
                                 visible: !entry.group-header;
@@ -2421,7 +2419,7 @@ list := ListView {
                                 border-radius: 5px;
                                 border-width: 0px;
                                 clip: true;
-                                background: entry.id == root.drop-hover-entry-id ? VisualStyle.cc7d7ff : (entry.selected ? VisualStyle.cdce6ff : (mouse.has-hover ? VisualStyle.ceff4ff : transparent));
+                                background: entry.id == root.drop-hover-entry-id ? VisualStyle.selection-emphasis : (entry.selected ? VisualStyle.selection : (mouse.has-hover ? VisualStyle.accent-hover : transparent));
                                 Rectangle {
                                 visible: root.view-mode != 7;
                                 x: root.view-mode == 0 ? root.details-hit-left - parent.x : 0px; width: root.view-mode == 0 ? root.file-columns-width : parent.width;
@@ -2446,7 +2444,7 @@ alignment: start;
 spacing: 0px;
 for segment in entry.name-segments: Text {
     text: segment.text;
-    color: VisualStyle.c24252a;
+    color: VisualStyle.text-strong;
     font-size: VisualStyle.file-name-font-size;
     font-weight: segment.highlighted ? 700 : 400;
     horizontal-alignment: left;
@@ -2459,8 +2457,8 @@ visible: segment-layout.preferred-width > parent.width;
 x: parent.width - parent.fade-width;
 width: parent.fade-width;
 height: parent.height;
-background: entry.id == root.drop-hover-entry-id ? VisualStyle.cc7d7ff : (entry.selected ? VisualStyle.cdce6ff : (mouse.has-hover ? VisualStyle.ceff4ff : VisualStyle.cffffff));
-Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name-font-size; horizontal-alignment: right; vertical-alignment: center; }
+background: entry.id == root.drop-hover-entry-id ? VisualStyle.selection-emphasis : (entry.selected ? VisualStyle.selection : (mouse.has-hover ? VisualStyle.accent-hover : VisualStyle.surface));
+Text { text: "…"; color: VisualStyle.text-strong; font-size: VisualStyle.file-name-font-size; horizontal-alignment: right; vertical-alignment: center; }
                                             }
                                         }
                                         if root.rename-editing && root.rename-entry-id == entry.id && root.view-mode != 7 && !root.is-grid-view-mode(root.view-mode): InlineRenameEditor {
@@ -2481,7 +2479,7 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                                         x: column.content-left;
                                         width: parent.width - column.content-left - column.content-right;
                                         text: column.kind == 1 ? (root.search-results-mode ? entry.parent-path : entry.kind) : column.kind == 2 ? entry.size : column.kind == 3 ? entry.modified : entry.created;
-                                        color: VisualStyle.c6f717a;
+                                        color: VisualStyle.text-detail;
                                         font-size: 12px;
                                         vertical-alignment: center;
                                         overflow: elide;
@@ -2499,7 +2497,7 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                                     icon-size: root.layout-icon-size;
                                     icon-source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document);
                                 }
-                                if !(root.rename-editing && root.rename-entry-id == entry.id): Text { x: 64px; y: 8px; width: parent.width - 76px; height: 24px; text: entry.name; color: VisualStyle.c24252a; font-size: VisualStyle.file-name-font-size; font-weight: 500; vertical-alignment: center; overflow: elide; }
+                                if !(root.rename-editing && root.rename-entry-id == entry.id): Text { x: 64px; y: 8px; width: parent.width - 76px; height: 24px; text: entry.name; color: VisualStyle.text-strong; font-size: VisualStyle.file-name-font-size; font-weight: 500; vertical-alignment: center; overflow: elide; }
                                 if root.rename-editing && root.rename-entry-id == entry.id: InlineRenameEditor {
                                     z: 101;
                                     x: 64px; y: 8px;
@@ -2514,9 +2512,9 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                                     commit(name) => { root.commit-rename(name); }
                                     cancel => { root.cancel-rename(); }
                                 }
-                                Text { x: 64px; y: 34px; width: parent.width - 250px; height: 20px; text: entry.kind; color: VisualStyle.c6f717a; font-size: 12px; vertical-alignment: center; overflow: elide; }
-                                Text { x: parent.width - 174px; y: 34px; width: 74px; height: 20px; text: entry.size; color: VisualStyle.c6f717a; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
-                                Text { x: parent.width - 92px; y: 34px; width: 88px; height: 20px; text: entry.modified; color: VisualStyle.c6f717a; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
+                                Text { x: 64px; y: 34px; width: parent.width - 250px; height: 20px; text: entry.kind; color: VisualStyle.text-detail; font-size: 12px; vertical-alignment: center; overflow: elide; }
+                                Text { x: parent.width - 174px; y: 34px; width: 74px; height: 20px; text: entry.size; color: VisualStyle.text-detail; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
+                                Text { x: parent.width - 92px; y: 34px; width: 88px; height: 20px; text: entry.modified; color: VisualStyle.text-detail; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
                             }
                             mouse := TouchArea {
                                 x: root.view-mode == 0 ? root.details-hit-visible-left : 16px;
@@ -2578,7 +2576,7 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                         x: 16px; y: parent.height - 11px;
                         width: parent.width - 44px; height: 10px;
                         visible: root.view-mode == 0 && root.file-columns-width > self.width;
-                        background: horizontal-scroll-touch.has-hover ? VisualStyle.cf1f2f4 : transparent;
+                        background: horizontal-scroll-touch.has-hover ? VisualStyle.scrollbar-track-hover : transparent;
                         border-radius: 5px;
                         private property <length> thumb-width: max(40px, self.width * self.width / root.file-columns-width);
                         private property <length> thumb-travel: max(0px, self.width - self.thumb-width);
@@ -2586,7 +2584,7 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                             x: horizontal-scroll.thumb-travel * (-root.file-viewport-x / max(1px, root.file-columns-width - horizontal-scroll.width));
                             y: 3px; width: horizontal-scroll.thumb-width; height: horizontal-scroll-touch.has-hover ? 6px : 3px;
                             border-radius: self.height / 2;
-                            background: horizontal-scroll-touch.has-hover ? VisualStyle.c9a9da3 : VisualStyle.caeb1b6;
+                            background: horizontal-scroll-touch.has-hover ? VisualStyle.scrollbar-thumb-hover : VisualStyle.scrollbar-thumb;
                         }
                         horizontal-scroll-touch := TouchArea {
                             mouse-cursor: pointer;
@@ -2640,9 +2638,9 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                                 spacing: 8px;
                                 if row.group-header: Rectangle {
                                     width: max(0px, grid.width - 32px); height: parent.height;
-                                    Text { x: 16px; y: 5px; width: parent.width - 110px; height: 20px; text: row.group-label; color: VisualStyle.c30333a; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: elide; }
-                                    Text { x: 16px; y: 25px; width: parent.width - 32px; height: 18px; text: row.group-detail; color: VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; overflow: elide; }
-                                    Text { x: parent.width - 92px; y: 5px; width: 76px; height: 20px; text: row.group-count; color: VisualStyle.c72747d; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+                                    Text { x: 16px; y: 5px; width: parent.width - 110px; height: 20px; text: row.group-label; color: VisualStyle.text-primary; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: elide; }
+                                    Text { x: 16px; y: 25px; width: parent.width - 32px; height: 18px; text: row.group-detail; color: VisualStyle.text-tertiary; font-size: 11px; vertical-alignment: center; overflow: elide; }
+                                    Text { x: parent.width - 92px; y: 5px; width: 76px; height: 20px; text: row.group-count; color: VisualStyle.text-tertiary; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
                                 }
                                 for entry in row.entries: Rectangle {
                                     if entry.loaded && !entry.group-header: Rectangle {
@@ -2657,7 +2655,7 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                             }
                                     width: root.layout-card-width; height: root.layout-row-height - 8px;
                                     border-radius: 7px;
-                                    background: entry.selected ? VisualStyle.cdce6ff : card-touch.has-hover ? VisualStyle.ceff4ff : transparent;
+                                    background: entry.selected ? VisualStyle.selection : card-touch.has-hover ? VisualStyle.accent-hover : transparent;
                                     Image {
                                         private property <length> fallback-size: min(root.layout-icon-size, 48px);
                                         x: root.view-mode == 3 ? 4px : root.view-mode == 6 ? 8px + (root.layout-icon-size - self.width) / 2 : (parent.width - self.width) / 2;
@@ -2673,7 +2671,7 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                                         y: root.view-mode == 3 ? 0px : root.view-mode == 6 ? 8px : root.layout-icon-size + 10px;
                                         width: root.view-mode == 3 ? parent.width - 30px : root.view-mode == 6 ? parent.width - 72px : parent.width - 14px;
                                         height: root.view-mode == 3 ? parent.height : root.view-mode == 6 ? 24px : 48px;
-                                        text: entry.name; color: VisualStyle.c24252a; font-size: VisualStyle.file-name-font-size;
+                                        text: entry.name; color: VisualStyle.text-strong; font-size: VisualStyle.file-name-font-size;
                                         horizontal-alignment: root.view-mode == 3 || root.view-mode == 6 ? left : center; vertical-alignment: root.view-mode == 3 || root.view-mode == 6 ? center : top; wrap: root.view-mode == 3 || root.view-mode == 6 ? no-wrap : word-wrap; overflow: elide;
                                     }
                                     if root.rename-editing && root.rename-entry-id == entry.id && root.is-grid-view-mode(root.view-mode): Rectangle {
@@ -2696,11 +2694,11 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                                     }
                                     if root.view-mode == 6: Text {
                                         x: 64px; y: 32px; width: parent.width - 142px; height: 20px;
-                                        text: entry.kind; color: VisualStyle.c6f717a; font-size: 11px; vertical-alignment: center; overflow: elide;
+                                        text: entry.kind; color: VisualStyle.text-detail; font-size: 11px; vertical-alignment: center; overflow: elide;
                                     }
                                     if root.view-mode == 6: Text {
                                         x: parent.width - 72px; y: 32px; width: 64px; height: 20px;
-                                        text: entry.size; color: VisualStyle.c6f717a; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; overflow: elide;
+                                        text: entry.size; color: VisualStyle.text-detail; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; overflow: elide;
                                     }
                                     card-touch := TouchArea {
                                         enabled: entry.loaded && !(root.rename-editing && root.rename-entry-id == entry.id);
@@ -2741,9 +2739,9 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                             spacing: 8px;
                             if placed.row.group-header: Rectangle {
                                 width: max(0px, grid.width - 32px); height: parent.height;
-                                Text { x: 16px; y: 5px; width: parent.width - 110px; height: 20px; text: placed.row.group-label; color: VisualStyle.c30333a; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: elide; }
-                                Text { x: 16px; y: 25px; width: parent.width - 32px; height: 18px; text: placed.row.group-detail; color: VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; overflow: elide; }
-                                Text { x: parent.width - 92px; y: 5px; width: 76px; height: 20px; text: placed.row.group-count; color: VisualStyle.c72747d; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+                                Text { x: 16px; y: 5px; width: parent.width - 110px; height: 20px; text: placed.row.group-label; color: VisualStyle.text-primary; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: elide; }
+                                Text { x: 16px; y: 25px; width: parent.width - 32px; height: 18px; text: placed.row.group-detail; color: VisualStyle.text-tertiary; font-size: 11px; vertical-alignment: center; overflow: elide; }
+                                Text { x: parent.width - 92px; y: 5px; width: 76px; height: 20px; text: placed.row.group-count; color: VisualStyle.text-tertiary; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
                             }
                             for entry in placed.row.entries: Rectangle {
                                     if entry.loaded && !entry.group-header: Rectangle {
@@ -2758,7 +2756,7 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                             }
                                 width: root.layout-card-width; height: root.layout-row-height - 8px;
                                 border-radius: 7px;
-                                background: entry.selected ? VisualStyle.cdce6ff : grouped-card-touch.has-hover ? VisualStyle.ceff4ff : transparent;
+                                background: entry.selected ? VisualStyle.selection : grouped-card-touch.has-hover ? VisualStyle.accent-hover : transparent;
                                 Image {
                                     private property <length> fallback-size: min(root.layout-icon-size, 48px);
                                     x: root.view-mode == 3 ? 4px : root.view-mode == 6 ? 8px + (root.layout-icon-size - self.width) / 2 : (parent.width - self.width) / 2;
@@ -2774,7 +2772,7 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                                     y: root.view-mode == 3 ? 0px : root.view-mode == 6 ? 8px : root.layout-icon-size + 10px;
                                     width: root.view-mode == 3 ? parent.width - 30px : root.view-mode == 6 ? parent.width - 72px : parent.width - 14px;
                                     height: root.view-mode == 3 ? parent.height : root.view-mode == 6 ? 24px : 48px;
-                                    text: entry.name; color: VisualStyle.c24252a; font-size: VisualStyle.file-name-font-size;
+                                    text: entry.name; color: VisualStyle.text-strong; font-size: VisualStyle.file-name-font-size;
                                     horizontal-alignment: root.view-mode == 3 || root.view-mode == 6 ? left : center; vertical-alignment: root.view-mode == 3 || root.view-mode == 6 ? center : top; wrap: root.view-mode == 3 || root.view-mode == 6 ? no-wrap : word-wrap; overflow: elide;
                                 }
                                 if root.rename-editing && root.rename-entry-id == entry.id && root.is-grid-view-mode(root.view-mode): Rectangle {
@@ -2797,11 +2795,11 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                                 }
                                 if root.view-mode == 6: Text {
                                     x: 64px; y: 32px; width: parent.width - 142px; height: 20px;
-                                    text: entry.kind; color: VisualStyle.c6f717a; font-size: 11px; vertical-alignment: center; overflow: elide;
+                                    text: entry.kind; color: VisualStyle.text-detail; font-size: 11px; vertical-alignment: center; overflow: elide;
                                 }
                                 if root.view-mode == 6: Text {
                                     x: parent.width - 72px; y: 32px; width: 64px; height: 20px;
-                                    text: entry.size; color: VisualStyle.c6f717a; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; overflow: elide;
+                                    text: entry.size; color: VisualStyle.text-detail; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; overflow: elide;
                                 }
                                 grouped-card-touch := TouchArea {
                                     enabled: entry.loaded && !(root.rename-editing && root.rename-entry-id == entry.id);
@@ -2862,13 +2860,13 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                     }
                     if (root.page-state == 1 && root.loading-hint-visible) || root.page-state == 3: VerticalLayout {
                         alignment: center; spacing: 8px;
-                        Text { text: root.page-state == 1 ? root.text-loading : (root.search-results-mode ? root.text-no-search-results : root.text-empty-folder); color: VisualStyle.c62656f; font-size: 16px; horizontal-alignment: center; }
+                        Text { text: root.page-state == 1 ? root.text-loading : (root.search-results-mode ? root.text-no-search-results : root.text-empty-folder); color: VisualStyle.text-secondary; font-size: 16px; horizontal-alignment: center; }
                     }
                     if root.page-state >= 5: VerticalLayout {
                         alignment: center; spacing: 12px;
                         if !root.show-everything-help: HorizontalLayout { alignment: center; Image { width: 48px; height: 48px; source: IconMap.status-locked; } }
-                        Text { text: root.error-page-title; color: VisualStyle.c30333a; font-size: 20px; font-weight: 600; horizontal-alignment: center; }
-                        HorizontalLayout { alignment: center; Text { width: min(root.width - 40px, 900px); text: root.error-page-description; color: VisualStyle.c62656f; font-size: 13px; horizontal-alignment: center; wrap: word-wrap; } }
+                        Text { text: root.error-page-title; color: VisualStyle.text-primary; font-size: 20px; font-weight: 600; horizontal-alignment: center; }
+                        HorizontalLayout { alignment: center; Text { width: min(root.width - 40px, 900px); text: root.error-page-description; color: VisualStyle.text-secondary; font-size: 13px; horizontal-alignment: center; wrap: word-wrap; } }
                         Rectangle { height: 4px; }
                         error-page-actions := Rectangle {
                             height: 32px;
@@ -2889,15 +2887,15 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                 }
 
                 if !root.active-is-home: status-bar := Rectangle {
-                    height: 30px; background: VisualStyle.cfafbfc;
-                    Text { x: 14px; text: root.operation-error != "" ? root.operation-error : root.status-text; color: root.operation-error != "" ? VisualStyle.cc42b1c : VisualStyle.c72747d; font-size: 11px; vertical-alignment: center; }
+                    height: 30px; background: VisualStyle.surface-subtle;
+                    Text { x: 14px; text: root.operation-error != "" ? root.operation-error : root.status-text; color: root.operation-error != "" ? VisualStyle.danger : VisualStyle.text-tertiary; font-size: 11px; vertical-alignment: center; }
                     Rectangle {
                         x: parent.width - 220px; width: 84px; height: 26px; y: 2px;
                         HorizontalLayout {
                             spacing: 2px;
                             for mode in [0, 1, 2]: Rectangle {
-                                width: 26px; border-radius: 4px; background: root.view-mode == mode ? VisualStyle.cdce6ff : mode-touch.has-hover ? VisualStyle.ceff4ff : transparent;
-                                Text { text: mode == 0 ? "≡" : mode == 1 ? "☷" : "▦"; color: VisualStyle.c30333a; horizontal-alignment: center; vertical-alignment: center; }
+                                width: 26px; border-radius: 4px; background: root.view-mode == mode ? VisualStyle.selection : mode-touch.has-hover ? VisualStyle.accent-hover : transparent;
+                                Text { text: mode == 0 ? "≡" : mode == 1 ? "☷" : "▦"; color: VisualStyle.text-primary; horizontal-alignment: center; vertical-alignment: center; }
                                 mode-touch := TouchArea { clicked => { root.change-view-mode(mode); } mouse-cursor: pointer; }
                             }
                         }
@@ -2905,8 +2903,8 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                     Rectangle {
                         visible: root.operations.length > 0;
                         x: parent.width - 126px; width: 118px; height: 26px; y: 2px; border-radius: 5px;
-                        background: task-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
-                        Text { text: root.operations.length + " " + root.text-task-count; color: VisualStyle.c30333a; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                        background: task-touch.has-hover ? VisualStyle.surface-hover : transparent;
+                        Text { text: root.operations.length + " " + root.text-task-count; color: VisualStyle.text-primary; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
                         task-touch := TouchArea { clicked => { root.open-operation-window(); } mouse-cursor: pointer; }
                         accessible-role: button; accessible-id: "operations-open"; accessible-label: root.text-file-operations; accessible-action-default => { root.open-operation-window(); }
                     }
@@ -2932,20 +2930,20 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                 spacing: root.minimal ? 16px : 28px;
                 Rectangle {
                     width: root.minimal ? 150px : 236px;
-                    background: VisualStyle.cfafbfc;
+                    background: VisualStyle.surface-subtle;
                     border-radius: 9px;
                     VerticalLayout {
                         padding-left: 12px; padding-right: 12px; padding-top: 18px; padding-bottom: 18px; spacing: 6px;
-                        Text { text: root.text-settings-title; color: VisualStyle.c30333a; font-size: 22px; font-weight: 600; height: 42px; }
+                        Text { text: root.text-settings-title; color: VisualStyle.text-primary; font-size: 22px; font-weight: 600; height: 42px; }
                         for section[index] in [root.text-settings-general, root.text-settings-appearance, root.text-everything, root.text-settings-developer, root.text-settings-about]: Rectangle {
                             visible: index != 3 || root.debug-tools-enabled;
                             height: 42px; border-radius: 6px;
-                            background: root.settings-section == index ? VisualStyle.cdce6ff : (settings-nav-touch.has-hover ? VisualStyle.cedf1f6 : transparent);
-                            Rectangle { visible: root.settings-section == index; x: 0px; y: 9px; width: 3px; height: 24px; border-radius: 2px; background: VisualStyle.c4f6bed; }
+                            background: root.settings-section == index ? VisualStyle.selection : (settings-nav-touch.has-hover ? VisualStyle.surface-hover : transparent);
+                            Rectangle { visible: root.settings-section == index; x: 0px; y: 9px; width: 3px; height: 24px; border-radius: 2px; background: VisualStyle.accent; }
                             HorizontalLayout {
                                 padding-left: 13px; padding-right: 10px; spacing: 10px;
                                 InlineIcon { icon-source: index == 0 ? IconMap.action-language : IconMap.action-settings; icon-size: 18px; }
-                                Text { text: section; color: VisualStyle.c30333a; font-size: 14px; vertical-alignment: center; overflow: elide; }
+                                Text { text: section; color: VisualStyle.text-primary; font-size: 14px; vertical-alignment: center; overflow: elide; }
                             }
                             settings-nav-touch := TouchArea { mouse-cursor: pointer; clicked => { root.settings-section = index; } }
                             accessible-role: button; accessible-label: section;
@@ -2975,21 +2973,21 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                         settings-content := VerticalLayout {
                             width: settings-scroll.width;
                             spacing: 16px;
-                            Text { text: root.settings-title(root.settings-section); color: VisualStyle.c30333a; font-size: 22px; font-weight: 600; height: 44px; }
+                            Text { text: root.settings-title(root.settings-section); color: VisualStyle.text-primary; font-size: 22px; font-weight: 600; height: 44px; }
                             if root.settings-section == 0: VerticalLayout {
                                 spacing: 12px;
                                 Rectangle {
-                                    height: 232px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                    height: 232px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
                                     VerticalLayout {
                                         padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 12px;
-                                        Text { text: root.text-language; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
+                                        Text { text: root.text-language; color: VisualStyle.text-primary; font-size: 15px; font-weight: 600; }
                                         HorizontalLayout {
                                             height: 42px; spacing: 8px;
                                             for language-option[index] in [root.text-language-chinese, root.text-language-english]: Rectangle {
                                                 horizontal-stretch: 1; border-radius: 6px; border-width: root.language-mode == index ? 2px : 1px;
-                                                border-color: root.language-mode == index ? VisualStyle.c4f6bed : VisualStyle.ce0e2e7;
-                                                background: language-card-touch.pressed ? VisualStyle.cdde3ed : language-card-touch.has-hover ? VisualStyle.cedf1f6 : VisualStyle.cffffff;
-                                                Text { text: language-option; color: VisualStyle.c30333a; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                                                border-color: root.language-mode == index ? VisualStyle.accent : VisualStyle.border;
+                                                background: language-card-touch.pressed ? VisualStyle.surface-pressed : language-card-touch.has-hover ? VisualStyle.surface-hover : VisualStyle.surface;
+                                                Text { text: language-option; color: VisualStyle.text-primary; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
                                                 language-card-touch := TouchArea { mouse-cursor: pointer; clicked => { root.change-language(index); } }
                                                 accessible-role: button; accessible-label: language-option;
                                             }
@@ -3000,13 +2998,13 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                                     }
                                 }
                                 Rectangle {
-                                    height: 208px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                    height: 208px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
                                     VerticalLayout {
                                         padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 8px;
-                                        Text { text: root.text-system-integration; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
-                                        Text { text: root.text-folder-default-title; color: VisualStyle.c30333a; font-size: 14px; font-weight: 600; }
-                                        Text { text: root.text-folder-default-detail; color: VisualStyle.c62656f; font-size: 12px; wrap: word-wrap; }
-                                        Text { text: root.text-integration-status + " " + root.folder-integration-status; color: root.folder-integration-enabled && !root.folder-integration-needs-repair ? VisualStyle.c4f6bed : VisualStyle.c62656f; font-size: 12px; overflow: elide; }
+                                        Text { text: root.text-system-integration; color: VisualStyle.text-primary; font-size: 15px; font-weight: 600; }
+                                        Text { text: root.text-folder-default-title; color: VisualStyle.text-primary; font-size: 14px; font-weight: 600; }
+                                        Text { text: root.text-folder-default-detail; color: VisualStyle.text-secondary; font-size: 12px; wrap: word-wrap; }
+                                        Text { text: root.text-integration-status + " " + root.folder-integration-status; color: root.folder-integration-enabled && !root.folder-integration-needs-repair ? VisualStyle.accent : VisualStyle.text-secondary; font-size: 12px; overflow: elide; }
                                         HorizontalLayout {
                                             height: 32px; spacing: 8px;
                                             StandaloneActionButton {
@@ -3021,30 +3019,30 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                                         }
                                         Rectangle {
                                             height: 18px;
-                                            Text { text: root.text-integration-path-label + " " + root.folder-integration-bound-path; color: VisualStyle.c62656f; font-size: 11px; overflow: elide; }
+                                            Text { text: root.text-integration-path-label + " " + root.folder-integration-bound-path; color: VisualStyle.text-secondary; font-size: 11px; overflow: elide; }
                                             Tooltip { text: @markdown("\{root.folder-integration-bound-path}"); }
                                         }
                                     }
                                 }
                                 Rectangle {
-                                    height: 238px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                    height: 238px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
                                     VerticalLayout {
                                         padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 8px;
                                         HorizontalLayout {
                                             height: 22px; spacing: 10px;
-                                            Text { text: root.text-win-e-title; color: VisualStyle.c30333a; font-size: 14px; font-weight: 600; vertical-alignment: center; }
+                                            Text { text: root.text-win-e-title; color: VisualStyle.text-primary; font-size: 14px; font-weight: 600; vertical-alignment: center; }
                                             Rectangle {
-                                                width: 72px; height: 22px; border-radius: 11px; background: VisualStyle.ce5e9f2;
-                                                Text { text: root.text-integration-experimental; color: VisualStyle.c62656f; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
+                                                width: 72px; height: 22px; border-radius: 11px; background: VisualStyle.navigation-hover;
+                                                Text { text: root.text-integration-experimental; color: VisualStyle.text-secondary; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
                                             }
                                             Rectangle { horizontal-stretch: 1; }
                                         }
-                                        Text { text: root.text-win-e-detail; color: VisualStyle.c62656f; font-size: 12px; wrap: word-wrap; }
-                                        Text { text: root.text-win-e-risk; color: VisualStyle.cc42b1c; font-size: 11px; wrap: word-wrap; }
-                                        Text { text: root.text-integration-status + " " + root.win-e-integration-status; color: root.win-e-integration-enabled && !root.win-e-integration-needs-repair ? VisualStyle.c4f6bed : VisualStyle.c62656f; font-size: 12px; overflow: elide; }
+                                        Text { text: root.text-win-e-detail; color: VisualStyle.text-secondary; font-size: 12px; wrap: word-wrap; }
+                                        Text { text: root.text-win-e-risk; color: VisualStyle.danger; font-size: 11px; wrap: word-wrap; }
+                                        Text { text: root.text-integration-status + " " + root.win-e-integration-status; color: root.win-e-integration-enabled && !root.win-e-integration-needs-repair ? VisualStyle.accent : VisualStyle.text-secondary; font-size: 12px; overflow: elide; }
                                         Rectangle {
                                             height: 18px;
-                                            Text { text: root.text-integration-path-label + " " + root.win-e-integration-bound-path; color: VisualStyle.c62656f; font-size: 11px; overflow: elide; }
+                                            Text { text: root.text-integration-path-label + " " + root.win-e-integration-bound-path; color: VisualStyle.text-secondary; font-size: 11px; overflow: elide; }
                                             Tooltip { text: @markdown("\{root.win-e-integration-bound-path}"); }
                                         }
                                         HorizontalLayout {
@@ -3063,17 +3061,17 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                                 }
                             }
                             if root.settings-section == 1: Rectangle {
-                                height: 212px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                height: 212px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
                                 VerticalLayout {
                                     padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 12px;
-                                    Text { text: root.text-theme; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
+                                    Text { text: root.text-theme; color: VisualStyle.text-primary; font-size: 15px; font-weight: 600; }
                                     HorizontalLayout {
                                         height: 42px; spacing: 8px;
                                         for theme-option[index] in [root.text-theme-system, root.text-theme-light, root.text-theme-dark]: Rectangle {
                                             horizontal-stretch: 1; border-radius: 6px; border-width: root.theme-mode == index ? 2px : 1px;
-                                            border-color: root.theme-mode == index ? VisualStyle.c4f6bed : VisualStyle.ce0e2e7;
-                                            background: theme-card-touch.pressed ? VisualStyle.cdde3ed : theme-card-touch.has-hover ? VisualStyle.cedf1f6 : VisualStyle.cffffff;
-                                            Text { text: theme-option; color: VisualStyle.c30333a; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                                            border-color: root.theme-mode == index ? VisualStyle.accent : VisualStyle.border;
+                                            background: theme-card-touch.pressed ? VisualStyle.surface-pressed : theme-card-touch.has-hover ? VisualStyle.surface-hover : VisualStyle.surface;
+                                            Text { text: theme-option; color: VisualStyle.text-primary; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
                                             theme-card-touch := TouchArea { mouse-cursor: pointer; clicked => { root.change-theme(index); } }
                                             accessible-role: button; accessible-label: theme-option;
                                         }
@@ -3081,8 +3079,8 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                                     CheckBox { text: root.text-quick-menu-backdrop; checked: root.quick-menu-backdrop; toggled => { root.change-quick-menu-backdrop(self.checked); } }
                                     HorizontalLayout {
                                         height: 20px;
-                                        Text { text: root.text-quick-menu-backdrop-opacity; color: VisualStyle.c30333a; font-size: 13px; vertical-alignment: center; }
-                                        Text { text: root.quick-menu-backdrop-opacity + "%"; color: VisualStyle.c62656f; font-size: 13px; horizontal-alignment: right; vertical-alignment: center; }
+                                        Text { text: root.text-quick-menu-backdrop-opacity; color: VisualStyle.text-primary; font-size: 13px; vertical-alignment: center; }
+                                        Text { text: root.quick-menu-backdrop-opacity + "%"; color: VisualStyle.text-secondary; font-size: 13px; horizontal-alignment: right; vertical-alignment: center; }
                                     }
                                     Slider {
                                         height: 28px;
@@ -3098,34 +3096,34 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                             if root.settings-section == 2: VerticalLayout {
                                 spacing: 12px;
                                 Rectangle {
-                                    height: 274px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                    height: 274px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
                                     VerticalLayout {
                                         padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 8px;
-                                        Text { text: root.text-everything-connection; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
-                                        Text { text: root.text-everything-path; color: VisualStyle.c30333a; font-size: 12px; }
+                                        Text { text: root.text-everything-connection; color: VisualStyle.text-primary; font-size: 15px; font-weight: 600; }
+                                        Text { text: root.text-everything-path; color: VisualStyle.text-primary; font-size: 12px; }
                                         HorizontalLayout {
                                             height: 32px; spacing: 8px;
                                             Rectangle {
-                                                horizontal-stretch: 1; border-width: 1px; border-color: VisualStyle.ce0e2e7; border-radius: 4px; background: VisualStyle.cffffff;
+                                                horizontal-stretch: 1; border-width: 1px; border-color: VisualStyle.border; border-radius: 4px; background: VisualStyle.surface;
                                                 TextInput { x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.everything-path; single-line: true; vertical-alignment: center; edited => { root.update-everything-config(root.everything-path, root.everything-instance); } }
                                             }
                                             StandaloneActionButton { width: 112px; height: 32px; label: root.text-select-everything-program; enabled: !root.everything-busy; clicked => { root.select-everything-program(); } }
                                         }
-                                        Text { text: root.text-everything-instance; color: VisualStyle.c30333a; font-size: 12px; }
+                                        Text { text: root.text-everything-instance; color: VisualStyle.text-primary; font-size: 12px; }
                                         Rectangle {
-                                            height: 32px; border-width: 1px; border-color: VisualStyle.ce0e2e7; border-radius: 4px; background: VisualStyle.cffffff;
+                                            height: 32px; border-width: 1px; border-color: VisualStyle.border; border-radius: 4px; background: VisualStyle.surface;
                                             TextInput { x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.everything-instance; single-line: true; vertical-alignment: center; edited => { root.update-everything-config(root.everything-path, root.everything-instance); } }
                                         }
-                                        Text { text: root.text-everything-instance-help; color: VisualStyle.c62656f; font-size: 11px; wrap: word-wrap; }
+                                        Text { text: root.text-everything-instance-help; color: VisualStyle.text-secondary; font-size: 11px; wrap: word-wrap; }
                                         CheckBox { text: root.text-file-list-quick-search; checked: root.file-list-quick-search; toggled => { root.change-file-list-quick-search(self.checked); } }
                                     }
                                 }
                                 Rectangle {
-                                    height: 142px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                    height: 142px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
                                     VerticalLayout {
                                         padding-left: 20px; padding-right: 20px; padding-top: 14px; padding-bottom: 14px; spacing: 8px;
-                                        Text { text: root.text-everything-actions; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
-                                        Text { text: root.everything-status; color: VisualStyle.c62656f; font-size: 12px; wrap: word-wrap; }
+                                        Text { text: root.text-everything-actions; color: VisualStyle.text-primary; font-size: 15px; font-weight: 600; }
+                                        Text { text: root.everything-status; color: VisualStyle.text-secondary; font-size: 12px; wrap: word-wrap; }
                                         HorizontalLayout {
                                             height: 32px; spacing: 8px;
                                             StandaloneActionButton { width: (parent.width - 8px) / 2; height: 32px; label: root.text-test-connection; enabled: !root.everything-busy; clicked => { root.test-everything-connection(); } }
@@ -3134,14 +3132,14 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                                     }
                                 }
                                 Rectangle {
-                                    height: 174px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                    height: 174px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
                                     VerticalLayout {
                                         padding-left: 20px; padding-right: 20px; padding-top: 14px; padding-bottom: 14px; spacing: 6px;
-                                        Text { text: root.text-everything-help; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
-                                        Text { text: root.text-everything-help-install; color: VisualStyle.c62656f; font-size: 11px; wrap: word-wrap; }
-                                        Text { text: root.text-everything-help-dependencies; color: VisualStyle.c62656f; font-size: 11px; wrap: word-wrap; }
-                                        Text { text: root.text-everything-help-independent; color: VisualStyle.c62656f; font-size: 11px; wrap: word-wrap; }
-                                        Text { text: root.text-everything-help-settings; color: VisualStyle.c62656f; font-size: 11px; wrap: word-wrap; }
+                                        Text { text: root.text-everything-help; color: VisualStyle.text-primary; font-size: 15px; font-weight: 600; }
+                                        Text { text: root.text-everything-help-install; color: VisualStyle.text-secondary; font-size: 11px; wrap: word-wrap; }
+                                        Text { text: root.text-everything-help-dependencies; color: VisualStyle.text-secondary; font-size: 11px; wrap: word-wrap; }
+                                        Text { text: root.text-everything-help-independent; color: VisualStyle.text-secondary; font-size: 11px; wrap: word-wrap; }
+                                        Text { text: root.text-everything-help-settings; color: VisualStyle.text-secondary; font-size: 11px; wrap: word-wrap; }
                                     }
                                 }
                                 HorizontalLayout {
@@ -3153,11 +3151,11 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                             if root.settings-section == 3 && root.debug-tools-enabled: VerticalLayout {
                                 spacing: 12px;
                                 Rectangle {
-                                    height: 244px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                    height: 244px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
                                     VerticalLayout {
                                         padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 12px;
-                                        Text { text: root.text-ui-showcase; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
-                                        Text { text: root.text-ui-showcase-detail; color: VisualStyle.c62656f; font-size: 12px; wrap: word-wrap; }
+                                        Text { text: root.text-ui-showcase; color: VisualStyle.text-primary; font-size: 15px; font-weight: 600; }
+                                        Text { text: root.text-ui-showcase-detail; color: VisualStyle.text-secondary; font-size: 12px; wrap: word-wrap; }
                                         HorizontalLayout {
                                             height: 34px; spacing: 8px;
                                             StandaloneActionButton { width: (parent.width - 8px) / 2; label: root.text-show-delete-confirmation; clicked => { root.show-debug-window(0); } }
@@ -3171,26 +3169,26 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
                                     }
                                 }
                                 Rectangle {
-                                    height: 170px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                    height: 170px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
                                     VerticalLayout {
                                         padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 10px;
-                                        Text { text: root.text-window-trace-title; color: VisualStyle.c30333a; font-size: 15px; font-weight: 600; }
-                                        Text { text: root.text-window-trace-detail; color: VisualStyle.c62656f; font-size: 12px; wrap: word-wrap; }
+                                        Text { text: root.text-window-trace-title; color: VisualStyle.text-primary; font-size: 15px; font-weight: 600; }
+                                        Text { text: root.text-window-trace-detail; color: VisualStyle.text-secondary; font-size: 12px; wrap: word-wrap; }
                                         HorizontalLayout {
                                             height: 34px; spacing: 12px;
                                             StandaloneActionButton { width: 132px; enabled: !root.window-trace-active; label: root.window-trace-active ? root.text-window-trace-active : root.text-window-trace-start; clicked => { root.start-window-trace(); } }
-                                            Text { text: root.window-trace-status; color: root.window-trace-active ? VisualStyle.c4f6bed : VisualStyle.c62656f; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                                            Text { text: root.window-trace-status; color: root.window-trace-active ? VisualStyle.accent : VisualStyle.text-secondary; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
                                         }
                                     }
                                 }
                             }
                             if root.settings-section == 4: Rectangle {
-                                height: 144px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.ce0e2e7; background: VisualStyle.cfafbfc;
+                                height: 144px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
                                 VerticalLayout {
                                     padding-left: 20px; padding-right: 20px; padding-top: 20px; padding-bottom: 20px; spacing: 10px;
-                                    Text { text: "AsterFiles"; color: VisualStyle.c30333a; font-size: 20px; font-weight: 600; }
-                                    Text { text: root.text-version + " " + root.app-version; color: VisualStyle.c62656f; font-size: 14px; }
-                                    Text { text: "GNU General Public License v3.0"; color: VisualStyle.c62656f; font-size: 12px; }
+                                    Text { text: "AsterFiles"; color: VisualStyle.text-primary; font-size: 20px; font-weight: 600; }
+                                    Text { text: root.text-version + " " + root.app-version; color: VisualStyle.text-secondary; font-size: 14px; }
+                                    Text { text: "GNU General Public License v3.0"; color: VisualStyle.text-secondary; font-size: 12px; }
                                 }
                             }
                             Rectangle { height: 16px; }
@@ -3215,8 +3213,8 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
         y: max(50px, min(root.height - self.height - 4px, root.column-drag-pointer-y + 10px));
         width: min(220px, max(84px, root.column-width(root.column-drag-source-kind)));
         height: 32px; z: 100; border-radius: 5px; border-width: 1px;
-        border-color: VisualStyle.ce0e2e7; background: VisualStyle.cffffff; opacity: 0.82;
-        Text { x: 10px; width: parent.width - 20px; text: root.column-label(root.column-drag-source-kind); color: VisualStyle.c30333a; font-size: 12px; vertical-alignment: center; overflow: elide; }
+        border-color: VisualStyle.border; background: VisualStyle.surface; opacity: 0.82;
+        Text { x: 10px; width: parent.width - 20px; text: root.column-label(root.column-drag-source-kind); color: VisualStyle.text-primary; font-size: 12px; vertical-alignment: center; overflow: elide; }
     }
 
     if root.drop-menu-open: TouchArea {
@@ -3228,13 +3226,13 @@ Text { text: "…"; color: VisualStyle.c24252a; font-size: VisualStyle.file-name
         x: min(max(12px, root.context-menu-anchor-x), max(12px, parent.width - self.width - 12px));
         y: min(max(12px, root.context-menu-anchor-y), max(12px, parent.height - self.height - 12px));
         width: 250px; height: 156px;
-        background: VisualStyle.cffffff; border-color: VisualStyle.ce0e2e7; border-width: 1px; border-radius: 7px;
+        background: VisualStyle.surface; border-color: VisualStyle.border; border-width: 1px; border-radius: 7px;
         VerticalLayout { padding: 6px;
             for option[index] in [root.text-drop-copy, root.text-drop-move, root.text-drop-link, root.text-drop-cancel]: Rectangle {
                 height: 36px; border-radius: 5px;
                 private property <bool> option-enabled: index == 3 || (index == 0 ? root.drop-can-copy : index == 1 ? root.drop-can-move : root.drop-can-link);
-                background: self.option-enabled && option-touch.has-hover ? VisualStyle.cedf1f6 : transparent;
-                Text { x: 10px; text: option; color: parent.option-enabled ? VisualStyle.c30333a : VisualStyle.c9a9da3; font-size: 12px; vertical-alignment: center; }
+                background: self.option-enabled && option-touch.has-hover ? VisualStyle.surface-hover : transparent;
+                Text { x: 10px; text: option; color: parent.option-enabled ? VisualStyle.text-primary : VisualStyle.text-disabled; font-size: 12px; vertical-alignment: center; }
                 option-touch := TouchArea { enabled: parent.option-enabled; clicked => { root.drop-menu-open = false; root.choose-drop-effect(index == 3 ? 0 : index + 1); } }
                 accessible-role: button; accessible-label: option; accessible-enabled: self.option-enabled;
             }
@@ -3288,18 +3286,18 @@ if root.tabs-menu-open: TouchArea {
     if root.tabs-menu-open: Rectangle {
         x: max(8px, parent.width - 3 * 46px - 270px); y: 46px;
         width: 260px; height: min(354px, 12px + min(root.tabs.length, 9) * 38px); z: 20;
-        background: VisualStyle.cffffff; border-color: VisualStyle.ce0e2e7; border-width: 1px; border-radius: 7px;
+        background: VisualStyle.surface; border-color: VisualStyle.border; border-width: 1px; border-radius: 7px;
         clip: true;
         ListView {
             x: 6px; y: 6px; width: parent.width - 12px; height: parent.height - 12px;
             vertical-scrollbar-policy: ScrollBarPolicy.as-needed;
             for tab[index] in root.tabs: Rectangle {
                 height: 38px; border-radius: 5px;
-                background: tab.active ? VisualStyle.cdce6ff : (tabs-menu-touch.has-hover ? VisualStyle.cedf1f6 : transparent);
+                background: tab.active ? VisualStyle.selection : (tabs-menu-touch.has-hover ? VisualStyle.surface-hover : transparent);
                 HorizontalLayout {
                     padding-left: 8px; padding-right: 8px; spacing: 8px;
                     InlineIcon { icon-source: tab.is-settings ? IconMap.action-settings : tab.is-home ? IconMap.location-home : (tab.icon.width != 0 ? tab.icon : (tab.is-drive ? IconMap.location-drive : IconMap.file-folder)); icon-size: 16px; }
-                    Text { text: tab.title; color: VisualStyle.c303138; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; font-weight: tab.active ? 600 : 400; }
+                    Text { text: tab.title; color: VisualStyle.text-primary; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; font-weight: tab.active ? 600 : 400; }
                 }
                 tabs-menu-touch := TouchArea {
                     mouse-cursor: pointer;
