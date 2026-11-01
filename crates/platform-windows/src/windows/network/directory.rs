@@ -165,6 +165,7 @@ fn receive_stream(
         let mut skipped = 0_usize;
         let mut next_id = 1_u32;
         let mut completed = false;
+        let mut shared_parent = None;
         loop {
             if cancel.load(Ordering::Acquire) {
                 return Err(cancelled());
@@ -177,8 +178,9 @@ fn receive_stream(
                             "data after directory completion",
                         ));
                     }
-                    let (entries, batch_skipped, done) = read_batch(file)?;
-                    for entry in &entries {
+                    let (mut entries, batch_skipped, done) = read_batch(file)?;
+                    for entry in &mut entries {
+                        entry.path.share_parent(&mut shared_parent);
                         if entry.id.0 != next_id {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -379,7 +381,7 @@ fn enumerate_directory(
         };
         let estimated_bytes = 64
             + 2 * (entry.original_name.encode_wide().count()
-                + entry.path.as_os_str().encode_wide().count());
+                + entry.path().as_os_str().encode_wide().count());
         if batch_bytes + estimated_bytes > MAX_BATCH_BYTES && !entries.is_empty() {
             emit(&entries, skipped, false)?;
             entries.clear();
@@ -432,7 +434,7 @@ fn encode_batch(entries: &[FileEntry], skipped: usize, done: bool) -> io::Result
         )?;
         write_units(
             &mut bytes,
-            &entry.path.as_os_str().encode_wide().collect::<Vec<_>>(),
+            &entry.path().as_os_str().encode_wide().collect::<Vec<_>>(),
         )?;
         bytes.push(match entry.kind {
             EntryKind::Directory => 0,
@@ -551,14 +553,11 @@ fn read_batch(reader: impl Read) -> io::Result<(Vec<FileEntry>, usize, bool)> {
             display_name: original_name.to_string_lossy().into_owned(),
             name_highlights: Vec::new(),
             original_name,
-            path: entry_path.clone(),
+            path: entry_path.clone().into(),
             kind,
             open_target: None,
             library_source_index: None,
-            parent_display: entry_path
-                .parent()
-                .map(|value| value.as_os_str().to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            parent_display: String::new(),
             size_bytes,
             folder_size: if crate::network::is_unc_path(&entry_path) {
                 FolderSizeState::NotIndexed
@@ -593,7 +592,7 @@ mod test_support {
             original_name: name.clone(),
             display_name: name.to_string_lossy().into(),
             name_highlights: vec![],
-            path: PathBuf::from(r"\\fixture\share").join(name),
+            path: PathBuf::from(r"\\fixture\share").join(name).into(),
             kind: EntryKind::File,
             open_target: None,
             library_source_index: None,
@@ -740,6 +739,45 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[test]
+    fn issue_170_real_directory_batches_share_parent_and_omit_parent_display() {
+        let fixture = StreamFiles::create().unwrap();
+        let data = std::env::temp_dir().join(fixture.0.file_name().unwrap());
+        std::fs::create_dir(&data).unwrap();
+        for index in 0..300 {
+            std::fs::write(data.join(format!("entry-{index:04}.txt")), b"fixture").unwrap();
+        }
+        let files = StreamFiles::create().unwrap();
+        write_directory_input(&files.input(), &data, FileVisibility::default()).unwrap();
+        let mut parent = None;
+        let mut batches = 0;
+        let mut count = 0;
+        receive_stream(
+            child_command(&files, "enumerate"),
+            &files.output(),
+            &AtomicBool::new(false),
+            Duration::from_secs(10),
+            |entries| {
+                batches += 1;
+                for entry in entries {
+                    let shared = parent.get_or_insert_with(|| Arc::clone(entry.path.parent()));
+                    assert!(Arc::ptr_eq(shared, entry.path.parent()));
+                    assert_eq!(shared.as_ref(), data.as_path());
+                    assert!(entry.parent_display.is_empty());
+                    assert_eq!(entry.path(), data.join(&entry.original_name));
+                    count += 1;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(count, 300);
+        assert!(batches > 1);
+        for index in 0..300 {
+            std::fs::remove_file(data.join(format!("entry-{index:04}.txt"))).unwrap();
+        }
+        std::fs::remove_dir(data).unwrap();
+    }
     #[test]
     fn issue_176_real_directory_stream_in_work_parent_has_no_visible_work_changes() {
         let files = StreamFiles::create().unwrap();
@@ -1110,7 +1148,7 @@ mod tests {
             .unwrap();
         assert_eq!(folder.kind, EntryKind::Directory);
         assert_eq!(folder.folder_size, FolderSizeState::Unknown);
-        assert_eq!(folder.path, data.join("folder"));
+        assert_eq!(folder.path(), data.join("folder"));
         for name in [".asterfiles-cleanup", ".ASTERFILES-CLEANUP-copy", "folder"] {
             std::fs::remove_dir(data.join(name)).unwrap();
         }
@@ -1155,8 +1193,8 @@ mod tests {
                     peak = peak.max(entries.len());
                     for entry in entries {
                         assert_eq!(entry.size_bytes, Some(7));
-                        assert_eq!(entry.path.parent(), Some(data.as_path()));
-                        assert!(paths.insert(entry.path));
+                        assert_eq!(entry.path().parent(), Some(data.as_path()));
+                        assert!(paths.insert(entry.path()));
                         assert!(ids.insert(entry.id.0));
                     }
                     Ok(())
@@ -1367,12 +1405,25 @@ mod tests {
     fn issue_103_batch_preserves_raw_identity_and_rejects_unbounded_or_invalid_frames() {
         let mut original = entry(99);
         original.original_name = OsString::from_wide(&[b'a' as u16, 0xd800]);
-        original.path = PathBuf::from(r"\\server\share").join(&original.original_name);
+        let mut parent = r"\\server\share\parent-".encode_utf16().collect::<Vec<_>>();
+        parent.push(0xd801);
+        let original_path =
+            PathBuf::from(OsString::from_wide(&parent)).join(&original.original_name);
+        original.path = original_path.clone().into();
         original.modified = Some(SystemTime::UNIX_EPOCH + Duration::new(42, 7));
         let encoded = encode_batch(&[original.clone()], 5, false).unwrap();
         let (decoded, skipped, done) = read_batch(encoded.as_slice()).unwrap();
         assert_eq!(decoded[0].id, original.id);
         assert_eq!(decoded[0].path, original.path);
+        assert_eq!(
+            decoded[0]
+                .path()
+                .as_os_str()
+                .encode_wide()
+                .collect::<Vec<_>>(),
+            original_path.as_os_str().encode_wide().collect::<Vec<_>>()
+        );
+        assert!(decoded[0].parent_display.is_empty());
         assert_eq!(decoded[0].original_name, original.original_name);
         assert_eq!(decoded[0].modified, original.modified);
         assert_eq!(skipped, 5);

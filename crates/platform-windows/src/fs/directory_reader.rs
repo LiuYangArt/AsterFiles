@@ -103,14 +103,11 @@ fn file_entry(
         display_name: original_name.to_string_lossy().into_owned(),
         name_highlights: Vec::new(),
         original_name,
-        path: path.clone(),
+        path: path.into(),
         kind,
         open_target: None,
         library_source_index: None,
-        parent_display: path
-            .parent()
-            .map(|value| value.as_os_str().to_string_lossy().into_owned())
-            .unwrap_or_default(),
+        parent_display: String::new(),
         size_bytes: metadata.is_file().then_some(metadata.len()),
         folder_size: crate::domain::FolderSizeState::Unknown,
         modified: metadata.modified().ok(),
@@ -231,6 +228,18 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+    #[test]
+    fn issue_170_watch_snapshot_keeps_raw_path_without_parent_display() {
+        let fixture = TempTree::new("compact-watch");
+        let path = fixture.child("kept.txt");
+        fs::write(&path, b"fixture").unwrap();
+        let entry = read_path_entry(&path, FileVisibility::default(), 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.path(), path);
+        assert_eq!(entry.original_name, "kept.txt");
+        assert!(entry.parent_display.is_empty());
     }
     #[test]
     fn internal_cleanup_paths_are_filtered_regardless_of_visibility() {

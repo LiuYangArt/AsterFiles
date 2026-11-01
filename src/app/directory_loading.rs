@@ -397,11 +397,11 @@ fn read_network_root_batches(
                         .unwrap_or_else(|| item.label.clone().into()),
                     display_name: item.label.clone(),
                     name_highlights: Vec::new(),
-                    path: item.target.clone(),
+                    path: item.target.clone().into(),
                     kind: crate::domain::EntryKind::Directory,
                     open_target: None,
                     library_source_index: None,
-                    parent_display: request.path.as_os_str().to_string_lossy().into_owned(),
+                    parent_display: String::new(),
                     size_bytes: None,
                     folder_size: FolderSizeState::NotIndexed,
                     modified: None,
@@ -725,7 +725,7 @@ fn webdav_file_entry(
         original_name: name.clone().into(),
         display_name: name,
         name_highlights: Vec::new(),
-        path: PathBuf::new(),
+        path: PathBuf::new().into(),
         kind: if item.is_directory {
             crate::domain::EntryKind::Directory
         } else {
@@ -733,7 +733,7 @@ fn webdav_file_entry(
         },
         open_target: None,
         library_source_index: None,
-        parent_display: target.directory.clone(),
+        parent_display: String::new(),
         size_bytes: item.size,
         folder_size: crate::domain::FolderSizeState::NotIndexed,
         modified: item.modified,
@@ -849,7 +849,7 @@ mod tests {
         else {
             panic!("{first:?}")
         };
-        assert_eq!(entries[0].path, link.join("kept.txt"));
+        assert_eq!(entries[0].path(), link.join("kept.txt"));
         assert!(receiver.recv_timeout(Duration::from_millis(80)).is_err());
         acknowledgement.send(()).unwrap();
         assert!(matches!(

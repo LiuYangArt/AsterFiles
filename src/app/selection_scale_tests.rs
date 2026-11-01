@@ -22,7 +22,7 @@ fn entry(id: u32) -> FileEntry {
     FileEntry {
         id: EntryId(id),
         original_name: OsString::from(&name),
-        path: PathBuf::from(DIRECTORY).join(&name),
+        path: PathBuf::from(DIRECTORY).join(&name).into(),
         display_name: name,
         name_highlights: Vec::new(),
         kind: EntryKind::File,

@@ -43,7 +43,7 @@ impl InputFixture {
                         original_name: format!("folder{id}").into(),
                         display_name: format!("folder{id}"),
                         name_highlights: Vec::new(),
-                        path: root.join(format!("folder{id}")),
+                        path: root.join(format!("folder{id}")).into(),
                         kind: crate::domain::EntryKind::Directory,
                         open_target: None,
                         library_source_index: None,

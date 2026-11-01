@@ -29,7 +29,7 @@ fn fixture(count: u32, mode: ViewMode, group: GroupField) -> SharedSessions {
                     original_name: OsString::from(&name),
                     display_name: name.clone(),
                     name_highlights: Vec::new(),
-                    path: root.join(name),
+                    path: root.join(name).into(),
                     kind: crate::domain::EntryKind::File,
                     open_target: None,
                     library_source_index: None,
@@ -490,7 +490,7 @@ fn issue_165_selection_and_backfill_patch_only_requested_entry() {
         let entry = &mut Arc::make_mut(&mut tab.entries)[index];
         entry.display_name = "renamed-entry.txt".into();
         entry.original_name = "renamed-entry.txt".into();
-        entry.path = Path::new(ROOT).join("renamed-entry.txt");
+        entry.path = Path::new(ROOT).join("renamed-entry.txt").into();
         entry.size_bytes = Some(123_456);
         let tab = app.tab(TabId(1)).unwrap();
         model.patch_entries(tab, &app, &HashSet::from([id]));

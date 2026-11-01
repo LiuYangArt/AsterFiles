@@ -323,7 +323,7 @@ impl Fixture {
             .replace_entries(vec![FileEntry {
                 id: EntryId(1),
                 original_name: "file.txt".into(),
-                path: PathBuf::from(r"C:\same\file.txt"),
+                path: PathBuf::from(r"C:\same\file.txt").into(),
                 display_name: "file.txt".to_owned(),
                 name_highlights: Vec::new(),
                 kind: crate::domain::EntryKind::File,

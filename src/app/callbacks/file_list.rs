@@ -85,7 +85,7 @@ pub(super) fn wire_open(ui: &AppWindow, state: &WindowSessions, workers: &Worker
         }
         if let Some((tab_id, entry)) = target {
             let is_directory = entry.kind == crate::domain::EntryKind::Directory;
-            let target = entry.open_target.unwrap_or(entry.path);
+            let target = entry.open_target.clone().unwrap_or_else(|| entry.path());
             if is_directory {
                 submit_path_navigation(
                     &sender_for_entry,
@@ -174,11 +174,11 @@ pub(super) fn wire_selection(ui: &AppWindow, state: &WindowSessions, workers: &W
                         &network_sender_for_activate_entry,
                         &state_for_activate_entry,
                         tab_id,
-                        entry.open_target.unwrap_or(entry.path),
+                        entry.open_target.clone().unwrap_or_else(|| entry.path()),
                         NavigationKind::Normal,
                     );
                 } else {
-                    let path = entry.open_target.unwrap_or(entry.path);
+                    let path = entry.open_target.clone().unwrap_or_else(|| entry.path());
                     thread::spawn(move || {
                         if let Err(error) = platform::open_path(&path) {
                             eprintln!("unable to open file: {error}");

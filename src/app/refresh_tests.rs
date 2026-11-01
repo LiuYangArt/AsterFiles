@@ -18,7 +18,7 @@ fn fixture(count: u32, mode: ViewMode, group: GroupField) -> (WindowSessions, Ap
                     id: EntryId(id),
                     original_name: name.clone().into(),
                     display_name: name.clone(),
-                    path: root.join(name),
+                    path: root.join(name).into(),
                     name_highlights: Vec::new(),
                     kind: crate::domain::EntryKind::File,
                     open_target: None,

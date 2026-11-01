@@ -1265,7 +1265,7 @@ mod tests {
                 original_name: "file.txt".into(),
                 display_name: "file.txt".into(),
                 name_highlights: Vec::new(),
-                path: PathBuf::from("same/file.txt"),
+                path: PathBuf::from("same/file.txt").into(),
                 kind: crate::domain::EntryKind::File,
                 open_target: None,
                 library_source_index: None,

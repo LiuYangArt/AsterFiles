@@ -43,7 +43,8 @@ pub(super) fn shared_icon_request(
     entry: &FileEntry,
     size: u32,
 ) -> Option<IconRequest> {
-    let type_key = entry_type_icon_key(&entry.path, entry.kind);
+    let entry_path = entry.path();
+    let type_key = entry_type_icon_key(&entry_path, entry.kind);
     let path = if let Some(key) = &type_key {
         let identity = (key.clone(), size);
         if app.image_cache.types.contains_key(&identity) || !app.type_icon_requests.insert(identity)
@@ -52,14 +53,14 @@ pub(super) fn shared_icon_request(
         }
         key.query_path()
     } else {
-        if app.image_cache.ordinary.contains_key(&entry.path)
+        if app.image_cache.ordinary.contains_key(&entry_path)
             || !app
                 .ordinary_icon_requests
-                .insert((tab_id, request_id, entry.path.clone()))
+                .insert((tab_id, request_id, entry_path.clone()))
         {
             return None;
         }
-        entry.path.clone()
+        entry_path.clone()
     };
     Some(IconRequest {
         tab_id,
@@ -121,18 +122,19 @@ pub(super) fn row_image(
     app: &AppState,
     grid_requested_px: Option<u32>,
 ) -> (Image, i32) {
+    let entry_path = entry.path();
     let grid_image = grid_requested_px.and_then(|requested_px| {
         app.image_cache
             .thumbnails
-            .get(&(entry.path.clone(), requested_px))
+            .get(&(entry_path.clone(), requested_px))
     });
     let grid_icon = grid_requested_px.and_then(|requested_px| {
         app.image_cache
             .grid_icons
-            .get(&(entry.path.clone(), requested_px))
+            .get(&(entry_path.clone(), requested_px))
     });
-    let shared_icon = entry_type_icon_key(&entry.path, entry.kind).and_then(|key| {
-        let size = if crate::network::is_unc_path(&entry.path) {
+    let shared_icon = entry_type_icon_key(&entry_path, entry.kind).and_then(|key| {
+        let size = if crate::network::is_unc_path(&entry_path) {
             0
         } else {
             grid_requested_px.unwrap_or(0)
@@ -145,7 +147,7 @@ pub(super) fn row_image(
         }
         app.icons
             .get(&(tab.id, tab.latest_request(), entry.id))
-            .or_else(|| app.image_cache.ordinary.get(&entry.path))
+            .or_else(|| app.image_cache.ordinary.get(&entry_path))
     });
     let state = grid_requested_px.map_or(0, |requested_px| {
         if grid_image.is_some() {
@@ -155,7 +157,7 @@ pub(super) fn row_image(
         } else if app.thumbnail_failures.contains_key(&(
             tab.id,
             tab.latest_request(),
-            entry.path.clone(),
+            entry_path.clone(),
             requested_px,
         )) {
             3
@@ -319,7 +321,7 @@ pub(super) fn present_batch(
                         .into_iter()
                         .filter(|id| {
                             tab.visible_entry(*id)
-                                .and_then(|entry| entry_type_icon_key(&entry.path, entry.kind))
+                                .and_then(|entry| entry_type_icon_key(&entry.path(), entry.kind))
                                 .is_some_and(|key| types.contains(&key))
                         }),
                 );

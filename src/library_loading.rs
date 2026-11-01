@@ -48,7 +48,7 @@ impl Aggregate {
         entries
             .into_iter()
             .filter_map(|mut entry| {
-                if !self.seen.insert(entry.path.clone()) {
+                if !self.seen.insert(entry.path()) {
                     return None;
                 }
                 entry.id = EntryId(self.next_id);

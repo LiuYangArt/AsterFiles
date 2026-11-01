@@ -519,7 +519,7 @@ mod tests {
             original_name: OsString::from(name),
             display_name: name.to_owned(),
             name_highlights: Vec::<NameHighlightSegment>::new(),
-            path: PathBuf::from(name),
+            path: PathBuf::from(name).into(),
             kind,
             open_target: None,
             library_source_index: None,

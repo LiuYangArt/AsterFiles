@@ -725,7 +725,7 @@ impl From<&FileEntry> for ActivateTarget {
         if let Some(item) = &entry.webdav {
             Self::WebDav(item.path.clone())
         } else {
-            Self::Path(entry.path.clone())
+            Self::Path(entry.path())
         }
     }
 }
@@ -924,21 +924,22 @@ fn thumbnail_request(
     entry: &FileEntry,
     requested_px: u32,
 ) -> Option<IconRequest> {
-    if crate::network::is_unc_path(&entry.path) {
+    let entry_path = entry.path();
+    if crate::network::is_unc_path(&entry_path) {
         return ordinary_icon_request(app, tab_id, request_id, entry);
     }
-    let key = (entry.path.clone(), requested_px);
+    let key = (entry_path.clone(), requested_px);
     if app.image_cache.thumbnails.contains_key(&key)
         || app.image_cache.grid_icons.contains_key(&key)
         || !thumbnail_retry_due(
             app.thumbnail_failures
-                .get(&(tab_id, request_id, entry.path.clone(), requested_px)),
+                .get(&(tab_id, request_id, entry_path.clone(), requested_px)),
             Instant::now(),
         )
     {
         return None;
     }
-    if let Some(type_key) = entry_type_icon_key(&entry.path, entry.kind)
+    if let Some(type_key) = entry_type_icon_key(&entry_path, entry.kind)
         && (entry.size_bytes == Some(0) || app.thumbnail_types.get(&type_key) != Some(&true))
     {
         return file_images::shared_icon_request(app, tab_id, request_id, entry, requested_px);
@@ -947,7 +948,7 @@ fn thumbnail_request(
         tab_id,
         request_id,
         target: IconTarget::Entry(entry.id),
-        path: entry.path.clone(),
+        path: entry_path,
         thumbnail: true,
         requested_px,
         type_key: None,
@@ -3899,7 +3900,7 @@ fn apply_late_shell_select_reveal(
             if let Some(entry) = tab
                 .entries
                 .iter()
-                .find(|entry| entry.path == target)
+                .find(|entry| entry.path.matches(&target))
                 .cloned()
             {
                 changed = mutate_selection(tab, |tab| tab.select_entry(entry.id, false, false));
@@ -5006,17 +5007,13 @@ fn selected_paths(app: &AppState) -> Vec<PathBuf> {
     app.active()
         .selected
         .iter()
-        .filter_map(|id| {
-            app.active()
-                .visible_entry(*id)
-                .map(|entry| entry.path.clone())
-        })
+        .filter_map(|id| app.active().visible_entry(*id).map(|entry| entry.path()))
         .collect()
 }
 fn selected_paths_for_tab(tab: &TabSession) -> Vec<PathBuf> {
     tab.selected
         .iter()
-        .filter_map(|id| tab.visible_entry(*id).map(|entry| entry.path.clone()))
+        .filter_map(|id| tab.visible_entry(*id).map(|entry| entry.path()))
         .collect()
 }
 
@@ -6966,7 +6963,7 @@ fn built_in_context_rows(
                 .first()
                 .and_then(|id| app.active().visible_entry(*id))
                 .filter(|entry| entry.kind == crate::domain::EntryKind::Directory)
-                .map(|entry| entry.path.clone())
+                .map(|entry| entry.path())
         } else {
             None
         };
@@ -8927,10 +8924,10 @@ impl FileDragGesture {
                 .iter()
                 .filter_map(|id| tab.visible_entry(*id))
                 .filter(|entry| entry.webdav.is_none())
-                .map(|entry| DraggedEntry::Local(entry.id, entry.path.clone()))
+                .map(|entry| DraggedEntry::Local(entry.id, entry.path()))
                 .collect()
         } else {
-            vec![DraggedEntry::Local(entry.id, entry.path.clone())]
+            vec![DraggedEntry::Local(entry.id, entry.path())]
         };
         if entries.is_empty() {
             return;
@@ -8955,7 +8952,7 @@ impl FileDragGesture {
             || drag.entries.iter().any(|entry| match entry {
                 DraggedEntry::Local(id, path) => tab
                     .visible_entry(*id)
-                    .is_none_or(|entry| entry.webdav.is_some() || entry.path != *path),
+                    .is_none_or(|entry| entry.webdav.is_some() || !entry.path.matches(path)),
                 DraggedEntry::Remote { id, identity, .. } => tab
                     .visible_entry(*id)
                     .is_none_or(|entry| entry.webdav.as_ref() != Some(identity)),
@@ -11224,7 +11221,7 @@ fn wire_native_drag_drop(
                                 app.active()
                                     .visible_entries()
                                     .iter()
-                                    .find(|entry| entry.path == row.path)
+                                    .find(|entry| entry.path.matches(&row.path))
                                     .map(|entry| entry.id.0 as i32)
                             })
                         })
@@ -11485,7 +11482,7 @@ fn drop_target_snapshot(
                     top: row_top,
                     right: item_right,
                     bottom: row_bottom.min(bottom),
-                    path: entry.path.clone(),
+                    path: entry.path(),
                 }
             })
         })
@@ -13880,7 +13877,7 @@ fn refresh_cut_rows(state: &SharedSessions, changed_paths: &[PathBuf]) {
                 .entries
                 .iter()
                 .chain(tab.pending_entries().iter())
-                .filter(|entry| changed_paths.contains(&entry.path))
+                .filter(|entry| changed_paths.contains(&entry.path()))
                 .map(|entry| entry.id)
                 .collect::<HashSet<_>>();
             Some((tab.id, entries))
@@ -13999,7 +13996,7 @@ fn queue_completed_rename(app: &mut AppState, origin_tab: TabId, target: PathBuf
 fn directory_path_snapshot(tab: &TabSession) -> HashSet<PathBuf> {
     tab.visible_entries()
         .iter()
-        .map(|entry| entry.path.clone())
+        .map(|entry| entry.path())
         .collect()
 }
 
@@ -14009,8 +14006,8 @@ fn detect_unique_created_path(
 ) -> Option<PathBuf> {
     let mut added = entries
         .iter()
-        .filter(|entry| !baseline.contains(&entry.path))
-        .map(|entry| entry.path.clone());
+        .filter(|entry| !baseline.contains(&entry.path()))
+        .map(|entry| entry.path());
     let path = added.next()?;
     added.next().is_none().then_some(path)
 }
@@ -15353,7 +15350,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> DirectoryEventC
                         .filter_map(|target| {
                             tab.entries
                                 .iter()
-                                .find(|entry| entry.path == *target)
+                                .find(|entry| entry.path.matches(target))
                                 .map(|entry| entry.id)
                         })
                         .collect::<Vec<_>>();
@@ -15370,7 +15367,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> DirectoryEventC
                 });
                 if let Some(target) = shell_created.as_ref()
                     && focus.is_none()
-                    && let Some(entry) = tab.entries.iter().find(|entry| entry.path == *target)
+                    && let Some(entry) = tab.entries.iter().find(|entry| entry.path.matches(target))
                 {
                     tab.selected = vec![entry.id].into();
                     tab.focused = Some(entry.id);
@@ -15415,7 +15412,7 @@ fn apply_event(state: &SharedSessions, event: DirectoryEvent) -> DirectoryEventC
                 && let Some(target) = shell_created
                 && let Some(entry) = app
                     .tab(tab_id)
-                    .and_then(|tab| tab.entries.iter().find(|entry| entry.path == target))
+                    .and_then(|tab| tab.entries.iter().find(|entry| entry.path.matches(&target)))
                     .cloned()
             {
                 app.focus_after_refresh.remove(&tab_id);
@@ -15823,7 +15820,7 @@ fn spawn_everything_worker(
                                         })
                                         .collect(),
                                     original_name: item.name,
-                                    path: item.path,
+                                    path: item.path.into(),
                                     kind: if item.is_directory {
                                         crate::domain::EntryKind::Directory
                                     } else {
@@ -16889,7 +16886,7 @@ fn submit_visible_shortcuts(
                     tab_id,
                     request_id,
                     entry_id,
-                    path: entry.path.clone(),
+                    path: entry.path(),
                 })
             })
             .filter(|request| {
@@ -16928,7 +16925,7 @@ fn spawn_shortcut_worker(
                     tab.latest_request() == request.request_id
                         && tab
                             .visible_entry(request.entry_id)
-                            .is_some_and(|entry| entry.path == request.path)
+                            .is_some_and(|entry| entry.path.matches(&request.path))
                 })
             });
             if !current {
@@ -18298,9 +18295,9 @@ fn icon_event_is_current(app: &AppState, event: &IconEvent) -> bool {
             && match event.target {
                 IconTarget::Entry(entry_id) => tab.visible_entry(entry_id).is_some_and(|entry| {
                     event.type_key.as_ref().is_some_and(|key| {
-                        entry_type_icon_key(&entry.path, entry.kind).as_ref() == Some(key)
+                        entry_type_icon_key(&entry.path(), entry.kind).as_ref() == Some(key)
                             && event.path == key.query_path()
-                    }) || (event.type_key.is_none() && entry.path == event.path)
+                    }) || (event.type_key.is_none() && entry.path.matches(&event.path))
                 }),
                 IconTarget::Location => tab.visible_path() == Some(event.path.as_path()),
             }
@@ -18403,7 +18400,7 @@ fn update_icon_row(ui: &AppWindow, state: &SharedSessions, update: IconUpdate) {
             .into_iter()
             .filter_map(|id| tab.visible_entry(id))
             .filter(|entry| {
-                entry_type_icon_key(&entry.path, entry.kind).as_ref() == Some(&type_key)
+                entry_type_icon_key(&entry.path(), entry.kind).as_ref() == Some(&type_key)
             })
             .map(|entry| entry.id)
             .collect::<HashSet<_>>();
@@ -19557,10 +19554,11 @@ fn file_row(
 ) -> FileRow {
     debug_assert!(
         entry.webdav.is_some() || {
-            let leaf = if crate::network::is_unc_path(&entry.path) {
-                crate::network::unc_leaf_name(&entry.path)
+            let path = entry.path();
+            let leaf = if crate::network::is_unc_path(&path) {
+                crate::network::unc_leaf_name(&path)
             } else {
-                entry.path.file_name().map(ToOwned::to_owned)
+                path.file_name().map(ToOwned::to_owned)
             };
             leaf.as_deref() == Some(entry.original_name.as_os_str())
         },
@@ -19572,7 +19570,7 @@ fn file_row(
         texts,
         tab.selected.contains(&entry.id),
         tab.focused == Some(entry.id),
-        app.cut_paths.contains(&entry.path),
+        app.cut_paths.contains(&entry.path()),
         icon,
         thumbnail_state,
         tab.folder_sizes.state_for(entry),
@@ -19619,7 +19617,7 @@ fn file_row_content(
                 .webdav
                 .as_ref()
                 .map(|item| Path::new(item.path.as_str()))
-                .unwrap_or(entry.path.as_path())
+                .unwrap_or_else(|| Path::new(entry.path.file_name().unwrap_or_default()))
                 .extension()
                 .map(|extension| extension.to_string_lossy().to_uppercase())
                 .filter(|extension| !extension.is_empty())

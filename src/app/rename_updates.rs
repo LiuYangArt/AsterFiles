@@ -63,7 +63,7 @@ pub(super) fn apply_completed(app: &mut AppState, old: &Path, new: &Path) -> Ren
             .flat_map(|window| window.tabs.values())
             .flat_map(|tab| tab.visible_entries())
             .any(|entry| {
-                entry.path == old
+                entry.path.matches(old)
                     && entry.kind == crate::domain::EntryKind::Directory
                     && entry.open_target.is_none()
             });
@@ -91,7 +91,10 @@ pub(super) fn apply_completed(app: &mut AppState, old: &Path, new: &Path) -> Ren
             }
             (location_contains(app, &location, parent)
                 || (tab.load_state == LoadState::Complete
-                    && tab.visible_entries().iter().any(|entry| entry.path == old)))
+                    && tab
+                        .visible_entries()
+                        .iter()
+                        .any(|entry| entry.path.matches(old))))
             .then_some((tab.id, Some(location), false))
         })
         .collect::<Vec<_>>();
@@ -219,7 +222,7 @@ mod tests {
             display_name: name.to_string_lossy().into_owned(),
             original_name: name,
             name_highlights: Vec::new(),
-            path,
+            path: path.into(),
             kind: EntryKind::File,
             open_target: None,
             library_source_index: None,
@@ -340,7 +343,7 @@ mod tests {
             [EntryId(2), EntryId(1)]
         );
         assert_eq!(
-            tab.visible_entry(EntryId(1)).unwrap().path,
+            tab.visible_entry(EntryId(1)).unwrap().path(),
             Path::new(r"C:\photos\z.png")
         );
         assert_eq!(

@@ -61,11 +61,12 @@ impl Images {
     }
 
     fn get(&self, entry: &FileEntry) -> (Image, i32) {
-        let key = self.requested_px.map(|px| (entry.path.clone(), px));
+        let entry_path = entry.path();
+        let key = self.requested_px.map(|px| (entry_path.clone(), px));
         let thumbnail = key.as_ref().and_then(|key| self.thumbnails.get(key));
         let grid = key.as_ref().and_then(|key| self.grid_icons.get(key));
-        let shared = entry_type_icon_key(&entry.path, entry.kind).and_then(|key| {
-            let px = if crate::network::is_unc_path(&entry.path) {
+        let shared = entry_type_icon_key(&entry_path, entry.kind).and_then(|key| {
+            let px = if crate::network::is_unc_path(&entry_path) {
                 0
             } else {
                 self.requested_px.unwrap_or(0)
@@ -78,14 +79,14 @@ impl Images {
             }
             self.entries
                 .get(&entry.id)
-                .or_else(|| self.ordinary.get(&entry.path))
+                .or_else(|| self.ordinary.get(&entry_path))
         });
         let state = self.requested_px.map_or(0, |_| {
             if thumbnail.is_some() {
                 2
             } else if grid.is_some() || shared.is_some() {
                 4
-            } else if self.failed.contains(&entry.path) {
+            } else if self.failed.contains(&entry_path) {
                 3
             } else {
                 1
@@ -294,7 +295,7 @@ impl DirectoryRows {
     pub(super) fn evict_image(&self, id: EntryId) {
         let changed = {
             let mut state = self.state.borrow_mut();
-            let Some(path) = state.entry(id).map(|entry| entry.path.clone()) else {
+            let Some(path) = state.entry(id).map(|entry| entry.path()) else {
                 return;
             };
             let active = state.image_updates.remove(&id).is_some();
@@ -337,10 +338,11 @@ impl DirectoryRows {
                 } else {
                     state.querying.remove(id);
                 }
-                if app.cut_paths.contains(&entry.path) {
-                    state.cut_paths.insert(entry.path.clone());
+                let path = entry.path();
+                if app.cut_paths.contains(&path) {
+                    state.cut_paths.insert(path);
                 } else {
-                    state.cut_paths.remove(&entry.path);
+                    state.cut_paths.remove(&path);
                 }
             }
         }
@@ -405,10 +407,11 @@ impl DirectoryRows {
                 } else {
                     state.querying.remove(&entry.id);
                 }
-                if app.cut_paths.contains(&entry.path) {
-                    state.cut_paths.insert(entry.path.clone());
+                let path = entry.path();
+                if app.cut_paths.contains(&path) {
+                    state.cut_paths.insert(path);
                 } else {
-                    state.cut_paths.remove(&entry.path);
+                    state.cut_paths.remove(&path);
                 }
                 if let Some((start, count)) = added_ranges.last_mut()
                     && *start + *count == *index
@@ -475,8 +478,8 @@ impl DirectoryRows {
                                 || match (state.entry(entry_id), next.entry(entry_id)) {
                                     (Some(old), Some(new)) => {
                                         !same_entry(old, new)
-                                            || state.cut_paths.contains(&old.path)
-                                                != next.cut_paths.contains(&new.path)
+                                            || state.cut_paths.contains(&old.path())
+                                                != next.cut_paths.contains(&new.path())
                                     }
                                     _ => true,
                                 }
@@ -555,7 +558,7 @@ impl Model for DirectoryRows {
                     state.texts,
                     state.selected.contains(entry_id),
                     state.focused == Some(*entry_id),
-                    state.cut_paths.contains(&entry.path),
+                    state.cut_paths.contains(&entry.path()),
                     icon.clone(),
                     image_state,
                     if entry.folder_size == FolderSizeState::Unknown
@@ -601,7 +604,7 @@ impl Model for DirectoryRows {
                     .insert(id, (data.icon, data.thumbnail_state));
             } else {
                 state.image_updates.remove(&id);
-                if let Some(path) = state.entry(id).map(|entry| entry.path.clone()) {
+                if let Some(path) = state.entry(id).map(|entry| entry.path()) {
                     state.images.evict(id, &path);
                     if data.thumbnail_state == 3 {
                         state.images.failed.insert(path);
@@ -899,7 +902,7 @@ mod tests {
                         original_name: OsString::from(&name),
                         display_name: name.clone(),
                         name_highlights: Vec::new(),
-                        path: root.join(name),
+                        path: root.join(name).into(),
                         kind: crate::domain::EntryKind::File,
                         open_target: None,
                         library_source_index: None,

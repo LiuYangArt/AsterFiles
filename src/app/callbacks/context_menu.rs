@@ -28,10 +28,7 @@ pub(super) fn wire_open(
             {
                 tab.select_entry(id, false, false);
             }
-            quick_access_path = app
-                .active()
-                .visible_entry(id)
-                .map(|entry| entry.path.clone());
+            quick_access_path = app.active().visible_entry(id).map(|entry| entry.path());
         }
         drop(app);
         if let Ok(mut menu) = quick_menu_for_entry.lock() {

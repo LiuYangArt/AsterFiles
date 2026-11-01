@@ -8,7 +8,7 @@ fn entry(id: u32, path: PathBuf) -> FileEntry {
         display_name: path.file_name().unwrap().to_string_lossy().into_owned(),
         name_highlights: Vec::new(),
         parent_display: String::new(),
-        path,
+        path: path.into(),
         kind: crate::domain::EntryKind::File,
         open_target: None,
         library_source_index: None,
@@ -435,7 +435,7 @@ fn issue_176_delete_completion_fills_the_gap_without_rewinding_any_view() {
                 tab.load_state = LoadState::Complete;
                 tab.select_entry(EntryId(80), false, false);
                 tab.select_entry(EntryId(90), true, false);
-                let deleted = item(80).path;
+                let deleted = item(80).path();
                 let operation_id = app.operations.submit(
                     OperationResource::Local,
                     kind,
@@ -520,7 +520,7 @@ fn issue_176_delete_completion_fills_the_gap_without_rewinding_any_view() {
                 let app = state.lock().unwrap();
                 let tab = app.active();
                 assert_eq!(tab.entries.len(), 399);
-                assert_eq!(tab.entries[79].path, item(81).path);
+                assert_eq!(tab.entries[79].path(), item(81).path());
                 assert_eq!(tab.selected, vec![EntryId(910)]);
                 assert_eq!(tab.focused, Some(EntryId(910)));
                 assert_eq!(tab.selection_anchor, Some(EntryId(910)));
@@ -607,7 +607,7 @@ fn issue_176_repeated_operation_refresh_rejects_old_results_and_keeps_latest_cho
             .active()
             .visible_entry(EntryId(2))
             .unwrap()
-            .path,
+            .path(),
         root.join("stay.txt")
     );
     apply_event(

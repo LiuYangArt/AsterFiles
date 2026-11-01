@@ -12,7 +12,7 @@ fn entry(id: u32, name: &str) -> FileEntry {
         original_name: path.file_name().unwrap().to_owned(),
         display_name: name.to_owned(),
         name_highlights: Vec::new(),
-        path,
+        path: path.into(),
         kind: EntryKind::File,
         open_target: None,
         library_source_index: None,
@@ -111,7 +111,7 @@ fn assert_index_identity(tab: &TabSession) {
         assert_eq!(tab.visible_entry_index(entry.id), Some(index));
         assert_eq!(tab.visible_entry(entry.id).unwrap().path, entry.path);
         assert_eq!(
-            entry.path.file_name(),
+            entry.path().file_name(),
             Some(entry.original_name.as_os_str())
         );
     }
@@ -510,7 +510,7 @@ fn issue_141_waiting_network_producer_does_not_block_local_navigation_or_cancell
     worker.join().unwrap();
     apply_event(&state, pending);
     let mut local_entry = entry(1, "local.txt");
-    local_entry.path = local_path.join("local.txt");
+    local_entry.path = local_path.join("local.txt").into();
     local_entry.parent_display = local_path.to_string_lossy().into_owned();
     apply_event(
         &state,
@@ -536,7 +536,7 @@ fn issue_141_waiting_network_producer_does_not_block_local_navigation_or_cancell
     assert_eq!(app.active().load_state, LoadState::Complete);
     assert_eq!(app.active().visible_path(), Some(local_path.as_path()));
     assert_eq!(app.active().entries.len(), 1);
-    assert_eq!(app.active().entries[0].path, local_path.join("local.txt"));
+    assert_eq!(app.active().entries[0].path(), local_path.join("local.txt"));
 }
 
 #[test]

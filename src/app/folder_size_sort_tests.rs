@@ -24,7 +24,7 @@ fn entry(id: u32) -> FileEntry {
         original_name: OsString::from(&name),
         display_name: name,
         name_highlights: Vec::new(),
-        path,
+        path: path.into(),
         kind,
         open_target: None,
         library_source_index: None,

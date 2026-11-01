@@ -1,5 +1,7 @@
 use crate as domain;
 
+mod entry_path;
+pub use entry_path::EntryPath;
 pub mod file_operations;
 pub mod folder_size_scheduler;
 pub mod geometry;
@@ -1271,16 +1273,16 @@ impl TabSession {
                 .selected
                 .iter()
                 .filter_map(|id| self.visible_entry(*id))
-                .map(|entry| entry.path.clone())
+                .map(|entry| entry.path())
                 .collect::<HashSet<_>>();
             let focused = self
                 .focused
                 .and_then(|id| self.visible_entry(id))
-                .map(|entry| entry.path.clone());
+                .map(|entry| entry.path());
             let anchor = self
                 .selection_anchor
                 .and_then(|id| self.visible_entry(id))
-                .map(|entry| entry.path.clone());
+                .map(|entry| entry.path());
             (selected, focused, anchor)
         });
         self.commit_pending();
@@ -1296,18 +1298,18 @@ impl TabSession {
             self.selected = self
                 .entries
                 .iter()
-                .filter(|entry| selected.contains(&entry.path))
+                .filter(|entry| selected.contains(&entry.path()))
                 .map(|entry| entry.id)
                 .collect();
             self.focused = self
                 .entries
                 .iter()
-                .find(|entry| Some(&entry.path) == focused.as_ref())
+                .find(|entry| Some(&entry.path()) == focused.as_ref())
                 .map(|entry| entry.id);
             self.selection_anchor = self
                 .entries
                 .iter()
-                .find(|entry| Some(&entry.path) == anchor.as_ref())
+                .find(|entry| Some(&entry.path()) == anchor.as_ref())
                 .map(|entry| entry.id);
         }
         self.error = warning;
@@ -1408,7 +1410,10 @@ impl TabSession {
         if self.page_source != PageSource::Directory || self.load_state != LoadState::Complete {
             return None;
         }
-        let index = self.entries.iter().position(|entry| entry.path == old)?;
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.path.matches(old))?;
         let name = new.file_name()?.to_owned();
         let entry = &mut Arc::make_mut(&mut self.entries)[index];
         let id = entry.id;
@@ -1419,7 +1424,9 @@ impl TabSession {
             entry.open_target = None;
             entry.kind = EntryKind::File;
         }
-        entry.path = new.to_path_buf();
+        let mut parent = Some(Arc::clone(entry.path.parent()));
+        entry.path = new.into();
+        entry.path.share_parent(&mut parent);
         entry.original_name = name;
         entry.display_name = entry.original_name.to_string_lossy().into_owned();
         entry.name_highlights.clear();
@@ -1507,17 +1514,14 @@ impl TabSession {
         let selected_paths = self
             .selected
             .iter()
-            .filter_map(|id| {
-                self.visible_entry(*id)
-                    .map(|entry| (*id, entry.path.clone()))
-            })
+            .filter_map(|id| self.visible_entry(*id).map(|entry| (*id, entry.path())))
             .collect::<HashMap<_, _>>();
         let focused_path = self
             .focused
-            .and_then(|id| self.visible_entry(id).map(|entry| (id, entry.path.clone())));
+            .and_then(|id| self.visible_entry(id).map(|entry| (id, entry.path())));
         let anchor_path = self
             .selection_anchor
-            .and_then(|id| self.visible_entry(id).map(|entry| (id, entry.path.clone())));
+            .and_then(|id| self.visible_entry(id).map(|entry| (id, entry.path())));
         let current = Arc::make_mut(&mut self.entries);
         for entry in entries {
             if let Some(index) = current.iter().position(|existing| existing.id == entry.id) {
@@ -1549,7 +1553,7 @@ impl TabSession {
         let entry_paths = self
             .entries
             .iter()
-            .map(|entry| (entry.id, entry.path.clone()))
+            .map(|entry| (entry.id, entry.path()))
             .collect::<HashMap<_, _>>();
         self.selected.retain(|id| {
             selected_paths
@@ -1978,7 +1982,7 @@ fn entry_type_key(entry: &FileEntry) -> String {
         .webdav
         .as_ref()
         .map(|identity| Path::new(&identity.path))
-        .unwrap_or(entry.path.as_path());
+        .unwrap_or_else(|| Path::new(entry.path.file_name().unwrap_or_default()));
     name.extension()
         .map(|extension| extension.to_string_lossy().to_lowercase())
         .unwrap_or_default()
@@ -2038,7 +2042,7 @@ fn compare_entries(
         })
         .then_with(|| match (&left.webdav, &right.webdav) {
             (Some(left_entry), Some(right_entry)) => left_entry.path.cmp(&right_entry.path),
-            _ => left.path.cmp(&right.path),
+            _ => left.path().cmp(&right.path()),
         })
 }
 
@@ -2145,7 +2149,7 @@ pub struct FileEntry {
     pub original_name: OsString,
     pub display_name: String,
     pub name_highlights: Vec<NameHighlightSegment>,
-    pub path: PathBuf,
+    pub path: EntryPath,
     pub kind: EntryKind,
     pub open_target: Option<PathBuf>,
     pub library_source_index: Option<usize>,
@@ -2158,8 +2162,12 @@ pub struct FileEntry {
 }
 
 impl FileEntry {
+    pub fn path(&self) -> PathBuf {
+        self.path.to_path_buf()
+    }
+
     pub fn accepts_folder_size(&self, entry_id: EntryId, original_path: &Path) -> bool {
-        self.webdav.is_none() && self.id == entry_id && self.path == original_path
+        self.webdav.is_none() && self.id == entry_id && self.path.matches(original_path)
     }
 
     pub fn set_folder_size(
@@ -2182,7 +2190,7 @@ impl FileEntry {
         target: PathBuf,
         is_directory: Option<bool>,
     ) -> bool {
-        if self.id != entry_id || self.path != original_path || is_directory == Some(false) {
+        if self.id != entry_id || !self.path.matches(original_path) || is_directory == Some(false) {
             return false;
         }
         self.kind = EntryKind::Directory;
@@ -2201,13 +2209,61 @@ pub enum EntryKind {
 mod tests {
     use super::*;
 
+    #[test]
+    fn issue_170_rename_keeps_shared_parent_and_raw_identity() {
+        let directory = Path::new(r"C:\shared");
+        let mut one = entry(1, "one.txt", EntryKind::File, Some(1));
+        let mut two = entry(2, "two.txt", EntryKind::File, Some(2));
+        one.path = directory.join("one.txt").into();
+        two.path = directory.join("two.txt").into();
+        let mut parent = None;
+        one.path.share_parent(&mut parent);
+        two.path.share_parent(&mut parent);
+        let mut tab = TabSession::new_at(TabId(1), directory.to_path_buf().into());
+        tab.load_state = LoadState::Complete;
+        tab.replace_entries(vec![one, two]);
+        let old_snapshot = Arc::clone(&tab.entries);
+        assert_eq!(
+            tab.rename_loaded_entry(&directory.join("one.txt"), &directory.join("renamed.txt")),
+            Some(EntryId(1))
+        );
+        let renamed = tab.visible_entry(EntryId(1)).unwrap();
+        assert_eq!(renamed.path(), directory.join("renamed.txt"));
+        assert_eq!(renamed.original_name, "renamed.txt");
+        assert!(Arc::ptr_eq(
+            renamed.path.parent(),
+            tab.visible_entry(EntryId(2)).unwrap().path.parent()
+        ));
+        assert_eq!(old_snapshot[0].path(), directory.join("one.txt"));
+        assert!(Arc::ptr_eq(
+            renamed.path.parent(),
+            old_snapshot[0].path.parent()
+        ));
+    }
+
+    #[test]
+    fn issue_170_shared_path_sort_uses_complete_path_order() {
+        let mut short = entry(1, "same", EntryKind::File, None);
+        let mut nested = entry(2, "same", EntryKind::File, None);
+        short.path = r"C:\a\z".into();
+        nested.path = r"C:\a\b\a".into();
+        // Parent order alone would place the shorter parent first.
+        assert_eq!(
+            compare_entries(&short, &nested, SortField::Name, SortDirection::Ascending),
+            short.path().cmp(&nested.path())
+        );
+        assert_eq!(
+            compare_entries(&short, &nested, SortField::Name, SortDirection::Ascending),
+            Ordering::Greater
+        );
+    }
     fn entry(id: u32, name: &str, kind: EntryKind, size: Option<u64>) -> FileEntry {
         FileEntry {
             id: EntryId(id),
             original_name: name.into(),
             display_name: name.into(),
             name_highlights: Vec::new(),
-            path: PathBuf::from(name),
+            path: PathBuf::from(name).into(),
             kind,
             open_target: None,
             library_source_index: None,
@@ -2655,10 +2711,10 @@ mod tests {
         use std::time::{Duration, SystemTime};
 
         let mut older = entry(1, "same", EntryKind::File, Some(1));
-        older.path = PathBuf::from(r"C:\b\same");
+        older.path = PathBuf::from(r"C:\b\same").into();
         older.created = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
         let mut newer = entry(2, "same", EntryKind::File, Some(1));
-        newer.path = PathBuf::from(r"C:\a\same");
+        newer.path = PathBuf::from(r"C:\a\same").into();
         newer.created = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2));
         let mut session = TabSession::new(TabId(1));
         session.replace_entries(vec![newer, older]);
@@ -3192,7 +3248,7 @@ mod tests {
             original_name: "零字节".into(),
             display_name: "零字节".into(),
             name_highlights: Vec::new(),
-            path: original.clone(),
+            path: original.clone().into(),
             kind: EntryKind::Directory,
             open_target: None,
             library_source_index: None,
@@ -3217,7 +3273,7 @@ mod tests {
         let original = PathBuf::from(r"C:\links\docs.lnk");
         let target = PathBuf::from(r"C:\docs");
         let mut item = entry(3, "docs.lnk", EntryKind::File, Some(4));
-        item.path = original.clone();
+        item.path = original.clone().into();
         assert!(!item.set_shortcut_target(EntryId(4), &original, target.clone(), Some(true)));
         assert!(!item.set_shortcut_target(
             EntryId(3),
@@ -3236,7 +3292,7 @@ mod tests {
         let path = PathBuf::from(r"C:\links\docs.lnk");
         let target = PathBuf::from(r"C:\docs");
         let mut pending = entry(1, "docs.lnk", EntryKind::File, Some(4));
-        pending.path = path.clone();
+        pending.path = path.clone().into();
         let mut session = TabSession::new(TabId(1));
         let (request, _) =
             session.begin_directory_navigation(r"C:\links".into(), NavigationKind::Normal);
@@ -3271,9 +3327,9 @@ mod tests {
     #[test]
     fn issue_64_pending_sort_keeps_entry_indices_current() {
         let mut directory_link = entry(1, "z-folder.lnk", EntryKind::File, Some(4));
-        directory_link.path = PathBuf::from(r"C:\links\z-folder.lnk");
+        directory_link.path = PathBuf::from(r"C:\links\z-folder.lnk").into();
         let mut other = entry(2, "a-file.txt", EntryKind::File, Some(4));
-        other.path = PathBuf::from(r"C:\links\a-file.txt");
+        other.path = PathBuf::from(r"C:\links\a-file.txt").into();
         let mut session = TabSession::new(TabId(1));
         let (request, _) =
             session.begin_directory_navigation(r"C:\links".into(), NavigationKind::Normal);
@@ -3696,15 +3752,15 @@ mod tests {
     #[test]
     fn size_sort_uses_path_after_equal_size_and_name() {
         let mut left = entry(1, "same", EntryKind::Directory, None);
-        left.path = PathBuf::from(r"C:\b\same");
+        left.path = PathBuf::from(r"C:\b\same").into();
         left.folder_size = FolderSizeState::Value(7);
         let mut right = entry(2, "same", EntryKind::Directory, None);
-        right.path = PathBuf::from(r"C:\a\same");
+        right.path = PathBuf::from(r"C:\a\same").into();
         right.folder_size = FolderSizeState::Value(7);
         let mut session = TabSession::new(TabId(1));
         session.replace_entries(vec![left, right]);
         session.set_sort(SortField::Size);
-        assert_eq!(session.entries[0].path, PathBuf::from(r"C:\a\same"));
+        assert_eq!(session.entries[0].path(), PathBuf::from(r"C:\a\same"));
     }
     #[test]
     fn entry_id_resolves_original_unicode_path() {
@@ -3715,7 +3771,7 @@ mod tests {
             original_name: "📁".into(),
             display_name: "📁".into(),
             name_highlights: Vec::new(),
-            path: original.clone(),
+            path: original.clone().into(),
             kind: EntryKind::Directory,
             open_target: None,
             library_source_index: None,
@@ -3727,9 +3783,7 @@ mod tests {
             webdav: None,
         }]);
         assert_eq!(
-            session
-                .visible_entry(EntryId(9))
-                .map(|entry| entry.path.clone()),
+            session.visible_entry(EntryId(9)).map(|entry| entry.path()),
             Some(original)
         );
     }

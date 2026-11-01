@@ -18,6 +18,11 @@ FTP、SFTP 等协议继续后置。WebDAV 首个切片已经接入，可以添�
 
 包拆分不改变 `TabId + RequestId` 隔离、分批显示、文件操作或本地化语义。目录和网络工作继续在后台执行。包的职责入口见 [架构索引](architecture.md#cargo-工作区边界166)，依赖检查和构建比较见 [#166 验证](agent/debug-validation.md#issue-166)。
 
+## 条目路径存储（#170）
+
+`crates/domain/src/entry_path.rs` 保存条目的原始父路径和名称。同一次普通目录读取在跨批次结果间共享 `Arc<Path>` 父路径；完整 `PathBuf` 只在操作、缓存或协议边界按需组装，不在每条记录中缓存。名称、未配对 UTF-16 和 UNC 身份不经过显示文字转换。重命名复用原父路径，副本继续共享父路径。
+
+普通目录、库和 WebDAV 列表不保存未显示的父目录文字。Everything 搜索仍保存并显示每条结果的父目录；完整路径排序、分组和文件操作语义不变。内存测量入口及统计口径见 [#170 验证](agent/debug-validation.md#issue-170)。
 ## 必须长期保持的边界
 
 - 文件和目录身份留在 Rust：使用 `PathBuf/OsString` 或稳定 ID。Slint 只接收展示文本和稳定 ID。

@@ -227,7 +227,7 @@ pub(super) fn snapshot(
                             tab: target,
                             entry_id: entry.id,
                         },
-                        path: entry.path.clone(),
+                        path: entry.path(),
                         selected: selected.contains(&entry.id),
                     })
                     .collect(),
@@ -481,8 +481,10 @@ pub(super) fn rename(
             return Err(ActionError::NotAllowed);
         }
         let entry = checked_entry(&app, target)?;
-        let parent = entry.path.parent().ok_or(ActionError::NotAllowed)?;
-        OperationItem::pending(Some(entry.path.clone()), Some(parent.join(name)))
+        let path = entry.path();
+        let parent = path.parent().ok_or(ActionError::NotAllowed)?;
+        let destination = parent.join(name);
+        OperationItem::pending(Some(path), Some(destination))
     };
     enqueue_operation(
         state,

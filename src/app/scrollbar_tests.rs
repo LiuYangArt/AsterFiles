@@ -27,7 +27,7 @@ impl Fixture {
                         original_name: name.clone().into(),
                         display_name: name.clone(),
                         name_highlights: Vec::new(),
-                        path: root.join(name),
+                        path: root.join(name).into(),
                         kind: crate::domain::EntryKind::File,
                         open_target: None,
                         library_source_index: None,

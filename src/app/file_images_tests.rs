@@ -7,7 +7,7 @@ fn entry(id: u32, extension: &str, size: u64) -> FileEntry {
         id: EntryId(id),
         original_name: name.clone().into(),
         display_name: name.clone(),
-        path: PathBuf::from(r"C:\issue-175-icons").join(name),
+        path: PathBuf::from(r"C:\issue-175-icons").join(name).into(),
         name_highlights: Vec::new(),
         kind: crate::domain::EntryKind::File,
         open_target: None,
@@ -61,7 +61,7 @@ fn issue_176_retained_refresh_does_not_reuse_independent_icons_by_old_id() {
     i_slint_backend_testing::init_no_event_loop();
     let (state, _ui) = fixture(1, "exe", 1);
     let old = state.lock().unwrap().active().entries[0].clone();
-    let path = old.path.parent().unwrap().to_path_buf();
+    let path = old.path().parent().unwrap().to_path_buf();
     let (sender, receiver) = mpsc::channel();
     assert!(submit_navigation(
         &sender,
@@ -88,7 +88,7 @@ fn issue_176_retained_refresh_does_not_reuse_independent_icons_by_old_id() {
             .contains_key(&(TabId(1), request.request_id, EntryId(1)))
     );
     let mut replacement = entry(1, "exe", 1);
-    replacement.path = path.join("replacement.exe");
+    replacement.path = path.join("replacement.exe").into();
     apply_event(
         &state,
         DirectoryEvent::Batch {
@@ -114,7 +114,7 @@ fn issue_176_retained_refresh_does_not_reuse_independent_icons_by_old_id() {
         !app.icons
             .contains_key(&(TabId(1), request.request_id, EntryId(1)))
     );
-    assert!(app.image_cache.ordinary.contains_key(&old.path));
+    assert!(app.image_cache.ordinary.contains_key(&old.path()));
     assert_eq!(
         file_images::row_image(&app.active().entries[0], app.active(), &app, None)
             .0

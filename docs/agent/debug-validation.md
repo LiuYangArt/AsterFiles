@@ -75,11 +75,23 @@
 | [#167](#issue-167) | Windows 系统绑定版本（#167） |
 | [#168](#issue-168) | Windows 平台安全前提说明（#168） |
 | [#169](#issue-169) | Agent 场景登记与 Release 入口（#169） |
+| [#170](#issue-170) | 大目录条目内存（#170） |
 | [#175](#issue-175) | Issue #175 十万条目目录加载、框选与滚动 |
 | [#176](#issue-176) | Temp 监听循环与本地刷新（#176） |
 | [#177](#issue-177) | Issue #177 地址栏退出编辑 |
 | [#178](#issue-178) | 滚动条离窗释放（#178） |
 
+<a id="issue-170"></a>
+
+## 大目录条目内存（#170）
+
+无界面测量：`python tools/build.py run --example file_entry_memory --locked -- after`。首次在 `artifacts/perf/issue-170/fixture/` 创建十万个空文件，随后通过正式目录辅助进程读取；再次运行复用同一目录。不会启动应用窗口。专项回归为 `cargo test --workspace --locked issue_170 -- --nocapture`，完整回归为 `python tools/verify.py`。
+
+测量使用独立示例程序中的计数分配器，先预热读取，再统计条目及其 Vec 存活期间的主进程请求字节与分配块数。临时读取缓冲区已释放；不计系统堆元数据和辅助进程。释放条目后必须回到基线。修改前代码与测量程序存于 `artifacts/perf/issue-170/baseline-source/`，修改前后结果分别为 `before.json`、`after.json`；对比汇总为 `comparison.json`。时间是单次观测，不作为速度提升结论。
+
+十万条目保留内存由 47,600,000 字节降为 35,700,080 字节，减少约 25%；存活分配由 400,001 块降为 300,002 块。重复父目录显示文字由 5,900,000 字节降为零。已按实测选择共享父路径并移除无用父目录显示文字，保留名称、显示文字及高亮的现有表示，不继续扩大重构范围。
+
+回归覆盖跨批共享、原始 UTF-16、路径完整顺序、重命名后的快照隔离、复制/拖拽身份和搜索父目录显示。现有 #175 十万条目加载、选择与滚动的无窗口性能测试仍纳入完整验证；本次证据另存 `artifacts/perf/issue-170/large-directory.json`。日志位于 `artifacts/logs/issue-170/`，收尾汇总位于 `artifacts/state/issue-170/verification.json`。
 <a id="issue-106"></a>
 
 ## Windows CI（#106）

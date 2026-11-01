@@ -100,7 +100,7 @@ fn synthetic_entry(id: u32, directory_every: u32) -> FileEntry {
     FileEntry {
         id: EntryId(id),
         original_name: OsString::from(&name),
-        path: PathBuf::from(SYNTHETIC_DIRECTORY).join(&name),
+        path: PathBuf::from(SYNTHETIC_DIRECTORY).join(&name).into(),
         display_name: name,
         name_highlights: Vec::new(),
         kind: if directory {
@@ -766,7 +766,7 @@ fn issue_175_out_of_order_batches_keep_rows_in_pending_order() {
             let mut entry = synthetic_entry(id, 0);
             let name = format!("item-{rank:06}.txt");
             entry.original_name = OsString::from(&name);
-            entry.path = PathBuf::from(SYNTHETIC_DIRECTORY).join(&name);
+            entry.path = PathBuf::from(SYNTHETIC_DIRECTORY).join(&name).into();
             entry.display_name = name;
             entry
         };

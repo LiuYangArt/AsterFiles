@@ -310,7 +310,7 @@ fn issue_104_deduplicates_sources_preserves_sparse_indices_paths_and_global_ids(
             entries
                 .iter()
                 .any(|entry| entry.library_source_index == Some(index)
-                    && entry.path == path.join("item-0000.txt"))
+                    && entry.path() == path.join("item-0000.txt"))
         );
     }
 }
@@ -463,12 +463,12 @@ fn issue_104_library_source_hides_internal_cleanup_directory() {
     assert!(
         entries
             .iter()
-            .any(|entry| entry.path == source.join(".asterfiles-cleanup-copy"))
+            .any(|entry| entry.path() == source.join(".asterfiles-cleanup-copy"))
     );
     assert!(
         !entries
             .iter()
-            .any(|entry| entry.path == source.join(".asterfiles-cleanup"))
+            .any(|entry| entry.path() == source.join(".asterfiles-cleanup"))
     );
 }
 
@@ -484,7 +484,7 @@ fn partial_failure_reader(
             display_name: "preserved.txt".into(),
             name_highlights: Vec::new(),
             original_name: "preserved.txt".into(),
-            path: path.join("preserved.txt"),
+            path: path.join("preserved.txt").into(),
             kind: crate::domain::EntryKind::File,
             open_target: None,
             library_source_index: None,
@@ -523,7 +523,10 @@ fn issue_104_preserves_delivered_entries_when_every_source_fails_and_prioritizes
     let (entries, batches, terminal) = loader.collect();
     assert_eq!(batches, [1]);
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].path, Path::new("partial").join("preserved.txt"));
+    assert_eq!(
+        entries[0].path(),
+        Path::new("partial").join("preserved.txt")
+    );
     assert_eq!(entries[0].library_source_index, Some(1));
     assert_eq!(entries[0].id, EntryId(1));
     assert!(matches!(

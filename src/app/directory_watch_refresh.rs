@@ -308,8 +308,8 @@ fn probe_changes_with(
             let previous = probe
                 .entries
                 .iter()
-                .filter(|entry| probe.pending.batch.paths.contains(&entry.path))
-                .map(|entry| (&entry.path, entry))
+                .filter(|entry| probe.pending.batch.paths.contains(&entry.path()))
+                .map(|entry| (entry.path(), entry))
                 .collect::<HashMap<_, _>>();
             let changed = probe.pending.batch.uncertain
                 || probe

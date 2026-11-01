@@ -818,7 +818,7 @@ fn library_projection_entry(id: u32, source_index: usize, path: &str) -> FileEnt
         display_name: original_name.to_string_lossy().into_owned(),
         name_highlights: Vec::new(),
         original_name,
-        path: path.clone(),
+        path: path.clone().into(),
         kind: crate::domain::EntryKind::File,
         open_target: None,
         library_source_index: Some(source_index),
@@ -3046,6 +3046,87 @@ fn quick_menu_submenu_projection_keeps_token_and_leaf_command_id() {
 }
 
 #[test]
+fn issue_170_webdav_type_group_and_fit_preserve_empty_local_path_behavior() {
+    let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\first")], 0, [0, 1, 2, 3]);
+    let mut entry = focus_entry(1, "report.verylongextension");
+    entry.path = PathBuf::new().into();
+    entry.webdav = Some(crate::domain::WebDavEntry {
+        connection_id: 7,
+        revision: 1,
+        root: "/dav".into(),
+        path: "/dav/report.verylongextension".into(),
+    });
+    let tab = app.tab_mut(TabId(1)).unwrap();
+    tab.load_state = LoadState::Complete;
+    tab.replace_entries(vec![entry]);
+    let expected_width = (6 * 8 + 28).clamp(
+        crate::domain::MIN_COLUMN_WIDTH,
+        crate::domain::MAX_COLUMN_WIDTH,
+    );
+    assert_eq!(fitted_column_width(&app, ColumnKind::Kind), expected_width);
+    let groups = group_projection::project_groups(
+        app.active().visible_entries(),
+        GroupField::Kind,
+        SortDirection::Ascending,
+        group_projection::GroupProjectionContext {
+            language: app.language,
+            now: std::time::SystemTime::UNIX_EPOCH,
+            utc_offset_seconds: 0,
+        },
+    );
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].key, "kind:file");
+    assert_eq!(groups[0].entries, [EntryId(1)]);
+}
+
+#[test]
+fn issue_170_search_rows_keep_parent_paths_in_headless_model() {
+    i_slint_backend_testing::init_no_event_loop();
+    let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\first")], 0, [0, 1, 2, 3]);
+    let tab_id = app.active().id;
+    let (request_id, _) = app
+        .tab_mut(tab_id)
+        .unwrap()
+        .begin_search(SearchScope::Global, "same".into());
+    let parents = [r"C:\first", r"D:\second"];
+    let entries = parents
+        .iter()
+        .enumerate()
+        .map(|(index, parent)| {
+            let mut entry = focus_entry(index as u32 + 1, &format!(r"{parent}\same.txt"));
+            entry.parent_display = (*parent).into();
+            entry
+        })
+        .collect();
+    assert!(apply_search_page_event(&mut app, tab_id, request_id, 0, entries, 2, 2).is_some());
+    let tab = app.tab(tab_id).unwrap();
+    let model = VecModel::from(search_window_rows(
+        tab,
+        &app,
+        SearchWindow { start: 0, len: 2 },
+        None,
+    ));
+    for (index, parent) in parents.iter().enumerate() {
+        let entry = tab.visible_entry(EntryId(index as u32 + 1)).unwrap();
+        let content = file_row_content(
+            entry,
+            Texts::new(app.language),
+            false,
+            false,
+            false,
+            Image::default(),
+            0,
+            entry.folder_size,
+        );
+        assert_eq!(content.parent_path.as_str(), *parent);
+        let row = model.row_data(index).unwrap();
+        assert_eq!(row.parent_path, content.parent_path);
+        assert_eq!(row.name.as_str(), "same.txt");
+        assert!(entry.path.matches(&Path::new(parent).join("same.txt")));
+    }
+}
+
+#[test]
 fn search_window_keeps_slint_model_bounded_at_deep_offsets() {
     assert_eq!(
         search_window_for_index(65_536, 133_796, 1),
@@ -3300,7 +3381,7 @@ fn issue_99_ordinary_path_requests_are_deduplicated_and_stale_work_is_cleared() 
     let mut app = state.lock().unwrap();
     app.image_cache
         .ordinary
-        .insert(entry.path.clone(), test_image(32));
+        .insert(entry.path(), test_image(32));
     assert!(ordinary_icon_request(&mut app, TabId(1), RequestId(13), &entry).is_none());
 }
 
@@ -3510,7 +3591,7 @@ fn issue_156_unc_uses_type_icons_and_unsupported_files_use_shell_icon() {
         .clone();
     app.image_cache
         .grid_icons
-        .insert((entry.path.clone(), 48), test_image(48));
+        .insert((entry.path(), 48), test_image(48));
     assert!(thumbnail_request(&mut app, TabId(1), RequestId(12), &entry, 48).is_none());
     let tab = app.tab(TabId(1)).unwrap();
     let row = file_row(&entry, tab, Texts::new(Language::Chinese), &app, Some(48));
@@ -5349,7 +5430,7 @@ fn search_and_icon_events_route_to_non_active_windows() {
         tab_id: second_tab,
         request_id,
         target: IconTarget::Entry(EntryId(1)),
-        path: search_entry.path,
+        path: search_entry.path(),
         icon: platform::windows::shell_icons::ShellIconRgba {
             width: 1,
             height: 1,
@@ -6511,7 +6592,7 @@ fn icon_events_require_matching_tab_request_entry_and_path() {
         original_name: "file.txt".into(),
         display_name: "file.txt".into(),
         name_highlights: Vec::new(),
-        path: PathBuf::from("same/file.txt"),
+        path: PathBuf::from("same/file.txt").into(),
         kind: crate::domain::EntryKind::File,
         open_target: None,
         library_source_index: None,
@@ -6614,7 +6695,7 @@ fn stale_folder_size_event_cannot_update_reused_entry_id() {
     tab.page_source = PageSource::Directory;
     tab.replace_entries(vec![FileEntry {
         id: EntryId(1),
-        path: PathBuf::from(r"C:\current\same-id"),
+        path: PathBuf::from(r"C:\current\same-id").into(),
         original_name: "same-id".into(),
         display_name: "same-id".into(),
         name_highlights: Vec::new(),
@@ -6689,7 +6770,7 @@ fn focus_entry(id: u32, path: &str) -> FileEntry {
             .to_string_lossy()
             .into_owned(),
         name_highlights: Vec::new(),
-        path: PathBuf::from(path),
+        path: PathBuf::from(path).into(),
         kind: crate::domain::EntryKind::File,
         open_target: None,
         library_source_index: None,
@@ -7401,7 +7482,7 @@ fn repeated_context_menu_hit_test_switches_between_entry_and_background() {
             .unwrap();
         tab.replace_entries(vec![FileEntry {
             id: EntryId(1),
-            path: PathBuf::from("C:/test/item.txt"),
+            path: PathBuf::from("C:/test/item.txt").into(),
             original_name: std::ffi::OsString::from("item.txt"),
             display_name: "item.txt".into(),
             name_highlights: Vec::new(),
@@ -7483,7 +7564,7 @@ fn context_menu_hit_test_accounts_for_negative_viewport_offset() {
                         original_name: format!("{id}.txt").into(),
                         display_name: format!("{id}.txt"),
                         name_highlights: Vec::new(),
-                        path: PathBuf::from(format!(r"C:\test\{id}.txt")),
+                        path: PathBuf::from(format!(r"C:\test\{id}.txt")).into(),
                         kind: crate::domain::EntryKind::File,
                         open_target: None,
                         library_source_index: None,
@@ -8041,7 +8122,7 @@ fn issue_176_refresh_projection_keeps_rows_selection_and_scroll() {
             .active()
             .visible_entry(EntryId(80))
             .unwrap()
-            .path,
+            .path(),
         path.join("file080.txt")
     );
     apply_event(

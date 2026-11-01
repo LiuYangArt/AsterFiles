@@ -131,7 +131,7 @@ impl FolderSizeScheduler {
             let Some(entry) = entries.get(*index) else {
                 continue;
             };
-            if !entry.is_directory() || is_internal_cleanup_path(&entry.path) {
+            if !entry.is_directory() || is_internal_cleanup_path(&entry.path()) {
                 continue;
             }
             let key = key_for_entry(entry);
@@ -177,12 +177,12 @@ impl FolderSizeScheduler {
         self.strategy = FolderSizeStrategy::CompleteForSort;
         self.complete_snapshot = entries
             .iter()
-            .filter(|entry| entry.is_directory() && !is_internal_cleanup_path(&entry.path))
+            .filter(|entry| entry.is_directory() && !is_internal_cleanup_path(&entry.path()))
             .map(key_for_entry)
             .collect();
         for entry in entries.iter() {
             if entry.is_directory()
-                && !is_internal_cleanup_path(&entry.path)
+                && !is_internal_cleanup_path(&entry.path())
                 && entry.folder_size.is_terminal()
             {
                 self.staged.insert(key_for_entry(entry), entry.folder_size);
@@ -314,7 +314,7 @@ pub enum FolderSizeCommit {
 fn key_for_entry(entry: &FileEntry) -> FolderSizeKey {
     FolderSizeKey {
         entry_id: entry.id,
-        path: entry.path.clone(),
+        path: entry.path(),
     }
 }
 
@@ -351,7 +351,7 @@ mod tests {
             original_name: OsString::from(name),
             display_name: name.to_owned(),
             name_highlights: Vec::<NameHighlightSegment>::new(),
-            path: PathBuf::from(format!(r"C:\sizes\{name}")),
+            path: PathBuf::from(format!(r"C:\sizes\{name}")).into(),
             kind: EntryKind::Directory,
             open_target: None,
             library_source_index: None,
@@ -387,7 +387,7 @@ mod tests {
             entry(2, ".asterfiles-cleanup"),
             entry(3, ".asterfiles-cleanup-copy"),
         ];
-        entries[1].path = PathBuf::from(r"C:\sizes\.ASTERFILES-CLEANUP\task");
+        entries[1].path = PathBuf::from(r"C:\sizes\.ASTERFILES-CLEANUP\task").into();
         let mut scheduler = FolderSizeScheduler::new();
 
         let queries = scheduler.visible_queries(RequestId(12), &entries, 0, 3);
@@ -404,7 +404,7 @@ mod tests {
             entry(2, ".asterfiles-cleanup"),
             entry(3, ".asterfiles-cleanup-copy"),
         ];
-        entries[1].path = PathBuf::from(r"C:\sizes\.asterfiles-cleanup\task");
+        entries[1].path = PathBuf::from(r"C:\sizes\.asterfiles-cleanup\task").into();
         let mut scheduler = FolderSizeScheduler::new();
 
         let queries = scheduler.begin_complete_sort(RequestId(13), &entries);

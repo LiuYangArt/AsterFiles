@@ -20,7 +20,7 @@ fn memory_app() -> AppState {
         original_name: "Bridge".into(),
         display_name: "Bridge".into(),
         name_highlights: Vec::new(),
-        path: PathBuf::from("C:/issue-93-memory/source/Bridge"),
+        path: PathBuf::from("C:/issue-93-memory/source/Bridge").into(),
         kind: crate::domain::EntryKind::Directory,
         open_target: None,
         library_source_index: None,
@@ -135,7 +135,7 @@ fn issue_93_reused_entry_id_cannot_authorize_a_different_original_path() {
     let mut gesture = armed(&app);
     let source = app.active().id;
     Arc::make_mut(&mut app.tab_mut(source).unwrap().entries)[0].path =
-        PathBuf::from("C:/issue-93-memory/source/Whitebox");
+        PathBuf::from("C:/issue-93-memory/source/Whitebox").into();
     assert!(gesture.take_native_start(&app, 100.0, 100.0).is_none());
     assert!(gesture.pending.is_none());
 }
