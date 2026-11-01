@@ -636,6 +636,7 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
                     x: _point.x,
                     y: _point.y,
                 };
+                // SAFETY: The helper belongs to this OLE thread; the registered target window, data interface, and local POINT survive the call.
                 let _ = unsafe {
                     helper.DragEnter(
                         HWND(self.hwnd as *mut c_void),
@@ -666,6 +667,7 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
             (paths, incoming)
         };
         let target = self.target(_point);
+        // SAFETY: The OLE DragEnter caller supplies the effect pointer for this callback; null is accepted as no offered effect.
         let offered = unsafe { native_effect.as_ref() }
             .copied()
             .unwrap_or(DROPEFFECT_NONE);
@@ -716,6 +718,7 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
                     x: _point.x,
                     y: _point.y,
                 };
+                // SAFETY: This helper is retained on the registered OLE thread and point is valid until the synchronous call returns.
                 let _ = unsafe { helper.DragOver(&point, DROPEFFECT_MOVE) };
             }
             set_native_effect(native_effect, DropEffect::Move);
@@ -778,6 +781,7 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
             });
             notify_tab_target(self.hwnd, TabTargetEvent::Leave);
             if let Some(helper) = &self.helper {
+                // SAFETY: The retained helper is called on the same OLE thread that handled DragEnter.
                 let _ = unsafe { helper.DragLeave() };
             }
             return Ok(());
@@ -826,6 +830,7 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
                     x: _point.x,
                     y: _point.y,
                 };
+                // SAFETY: The helper and borrowed data interface are live on this OLE thread, and point remains valid during Drop.
                 let _ = unsafe { helper.Drop(data, &point, DROPEFFECT_MOVE) };
             }
             set_native_effect(native_effect, DropEffect::Move);
@@ -926,6 +931,7 @@ impl IDropTarget_Impl for NativeDropTarget_Impl {
 }
 
 fn set_native_effect(output: *mut DROPEFFECT, effect: DropEffect) {
+    // SAFETY: Only OLE callbacks pass this pointer; a nonnull effect output is writable for the duration of the callback.
     if let Some(output) = unsafe { output.as_mut() } {
         *output = effect.native();
     }
@@ -1287,11 +1293,14 @@ fn read_descriptor_entries(
     wide: bool,
 ) -> io::Result<Option<Vec<VirtualEntry>>> {
     let format = format_etc(format_id);
+    // SAFETY: data is a live OLE interface and format is an initialized descriptor request with no target-device pointer.
     if unsafe { data.QueryGetData(&format) }.is_err() {
         return Ok(None);
     }
+    // SAFETY: The initialized descriptor request remains alive; this function owns and releases the returned medium.
     let mut medium = unsafe { data.GetData(&format) }.map_err(windows_error)?;
     let result = parse_descriptors(&medium, wide);
+    // SAFETY: This is the single release of the owned GetData medium after descriptor bytes have been copied.
     unsafe { ReleaseStgMedium(&mut medium) };
     result.map(Some)
 }
@@ -1381,6 +1390,7 @@ fn safe_relative(name: &str) -> Option<PathBuf> {
 fn write_virtual_contents(data: &IDataObject, index: usize, destination: &Path) -> io::Result<()> {
     let formats =
         virtual_formats().ok_or_else(|| io::Error::other("file contents format is unavailable"))?;
+    // SAFETY: The live data object receives an initialized indexed contents request; this scope owns the returned medium.
     let mut medium = unsafe {
         data.GetData(&contents_format(
             formats.contents,
@@ -1390,6 +1400,7 @@ fn write_virtual_contents(data: &IDataObject, index: usize, destination: &Path) 
     .map_err(windows_error)?;
     let result = write_medium_bytes(&mut medium, destination);
     if medium.tymed != 0 {
+        // SAFETY: A nonzero medium tag means write_medium_bytes did not consume it; this path releases it exactly once.
         unsafe { ReleaseStgMedium(&mut medium) };
     }
     result
@@ -1407,8 +1418,10 @@ fn contents_format(format: u16, index: i32) -> FORMATETC {
 
 fn write_medium_bytes(medium: &mut STGMEDIUM, destination: &Path) -> io::Result<()> {
     if medium.tymed == TYMED_ISTREAM.0 as u32 {
+        // SAFETY: TYMED_ISTREAM selects pstm, whose owned interface is moved out before the medium tag is cleared.
         let stream = unsafe { ManuallyDrop::take(&mut medium.u.pstm) };
         medium.tymed = 0;
+        // SAFETY: The stream has been taken and tymed cleared, so cleanup cannot release that moved interface again.
         unsafe { ReleaseStgMedium(medium) };
         let stream = stream.ok_or_else(|| io::Error::other("file contents stream is empty"))?;
         return write_stream(&stream, destination);
@@ -1426,6 +1439,7 @@ fn write_stream(stream: &IStream, destination: &Path) -> io::Result<()> {
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let mut read = 0u32;
+        // SAFETY: The retained IStream receives the complete writable buffer and a live byte-count output on this OLE thread.
         unsafe {
             stream
                 .Read(
@@ -1453,19 +1467,24 @@ fn global_bytes(medium: &STGMEDIUM) -> io::Result<Vec<u8>> {
     if medium.tymed != TYMED_HGLOBAL.0 as u32 {
         return Err(io::Error::other("drop data is not memory"));
     }
+    // SAFETY: The preceding tag check selects hGlobal and the caller retains the medium throughout this read.
     let handle = unsafe { medium.u.hGlobal };
     if handle.is_invalid() {
         return Err(io::Error::other("drop memory is invalid"));
     }
+    // SAFETY: The noninvalid HGLOBAL remains owned by the caller while its allocation size is queried.
     let size = unsafe { GlobalSize(handle) };
     if size == 0 {
         return Ok(Vec::new());
     }
+    // SAFETY: The caller retains this nonempty HGLOBAL allocation until its temporary lock is released.
     let pointer = unsafe { GlobalLock(handle) }.cast::<u8>();
     if pointer.is_null() {
         return Err(io::Error::other("drop memory is locked"));
     }
+    // SAFETY: The successful lock exposes size bytes from this allocation; they are copied before unlocking.
     let bytes = unsafe { std::slice::from_raw_parts(pointer, size) }.to_vec();
+    // SAFETY: This balances the successful GlobalLock after the owned byte copy is complete.
     let _ = unsafe { GlobalUnlock(handle) };
     Ok(bytes)
 }
@@ -1478,8 +1497,11 @@ fn read_drop_paths(data: &IDataObject) -> io::Result<Vec<PathBuf>> {
         lindex: -1,
         tymed: TYMED_HGLOBAL.0 as u32,
     };
+    // SAFETY: The live OLE object receives a CF_HDROP/HGLOBAL request; the returned medium is released below.
     let mut medium = unsafe { data.GetData(&format) }.map_err(windows_error)?;
+    // SAFETY: GetData fulfilled the CF_HDROP HGLOBAL request; its allocation stays owned until read_hdrop returns.
     let result = read_hdrop(unsafe { HDROP(medium.u.hGlobal.0) });
+    // SAFETY: read_hdrop no longer borrows the allocation, and this is its single owned-medium release.
     unsafe { ReleaseStgMedium(&mut medium) };
     result
 }
@@ -1530,8 +1552,10 @@ fn decode_tab_drag_payload(bytes: &[u8]) -> Option<TabDragPayload> {
 fn read_tab_drag_payload(data: &IDataObject) -> Option<TabDragPayload> {
     let format = clipboard_format(TAB_DRAG_FORMAT).ok()?;
     let format = format_etc(format);
+    // SAFETY: The private tab format request is initialized; the returned medium is owned until released below.
     let mut medium = unsafe { data.GetData(&format) }.ok()?;
     let bytes = read_hglobal_bytes(&medium).ok();
+    // SAFETY: read_hglobal_bytes copied the payload, so the owned medium can now be released once.
     unsafe { ReleaseStgMedium(&mut medium) };
     bytes.and_then(|bytes| decode_tab_drag_payload(&bytes))
 }
@@ -1540,13 +1564,18 @@ fn read_hglobal_bytes(medium: &STGMEDIUM) -> io::Result<Vec<u8>> {
     if medium.tymed != TYMED_HGLOBAL.0 as u32 {
         return Err(io::Error::other("tab drag payload storage is unavailable"));
     }
+    // SAFETY: The checked TYMED_HGLOBAL tag selects hGlobal; the caller owns the medium during this function.
     let global = unsafe { medium.u.hGlobal };
+    // SAFETY: The caller retains the HGLOBAL while its allocation size is queried.
     let size = unsafe { GlobalSize(global) };
+    // SAFETY: The caller retains the allocation through the lock and subsequent byte copy.
     let pointer = unsafe { GlobalLock(global) };
     if pointer.is_null() {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: GlobalLock returned nonnull storage; GlobalSize supplies the allocation extent and copying ends before unlock.
     let bytes = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), size) }.to_vec();
+    // SAFETY: This balances the successful payload lock after all bytes have been copied to owned storage.
     let _ = unsafe { GlobalUnlock(global) };
     Ok(bytes)
 }
@@ -1571,6 +1600,7 @@ pub fn begin_tab_drag(payload: TabDragPayload, image: &TabDragImage) -> io::Resu
     let drag_result = (|| {
         let bitmap = NativeDragBitmap::new(image)?;
         let helper: IDragSourceHelper =
+            // SAFETY: OleApartment is alive on this thread; the class and requested helper interface match the Shell drag helper.
             unsafe { CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER) }
                 .map_err(windows_error)?;
         let drag_image = SHDRAGIMAGE {
@@ -1587,11 +1617,13 @@ pub fn begin_tab_drag(payload: TabDragPayload, image: &TabDragImage) -> io::Resu
             hbmpDragImage: bitmap.handle,
             crColorKey: COLORREF(0x00ff00ff),
         };
+        // SAFETY: bitmap owns the DIB throughout initialization, and drag_image and data remain alive on the OLE thread.
         unsafe { helper.InitializeFromBitmap(&drag_image, &data) }.map_err(windows_error)?;
         let drop_source = IDropSource::from(NativeDropSource {
             feedback: DragCursorFeedback::Arrow,
         });
         let mut effect = DROPEFFECT_NONE;
+        // SAFETY: The apartment, data, drop source, and effect output remain alive through the synchronous drag loop.
         let result = unsafe { DoDragDrop(&data, &drop_source, DROPEFFECT_MOVE, &mut effect) };
         Ok::<_, io::Error>((result, effect))
     })();
@@ -1627,15 +1659,20 @@ impl NativeDragBitmap {
             ..Default::default()
         };
         let mut pixels = ptr::null_mut();
+        // SAFETY: info describes a top-down 32-bit DIB; pixels is a writable output and the returned bitmap is owned locally.
         let bitmap = unsafe { CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut pixels, None, 0) }
             .map_err(windows_error)?;
+        // SAFETY: No borrowed display DC is supplied; the compatible memory DC is owned until DeleteDC.
         let dc = unsafe { CreateCompatibleDC(None) };
         if dc.is_invalid() {
+            // SAFETY: DIB creation succeeded and the bitmap has not been selected into a DC on this error path.
             let _ = unsafe { DeleteObject(HGDIOBJ(bitmap.0)) };
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: Both DC and bitmap are live owned GDI objects; the previous selection is saved for restoration.
         let old = unsafe { SelectObject(dc, HGDIOBJ(bitmap.0)) };
         let key = COLORREF(0x00ff00ff);
+        // SAFETY: Creating a brush from a value-only COLORREF borrows no memory; the returned GDI object is locally owned.
         let key_brush = unsafe { CreateSolidBrush(key) };
         let background = if image.dark {
             if image.active {
@@ -1648,6 +1685,7 @@ impl NativeDragBitmap {
         } else {
             COLORREF(0x00ffffff)
         };
+        // SAFETY: The value-only color creates a locally owned brush retained until it is deselected and deleted.
         let background_brush = unsafe { CreateSolidBrush(background) };
         let full = WinRect {
             left: 0,
@@ -1655,8 +1693,11 @@ impl NativeDragBitmap {
             right: width,
             bottom: height,
         };
+        // SAFETY: The live DC, brush, and initialized local rectangle remain valid during the synchronous fill.
         unsafe { FillRect(dc, &full, key_brush) };
+        // SAFETY: The live background brush is selected into this owned DC; its previous brush is retained for restoration.
         let old_brush = unsafe { SelectObject(dc, HGDIOBJ(background_brush.0)) };
+        // SAFETY: The owned DC and its selected bitmap/brush remain live while GDI draws the rounded card.
         let _ = unsafe { RoundRect(dc, 0, 0, width, height, 14, 14) };
         if let Some((icon_width, icon_height, icon)) = image.icon.as_ref() {
             composite_icon(
@@ -1672,7 +1713,9 @@ impl NativeDragBitmap {
                 icon,
             );
         }
+        // SAFETY: The owned memory DC remains live throughout text rendering.
         let _ = unsafe { SetBkMode(dc, TRANSPARENT) };
+        // SAFETY: The owned DC and value-only COLORREF remain valid during the text-color update.
         let _ = unsafe {
             SetTextColor(
                 dc,
@@ -1690,6 +1733,7 @@ impl NativeDragBitmap {
             right: width - 10,
             bottom: height,
         };
+        // SAFETY: The mutable UTF-16 title slice and rectangle outlive DrawTextW, and the DC retains its bitmap selection.
         unsafe {
             DrawTextW(
                 dc,
@@ -1700,16 +1744,22 @@ impl NativeDragBitmap {
         };
 
         // The drag card itself is opaque; only the pixels outside rounded corners use the color key.
+        // SAFETY: CreateDIBSection returned storage for this width-by-height 32-bit bitmap, which is still owned and selected.
         let bytes = unsafe {
             std::slice::from_raw_parts_mut(pixels.cast::<u8>(), (width * height * 4) as usize)
         };
         for pixel in bytes.as_chunks_mut::<4>().0 {
             pixel[3] = 255;
         }
+        // SAFETY: old_brush is the selection saved from this DC before the temporary background brush was selected.
         unsafe { SelectObject(dc, old_brush) };
+        // SAFETY: The key brush is locally owned and was never selected into the DC.
         let _ = unsafe { DeleteObject(HGDIOBJ(key_brush.0)) };
+        // SAFETY: The background brush is locally owned and has just been deselected from the DC.
         let _ = unsafe { DeleteObject(HGDIOBJ(background_brush.0)) };
+        // SAFETY: old is the object saved from this same DC, and restoring it deselects the owned bitmap.
         unsafe { SelectObject(dc, old) };
+        // SAFETY: This memory DC was created locally and all temporary selections have been restored.
         let _ = unsafe { DeleteDC(dc) };
         Ok(Self { handle: bitmap })
     }
@@ -1717,6 +1767,7 @@ impl NativeDragBitmap {
 
 impl Drop for NativeDragBitmap {
     fn drop(&mut self) {
+        // SAFETY: The guard owns this DIB and initialization already deselected it from its temporary DC.
         let _ = unsafe { DeleteObject(HGDIOBJ(self.handle.0)) };
     }
 }
@@ -1737,6 +1788,7 @@ fn composite_icon(
     if target.is_null() || source_width == 0 || source_height == 0 {
         return;
     }
+    // SAFETY: The only caller passes the live 32-bit DIB allocation with its exact dimensions; the pointer was checked nonnull.
     let target = unsafe {
         std::slice::from_raw_parts_mut(target, (target_width * target_height * 4) as usize)
     };
@@ -1758,11 +1810,14 @@ fn composite_icon(
 }
 
 fn read_hdrop(drop: HDROP) -> io::Result<Vec<PathBuf>> {
+    // SAFETY: The caller retains the CF_HDROP medium for every query made by this function.
     let count = unsafe { DragQueryFileW(drop, u32::MAX, None) };
     let mut paths = Vec::with_capacity(count as usize);
     for index in 0..count {
+        // SAFETY: index is within the count returned for this still-owned CF_HDROP handle.
         let length = unsafe { DragQueryFileW(drop, index, None) };
         let mut buffer = vec![0_u16; length as usize + 1];
+        // SAFETY: The queried length plus one UTF-16 terminator fits buffer, which remains writable for the call.
         let copied = unsafe { DragQueryFileW(drop, index, Some(&mut buffer)) };
         if copied != length {
             return Err(io::Error::other("unable to read CF_HDROP path"));
@@ -1821,6 +1876,7 @@ pub fn begin_outbound_drag(
     });
     let allowed = DROPEFFECT(DROPEFFECT_COPY.0 | DROPEFFECT_MOVE.0 | DROPEFFECT_LINK.0);
     let mut native_effect = DROPEFFECT_NONE;
+    // SAFETY: The OLE apartment, Shell data object, drop source, and effect output survive the synchronous drag loop.
     let result = unsafe { DoDragDrop(&data_object, &drop_source, allowed, &mut native_effect) };
     if result.is_err() {
         return Err(windows_error(WindowsError::from(result)));
@@ -1860,6 +1916,7 @@ pub fn begin_virtual_outbound_drag(
         feedback: DragCursorFeedback::System,
     });
     let mut native_effect = DROPEFFECT_NONE;
+    // SAFETY: The OLE apartment and owned virtual-file data object outlive DoDragDrop; its output points to local storage.
     let result = unsafe { DoDragDrop(&data, &drop_source, DROPEFFECT_COPY, &mut native_effect) };
     if result.is_err() {
         return Err(windows_error(WindowsError::from(result)));
@@ -1944,6 +2001,7 @@ struct VirtualOutboundObject {
 #[allow(non_snake_case)]
 impl IDataObject_Impl for VirtualOutboundObject_Impl {
     fn GetData(&self, format: *const FORMATETC) -> windows::core::Result<STGMEDIUM> {
+        // SAFETY: The COM caller provides readable FORMATETC storage for the callback; null is rejected before borrowing.
         let format = unsafe { format.as_ref() }.ok_or_else(|| WindowsError::from(E_NOTIMPL))?;
         if supports_format(format, self.descriptor_format) {
             return allocate_medium(&self.descriptor);
@@ -1977,6 +2035,7 @@ impl IDataObject_Impl for VirtualOutboundObject_Impl {
     }
 
     fn QueryGetData(&self, format: *const FORMATETC) -> HRESULT {
+        // SAFETY: The COM caller keeps the input FORMATETC alive throughout this call, with null handled explicitly.
         let Some(format) = (unsafe { format.as_ref() }) else {
             return DV_E_FORMATETC;
         };
@@ -1994,6 +2053,7 @@ impl IDataObject_Impl for VirtualOutboundObject_Impl {
     }
 
     fn GetCanonicalFormatEtc(&self, _input: *const FORMATETC, output: *mut FORMATETC) -> HRESULT {
+        // SAFETY: The COM caller supplies writable FORMATETC output when nonnull; the borrow stays within this callback.
         if let Some(output) = unsafe { output.as_mut() } {
             output.ptd = ptr::null_mut();
         }
@@ -2007,9 +2067,11 @@ impl IDataObject_Impl for VirtualOutboundObject_Impl {
         release: windows::core::BOOL,
     ) -> windows::core::Result<()> {
         if release.as_bool()
+            // SAFETY: The COM SetData caller supplies a readable medium for the call; ownership transfers only when release is true.
             && let Some(medium) = unsafe { medium.as_ref() }
         {
             let mut owned = medium.clone();
+            // SAFETY: release transfers the caller-owned medium; the local shallow copy is released once and not otherwise dropped.
             unsafe { ReleaseStgMedium(&mut owned) };
         }
         Ok(())
@@ -2030,6 +2092,7 @@ impl IDataObject_Impl for VirtualOutboundObject_Impl {
             },
             format_etc(self.preferred_format),
         ];
+        // SAFETY: The initialized formats contain no borrowed target-device pointers; the enumerator copies their live array.
         unsafe { SHCreateStdEnumFmtEtc(&formats) }
     }
 
@@ -2125,10 +2188,12 @@ impl ISequentialStream_Impl for PullStream_Impl {
         let Some(reader) = reader.as_mut() else {
             return E_FAIL;
         };
+        // SAFETY: The IStream caller guarantees cb writable bytes at nonnull pv, with no overlapping references during Read.
         let buffer = unsafe { std::slice::from_raw_parts_mut(pv.cast::<u8>(), cb as usize) };
         match reader.read(buffer) {
             Ok(count) => {
                 if !pcbread.is_null() {
+                    // SAFETY: The COM caller supplies writable u32 storage when pcbread is nonnull; the result fits the requested u32 count.
                     unsafe { *pcbread = count as u32 };
                 }
                 HRESULT(0)
@@ -2207,9 +2272,12 @@ fn shell_data_object(paths: &[PathBuf], supplemental: &IDataObject) -> io::Resul
                 .chain(std::iter::once(0))
                 .collect::<Vec<_>>();
             let mut pidl = ptr::null_mut();
+            // SAFETY: validate_drag_path rejected embedded NULs; the terminated path and pidl output stay alive through parsing.
             unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut pidl, 0, None) }
                 .map_err(windows_error)?;
+            // SAFETY: SHParseDisplayName returned an owned absolute PIDL; cloning reads it without transferring ownership.
             let parent = unsafe { ILClone(pidl) };
+            // SAFETY: parent is checked nonnull before trimming the owned PIDL clone.
             if parent.is_null() || !unsafe { ILRemoveLastID(Some(parent)) }.as_bool() {
                 return Err(io::Error::other("unable to resolve outbound Shell parent"));
             }
@@ -2219,13 +2287,16 @@ fn shell_data_object(paths: &[PathBuf], supplemental: &IDataObject) -> io::Resul
         let common_parent = parent_pidls.first().copied().filter(|first| {
             parent_pidls
                 .iter()
+                // SAFETY: Every compared parent PIDL is an owned clone kept in parent_pidls until data-object creation finishes.
                 .all(|candidate| unsafe { ILIsEqual(*first, *candidate) }.as_bool())
         });
         if let Some(parent) = common_parent {
             let children = pidls
                 .iter()
+                // SAFETY: Each absolute PIDL remains owned in pidls, so its borrowed final item stays valid through SHCreateDataObject.
                 .map(|pidl| unsafe { ILFindLastID(*pidl) }.cast_const())
                 .collect::<Vec<_>>();
+            // SAFETY: The parent and child PIDLs remain owned until this call copies them; supplemental is a live COM interface.
             unsafe {
                 SHCreateDataObject::<_, IDataObject>(
                     Some(parent.cast_const()),
@@ -2239,8 +2310,11 @@ fn shell_data_object(paths: &[PathBuf], supplemental: &IDataObject) -> io::Resul
                 .iter()
                 .map(|pidl| pidl.cast_const())
                 .collect::<Vec<_>>();
+            // SAFETY: This thread has a live OleApartment while requesting the Shell desktop interface.
             let desktop = unsafe { SHGetDesktopFolder() }.map_err(windows_error)?;
+            // SAFETY: desktop is a retained COM interface; the returned PIDL is owned and freed after object creation.
             let desktop_pidl = unsafe { SHGetIDListFromObject(&desktop) }.map_err(windows_error)?;
+            // SAFETY: desktop_pidl and all absolute child PIDLs remain allocated during the call; supplemental is also retained.
             let created = unsafe {
                 SHCreateDataObject::<_, IDataObject>(
                     Some(desktop_pidl.cast_const()),
@@ -2249,11 +2323,13 @@ fn shell_data_object(paths: &[PathBuf], supplemental: &IDataObject) -> io::Resul
                 )
             }
             .map_err(windows_error);
+            // SAFETY: Object creation has finished borrowing this uniquely owned PIDL returned by SHGetIDListFromObject.
             unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(desktop_pidl.cast())) };
             created
         }
     })();
     for pidl in pidls.into_iter().chain(parent_pidls) {
+        // SAFETY: Each entry is a distinct Shell-allocated PIDL owned by these vectors, and no borrowed child pointers remain.
         unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(pidl.cast())) };
     }
     result
@@ -2262,6 +2338,7 @@ struct OleApartment;
 
 impl OleApartment {
     fn initialize() -> io::Result<Self> {
+        // SAFETY: Only successful initialization constructs the guard, which balances the call on this same thread.
         unsafe { OleInitialize(None) }
             .map(|()| Self)
             .map_err(windows_error)
@@ -2270,6 +2347,7 @@ impl OleApartment {
 
 impl Drop for OleApartment {
     fn drop(&mut self) {
+        // SAFETY: The guard represents one successful OleInitialize on this thread and is not moved across threads.
         unsafe { OleUninitialize() };
     }
 }
@@ -2303,8 +2381,10 @@ impl IDropSource_Impl for NativeDropSource_Impl {
 fn drag_feedback_result(feedback: DragCursorFeedback) -> HRESULT {
     match feedback {
         DragCursorFeedback::System => DRAGDROP_S_USEDEFAULTCURSORS,
+        // SAFETY: IDC_ARROW is a predefined cursor identifier and no module-specific resource pointer is supplied.
         DragCursorFeedback::Arrow => match unsafe { LoadCursorW(None, IDC_ARROW) } {
             Ok(cursor) => {
+                // SAFETY: LoadCursorW returned a shared system cursor, which remains valid without application-owned destruction.
                 unsafe { SetCursor(Some(cursor)) };
                 HRESULT(0)
             }
@@ -2335,6 +2415,7 @@ struct OutboundDataObject {
 #[allow(non_snake_case)]
 impl IDataObject_Impl for OutboundDataObject_Impl {
     fn GetData(&self, format: *const FORMATETC) -> windows::core::Result<STGMEDIUM> {
+        // SAFETY: The COM caller supplies readable FORMATETC storage for this callback; null is rejected before borrowing.
         let format = unsafe { format.as_ref() }.ok_or_else(|| WindowsError::from(E_NOTIMPL))?;
         self.formats
             .iter()
@@ -2360,6 +2441,7 @@ impl IDataObject_Impl for OutboundDataObject_Impl {
     }
 
     fn QueryGetData(&self, format: *const FORMATETC) -> HRESULT {
+        // SAFETY: The callback only borrows the COM caller input for this call and explicitly handles null.
         let Some(format) = (unsafe { format.as_ref() }) else {
             return DV_E_FORMATETC;
         };
@@ -2380,6 +2462,7 @@ impl IDataObject_Impl for OutboundDataObject_Impl {
     }
 
     fn GetCanonicalFormatEtc(&self, _input: *const FORMATETC, output: *mut FORMATETC) -> HRESULT {
+        // SAFETY: The COM caller provides writable output when nonnull, and this borrow never escapes the callback.
         if let Some(output) = unsafe { output.as_mut() } {
             output.ptd = ptr::null_mut();
         }
@@ -2392,7 +2475,9 @@ impl IDataObject_Impl for OutboundDataObject_Impl {
         medium: *const STGMEDIUM,
         release: windows::core::BOOL,
     ) -> windows::core::Result<()> {
+        // SAFETY: The COM caller keeps FORMATETC readable for SetData; null is rejected before borrowing.
         let format = unsafe { format.as_ref() }.ok_or_else(|| WindowsError::from(E_NOTIMPL))?;
+        // SAFETY: The COM caller retains readable STGMEDIUM storage for this call; null is rejected before use.
         let medium = unsafe { medium.as_ref() }.ok_or_else(|| WindowsError::from(E_NOTIMPL))?;
         if !supports_format(format, self.performed_format) {
             if !self.accept_extra_set_data {
@@ -2404,6 +2489,7 @@ impl IDataObject_Impl for OutboundDataObject_Impl {
                     .iter_mut()
                     .find(|(stored, _)| format_matches(format, stored))
                 {
+                    // SAFETY: The mutex grants exclusive access to this independently copied medium before its stored replacement.
                     unsafe { ReleaseStgMedium(&mut existing.1) };
                     existing.1 = stored;
                 } else {
@@ -2418,6 +2504,7 @@ impl IDataObject_Impl for OutboundDataObject_Impl {
         }
         if release.as_bool() {
             let mut owned = medium.clone();
+            // SAFETY: The release flag transfers this original medium to SetData; only the local shallow copy is released once.
             unsafe { ReleaseStgMedium(&mut owned) };
         }
         Ok(())
@@ -2444,6 +2531,7 @@ impl IDataObject_Impl for OutboundDataObject_Impl {
                     }),
             )
             .collect::<Vec<_>>();
+        // SAFETY: All format records remain alive for this call; SHCreateStdEnumFmtEtc copies their descriptors.
         unsafe { SHCreateStdEnumFmtEtc(&formats) }
     }
 
@@ -2469,6 +2557,7 @@ impl Drop for OutboundDataObject {
     fn drop(&mut self) {
         if let Ok(formats) = self.dynamic_formats.get_mut() {
             for (_, medium) in formats {
+                // SAFETY: Each stored medium came from CopyStgMedium and is uniquely owned; destruction has exclusive access.
                 unsafe { ReleaseStgMedium(medium) };
             }
         }
@@ -2476,6 +2565,7 @@ impl Drop for OutboundDataObject {
 }
 
 fn copy_medium(medium: &STGMEDIUM) -> windows::core::Result<STGMEDIUM> {
+    // SAFETY: The caller retains the source medium while CopyStgMedium creates independently releasable ownership.
     unsafe { CopyStgMedium(medium) }
 }
 
@@ -2502,6 +2592,7 @@ fn encode_dropfiles(paths: &[PathBuf]) -> io::Result<Vec<u8>> {
         fNC: false.into(),
         fWide: true.into(),
     };
+    // SAFETY: bytes is sized for the complete DROPFILES header and UTF-16 list; neither live source overlaps it.
     unsafe {
         ptr::copy_nonoverlapping(
             (&header as *const DROPFILES).cast::<u8>(),
@@ -2530,6 +2621,7 @@ fn validate_drag_path(path: &Path) -> io::Result<()> {
 
 fn clipboard_format(name: &str) -> io::Result<u16> {
     let name = format!("{name}\0").encode_utf16().collect::<Vec<_>>();
+    // SAFETY: The local format name is NUL-terminated and remains allocated until registration returns.
     let format = unsafe { RegisterClipboardFormatW(PCWSTR(name.as_ptr())) };
     if format == 0 {
         Err(io::Error::last_os_error())
@@ -2556,13 +2648,18 @@ fn supports_format(format: &FORMATETC, expected: u16) -> bool {
 }
 
 fn allocate_medium(bytes: &[u8]) -> windows::core::Result<STGMEDIUM> {
+    // SAFETY: The allocation size equals the source byte length and the new movable HGLOBAL is locally owned.
     let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes.len()) }?;
+    // SAFETY: memory is the live allocation just returned by GlobalAlloc and has not been transferred.
     let pointer = unsafe { GlobalLock(memory) }.cast::<u8>();
     if pointer.is_null() {
+        // SAFETY: Lock failure leaves allocation ownership local; no returned medium will attempt to free it.
         unsafe { GlobalFree(memory.0 as _) };
         return Err(WindowsError::from_thread());
     }
+    // SAFETY: The successful lock exposes bytes.len() writable bytes in a separate allocation from the source.
     unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), pointer, bytes.len()) };
+    // SAFETY: This balances the successful lock before the STGMEDIUM takes ownership of memory.
     let _ = unsafe { GlobalUnlock(memory) };
     Ok(STGMEDIUM {
         tymed: TYMED_HGLOBAL.0 as u32,
@@ -2575,15 +2672,20 @@ fn read_effect_medium(medium: &STGMEDIUM) -> windows::core::Result<DropEffect> {
     if medium.tymed != TYMED_HGLOBAL.0 as u32 {
         return Err(DV_E_FORMATETC.into());
     }
+    // SAFETY: The preceding TYMED_HGLOBAL check selects hGlobal; its caller retains the medium during reading.
     let handle = unsafe { medium.u.hGlobal };
+    // SAFETY: The noninvalid caller-owned HGLOBAL remains alive while checking that one effect value fits.
     if handle.is_invalid() || unsafe { GlobalSize(handle) } < size_of::<u32>() {
         return Err(DV_E_FORMATETC.into());
     }
+    // SAFETY: The allocation has room for u32 and remains owned while the temporary lock is held.
     let pointer = unsafe { GlobalLock(handle) }.cast::<u32>();
     if pointer.is_null() {
         return Err(WindowsError::from_thread());
     }
+    // SAFETY: The successful lock exposes at least four bytes; read_unaligned accepts its actual alignment.
     let effect = DropEffect::from_native(DROPEFFECT(unsafe { pointer.read_unaligned() }));
+    // SAFETY: This balances the successful lock after the effect value has been copied.
     let _ = unsafe { GlobalUnlock(handle) };
     Ok(effect)
 }
@@ -2598,7 +2700,9 @@ pub fn client_screen_rect(hwnd: isize) -> io::Result<(i32, i32, i32, i32)> {
     let mut rect = RECT::default();
     let mut origin = RawPoint::default();
     let hwnd = hwnd as RawHwnd;
+    // SAFETY: The caller supplies the current native window handle; rect is writable local storage.
     if unsafe { GetClientRect(hwnd, &mut rect) } == 0
+        // SAFETY: The same window handle is queried synchronously and origin is writable initialized local storage.
         || unsafe { ClientToScreen(hwnd, &mut origin) } == 0
     {
         return Err(io::Error::last_os_error());
@@ -2791,6 +2895,7 @@ impl DragDropRegistration {
         }
         let state = Arc::new(Mutex::new(DragDropState::default()));
         let helper =
+            // SAFETY: register_current initialized OLE on this thread before requesting the matching Shell drop-helper interface.
             unsafe { CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER) }.ok();
         let target = IDropTarget::from(NativeDropTarget {
             hwnd,
@@ -2802,6 +2907,7 @@ impl DragDropRegistration {
             intents,
         });
         let hwnd = HWND(hwnd as *mut c_void);
+        // SAFETY: The native window is owned by this OLE thread; target is retained in the registration until explicit revocation.
         if let Err(error) = unsafe { RegisterDragDrop(hwnd, &target) } {
             return Err(windows_error(error));
         }
@@ -2824,6 +2930,7 @@ impl ExplicitRevoke for DragDropRegistration {
         if self.target.is_none() {
             return false;
         }
+        // SAFETY: Registrations are revoked on their owning OLE thread before dropping the retained IDropTarget interface.
         let revoked = match unsafe { RevokeDragDrop(self.hwnd) } {
             Ok(()) => true,
             Err(error) => {
@@ -2896,6 +3003,7 @@ mod tests {
         let (target, intents) = memory_drop_target();
         let point = POINTL { x: 10, y: 10 };
         let mut effect = all_native_effects();
+        // SAFETY: The test keeps the in-memory COM target/data and writable effect alive on its initialized OLE thread.
         unsafe {
             target
                 .Drop(&data, MODIFIERKEYS_FLAGS(0), point, &mut effect)
@@ -2904,6 +3012,7 @@ mod tests {
         assert_eq!(effect, DROPEFFECT_NONE);
         assert!(intents.try_recv().is_err());
         effect = all_native_effects();
+        // SAFETY: The test target and data remain retained and effect is writable across this simulated Over/Drop sequence.
         unsafe {
             target.DragOver(MK_LBUTTON, point, &mut effect).unwrap();
             target
@@ -2913,6 +3022,7 @@ mod tests {
         assert_eq!(effect, DROPEFFECT_NONE);
         assert!(intents.try_recv().is_err());
         effect = all_native_effects();
+        // SAFETY: The test owns target/data throughout the callback sequence and passes local effect output on its OLE thread.
         unsafe {
             target
                 .DragEnter(&data, MK_LBUTTON, point, &mut effect)
@@ -2925,6 +3035,7 @@ mod tests {
         assert_eq!(effect, DROPEFFECT_NONE);
         assert!(intents.try_recv().is_err());
         effect = all_native_effects();
+        // SAFETY: The initialized OLE test retains both COM interfaces and its effect output until Enter and Drop return.
         unsafe {
             target
                 .DragEnter(&data, MK_LBUTTON, point, &mut effect)
@@ -2935,6 +3046,7 @@ mod tests {
         }
         assert_eq!(intents.try_recv().unwrap().effect, DropEffect::Move);
         effect = all_native_effects();
+        // SAFETY: The retained test target/data and local effect remain valid even when the application rejects this duplicate Drop.
         unsafe {
             target
                 .Drop(&data, MODIFIERKEYS_FLAGS(0), point, &mut effect)
@@ -2952,6 +3064,7 @@ mod tests {
         let (target, intents) = memory_drop_target();
         let point = POINTL { x: 10, y: 10 };
         let mut effect = all_native_effects();
+        // SAFETY: Both original and replacement IDataObjects remain owned while the test calls the live target with local effect output.
         unsafe {
             target
                 .DragEnter(&original, MK_LBUTTON, point, &mut effect)
@@ -2963,6 +3076,7 @@ mod tests {
         assert_eq!(effect, DROPEFFECT_NONE);
         assert!(intents.try_recv().is_err());
         effect = all_native_effects();
+        // SAFETY: The original COM data and target are still retained, and the duplicate call receives writable local output.
         unsafe {
             target
                 .Drop(&original, MODIFIERKEYS_FLAGS(0), point, &mut effect)
@@ -2986,6 +3100,7 @@ mod tests {
         ] {
             let (target, intents) = memory_drop_target();
             let mut effect = all_native_effects();
+            // SAFETY: Each test iteration retains the in-memory interfaces and local effect through the synchronous OLE callbacks.
             unsafe {
                 target
                     .DragEnter(
@@ -3019,6 +3134,7 @@ mod tests {
         let (target, intents) = memory_drop_target();
         let point = POINTL { x: 10, y: 10 };
         let mut effect = DROPEFFECT_COPY;
+        // SAFETY: The test owns the target/data and passes initialized point/effect storage on its OLE thread.
         unsafe {
             target
                 .DragEnter(
@@ -3030,12 +3146,14 @@ mod tests {
                 .unwrap();
         }
         effect = all_native_effects();
+        // SAFETY: The test target/data remain retained after Enter, and effect is a writable local output.
         unsafe {
             target.Drop(&data, MK_SHIFT, point, &mut effect).unwrap();
         }
         assert_eq!(effect, DROPEFFECT_NONE);
         assert!(intents.try_recv().is_err());
         effect = all_native_effects();
+        // SAFETY: The test retains the COM interfaces and effect storage while exercising the already-consumed gesture.
         unsafe {
             target.Drop(&data, MK_CONTROL, point, &mut effect).unwrap();
         }
@@ -3051,6 +3169,7 @@ mod tests {
             PathBuf::from(r"\\server\share\folder"),
         ];
         let bytes = encode_dropfiles(&paths).unwrap();
+        // SAFETY: encode_dropfiles initialized the complete header; read_unaligned does not require Vec<u8> alignment.
         let header = unsafe { bytes.as_ptr().cast::<DROPFILES>().read_unaligned() };
 
         assert_eq!(header.pFiles as usize, size_of::<DROPFILES>());
@@ -3086,14 +3205,17 @@ mod tests {
         let data = shell_data_object(std::slice::from_ref(&temporary), &supplemental).unwrap();
         let shell_id_list = clipboard_format("Shell IDList Array").unwrap();
         assert_eq!(
+            // SAFETY: The test retains the Shell data object and borrows an initialized CF_HDROP request during this OLE call.
             unsafe { data.QueryGetData(&format_etc(CF_HDROP)) },
             HRESULT(0)
         );
         assert_eq!(
+            // SAFETY: The live Shell data object receives an initialized Shell IDList format request on this test OLE thread.
             unsafe { data.QueryGetData(&format_etc(shell_id_list)) },
             HRESULT(0)
         );
         assert_eq!(
+            // SAFETY: The test retains the data object and passes a complete preferred-effect request for the synchronous query.
             unsafe { data.QueryGetData(&format_etc(preferred_format)) },
             HRESULT(0)
         );
@@ -3153,10 +3275,12 @@ mod tests {
         });
 
         assert_eq!(
+            // SAFETY: The retained test data object receives a complete private-tab format request on its initialized OLE thread.
             unsafe { data.QueryGetData(&format_etc(tab_format)) },
             HRESULT(0)
         );
         assert_ne!(
+            // SAFETY: The retained test data object receives a complete CF_HDROP request to verify the unsupported format result.
             unsafe { data.QueryGetData(&format_etc(CF_HDROP)) },
             HRESULT(0)
         );
@@ -3199,6 +3323,7 @@ mod tests {
         };
         let bitmap = NativeDragBitmap::new(&image).unwrap();
         let helper: IDragSourceHelper =
+            // SAFETY: The test initializes OLE on this thread before requesting the matching Shell drag-helper interface.
             unsafe { CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER) }.unwrap();
         let drag_image = SHDRAGIMAGE {
             sizeDragImage: SIZE { cx: 178, cy: 34 },
@@ -3207,6 +3332,7 @@ mod tests {
             crColorKey: COLORREF(0x00ff00ff),
         };
 
+        // SAFETY: The owned test bitmap, drag-image descriptor, and retained data object all survive helper initialization.
         unsafe { helper.InitializeFromBitmap(&drag_image, &data) }.unwrap();
     }
 
@@ -3645,6 +3771,7 @@ mod tests {
         let (target, intents) = directory_drop_target(directory);
         let mut effect = all_native_effects();
         let point = POINTL { x: 10, y: 10 };
+        // SAFETY: The test caller retains data and the in-memory target while local point/effect storage is used by both callbacks.
         unsafe {
             target
                 .DragEnter(data, MK_LBUTTON, point, &mut effect)
@@ -3720,6 +3847,7 @@ struct VirtualDropSource {
 #[allow(non_snake_case)]
 impl IDataObject_Impl for VirtualDropSource_Impl {
     fn GetData(&self, format: *const FORMATETC) -> windows::core::Result<STGMEDIUM> {
+        // SAFETY: The COM test caller keeps FORMATETC readable for this call; null is rejected before borrowing.
         let format = unsafe { format.as_ref() }.ok_or_else(|| WindowsError::from(E_NOTIMPL))?;
         let Some(formats) = virtual_formats() else {
             return Err(DV_E_FORMATETC.into());
@@ -3753,6 +3881,7 @@ impl IDataObject_Impl for VirtualDropSource_Impl {
     }
 
     fn QueryGetData(&self, format: *const FORMATETC) -> HRESULT {
+        // SAFETY: The COM test caller input remains valid during the callback; null is explicitly rejected.
         let Some(format) = (unsafe { format.as_ref() }) else {
             return DV_E_FORMATETC;
         };
@@ -3771,6 +3900,7 @@ impl IDataObject_Impl for VirtualDropSource_Impl {
     }
 
     fn GetCanonicalFormatEtc(&self, _input: *const FORMATETC, output: *mut FORMATETC) -> HRESULT {
+        // SAFETY: The COM test caller supplies writable output when nonnull, with no reference retained after the call.
         if let Some(output) = unsafe { output.as_mut() } {
             output.ptd = ptr::null_mut();
         }
@@ -3836,12 +3966,14 @@ impl ISequentialStream_Impl for MemoryStream_Impl {
         let mut cursor = self.cursor.lock().unwrap();
         if *cursor >= self.bytes.len() {
             if !pcbread.is_null() {
+                // SAFETY: The IStream caller provides writable byte-count storage when this optional output is nonnull.
                 unsafe { *pcbread = 0 };
             }
             return HRESULT(0);
         }
         let end = (*cursor + cb as usize).min(self.bytes.len());
         let count = end - *cursor;
+        // SAFETY: The COM caller grants cb writable destination bytes; count stays within both that buffer and the owned source slice.
         unsafe {
             ptr::copy_nonoverlapping(self.bytes[*cursor..].as_ptr(), pv.cast(), count);
             if !pcbread.is_null() {

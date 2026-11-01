@@ -105,6 +105,7 @@ struct ComGuard {
 }
 impl ComGuard {
     fn new() -> io::Result<Self> {
+        // SAFETY: Initialization is local to this thread; the guard balances success and does not uninitialize a pre-existing apartment on mode mismatch.
         let result = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
         if result.is_ok() {
             Ok(Self { initialized: true })
@@ -120,6 +121,7 @@ impl ComGuard {
 impl Drop for ComGuard {
     fn drop(&mut self) {
         if self.initialized {
+            // SAFETY: initialized is set only for this thread successful CoInitializeEx call, and the local guard has not moved threads.
             unsafe { CoUninitialize() };
         }
     }
@@ -328,6 +330,7 @@ pub fn network_drive_to_unc(path: &Path) -> io::Result<PathBuf> {
     let mut capacity = 256_u32;
     loop {
         let mut remote = vec![0_u16; capacity as usize];
+        // SAFETY: local is NUL-terminated; remote has capacity UTF-16 slots and capacity is a live writable count for this query.
         let result = unsafe {
             windows_sys::Win32::NetworkManagement::WNet::WNetGetConnectionW(
                 local.as_ptr(),
@@ -378,6 +381,7 @@ pub fn connect_network_share(
         lpRemoteName: remote.as_ptr() as _,
         ..Default::default()
     };
+    // SAFETY: Resource, share, username and optional password buffers remain NUL-terminated and live until WNetAddConnection3W returns.
     let code = unsafe {
         windows_sys::Win32::NetworkManagement::WNet::WNetAddConnection3W(
             ptr::null_mut(),
@@ -416,6 +420,7 @@ fn disconnect_network_share_inner(
 ) -> Result<NetworkResult, NetworkAuthError> {
     let root = normalize_share_root(path)?;
     let name = wide_null(root.as_os_str());
+    // SAFETY: name is a NUL-terminated share root kept alive for the call; all other arguments are documented scalar flags.
     let code = unsafe {
         windows_sys::Win32::NetworkManagement::WNet::WNetCancelConnection2W(
             name.as_ptr(),
@@ -480,11 +485,13 @@ fn write_network_credential(
         UserName: user.as_mut_ptr(),
         ..Default::default()
     };
+    // SAFETY: The credential header borrows target, user and secret with the exact blob size; all remain live until CredWriteW returns.
     let written = unsafe { CredWriteW(&credential, 0) };
     clear_bytes(&mut secret);
     if written != 0 {
         Ok(())
     } else {
+        // SAFETY: GetLastError reads this thread error state and neither borrows nor retains Rust memory.
         let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
         Err(network_auth_error(code))
     }
@@ -533,7 +540,9 @@ struct ShellItemInfo {
 fn enumerate_shell_folder(path: &Path) -> io::Result<Vec<ShellItemInfo>> {
     let wide = wide_null(path.as_os_str());
     let root: IShellItem =
+        // SAFETY: wide is NUL-terminated and live for parsing; this worker retains its COM apartment and owns the resulting interface.
         unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).map_err(windows_error)? };
+    // SAFETY: root is an owned same-thread Shell interface and the handler GUID matches IEnumShellItems.
     let items: IEnumShellItems = unsafe {
         root.BindToHandler(None, &BHID_EnumItems)
             .map_err(windows_error)?
@@ -542,6 +551,7 @@ fn enumerate_shell_folder(path: &Path) -> io::Result<Vec<ShellItemInfo>> {
     loop {
         let mut next = [None];
         let mut fetched = 0;
+        // SAFETY: next has one initialized output slot and fetched is writable; the enumerator is owned on this COM thread.
         if unsafe { items.Next(&mut next, Some(&mut fetched)) }.is_err() || fetched == 0 {
             break;
         }
@@ -555,6 +565,7 @@ fn enumerate_shell_folder(path: &Path) -> io::Result<Vec<ShellItemInfo>> {
     Ok(result)
 }
 fn display_name(item: &IShellItem, kind: windows::Win32::UI::Shell::SIGDN) -> Option<String> {
+    // SAFETY: item is a live Shell interface on this thread; its returned task-allocated name is copied and freed next.
     let value = unsafe { item.GetDisplayName(kind).ok()? };
     let text = take_shell_string(value);
     (!text.is_empty()).then(|| text.to_string_lossy().into_owned())
@@ -563,6 +574,7 @@ fn take_shell_string(value: PWSTR) -> OsString {
     if value.is_null() {
         return OsString::new();
     }
+    // SAFETY: Only successful Shell name/known-folder outputs reach here; their NUL-terminated allocation stays live until its single task-allocator free.
     unsafe {
         let mut len = 0;
         while *value.0.add(len) != 0 {
@@ -580,6 +592,7 @@ pub fn downloads_directory() -> io::Result<PathBuf> {
 
 fn known_folder_path(id: &GUID) -> io::Result<PathBuf> {
     let result =
+        // SAFETY: id is a borrowed live GUID; the successful known-folder call transfers its task-allocated UTF-16 result for copying and freeing.
         unsafe { SHGetKnownFolderPath(id, windows::Win32::UI::Shell::KNOWN_FOLDER_FLAG(0), None) };
     let value = result.map_err(windows_error)?;
     Ok(take_shell_string(value).into())
@@ -1273,6 +1286,7 @@ pub fn try_run_child_from_args() -> io::Result<bool> {
         let result =
             connect_network_share(&path, username.as_deref(), password.as_deref(), remember);
         if let Some(password) = &mut password {
+            // SAFETY: The string is exclusively borrowed; replacing every byte with zero preserves valid UTF-8 before the borrow ends.
             unsafe { password.as_bytes_mut() }.fill(0);
         }
         write_auth_result(&output, result)?;
@@ -1404,6 +1418,7 @@ fn protect_bytes(bytes: &[u8]) -> io::Result<Vec<u8>> {
         pbData: bytes.as_ptr() as *mut u8,
     };
     let mut output = CRYPT_INTEGER_BLOB::default();
+    // SAFETY: input references bytes for its checked u32 length; output is writable and all optional pointers are null for the synchronous DPAPI call.
     if unsafe {
         CryptProtectData(
             &input,
@@ -1419,7 +1434,9 @@ fn protect_bytes(bytes: &[u8]) -> io::Result<Vec<u8>> {
         return Err(io::Error::last_os_error());
     }
     let protected =
+        // SAFETY: Successful DPAPI protection returned an allocated output blob of cbData bytes, still owned until LocalFree below.
         unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    // SAFETY: DPAPI allocated output.pbData with the local allocator; the bytes have been copied and this is its sole free.
     unsafe { LocalFree(output.pbData as _) };
     Ok(protected)
 }
@@ -1443,6 +1460,7 @@ fn unprotect_bytes(bytes: &[u8]) -> io::Result<Vec<u8>> {
         pbData: bytes.as_ptr() as *mut u8,
     };
     let mut output = CRYPT_INTEGER_BLOB::default();
+    // SAFETY: input references the live encrypted byte slice for its checked u32 length; output is writable and optional pointers are null.
     if unsafe {
         CryptUnprotectData(
             &input,
@@ -1458,7 +1476,9 @@ fn unprotect_bytes(bytes: &[u8]) -> io::Result<Vec<u8>> {
         return Err(io::Error::last_os_error());
     }
     let unprotected =
+        // SAFETY: Successful DPAPI decryption returned its allocated output blob of cbData bytes, kept live until the wipe and free below.
         unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    // SAFETY: We exclusively own this local-allocator blob; the returned byte count bounds the wipe and the allocation is freed once.
     unsafe {
         std::ptr::write_bytes(output.pbData, 0, output.cbData as usize);
         LocalFree(output.pbData as _);

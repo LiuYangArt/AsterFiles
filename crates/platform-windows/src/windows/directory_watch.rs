@@ -111,6 +111,7 @@ impl DirectoryWatch {
             .lock()
             .expect("directory watch handle poisoned");
         if directory != 0 {
+            // SAFETY: The shared directory value comes from CreateFileW; null OVERLAPPED requests cancellation without borrowing request storage.
             unsafe {
                 CancelIoEx(directory as HANDLE, ptr::null());
             }
@@ -143,6 +144,7 @@ fn open_directory(path: &Path) -> io::Result<HANDLE> {
     }
     wide.push(0);
 
+    // SAFETY: wide is NUL-terminated with no embedded NUL; all optional pointers are null and the returned handle is owned.
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
@@ -166,6 +168,7 @@ fn watch_directory(
     events: mpsc::Sender<DirectoryWatchEvent>,
     shared: Arc<WatchShared>,
 ) {
+    // SAFETY: No borrowed name or security pointers are supplied; the worker owns the returned event until cleanup.
     let event = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
     if event.is_null() {
         send_error(&events, &root, io::Error::last_os_error());
@@ -181,6 +184,7 @@ fn watch_directory(
     let mut coalescer = ChangeCoalescer::default();
 
     while !shared.cancelled.load(Ordering::Acquire) {
+        // SAFETY: The worker owns this live event and resets it before issuing its next overlapped request.
         unsafe {
             ResetEvent(event);
         }
@@ -188,6 +192,8 @@ fn watch_directory(
             hEvent: event,
             ..Default::default()
         };
+        // SAFETY: directory was opened for overlapped reads; buffer and overlapped must outlive
+        // request completion. Exceptional-wait cleanup does not yet establish this lifetime; see #180.
         let started = unsafe {
             ReadDirectoryChangesW(
                 directory,
@@ -208,12 +214,14 @@ fn watch_directory(
             break;
         }
 
+        // SAFETY: event belongs to this worker and is retained while waiting for the pending directory request.
         if unsafe { WaitForSingleObject(event, INFINITE) } != WAIT_OBJECT_0 {
             send_error(&events, &root, io::Error::last_os_error());
             break;
         }
 
         let mut bytes = 0u32;
+        // SAFETY: The event signaled the request represented by overlapped; bytes is writable and the request buffers remain alive.
         let completed = unsafe { GetOverlappedResult(directory, &overlapped, &mut bytes, 0) };
         if completed == 0 {
             let error = io::Error::last_os_error();
@@ -285,6 +293,7 @@ fn watch_directory(
             changes: trailing,
         });
     }
+    // SAFETY: This worker is the sole owner of the event created above and closes it once after the read loop.
     unsafe {
         CloseHandle(event);
     }
@@ -300,6 +309,7 @@ fn close_directory(shared: &WatchShared) {
         std::mem::replace(&mut *directory, 0)
     };
     if handle != 0 {
+        // SAFETY: Taking the shared handle replaces it with zero, so this cleanup path owns the close operation.
         unsafe {
             CloseHandle(handle as HANDLE);
         }

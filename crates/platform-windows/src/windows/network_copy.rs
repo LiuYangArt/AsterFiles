@@ -83,6 +83,7 @@ fn consume_line(output: &mut Output, line: &str) {
 
 fn oem_text(bytes: &[u8]) -> String {
     use windows_sys::Win32::Globalization::{CP_OEMCP, MultiByteToWideChar};
+    // SAFETY: bytes remains borrowed for the supplied byte count; null output with zero capacity requests only the UTF-16 size.
     let length = unsafe {
         MultiByteToWideChar(
             CP_OEMCP,
@@ -97,6 +98,7 @@ fn oem_text(bytes: &[u8]) -> String {
         return String::from_utf8_lossy(bytes).into_owned();
     }
     let mut units = vec![0_u16; length as usize];
+    // SAFETY: bytes stays borrowed and units contains length writable UTF-16 elements, matching the queried capacity.
     let written = unsafe {
         MultiByteToWideChar(
             CP_OEMCP,
@@ -165,6 +167,7 @@ fn process_exited(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<
         Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
         System::Threading::WaitForSingleObject,
     };
+    // SAFETY: The caller retains ownership of this process or test-event handle through the nonblocking wait.
     match unsafe { WaitForSingleObject(handle, 0) } {
         WAIT_OBJECT_0 => Ok(true),
         WAIT_TIMEOUT => Ok(false),
@@ -200,7 +203,9 @@ impl Running {
     fn transferred_io(&self) -> Option<(u64, u64)> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::Threading::{GetProcessIoCounters, IO_COUNTERS};
+        // SAFETY: IO_COUNTERS contains only integer fields, so the all-zero bit pattern is valid initialized storage.
         let mut counters: IO_COUNTERS = unsafe { std::mem::zeroed() };
+        // SAFETY: self.child owns the open process handle; counters is writable IO_COUNTERS storage that outlives the call.
         (unsafe { GetProcessIoCounters(self.child.as_raw_handle() as _, &mut counters) } != 0)
             .then_some((counters.ReadTransferCount, counters.WriteTransferCount))
     }
@@ -215,6 +220,7 @@ impl Running {
         let mut buffer = [0_u8; 4096];
         for _ in 0..64 {
             let mut available = 0;
+            // SAFETY: stdout owns the open pipe handle; available is writable and all null buffer outputs have zero capacity.
             if unsafe {
                 PeekNamedPipe(
                     stdout.as_raw_handle() as _,
@@ -618,6 +624,7 @@ pub fn copy_file(
             root.push(std::path::MAIN_SEPARATOR_STR);
             let wide: Vec<u16> = root.as_os_str().encode_wide().chain(Some(0)).collect();
             Ok(matches!(
+                // SAFETY: wide contains a live NUL-terminated drive root, and GetDriveTypeW retains no pointer to it.
                 unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(wide.as_ptr()) },
                 2 | 3
             ))
@@ -915,13 +922,16 @@ mod tests {
             System::Threading::{CreateEventW, OpenProcess, SYNCHRONIZATION_SYNCHRONIZE},
         };
         let handle = if let Ok(pid) = std::env::var("ASTERFILES_TERMINATING_PROCESS_PROBE") {
+            // SAFETY: The test requests only synchronization access using a scalar PID and no borrowed security pointers.
             unsafe { OpenProcess(SYNCHRONIZATION_SYNCHRONIZE, 0, pid.parse().unwrap()) }
         } else {
+            // SAFETY: The event is unnamed with default security; this test takes ownership of the returned handle.
             unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) }
         };
         assert!(!handle.is_null());
         let started = Instant::now();
         let exited = wait_for_exit(|| process_exited(handle), STOP_GRACE).unwrap();
+        // SAFETY: The non-null test handle remains owned until the wait finishes and is closed exactly once here.
         unsafe {
             CloseHandle(handle);
         }

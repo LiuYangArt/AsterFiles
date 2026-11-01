@@ -72,10 +72,13 @@ impl PrimaryInstance {
 
 pub fn claim_primary() -> io::Result<Option<PrimaryInstance>> {
     let name = wide(INSTANCE_NAME);
+    // SAFETY: name is NUL-terminated and lives for the call; null security uses defaults, and success
+    // yields one owned handle.
     let mutex = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
     if mutex.is_null() {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: This immediately reads CreateMutexW's thread-local status before any other Win32 operation.
     let already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
     let mutex = OwnedHandle(mutex);
     if already_exists {
@@ -173,7 +176,10 @@ fn record_ipc_error(stage: &str, error: &io::Error) {
 }
 
 fn accept_pipe(pipe: &OwnedHandle) -> io::Result<()> {
+    // SAFETY: This is an owned server pipe opened for synchronous I/O; a null OVERLAPPED matches that mode.
     if unsafe { ConnectNamedPipe(pipe.0, ptr::null_mut()) } != 0
+        // SAFETY: This reads the failed connection's thread-local status to recognize the already-connected
+        // race.
         || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED
     {
         Ok(())
@@ -226,6 +232,8 @@ fn create_pipe(pipe_name: &str, first_instance: bool) -> io::Result<OwnedHandle>
     } else {
         0
     };
+    // SAFETY: name is NUL-terminated; null security uses defaults, and the synchronous message-mode server
+    // handle is uniquely wrapped on success.
     let handle = unsafe {
         CreateNamedPipeW(
             name.as_ptr(),
@@ -247,6 +255,8 @@ fn create_pipe(pipe_name: &str, first_instance: bool) -> io::Result<OwnedHandle>
 
 fn open_pipe(pipe_name: &str) -> io::Result<OwnedHandle> {
     let name = wide(pipe_name);
+    // SAFETY: The NUL-terminated name remains live; the returned synchronous client handle is checked
+    // before ownership is wrapped.
     let handle = unsafe {
         CreateFileW(
             name.as_ptr(),
@@ -295,6 +305,8 @@ fn connect_with_start(
         }
         let interval = remaining.min(Duration::from_millis(50));
         if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) {
+            // SAFETY: The pipe name remains NUL-terminated and live throughout this finite wait; no buffer
+            // pointer is retained.
             let _ = unsafe { WaitNamedPipeW(name.as_ptr(), interval.as_millis() as u32) };
         } else {
             thread::sleep(interval);
@@ -304,6 +316,8 @@ fn connect_with_start(
 
 fn pipe_server_process_id(handle: HANDLE) -> io::Result<u32> {
     let mut process_id = 0;
+    // SAFETY: handle is borrowed from the live connected pipe, and process_id is writable storage for the
+    // server PID.
     if unsafe { GetNamedPipeServerProcessId(handle, &mut process_id) } == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -320,6 +334,8 @@ fn grant_foreground_permission(handle: HANDLE) -> io::Result<u32> {
     use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 
     let process_id = pipe_server_process_id(handle)?;
+    // SAFETY: process_id was obtained from the connected pipe and excludes the all-processes sentinel; no
+    // Rust pointer is passed.
     if unsafe { AllowSetForegroundWindow(process_id) } == 0 {
         return Err(io::Error::other(format!(
             "server_pid={process_id} permission denied: {}",
@@ -387,6 +403,8 @@ fn write_ack(handle: HANDLE, kind: u32) -> io::Result<()> {
 
 fn available_bytes(handle: HANDLE) -> io::Result<u32> {
     let mut available = 0;
+    // SAFETY: The live synchronous pipe writes only the initialized available output; all omitted data
+    // outputs are explicitly null.
     if unsafe {
         PeekNamedPipe(
             handle,
@@ -463,6 +481,8 @@ fn wait_for_client_close(handle: HANDLE, timeout: Duration) -> io::Result<()> {
 
 fn write_message(handle: HANDLE, bytes: &[u8]) -> io::Result<()> {
     let mut written = 0;
+    // SAFETY: bytes stays readable for its encoded message length; written is writable and a null
+    // OVERLAPPED matches the synchronous handle.
     if unsafe {
         WriteFile(
             handle,
@@ -489,6 +509,8 @@ fn read_message(handle: HANDLE) -> io::Result<Vec<u8>> {
     let mut buffer = [0_u8; 4096];
     loop {
         let mut read = 0;
+        // SAFETY: buffer is exclusively borrowed with exactly its writable byte length; read is initialized
+        // output for this synchronous pipe.
         let succeeded = unsafe {
             ReadFile(
                 handle,
@@ -499,6 +521,8 @@ fn read_message(handle: HANDLE) -> io::Result<Vec<u8>> {
             )
         };
         bytes.extend_from_slice(&buffer[..read as usize]);
+        // SAFETY: This immediately reads ReadFile's failure status before another Win32 call can overwrite
+        // it.
         if succeeded == 0 && unsafe { GetLastError() } != ERROR_MORE_DATA {
             return Err(io::Error::last_os_error());
         }
@@ -669,9 +693,13 @@ fn wide(value: &str) -> Vec<u16> {
 }
 
 struct OwnedHandle(HANDLE);
+// SAFETY: These mutex/pipe handles are kernel objects without thread affinity; ownership moves, and the
+// wrapper is not Clone or Sync.
 unsafe impl Send for OwnedHandle {}
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
+        // SAFETY: This wrapper is constructed only for valid owned handles and relinquishes its one
+        // reference exactly once.
         unsafe { CloseHandle(self.0) };
     }
 }
@@ -679,6 +707,8 @@ impl Drop for OwnedHandle {
 struct ConnectedPipe(OwnedHandle);
 impl Drop for ConnectedPipe {
     fn drop(&mut self) {
+        // SAFETY: The server connection is still owned by the nested handle; disconnect occurs before that
+        // handle is closed.
         unsafe { DisconnectNamedPipe(self.0.0) };
     }
 }

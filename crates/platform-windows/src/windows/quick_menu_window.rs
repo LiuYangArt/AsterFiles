@@ -75,12 +75,15 @@ fn set_acrylic_composition(
     opacity: u8,
 ) -> io::Result<()> {
     const USER32: &[u16] = &[117, 115, 101, 114, 51, 50, 46, 100, 108, 108, 0];
+    // SAFETY: USER32 is terminated UTF-16 and names an already-loaded system module that is borrowed,
+    // not unloaded.
     let module = unsafe { GetModuleHandleW(USER32.as_ptr()) };
     if module.is_null() {
         return Err(io::Error::last_os_error());
     }
     const FUNCTION_NAME: &[u8] = b"SetWindowCompositionAttribute\0";
 
+    // SAFETY: module was checked non-null and FUNCTION_NAME is the terminated ASCII export name.
     let Some(function) = (unsafe { GetProcAddress(module, FUNCTION_NAME.as_ptr()) }) else {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -88,6 +91,8 @@ fn set_acrylic_composition(
         ));
     };
     let set_window_composition_attribute: SetWindowCompositionAttribute =
+        // SAFETY: The named user32 export uses the system ABI and the HWND/composition-data signature
+        // declared above.
         unsafe { std::mem::transmute(function) };
     let mut policy = AccentPolicy {
         state: if enabled {
@@ -104,6 +109,8 @@ fn set_acrylic_composition(
         data: (&mut policy as *mut AccentPolicy).cast(),
         size: std::mem::size_of::<AccentPolicy>(),
     };
+    // SAFETY: data/policy have repr(C) layout and remain writable for the call; size matches
+    // AccentPolicy exactly.
     if unsafe { set_window_composition_attribute(hwnd, &mut data) } == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -123,20 +130,28 @@ unsafe extern "system" fn popup_window_proc(
         WM_MOUSEACTIVATE => return MA_NOACTIVATE as LRESULT,
         WM_STYLECHANGING if lparam != 0 => {
             // Winit rewrites styles on every visibility transition; keep popup invariants.
+            // SAFETY: For WM_STYLECHANGING Windows supplies a writable STYLESTRUCT in nonzero lparam
+            // for this callback.
             let style = unsafe { &mut *(lparam as *mut STYLESTRUCT) };
             style.styleNew = popup_style(wparam as i32, style.styleNew);
         }
         WM_WINDOWPOSCHANGING if lparam != 0 => {
             // Winit can use SW_SHOW again when a pooled popup changes visibility or style.
+            // SAFETY: For WM_WINDOWPOSCHANGING Windows supplies a writable WINDOWPOS valid until this
+            // callback returns.
             unsafe {
                 (*(lparam as *mut WINDOWPOS)).flags |= SWP_NOACTIVATE;
             }
         }
+        // SAFETY: Windows is destroying this subclassed HWND; id and callback match the installed
+        // subclass registration.
         WM_NCDESTROY => unsafe {
             RemoveWindowSubclass(hwnd, Some(popup_window_proc), id);
         },
         _ => {}
     }
+    // SAFETY: The unchanged callback payload is forwarded synchronously within the current window's
+    // subclass chain.
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 
@@ -152,6 +167,8 @@ fn popup_style(index: i32, style: u32) -> u32 {
 
 pub fn show_without_activation(hwnd: isize) {
     // Make the cloaked HWND visible before Slint calls SW_SHOW, which would activate a hidden HWND.
+    // SAFETY: hwnd is borrowed from the popup backend on its owner thread; both calls use only scalar
+    // flags and handles.
     unsafe {
         ShowWindow(hwnd as HWND, SW_SHOWNOACTIVATE);
         SetWindowPos(
@@ -169,6 +186,8 @@ pub fn show_without_activation(hwnd: isize) {
         &format!(
             "popup={} foreground={}",
             hwnd,
+            // SAFETY: GetForegroundWindow takes no pointers and its borrowed handle is used only as a
+            // diagnostic integer.
             unsafe { GetForegroundWindow() } as isize,
         ),
     );
@@ -195,12 +214,16 @@ pub fn attach_owner(popup: isize, owner: isize) -> io::Result<()> {
         ));
     }
     let popup = popup as HWND;
+    // SAFETY: Both IsWindow calls only query scalar HWND values and do not dereference user-provided
+    // pointers.
     if unsafe { IsWindow(popup) } == 0 || unsafe { IsWindow(owner as HWND) } == 0 {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "popup owner was destroyed",
         ));
     }
+    // SAFETY: The checked popup is owned by this UI thread; the static subclass callback and owner
+    // HWND outlive attachment.
     unsafe {
         if windows_sys::Win32::UI::Shell::SetWindowSubclass(
             popup,
@@ -246,6 +269,8 @@ pub fn attach_owner(popup: isize, owner: isize) -> io::Result<()> {
 }
 
 pub fn set_backdrop(hwnd: isize, enabled: bool, dark_theme: bool, opacity: u8) -> io::Result<()> {
+    // SAFETY: IsWindow only queries the scalar HWND and rejects a destroyed window before the
+    // attribute calls.
     if hwnd == 0 || unsafe { IsWindow(hwnd as HWND) } == 0 {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -267,6 +292,8 @@ pub fn set_backdrop(hwnd: isize, enabled: bool, dark_theme: bool, opacity: u8) -
             "DWMWA_USE_IMMERSIVE_DARK_MODE",
         ),
     ] {
+        // SAFETY: value is a live i32 and the supplied byte count exactly matches the requested DWM
+        // attribute representation.
         let result = unsafe {
             DwmSetWindowAttribute(
                 hwnd as HWND,
@@ -286,6 +313,8 @@ pub fn set_backdrop(hwnd: isize, enabled: bool, dark_theme: bool, opacity: u8) -
 }
 
 pub fn set_cloaked(hwnd: isize, cloaked: bool) -> io::Result<()> {
+    // SAFETY: IsWindow only queries the scalar HWND and rejects a destroyed window before the cloak
+    // update.
     if hwnd == 0 || unsafe { IsWindow(hwnd as HWND) } == 0 {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -293,6 +322,8 @@ pub fn set_cloaked(hwnd: isize, cloaked: bool) -> io::Result<()> {
         ));
     }
     let value = i32::from(cloaked);
+    // SAFETY: The live i32 cloak value has the exact attribute byte size and is borrowed only during
+    // this call.
     let result = unsafe {
         DwmSetWindowAttribute(
             hwnd as HWND,
@@ -311,6 +342,7 @@ pub fn set_cloaked(hwnd: isize, cloaked: bool) -> io::Result<()> {
 }
 
 pub fn flush_compositor() -> io::Result<()> {
+    // SAFETY: DwmFlush takes no pointers or owned handles; its failure is returned to the caller.
     let result = unsafe { DwmFlush() };
     if result < 0 {
         return Err(io::Error::other(format!(
@@ -332,6 +364,8 @@ pub fn client_point_to_screen(owner: isize, point: PhysicalPoint) -> io::Result<
         x: point.x,
         y: point.y,
     };
+    // SAFETY: point is writable POINT storage and owner is a borrowed backend HWND, rejected by
+    // Windows if stale.
     if unsafe { ClientToScreen(owner as HWND, &mut point) } == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -339,6 +373,8 @@ pub fn client_point_to_screen(owner: isize, point: PhysicalPoint) -> io::Result<
 }
 
 pub fn work_area_for_point(point: PhysicalPoint) -> io::Result<PhysicalRect> {
+    // SAFETY: MonitorFromPoint receives the POINT by value; its returned monitor is borrowed and
+    // never freed here.
     let monitor = unsafe {
         MonitorFromPoint(
             POINT {
@@ -357,6 +393,8 @@ pub fn work_area_for_point(point: PhysicalPoint) -> io::Result<PhysicalRect> {
         rcWork: RECT::default(),
         dwFlags: 0,
     };
+    // SAFETY: monitor was checked non-null; information has the required cbSize and writable
+    // MONITORINFO storage.
     if unsafe { GetMonitorInfoW(monitor, &mut information) } == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -370,6 +408,8 @@ pub fn work_area_for_point(point: PhysicalPoint) -> io::Result<PhysicalRect> {
 }
 
 pub fn foreground_belongs_to(owner: isize, popups: &[isize]) -> bool {
+    // SAFETY: GetForegroundWindow takes no pointers and returns a borrowed handle used only for
+    // comparison and queries.
     let foreground = unsafe { GetForegroundWindow() };
     if foreground.is_null() {
         return false;
@@ -383,6 +423,8 @@ pub fn foreground_belongs_to(owner: isize, popups: &[isize]) -> bool {
     }
     let mut current = foreground;
     while !current.is_null() {
+        // SAFETY: current is a borrowed window handle; GetWindow only queries its owner and may
+        // return null.
         current = unsafe { GetWindow(current, GW_OWNER) };
         if current == owner as HWND
             || popups
@@ -397,10 +439,18 @@ pub fn foreground_belongs_to(owner: isize, popups: &[isize]) -> bool {
 
 pub fn focus_window(hwnd: isize) {
     if hwnd != 0
+        // SAFETY: IsWindow queries only the scalar handle before any request to bring the window
+        // forward.
         && unsafe { IsWindow(hwnd as HWND) } != 0
+        // SAFETY: GetForegroundWindow takes no pointers and its borrowed handle is only compared
+        // here.
         && unsafe { GetForegroundWindow() } != hwnd as HWND
+        // SAFETY: Both window calls only query borrowed handles; no pointer-valued message or owned
+        // resource is passed.
         && unsafe { GetWindow(GetForegroundWindow(), GW_OWNER) } == hwnd as HWND
     {
+        // SAFETY: The checked backend HWND is borrowed and this scalar-handle request does not
+        // transfer ownership.
         unsafe { SetForegroundWindow(hwnd as HWND) };
     }
 }
@@ -436,6 +486,8 @@ mod tests {
 
     #[test]
     fn quick_menu_popup_mouse_activation_keeps_click_delivery() {
+        // SAFETY: WM_MOUSEACTIVATE returns before any HWND or lparam access, so this branch permits
+        // null test handles.
         let result = unsafe {
             popup_window_proc(
                 std::ptr::null_mut(),

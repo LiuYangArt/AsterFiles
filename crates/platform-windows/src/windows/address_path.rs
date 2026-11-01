@@ -215,11 +215,13 @@ fn expand_environment_strings(input: &OsStr) -> OsString {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
+    // SAFETY: source is NUL-terminated; a null output with capacity zero requests only the required UTF-16 length.
     let required = unsafe { ExpandEnvironmentStringsW(source.as_ptr(), std::ptr::null_mut(), 0) };
     if required == 0 {
         return input.to_os_string();
     }
     let mut output = vec![0u16; required as usize];
+    // SAFETY: source remains live and output has exactly the writable UTF-16 capacity passed to Windows.
     let written = unsafe {
         ExpandEnvironmentStringsW(source.as_ptr(), output.as_mut_ptr(), output.len() as u32)
     };

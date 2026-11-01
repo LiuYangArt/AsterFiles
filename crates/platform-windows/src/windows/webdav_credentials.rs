@@ -71,6 +71,7 @@ fn write_generic(connection_id: u64, username: &str, password: &str) -> io::Resu
         UserName: user.as_mut_ptr(),
         ..Default::default()
     };
+    // SAFETY: The header borrows live NUL-terminated target/user buffers and a secret blob with its checked exact byte length; none are retained by CredWriteW.
     let written = unsafe { CredWriteW(&credential, 0) };
     secret.fill(0);
     if written == 0 {
@@ -89,6 +90,7 @@ fn read_generic(connection_id: u64) -> io::Result<Option<String>> {
 
     let mut target = wide_null(&format!("{TARGET_PREFIX}{connection_id}"));
     let mut credential = std::ptr::null_mut();
+    // SAFETY: target is NUL-terminated and credential is a writable output pointer; a successful read transfers the Credential Manager allocation.
     let found = unsafe { CredReadW(target.as_mut_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) };
     if found == 0 {
         let code = io::Error::last_os_error();
@@ -98,6 +100,8 @@ fn read_generic(connection_id: u64) -> io::Result<Option<String>> {
             Err(code)
         };
     }
+    // SAFETY: CredReadW owns the live header/blob until CredFree. Constructing the slice additionally
+    // requires a non-null blob even when empty; the empty-blob path does not establish this (#179).
     let value = unsafe {
         let header = &*credential;
         let bytes =
@@ -117,6 +121,7 @@ fn delete_generic(connection_id: u64) -> io::Result<()> {
     };
 
     let mut target = wide_null(&format!("{TARGET_PREFIX}{connection_id}"));
+    // SAFETY: target is a live NUL-terminated name, and CredDeleteW neither retains its pointer nor transfers ownership.
     let deleted = unsafe { CredDeleteW(target.as_mut_ptr(), CRED_TYPE_GENERIC, 0) };
     if deleted != 0 {
         return Ok(());

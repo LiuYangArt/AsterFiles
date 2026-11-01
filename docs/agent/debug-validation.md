@@ -73,6 +73,7 @@
 | [#165](#issue-165) | 目录按需生成行的模型（#165） |
 | [#166](#issue-166) | Cargo 工作区与依赖边界（#166） |
 | [#167](#issue-167) | Windows 系统绑定版本（#167） |
+| [#168](#issue-168) | Windows 平台安全前提说明（#168） |
 | [#175](#issue-175) | Issue #175 十万条目目录加载、框选与滚动 |
 | [#176](#issue-176) | Temp 监听循环与本地刷新（#176） |
 | [#177](#issue-177) | Issue #177 地址栏退出编辑 |
@@ -991,6 +992,21 @@ python tools/verify.py
 当前 Windows 依赖树仍有 `0.52.0` 和 `0.59.0`：前者来自 Slint 使用的 glutin、winit，后者来自 `embed-resource` 使用的 winreg。锁文件还保留可选依赖 `io-lifetimes` 引入的 `0.48.0`，当前 Windows 依赖树没有启用它；本专项不强制升级间接依赖。
 
 重复依赖的原始输出保存到 `artifacts/state/issue-167/duplicates-before.txt` 和 `duplicates-after.txt`，各版本来源及检查汇总放在同目录。完整验证日志为 `artifacts/logs/verify-*.log`，汇总为 `artifacts/verify/summary.json`。验收结果回写 GitHub Issue，本文不保存完成状态。
+
+<a id="issue-168"></a>
+
+## Windows 平台安全前提说明（#168）
+
+Windows 平台包在根模块启用 `deny(clippy::undocumented_unsafe_blocks)`，覆盖 Windows 集成、文件操作及其测试。每个不安全代码块和跨线程实现都要以 `SAFETY` 说明句柄所有权、指针范围、缓冲区存活时间或线程前提。原有 COM、Job Object、搜索句柄等封装继续承担释放职责，不为添加注释改写平台逻辑。
+
+```powershell
+cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
+python tools/verify.py
+```
+
+验证同时检查：工作区 Clippy 通过；临时加入缺少安全说明的测试块时，Clippy 必须报 `undocumented_unsafe_blocks`，恢复后再执行完整验证。原始源码逐行对比保留在 `artifacts/state/issue-168/source-audit.json`，用于确认运行代码未改变。
+
+证据集中在 `artifacts/state/issue-168/`：`lint-probe.json` 保存反向检查，`verification.json` 保存汇总。完整验证及本地 Release 收尾日志保存在 `artifacts/logs/issue-168/`。注释陈述必要前提，不代替对运行时内存安全的证明；审查发现但超出本次范围的既有问题由 GitHub Issues #179、#180、#181、#182 和 #183 跟踪。
 
 ## 文件操作人工验证矩阵
 

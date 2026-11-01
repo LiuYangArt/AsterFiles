@@ -36,12 +36,18 @@ pub fn show(x: i32, y: i32, width: i32, height: i32, dark_theme: bool) -> io::Re
     let hwnd = INDICATOR.with(|indicator| {
         let existing = indicator.get();
         if !existing.is_null()
+            // SAFETY: This is a borrowed HWND from the owning thread's indicator slot; IsWindow accepts
+            // stale handles without dereferencing Rust memory.
             && unsafe { IsWindow(existing) } != 0
             && INDICATOR_DARK.with(Cell::get) == dark_theme
         {
             return existing;
         }
+        // SAFETY: The thread-local slot may hold a destroyed HWND, so the OS validates it before reuse or
+        // destruction.
         if !existing.is_null() && unsafe { IsWindow(existing) } != 0 {
+            // SAFETY: This live indicator was created and is destroyed on this same thread before its slot
+            // is cleared.
             unsafe { DestroyWindow(existing) };
         }
         indicator.set(ptr::null_mut());
@@ -56,9 +62,13 @@ pub fn show(x: i32, y: i32, width: i32, height: i32, dark_theme: bool) -> io::Re
             lpszClassName: class_name.as_ptr(),
             ..Default::default()
         };
+        // SAFETY: class points to a static NUL-terminated name, a static callback and a brush kept alive
+        // for the registered class.
         unsafe {
             let _ = RegisterClassW(&class);
         }
+        // SAFETY: The registered class name is static and NUL-terminated; all optional pointer parameters
+        // are null, and this thread owns the new HWND.
         let created = unsafe {
             CreateWindowExW(
                 WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -76,6 +86,8 @@ pub fn show(x: i32, y: i32, width: i32, height: i32, dark_theme: bool) -> io::Re
             )
         };
         if !created.is_null() {
+            // SAFETY: created is a successful layered-window HWND owned by this thread; alpha is a scalar
+            // and no pointer is retained.
             let _ = unsafe { SetLayeredWindowAttributes(created, 0, 255, LWA_ALPHA) };
             indicator.set(created);
             INDICATOR_DARK.set(dark_theme);
@@ -85,6 +97,8 @@ pub fn show(x: i32, y: i32, width: i32, height: i32, dark_theme: bool) -> io::Re
     if hwnd.is_null() {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: hwnd is this thread's live indicator; its positive dimensions and non-activating flags carry
+    // no borrowed memory.
     if unsafe {
         SetWindowPos(
             hwnd,
@@ -113,6 +127,8 @@ fn indicator_brush(dark_theme: bool) -> HBRUSH {
         if !existing.is_null() {
             existing
         } else {
+            // SAFETY: The scalar COLORREF creates an owned brush that remains in the thread-local cache for
+            // the registered class lifetime.
             let created = unsafe { CreateSolidBrush(color) };
             brush.set(created);
             created
@@ -120,6 +136,8 @@ fn indicator_brush(dark_theme: bool) -> HBRUSH {
     })
 }
 
+// SAFETY: Windows calls this static registered procedure with its native window/message parameters; no Rust
+// state pointer is stored.
 unsafe extern "system" fn indicator_window_proc(
     hwnd: HWND,
     message: u32,
@@ -129,6 +147,7 @@ unsafe extern "system" fn indicator_window_proc(
     if message == WM_NCHITTEST {
         return -1;
     }
+    // SAFETY: The callback forwards untouched native parameters on its window's owning thread.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
@@ -136,6 +155,8 @@ pub fn hide() {
     INDICATOR.with(|indicator| {
         let hwnd = indicator.get();
         if !hwnd.is_null() {
+            // SAFETY: The HWND belongs to this thread's indicator slot; ShowWindow uses only the handle and
+            // scalar show command.
             unsafe { ShowWindow(hwnd, SW_HIDE) };
         }
     });
@@ -145,6 +166,8 @@ pub fn destroy() {
     INDICATOR.with(|indicator| {
         let hwnd = indicator.replace(ptr::null_mut());
         if !hwnd.is_null() {
+            // SAFETY: replace cleared the sole thread-local owner; this thread destroys its own indicator
+            // window once.
             unsafe { DestroyWindow(hwnd) };
         }
     });

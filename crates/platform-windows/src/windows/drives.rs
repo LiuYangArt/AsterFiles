@@ -28,6 +28,7 @@ pub fn query_capacity(root: &Path) -> io::Result<DriveCapacity> {
         .collect::<Vec<_>>();
     let mut available = 0;
     let mut total = 0;
+    // SAFETY: root is NUL-terminated; available and total are distinct writable u64 outputs kept alive for the call.
     unsafe {
         GetDiskFreeSpaceExW(
             PCWSTR(root.as_ptr()),

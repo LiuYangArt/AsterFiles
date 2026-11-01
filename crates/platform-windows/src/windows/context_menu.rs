@@ -517,6 +517,8 @@ fn shell_menu_worker_loop(
 
 fn ensure_sta_message_queue() {
     let mut message = MSG::default();
+    // SAFETY: message is writable MSG storage; PM_NOREMOVE only establishes this worker thread's
+    // queue.
     unsafe {
         let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
     }
@@ -524,7 +526,10 @@ fn ensure_sta_message_queue() {
 
 fn pump_sta_messages() {
     let mut message = MSG::default();
+    // SAFETY: message remains writable for PeekMessageW, which reads only this STA thread's queue.
     while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+        // SAFETY: message was just retrieved from this thread's queue and stays alive through
+        // dispatch.
         unsafe {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
@@ -620,6 +625,8 @@ impl ClassicMenuSession {
         working_directory: Option<PathBuf>,
         create_context_menu: impl FnOnce() -> io::Result<IContextMenu>,
     ) -> io::Result<Self> {
+        // SAFETY: The menu is created and released on this worker thread; successful STA
+        // initialization is balanced.
         let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
         if initialized == RPC_E_CHANGED_MODE {
             return Err(io::Error::other(
@@ -630,18 +637,23 @@ impl ClassicMenuSession {
         let context_menu = match create_context_menu() {
             Ok(value) => value,
             Err(error) => {
+                // SAFETY: This thread successfully initialized COM above; no session interfaces
+                // escaped the failed creation.
                 unsafe { CoUninitialize() };
                 return Err(error);
             }
         };
         let context_menu3 = context_menu.cast::<IContextMenu3>().ok();
         let context_menu2 = context_menu.cast::<IContextMenu2>().ok();
+        // SAFETY: CreatePopupMenu takes no pointers; the returned HMENU is owned by the session.
         let menu = match unsafe { CreatePopupMenu() } {
             Ok(menu) => menu,
             Err(error) => {
                 drop(context_menu3);
                 drop(context_menu2);
                 drop(context_menu);
+                // SAFETY: All menu interfaces have been dropped before balancing this thread's COM
+                // initialization.
                 unsafe { CoUninitialize() };
                 return Err(windows_error(error));
             }
@@ -652,16 +664,21 @@ impl ClassicMenuSession {
             } else {
                 0
             };
+        // SAFETY: The STA-owned context interface and popup are live; the reserved command-ID range
+        // is bounded.
         let query = unsafe {
             context_menu.QueryContextMenu(menu, 0, FIRST_COMMAND_ID, LAST_COMMAND_ID, flags)
         };
         if query.is_err() {
+            // SAFETY: menu is the popup created above and has not been destroyed or transferred.
             unsafe {
                 let _ = DestroyMenu(menu);
             }
             drop(context_menu3);
             drop(context_menu2);
             drop(context_menu);
+            // SAFETY: The failed session's interfaces are released before balancing its successful
+            // COM initialization.
             unsafe { CoUninitialize() };
             return Err(io::Error::other(format!(
                 "QueryContextMenu failed: {query:?}"
@@ -837,6 +854,8 @@ impl ClassicMenuSession {
             },
         };
         let base = (&invocation as *const CMINVOKECOMMANDINFOEX).cast();
+        // SAFETY: invocation is a live repr(C) extended command structure with the documented base
+        // prefix; the verb is a validated command offset.
         unsafe { context_menu.InvokeCommand(&*base) }.map_err(windows_error)?;
         Ok(self.open_with.invocation(command_id, verb))
     }
@@ -867,17 +886,23 @@ impl ClassicMenuSession {
             message,
             windows::Win32::UI::WindowsAndMessaging::WM_INITMENU | WM_INITMENUPOPUP
         ) && let Some(menu2) = &self.context_menu2
+            // SAFETY: Only initialization messages with live menu handles reach this branch, on the
+            // interface's owning STA.
             && unsafe { menu2.HandleMenuMsg(message, wparam, lparam) }.is_ok()
         {
             return Some(LRESULT::default());
         }
         if let Some(menu3) = &self.context_menu3 {
             let mut result = LRESULT::default();
+            // SAFETY: Current callers pass initialization messages prepared by prepare_submenu;
+            // result is writable and the interface remains retained on its owning STA.
             if unsafe { menu3.HandleMenuMsg2(message, wparam, lparam, Some(&mut result)) }.is_ok() {
                 return Some(result);
             }
         }
         if let Some(menu2) = &self.context_menu2
+            // SAFETY: The session retains this STA interface and forwards only the menu message
+            // payloads prepared above.
             && unsafe { menu2.HandleMenuMsg(message, wparam, lparam) }.is_ok()
         {
             return Some(LRESULT::default());
@@ -898,6 +923,8 @@ fn menu_item_verb(parent: HMENU, position: u32, session: &ClassicMenuSession) ->
         fMask: MIIM_ID,
         ..Default::default()
     };
+    // SAFETY: parent belongs to the live session; info has the required cbSize and writable output
+    // storage.
     unsafe { GetMenuItemInfoW(parent, position, true, &mut info) }.ok()?;
     (FIRST_COMMAND_ID..=LAST_COMMAND_ID)
         .contains(&info.wID)
@@ -1003,6 +1030,8 @@ fn launch_powershell_background_command(
         nShow: SW_SHOWNORMAL,
         ..Default::default()
     };
+    // SAFETY: All UTF-16 strings and the sized execution structure outlive this synchronous Shell
+    // call.
     if unsafe { ShellExecuteExW(&mut info) } == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -1017,6 +1046,8 @@ fn registry_string(
     let key = wide_null_str(key);
     let value = wide_null_str(value);
     let mut bytes = 0_u32;
+    // SAFETY: key/value are terminated UTF-16; the null data pointer requests only the writable byte
+    // count.
     let status = unsafe {
         RegGetValueW(
             root,
@@ -1032,6 +1063,8 @@ fn registry_string(
         return None;
     }
     let mut buffer = vec![0_u16; bytes as usize / 2];
+    // SAFETY: buffer holds the queried byte count in u16 units; key/value and output pointers remain
+    // live.
     let status = unsafe {
         RegGetValueW(
             root,
@@ -1069,6 +1102,8 @@ fn registry_subkeys(
     };
     let key = wide_null_str(key);
     let mut handle = ptr::null_mut();
+    // SAFETY: root is borrowed, key is terminated UTF-16, and handle is writable storage for the
+    // opened key.
     if unsafe { RegOpenKeyExW(root, key.as_ptr(), 0, KEY_READ, &mut handle) } != 0 {
         return None;
     }
@@ -1076,6 +1111,8 @@ fn registry_subkeys(
     for index in 0.. {
         let mut buffer = vec![0_u16; 256];
         let mut length = buffer.len() as u32;
+        // SAFETY: handle is still open; length describes buffer's u16 capacity and all unused outputs
+        // are null.
         let status = unsafe {
             RegEnumKeyExW(
                 handle,
@@ -1092,11 +1129,15 @@ fn registry_subkeys(
             break;
         }
         if status != 0 {
+            // SAFETY: This branch owns the successfully opened handle and returns immediately after
+            // closing it.
             unsafe { RegCloseKey(handle) };
             return None;
         }
         names.push(String::from_utf16_lossy(&buffer[..length as usize]));
     }
+    // SAFETY: The owned registry handle remains open until enumeration completes and is closed once
+    // here.
     unsafe { RegCloseKey(handle) };
     Some(names)
 }
@@ -1107,11 +1148,15 @@ fn wide_null_str(value: &str) -> Vec<u16> {
 
 impl Drop for ClassicMenuSession {
     fn drop(&mut self) {
+        // SAFETY: The thread-affine session owns its menu; destroying the root also destroys its
+        // child menus.
         unsafe {
             let _ = DestroyMenu(self.menu);
         }
         self.release_com_interfaces();
         if self.com_initialized {
+            // SAFETY: Session COM interfaces were released above, on the same STA that initialized
+            // them.
             unsafe { CoUninitialize() };
         }
     }
@@ -1181,10 +1226,14 @@ fn create_item_context_menu_for_identities(
         for identity in identities {
             let wide = wide_null_os(identity);
             let mut full_pidl = ptr::null_mut();
+            // SAFETY: wide is terminated UTF-16; full_pidl is writable and its returned allocation is
+            // retained for cleanup.
             unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut full_pidl, 0, None) }
                 .map_err(windows_error)?;
             full_pidls.push(full_pidl);
             let mut child_pidl = ptr::null_mut();
+            // SAFETY: full_pidl is a live Shell allocation; the borrowed child PIDL stays valid until
+            // full_pidls is freed.
             let folder: IShellFolder = unsafe { SHBindToParent(full_pidl, Some(&mut child_pidl)) }
                 .map_err(windows_error)?;
             if parent_folder.is_none() {
@@ -1192,6 +1241,8 @@ fn create_item_context_menu_for_identities(
             }
             child_pidls.push(child_pidl.cast_const());
         }
+        // SAFETY: Validated items share a parent; all child PIDLs still borrow live full_pidls during
+        // GetUIObjectOf.
         unsafe {
             parent_folder
                 .as_ref()
@@ -1205,6 +1256,8 @@ fn create_item_context_menu_for_identities(
 }
 
 pub fn invoke_path_verb(path: &Path, verb: &str) -> io::Result<()> {
+    // SAFETY: This synchronous operation retains its interfaces on this STA and balances successful
+    // initialization.
     let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     if initialized == RPC_E_CHANGED_MODE {
         return Err(io::Error::other("Shell verb requires an STA thread"));
@@ -1212,8 +1265,12 @@ pub fn invoke_path_verb(path: &Path, verb: &str) -> io::Result<()> {
     initialized.ok().map_err(windows_error)?;
     let result = (|| {
         let context_menu = create_selection_context_menu(&[path.to_path_buf()], HWND::default())?;
+        // SAFETY: CreatePopupMenu takes no pointers; this function owns and later destroys the
+        // returned popup.
         let menu = unsafe { CreatePopupMenu() }.map_err(windows_error)?;
         let result = (|| {
+            // SAFETY: The context interface and popup remain live on this STA; the command range
+            // matches offset encoding.
             unsafe {
                 context_menu.QueryContextMenu(
                     menu,
@@ -1248,16 +1305,22 @@ pub fn invoke_path_verb(path: &Path, verb: &str) -> io::Result<()> {
                 ..Default::default()
             };
             let base = (&invocation as *const CMINVOKECOMMANDINFOEX).cast();
+            // SAFETY: invocation is a live repr(C) extended structure with the base prefix and a
+            // range-checked integer verb.
             unsafe { context_menu.InvokeCommand(&*base) }.map_err(windows_error)
         })();
+        // SAFETY: menu was created above and is destroyed exactly once after the invocation finishes.
         unsafe { DestroyMenu(menu) }.ok();
         result
     })();
+    // SAFETY: All interfaces in the closure have been dropped before balancing this thread's COM
+    // initialization.
     unsafe { CoUninitialize() };
     result
 }
 
 fn shell_home_command_by_title(menu: HMENU, verb: &str) -> Option<u32> {
+    // SAFETY: menu is a popup retained by the caller; querying its count does not transfer ownership.
     let count = unsafe { GetMenuItemCount(Some(menu)) };
     if count <= 0 {
         return None;
@@ -1270,10 +1333,14 @@ fn shell_home_command_by_title(menu: HMENU, verb: &str) -> Option<u32> {
             fMask: MIIM_ID | MIIM_STRING,
             ..Default::default()
         };
+        // SAFETY: position is below the queried count and info has a valid size; null text requests
+        // the required length.
         unsafe { GetMenuItemInfoW(menu, position, true, &mut info) }.ok()?;
         let mut title = vec![0_u16; info.cch as usize + 1];
         info.dwTypeData = PWSTR(title.as_mut_ptr());
         info.cch = title.len() as u32;
+        // SAFETY: title has cch plus terminator capacity; the sized info points to that live writable
+        // buffer.
         unsafe { GetMenuItemInfoW(menu, position, true, &mut info) }.ok()?;
         let normalized = clean_menu_title(&String::from_utf16_lossy(&title[..info.cch as usize]))
             .to_ascii_lowercase();
@@ -1294,14 +1361,22 @@ fn shell_home_command_by_title(menu: HMENU, verb: &str) -> Option<u32> {
 fn create_background_context_menu(identity: &OsStr, owner: HWND) -> io::Result<IContextMenu> {
     let wide = wide_null_os(identity);
     let mut full_pidl = ptr::null_mut();
+    // SAFETY: wide is terminated UTF-16 and full_pidl receives an owned Shell allocation freed after
+    // binding.
     unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut full_pidl, 0, None) }
         .map_err(windows_error)?;
     let result = (|| {
         let mut child_pidl = ptr::null_mut();
         let parent: IShellFolder =
+            // SAFETY: full_pidl remains allocated; child_pidl is an output borrow into that
+            // allocation.
             unsafe { SHBindToParent(full_pidl, Some(&mut child_pidl)) }.map_err(windows_error)?;
         let folder: IShellFolder =
+            // SAFETY: parent is retained and child_pidl still refers into the live full_pidl
+            // allocation.
             unsafe { parent.BindToObject(child_pidl.cast_const(), None) }.map_err(windows_error)?;
+        // SAFETY: folder is retained on this STA; owner is the caller's borrowed window handle or
+        // null.
         unsafe { folder.CreateViewObject(owner) }.map_err(windows_error)
     })();
     free_pidls(vec![full_pidl]);
@@ -1310,6 +1385,8 @@ fn create_background_context_menu(identity: &OsStr, owner: HWND) -> io::Result<I
 
 fn free_pidls(pidls: Vec<*mut windows::Win32::UI::Shell::Common::ITEMIDLIST>) {
     for pidl in pidls {
+        // SAFETY: Each pointer is an owned SHParseDisplayName allocation and is released once after
+        // all child borrows.
         unsafe { CoTaskMemFree(Some(pidl.cast())) };
     }
 }
@@ -1318,6 +1395,7 @@ fn read_menu_level(
     menu: HMENU,
     session: &mut ClassicMenuSession,
 ) -> io::Result<Vec<ClassicMenuItem>> {
+    // SAFETY: The session retains menu for this synchronous read; ownership is not transferred.
     let count = unsafe { GetMenuItemCount(Some(menu)) };
     if count < 0 {
         return Err(io::Error::last_os_error());
@@ -1329,6 +1407,8 @@ fn read_menu_level(
             fMask: MIIM_FTYPE | MIIM_ID | MIIM_STATE | MIIM_STRING | MIIM_SUBMENU,
             ..Default::default()
         };
+        // SAFETY: position is within the queried menu count and info has its size set; the first call
+        // only sizes text.
         unsafe { GetMenuItemInfoW(menu, position, true, &mut info) }.map_err(windows_error)?;
         if info.fType.contains(MFT_SEPARATOR) {
             items.push(ClassicMenuItem {
@@ -1345,6 +1425,8 @@ fn read_menu_level(
         let mut title = vec![0_u16; info.cch as usize + 1];
         info.dwTypeData = PWSTR(title.as_mut_ptr());
         info.cch = title.len() as u32;
+        // SAFETY: title owns info.cch UTF-16 slots including the terminator and stays writable for
+        // this call.
         unsafe { GetMenuItemInfoW(menu, position, true, &mut info) }.map_err(windows_error)?;
         let command_id = (FIRST_COMMAND_ID..=LAST_COMMAND_ID)
             .contains(&info.wID)
@@ -1376,6 +1458,7 @@ fn read_menu_level(
 }
 
 fn submenu_position(parent: HMENU, submenu: HMENU) -> io::Result<u32> {
+    // SAFETY: parent is a session-owned menu that remains alive during submenu lookup.
     let count = unsafe { GetMenuItemCount(Some(parent)) };
     if count < 0 {
         return Err(io::Error::last_os_error());
@@ -1386,6 +1469,8 @@ fn submenu_position(parent: HMENU, submenu: HMENU) -> io::Result<u32> {
             fMask: MIIM_SUBMENU,
             ..Default::default()
         };
+        // SAFETY: position is within the queried parent count; sized info supplies writable
+        // submenu-handle storage.
         unsafe { GetMenuItemInfoW(parent, position, true, &mut info) }.map_err(windows_error)?;
         if info.hSubMenu == submenu {
             return Ok(position);
@@ -1403,6 +1488,8 @@ fn submenu_at_position(parent: HMENU, position: u32) -> io::Result<HMENU> {
         fMask: MIIM_SUBMENU,
         ..Default::default()
     };
+    // SAFETY: parent is retained by the session and position came from its submenu lookup; info is
+    // correctly sized.
     unsafe { GetMenuItemInfoW(parent, position, true, &mut info) }.map_err(windows_error)?;
     if info.hSubMenu.is_invalid() {
         return Err(io::Error::new(
@@ -1417,6 +1504,7 @@ fn read_menu_recursive(
     menu: HMENU,
     session: &ClassicMenuSession,
 ) -> io::Result<Vec<ClassicMenuItem>> {
+    // SAFETY: menu is retained by the session throughout recursive traversal.
     let count = unsafe { GetMenuItemCount(Some(menu)) };
     if count < 0 {
         return Err(io::Error::last_os_error());
@@ -1428,6 +1516,8 @@ fn read_menu_recursive(
             fMask: MIIM_FTYPE | MIIM_ID | MIIM_STATE | MIIM_STRING | MIIM_SUBMENU,
             ..Default::default()
         };
+        // SAFETY: position is within the queried count; sized info requests metadata and the required
+        // text length.
         unsafe { GetMenuItemInfoW(menu, position, true, &mut info) }.map_err(windows_error)?;
         if info.fType.contains(MFT_SEPARATOR) {
             items.push(ClassicMenuItem {
@@ -1444,6 +1534,8 @@ fn read_menu_recursive(
         let mut title = vec![0_u16; info.cch as usize + 1];
         info.dwTypeData = PWSTR(title.as_mut_ptr());
         info.cch = title.len() as u32;
+        // SAFETY: title holds the requested UTF-16 capacity and info points to it only for this
+        // synchronous query.
         unsafe { GetMenuItemInfoW(menu, position, true, &mut info) }.map_err(windows_error)?;
         let command_id = (FIRST_COMMAND_ID..=LAST_COMMAND_ID)
             .contains(&info.wID)
@@ -1478,6 +1570,8 @@ fn read_menu_recursive(
 fn command_verb(context_menu: &IContextMenu, command_id: u32) -> Option<String> {
     let offset = command_id.checked_sub(FIRST_COMMAND_ID)? as usize;
     let mut buffer = vec![0_u16; 260];
+    // SAFETY: GCS_VERBW writes UTF-16 units; buffer is u16-aligned and its unit count matches the
+    // supplied capacity.
     unsafe {
         context_menu.GetCommandString(
             offset,

@@ -132,6 +132,8 @@ pub fn install(hwnd: isize) -> io::Result<()> {
         ));
     }
     let hwnd = hwnd as HWND;
+    // SAFETY: The application installs subclasses on its window thread; hwnd is non-null and the static
+    // callback stores no Rust data pointer.
     if unsafe { SetWindowSubclass(hwnd, Some(window_dpi_proc), SUBCLASS_ID, 0) } == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -142,13 +144,17 @@ pub fn install(hwnd: isize) -> io::Result<()> {
 }
 
 fn borderless_normal_baseline(hwnd: HWND) -> Option<ClientBaseline> {
+    // SAFETY: These read-only window-state APIs accept the borrowed HWND and retain no Rust pointers.
     if unsafe { IsZoomed(hwnd) != 0 || IsIconic(hwnd) != 0 } {
         return None;
     }
     let mut client = RECT::default();
     let mut outer = RECT::default();
+    // SAFETY: The scalar DPI query borrows only hwnd and returns zero for an invalid/unavailable window.
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     if dpi == 0
+        // SAFETY: client and outer are separate writable RECTs; both APIs receive their full structures for
+        // synchronous output.
         || unsafe { GetClientRect(hwnd, &mut client) == 0 || GetWindowRect(hwnd, &mut outer) == 0 }
     {
         return None;
@@ -167,6 +173,8 @@ fn borderless_normal_baseline(hwnd: HWND) -> Option<ClientBaseline> {
     Some(ClientBaseline { width, height, dpi })
 }
 
+// SAFETY: Windows invokes this installed subclass on the owning window thread; message-specific pointers
+// live for the callback.
 unsafe extern "system" fn window_dpi_proc(
     hwnd: HWND,
     message: u32,
@@ -200,6 +208,8 @@ unsafe extern "system" fn window_dpi_proc(
             let candidate =
                 WINDOWS.with(|windows| windows.borrow_mut().get_mut(&hwnd)?.scaled_candidate(dpi));
             if let Some((width, height)) = candidate {
+                // SAFETY: WM_GETDPISCALEDSIZE supplies a non-null writable SIZE for this callback; no
+                // reference survives the native message.
                 unsafe {
                     *(lparam as *mut SIZE) = SIZE {
                         cx: width,
@@ -216,8 +226,12 @@ unsafe extern "system" fn window_dpi_proc(
             }
         }
         WM_DPICHANGED => {
+            // SAFETY: This branch is inside WM_DPICHANGED; both window-state queries only borrow the
+            // callback's HWND.
             let suggested = if lparam != 0 && unsafe { IsZoomed(hwnd) == 0 && IsIconic(hwnd) == 0 }
             {
+                // SAFETY: WM_DPICHANGED supplies an aligned RECT readable until callback return; copying it
+                // avoids retaining its pointer.
                 Some(unsafe { *(lparam as *const RECT) })
             } else {
                 None
@@ -229,6 +243,8 @@ unsafe extern "system" fn window_dpi_proc(
             });
         }
         WM_WINDOWPOSCHANGING if lparam != 0 => {
+            // SAFETY: WM_WINDOWPOSCHANGING supplies a non-null writable WINDOWPOS; the exclusive borrow
+            // ends before forwarding can re-enter.
             let position = unsafe { &mut *(lparam as *mut WINDOWPOS) };
             let adapted = WINDOWS.with(|windows| {
                 windows
@@ -263,6 +279,8 @@ unsafe extern "system" fn window_dpi_proc(
             WINDOWS.with(|windows| {
                 windows.borrow_mut().remove(&hwnd);
             });
+            // SAFETY: This is the matching callback/id on its owning HWND; removal occurs during its final
+            // destruction message.
             unsafe {
                 RemoveWindowSubclass(hwnd, Some(window_dpi_proc), SUBCLASS_ID);
             }
@@ -271,6 +289,8 @@ unsafe extern "system" fn window_dpi_proc(
     }
     // winit/Slint still receive every DPI event. No borrow survives this call:
     // SetWindowPos and application callbacks can re-enter the native procedure.
+    // SAFETY: The native message and payload are forwarded before their callback lifetime ends; no RefCell
+    // borrow crosses this re-entrant call.
     let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
     if message == WM_DPICHANGED {
         WINDOWS.with(|windows| {

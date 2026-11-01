@@ -119,13 +119,19 @@ fn restore_recycled_batch(
         .file_name()
         .ok_or("restore temporary destination has no name")?;
     let operation: IFileOperation =
+        // SAFETY: The restore worker successfully initialized its STA and retains the created
+        // operation on that thread.
         unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_LOCAL_SERVER) }
             .map_err(|error| windows_error(error).to_string())?;
+    // SAFETY: operation is a live interface on the restore STA and restore_flags contains only Shell
+    // operation flags.
     unsafe { operation.SetOperationFlags(restore_flags()) }
         .map_err(|error| windows_error(error).to_string())?;
     let recycled = shell_item_from_pidl(absolute_pidl)?;
     let parent_wide = shell_path(parent).map_err(|error| error.to_string())?;
     let parent_item: IShellItem =
+        // SAFETY: parent_wide is validated, terminated UTF-16 and remains live through item creation
+        // on this STA.
         unsafe { SHCreateItemFromParsingName(PCWSTR(parent_wide.as_ptr()), None) }
             .map_err(|error| windows_error(error).to_string())?;
     let mut name_wide = name.encode_wide().collect::<Vec<_>>();
@@ -139,16 +145,21 @@ fn restore_recycled_batch(
         results: results.clone(),
         is_cancelled: is_cancelled.clone(),
     });
+    // SAFETY: Both Shell items, sink and terminated destination name remain live through the queued
+    // move and execution.
     unsafe { operation.MoveItem(&recycled, &parent_item, PCWSTR(name_wide.as_ptr()), &sink) }
         .map_err(|error| windows_error(error).to_string())?;
     if is_cancelled() {
         return Err("recycle restore cancelled".to_owned());
     }
+    // SAFETY: Queued items and sinks remain retained by the live operation on the initialized restore
+    // STA.
     unsafe { operation.PerformOperations() }.map_err(|error| windows_error(error).to_string())?;
     let callback = results
         .lock()
         .expect("restore result sink poisoned")
         .remove(&0);
+    // SAFETY: The operation is still retained on its owning STA after PerformOperations completed.
     let aborted = unsafe { operation.GetAnyOperationsAborted() }
         .map(|value| value.as_bool())
         .unwrap_or(true);
@@ -217,6 +228,8 @@ fn shell_item_from_pidl(bytes: &[u8]) -> Result<IShellItem, String> {
         return Err("invalid recycled item identity".to_owned());
     }
     let mut words = vec![0_u16; bytes.len().div_ceil(2)];
+    // SAFETY: words is aligned and large enough for the nonoverlapping copy; bytes are the
+    // Shell-produced PIDL preserved by undo.
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), words.as_mut_ptr().cast(), bytes.len());
         SHCreateItemFromIDList(words.as_ptr().cast())
@@ -225,12 +238,17 @@ fn shell_item_from_pidl(bytes: &[u8]) -> Result<IShellItem, String> {
 }
 
 fn shell_item_path(item: &IShellItem) -> Option<PathBuf> {
+    // SAFETY: item is a retained Shell interface on the COM worker; the returned string uses the COM
+    // task allocator.
     let value = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }.ok()?;
     if value.is_null() {
         return None;
     }
+    // SAFETY: GetDisplayName returned a non-null terminated UTF-16 allocation that remains live until
+    // the following free.
     let wide = unsafe { value.as_wide() };
     let path = PathBuf::from(OsString::from_wide(wide));
+    // SAFETY: The returned COM string has been copied to an owned path and is released exactly once.
     unsafe { CoTaskMemFree(Some(value.as_ptr().cast())) };
     Some(path)
 }
@@ -255,13 +273,21 @@ fn same_windows_path(left: &Path, right: &Path) -> bool {
 }
 
 fn absolute_pidl(item: &IShellItem) -> Option<Vec<u8>> {
+    // SAFETY: item is a retained Shell interface; SHGetIDListFromObject returns a separate
+    // task-allocated PIDL.
     let pidl = unsafe { SHGetIDListFromObject(item) }.ok()?;
     if pidl.is_null() {
         return None;
     }
+    // SAFETY: pidl is the non-null Shell-produced allocation returned above and has not yet been
+    // freed.
     let size = unsafe { ILGetSize(Some(pidl.cast_const())) } as usize;
     let bytes = (size >= 2)
+        // SAFETY: ILGetSize measured this live PIDL allocation; the byte slice is copied before the
+        // allocation is freed.
         .then(|| unsafe { std::slice::from_raw_parts(pidl.cast::<u8>(), size).to_vec() });
+    // SAFETY: The Shell PIDL bytes have been copied and this sole task-allocated pointer is released
+    // once.
     unsafe { CoTaskMemFree(Some(pidl.cast())) };
     bytes
 }
@@ -313,6 +339,8 @@ fn recycle_batch(
     on_progress: Arc<dyn Fn(RecycleProgress) + Send + Sync>,
 ) -> RecycleResult {
     let operation: IFileOperation =
+        // SAFETY: The recycle worker initialized COM and keeps operation and all its callbacks on the
+        // worker STA.
         match unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_LOCAL_SERVER) } {
             Ok(operation) => operation,
             Err(error) => return failed_result(paths, &windows_error(error).to_string()),
@@ -322,6 +350,8 @@ fn recycle_batch(
     let mut queued = Vec::with_capacity(paths.len());
     let mut initial = HashMap::new();
 
+    // SAFETY: operation is retained on this initialized STA and recycle_flags consists of documented
+    // operation flags.
     if let Err(error) = unsafe { operation.SetOperationFlags(recycle_flags()) } {
         return failed_result(paths, &windows_error(error).to_string());
     }
@@ -334,6 +364,8 @@ fn recycle_batch(
         if is_cancelled() {
             break;
         }
+        // SAFETY: shell_path validated and terminated wide_path, which stays live through this
+        // synchronous Shell item creation.
         let item: io::Result<IShellItem> = shell_path(path).and_then(|wide_path| unsafe {
             SHCreateItemFromParsingName(PCWSTR(wide_path.as_ptr()), None).map_err(windows_error)
         });
@@ -344,6 +376,8 @@ fn recycle_batch(
                     results: results.clone(),
                     is_cancelled: is_cancelled.clone(),
                 });
+                // SAFETY: item and sink are live COM interfaces on the worker STA; IFileOperation
+                // retains them for queued deletion.
                 match unsafe { operation.DeleteItem(&item, &sink) }.map_err(windows_error) {
                     Ok(()) => queued.push((index, path.clone())),
                     Err(error) => {
@@ -367,18 +401,25 @@ fn recycle_batch(
         current_item,
         is_cancelled: is_cancelled.clone(),
     });
+    // SAFETY: progress_sink remains live through PerformOperations and the operation retains its
+    // advisory reference.
     let advise_cookie = unsafe { operation.Advise(&progress_sink) }.ok();
     let perform_error = if queued.is_empty() || is_cancelled() {
         None
     } else {
+        // SAFETY: Queued Shell items and callbacks are retained by operation on the same initialized
+        // STA.
         unsafe { operation.PerformOperations() }
             .map_err(windows_error)
             .err()
             .map(|error| error.to_string())
     };
     if let Some(cookie) = advise_cookie {
+        // SAFETY: cookie came from this operation's successful Advise call and is removed once before
+        // the sink is released.
         let _ = unsafe { operation.Unadvise(cookie) };
     }
+    // SAFETY: operation remains live on the worker STA after execution and advisory cleanup.
     let aborted = unsafe { operation.GetAnyOperationsAborted() }
         .map(|value| value.as_bool())
         .unwrap_or(false);
@@ -813,6 +854,8 @@ struct ComApartment;
 
 impl ComApartment {
     fn initialize() -> io::Result<Self> {
+        // SAFETY: This worker requests an STA and creates the guard only on success, requiring one
+        // matching uninitialization.
         unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
             .ok()
             .map_err(windows_error)?;
@@ -822,6 +865,8 @@ impl ComApartment {
 
 impl Drop for ComApartment {
     fn drop(&mut self) {
+        // SAFETY: The guard is dropped on the worker that initialized COM, after the operation and
+        // sinks were released.
         unsafe { CoUninitialize() };
     }
 }

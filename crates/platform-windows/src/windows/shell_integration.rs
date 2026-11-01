@@ -124,6 +124,8 @@ pub fn restore_win_e() -> io::Result<()> {
 }
 
 fn notify_shell() {
+    // SAFETY: SHCNE_ASSOCCHANGED requires no item PIDLs; both optional item pointers are null and not
+    // dereferenced.
     unsafe {
         SHChangeNotify(
             SHCNE_ASSOCCHANGED as i32,
@@ -510,6 +512,8 @@ fn read_value(path: &str, name: &str) -> io::Result<Option<RegistryValue>> {
     let name = wide(name);
     let mut value_type = 0;
     let mut size = 0;
+    // SAFETY: key is held open by RegKey and name is terminated UTF-16; null data requests only the
+    // writable size/type.
     let result = unsafe {
         RegQueryValueExW(
             key.0,
@@ -527,6 +531,8 @@ fn read_value(path: &str, name: &str) -> io::Result<Option<RegistryValue>> {
     let mut data = vec![0; size as usize];
     loop {
         let mut actual_size = data.len() as u32;
+        // SAFETY: RegKey keeps the handle live and actual_size matches data's byte capacity;
+        // ERROR_MORE_DATA is retried.
         let result = unsafe {
             RegQueryValueExW(
                 key.0,
@@ -570,6 +576,8 @@ fn write_dword(path: &str, name: &str, value: u32) -> io::Result<()> {
 fn write_raw(path: &str, name: &str, value_type: REG_VALUE_TYPE, data: &[u8]) -> io::Result<()> {
     let key = create_key(HKEY_CURRENT_USER, path, KEY_READ | KEY_WRITE)?;
     let name = wide(name);
+    // SAFETY: RegKey retains the opened key; name is terminated and data's pointer and byte length
+    // describe a live slice.
     check(unsafe {
         RegSetValueExW(
             key.0,
@@ -586,6 +594,8 @@ fn delete_value(path: &str, name: &str) -> io::Result<()> {
     let Some(key) = open_key(HKEY_CURRENT_USER, path, KEY_WRITE)? else {
         return Ok(());
     };
+    // SAFETY: RegKey owns the open handle and the temporary terminated name remains alive for this
+    // synchronous call.
     let result = unsafe { RegDeleteValueW(key.0, wide(name).as_ptr()) };
     if result == ERROR_FILE_NOT_FOUND {
         Ok(())
@@ -595,6 +605,8 @@ fn delete_value(path: &str, name: &str) -> io::Result<()> {
 }
 
 fn delete_tree(root: HKEY, path: &str, missing_ok: bool) -> io::Result<()> {
+    // SAFETY: root is a borrowed predefined key and the terminated path remains alive throughout
+    // deletion.
     let result = unsafe { RegDeleteTreeW(root, wide(path).as_ptr()) };
     if missing_ok && result == ERROR_FILE_NOT_FOUND {
         Ok(())
@@ -605,6 +617,7 @@ fn delete_tree(root: HKEY, path: &str, missing_ok: bool) -> io::Result<()> {
 
 fn open_key(root: HKEY, path: &str, access: REG_SAM_FLAGS) -> io::Result<Option<RegKey>> {
     let mut key = ptr::null_mut();
+    // SAFETY: root is borrowed; the terminated path and writable key output outlive RegOpenKeyExW.
     let result = unsafe { RegOpenKeyExW(root, wide(path).as_ptr(), 0, access, &mut key) };
     if result == ERROR_FILE_NOT_FOUND {
         Ok(None)
@@ -616,6 +629,8 @@ fn open_key(root: HKEY, path: &str, access: REG_SAM_FLAGS) -> io::Result<Option<
 
 fn create_key(root: HKEY, path: &str, access: REG_SAM_FLAGS) -> io::Result<RegKey> {
     let mut key = ptr::null_mut();
+    // SAFETY: The terminated path and key output are live; optional security/class/disposition
+    // pointers are null.
     check(unsafe {
         RegCreateKeyExW(
             root,
@@ -635,6 +650,8 @@ fn create_key(root: HKEY, path: &str, access: REG_SAM_FLAGS) -> io::Result<RegKe
 struct RegKey(HKEY);
 impl Drop for RegKey {
     fn drop(&mut self) {
+        // SAFETY: RegKey owns a successfully opened or created registry handle and Drop closes it
+        // exactly once.
         unsafe { RegCloseKey(self.0) };
     }
 }

@@ -47,10 +47,12 @@ pub fn mark_internal_cleanup_directory(path: &std::path::Path) -> io::Result<()>
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
+    // SAFETY: wide is a live, NUL-terminated UTF-16 path; the query retains no pointer to it.
     let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
     if attributes == INVALID_FILE_ATTRIBUTES {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: The same NUL-terminated path remains live, and attributes contains the successful query result plus documented flags.
     if unsafe {
         SetFileAttributesW(
             wide.as_ptr(),
@@ -64,6 +66,7 @@ pub fn mark_internal_cleanup_directory(path: &std::path::Path) -> io::Result<()>
 }
 pub fn cursor_screen_position() -> io::Result<(i32, i32)> {
     let mut cursor = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    // SAFETY: cursor is initialized writable POINT storage; GetCursorPos does not retain its address.
     if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut cursor) } == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -80,6 +83,7 @@ pub fn move_window(hwnd: isize, x: i32, y: i32) -> io::Result<()> {
             "main window handle is not available",
         ));
     }
+    // SAFETY: The caller supplies its window HWND; all position data are passed by value and no Rust borrow escapes.
     if unsafe {
         SetWindowPos(
             hwnd as windows_sys::Win32::Foundation::HWND,
@@ -107,12 +111,16 @@ pub fn restore_and_focus_window(hwnd: isize) {
         return;
     }
     let target = hwnd as windows_sys::Win32::Foundation::HWND;
+    // SAFETY: target is passed as an opaque window handle; IsIconic retains no Rust pointer or ownership.
     let minimized = unsafe { IsIconic(target) } != 0;
     // Restoring an already maximized window would discard the user's window state.
     if minimized {
+        // SAFETY: The caller supplied this window handle; ShowWindow uses only by-value arguments and retains no Rust memory.
         unsafe { ShowWindow(target, SW_RESTORE) };
     }
+    // SAFETY: The HWND is an opaque borrowed window identifier, not an address into Rust storage.
     let accepted = unsafe { SetForegroundWindow(target) } != 0;
+    // SAFETY: This no-argument query returns a borrowed HWND and does not transfer ownership or borrow Rust memory.
     let foreground = unsafe { GetForegroundWindow() };
     // SetForegroundWindow does not provide a reliable GetLastError failure reason.
     crate::operation_audit::record(
@@ -131,6 +139,7 @@ pub fn show_error_dialog(owner: isize, title: &str, message: &str) {
 
     let title = title.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
     let message = message.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    // SAFETY: Title and message are NUL-terminated buffers that outlive the synchronous modal call, including its message loop.
     unsafe {
         MessageBoxW(
             owner as windows_sys::Win32::Foundation::HWND,
@@ -143,6 +152,7 @@ pub fn show_error_dialog(owner: isize, title: &str, message: &str) {
 
 pub fn has_pointer_capture(hwnd: isize) -> bool {
     hwnd != 0
+        // SAFETY: This no-argument, thread-local capture query retains no Rust memory and returns only a borrowed HWND.
         && unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture() }
             == hwnd as windows_sys::Win32::Foundation::HWND
 }
@@ -150,9 +160,11 @@ pub fn has_pointer_capture(hwnd: isize) -> bool {
 pub fn shift_key_down() -> bool {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_SHIFT};
 
+    // SAFETY: VK_SHIFT is a valid virtual-key code; the query borrows no Rust memory.
     unsafe { GetAsyncKeyState(VK_SHIFT as i32) < 0 }
 }
 
 pub fn release_pointer_capture() {
+    // SAFETY: This thread-local capture operation takes no pointers and does not retain Rust resources.
     unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture() };
 }

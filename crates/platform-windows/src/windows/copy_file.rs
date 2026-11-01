@@ -70,6 +70,7 @@ pub fn copy_file(
             pProgressRoutine: Some(copy_progress),
             pvCallbackContext: (&mut context as *mut CopyContext<'_>).cast::<c_void>(),
         };
+        // SAFETY: The call is synchronous: path buffers, BOOL-compatible cancellation storage and the exclusively used callback context outlive all callbacks.
         let result = unsafe {
             CopyFile2(
                 PCWSTR(source_wide.as_ptr()),
@@ -106,10 +107,12 @@ pub fn copy_file(
     }
 }
 
+// SAFETY: Windows invokes this registered callback with our live CopyContext and a COPYFILE2_MESSAGE valid for the callback duration.
 unsafe extern "system" fn copy_progress(
     message: *const COPYFILE2_MESSAGE,
     callback_context: *const c_void,
 ) -> COPYFILE2_MESSAGE_ACTION {
+    // SAFETY: callback_context was created from the stack CopyContext above; CopyFile2 serializes progress callbacks before returning.
     let Some(context) = (unsafe { (callback_context as *mut CopyContext<'_>).as_mut() }) else {
         return COPYFILE2_PROGRESS_CANCEL;
     };
@@ -117,8 +120,10 @@ unsafe extern "system" fn copy_progress(
         return COPYFILE2_PROGRESS_CANCEL;
     }
     if !message.is_null() {
+        // SAFETY: A non-null message supplied by CopyFile2 points to a properly aligned COPYFILE2_MESSAGE valid for this callback.
         let message = unsafe { &*message };
         if message.Type == COPYFILE2_CALLBACK_CHUNK_FINISHED {
+            // SAFETY: The message discriminant is COPYFILE2_CALLBACK_CHUNK_FINISHED, so ChunkFinished is the active union member.
             let total = unsafe { message.Info.ChunkFinished }.uliTotalBytesTransferred;
             let advanced = total.saturating_sub(context.last_total);
             context.last_total = context.last_total.max(total);
@@ -194,6 +199,7 @@ mod tests {
         let destination = temp.0.join("目标 文件.bin");
         fs::write(&source, b"copyfile2 metadata").unwrap();
         let source_wide = wide_path(&source);
+        // SAFETY: source_wide is a NUL-terminated path owned by this test and stays alive for the synchronous call.
         unsafe {
             SetFileAttributesW(
                 PCWSTR(source_wide.as_ptr()),
@@ -215,10 +221,12 @@ mod tests {
             modified
         );
         let destination_wide = wide_path(&destination);
+        // SAFETY: destination_wide is NUL-terminated and remains live for the attribute query.
         let attributes = unsafe { GetFileAttributesW(PCWSTR(destination_wide.as_ptr())) };
         assert_ne!(attributes, INVALID_FILE_ATTRIBUTES);
         assert!(attributes & FILE_ATTRIBUTE_HIDDEN.0 != 0);
         assert!(attributes & FILE_ATTRIBUTE_READONLY.0 != 0);
+        // SAFETY: The test owns the destination and its NUL-terminated path buffer remains live through attribute cleanup.
         unsafe {
             SetFileAttributesW(PCWSTR(destination_wide.as_ptr()), Default::default()).unwrap()
         };

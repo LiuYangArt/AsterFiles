@@ -61,8 +61,10 @@ const CLSID_UNPIN_FROM_FREQUENT_EXECUTE: GUID =
     GUID::from_u128(0xee20eeba_df64_4a4e_b7bb_2d1c6b2dfcc1);
 
 fn execute_unpin(path: &Path) -> io::Result<()> {
+    // SAFETY: This thread initializes its own COM apartment; only a successful call proceeds to the balancing uninitialize below.
     let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     initialized.ok().map_err(io::Error::other)?;
+    // SAFETY: All Shell interfaces stay on this initialized thread; the UTF-16 path and selection objects outlive their synchronous COM calls.
     let result = (|| unsafe {
         let wide = path
             .as_os_str()
@@ -85,6 +87,7 @@ fn execute_unpin(path: &Path) -> io::Result<()> {
             .map_err(io::Error::other)?;
         command.Execute().map_err(io::Error::other)
     })();
+    // SAFETY: All closure-local interfaces have been dropped, and this thread balances its successful CoInitializeEx call exactly once.
     unsafe { CoUninitialize() };
     result
 }

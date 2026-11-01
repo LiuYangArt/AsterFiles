@@ -92,7 +92,9 @@ fn changed() -> io::Error {
 }
 
 fn handle_version(file: &File) -> io::Result<SourceVersion> {
+    // SAFETY: BY_HANDLE_FILE_INFORMATION contains only integer/FILETIME fields, so zero-initialization is valid.
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: file owns the open handle and info is live writable BY_HANDLE_FILE_INFORMATION storage.
     if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -120,6 +122,7 @@ fn streams(path: &Path, size: u64) -> io::Result<Vec<StreamVersion>> {
     struct Search(windows_sys::Win32::Foundation::HANDLE);
     impl Drop for Search {
         fn drop(&mut self) {
+            // SAFETY: Search is constructed only from a successful search handle and uniquely owns the matching FindClose call.
             unsafe {
                 FindClose(self.0);
             }
@@ -129,7 +132,9 @@ fn streams(path: &Path, size: u64) -> io::Result<Vec<StreamVersion>> {
         name: OsString::new(),
         size,
     }];
+    // SAFETY: WIN32_FIND_STREAM_DATA contains only integer and UTF-16 array fields; its zero bit pattern is valid.
     let mut data: WIN32_FIND_STREAM_DATA = unsafe { std::mem::zeroed() };
+    // SAFETY: The temporary UTF-16 path buffer lives through the call; data has the layout required by FindStreamInfoStandard.
     let handle = unsafe {
         FindFirstStreamW(
             wide(path).as_ptr(),
@@ -172,6 +177,7 @@ fn streams(path: &Path, size: u64) -> io::Result<Vec<StreamVersion>> {
                 size: data.StreamSize as u64,
             });
         }
+        // SAFETY: search owns the live enumeration handle and data remains writable WIN32_FIND_STREAM_DATA storage.
         if unsafe { FindNextStreamW(search.0, std::ptr::addr_of_mut!(data).cast()) } == 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() != Some(ERROR_HANDLE_EOF as i32) {
@@ -375,6 +381,7 @@ fn preserve_metadata(file: &File, path: &Path, version: &SourceVersion) -> io::R
     let created = filetime(version.created);
     let accessed = filetime(version.accessed);
     let modified = filetime(version.modified);
+    // SAFETY: file owns the live output handle and all three FILETIME values remain borrowed through the synchronous update.
     if unsafe { SetFileTime(file.as_raw_handle(), &created, &accessed, &modified) } == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -385,6 +392,7 @@ fn preserve_metadata(file: &File, path: &Path, version: &SourceVersion) -> io::R
             | FILE_ATTRIBUTE_ARCHIVE
             | FILE_ATTRIBUTE_TEMPORARY
             | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED);
+    // SAFETY: wide(path) is NUL-terminated and its temporary allocation remains live through this synchronous attribute update.
     if unsafe {
         SetFileAttributesW(
             wide(path).as_ptr(),

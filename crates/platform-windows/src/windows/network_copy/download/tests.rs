@@ -371,6 +371,7 @@ fn issue_137_block_download_preserves_named_streams_time_and_readonly_hidden_att
     let stream = OsStr::new(":asterfiles:$DATA");
     fs::write(stream_path(&source, stream), vec![71; BLOCK_SIZE + 57]).unwrap();
     assert_ne!(
+        // SAFETY: The test owns source; wide(&source) is NUL-terminated and its temporary buffer lives through this synchronous call.
         unsafe {
             SetFileAttributesW(
                 wide(&source).as_ptr(),
@@ -398,10 +399,12 @@ fn issue_137_block_download_preserves_named_streams_time_and_readonly_hidden_att
     assert_eq!(copied.created, before.created);
     assert_eq!(copied.modified, before.modified);
     assert_eq!(
+        // SAFETY: The destination path is NUL-terminated and the temporary UTF-16 buffer outlives this attribute query.
         unsafe { GetFileAttributesW(wide(&destination).as_ptr()) }
             & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_READONLY),
         FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_READONLY
     );
+    // SAFETY: Both test paths remain valid NUL-terminated temporary buffers for their respective synchronous cleanup calls.
     unsafe {
         SetFileAttributesW(wide(&source).as_ptr(), FILE_ATTRIBUTE_NORMAL);
         SetFileAttributesW(wide(&destination).as_ptr(), FILE_ATTRIBUTE_NORMAL);

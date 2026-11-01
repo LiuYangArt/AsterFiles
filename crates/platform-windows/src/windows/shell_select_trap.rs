@@ -116,6 +116,8 @@ fn run_launch_request(
             if result.is_err()
                 && let Some(hwnd) = receiver_hwnd
             {
+                // SAFETY: PostMessageW copies this pointer-free WM_CLOSE payload; the borrowed HWND
+                // may be rejected if already destroyed.
                 unsafe {
                     let _ = PostMessageW(Some(HWND(hwnd as _)), WM_CLOSE, WPARAM(0), LPARAM(0));
                 }
@@ -159,6 +161,8 @@ impl ShellSelectTrap {
         let ole = OleGuard::new()?;
         let inner = Rc::new(Inner {
             hwnd: Cell::new(HWND(ptr::null_mut())),
+            // SAFETY: GetCurrentThreadId takes no pointers and identifies the STA that owns Inner and
+            // its hidden window.
             owner_thread: unsafe { GetCurrentThreadId() },
             started: Instant::now(),
             folder: folder.to_path_buf(),
@@ -208,6 +212,8 @@ impl ShellSelectTrap {
     }
 
     fn pump(&self, timeout: Duration) {
+        // SAFETY: IsWindow only queries the stored handle; the Rc-owned trap keeps window teardown on
+        // this STA.
         if self.selected().is_none() && unsafe { IsWindow(Some(self.inner.hwnd.get())) }.as_bool() {
             pump_until_select_or_timeout(self.inner.hwnd.get(), timeout);
         }
@@ -231,6 +237,7 @@ fn capture_shell_select(
 }
 
 fn register_pending_shell_window(inner: &Rc<Inner>, folder: &Path) -> Result<(), String> {
+    // SAFETY: OleGuard initialized this STA, and the IShellWindows interface remains confined to it.
     let shell_windows: IShellWindows = unsafe { CoCreateInstance(&ShellWindows, None, CLSCTX_ALL) }
         .map_err(|error| error.to_string())?;
     let pidl = parse_pidl(folder).ok_or_else(|| "folder-pidl".to_owned())?;
@@ -238,13 +245,19 @@ fn register_pending_shell_window(inner: &Rc<Inner>, folder: &Path) -> Result<(),
 
     let mut location = pidl_variant(pidl).map_err(|error| error.to_string())?;
     let mut unused = VARIANT::default();
+    // SAFETY: GetCurrentThreadId has no pointer preconditions and records the registration's owning
+    // STA.
     let thread_id = unsafe { GetCurrentThreadId() } as i32;
     let pending =
+        // SAFETY: The STA interface and both VARIANT values remain live; location owns a copied PIDL
+        // payload.
         unsafe { shell_windows.RegisterPending(thread_id, &location, &unused, SWC_BROWSER) }
             .map_err(|error| error.to_string())?;
     inner.pending_cookie.set(pending);
     inner.pending_registered.set(true);
     *inner.shell_windows.borrow_mut() = Some(shell_windows);
+    // SAFETY: Both VARIANTs were initialized locally and are no longer needed by the completed
+    // registration call.
     unsafe {
         let _ = VariantClear(&mut location);
         let _ = VariantClear(&mut unused);
@@ -263,11 +276,17 @@ fn complete_shell_window_register(inner: &Rc<Inner>, dispatch: &IDispatch) -> Re
     }
     let mut location = pidl_variant(pidl).map_err(|error| error.to_string())?;
     let hwnd = inner.hwnd.get().0 as i32;
+    // SAFETY: dispatch and the hidden HWND remain owned by the trap on this STA throughout
+    // registration.
     let cookie = unsafe { shell_windows.Register(dispatch, hwnd, SWC_BROWSER) }
         .map_err(|error| error.to_string())?;
     inner.register_cookie.set(cookie);
     inner.window_registered.set(true);
+    // SAFETY: cookie came from successful registration and location owns the PIDL bytes during the
+    // synchronous call.
     unsafe { shell_windows.OnNavigate(cookie, &location) }.map_err(|error| error.to_string())?;
+    // SAFETY: location is an initialized local VARIANT and OnNavigate has completed before its
+    // contents are cleared.
     unsafe {
         let _ = VariantClear(&mut location);
     }
@@ -280,11 +299,15 @@ fn parse_pidl(path: &Path) -> Option<*mut ITEMIDLIST> {
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
+    // SAFETY: OleGuard has initialized the current STA; the returned desktop interface stays on that
+    // thread.
     let desktop = unsafe { SHGetDesktopFolder() }.ok()?;
     let mut pidl = ptr::null_mut();
     let mut attributes = 0;
     // Files uses the desktop IShellFolder parser. It preserves filesystem PIDLs
     // for known folders, which lets IShellWindows match the caller's folder.
+    // SAFETY: wide is terminated UTF-16, output storage is writable, and the desktop interface is
+    // retained on this STA.
     unsafe {
         desktop
             .ParseDisplayName(
@@ -301,7 +324,11 @@ fn parse_pidl(path: &Path) -> Option<*mut ITEMIDLIST> {
 }
 
 fn pidl_variant(pidl: *mut ITEMIDLIST) -> windows::core::Result<VARIANT> {
+    // SAFETY: Callers pass a non-null Shell-created PIDL retained by the trap or probe until this
+    // copy finishes.
     let size = unsafe { ILGetSize(Some(pidl)) };
+    // SAFETY: size describes that live PIDL allocation; InitVariantFromBuffer copies its bytes into
+    // an owned VARIANT.
     unsafe { InitVariantFromBuffer(pidl.cast(), size) }
 }
 
@@ -309,7 +336,11 @@ fn pidl_to_path(pidl: *const ITEMIDLIST) -> Option<PathBuf> {
     if pidl.is_null() {
         return None;
     }
+    // SAFETY: pidl is a non-null Shell allocation or live combined PIDL and remains allocated during
+    // item creation.
     let item: IShellItem = unsafe { SHCreateItemFromIDList(pidl) }.ok()?;
+    // SAFETY: item is retained on the current STA; the returned Shell string is consumed and freed by
+    // take_shell_path.
     let value = unsafe { item.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING) }.ok()?;
     Some(take_shell_path(value))
 }
@@ -319,14 +350,20 @@ fn take_shell_path(value: PWSTR) -> PathBuf {
         return PathBuf::new();
     }
     let mut length = 0;
+    // SAFETY: value is a non-null, terminated Shell string returned by
+    // GetDisplayName/SHGetKnownFolderPath.
     unsafe {
         while *value.0.add(length) != 0 {
             length += 1;
         }
     }
+    // SAFETY: The preceding scan found the terminator inside this live Shell string; length excludes
+    // that terminator.
     let path = PathBuf::from(OsString::from_wide(unsafe {
         std::slice::from_raw_parts(value.0, length)
     }));
+    // SAFETY: The Shell string has been copied into an owned path and is freed once with its matching
+    // COM allocator.
     unsafe { CoTaskMemFree(Some(value.0.cast())) };
     path
 }
@@ -337,11 +374,15 @@ fn long_path(path: &Path) -> PathBuf {
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
+    // SAFETY: wide is terminated UTF-16; a null output with zero capacity requests only the required
+    // size.
     let needed = unsafe { GetLongPathNameW(wide.as_ptr(), ptr::null_mut(), 0) };
     if needed == 0 {
         return path.to_path_buf();
     }
     let mut buffer = vec![0; needed as usize];
+    // SAFETY: buffer has exactly needed UTF-16 slots; both input and output remain alive for the
+    // synchronous call.
     let written = unsafe { GetLongPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), needed) };
     if written == 0 || written >= needed {
         return path.to_path_buf();
@@ -392,6 +433,8 @@ fn rebase_selected_onto_folder(folder: &Path, selected: &Path) -> PathBuf {
 
 fn pump_until_select_or_timeout(hwnd: HWND, timeout: Duration) {
     let millis = timeout.as_millis().min(u32::MAX as u128) as u32;
+    // SAFETY: hwnd belongs to this STA; message is writable and only retrieved messages are
+    // dispatched before timer removal.
     unsafe {
         if SetTimer(Some(hwnd), TIMER_ID, millis, None) == 0 {
             crate::operation_audit::record("shell-select-trap", "timer-failed");
@@ -412,10 +455,14 @@ fn register_class() -> Option<Vec<u16>> {
         cbSize: mem::size_of::<WNDCLASSEXW>() as u32,
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(trap_wnd_proc),
+        // SAFETY: A null module name borrows the current executable's module; the call neither
+        // unloads nor transfers it.
         hInstance: HINSTANCE(unsafe { GetModuleHandleW(ptr::null()) }),
         lpszClassName: PCWSTR(class.as_ptr()),
         ..Default::default()
     };
+    // SAFETY: wnd_class has the required size, a system-ABI callback and a class name retained
+    // through registration.
     let atom = unsafe { RegisterClassExW(&wnd_class) };
     if atom == 0 {
         let error = std::io::Error::last_os_error();
@@ -428,6 +475,8 @@ fn register_class() -> Option<Vec<u16>> {
 
 fn create_trap_window(class: &[u16]) -> Option<HWND> {
     let title = wide("AsterFiles Shell Select");
+    // SAFETY: class/title are terminated UTF-16 and the registered system-ABI window procedure
+    // remains available.
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -448,6 +497,8 @@ fn create_trap_window(class: &[u16]) -> Option<HWND> {
     if hwnd.0.is_null() {
         None
     } else {
+        // SAFETY: The newly created HWND is live; the cloak attribute reads one i32 matching the
+        // explicit byte size.
         unsafe {
             let cloak: i32 = 1;
             let _ = windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute(
@@ -469,19 +520,26 @@ extern "system" fn trap_wnd_proc(
 ) -> LRESULT {
     match message {
         WM_CLOSE => {
+            // SAFETY: Windows invoked this procedure on the owning thread; hwnd is its live window
+            // until this WM_CLOSE is handled.
             unsafe {
                 let _ = DestroyWindow(hwnd);
             }
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == TIMER_ID => {
+            // SAFETY: PostQuitMessage posts to this callback's current thread and takes no pointers.
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
         WM_DESTROY => {
+            // SAFETY: The destroy callback runs on the window's owner; PostQuitMessage only affects
+            // that thread's queue.
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
+        // SAFETY: This callback forwards Windows' unchanged HWND and message payload to the default
+        // window procedure.
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }
 }
@@ -513,11 +571,15 @@ impl Inner {
         if folder.is_null() {
             return None;
         }
+        // SAFETY: folder is retained by ShellWindowGuard and pidl_item is borrowed from the current
+        // Shell SelectItem callback.
         let combined = unsafe { ILCombine(Some(folder), Some(pidl_item)) };
         if combined.is_null() {
             return None;
         }
         let path = pidl_to_path(combined.cast_const());
+        // SAFETY: combined is ILCombine's owned allocation; pidl_to_path finished borrowing it before
+        // this single free.
         unsafe { CoTaskMemFree(Some(combined.cast())) };
         // Shell parsing names expand 8.3 components; keep the Folder Open identity.
         path.filter(|path| !path.as_os_str().is_empty())
@@ -529,6 +591,8 @@ struct OleGuard(bool);
 
 impl OleGuard {
     fn new() -> Option<Self> {
+        // SAFETY: OLE initialization is confined to the trap's STA and every success is balanced by
+        // OleGuard.
         match unsafe { OleInitialize(None) } {
             Ok(()) => Some(Self(true)),
             Err(error) if error.code() == RPC_E_CHANGED_MODE => None,
@@ -540,6 +604,8 @@ impl OleGuard {
 impl Drop for OleGuard {
     fn drop(&mut self) {
         if self.0 {
+            // SAFETY: This guard represents a successful OleInitialize on the same thread and
+            // outlives the Shell objects.
             unsafe { OleUninitialize() };
         }
     }
@@ -552,6 +618,8 @@ struct WindowGuard {
 
 impl Drop for WindowGuard {
     fn drop(&mut self) {
+        // SAFETY: The guard owns this HWND and terminated class name; teardown runs on their creating
+        // STA.
         unsafe {
             let _ = DestroyWindow(self.hwnd);
             let _ = UnregisterClassW(PCWSTR(self.class.as_ptr()), None);
@@ -568,16 +636,22 @@ impl Drop for ShellWindowGuard {
         let shell_windows = self.inner.shell_windows.borrow();
         if let Some(shell_windows) = shell_windows.as_ref() {
             if self.inner.window_registered.replace(false) {
+                // SAFETY: The live STA interface owns the saved successful registration;
+                // replace(false) prevents a second revoke.
                 let _ = unsafe { shell_windows.Revoke(self.inner.register_cookie.get()) };
             }
             if self.inner.pending_registered.replace(false)
                 && self.inner.pending_cookie.get() != self.inner.register_cookie.get()
             {
+                // SAFETY: This is a separate successful pending registration, not already revoked via
+                // the completed cookie.
                 let _ = unsafe { shell_windows.Revoke(self.inner.pending_cookie.get()) };
             }
         }
         let pidl = self.inner.folder_pidl.replace(ptr::null_mut());
         if !pidl.is_null() {
+            // SAFETY: Replacing the stored PIDL with null takes its sole allocation ownership;
+            // Shell registrations received copied VARIANT/PIDL data rather than borrowing this allocation.
             unsafe { CoTaskMemFree(Some(pidl.cast())) };
         }
     }
@@ -714,6 +788,8 @@ impl IWebBrowser_Impl for ShellSelectHost_Impl {
 #[allow(non_snake_case)]
 impl IWebBrowserApp_Impl for ShellSelectHost_Impl {
     fn Quit(&self) -> windows::core::Result<()> {
+        // SAFETY: The pointer-free WM_CLOSE is posted to the trap's borrowed HWND; PostMessageW does
+        // not retain Rust memory.
         unsafe { PostMessageW(Some(self.inner.hwnd.get()), WM_CLOSE, WPARAM(0), LPARAM(0)) }
     }
     fn ClientToWindow(&self, pcx: *mut i32, pcy: *mut i32) -> windows::core::Result<()> {
@@ -789,6 +865,8 @@ impl IServiceProvider_Impl for ShellSelectHost_Impl {
         riid: *const GUID,
         ppvobject: *mut *mut c_void,
     ) -> windows::core::Result<()> {
+        // SAFETY: COM supplies readable riid and writable ppvobject storage; null output is rejected
+        // before QueryInterface.
         unsafe {
             if ppvobject.is_null() {
                 return Err(E_POINTER.into());
@@ -876,13 +954,19 @@ impl IShellView_Impl for ShellSelectHost_Impl {
                 format!(
                     "owner_thread={} callback_thread={} elapsed_ms={} target={path:?}",
                     self.inner.owner_thread,
+                    // SAFETY: GetCurrentThreadId takes no pointers and records the thread executing
+                    // this COM callback.
                     unsafe { GetCurrentThreadId() },
                     self.inner.started.elapsed().as_millis()
                 ),
             );
+            // SAFETY: GetCurrentThreadId has no pointer preconditions; the non-agile host is expected
+            // to run on its owning STA.
             debug_assert_eq!(self.inner.owner_thread, unsafe { GetCurrentThreadId() });
             *self.inner.selected.borrow_mut() = Some(path);
             // Match Files: wake the HWND owner, never a COM caller's message queue.
+            // SAFETY: WM_CLOSE contains no borrowed pointers and targets the HWND owned by this
+            // non-agile Shell host.
             unsafe { PostMessageW(Some(self.inner.hwnd.get()), WM_CLOSE, WPARAM(0), LPARAM(0)) }?;
         }
         Ok(())
@@ -895,6 +979,8 @@ impl IShellView_Impl for ShellSelectHost_Impl {
         ppv: *mut *mut c_void,
     ) -> windows::core::Result<()> {
         if !ppv.is_null() {
+            // SAFETY: COM supplies writable interface-output storage; the explicit null check
+            // precedes this store.
             unsafe { *ppv = ptr::null_mut() };
         }
         Err(E_NOINTERFACE.into())
@@ -926,12 +1012,16 @@ mod tests {
             .encode_wide()
             .chain(Some(0))
             .collect::<Vec<_>>();
+        // SAFETY: wide is terminated UTF-16 and retained during PIDL creation; callers free the
+        // returned Shell allocation.
         let pidl = unsafe { ILCreateFromPathW(PCWSTR(wide.as_ptr())) };
         assert!(!pidl.is_null(), "caller could not create a filesystem PIDL");
         pidl
     }
 
     fn downloads_dir() -> PathBuf {
+        // SAFETY: The known-folder GUID is static and the output is an owned Shell string consumed by
+        // take_shell_path.
         let path = unsafe {
             SHGetKnownFolderPath(&FOLDERID_Downloads, KF_FLAG_DEFAULT, None)
                 .expect("Downloads known folder is available")
@@ -1000,13 +1090,23 @@ mod tests {
                 let pidl = caller_pidl(&opener_file);
                 let opened = if with_child_array {
                     let parent = caller_pidl(opener_file.parent().unwrap());
+                    // SAFETY: pidl is the opener's live Shell allocation; the returned last-child
+                    // pointer borrows that allocation.
                     let child = unsafe { ILFindLastID(pidl) };
+                    // SAFETY: parent and child PIDLs stay allocated through this synchronous Shell
+                    // call on an OLE-initialized thread.
                     let result = unsafe { SHOpenFolderAndSelectItems(parent, Some(&[child]), 0) };
+                    // SAFETY: parent is the opener's owned Shell allocation and the completed call no
+                    // longer borrows it.
                     unsafe { CoTaskMemFree(Some(parent.cast())) };
                     result
                 } else {
+                    // SAFETY: pidl is a live Shell allocation on this OLE-initialized thread; no
+                    // child-array pointer is supplied.
                     unsafe { SHOpenFolderAndSelectItems(pidl, None, 0) }
                 };
+                // SAFETY: pidl is owned by this opener and all calls using it or its borrowed child
+                // have completed.
                 unsafe { CoTaskMemFree(Some(pidl.cast())) };
                 opened
             })

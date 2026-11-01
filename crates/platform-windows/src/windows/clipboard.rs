@@ -67,6 +67,7 @@ pub struct ClipboardFileList {
 }
 
 pub fn sequence_number() -> u32 {
+    // SAFETY: This query takes no pointers and does not require opening the clipboard.
     unsafe { GetClipboardSequenceNumber() }
 }
 
@@ -109,6 +110,7 @@ impl ClipboardListener {
     fn stop(&mut self) {
         if self.hwnd != 0 {
             let hwnd = windows::Win32::Foundation::HWND(self.hwnd as *mut _);
+            // SAFETY: The listener owns this message-only window until its thread handles WM_CLOSE; no pointers are posted.
             let _ = unsafe {
                 PostMessageW(
                     Some(hwnd),
@@ -143,6 +145,7 @@ fn listener_thread(
     let sender = Box::new(event_sender);
     let sender_pointer = Box::into_raw(sender);
     let class_name = wide(LISTENER_CLASS);
+    // SAFETY: The class is registered, class_name stays NUL-terminated through creation, and the boxed sender becomes window userdata.
     let window = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -160,16 +163,20 @@ fn listener_thread(
         )
     };
     let Ok(window) = window else {
+        // SAFETY: Creation failed without transferring the boxed sender to a live listener window.
         unsafe { drop(Box::from_raw(sender_pointer)) };
         let _ = ready_sender.send(Err(io::Error::last_os_error()));
         return;
     };
+    // SAFETY: window was created on this thread and remains alive until its WM_CLOSE handler destroys it.
     if let Err(error) = unsafe { AddClipboardFormatListener(window) } {
+        // SAFETY: This thread owns the just-created window; destruction releases its sender in WM_NCDESTROY.
         let _ = unsafe { DestroyWindow(window) };
         let _ = ready_sender.send(Err(windows_error(error)));
         return;
     }
     let _ = ready_sender.send(Ok(window.0 as isize));
+    // SAFETY: The live window owns the boxed sender; MSG is writable and all messages are dispatched on its creating thread.
     unsafe {
         let sender = GetWindowLongPtrW(window, GWLP_USERDATA) as *const mpsc::Sender<u32>;
         if !sender.is_null() {
@@ -193,6 +200,7 @@ fn listener_class() -> u16 {
             lpszClassName: windows::core::PCWSTR(class_name.as_ptr()),
             ..Default::default()
         };
+        // SAFETY: class has the required size, a system-ABI callback, and a NUL-terminated class name alive through registration.
         unsafe { RegisterClassExW(&class) }
     })
 }
@@ -204,31 +212,40 @@ unsafe extern "system" fn listener_window_proc(
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
     if message == WM_NCCREATE {
+        // SAFETY: Windows supplies a valid CREATESTRUCTW pointer only for WM_NCCREATE, which is checked above.
         let create = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
+        // SAFETY: The creating thread stores the sender pointer supplied by listener_thread without dereferencing it.
         unsafe { SetWindowLongPtrW(window, GWLP_USERDATA, create.lpCreateParams as isize) };
         return windows::Win32::Foundation::LRESULT(1);
     }
+    // SAFETY: Windows invokes this callback with its window; userdata is either unset or the sender installed at WM_NCCREATE.
     let sender = unsafe { GetWindowLongPtrW(window, GWLP_USERDATA) as *mut mpsc::Sender<u32> };
     match message {
         WM_CLIPBOARDUPDATE if !sender.is_null() => {
+            // SAFETY: The nonnull userdata still owns its sender until this thread processes WM_NCDESTROY.
             let _ = unsafe { (*sender).send(sequence_number()) };
             windows::Win32::Foundation::LRESULT(0)
         }
         WM_CLOSE => {
+            // SAFETY: WM_CLOSE runs on the listener window thread before that window is destroyed.
             let _ = unsafe { RemoveClipboardFormatListener(window) };
+            // SAFETY: This callback is executing on the thread that owns the listener window.
             let _ = unsafe { DestroyWindow(window) };
             windows::Win32::Foundation::LRESULT(0)
         }
         WM_NCDESTROY => {
             if !sender.is_null() {
+                // SAFETY: WM_NCDESTROY runs once; clearing userdata prevents another access before reclaiming the original Box.
                 unsafe {
                     SetWindowLongPtrW(window, GWLP_USERDATA, 0);
                     drop(Box::from_raw(sender));
                 }
             }
+            // SAFETY: The listener callback posts quit only to its own message-loop thread.
             unsafe { PostQuitMessage(0) };
             windows::Win32::Foundation::LRESULT(0)
         }
+        // SAFETY: Unconsumed message arguments are forwarded unchanged to the system window procedure.
         _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
     }
 }
@@ -260,6 +277,7 @@ pub fn write_file_list(paths: &[PathBuf], operation: ClipboardOperation) -> io::
         ],
     });
 
+    // SAFETY: The local OLE apartment and data object outlive both clipboard calls; flushing materializes the offered bytes.
     retry_clipboard(|| unsafe {
         OleSetClipboard(&data_object)?;
         OleFlushClipboard()
@@ -299,14 +317,17 @@ fn read_stable_file_list_snapshot() -> io::Result<(u32, Option<ClipboardFileList
 fn clear_clipboard_if_sequence(expected_sequence: u32) -> io::Result<bool> {
     let mut last_error = None;
     for attempt in 0..CLIPBOARD_RETRIES {
+        // SAFETY: No window pointer is supplied; a successful call grants this thread clipboard access until CloseClipboard.
         match unsafe { OpenClipboard(None) } {
             Ok(()) => {
                 let matches = sequence_number() == expected_sequence;
                 let result = if matches {
+                    // SAFETY: OpenClipboard succeeded on this thread and the sequence still matches the cut snapshot.
                     unsafe { EmptyClipboard() }.map(|()| true)
                 } else {
                     Ok(false)
                 };
+                // SAFETY: This thread owns the successful OpenClipboard call and closes it exactly once on this path.
                 let close_result = unsafe { CloseClipboard() };
                 return result
                     .and_then(|cleared| close_result.map(|()| cleared))
@@ -327,6 +348,7 @@ pub fn write_text(value: &std::ffi::OsStr) -> io::Result<()> {
     let data_object = IDataObject::from(ClipboardDataObject {
         formats: vec![(CF_UNICODETEXT, bytes)],
     });
+    // SAFETY: The initialized OLE apartment and owned text data object remain alive until both calls finish.
     retry_clipboard(|| unsafe {
         OleSetClipboard(&data_object)?;
         OleFlushClipboard()
@@ -350,9 +372,11 @@ fn read_file_list_from_current() -> io::Result<Option<ClipboardFileList>> {
     let data_object = retry_get_clipboard().map_err(windows_error)?;
 
     let drop_format = format_etc(CF_HDROP);
+    // SAFETY: The OLE-owned data object is alive and drop_format is a fully initialized CF_HDROP request.
     if unsafe { data_object.QueryGetData(&drop_format) }.is_err() {
         return Ok(None);
     }
+    // SAFETY: The live OLE object receives a borrowed initialized FORMATETC; the returned medium is immediately guarded.
     let drop_medium = unsafe { data_object.GetData(&drop_format) }.map_err(windows_error)?;
     let drop_medium = StgMediumGuard::new(drop_medium);
     let paths = read_dropfiles(drop_medium.medium())?;
@@ -377,6 +401,7 @@ fn retry_clipboard(mut action: impl FnMut() -> windows::core::Result<()>) -> io:
 fn retry_get_clipboard() -> windows::core::Result<IDataObject> {
     let mut last_error = None;
     for attempt in 0..CLIPBOARD_RETRIES {
+        // SAFETY: Callers keep OleApartment alive on this thread; successful calls return an owned COM interface.
         match unsafe { OleGetClipboard() } {
             Ok(data_object) => return Ok(data_object),
             Err(error) => last_error = Some(error),
@@ -404,6 +429,7 @@ fn encode_dropfiles(paths: &[PathBuf]) -> io::Result<Vec<u8>> {
         fNC: false.into(),
         fWide: true.into(),
     };
+    // SAFETY: bytes has room for the header and all UTF-16 units; both sources are separate live allocations.
     unsafe {
         ptr::copy_nonoverlapping(
             (&header as *const DROPFILES).cast::<u8>(),
@@ -423,16 +449,21 @@ fn read_dropfiles(medium: &STGMEDIUM) -> io::Result<Vec<PathBuf>> {
     if medium.tymed != TYMED_HGLOBAL.0 as u32 {
         return Err(io::Error::other("clipboard file list is not HGLOBAL data"));
     }
+    // SAFETY: The checked TYMED_HGLOBAL tag selects hGlobal; the surrounding guard retains ownership.
     let handle = unsafe { medium.u.hGlobal };
+    // SAFETY: The noninvalid HGLOBAL remains owned by the medium while its allocation size is queried.
     if handle.is_invalid() || unsafe { GlobalSize(handle) } < size_of::<DROPFILES>() {
         return Err(io::Error::other("clipboard file list is malformed"));
     }
     let drop_handle = HDROP(handle.0);
+    // SAFETY: The CF_HDROP medium owns this handle until all file queries finish.
     let count = unsafe { DragQueryFileW(drop_handle, u32::MAX, None) };
     let mut paths = Vec::with_capacity(count as usize);
     for index in 0..count {
+        // SAFETY: index is below the file count reported for this still-owned CF_HDROP handle.
         let length = unsafe { DragQueryFileW(drop_handle, index, None) };
         let mut buffer = vec![0_u16; length as usize + 1];
+        // SAFETY: buffer includes the queried UTF-16 length plus its terminator and remains writable during the call.
         let copied = unsafe { DragQueryFileW(drop_handle, index, Some(&mut buffer)) };
         if copied == 0 && length != 0 {
             return Err(io::Error::last_os_error());
@@ -457,6 +488,7 @@ fn validate_path(path: &Path) -> io::Result<()> {
 
 fn preferred_drop_effect_format() -> io::Result<u16> {
     let name = "Preferred DropEffect\0".encode_utf16().collect::<Vec<_>>();
+    // SAFETY: name contains a terminating NUL and remains allocated until registration returns.
     let format = unsafe { RegisterClipboardFormatW(PCWSTR(name.as_ptr())) };
     if format == 0 {
         Err(io::Error::last_os_error())
@@ -467,20 +499,26 @@ fn preferred_drop_effect_format() -> io::Result<u16> {
 
 fn read_drop_effect(data_object: &IDataObject) -> Option<ClipboardOperation> {
     let format = format_etc(preferred_drop_effect_format().ok()?);
+    // SAFETY: The live data object receives an initialized HGLOBAL format request; its result is immediately guarded.
     let medium = unsafe { data_object.GetData(&format) }.ok()?;
     let medium = StgMediumGuard::new(medium);
     if medium.medium().tymed != TYMED_HGLOBAL.0 as u32 {
         return None;
     }
+    // SAFETY: The medium tag was checked as TYMED_HGLOBAL and its guard retains the allocation.
     let handle = unsafe { medium.medium().u.hGlobal };
+    // SAFETY: The guarded noninvalid handle remains alive while checking that a u32 fits.
     if handle.is_invalid() || unsafe { GlobalSize(handle) } < size_of::<u32>() {
         return None;
     }
+    // SAFETY: The guarded HGLOBAL has at least four bytes and stays owned while the lock is held.
     let pointer = unsafe { GlobalLock(handle) }.cast::<u32>();
     if pointer.is_null() {
         return None;
     }
+    // SAFETY: GlobalLock returned nonnull storage of at least size_of::<u32>(); read_unaligned imposes no alignment requirement.
     let effect = unsafe { pointer.read_unaligned() };
+    // SAFETY: This balances the successful GlobalLock after the effect value has been copied out.
     let _ = unsafe { GlobalUnlock(handle) };
     if effect & DROPEFFECT_MOVE != 0 {
         Some(ClipboardOperation::Move)
@@ -500,13 +538,18 @@ fn format_etc(format: u16) -> FORMATETC {
 }
 
 fn allocate_medium(bytes: &[u8]) -> windows::core::Result<STGMEDIUM> {
+    // SAFETY: The requested allocation size matches bytes.len(); ownership is transferred only after initialization.
     let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes.len()) }?;
+    // SAFETY: memory is the newly allocated movable HGLOBAL and has not been freed or transferred.
     let pointer = unsafe { GlobalLock(memory) }.cast::<u8>();
     if pointer.is_null() {
+        // SAFETY: The failed lock left this allocation owned locally, so no STGMEDIUM will free it.
         unsafe { GlobalFree(memory.0 as _) };
         return Err(WindowsError::from_thread());
     }
+    // SAFETY: The locked allocation has bytes.len() bytes and cannot overlap the borrowed source slice.
     unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), pointer, bytes.len()) };
+    // SAFETY: The successful lock is balanced after copying; the returned medium takes allocation ownership.
     let _ = unsafe { GlobalUnlock(memory) };
     Ok(STGMEDIUM {
         tymed: TYMED_HGLOBAL.0 as u32,
@@ -523,6 +566,7 @@ struct OleApartment;
 
 impl OleApartment {
     fn initialize() -> io::Result<Self> {
+        // SAFETY: OLE is initialized on the current thread; only success constructs the guard that later uninitializes it.
         unsafe { OleInitialize(None) }
             .map(|()| Self)
             .map_err(windows_error)
@@ -531,6 +575,7 @@ impl OleApartment {
 
 impl Drop for OleApartment {
     fn drop(&mut self) {
+        // SAFETY: This guard was constructed only by a successful OleInitialize and is dropped on its calling thread.
         unsafe { OleUninitialize() };
     }
 }
@@ -549,6 +594,7 @@ impl StgMediumGuard {
 
 impl Drop for StgMediumGuard {
     fn drop(&mut self) {
+        // SAFETY: The guard uniquely owns this GetData result and releases it once after all borrowed reads finish.
         unsafe { ReleaseStgMedium(&mut self.0) };
     }
 }
@@ -561,6 +607,7 @@ struct ClipboardDataObject {
 #[allow(non_snake_case)]
 impl IDataObject_Impl for ClipboardDataObject_Impl {
     fn GetData(&self, format: *const FORMATETC) -> windows::core::Result<STGMEDIUM> {
+        // SAFETY: The COM caller supplies a readable FORMATETC for this call; null is rejected before borrowing.
         let format = unsafe { format.as_ref() }.ok_or_else(|| WindowsError::from(E_NOTIMPL))?;
         self.formats
             .iter()
@@ -578,6 +625,7 @@ impl IDataObject_Impl for ClipboardDataObject_Impl {
     }
 
     fn QueryGetData(&self, format: *const FORMATETC) -> HRESULT {
+        // SAFETY: The COM caller keeps the input FORMATETC valid for the call; null is handled without dereferencing.
         let Some(format) = (unsafe { format.as_ref() }) else {
             return DV_E_FORMATETC;
         };
@@ -593,6 +641,7 @@ impl IDataObject_Impl for ClipboardDataObject_Impl {
     }
 
     fn GetCanonicalFormatEtc(&self, _input: *const FORMATETC, output: *mut FORMATETC) -> HRESULT {
+        // SAFETY: The COM caller supplies writable output storage when nonnull; no reference escapes this callback.
         if let Some(output) = unsafe { output.as_mut() } {
             output.ptd = ptr::null_mut();
         }
@@ -617,6 +666,7 @@ impl IDataObject_Impl for ClipboardDataObject_Impl {
             .iter()
             .map(|(id, _)| format_etc(*id))
             .collect::<Vec<_>>();
+        // SAFETY: All FORMATETC entries have null target-device pointers; the enumerator copies the live input slice.
         unsafe { SHCreateStdEnumFmtEtc(&formats) }
     }
 
@@ -669,6 +719,7 @@ mod tests {
             PathBuf::from(r"\\server\share\two"),
         ];
         let bytes = encode_dropfiles(&paths).unwrap();
+        // SAFETY: encode_dropfiles produced a complete DROPFILES header; read_unaligned handles the byte vector alignment.
         let header = unsafe { bytes.as_ptr().cast::<DROPFILES>().read_unaligned() };
         assert_eq!(header.pFiles as usize, size_of::<DROPFILES>());
         assert!(header.fWide.as_bool());

@@ -193,10 +193,14 @@ mod windows_impl {
                 io::Error::new(io::ErrorKind::InvalidInput, "invalid Shell icon size")
             })?;
         let wide = wide_null(path.as_os_str());
+        // SAFETY: wide is NUL-terminated and alive for parsing; the worker's initialized apartment owns the
+        // resulting typed COM reference.
         let factory: IShellItemImageFactory = unsafe {
             SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).map_err(windows_error)?
         };
         // Ask Shell for the file's own image at the requested size without enlarging a small icon.
+        // SAFETY: The factory is live on its worker apartment; size is positive and the returned HBITMAP is
+        // taken into an owned wrapper.
         let bitmap = unsafe {
             factory
                 .GetImage(
@@ -238,6 +242,8 @@ mod windows_impl {
         let (lookup_name, attributes) = key.lookup();
         let wide_name = wide_null(&lookup_name);
         let mut file_info = SHFILEINFOW::default();
+        // SAFETY: wide_name is NUL-terminated; file_info is a full writable SHFILEINFOW and its returned
+        // icon is owned, not shared.
         let result = unsafe {
             SHGetFileInfoW(
                 PCWSTR(wide_name.as_ptr()),
@@ -267,6 +273,8 @@ mod windows_impl {
         let (lookup_name, attributes) = key.lookup();
         let wide_name = wide_null(&lookup_name);
         let mut file_info = SHFILEINFOW::default();
+        // SAFETY: The NUL-terminated type name and SHFILEINFOW storage remain live; only a system
+        // image-list index is requested.
         let result = unsafe {
             SHGetFileInfoW(
                 PCWSTR(wide_name.as_ptr()),
@@ -283,8 +291,12 @@ mod windows_impl {
         }
         for list_id in [SHIL_LARGE, SHIL_EXTRALARGE, SHIL_JUMBO] {
             let images: IImageList =
+                // SAFETY: The requested SHIL identifier is a documented system list; the returned typed COM
+                // reference stays on this worker.
                 unsafe { SHGetImageList(list_id as i32) }.map_err(windows_error)?;
             let (mut width, mut height) = (0, 0);
+            // SAFETY: The live IImageList writes into two initialized local i32 outputs; no output pointer
+            // escapes the call.
             unsafe { images.GetIconSize(&mut width, &mut height) }.map_err(windows_error)?;
             if width <= 0 || height <= 0 {
                 return Err(io::Error::other(
@@ -292,6 +304,8 @@ mod windows_impl {
                 ));
             }
             if width.min(height) >= size || list_id == SHIL_JUMBO {
+                // SAFETY: file_info.iIcon came from the system list lookup; GetIcon returns an owned copy
+                // that ShellIcon destroys.
                 let icon = unsafe { images.GetIcon(file_info.iIcon, ILD_TRANSPARENT.0) }
                     .map_err(windows_error)?;
                 // Downsample a native larger image; never manufacture detail by scaling up.
@@ -321,6 +335,8 @@ mod windows_impl {
             let handler = wide_null(OsStr::new(handler));
             let mut output = [0_u16; 128];
             let mut length = output.len() as u32;
+            // SAFETY: Both input strings are NUL-terminated; output has length writable UTF-16 units and
+            // NOTRUNCATE rejects insufficient capacity.
             let result = unsafe {
                 AssocQueryStringW(
                     ASSOCF_NOTRUNCATE,
@@ -354,6 +370,8 @@ mod windows_impl {
     ) -> io::Result<ShellThumbnailRgba> {
         use windows::Win32::Foundation::SIZE;
         let wide = wide_null(path.as_os_str());
+        // SAFETY: The NUL-terminated path stays alive during parsing, and the resulting factory is used
+        // only on this COM worker.
         let factory: IShellItemImageFactory = unsafe {
             SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).map_err(windows_error)?
         };
@@ -362,6 +380,8 @@ mod windows_impl {
         } else {
             SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK | SIIGBF_SCALEUP
         };
+        // SAFETY: The live factory receives scalar dimensions and flags; ownership of a successful bitmap
+        // is transferred to Bitmap.
         let bitmap = unsafe {
             factory
                 .GetImage(
@@ -391,6 +411,8 @@ mod windows_impl {
     fn bitmap_to_rgba(bitmap: HBITMAP) -> io::Result<ShellIconRgba> {
         use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
         let mut native = BITMAP::default();
+        // SAFETY: bitmap is held by the caller's Bitmap guard; native is a writable BITMAP with its exact
+        // structure size.
         let read = unsafe {
             GetObjectW(
                 bitmap.into(),
@@ -416,10 +438,14 @@ mod windows_impl {
             ..Default::default()
         };
         let mut pixels = vec![0; width as usize * height as usize * 4];
+        // SAFETY: None requests the screen DC without borrowing a Rust buffer; success is paired with
+        // ReleaseDC below.
         let dc = unsafe { GetDC(None) };
         if dc.is_invalid() {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: The 32-bit top-down header matches pixels' width * height * 4 capacity; bitmap and DC
+        // stay live during extraction.
         let lines = unsafe {
             GetDIBits(
                 dc,
@@ -431,6 +457,8 @@ mod windows_impl {
                 DIB_RGB_COLORS,
             )
         };
+        // SAFETY: dc was acquired for the screen with GetDC(None), and is released once with the same owner
+        // before returning.
         unsafe { ReleaseDC(None, dc) };
         if lines != height as i32 {
             return Err(io::Error::other(
@@ -446,6 +474,8 @@ mod windows_impl {
 
     impl ComInitialization {
         fn new() -> io::Result<Self> {
+            // SAFETY: The reserved argument is null; this worker-local guard records whether OleInitialize
+            // requires a matching uninitialize.
             let result = unsafe { OleInitialize(None) };
             if result.is_ok() {
                 Ok(Self { uninitialize: true })
@@ -467,6 +497,8 @@ mod windows_impl {
     impl Drop for ComInitialization {
         fn drop(&mut self) {
             if self.uninitialize {
+                // SAFETY: Only a successful OleInitialize sets this flag; the guard is dropped on the same
+                // worker after its Shell references.
                 unsafe { OleUninitialize() };
             }
         }
@@ -479,6 +511,8 @@ mod windows_impl {
             let wide_path = wide_null(path.as_os_str());
             let mut file_info = SHFILEINFOW::default();
             let flags = SHGFI_ICON | SHGFI_LARGEICON;
+            // SAFETY: The NUL-terminated path and full-sized file_info are live; SHGFI_ICON yields an icon
+            // owned by ShellIcon on success.
             let result = unsafe {
                 SHGetFileInfoW(
                     PCWSTR(wide_path.as_ptr()),
@@ -492,6 +526,8 @@ mod windows_impl {
                 return Ok(Self(file_info.hIcon));
             }
 
+            // SAFETY: The fallback uses the same live path/output storage; USEFILEATTRIBUTES requests a
+            // type icon without opening the path.
             let result = unsafe {
                 SHGetFileInfoW(
                     PCWSTR(wide_path.as_ptr()),
@@ -511,7 +547,10 @@ mod windows_impl {
         }
 
         fn to_rgba(&self) -> io::Result<ShellIconRgba> {
+            // SAFETY: SM_CXICON is a documented scalar metric; the query retains no pointers or handles.
             let width = unsafe { GetSystemMetrics(SM_CXICON) };
+            // SAFETY: SM_CYICON is a documented scalar metric; its result is checked before allocating the
+            // icon bitmap.
             let height = unsafe { GetSystemMetrics(SM_CYICON) };
             if width <= 0 || height <= 0 {
                 return Err(io::Error::other(format!(
@@ -546,11 +585,14 @@ mod windows_impl {
                 ..Default::default()
             };
             let mut pixel_pointer = ptr::null_mut();
+            // SAFETY: None creates a new memory DC owned by DeviceContext; it is not a borrowed window DC.
             let dc = unsafe { CreateCompatibleDC(None) };
             if dc.is_invalid() {
                 return Err(io::Error::last_os_error());
             }
             let dc = DeviceContext(dc);
+            // SAFETY: The header describes a positive-sized 32-bit DIB with checked byte_len; pixel_pointer
+            // is writable output owned by the returned bitmap.
             let bitmap = unsafe {
                 CreateDIBSection(
                     Some(dc.0),
@@ -563,21 +605,31 @@ mod windows_impl {
             }
             .map_err(windows_error)?;
             if pixel_pointer.is_null() {
+                // SAFETY: The successful CreateDIBSection bitmap has not been selected or wrapped yet; this
+                // failure path deletes it once.
                 let _ = unsafe { DeleteObject(bitmap.into()) };
                 return Err(io::Error::other(
                     "CreateDIBSection returned no pixel buffer",
                 ));
             }
             let bitmap = Bitmap(bitmap);
+            // SAFETY: Both the memory DC and DIB are owned and live; the previous selection is saved for
+            // restoration before either is destroyed.
             let previous = unsafe { SelectObject(dc.0, bitmap.0.into()) };
             if previous.is_invalid() {
                 return Err(io::Error::last_os_error());
             }
             let selection = BitmapSelection { dc: dc.0, previous };
 
+            // SAFETY: CreateDIBSection supplied this non-null writable buffer for the checked byte_len, and
+            // Bitmap keeps the allocation alive.
             unsafe { ptr::write_bytes(pixel_pointer.cast::<u8>(), 0, byte_len) };
+            // SAFETY: The live icon is drawn into the selected positive-sized owned DIB; all native
+            // resources remain alive through the call.
             unsafe { DrawIconEx(dc.0, 0, 0, self.0, width, height, 0, None, DI_NORMAL) }
                 .map_err(windows_error)?;
+            // SAFETY: The selected DIB allocation still owns byte_len initialized bytes; to_vec copies them
+            // before the selection and bitmap are released.
             let pixels = unsafe {
                 std::slice::from_raw_parts(pixel_pointer.cast::<u8>(), byte_len).to_vec()
             };
@@ -592,6 +644,8 @@ mod windows_impl {
     impl Drop for ShellIcon {
         fn drop(&mut self) {
             if !self.0.is_invalid() {
+                // SAFETY: ShellIcon owns this non-shared icon from SHGetFileInfoW or IImageList::GetIcon,
+                // and destroys it only once.
                 let _ = unsafe { DestroyIcon(self.0) };
             }
         }
@@ -602,6 +656,8 @@ mod windows_impl {
     impl Drop for DeviceContext {
         fn drop(&mut self) {
             if !self.0.is_invalid() {
+                // SAFETY: DeviceContext owns this memory DC from CreateCompatibleDC; selection restoration
+                // precedes its single DeleteDC.
                 let _ = unsafe { DeleteDC(self.0) };
             }
         }
@@ -612,6 +668,8 @@ mod windows_impl {
     impl Drop for Bitmap {
         fn drop(&mut self) {
             if !self.0.is_invalid() {
+                // SAFETY: Bitmap uniquely owns this HBITMAP; any selection guard drops before deletion.
+                // Shell-returned bitmaps are never selected into a DC here.
                 let _ = unsafe { DeleteObject(self.0.into()) };
             }
         }
@@ -625,6 +683,8 @@ mod windows_impl {
     impl Drop for BitmapSelection {
         fn drop(&mut self) {
             if !self.dc.is_invalid() && !self.previous.is_invalid() {
+                // SAFETY: previous is the original object borrowed from this live DC; restoring it ends the
+                // DIB selection before bitmap destruction.
                 unsafe { SelectObject(self.dc, self.previous) };
             }
         }

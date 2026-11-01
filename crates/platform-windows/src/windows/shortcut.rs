@@ -19,10 +19,13 @@ pub fn create_shortcut(source: &Path, destination: &Path) -> io::Result<()> {
     let _apartment = ComApartment::initialize()?;
     let source = wide(source)?;
     let destination = wide(destination)?;
+    // SAFETY: The local guard retains this thread STA; the requested ShellLink object is returned as an owned IShellLinkW interface.
     let link: IShellLinkW = unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }
         .map_err(windows_error)?;
+    // SAFETY: link stays on its owning COM thread and source is a live NUL-terminated UTF-16 path for this synchronous call.
     unsafe { link.SetPath(PCWSTR(source.as_ptr())) }.map_err(windows_error)?;
     let persist: IPersistFile = link.cast().map_err(windows_error)?;
+    // SAFETY: persist stays on the initialized thread; destination is NUL-terminated and live until the synchronous save returns.
     unsafe { persist.Save(PCWSTR(destination.as_ptr()), true) }.map_err(windows_error)
 }
 
@@ -75,6 +78,7 @@ fn windows_error(error: windows::core::Error) -> io::Error {
 struct ComApartment;
 impl ComApartment {
     fn initialize() -> io::Result<Self> {
+        // SAFETY: COM initialization is local to this thread; a guard is constructed only for a successful result that must be balanced.
         unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
             .ok()
             .map_err(windows_error)?;
@@ -83,6 +87,7 @@ impl ComApartment {
 }
 impl Drop for ComApartment {
     fn drop(&mut self) {
+        // SAFETY: The local guard drops on its initializing thread and balances exactly one successful CoInitializeEx call.
         unsafe { CoUninitialize() };
     }
 }

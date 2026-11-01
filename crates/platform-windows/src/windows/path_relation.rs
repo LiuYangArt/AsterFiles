@@ -42,6 +42,7 @@ fn identity(path: &Path, open_link: bool) -> io::Result<Identity> {
     // Resolve the opened handle so mapped drives and directory aliases use the same policy.
     let mut name = vec![0_u16; 512];
     loop {
+        // SAFETY: file keeps the handle open; name has name.len() writable UTF-16 elements and retains its allocation until the query returns.
         let length = unsafe {
             GetFinalPathNameByHandleW(
                 file.as_raw_handle(),
@@ -60,7 +61,9 @@ fn identity(path: &Path, open_link: bool) -> io::Result<Identity> {
         name.resize(length as usize + 1, 0);
     }
     let resolved = OsString::from_wide(&name);
+    // SAFETY: BY_HANDLE_FILE_INFORMATION contains only integer and FILETIME fields, whose zero bit patterns are valid.
     let mut standard: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: file owns the live handle and standard is initialized writable BY_HANDLE_FILE_INFORMATION storage.
     if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut standard) } == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -75,7 +78,9 @@ fn identity(path: &Path, open_link: bool) -> io::Result<Identity> {
             local: None,
         });
     }
+    // SAFETY: FILE_ID_INFO contains only integer/byte-array fields; zero is a valid initial value.
     let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: file still owns the live handle; info has the FILE_ID_INFO layout and exact size required by FileIdInfo.
     if unsafe {
         GetFileInformationByHandleEx(
             file.as_raw_handle(),

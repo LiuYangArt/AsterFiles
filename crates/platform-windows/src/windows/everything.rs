@@ -406,6 +406,8 @@ impl EverythingClient {
     }
     fn window(&self) -> Result<HWND, EverythingError> {
         let class = wide(instance_class(&self.config.instance_name));
+        // SAFETY: The class buffer is NUL-terminated and lives through the lookup; the returned HWND is
+        // borrowed.
         let w = unsafe { FindWindowW(class.as_ptr(), ptr::null()) };
         if w.is_null() {
             Err(EverythingError::NotRunning(
@@ -474,6 +476,8 @@ fn instance_class(i: &str) -> String {
 }
 fn send(w: HWND, cmd: usize, arg: isize, timeout: Duration) -> Result<usize, EverythingError> {
     let mut result = 0;
+    // SAFETY: The target is the discovered Everything HWND; result is writable for this synchronous scalar
+    // IPC call.
     let ok = unsafe {
         SendMessageTimeoutW(
             w,
@@ -486,6 +490,7 @@ fn send(w: HWND, cmd: usize, arg: isize, timeout: Duration) -> Result<usize, Eve
         )
     };
     if ok == 0 {
+        // SAFETY: GetLastError reads this thread's status immediately after the failed message send.
         let code = unsafe { GetLastError() };
         if code == 1460 {
             Err(EverythingError::Timeout)
@@ -507,6 +512,8 @@ fn query_ipc(
     register_reply()?;
     let mut state = ReplyState::default();
     let class = wide(REPLY_CLASS);
+    // SAFETY: The registered procedure uses state only on this thread; its stack allocation outlives the
+    // message-only window.
     let w = unsafe {
         CreateWindowExW(
             0,
@@ -541,6 +548,8 @@ fn query_ipc(
         lpData: bytes.as_ptr().cast_mut().cast::<c_void>(),
     };
     let mut accepted = 0;
+    // SAFETY: cds and its byte buffer remain alive during WM_COPYDATA dispatch, and accepted is a writable
+    // result slot.
     let ok = unsafe {
         SendMessageTimeoutW(
             target,
@@ -553,6 +562,8 @@ fn query_ipc(
         )
     };
     if ok == 0 || accepted == 0 {
+        // SAFETY: This thread owns the reply window, and destroying it ends callbacks using the borrowed
+        // stack state.
         unsafe { DestroyWindow(w) };
         return if ok == 0 {
             Err(last_error())
@@ -560,18 +571,29 @@ fn query_ipc(
             Err(EverythingError::QueryRejected)
         };
     }
+    // SAFETY: The live reply window belongs to this worker thread; a null callback routes timer messages to
+    // its procedure.
     let timer = unsafe { SetTimer(w, 1, millis(timeout), None) };
     if timer == 0 {
+        // SAFETY: The timer failed before the message loop; this thread still owns the reply window and its
+        // state.
         unsafe { DestroyWindow(w) };
         return Err(last_error());
     }
+    // SAFETY: MSG contains only integers and nullable pointers, so zero is a valid initial output value.
     let mut msg = unsafe { zeroed::<MSG>() };
+    // SAFETY: msg is a writable MSG, and the owning thread keeps the reply window and state alive while
+    // pumping.
     while unsafe { GetMessageW(&mut msg, ptr::null_mut(), 0, 0) } > 0 {
+        // SAFETY: GetMessageW succeeded, so msg is initialized; both calls consume it synchronously on this
+        // window thread.
         unsafe {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
+    // SAFETY: The worker owns this timer and window; neither is used after cleanup, before the stack state
+    // is read.
     unsafe {
         KillTimer(w, timer);
         DestroyWindow(w);
@@ -582,18 +604,32 @@ fn query_ipc(
 struct ReplyState {
     result: Option<Result<EverythingSearchPage, EverythingError>>,
 }
+// SAFETY: Windows invokes this registered procedure on the reply-window thread with native message payload
+// lifetimes.
 unsafe extern "system" fn reply_proc(w: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE {
+        // SAFETY: WM_NCCREATE supplies a CREATESTRUCTW that is valid for this callback; lpCreateParams came
+        // from query_ipc.
         let c = unsafe { &*(lp as *const CREATESTRUCTW) };
+        // SAFETY: The stored pointer targets query_ipc's stack state, which outlives this window and all
+        // its callbacks.
         unsafe { SetWindowLongPtrW(w, GWLP_USERDATA, c.lpCreateParams as isize) };
         return 1;
     }
+    // SAFETY: This reads the pointer stored during WM_NCCREATE; it is checked before either dereference
+    // below.
     let state = unsafe { GetWindowLongPtrW(w, GWLP_USERDATA) as *mut ReplyState };
     if msg == WM_COPYDATA && !state.is_null() {
+        // SAFETY: WM_COPYDATA supplies a COPYDATASTRUCT valid for this callback; no reference escapes the
+        // procedure.
         let cds = unsafe { &*(lp as *const COPYDATASTRUCT) };
         if cds.dwData == REPLY && !cds.lpData.is_null() {
             let bytes =
+                // SAFETY: Windows keeps the non-null WM_COPYDATA buffer readable for cbData bytes until
+                // this callback returns.
                 unsafe { std::slice::from_raw_parts(cds.lpData.cast::<u8>(), cds.cbData as usize) };
+            // SAFETY: The non-null state belongs to this window thread, and parsing copies all data before
+            // the message buffer expires.
             unsafe {
                 (*state).result = Some(parse_results(bytes));
                 PostQuitMessage(0)
@@ -601,12 +637,16 @@ unsafe extern "system" fn reply_proc(w: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             return 1;
         }
     } else if msg == WM_TIMER && !state.is_null() {
+        // SAFETY: The non-null state remains owned by query_ipc until its window is destroyed on this same
+        // thread.
         unsafe {
             (*state).result = Some(Err(EverythingError::Timeout));
             PostQuitMessage(0)
         };
         return 0;
     }
+    // SAFETY: Unprocessed messages retain their original native parameters and are forwarded on the
+    // window's owning thread.
     unsafe { DefWindowProcW(w, msg, wp, lp) }
 }
 fn register_reply() -> Result<(), EverythingError> {
@@ -617,9 +657,15 @@ fn register_reply() -> Result<(), EverythingError> {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(reply_proc),
             lpszClassName: class.as_ptr(),
+            // SAFETY: The remaining WNDCLASSEXW fields are scalar flags or optional pointers for which zero
+            // is valid.
             ..unsafe { zeroed() }
         };
+        // SAFETY: wc has the correct size, a static callback and a live NUL-terminated class name; Windows
+        // copies the class data.
         if unsafe { RegisterClassExW(&wc) } == 0 {
+            // SAFETY: This reads the registration error before another Win32 call can overwrite the
+            // thread-local status.
             let code = unsafe { GetLastError() };
             if code != 1410 {
                 return Err(code);
@@ -813,6 +859,8 @@ struct Everything3Pipe {
     handle: HANDLE,
 }
 
+// SAFETY: The pipe HANDLE is not thread-affine; its unique wrapper moves under the client mutex with no
+// concurrent transaction.
 unsafe impl Send for Everything3Pipe {}
 
 impl Everything3Pipe {
@@ -822,6 +870,8 @@ impl Everything3Pipe {
         timeout: Duration,
     ) -> Result<Self, EverythingError> {
         let timeout_ms = millis(timeout);
+        // SAFETY: pipe_name is NUL-terminated by everything3_pipe_name; the returned overlapped handle is
+        // uniquely owned here.
         let mut handle = unsafe {
             CreateFileW(
                 pipe_name.as_ptr(),
@@ -833,8 +883,11 @@ impl Everything3Pipe {
                 ptr::null_mut(),
             )
         };
+        // SAFETY: This checks the status of the immediately preceding CreateFileW failure on this thread.
         if handle == INVALID_HANDLE_VALUE && unsafe { GetLastError() } == ERROR_PIPE_BUSY {
+            // SAFETY: The NUL-terminated pipe-name buffer remains alive throughout the bounded wait.
             if unsafe { WaitNamedPipeW(pipe_name.as_ptr(), timeout_ms) } == 0 {
+                // SAFETY: This reads the error from the failed pipe wait before any intervening Win32 call.
                 return if unsafe { GetLastError() } == ERROR_PIPE_BUSY {
                     Err(EverythingError::Timeout)
                 } else {
@@ -843,6 +896,8 @@ impl Everything3Pipe {
                     ))
                 };
             }
+            // SAFETY: The same live NUL-terminated name is reused; a successful retry transfers one handle
+            // into this wrapper.
             handle = unsafe {
                 CreateFileW(
                     pipe_name.as_ptr(),
@@ -914,6 +969,8 @@ impl Everything3Pipe {
 
 impl Drop for Everything3Pipe {
     fn drop(&mut self) {
+        // SAFETY: connect constructs this wrapper only with a valid owned pipe handle; Drop closes that
+        // handle exactly once.
         unsafe {
             CloseHandle(self.handle);
         }
@@ -974,6 +1031,7 @@ fn is_network_path(path: &Path) -> bool {
         return false;
     }
     let root = wide(format!("{}:\\", bytes[0] as char));
+    // SAFETY: root is a NUL-terminated drive-root buffer that remains alive for the synchronous query.
     unsafe { GetDriveTypeW(root.as_ptr()) == 4 }
 }
 fn write_overlapped(
@@ -1051,13 +1109,19 @@ fn overlapped_io(
     reading: bool,
     timeout: Duration,
 ) -> Result<usize, EverythingError> {
+    // SAFETY: Null security and name pointers request default attributes and an unnamed event; success
+    // yields an owned handle.
     let event = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
     if event.is_null() {
         return Err(last_error());
     }
+    // SAFETY: OVERLAPPED permits a zeroed initial state; the owned event is installed before any I/O
+    // starts.
     let mut overlapped: OVERLAPPED = unsafe { zeroed() };
     overlapped.hEvent = event;
     let mut transferred = 0u32;
+    // SAFETY: Private callers supply readable/writable storage for byte_count bytes. The buffer,
+    // OVERLAPPED and event must outlive completion; exceptional-wait cleanup is tracked in #180.
     let ok = unsafe {
         if reading {
             ReadFile(
@@ -1080,30 +1144,44 @@ fn overlapped_io(
     let result = if ok != 0 {
         Ok(transferred as usize)
     } else {
+        // SAFETY: This reads the status of the failed ReadFile or WriteFile before any intervening Win32
+        // call.
         let code = unsafe { GetLastError() };
         if code != ERROR_IO_PENDING {
             pipe_io_error(code)
         } else {
+            // SAFETY: The event is the valid owned completion event assigned to this operation and has not
+            // yet been closed.
             match unsafe { WaitForSingleObject(event, millis(timeout)) } {
                 WAIT_OBJECT_0 => {
+                    // SAFETY: The completion event is signalled; overlapped and transferred are still live
+                    // output storage for this pipe request.
                     if unsafe { GetOverlappedResult(handle, &overlapped, &mut transferred, 0) } != 0
                     {
                         Ok(transferred as usize)
                     } else {
+                        // SAFETY: This reads GetOverlappedResult's failure status immediately on the same
+                        // thread.
                         pipe_io_error(unsafe { GetLastError() })
                     }
                 }
                 WAIT_TIMEOUT => {
+                    // SAFETY: The pending operation still owns this OVERLAPPED; cancellation is followed by
+                    // a blocking completion check before timeout returns.
                     unsafe {
                         CancelIoEx(handle, &overlapped);
                         GetOverlappedResult(handle, &overlapped, &mut transferred, 1);
                     }
                     Err(EverythingError::Timeout)
                 }
+                // SAFETY: This reads the unexpected wait result's thread-local error without dereferencing
+                // the pending I/O state.
                 _ => pipe_io_error(unsafe { GetLastError() }),
             }
         }
     };
+    // SAFETY: This function uniquely owns the event handle returned by CreateEventW and releases that
+    // ownership once.
     unsafe {
         CloseHandle(event);
     }
@@ -1154,6 +1232,8 @@ fn reg_string(root: *mut c_void, key: &str, value: &str) -> Option<OsString> {
     let k = wide(key);
     let v = wide(value);
     let mut bytes = 0;
+    // SAFETY: root is a predefined registry key, k/v are NUL-terminated, and bytes is writable for the
+    // size-only query.
     let status = unsafe {
         RegGetValueW(
             root,
@@ -1169,6 +1249,8 @@ fn reg_string(root: *mut c_void, key: &str, value: &str) -> Option<OsString> {
         return None;
     }
     let mut buf = vec![0u16; bytes as usize / 2];
+    // SAFETY: buf was sized from the registry byte count; bytes reports its capacity, and a grown value is
+    // rejected by RegGetValueW.
     if unsafe {
         RegGetValueW(
             root,
@@ -1202,11 +1284,17 @@ fn common_paths() -> Vec<PathBuf> {
 }
 fn running_instances() -> Vec<String> {
     let mut out = Vec::new();
+    // SAFETY: EnumWindows invokes callbacks synchronously; the stack Vec stays live and is only mutated by
+    // those callbacks.
     unsafe { EnumWindows(Some(enum_windows), (&mut out as *mut Vec<String>) as LPARAM) };
     out
 }
+// SAFETY: This callback is registered only for the synchronous enumeration whose context points to its live
+// output Vec.
 unsafe extern "system" fn enum_windows(w: HWND, ctx: LPARAM) -> i32 {
     let mut buf = [0u16; 256];
+    // SAFETY: buf contains 256 writable UTF-16 units, exactly matching the capacity passed to
+    // GetClassNameW.
     let len = unsafe { GetClassNameW(w, buf.as_mut_ptr(), 256) };
     if len > 0 {
         let class = String::from_utf16_lossy(&buf[..len as usize]);
@@ -1219,6 +1307,8 @@ unsafe extern "system" fn enum_windows(w: HWND, ctx: LPARAM) -> i32 {
                 .map(str::to_owned)
         };
         if let Some(i) = instance {
+            // SAFETY: ctx came from running_instances' live Vec; callbacks run synchronously without a
+            // competing Rust borrow.
             let out = unsafe { &mut *(ctx as *mut Vec<String>) };
             if !out.contains(&i) {
                 out.push(i)
@@ -1234,6 +1324,7 @@ fn millis(d: Duration) -> u32 {
     d.as_millis().clamp(1, u32::MAX as u128) as u32
 }
 fn last_error() -> EverythingError {
+    // SAFETY: GetLastError reads only the calling thread's Win32 status and retains no pointer or handle.
     let c = unsafe { GetLastError() };
     if c == 1460 {
         EverythingError::Timeout

@@ -1,3 +1,5 @@
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use crate as platform;
 use asterfiles_domain as domain;
 use asterfiles_domain::{network, operation_audit};
@@ -42,6 +44,7 @@ pub fn system_uses_dark_theme() -> bool {
     let value_name = "AppsUseLightTheme\0".encode_utf16().collect::<Vec<_>>();
     let mut value = 1_u32;
     let mut size = std::mem::size_of::<u32>() as u32;
+    // SAFETY: The registry key and names are NUL-terminated; value and size are writable DWORD storage valid for this synchronous query.
     let result = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
@@ -89,6 +92,7 @@ mod windows_impl {
 
     pub fn double_click_interval() -> std::time::Duration {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+        // SAFETY: This no-argument system query borrows no Rust memory and returns an integer, not an owned resource.
         std::time::Duration::from_millis(unsafe { GetDoubleClickTime() }.into())
     }
     pub fn logical_drive_locations() -> impl Iterator<Item = KnownLocation> {
@@ -110,18 +114,23 @@ mod windows_impl {
         struct ComGuard;
         impl Drop for ComGuard {
             fn drop(&mut self) {
+                // SAFETY: COM uninitialization must balance success on this same thread. The eager
+                // then_some failure path does not establish that prerequisite; see #183.
                 unsafe { CoUninitialize() };
             }
         }
+        // SAFETY: COM initialization affects this thread only; a successful result is balanced by the local guard.
         let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
         let _guard = initialized.then_some(ComGuard);
         let namespace = "shell:::{3936e9e4-d92c-4eee-a85a-bc16d5ea0819}\0"
             .encode_utf16()
             .collect::<Vec<_>>();
+        // SAFETY: The NUL-terminated namespace buffer stays alive for the call; the returned interface owns its COM reference.
         let root: IShellItem = unsafe {
             SHCreateItemFromParsingName(PCWSTR(namespace.as_ptr()), None)
                 .map_err(std::io::Error::other)?
         };
+        // SAFETY: root owns a live Shell interface on this thread; the enumeration handler GUID has the requested interface type.
         let items: IEnumShellItems = unsafe {
             root.BindToHandler(None, &BHID_EnumItems)
                 .map_err(std::io::Error::other)?
@@ -130,12 +139,14 @@ mod windows_impl {
         loop {
             let mut next = [None];
             let mut fetched = 0;
+            // SAFETY: next has one initialized interface slot and fetched is writable; items remains owned on this COM thread.
             if unsafe { items.Next(&mut next, Some(&mut fetched)) }.is_err() || fetched == 0 {
                 break;
             }
             let Some(item) = next[0].take() else { continue };
             let pinned = item
                 .cast::<IShellItem2>()
+                // SAFETY: properties is a successful IShellItem2 cast on the same thread; GetBool borrows only the static property key.
                 .and_then(|properties| unsafe {
                     properties
                         .GetBool(&windows::Win32::Storage::EnhancedStorage::PKEY_Home_IsPinned)
@@ -144,11 +155,14 @@ mod windows_impl {
             if !pinned {
                 continue;
             }
+            // SAFETY: item owns a live Shell interface and the attribute mask contains only SFGAO_FOLDER.
             let attributes = unsafe { item.GetAttributes(SFGAO_FOLDER) }.unwrap_or_default();
             if !attributes.contains(SFGAO_FOLDER) {
                 continue;
             }
+            // SAFETY: item is alive on this COM thread; successful display names are task-allocated strings consumed by take_shell_string.
             let Ok(path) = (unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) })
+                // SAFETY: The same live item is queried; the returned task-allocated string is consumed by take_shell_string.
                 .or_else(|_| unsafe { item.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING) })
             else {
                 continue;
@@ -157,6 +171,7 @@ mod windows_impl {
             if path.as_os_str().is_empty() {
                 continue;
             }
+            // SAFETY: The live item returns an owned, NUL-terminated Shell string, which the map below copies and frees.
             let label = unsafe { item.GetDisplayName(SIGDN_NORMALDISPLAY) }
                 .map(take_shell_string)
                 .map(|value| value.to_string_lossy().into_owned())
@@ -180,20 +195,24 @@ mod windows_impl {
                 return PathBuf::new();
             }
             let mut len = 0;
+            // SAFETY: value is a non-null task-allocated UTF-16 string returned by GetDisplayName and remains allocated until below.
             unsafe {
                 while *value.0.add(len) != 0 {
                     len += 1;
                 }
             }
+            // SAFETY: len was counted before the terminating NUL in this live, aligned Shell UTF-16 allocation.
             let path = PathBuf::from(OsString::from_wide(unsafe {
                 std::slice::from_raw_parts(value.0, len)
             }));
+            // SAFETY: The Shell transferred this allocation to us; its contents have been copied and it is freed exactly once.
             unsafe { CoTaskMemFree(value.0.cast()) };
             path
         }
     }
 
     fn logical_drives() -> impl Iterator<Item = KnownLocation> {
+        // SAFETY: This no-argument query returns a drive bitmask and does not borrow or retain Rust memory.
         let mask = unsafe { GetLogicalDrives() };
         (0..26)
             .filter(move |index| mask & (1 << index) != 0)
@@ -222,6 +241,7 @@ mod windows_impl {
             .chain(Some(0))
             .collect::<Vec<_>>();
         let mut label = [0_u16; 261];
+        // SAFETY: root is NUL-terminated and label has label.len() writable UTF-16 elements; unused optional outputs are null.
         let success = unsafe {
             GetVolumeInformationW(
                 root.as_ptr(),
@@ -269,6 +289,7 @@ mod windows_impl {
             .encode_wide()
             .chain(Some(0))
             .collect::<Vec<_>>();
+        // SAFETY: Initialization is thread-local; only successful calls are balanced below, and an existing apartment is reused.
         let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         let should_uninitialize = initialized.is_ok();
         if initialized.is_err() && initialized != RPC_E_CHANGED_MODE {
@@ -276,6 +297,7 @@ mod windows_impl {
                 "CoInitializeEx failed: {initialized:?}"
             )));
         }
+        // SAFETY: COM calls stay on this thread; path buffers remain NUL-terminated and live, and each returned interface owns its reference.
         let result = (|| unsafe {
             let link: IShellLinkW =
                 CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).map_err(windows_error)?;
@@ -314,6 +336,7 @@ mod windows_impl {
             }))
         })();
         if should_uninitialize {
+            // SAFETY: This thread is balancing exactly its successful CoInitializeEx call after all local interfaces have been dropped.
             unsafe { CoUninitialize() };
         }
         result
@@ -339,6 +362,7 @@ mod windows_impl {
         let arguments =
             arguments.map(|value| value.encode_wide().chain(Some(0)).collect::<Vec<_>>());
         let operation = "open\0".encode_utf16().collect::<Vec<_>>();
+        // SAFETY: Target, verb and optional arguments are NUL-terminated buffers kept alive through this synchronous Shell call.
         let result = unsafe {
             ShellExecuteW(
                 ptr::null_mut(),
@@ -374,6 +398,7 @@ pub fn set_current_thread_low_priority() {
         GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
     };
 
+    // SAFETY: GetCurrentThread returns the current thread pseudo-handle; SetThreadPriority does not retain it or borrow Rust memory.
     unsafe {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
@@ -387,6 +412,7 @@ pub fn local_utc_offset_seconds() -> i32 {
         GetTimeZoneInformation, TIME_ZONE_ID_INVALID, TIME_ZONE_INFORMATION,
     };
     let mut information = TIME_ZONE_INFORMATION::default();
+    // SAFETY: information is initialized writable TIME_ZONE_INFORMATION storage for the duration of the synchronous query.
     let state = unsafe { GetTimeZoneInformation(&mut information) };
     if state == TIME_ZONE_ID_INVALID {
         return 0;

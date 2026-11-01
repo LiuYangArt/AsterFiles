@@ -52,6 +52,8 @@ pub fn install(hwnd: isize) -> io::Result<()> {
             "window handle is not available",
         ));
     }
+    // SAFETY: The application calls install on the non-null HWND's owning thread; the static subclass
+    // stores no borrowed Rust state.
     if unsafe { SetWindowSubclass(hwnd as HWND, Some(drag_recovery_proc), SUBCLASS_ID, 0) } == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -85,6 +87,8 @@ impl Drop for RecoveryGuard {
         if !recover {
             return;
         }
+        // SAFETY: The guard belongs to this window's message thread; the posted message has scalar
+        // parameters and transfers no pointers.
         if unsafe { PostMessageW(self.hwnd, WM_EXITSIZEMOVE, 0, 0) } == 0 {
             eprintln!("failed to post WM_EXITSIZEMOVE for window drag recovery");
             return;
@@ -96,6 +100,8 @@ impl Drop for RecoveryGuard {
     }
 }
 
+// SAFETY: Windows invokes this static subclass on the HWND's owning thread; its thread-local frame map is
+// accessed only there.
 unsafe extern "system" fn drag_recovery_proc(
     hwnd: HWND,
     message: u32,
@@ -118,6 +124,7 @@ unsafe extern "system" fn drag_recovery_proc(
         // winit 0.30 passes a POINTS pointer here instead of packed coordinates.
         // Keep its drag/release lifecycle, but give Windows the actual anchor.
         let mut cursor = POINT::default();
+        // SAFETY: cursor is a full writable POINT; the synchronous query retains no reference to it.
         if unsafe { GetCursorPos(&mut cursor) } == 0 {
             eprintln!(
                 "failed to query window drag anchor: {}",
@@ -126,16 +133,22 @@ unsafe extern "system" fn drag_recovery_proc(
             return 0;
         }
         let position = pack_screen_position(cursor.x, cursor.y);
+        // SAFETY: position packs screen coordinates as required by WM_NCLBUTTONDOWN; the remaining native
+        // parameters stay unchanged.
         return unsafe { DefSubclassProc(hwnd, message, wparam, position) };
     }
     if message == WM_NCDESTROY {
         FRAMES.with(|frames| {
             frames.borrow_mut().remove(&hwnd);
         });
+        // SAFETY: This removes the exact callback/id while processing destruction on the same window
+        // thread.
         unsafe {
             RemoveWindowSubclass(hwnd, Some(drag_recovery_proc), SUBCLASS_ID);
         }
     }
+    // SAFETY: Untouched native message parameters are forwarded within their callback lifetime on the
+    // owning thread.
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 

@@ -69,6 +69,7 @@ pub fn record(probe: &LaunchProbe, paths: &[ExternalLaunchPath]) {
 }
 
 fn current_command_line() -> OsString {
+    // SAFETY: Windows owns the process command-line UTF-16 buffer for the process lifetime; wide_string only copies it.
     wide_string(unsafe { GetCommandLineW() }).unwrap_or_default()
 }
 
@@ -77,6 +78,7 @@ fn process_image_path(pid: u32) -> Option<PathBuf> {
         let mut buffer = [0u16; 1024];
         let mut size = buffer.len() as u32;
         let ok =
+            // SAFETY: with_query_process keeps handle open; buffer and size are writable, with the exact UTF-16 capacity supplied.
             unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size) } != 0;
         if !ok || size == 0 {
             return None;
@@ -88,6 +90,7 @@ fn process_image_path(pid: u32) -> Option<PathBuf> {
 fn process_command_line(pid: u32) -> Option<OsString> {
     with_query_process(pid, |handle| {
         let mut needed = 0;
+        // SAFETY: The process handle remains open; null storage with length zero requests only the required buffer size.
         let first = unsafe {
             NtQueryInformationProcess(
                 handle,
@@ -101,6 +104,7 @@ fn process_command_line(pid: u32) -> Option<OsString> {
             return None;
         }
         let mut buffer = vec![0u8; needed as usize];
+        // SAFETY: buffer has the reported writable byte capacity and remains allocated through the query and subsequent copy.
         let status = unsafe {
             NtQueryInformationProcess(
                 handle,
@@ -113,11 +117,13 @@ fn process_command_line(pid: u32) -> Option<OsString> {
         if status < 0 || buffer.len() < std::mem::size_of::<UnicodeString>() {
             return None;
         }
+        // SAFETY: The successful query filled at least a UnicodeString header; read_unaligned handles the byte vector alignment.
         let header = unsafe { buffer.as_ptr().cast::<UnicodeString>().read_unaligned() };
         if header.buffer.is_null() || header.length == 0 {
             return None;
         }
         let units = (header.length as usize) / 2;
+        // SAFETY: A successful ProcessCommandLineInformation query returns its counted UTF-16 contents inside the still-live output allocation.
         Some(OsString::from_wide(unsafe {
             std::slice::from_raw_parts(header.buffer, units)
         }))
@@ -125,21 +131,25 @@ fn process_command_line(pid: u32) -> Option<OsString> {
 }
 
 fn with_query_process<T>(pid: u32, query: impl FnOnce(HANDLE) -> Option<T>) -> Option<T> {
+    // SAFETY: The requested query right is valid; no inheritable security pointer or Rust reference is passed to Windows.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
         return None;
     }
     let result = query(handle);
+    // SAFETY: This function owns the non-null OpenProcess handle and closes it once after the borrowed query returns.
     unsafe { CloseHandle(handle) };
     result
 }
 
 fn shell_process_id() -> Option<u32> {
+    // SAFETY: This no-argument query returns a borrowed Shell HWND without retaining Rust storage.
     let hwnd = unsafe { GetShellWindow() };
     if hwnd.is_null() {
         return None;
     }
     let mut pid = 0;
+    // SAFETY: hwnd is the queried Shell handle and pid is a live writable u32 output; no pointer escapes the call.
     unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
     (pid != 0).then_some(pid)
 }
@@ -157,8 +167,10 @@ fn parent_process_id() -> Option<u32> {
         inherited_from_unique_process_id: usize,
     }
 
+    // SAFETY: ProcessBasicInformation is repr(C) and contains only integer fields, for which all-zero is a valid value.
     let mut info = unsafe { std::mem::zeroed::<ProcessBasicInformation>() };
     let mut needed = 0;
+    // SAFETY: The current-process pseudo-handle is valid and info has the native process-basic-information layout and supplied size.
     let status = unsafe {
         NtQueryInformationProcess(
             GetCurrentProcess(),
@@ -175,16 +187,20 @@ fn parent_process_id() -> Option<u32> {
         }
     }
 
+    // SAFETY: The snapshot flags and process id are by-value inputs; no borrowed Rust memory is retained.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
         return None;
     }
+    // SAFETY: This no-argument query returns an integer process id and borrows no Rust memory.
     let current = unsafe { GetCurrentProcessId() };
     let mut entry = PROCESSENTRY32W {
         dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        // SAFETY: PROCESSENTRY32W contains only integer, pointer and UTF-16 array fields; zero is valid before dwSize is set.
         ..unsafe { std::mem::zeroed() }
     };
     let mut parent = None;
+    // SAFETY: snapshot is a live owned snapshot; entry has the required dwSize, stays writable for enumeration, and the snapshot is closed once.
     unsafe {
         if Process32FirstW(snapshot, &mut entry) != 0 {
             loop {
@@ -207,11 +223,13 @@ fn wide_string(ptr: *const u16) -> Option<OsString> {
         return None;
     }
     let mut length = 0;
+    // SAFETY: The only caller passes the process-lifetime NUL-terminated UTF-16 buffer returned by GetCommandLineW.
     unsafe {
         while *ptr.add(length) != 0 {
             length += 1;
         }
     }
+    // SAFETY: length was scanned within the same live NUL-terminated Windows buffer; UTF-16 elements are properly aligned.
     Some(OsString::from_wide(unsafe {
         std::slice::from_raw_parts(ptr, length)
     }))

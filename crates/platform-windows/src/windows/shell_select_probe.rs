@@ -33,6 +33,8 @@ fn caller_pidl(path: &Path) -> Result<*mut ITEMIDLIST> {
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
+    // SAFETY: wide is terminated UTF-16 and remains live while the Shell allocates the PIDL returned
+    // to the caller.
     let pidl = unsafe { ILCreateFromPathW(PCWSTR(wide.as_ptr())) };
     if pidl.is_null() {
         Err(format!("caller could not create a filesystem PIDL for {path:?}").into())
@@ -72,6 +74,8 @@ pub fn try_run() -> Result<bool> {
 
 fn receive(folder: &Path, output: &Path, mode: &str) -> Result<()> {
     let started = Instant::now();
+    // SAFETY: GetCurrentThreadId has no pointer preconditions and records the probe receiver's owner
+    // thread.
     let owner_thread = unsafe { GetCurrentThreadId() };
     let expected_folder = folder.to_path_buf();
     let expected_file = folder.join("中文 selected file.txt");
@@ -122,6 +126,8 @@ fn export(output: &Path) -> Result<()> {
     )));
     std::fs::create_dir(&fixtures.0)?;
     let downloads_fixture = KnownFolderFixture::new()?;
+    // SAFETY: OleGuard initialized this STA and the ShellWindows interface remains confined to this
+    // probe thread.
     let shell: IShellWindows = unsafe { CoCreateInstance(&ShellWindows, None, CLSCTX_ALL) }?;
     let mut results = Vec::new();
     let cases = [
@@ -149,9 +155,13 @@ fn export(output: &Path) -> Result<()> {
         let started = Instant::now();
         let pidl = caller_pidl(&folder)?;
         let location = pidl_variant(pidl)?;
+        // SAFETY: pidl_variant copied the Shell PIDL bytes, so this owned allocation has no remaining
+        // borrows.
         unsafe { CoTaskMemFree(Some(pidl.cast())) };
         let (dispatch, window_thread) = loop {
             let mut hwnd = 0;
+            // SAFETY: The retained STA interface borrows live VARIANTs and writes the local hwnd
+            // output during this call.
             if let Ok(dispatch) = unsafe {
                 shell.FindWindowSW(
                     &location,
@@ -163,6 +173,8 @@ fn export(output: &Path) -> Result<()> {
             } {
                 let mut pid = 0;
                 let tid =
+                    // SAFETY: The discovered HWND is only queried; pid is writable and Windows
+                    // reports failure for a stale handle.
                     unsafe { GetWindowThreadProcessId(HWND(hwnd as isize as _), Some(&mut pid)) };
                 if pid == child.0.id() {
                     break (dispatch, tid);
@@ -174,6 +186,8 @@ fn export(output: &Path) -> Result<()> {
             std::thread::sleep(Duration::from_millis(10));
         };
         let app: IWebBrowserApp = dispatch.cast()?;
+        // SAFETY: app is a retained interface from the registered child; COM marshals this call to
+        // its owner STA.
         let executable = unsafe { app.FullName() }?;
         let expected = std::env::current_exe()?
             .as_os_str()
@@ -193,12 +207,16 @@ fn export(output: &Path) -> Result<()> {
             // Target the discovered child explicitly so a failed probe cannot launch the user's default manager.
             let view: IShellView = dispatch.cast()?;
             let pidl = caller_pidl(&file)?;
+            // SAFETY: pidl remains allocated through SelectItem; ILFindLastID returns its borrowed
+            // child PIDL.
             let result = unsafe {
                 view.SelectItem(
                     ILFindLastID(pidl),
                     (SVSI_SELECT.0 | SVSI_FOCUSED.0 | SVSI_ENSUREVISIBLE.0) as u32,
                 )
             };
+            // SAFETY: The synchronous selection call has returned and the probe frees its sole PIDL
+            // allocation once.
             unsafe { CoTaskMemFree(Some(pidl.cast())) };
             result?;
         }
@@ -250,6 +268,8 @@ struct KnownFolderFixture(PathBuf);
 impl KnownFolderFixture {
     fn new() -> Result<Self> {
         let known_folder =
+            // SAFETY: The static Downloads GUID is valid; the returned owned Shell string is consumed
+            // by take_shell_path.
             unsafe { SHGetKnownFolderPath(&FOLDERID_Downloads, KF_FLAG_DEFAULT, None) }?;
         let root = super::take_shell_path(known_folder);
         let path = root.join(format!(

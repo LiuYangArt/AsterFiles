@@ -59,6 +59,7 @@ pub(super) fn cancel_read_worker<T>(worker: &thread::JoinHandle<T>) {
     use std::os::windows::io::AsRawHandle;
     // Cancellation is only a request; never release its permit or join a pending SMB call here.
     if !worker.is_finished() {
+        // SAFETY: The borrowed JoinHandle keeps its thread handle open during this cancellation request; cancellation neither frees the worker nor its storage.
         unsafe {
             windows_sys::Win32::System::IO::CancelSynchronousIo(worker.as_raw_handle());
         }

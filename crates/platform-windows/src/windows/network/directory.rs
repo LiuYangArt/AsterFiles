@@ -236,6 +236,7 @@ fn receive_stream(
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::Threading::WaitForSingleObject;
         assert_eq!(
+            // SAFETY: child still owns the joined process handle, which stays open while this nonblocking wait verifies completion.
             unsafe { WaitForSingleObject(child.as_raw_handle() as _, 0) },
             0
         );
@@ -300,6 +301,7 @@ fn frame_slot_exists(output: &Path) -> io::Result<bool> {
         .chain(Some(0))
         .collect::<Vec<_>>();
     // Avoid opening a handle that would prolong deletion of the single frame slot.
+    // SAFETY: path is a live NUL-terminated UTF-16 frame path and the synchronous query retains no pointer.
     if unsafe { GetFileAttributesW(path.as_ptr()) } != INVALID_FILE_ATTRIBUTES {
         return Ok(true);
     }

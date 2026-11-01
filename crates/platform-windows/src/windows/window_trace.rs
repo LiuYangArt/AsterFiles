@@ -186,11 +186,17 @@ pub fn install(hwnd: isize, path: &Path) -> io::Result<()> {
         return Ok(());
     }
     let state = Box::into_raw(Box::new(WindowTraceState {
+        // SAFETY: This is a read-only DPI query for the supplied HWND; an unavailable window yields zero
+        // without touching Rust storage.
         dpi: Cell::new(unsafe { GetDpiForWindow(hwnd) }),
     }));
+    // SAFETY: The boxed state remains allocated for the subclass lifetime; install runs on the HWND's
+    // owning thread with a static callback.
     if unsafe { SetWindowSubclass(hwnd, Some(trace_window_proc), SUBCLASS_ID, state as usize) } == 0
     {
         let error = io::Error::last_os_error();
+        // SAFETY: Subclass installation failed, so no callback owns state; this reconstructs and drops the
+        // original Box exactly once.
         unsafe { drop(Box::from_raw(state)) };
         return Err(error);
     }
@@ -239,6 +245,8 @@ pub fn log_diagnostic(kind: &str, detail: &str) {
     ));
 }
 
+// SAFETY: Windows invokes this installed callback on the window thread; state is the allocation supplied by
+// install until WM_NCDESTROY.
 unsafe extern "system" fn trace_window_proc(
     hwnd: HWND,
     message: u32,
@@ -248,11 +256,17 @@ unsafe extern "system" fn trace_window_proc(
     state: usize,
 ) -> LRESULT {
     let Some(name) = message_name(message) else {
+        // SAFETY: Unrecognized messages keep their original native parameters and are forwarded during the
+        // callback lifetime.
         return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
     };
     let details = if message == WM_DPICHANGED {
+        // SAFETY: install stored this live Box pointer as subclass data; only this window thread accesses
+        // its Cell before final destruction.
         let state = unsafe { &*(state as *const WindowTraceState) };
         let old_dpi = state.dpi.replace(wparam as u32 & 0xffff);
+        // SAFETY: For WM_DPICHANGED, Windows supplies a readable RECT until callback return; as_ref also
+        // accepts an absent null payload.
         let suggested = unsafe { (lparam as *const RECT).as_ref() }.map(rect_values);
         format!(
             ",\"old_dpi\":{old_dpi},\"new_dpi\":{},\"new_dpi_y\":{},\"suggested_rect\":{}",
@@ -265,6 +279,8 @@ unsafe extern "system" fn trace_window_proc(
     };
     write_record(hwnd, name, "before", wparam, lparam, &details);
     if message == WM_NCDESTROY {
+        // SAFETY: This removes the matching subclass before reclaiming the Box supplied by install;
+        // WM_NCDESTROY is its final ownership release.
         unsafe {
             RemoveWindowSubclass(hwnd, Some(trace_window_proc), SUBCLASS_ID);
             drop(Box::from_raw(state as *mut WindowTraceState));
@@ -273,6 +289,8 @@ unsafe extern "system" fn trace_window_proc(
             windows.borrow_mut().remove(&hwnd);
         });
     }
+    // SAFETY: The original message parameters remain valid for the downstream chain; no reference into
+    // boxed state crosses this call.
     let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
     // 保存 DPI 原始建议值；子类只观察，下游如何处理由前后几何数据呈现。
     if message == WM_DPICHANGED {
@@ -314,6 +332,8 @@ fn message_name(message: u32) -> Option<&'static str> {
 
 fn message_details(message: u32, wparam: WPARAM, lparam: LPARAM) -> String {
     if matches!(message, WM_WINDOWPOSCHANGING | WM_WINDOWPOSCHANGED)
+        // SAFETY: Only matching native WINDOWPOS messages (or the local test fixture) reach this branch;
+        // the optional payload is borrowed, not retained.
         && let Some(pos) = unsafe { (lparam as *const WINDOWPOS).as_ref() }
     {
         format!(
@@ -321,6 +341,8 @@ fn message_details(message: u32, wparam: WPARAM, lparam: LPARAM) -> String {
             pos.x, pos.y, pos.cx, pos.cy, pos.flags, pos.hwndInsertAfter as usize,
         )
     } else if message == WM_GETDPISCALEDSIZE
+        // SAFETY: WM_GETDPISCALEDSIZE supplies a SIZE valid for this callback; null represents no payload
+        // and no reference escapes.
         && let Some(size) = unsafe { (lparam as *const SIZE).as_ref() }
     {
         format!(
@@ -350,18 +372,32 @@ fn write_record(
         return;
     };
     let mut process_id = 0;
+    // SAFETY: process_id is writable local output; the query only borrows hwnd and retains no Rust pointer.
     let thread_id = unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) };
+    // SAFETY: GetCapture reads this thread's capture HWND; the returned handle is observed without taking
+    // ownership.
     let capture = unsafe { GetCapture() } as usize;
+    // SAFETY: The documented virtual-key value is scalar; this read-only query has no pointer or resource
+    // ownership.
     let left_down = unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } < 0;
+    // SAFETY: This read-only DPI query retains no pointer and permits an unavailable HWND to report zero.
     let dpi = unsafe { GetDpiForWindow(hwnd) };
+    // SAFETY: This is a read-only maximization query for the borrowed HWND; it does not access Rust-managed
+    // memory.
     let maximized = unsafe { IsZoomed(hwnd) } != 0;
     let mut window_rect = RECT::default();
     let mut client_rect = RECT::default();
     let mut cursor = POINT::default();
     let window_rect =
+        // SAFETY: window_rect is writable RECT storage; its contents are used only when the synchronous API
+        // succeeds.
         (unsafe { GetWindowRect(hwnd, &mut window_rect) } != 0).then(|| rect_values(&window_rect));
     let client_rect =
+        // SAFETY: client_rect is a separate writable RECT; its contents are consumed only after a
+        // successful query.
         (unsafe { GetClientRect(hwnd, &mut client_rect) } != 0).then(|| rect_values(&client_rect));
+    // SAFETY: cursor is a writable POINT; the query completes before its coordinates are copied into the
+    // log record.
     let cursor = (unsafe { GetCursorPos(&mut cursor) } != 0).then_some([cursor.x, cursor.y]);
     trace.enqueue(format!(
         "{{\"time_unix_ms\":{},\"event\":{},\"phase\":{},\"hwnd\":{},\"thread_id\":{thread_id},\"process_id\":{process_id},\"wparam\":{wparam},\"lparam\":{lparam},\"capture_hwnd\":{capture},\"left_down\":{left_down},\"dpi\":{dpi},\"maximized\":{maximized},\"window_rect\":{},\"client_rect\":{},\"cursor\":{}{details}}}",

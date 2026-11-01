@@ -210,6 +210,7 @@ pub fn file_identity(path: &Path) -> Result<FileIdentity, OperationError> {
             });
         }
         wide.push(0);
+        // SAFETY: wide has no interior NUL and includes a terminator; no borrowed security or template handle is supplied.
         let handle = unsafe {
             CreateFileW(
                 windows::core::PCWSTR(wide.as_ptr()),
@@ -228,6 +229,7 @@ pub fn file_identity(path: &Path) -> Result<FileIdentity, OperationError> {
         })?;
         let mut info = FILE_ID_INFO::default();
         let mut basic = FILE_BASIC_INFO::default();
+        // SAFETY: handle is the successful CreateFileW result, still open; info is writable FILE_ID_INFO storage of the declared size.
         let result = unsafe {
             GetFileInformationByHandleEx(
                 handle,
@@ -236,6 +238,7 @@ pub fn file_identity(path: &Path) -> Result<FileIdentity, OperationError> {
                 std::mem::size_of::<FILE_ID_INFO>() as u32,
             )
         };
+        // SAFETY: The same open handle is borrowed; basic has the FILE_BASIC_INFO layout and exact output size.
         let basic_result = unsafe {
             GetFileInformationByHandleEx(
                 handle,
@@ -244,6 +247,7 @@ pub fn file_identity(path: &Path) -> Result<FileIdentity, OperationError> {
                 std::mem::size_of::<FILE_BASIC_INFO>() as u32,
             )
         };
+        // SAFETY: This function owns the successful CreateFileW handle and closes it once after both synchronous queries.
         let _ = unsafe { CloseHandle(handle) };
         result.map_err(|error| OperationError::Io {
             path: path.to_path_buf(),

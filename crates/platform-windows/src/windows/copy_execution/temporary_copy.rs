@@ -335,6 +335,7 @@ fn validate_local_path(path: &Path) -> io::Result<()> {
         let mut ancestor = PathBuf::from(prefix.as_os_str());
         ancestor.push(Path::new(r"\"));
         let root = wide_null(ancestor.as_os_str());
+        // SAFETY: root is a NUL-terminated UTF-16 drive-root buffer kept alive for the synchronous drive-type query.
         if unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(root.as_ptr()) } != 3 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,

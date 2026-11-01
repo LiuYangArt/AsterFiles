@@ -56,6 +56,7 @@ fn write_impl(path: &Path, bytes: &[u8], failure: InjectedFailure) -> io::Result
 
     let temporary_wide = wide_null(&temporary_path);
     let destination_wide = wide_null(path);
+    // SAFETY: Both path buffers are live NUL-terminated UTF-16 arrays; MoveFileExW completes before either buffer is released.
     if unsafe {
         MoveFileExW(
             temporary_wide.as_ptr(),
