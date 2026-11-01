@@ -1692,6 +1692,16 @@ impl TabSession {
             .collect();
     }
 
+    pub fn visible_entries_snapshot(&self) -> Arc<Vec<FileEntry>> {
+        if matches!(self.load_state, LoadState::Loading | LoadState::Partial)
+            && !self.retains_directory_view()
+        {
+            Arc::new(self.pending_entries.clone())
+        } else {
+            self.entries.clone()
+        }
+    }
+
     pub fn visible_entries(&self) -> &[FileEntry] {
         if self.load_state == LoadState::Partial && !self.retains_directory_view() {
             &self.pending_entries

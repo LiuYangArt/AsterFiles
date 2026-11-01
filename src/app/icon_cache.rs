@@ -58,6 +58,10 @@ impl BoundedImages {
         self.images.get(key)
     }
 
+    pub(super) fn snapshot(&self) -> HashMap<ImageKey, ShellIconRgba> {
+        self.images.clone()
+    }
+
     pub(super) fn contains_key(&self, key: &ImageKey) -> bool {
         self.images.contains_key(key)
     }

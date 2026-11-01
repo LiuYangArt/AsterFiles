@@ -6,7 +6,7 @@
 //! model, is keyed by the model allocation and is checked against the row ID before every use;
 //! a stale or missing index falls back to the original scan.
 use super::FileRow;
-use crate::domain::{EntryId, FileEntry, TabSession};
+use crate::domain::{EntryId, TabSession};
 use slint::{Model, VecModel};
 use std::{
     cell::RefCell,
@@ -70,13 +70,6 @@ impl RowLayout {
             Self::Recorded { headers, .. } => headers,
         }
     }
-
-    fn entries(&self) -> usize {
-        match self {
-            Self::VisibleOrder { projected } => projected.len(),
-            Self::Recorded { positions, .. } => positions.len(),
-        }
-    }
 }
 
 /// Registers the layout of a model that is about to be shown.
@@ -102,77 +95,6 @@ fn with_index<T>(
         let index = indexes.get_mut(&identity(model))?;
         (index.model.strong_count() > 0 && index.rows == model.row_count()).then(|| action(index))
     })
-}
-
-/// Pending indices that have no row yet, or `None` when the model is not in visible order.
-pub(super) fn unprojected(model: &VecModel<FileRow>, pending: &[FileEntry]) -> Option<Vec<usize>> {
-    with_index(model, |index| match &index.layout {
-        RowLayout::VisibleOrder { projected } => Some(
-            pending
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| !projected.contains(&entry.id))
-                .map(|(position, _)| position)
-                .collect(),
-        ),
-        RowLayout::Recorded { .. } => None,
-    })
-    .flatten()
-}
-
-/// Records rows inserted into a visible-order model; any other layout is dropped.
-pub(super) fn mark_projected(model: &VecModel<FileRow>, ids: impl IntoIterator<Item = EntryId>) {
-    INDEXES.with_borrow_mut(|indexes| {
-        let Some(index) = indexes.get_mut(&identity(model)) else {
-            return;
-        };
-        match &mut index.layout {
-            RowLayout::VisibleOrder { projected } => {
-                projected.extend(ids);
-                index.rows = model.row_count();
-            }
-            RowLayout::Recorded { .. } => {
-                indexes.remove(&identity(model));
-            }
-        }
-    });
-}
-
-/// Re-indexes a registered model after a full reconciliation walk.
-pub(super) fn reset_visible_order(
-    model: &VecModel<FileRow>,
-    ids: impl IntoIterator<Item = EntryId>,
-) {
-    INDEXES.with_borrow_mut(|indexes| {
-        if let Some(index) = indexes.get_mut(&identity(model))
-            && index.model.strong_count() > 0
-        {
-            index.rows = model.row_count();
-            index.layout = RowLayout::VisibleOrder {
-                projected: ids.into_iter().collect(),
-            };
-        }
-    });
-}
-
-/// Rebuild after an in-place reorder such as rename or folder-size sorting.
-pub(super) fn reindex(model: &VecModel<FileRow>, header_height: impl Fn(&FileRow) -> f32) {
-    INDEXES.with_borrow_mut(|indexes| {
-        if let Some(index) = indexes.get_mut(&identity(model)) {
-            let visible_order = matches!(index.layout, RowLayout::VisibleOrder { .. });
-            index.layout = RowLayout::build(
-                &model.iter().collect::<Vec<_>>(),
-                visible_order,
-                header_height,
-            );
-            index.rows = model.row_count();
-        }
-    });
-}
-
-/// Number of entry rows (headers excluded) when the index is current.
-pub(super) fn projected_entries(model: &VecModel<FileRow>) -> Option<usize> {
-    with_index(model, |index| index.layout.entries())
 }
 
 /// Rows of the given entries, verified against the row ID. Entries the index cannot place

@@ -138,9 +138,7 @@ fn complete_size_sort(state: &SharedSessions) -> Option<FolderSizeProjection> {
             );
             if commit == FolderSizeCommit::Staged {
                 let tab = app.tab_mut(TabId(1)).unwrap();
-                pending.extend(with_folder_scheduler(tab, |scheduler, entries| {
-                    scheduler.next_complete_queries(entries)
-                }));
+                pending.extend(tab.folder_sizes.next_complete_queries());
             }
             last = folder_size_projection(&mut app, TabId(1), commit);
         }
@@ -243,13 +241,16 @@ fn issue_134_completed_size_sort_reorders_every_view_in_place() {
             }
         }
         if view_mode.uses_grid_layout() {
-            let positions = GRID_ENTRY_POSITIONS
-                .with_borrow(|by_window| by_window.get(&WindowId(1)).cloned().unwrap());
+            let grid = ui.get_grid_rows();
+            let grid = grid
+                .as_any()
+                .downcast_ref::<directory_model::DirectoryGrid>()
+                .unwrap();
             for (row_index, row) in ui.get_grid_rows().iter().enumerate() {
                 for (entry_index, entry) in row.entries.iter().enumerate() {
                     assert_eq!(
-                        positions.get(&EntryId(entry.id as u32)),
-                        Some(&(row_index, entry_index)),
+                        grid.locate(EntryId(entry.id as u32)),
+                        Some((row_index, entry_index)),
                         "{label}: grid slot follows the entry"
                     );
                 }

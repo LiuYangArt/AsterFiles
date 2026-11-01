@@ -197,16 +197,13 @@ fn viewport_changed(
         let app = state.lock().unwrap();
         (app.active().id, app.active().latest_request())
     };
-    let viewport_y = ui.get_file_viewport_y();
-    let viewport_height = ui.get_file_viewport_height();
     timing[0].time(|| {
         submit_visible_folder_sizes(
             &channels.everything_sender,
             &state.shared,
             tab_id,
             request_id,
-            viewport_y,
-            viewport_height,
+            ui,
         )
     });
     timing[1].time(|| {
@@ -368,8 +365,7 @@ fn profile_local_load(directory: &Path) -> LoadProfile {
                         &state.shared,
                         TabId(1),
                         request_id,
-                        ui.get_file_viewport_y(),
-                        ui.get_file_viewport_height(),
+                        &ui,
                     );
                     request_completed_file_images(
                         &ui,
@@ -491,7 +487,6 @@ fn profile_rectangle(group: GroupField, label: &'static str) -> RectangleProfile
         {
             let app = state.lock().unwrap();
             let rect = SelectionRect::from_points(x, start_y, x + step as f32, pointer_y);
-            let files = ui.get_files();
             let hit = |shown_rows| {
                 rectangle_selection_hits_for_app(
                     &app,
@@ -505,7 +500,7 @@ fn profile_rectangle(group: GroupField, label: &'static str) -> RectangleProfile
                     shown_rows,
                 )
             };
-            let indexed = hits.time(|| hit(files.as_any().downcast_ref::<VecModel<FileRow>>()));
+            let indexed = hits.time(|| projected_rectangle_hits(&ui, rect).unwrap());
             assert_eq!(
                 indexed,
                 hit(None),
@@ -807,8 +802,11 @@ fn issue_175_out_of_order_batches_keep_rows_in_pending_order() {
             assert_eq!(actual, expected, "batch {step}");
         }
         let files = ui.get_files();
-        let model = files.as_any().downcast_ref::<VecModel<FileRow>>().unwrap();
-        assert_eq!(file_row_index::projected_entries(model), Some(500));
+        let model = files
+            .as_any()
+            .downcast_ref::<directory_model::DirectoryRows>()
+            .unwrap();
+        assert_eq!(Some(model.entry_count()), Some(500));
         // Patches land on the selected rows only.
         let targets = [EntryId(7), EntryId(250), EntryId(405), EntryId(500)];
         let (tab_id, changed) = mutate_active_selection(&state, |tab| {

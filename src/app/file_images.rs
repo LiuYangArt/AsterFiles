@@ -202,6 +202,20 @@ pub(super) fn patch_images(
         .map(|entry| (entry.id, row_image(entry, tab, &app, size)))
         .collect::<HashMap<_, _>>();
     let mut changed = 0;
+    if let Some(rows) = directory_rows(ui) {
+        for (id, next) in &updates {
+            if let Some(index) = rows.locate(*id)
+                && let Some(mut row) = rows.row_data(index)
+                && (row.icon != next.0 || row.thumbnail_state != next.1)
+            {
+                row.icon = next.0.clone();
+                row.thumbnail_state = next.1;
+                rows.set_row_data(index, row);
+                changed += 1;
+            }
+        }
+        return changed;
+    }
     let files = ui.get_files();
     if let Some(rows) = files.as_any().downcast_ref::<VecModel<FileRow>>() {
         for (id, index) in file_row_index::locate(rows, tab, updates.keys().copied()) {

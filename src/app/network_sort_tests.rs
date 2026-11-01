@@ -225,7 +225,6 @@ fn issue_141_list_model_inserts_before_existing_rows_without_duplicates_or_scrol
                 preference.view_mode = mode
             });
         let ui = headless_model(request_id);
-        let original_model = ui.get_files();
         apply_network_batch(
             &state.shared,
             request_id,
@@ -235,6 +234,7 @@ fn issue_141_list_model_inserts_before_existing_rows_without_duplicates_or_scrol
         );
         append_active_file_rows(&ui, &state.shared, TabId(1), request_id);
         assert_eq!(list_ids(&ui), (1..=60).collect::<Vec<_>>());
+        let original_model = ui.get_files();
         let row_height = file_row_height(mode);
         ui.set_file_viewport_y(-20.0 * row_height - 7.0);
         apply_network_batch(
@@ -396,12 +396,14 @@ fn issue_141_grouped_and_grid_projections_keep_the_sorted_order_within_each_grou
         } else {
             vec![3, 4, 2, 1, 5]
         };
-        let list = projected_directory_rows(
-            tab.visible_entries(),
+        let groups = directory_group_projections(&app, tab, tab.visible_entries());
+        let list = directory_model::DirectoryRows::new(
+            tab.visible_entries_snapshot(),
+            groups.clone(),
             tab,
-            Texts::new(app.language),
             &app,
             None,
+            32.0,
         );
         assert_eq!(
             list.iter()
@@ -410,18 +412,15 @@ fn issue_141_grouped_and_grid_projections_keep_the_sorted_order_within_each_grou
                 .collect::<Vec<_>>(),
             expected
         );
-        let grid = projected_directory_grid_rows(
-            tab.visible_entries(),
-            tab,
-            Texts::new(app.language),
-            &app,
-            2,
-            64,
-        );
+        let grid = directory_model::DirectoryGrid::new(list.clone(), &groups, 2, 120.0);
         assert_eq!(
             grid.iter()
                 .filter(|row| !row.group_header)
-                .flat_map(|row| row.entries.iter().map(|entry| entry.id as u32))
+                .flat_map(|row| row
+                    .entries
+                    .iter()
+                    .map(|entry| entry.id as u32)
+                    .collect::<Vec<_>>())
                 .collect::<Vec<_>>(),
             expected
         );

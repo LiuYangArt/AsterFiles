@@ -138,109 +138,6 @@ pub(super) fn apply_completed(app: &mut AppState, old: &Path, new: &Path) -> Ren
     update
 }
 
-fn same_row(left: &FileRow, right: &FileRow) -> bool {
-    left.id == right.id
-        && left.name == right.name
-        && left.kind == right.kind
-        && left.size == right.size
-        && left.group_header == right.group_header
-        && left.group_label == right.group_label
-        && left.group_detail == right.group_detail
-        && left.group_count == right.group_count
-        && left.selected == right.selected
-        && left.focused == right.focused
-}
-
-fn preserve_images(row: &mut FileRow, previous: &HashMap<i32, FileRow>) {
-    if let Some(old) = previous.get(&row.id)
-        && old.icon.size().width > 0
-        && (old.name == row.name
-            || (old.is_directory && row.is_directory)
-            || Path::new(old.name.as_str())
-                .extension()
-                .map(|ext| ext.to_ascii_lowercase())
-                == Path::new(row.name.as_str())
-                    .extension()
-                    .map(|ext| ext.to_ascii_lowercase()))
-    {
-        row.icon = old.icon.clone();
-        row.thumbnail_state = old.thumbnail_state;
-    }
-}
-
-fn patch_rows(model: &ModelRc<FileRow>, next: Vec<FileRow>) {
-    let rows = model
-        .as_any()
-        .downcast_ref::<VecModel<FileRow>>()
-        .expect("directory projection uses mutable row models");
-    while rows.row_count() > next.len() {
-        rows.remove(rows.row_count() - 1);
-    }
-    for (index, row) in next.into_iter().enumerate() {
-        if let Some(existing) = rows.row_data(index) {
-            if !same_row(&existing, &row) {
-                rows.set_row_data(index, row);
-            }
-        } else {
-            rows.push(row);
-        }
-    }
-    file_row_index::reindex(rows, |row| {
-        group_header_height_for_detail(row.group_detail.as_str()) as f32
-    });
-}
-
-fn patch_grid(model: &ModelRc<GridRow>, next: Vec<GridRow>) {
-    let rows = model
-        .as_any()
-        .downcast_ref::<VecModel<GridRow>>()
-        .expect("directory grid projection uses mutable row models");
-    while rows.row_count() > next.len() {
-        rows.remove(rows.row_count() - 1);
-    }
-    for (index, mut row) in next.into_iter().enumerate() {
-        if let Some(existing) = rows.row_data(index) {
-            patch_rows(&existing.entries, row.entries.iter().collect());
-            row.entries = existing.entries.clone();
-            if existing.group_header != row.group_header
-                || existing.group_label != row.group_label
-                || existing.group_detail != row.group_detail
-                || existing.group_count != row.group_count
-            {
-                rows.set_row_data(index, row);
-            }
-        } else {
-            rows.push(row);
-        }
-    }
-}
-
-fn patch_placed(model: &ModelRc<PositionedGridRow>, next: Vec<PositionedGridRow>) {
-    let rows = model
-        .as_any()
-        .downcast_ref::<VecModel<PositionedGridRow>>()
-        .expect("grouped directory projection uses mutable row models");
-    while rows.row_count() > next.len() {
-        rows.remove(rows.row_count() - 1);
-    }
-    for (index, row) in next.into_iter().enumerate() {
-        if let Some(existing) = rows.row_data(index) {
-            if existing.offset != row.offset
-                || existing.extent != row.extent
-                || existing.row.group_header != row.row.group_header
-                || existing.row.group_label != row.row.group_label
-                || existing.row.group_detail != row.row.group_detail
-                || existing.row.group_count != row.row.group_count
-                || !std::ptr::eq(existing.row.entries.as_any(), row.row.entries.as_any())
-            {
-                rows.set_row_data(index, row);
-            }
-        } else {
-            rows.push(row);
-        }
-    }
-}
-
 pub(super) fn refresh_projection(
     ui: &AppWindow,
     state: &SharedSessions,
@@ -250,91 +147,7 @@ pub(super) fn refresh_projection(
     {
         let sessions = WindowSessions::new(state.clone(), window_id);
         let app = sessions.lock().expect("app state mutex is not poisoned");
-        let tab = app.active();
-        let mode = app.active_view_mode();
-        let texts = Texts::new(app.language);
-        if mode.uses_grid_layout() {
-            let previous = ui
-                .get_grid_rows()
-                .iter()
-                .flat_map(|row| {
-                    row.entries
-                        .iter()
-                        .map(|entry| (entry.id, entry))
-                        .collect::<Vec<_>>()
-                })
-                .collect::<HashMap<_, _>>();
-            let mut next = projected_directory_grid_rows(
-                tab.visible_entries(),
-                tab,
-                texts,
-                &app,
-                grid_column_count_for_view(ui, mode),
-                grid_thumbnail_request_px(mode, ui.window().scale_factor()),
-            );
-            for row in &mut next {
-                if let Some(entries) = row.entries.as_any().downcast_ref::<VecModel<FileRow>>() {
-                    for index in 0..entries.row_count() {
-                        let mut entry = entries.row_data(index).unwrap();
-                        preserve_images(&mut entry, &previous);
-                        entries.set_row_data(index, entry);
-                    }
-                }
-            }
-            patch_grid(&ui.get_grid_rows(), next);
-        } else {
-            let previous = ui
-                .get_files()
-                .iter()
-                .map(|row| (row.id, row))
-                .collect::<HashMap<_, _>>();
-            let mut next = projected_directory_rows(
-                tab.visible_entries(),
-                tab,
-                texts,
-                &app,
-                file_thumbnail_request_px(mode, ui.window().scale_factor()),
-            );
-            for row in &mut next {
-                preserve_images(row, &previous);
-            }
-            patch_rows(&ui.get_files(), next);
-        }
-    }
-    rebuild_grid_entry_positions(ui, window_id);
-    if ui.get_grouped_grid_enabled() {
-        let mut extent = 0.0;
-        let mut layout = Vec::new();
-        for row in ui.get_grid_rows().iter() {
-            let height = if row.group_header {
-                group_header_height_for_detail(row.group_detail.as_str()) as f32
-            } else {
-                file_row_height(projected_view_mode(ui))
-            };
-            layout.push(PositionedGridRow {
-                row,
-                offset: extent,
-                extent: height,
-            });
-            extent += height;
-        }
-        patch_placed(&ui.get_grouped_grid_layout(), layout.clone());
-        ui.set_grouped_grid_extent(extent);
-        let height = ui.get_file_viewport_height().max(0.0);
-        let viewport = ui
-            .get_file_viewport_y()
-            .clamp(-(extent - height).max(0.0), 0.0);
-        ui.set_file_viewport_y(viewport);
-        let overscan = file_row_height(projected_view_mode(ui)) * 2.0;
-        let start = (-viewport - overscan).max(0.0);
-        let end = -viewport + height + overscan;
-        patch_placed(
-            &ui.get_grouped_grid_visible_rows(),
-            layout
-                .into_iter()
-                .filter(|row| row.offset + row.extent > start && row.offset < end)
-                .collect(),
-        );
+        install_directory_models(ui, &app, app.active(), app.active_view_mode(), true);
     }
     // Keep unaffected displayed images and models; only absent images enter the existing scheduler.
     let (tab_id, _, mut requests) = grid_thumbnail_plan(ui, state, window_id);
@@ -473,10 +286,14 @@ mod tests {
                 refresh_projection(&ui, &state, WindowId(1), &scheduler);
                 let files = ui.get_files();
                 assert!(std::ptr::eq(original.as_any(), files.as_any()));
-                let rows = files.as_any().downcast_ref::<VecModel<FileRow>>().unwrap();
-                let app = state.lock().unwrap();
-                let tab = app.tab(TabId(1)).unwrap();
-                let located = file_row_index::locate(rows, tab, [EntryId(1), EntryId(2)]);
+                let rows = files
+                    .as_any()
+                    .downcast_ref::<directory_model::DirectoryRows>()
+                    .unwrap();
+                let located = [EntryId(1), EntryId(2)]
+                    .into_iter()
+                    .filter_map(|id| rows.locate(id).map(|index| (id, index)))
+                    .collect::<Vec<_>>();
                 assert_eq!(located.len(), 2);
                 for (id, index) in located {
                     assert_eq!(rows.row_data(index).unwrap().id, id.0 as i32);
@@ -484,15 +301,15 @@ mod tests {
                 let height = file_row_height(ViewMode::Details);
                 let mut top = 0.0;
                 for (index, row) in rows.iter().enumerate() {
-                    assert_eq!(file_row_index::top_of(rows, height, index), Some(top));
+                    assert_eq!(Some(rows.top_of(index)), Some(top));
                     top += if row.group_header {
                         group_header_height_for_detail(row.group_detail.as_str()) as f32
                     } else {
                         height
                     };
                 }
-                assert_eq!(file_row_index::extent(rows, height), Some(top));
-                assert_eq!(file_row_index::projected_entries(rows), Some(2));
+                assert_eq!(Some(rows.extent()), Some(top));
+                assert_eq!(Some(rows.entry_count()), Some(2));
             }
         }
     }
@@ -783,36 +600,6 @@ mod tests {
             visible.as_any(),
             ui.get_grouped_grid_visible_rows().as_any()
         ));
-    }
-
-    #[test]
-    fn issue_155_same_extension_keeps_resident_image_even_after_cache_eviction() {
-        let old = FileRow {
-            id: 1,
-            name: "a.png".into(),
-            icon: shell_icon_image(&image(48)),
-            thumbnail_state: 2,
-            ..FileRow::default()
-        };
-        let old_image = old.icon.clone();
-        let previous = HashMap::from([(1, old)]);
-        let mut same = FileRow {
-            id: 1,
-            name: "z.PNG".into(),
-            thumbnail_state: 1,
-            ..FileRow::default()
-        };
-        preserve_images(&mut same, &previous);
-        assert_eq!(same.icon, old_image);
-        let mut changed = FileRow {
-            id: 1,
-            name: "z.jpg".into(),
-            thumbnail_state: 2,
-            icon: shell_icon_image(&image(32)),
-            ..FileRow::default()
-        };
-        preserve_images(&mut changed, &previous);
-        assert_eq!(changed.icon.size().width, 32);
     }
 
     #[test]

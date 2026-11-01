@@ -553,15 +553,15 @@ pub fn export_folder_size_scheduler_state(path: &Path) -> io::Result<()> {
         created: None,
         webdav: None,
     };
-    let mut visible_entries = (1..=80).map(entry).collect::<Vec<_>>();
+    let visible_entries = (1..=80).map(entry).collect::<Vec<_>>();
     let mut visible = FolderSizeScheduler::new();
-    let first = visible.visible_queries(RequestId(1), &mut visible_entries, 0, 10);
-    let repeated = visible.visible_queries(RequestId(1), &mut visible_entries, 0, 10);
-    let scrolled = visible.visible_queries(RequestId(1), &mut visible_entries, 60, 10);
+    let first = visible.visible_queries(RequestId(1), &visible_entries, 0, 10);
+    let repeated = visible.visible_queries(RequestId(1), &visible_entries, 0, 10);
+    let scrolled = visible.visible_queries(RequestId(1), &visible_entries, 60, 10);
 
     let mut sorted_entries = (1..=55).map(entry).collect::<Vec<_>>();
     let mut complete = FolderSizeScheduler::new();
-    let mut pending = complete.begin_complete_sort(RequestId(2), &mut sorted_entries);
+    let mut pending = complete.begin_complete_sort(RequestId(2), &sorted_entries);
     let mut refreshes = 0;
     while !pending.is_empty() {
         for query in pending {
@@ -579,11 +579,11 @@ pub fn export_folder_size_scheduler_state(path: &Path) -> io::Result<()> {
                 refreshes += 1;
             }
         }
-        pending = complete.next_complete_queries(&mut sorted_entries);
+        pending = complete.next_complete_queries();
     }
     let progress = complete.progress().expect("complete sort has progress");
-    let mut cancellation_entries = vec![entry(56)];
-    let old = complete.begin_complete_sort(RequestId(2), &mut cancellation_entries);
+    let cancellation_entries = vec![entry(56)];
+    let old = complete.begin_complete_sort(RequestId(2), &cancellation_entries);
     complete.cancel(RequestId(3));
     let cancelled_rejected = old.first().is_some_and(|query| !complete.accepts(query));
     if let Some(parent) = path.parent() {

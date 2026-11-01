@@ -15,35 +15,34 @@ pub(super) fn wire_viewport(ui: &AppWindow, state: &WindowSessions, workers: &Wo
             refresh_grouped_grid_viewport(&ui);
         }
     });
-    ui.on_request_folder_size_range(move |viewport_y, viewport_height| {
+    ui.on_request_folder_size_range(move |_viewport_y, _viewport_height| {
         let target = state_for_folder_range.lock().ok().and_then(|app| {
             let tab = app.active();
             (tab.page_source == PageSource::Directory).then_some((tab.id, tab.latest_request()))
         });
-        if let Some((tab_id, request_id)) = target {
+        if let Some((tab_id, request_id)) = target
+            && let Some(ui) = weak_for_folder_range.upgrade()
+        {
             submit_visible_folder_sizes(
                 &everything_for_folder_range,
                 &state_for_folder_range.shared,
                 tab_id,
                 request_id,
-                viewport_y,
-                viewport_height,
+                &ui,
             );
-            if let Some(ui) = weak_for_folder_range.upgrade() {
-                request_visible_file_images(
-                    &ui,
-                    &state_for_folder_range.shared,
-                    state_for_folder_range.window_id,
-                    &thumbnails_for_folder_range,
-                );
-                submit_visible_shortcuts(
-                    &shortcut_for_folder_range,
-                    &state_for_folder_range.shared,
-                    &ui,
-                    tab_id,
-                    request_id,
-                );
-            }
+            request_visible_file_images(
+                &ui,
+                &state_for_folder_range.shared,
+                state_for_folder_range.window_id,
+                &thumbnails_for_folder_range,
+            );
+            submit_visible_shortcuts(
+                &shortcut_for_folder_range,
+                &state_for_folder_range.shared,
+                &ui,
+                tab_id,
+                request_id,
+            );
         }
     });
 }
@@ -339,9 +338,9 @@ pub(super) fn wire_layout(ui: &AppWindow, state: &WindowSessions, workers: &Work
                 tab.set_sort(field);
                 if tab.sort_field == SortField::Size {
                     let request_id = tab.latest_request();
-                    folder_queries = with_folder_scheduler(tab, |scheduler, entries| {
-                        scheduler.begin_complete_sort(request_id, entries)
-                    });
+                    folder_queries = tab
+                        .folder_sizes
+                        .begin_complete_sort(request_id, &tab.entries);
                 }
                 None
             }

@@ -41,6 +41,7 @@ Slint 语义使用与语言无关的控件标识。条目标识包含窗口、�
 
 | 职责 | 实现入口 | 状态与依赖边界 |
 | --- | --- | --- |
+| 目录按需显示 | `src/app/directory_model.rs`：`DirectoryRows`、`DirectoryGrid`、`PositionedDirectoryGrid` | 共享原始条目快照与显示索引；按请求生成列表和网格行；模型直接提供条目位置与分组几何，选择、图片和内容更新只通知变化行；Everything 保留原有稀疏分页 |
 | 图像缓存 | `src/app/icon_cache.rs`：`IconCache`、`BoundedImages` | 四套图像缓存仍由 `AppState.image_cache` 持有；普通和类型图标保留原容量规则，两套预览缓存各限 128 项，按最后写入顺序淘汰，读取不改变顺序；改名迁移在缓存内部完成 |
 | 查询与系统集成状态 | `src/app/app_state.rs`：`EverythingState`、`IntegrationState` | 仍是 `AppState` 的字段，沿用同一把锁和原有请求代次、忙碌状态及错误记录，不建立独立状态副本 |
 | 窗口回调组装 | `src/app/callbacks.rs`：`wire_callbacks` | 复用既有工作通道与确认窗口，按原顺序注册；`callbacks/` 下按地址栏、文件列表、导航、侧栏、标签、设置、菜单和任务划分职责 |
@@ -53,6 +54,8 @@ Slint 语义使用与语言无关的控件标识。条目标识包含窗口、�
 目录事件消费、目录监听、文件事件的窗口通知及全局界面刷新仍在 `app.rs`，因为它们共同连接目录、任务和窗口呈现。取消动作继续由 `actions.rs` 执行统一身份检查。`WindowSessions::lock()` 的活动窗口选择语义保持不变。协调子模块复用父层必要入口；工作模块不反向依赖协调模块，也不相互依赖。
 
 职责测试就近放在对应模块；跨职责和界面投影回归位于 `src/app/tests.rs`，保留原测试名称，共用测试夹具位于 `src/app/test_support.rs`。测试辅助不进入运行时构建。
+
+目录显示模型只保存来自标签会话的展示快照，选择和文件身份仍由 `TabSession` 管理（#165）。列表与网格共享原始条目；网格切片仅在请求行时建立，存活期间保持嵌套模型身份。框选、可见区请求和滚动查询直接使用显示索引，不为输入重建完整分组或生成整目录的 `FileRow`。实现边界见 [长期边界](foundation-plan.md#大目录按需显示与索引边界165175)，验证见 [#165 专项](agent/debug-validation.md#issue-165)。
 
 ## 复制执行与网络隔离（#149）
 

@@ -257,7 +257,6 @@ fn project_files(
     view_mode: ViewMode,
     projection_changed: bool,
 ) {
-    let texts = Texts::new(app.language);
     let projected_tab_id = tab.id.0 as i32;
     let projected_request_id = tab.latest_request().0 as i32;
     project_file_geometry(ui, view_mode);
@@ -273,7 +272,6 @@ fn project_files(
         ui.set_projected_file_tab_id(projected_tab_id);
         ui.set_projected_file_request_id(projected_request_id);
     }
-    let display_entries = directory_display_entries(tab);
     let grid_columns = grid_column_count_for_view(ui, view_mode);
     let total = tab.search_total.unwrap_or(tab.entries.len() as u32);
     let search_index =
@@ -287,10 +285,12 @@ fn project_files(
             grid_columns,
         ));
     }
-    let (file_rows, grid_rows) = if view_mode.uses_grid_layout() {
-        let requested_px = grid_thumbnail_request_px(view_mode, ui.window().scale_factor());
-        let grid_rows = if tab.page_source == PageSource::Search {
-            search_window_rows(tab, app, search_window, Some(requested_px))
+    if tab.page_source == PageSource::Directory {
+        install_directory_models(ui, app, tab, view_mode, false);
+    } else {
+        let (file_rows, grid_rows) = if view_mode.uses_grid_layout() {
+            let requested_px = grid_thumbnail_request_px(view_mode, ui.window().scale_factor());
+            let grid_rows = search_window_rows(tab, app, search_window, Some(requested_px))
                 .chunks(grid_columns)
                 .map(|entries| GridRow {
                     group_header: false,
@@ -299,52 +299,25 @@ fn project_files(
                     group_count: 0,
                     entries: ModelRc::new(VecModel::from(entries.to_vec())),
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (Vec::new(), grid_rows)
         } else {
-            projected_directory_grid_rows(
-                display_entries,
-                tab,
-                texts,
-                app,
-                grid_columns,
-                requested_px,
+            (
+                search_window_rows(
+                    tab,
+                    app,
+                    search_window,
+                    file_thumbnail_request_px(view_mode, ui.window().scale_factor()),
+                ),
+                Vec::new(),
             )
         };
-        (Vec::new(), grid_rows)
-    } else {
-        let file_rows = if tab.page_source == PageSource::Search {
-            search_window_rows(
-                tab,
-                app,
-                search_window,
-                file_thumbnail_request_px(view_mode, ui.window().scale_factor()),
-            )
-        } else {
-            projected_directory_rows(
-                display_entries,
-                tab,
-                texts,
-                app,
-                file_thumbnail_request_px(view_mode, ui.window().scale_factor()),
-            )
-        };
-        (file_rows, Vec::new())
-    };
-    let visible_order = tab.page_source == PageSource::Directory;
-    set_file_rows(ui, file_rows, visible_order);
-    ui.set_grid_column_count(grid_columns as i32);
-    ui.set_grid_rows(ModelRc::new(VecModel::from(grid_rows)));
-    let grouped_grid_enabled = view_mode.uses_grid_layout()
-        && tab.page_source == PageSource::Directory
-        && matches!(
-            tab.visible_location(),
-            Some(NavigationLocation::Directory(_))
-        )
-        && tab
-            .visible_path()
-            .is_some_and(|path| app.directory_preference(path).group_field != GroupField::None);
-    rebuild_grouped_grid_layout(ui, grouped_grid_enabled);
-    rebuild_grid_entry_positions(ui, window_id);
+        set_file_rows(ui, file_rows, false);
+        ui.set_grid_column_count(grid_columns as i32);
+        ui.set_grid_rows(ModelRc::new(VecModel::from(grid_rows)));
+        rebuild_grouped_grid_layout(ui, false);
+        rebuild_grid_entry_positions(ui, window_id);
+    }
     let preference_revision = if tab.page_source == PageSource::Search {
         0
     } else {

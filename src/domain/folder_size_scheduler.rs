@@ -50,6 +50,7 @@ pub struct FolderSizeScheduler {
     queued: HashSet<FolderSizeKey>,
     in_flight: HashSet<FolderSizeKey>,
     visible_snapshot: Vec<FolderSizeKey>,
+    visible_positions: HashMap<FolderSizeKey, usize>,
     complete_snapshot: Vec<FolderSizeKey>,
     staged: HashMap<FolderSizeKey, FolderSizeState>,
 }
@@ -69,6 +70,7 @@ impl FolderSizeScheduler {
             queued: HashSet::new(),
             in_flight: HashSet::new(),
             visible_snapshot: Vec::new(),
+            visible_positions: HashMap::new(),
             complete_snapshot: Vec::new(),
             staged: HashMap::new(),
         }
@@ -81,6 +83,7 @@ impl FolderSizeScheduler {
         self.queued.clear();
         self.in_flight.clear();
         self.visible_snapshot.clear();
+        self.visible_positions.clear();
         self.complete_snapshot.clear();
         self.staged.clear();
     }
@@ -95,28 +98,51 @@ impl FolderSizeScheduler {
     pub fn visible_queries(
         &mut self,
         request_id: RequestId,
-        entries: &mut [FileEntry],
+        entries: &[FileEntry],
         first_row: usize,
         visible_rows: usize,
     ) -> Vec<FolderSizeQuery> {
-        if self.request_id != request_id || self.strategy != FolderSizeStrategy::VisibleRange {
-            self.cancel(request_id);
-        }
         let prefetch = visible_rows.max(1);
         let start = first_row.saturating_sub(prefetch).min(entries.len());
         let end = first_row
             .saturating_add(visible_rows)
             .saturating_add(prefetch)
             .min(entries.len());
-        self.visible_snapshot = entries[start..end]
-            .iter()
-            .filter(|entry| entry.is_directory() && !is_internal_cleanup_path(&entry.path))
-            .map(key_for_entry)
-            .collect();
+        self.visible_entry_queries(request_id, entries, &(start..end).collect::<Vec<_>>())
+    }
+
+    pub fn clear_visible_range(&mut self) {
+        self.visible_snapshot.clear();
+        self.visible_positions.clear();
+    }
+
+    pub fn visible_entry_queries(
+        &mut self,
+        request_id: RequestId,
+        entries: &[FileEntry],
+        indices: &[usize],
+    ) -> Vec<FolderSizeQuery> {
+        if self.request_id != request_id || self.strategy != FolderSizeStrategy::VisibleRange {
+            self.cancel(request_id);
+        }
+        self.visible_snapshot.clear();
+        self.visible_positions.clear();
+        for index in indices {
+            let Some(entry) = entries.get(*index) else {
+                continue;
+            };
+            if !entry.is_directory() || is_internal_cleanup_path(&entry.path) {
+                continue;
+            }
+            let key = key_for_entry(entry);
+            if self.visible_positions.insert(key.clone(), *index).is_none() {
+                self.visible_snapshot.push(key);
+            }
+        }
         self.next_visible_queries(entries)
     }
 
-    pub fn next_visible_queries(&mut self, entries: &mut [FileEntry]) -> Vec<FolderSizeQuery> {
+    pub fn next_visible_queries(&mut self, entries: &[FileEntry]) -> Vec<FolderSizeQuery> {
         if self.strategy != FolderSizeStrategy::VisibleRange {
             return Vec::new();
         }
@@ -124,8 +150,13 @@ impl FolderSizeScheduler {
             .visible_snapshot
             .iter()
             .filter(|key| {
-                matching_entry(entries, key)
-                    .is_some_and(|entry| entry.folder_size == FolderSizeState::Unknown)
+                self.visible_positions
+                    .get(*key)
+                    .and_then(|index| entries.get(*index))
+                    .is_some_and(|entry| {
+                        entry.accepts_folder_size(key.entry_id, &key.path)
+                            && entry.folder_size == FolderSizeState::Unknown
+                    })
                     && !self.queued.contains(*key)
                     && !self.in_flight.contains(*key)
             })
@@ -135,12 +166,12 @@ impl FolderSizeScheduler {
             )
             .cloned()
             .collect();
-        self.mark_queued(entries, candidates)
+        self.mark_queued(candidates)
     }
     pub fn begin_complete_sort(
         &mut self,
         request_id: RequestId,
-        entries: &mut [FileEntry],
+        entries: &[FileEntry],
     ) -> Vec<FolderSizeQuery> {
         self.cancel(request_id);
         self.strategy = FolderSizeStrategy::CompleteForSort;
@@ -157,10 +188,10 @@ impl FolderSizeScheduler {
                 self.staged.insert(key_for_entry(entry), entry.folder_size);
             }
         }
-        self.next_complete_queries(entries)
+        self.next_complete_queries()
     }
 
-    pub fn next_complete_queries(&mut self, entries: &mut [FileEntry]) -> Vec<FolderSizeQuery> {
+    pub fn next_complete_queries(&mut self) -> Vec<FolderSizeQuery> {
         if self.strategy != FolderSizeStrategy::CompleteForSort {
             return Vec::new();
         }
@@ -178,7 +209,7 @@ impl FolderSizeScheduler {
             )
             .cloned()
             .collect::<Vec<_>>();
-        self.mark_queued(entries, candidates)
+        self.mark_queued(candidates)
     }
 
     pub fn start(&mut self, query: &FolderSizeQuery) -> bool {
@@ -189,17 +220,33 @@ impl FolderSizeScheduler {
         true
     }
 
-    pub fn reject(&mut self, query: &FolderSizeQuery, entries: &mut [FileEntry]) {
-        if !self.accepts(query)
-            || !(self.queued.remove(&query.key) || self.in_flight.remove(&query.key))
-        {
-            return;
+    pub fn reject(&mut self, query: &FolderSizeQuery) {
+        if self.accepts(query) {
+            self.queued.remove(&query.key);
+            self.in_flight.remove(&query.key);
         }
-        if let Some(entry) = matching_entry_mut(entries, &query.key)
-            && entry.folder_size == FolderSizeState::Querying
-        {
-            entry.folder_size = FolderSizeState::Unknown;
+    }
+
+    pub fn state_for(&self, entry: &FileEntry) -> FolderSizeState {
+        if entry.folder_size == FolderSizeState::Unknown {
+            let key = key_for_entry(entry);
+            if self.queued.contains(&key)
+                || self.in_flight.contains(&key)
+                || self.staged.contains_key(&key)
+            {
+                return FolderSizeState::Querying;
+            }
         }
+        entry.folder_size
+    }
+
+    pub fn querying_ids(&self) -> HashSet<EntryId> {
+        self.queued
+            .iter()
+            .chain(&self.in_flight)
+            .chain(self.staged.keys())
+            .map(|key| key.entry_id)
+            .collect()
     }
 
     pub fn complete(
@@ -242,17 +289,8 @@ impl FolderSizeScheduler {
             && self.strategy == query.strategy
     }
 
-    fn mark_queued(
-        &mut self,
-        entries: &mut [FileEntry],
-        candidates: Vec<FolderSizeKey>,
-    ) -> Vec<FolderSizeQuery> {
-        for key in &candidates {
-            self.queued.insert(key.clone());
-            if let Some(entry) = matching_entry_mut(entries, key) {
-                entry.folder_size = FolderSizeState::Querying;
-            }
-        }
+    fn mark_queued(&mut self, candidates: Vec<FolderSizeKey>) -> Vec<FolderSizeQuery> {
+        self.queued.extend(candidates.iter().cloned());
         candidates
             .into_iter()
             .map(|key| FolderSizeQuery {
@@ -280,11 +318,6 @@ fn key_for_entry(entry: &FileEntry) -> FolderSizeKey {
     }
 }
 
-fn matching_entry<'a>(entries: &'a [FileEntry], key: &FolderSizeKey) -> Option<&'a FileEntry> {
-    entries
-        .iter()
-        .find(|entry| entry.accepts_folder_size(key.entry_id, &key.path))
-}
 fn matching_entry_mut<'a>(
     entries: &'a mut [FileEntry],
     key: &FolderSizeKey,
@@ -357,7 +390,7 @@ mod tests {
         entries[1].path = PathBuf::from(r"C:\sizes\.ASTERFILES-CLEANUP\task");
         let mut scheduler = FolderSizeScheduler::new();
 
-        let queries = scheduler.visible_queries(RequestId(12), &mut entries, 0, 3);
+        let queries = scheduler.visible_queries(RequestId(12), &entries, 0, 3);
 
         assert_eq!(queries.len(), 2);
         assert!(queries.iter().all(|query| query.key.entry_id != EntryId(2)));
@@ -374,7 +407,7 @@ mod tests {
         entries[1].path = PathBuf::from(r"C:\sizes\.asterfiles-cleanup\task");
         let mut scheduler = FolderSizeScheduler::new();
 
-        let queries = scheduler.begin_complete_sort(RequestId(13), &mut entries);
+        let queries = scheduler.begin_complete_sort(RequestId(13), &entries);
 
         assert_eq!(queries.len(), 2);
         assert!(queries.iter().all(|query| query.key.entry_id != EntryId(2)));
@@ -389,13 +422,13 @@ mod tests {
     }
     #[test]
     fn visible_range_prefetches_one_screen_and_deduplicates() {
-        let mut entries = (0..100)
+        let entries = (0..100)
             .map(|index| entry(index + 1, &format!("folder-{index:03}")))
             .collect::<Vec<_>>();
         let mut scheduler = FolderSizeScheduler::new();
 
-        let first = scheduler.visible_queries(RequestId(7), &mut entries, 50, 10);
-        let duplicate = scheduler.visible_queries(RequestId(7), &mut entries, 50, 10);
+        let first = scheduler.visible_queries(RequestId(7), &entries, 50, 10);
+        let duplicate = scheduler.visible_queries(RequestId(7), &entries, 50, 10);
 
         assert_eq!(first.len(), 24);
         assert_eq!(first.first().unwrap().key.entry_id, EntryId(41));
@@ -405,10 +438,10 @@ mod tests {
 
     #[test]
     fn visible_range_past_the_last_entry_is_empty() {
-        let mut entries = vec![entry(1, "folder")];
+        let entries = vec![entry(1, "folder")];
         let mut scheduler = FolderSizeScheduler::new();
 
-        let queries = scheduler.visible_queries(RequestId(7), &mut entries, 900, 10);
+        let queries = scheduler.visible_queries(RequestId(7), &entries, 900, 10);
 
         assert!(queries.is_empty());
     }
@@ -418,7 +451,7 @@ mod tests {
         let mut entries = vec![entry(1, "a"), entry(2, "b"), entry(3, "c")];
         entries[0].folder_size = FolderSizeState::Value(9);
         let mut scheduler = FolderSizeScheduler::new();
-        let queries = scheduler.begin_complete_sort(RequestId(8), &mut entries);
+        let queries = scheduler.begin_complete_sort(RequestId(8), &entries);
         assert_eq!(queries.len(), 2);
         assert_eq!(
             scheduler.progress(),
@@ -433,7 +466,8 @@ mod tests {
             scheduler.complete(&queries[0], FolderSizeState::NotIndexed, &mut entries),
             FolderSizeCommit::Staged
         );
-        assert_eq!(entries[1].folder_size, FolderSizeState::Querying);
+        assert_eq!(entries[1].folder_size, FolderSizeState::Unknown);
+        assert_eq!(scheduler.state_for(&entries[1]), FolderSizeState::Querying);
 
         assert!(scheduler.start(&queries[1]));
         assert_eq!(
@@ -450,7 +484,7 @@ mod tests {
         let mut entries = vec![entry(1, "old")];
         let mut scheduler = FolderSizeScheduler::new();
         let query = scheduler
-            .visible_queries(RequestId(2), &mut entries, 0, 1)
+            .visible_queries(RequestId(2), &entries, 0, 1)
             .remove(0);
         assert!(scheduler.start(&query));
         scheduler.cancel(RequestId(3));
@@ -463,30 +497,132 @@ mod tests {
 
     #[test]
     fn rejecting_started_query_releases_it_for_resubmission() {
-        let mut entries = vec![entry(1, "a")];
+        let entries = vec![entry(1, "a")];
         let mut scheduler = FolderSizeScheduler::new();
         let query = scheduler
-            .visible_queries(RequestId(4), &mut entries, 0, 1)
+            .visible_queries(RequestId(4), &entries, 0, 1)
             .remove(0);
         assert!(scheduler.start(&query));
 
-        scheduler.reject(&query, &mut entries);
+        scheduler.reject(&query);
 
         assert_eq!(entries[0].folder_size, FolderSizeState::Unknown);
         assert_eq!(
             scheduler
-                .visible_queries(RequestId(4), &mut entries, 0, 1)
+                .visible_queries(RequestId(4), &entries, 0, 1)
                 .len(),
             1
         );
     }
+    #[test]
+    fn issue_165_visible_entries_follow_sparse_grid_positions_with_bounded_index() {
+        let mut entries = (0..100_000)
+            .map(|index| entry(index + 1, &format!("folder-{index:06}")))
+            .collect::<Vec<_>>();
+        let mut scheduler = FolderSizeScheduler::new();
+        let indices = [99_999, 50_000, 12, 50_000, usize::MAX];
+        let queries = scheduler.visible_entry_queries(RequestId(165), &entries, &indices);
+        assert_eq!(
+            queries
+                .iter()
+                .map(|query| query.key.entry_id)
+                .collect::<Vec<_>>(),
+            [EntryId(100_000), EntryId(50_001), EntryId(13)]
+        );
+        assert_eq!(scheduler.visible_positions.len(), 3);
+        assert_eq!(scheduler.visible_snapshot.len(), 3);
+        assert_eq!(entries[0].folder_size, FolderSizeState::Unknown);
+        assert_eq!(entries[99_999].folder_size, FolderSizeState::Unknown);
+        assert_eq!(
+            scheduler.state_for(&entries[99_999]),
+            FolderSizeState::Querying
+        );
+        assert!(
+            scheduler
+                .visible_entry_queries(RequestId(165), &entries, &indices)
+                .is_empty()
+        );
+        for query in &queries {
+            assert!(scheduler.start(query));
+            assert_eq!(
+                scheduler.complete(query, FolderSizeState::Value(165), &mut entries),
+                FolderSizeCommit::Visible(query.key.entry_id)
+            );
+        }
+        let next = scheduler.visible_entry_queries(RequestId(165), &entries, &[80_000]);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].key.entry_id, EntryId(80_001));
+        assert_eq!(scheduler.visible_positions.len(), 1);
+        scheduler.cancel(RequestId(166));
+        assert!(scheduler.visible_positions.is_empty());
+    }
+
+    #[test]
+    fn issue_165_query_planning_preserves_shared_entries_and_querying_presentation() {
+        use std::sync::Arc;
+        let entries = Arc::new(
+            (0..100_000)
+                .map(|index| entry(index + 1, &format!("folder-{index:06}")))
+                .collect::<Vec<_>>(),
+        );
+        let presentation = entries.clone();
+        let mut scheduler = FolderSizeScheduler::new();
+        let queries = scheduler.visible_entry_queries(RequestId(165), &entries, &[99_999, 90_000]);
+        assert!(Arc::ptr_eq(&entries, &presentation));
+        assert_eq!(Arc::strong_count(&entries), 2);
+        assert_eq!(entries[99_999].folder_size, FolderSizeState::Unknown);
+        assert_eq!(
+            scheduler.state_for(&entries[99_999]),
+            FolderSizeState::Querying
+        );
+        assert_eq!(
+            scheduler.querying_ids(),
+            HashSet::from([EntryId(100_000), EntryId(90_001)])
+        );
+        assert!(scheduler.start(&queries[0]));
+        assert_eq!(
+            scheduler.state_for(&entries[99_999]),
+            FolderSizeState::Querying
+        );
+        scheduler.reject(&queries[0]);
+        assert_eq!(
+            scheduler.state_for(&entries[99_999]),
+            FolderSizeState::Unknown
+        );
+        scheduler.cancel(RequestId(166));
+        assert_eq!(
+            scheduler.state_for(&entries[90_000]),
+            FolderSizeState::Unknown
+        );
+        assert!(scheduler.querying_ids().is_empty());
+        assert!(Arc::ptr_eq(&entries, &presentation));
+    }
+
+    #[test]
+    fn issue_165_visible_index_rechecks_identity_after_reorder() {
+        let mut entries = vec![entry(1, "a"), entry(2, "b")];
+        let mut scheduler = FolderSizeScheduler::new();
+        let query = scheduler
+            .visible_entry_queries(RequestId(165), &entries, &[0])
+            .remove(0);
+        scheduler.reject(&query);
+        entries.swap(0, 1);
+        assert!(
+            scheduler.next_visible_queries(&entries).is_empty(),
+            "a stale row must not query a different entry"
+        );
+        let next = scheduler.visible_entry_queries(RequestId(165), &entries, &[1]);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].key.entry_id, EntryId(1));
+    }
+
     #[test]
     fn complete_sort_refills_in_bounded_batches() {
         let mut entries = (0..60)
             .map(|index| entry(index + 1, &format!("folder-{index:03}")))
             .collect::<Vec<_>>();
         let mut scheduler = FolderSizeScheduler::new();
-        let mut queries = scheduler.begin_complete_sort(RequestId(11), &mut entries);
+        let mut queries = scheduler.begin_complete_sort(RequestId(11), &entries);
         assert_eq!(queries.len(), FOLDER_SIZE_SUBMIT_LIMIT);
         for query in queries.drain(..) {
             assert!(scheduler.start(&query));
@@ -495,7 +631,7 @@ mod tests {
                 FolderSizeCommit::CompleteSort
             );
         }
-        let next = scheduler.next_complete_queries(&mut entries);
+        let next = scheduler.next_complete_queries();
         assert_eq!(next.len(), FOLDER_SIZE_SUBMIT_LIMIT);
     }
 }

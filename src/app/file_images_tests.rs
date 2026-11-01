@@ -166,7 +166,10 @@ fn issue_175_icons_real_shell_and_pixel_updates_stay_viewport_bounded() {
     );
     assert_eq!(file_images::conversion_count() - conversions_before, 1);
     let files = ui.get_files();
-    let model = files.as_any().downcast_ref::<VecModel<FileRow>>().unwrap();
+    let model = files
+        .as_any()
+        .downcast_ref::<directory_model::DirectoryRows>()
+        .unwrap();
     let first = model.row_data(0).unwrap().icon.to_rgba8().unwrap();
     let second = model.row_data(1).unwrap().icon.to_rgba8().unwrap();
     assert_eq!(first.as_bytes().as_ptr(), second.as_bytes().as_ptr());

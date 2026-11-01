@@ -1744,13 +1744,6 @@ fn issue_18_grid_batches_skip_eager_icons_but_details_keep_them() {
     assert!(!details_requests[0].thumbnail);
 }
 #[test]
-fn issue_18_rebuilt_projection_is_coalesced_for_large_directories() {
-    assert!(should_rebuild_projection(0, 32));
-    assert!(!should_rebuild_projection(32, 255));
-    assert!(should_rebuild_projection(32, 288));
-}
-
-#[test]
 fn issue_18_thumbnail_cache_evicts_the_oldest_entry() {
     let mut cache = icon_cache::BoundedImages::new(2);
     cache.insert((PathBuf::from("first.png"), 256), test_image(1));
@@ -6366,12 +6359,14 @@ fn group_menu_command_updates_the_window_directory_and_projects_headers() {
             GroupField::Kind
         );
         let tab = app.active();
-        let rows = projected_directory_rows(
-            tab.visible_entries(),
+        let groups = directory_group_projections(&app, tab, tab.visible_entries());
+        let rows = directory_model::DirectoryRows::new(
+            tab.visible_entries_snapshot(),
+            groups,
             tab,
-            Texts::new(Language::Chinese),
             &app,
             None,
+            32.0,
         );
         let labels = rows
             .iter()
@@ -6669,7 +6664,9 @@ fn stale_folder_size_event_cannot_update_reused_entry_id() {
         FolderSizeCommit::Ignored
     );
     assert_eq!(
-        app.active_window_state().tabs[&TabId(1)].entries[0].folder_size,
+        app.active_window_state().tabs[&TabId(1)]
+            .folder_sizes
+            .state_for(&app.active_window_state().tabs[&TabId(1)].entries[0]),
         FolderSizeState::Querying
     );
     assert_eq!(
