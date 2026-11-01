@@ -74,6 +74,7 @@
 | [#166](#issue-166) | Cargo 工作区与依赖边界（#166） |
 | [#167](#issue-167) | Windows 系统绑定版本（#167） |
 | [#168](#issue-168) | Windows 平台安全前提说明（#168） |
+| [#169](#issue-169) | Agent 场景登记与 Release 入口（#169） |
 | [#175](#issue-175) | Issue #175 十万条目目录加载、框选与滚动 |
 | [#176](#issue-176) | Temp 监听循环与本地刷新（#176） |
 | [#177](#issue-177) | Issue #177 地址栏退出编辑 |
@@ -1007,6 +1008,28 @@ python tools/verify.py
 验证同时检查：工作区 Clippy 通过；临时加入缺少安全说明的测试块时，Clippy 必须报 `undocumented_unsafe_blocks`，恢复后再执行完整验证。原始源码逐行对比保留在 `artifacts/state/issue-168/source-audit.json`，用于确认运行代码未改变。
 
 证据集中在 `artifacts/state/issue-168/`：`lint-probe.json` 保存反向检查，`verification.json` 保存汇总。完整验证及本地 Release 收尾日志保存在 `artifacts/logs/issue-168/`。注释陈述必要前提，不代替对运行时内存安全的证明；审查发现但超出本次范围的既有问题由 GitHub Issues #179、#180、#181、#182 和 #183 跟踪。
+
+<a id="issue-169"></a>
+
+## Agent 场景登记与 Release 入口（#169）
+
+`src/agent_debug/scenarios.rs` 集中登记现有 20 个场景的名称和导出入口。参数解析、名称输出及执行共用同一张表；`main.rs` 只获取输出路径并调用公共分发。两个通用会话场景复用状态导出，其余场景沿用专属报告。名称、参数、默认路径和 JSON 格式不变。
+
+`--no-ui` 导出后退出。未指定时，专属报告之后仍按原有流程写入通用会话状态，再进入应用；本次不改变这个行为。`agent-actions` 始终只写自己的报告并退出，不输出公共状态事件。
+
+正式 Release 保留现有命令行调试入口，不新增 Cargo feature。网络复制的 #136、#137 探针需要检查实际程序的父子进程和优化后执行行为；保留入口可以直接诊断用户使用的同一份 Release 程序。增加 feature 会产生另一套待验证的程序，当前没有隔离这些本机显式命令的需求，因此选择保持单一构建方式。`tools/verify.py`、构建脚本和 CI 继续使用原有命令。
+
+保留的调试能力包括 `--agent-scenario`、`--agent-state-out`、`--no-ui`、网络复制探针和 Shell 启动探针及其接收角色。它们没有常驻远程服务，但不全是只读操作：状态导出会创建目录或覆盖指定文件；操作序列会处理自己的临时夹具；网络复制探针会在 `artifacts/state/` 下创建测试副本。调用前应检查输出位置和源路径。
+
+`--asterfiles-network-child` 是正常目录枚举、网络连接和文件操作依赖的内部辅助入口，`--shell-ui` 是 Shell 打开链路中的正式应用角色。它们与调试探针分别处理，不能因清理调试入口而屏蔽。设置页的“UI 陈列室”仍仅在 Debug 中显示，与命令行调试入口的保留策略不同。
+
+```powershell
+cargo test --locked issue_169 -- --nocapture
+python tools/verify.py
+python tools/verify.py --release
+```
+
+专项测试覆盖登记表完整性及唯一性、名称和路径不变、公共事件格式、退出行为、原有二次导出和失败传播，不创建桌面窗口。完整验证运行全部 20 个 Agent 场景及 Shell 启动探针；收尾执行本地 Release 构建，不发布。证据位于 `artifacts/logs/issue-169/` 和 `artifacts/state/issue-169/`，统一汇总为 `artifacts/verify/summary.json`。独立审查和自动验证通过即可验收，无需额外 UI 操作。
 
 ## 文件操作人工验证矩阵
 

@@ -1,3 +1,8 @@
+mod scenarios;
+
+pub use scenarios::export_scenario;
+use scenarios::parse_scenario;
+
 use std::{
     env,
     ffi::OsString,
@@ -50,31 +55,6 @@ pub enum AgentScenario {
 }
 
 impl AgentScenario {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::PermissionDenied => "permission-denied",
-            Self::FileOperationCenter => "file-operation-center",
-            Self::DragDropFoundation => "drag-drop-foundation",
-            Self::MultiWindowStateLayering => "multi-window-state-layering",
-            Self::TabReorder => "tab-reorder",
-            Self::TabDetach => "tab-detach",
-            Self::TabCrossWindow => "tab-cross-window",
-            Self::ExplorerPins => "explorer-pins",
-            Self::WindowsLibraries => "windows-libraries",
-            Self::QuickAccess => "quick-access",
-            Self::ShellThumbnail => "shell-thumbnail",
-            Self::ThumbnailScheduler => "thumbnail-scheduler",
-            Self::FolderSizeScheduler => "folder-size-scheduler",
-            Self::QuickMenuSearch => "quick-menu-search",
-            Self::QuickMenuPopup => "quick-menu-popup",
-            Self::NetworkFoundation => "network-foundation",
-            Self::DriveCapacity => "drive-capacity",
-            Self::Home => "home",
-            Self::FileListTypeSelect => "file-list-type-select",
-            Self::AgentActions => "agent-actions",
-        }
-    }
-
     fn default_path(self) -> PathBuf {
         match self {
             Self::AgentActions => Path::new(DEFAULT_STATE_DIR)
@@ -180,32 +160,6 @@ impl AgentOptions {
                 .clone()
                 .unwrap_or_else(|| scenario.default_path())
         })
-    }
-}
-
-fn parse_scenario(value: &str) -> Result<AgentScenario, String> {
-    match value {
-        "permission-denied" => Ok(AgentScenario::PermissionDenied),
-        "file-operation-center" => Ok(AgentScenario::FileOperationCenter),
-        "drag-drop-foundation" => Ok(AgentScenario::DragDropFoundation),
-        "multi-window-state-layering" => Ok(AgentScenario::MultiWindowStateLayering),
-        "tab-reorder" => Ok(AgentScenario::TabReorder),
-        "tab-detach" => Ok(AgentScenario::TabDetach),
-        "tab-cross-window" => Ok(AgentScenario::TabCrossWindow),
-        "explorer-pins" => Ok(AgentScenario::ExplorerPins),
-        "windows-libraries" => Ok(AgentScenario::WindowsLibraries),
-        "quick-access" => Ok(AgentScenario::QuickAccess),
-        "shell-thumbnail" => Ok(AgentScenario::ShellThumbnail),
-        "thumbnail-scheduler" => Ok(AgentScenario::ThumbnailScheduler),
-        "folder-size-scheduler" => Ok(AgentScenario::FolderSizeScheduler),
-        "quick-menu-search" => Ok(AgentScenario::QuickMenuSearch),
-        "quick-menu-popup" => Ok(AgentScenario::QuickMenuPopup),
-        "network-foundation" => Ok(AgentScenario::NetworkFoundation),
-        "drive-capacity" => Ok(AgentScenario::DriveCapacity),
-        "home" => Ok(AgentScenario::Home),
-        "file-list-type-select" => Ok(AgentScenario::FileListTypeSelect),
-        "agent-actions" => Ok(AgentScenario::AgentActions),
-        _ => Err(format!("unknown agent scenario: {value}")),
     }
 }
 
