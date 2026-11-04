@@ -1,0 +1,180 @@
+import { VisualStyle } from "visual-style.slint";
+import { ColumnRow } from "models.slint";
+
+export component FileHeader inherits Rectangle {
+    in property <bool> active-is-home;
+    callback begin-column-drag(int, float, float);
+    callback change-sort(int);
+    in-out property <int> column-drag-insertion-slot;
+    in-out property <bool> column-drag-pointer-active;
+    in-out property <length> column-drag-pointer-x;
+    in-out property <length> column-drag-pointer-y;
+    in-out property <int> column-drag-source-kind;
+    in-out property <bool> column-dragging;
+    in property <[ColumnRow]> columns;
+    in-out property <length> context-menu-anchor-x;
+    in-out property <length> context-menu-anchor-y;
+    callback end-column-drag(bool);
+    in property <length> file-columns-width;
+    in-out property <length> file-viewport-x;
+    in property <color> insertion-indicator-color;
+    in property <float> insertion-indicator-width;
+    in-out property <length> normal-created-width;
+    in-out property <length> normal-kind-width;
+    in-out property <length> normal-modified-width;
+    in-out property <length> normal-name-width;
+    in-out property <length> normal-size-width;
+    callback resize-column(int, float);
+    in-out property <length> search-created-width;
+    in-out property <length> search-modified-width;
+    in-out property <length> search-name-width;
+    in-out property <length> search-parent-width;
+    in property <bool> search-results-mode;
+    in-out property <length> search-size-width;
+    callback show-column-menu(int, float, float);
+    in property <bool> sort-descending;
+    in property <int> sort-field;
+    in-out property <bool> suppress-column-click;
+    callback update-column-drag(float, float, float, float, float, float) -> int;
+    in property <int> view-mode;
+    in property <Point> window-origin;
+
+    public pure function column-slot-x(slot: int) -> length {
+        return slot <= 0 ? 0px
+        : slot == 1 ? root.visible-column-width(0)
+        : slot == 2 ? root.visible-column-width(0) + root.visible-column-width(1)
+        : slot == 3 ? root.visible-column-width(0) + root.visible-column-width(1) + root.visible-column-width(2)
+        : slot == 4 ? root.visible-column-width(0) + root.visible-column-width(1) + root.visible-column-width(2) + root.visible-column-width(3)
+        : root.file-columns-width;
+    }
+    public function set-column-width(kind: int, width: length) {
+        if root.search-results-mode {
+            if kind == 0 { root.search-name-width = width; }
+            else if kind == 1 { root.search-parent-width = width; }
+            else if kind == 2 { root.search-size-width = width; }
+            else if kind == 3 { root.search-modified-width = width; }
+            else { root.search-created-width = width; }
+        } else {
+            if kind == 0 { root.normal-name-width = width; }
+            else if kind == 1 { root.normal-kind-width = width; }
+            else if kind == 2 { root.normal-size-width = width; }
+            else if kind == 3 { root.normal-modified-width = width; }
+            else { root.normal-created-width = width; }
+        }
+    }
+    public pure function column-width(kind: int) -> length {
+        return root.search-results-mode
+        ? (kind == 0 ? root.search-name-width : kind == 1 ? root.search-parent-width : kind == 2 ? root.search-size-width : kind == 3 ? root.search-modified-width : root.search-created-width)
+        : (kind == 0 ? root.normal-name-width : kind == 1 ? root.normal-kind-width : kind == 2 ? root.normal-size-width : kind == 3 ? root.normal-modified-width : root.normal-created-width);
+    }
+    public function clamp-file-viewport(available: length) {
+        root.file-viewport-x = max(min(0px, available - root.file-columns-width), min(0px, root.file-viewport-x));
+    }
+    public pure function visible-column-width(index: int) -> length {
+        return root.columns[index].visible ? root.column-width(root.columns[index].kind) : 0px;
+    }
+    height: root.view-mode == 0 && !root.active-is-home ? 38px : 0px; visible: root.view-mode == 0 && !root.active-is-home; background: VisualStyle.surface; border-width: 0px; clip: true;
+    header-viewport := Rectangle {
+        width: parent.width - 28px; height: parent.height; clip: true;
+        header-columns := Rectangle {
+            x: 16px + root.file-viewport-x; width: root.file-columns-width; height: parent.height;
+            clip: true;
+            HorizontalLayout {
+                spacing: 0px;
+                for column[index] in root.columns: Rectangle {
+                    visible: column.visible;
+                    width: self.visible ? root.column-width(column.kind) : 0px;
+                    background: (column-touch.has-hover || resize-touch.has-hover) ? VisualStyle.accent-hover : transparent;
+                    Rectangle { x: parent.width - 1px; y: 10px; width: 1px; height: 18px; background: VisualStyle.column-divider; }
+                    Rectangle { x: 0px; y: 0px; width: parent.width - 16px; height: parent.height; z: 1;
+                        Text {
+                            x: column.content-left + column.icon-slot; width: parent.width - self.x - column.content-right;
+                            horizontal-alignment: left;
+                            text: column.label + (root.sort-field == column.kind ? (root.sort-descending ? " ↓" : " ↑") : "");
+                            color: VisualStyle.text-detail; overflow: elide;
+                            font-size: 12px; font-weight: root.sort-field == column.kind ? 600 : 400; vertical-alignment: center;
+                        }
+                        column-touch := TouchArea {
+                            width: parent.width;
+                            mouse-cursor: root.column-dragging && root.column-drag-source-kind == column.kind ? grabbing : pointer;
+                            pointer-event(event) => {
+                                if event.button == PointerEventButton.right && event.kind == PointerEventKind.down {
+                                    root.context-menu-anchor-x = self.absolute-position.x + self.mouse-x - root.window-origin.x;
+                                    root.context-menu-anchor-y = self.absolute-position.y + self.mouse-y - root.window-origin.y;
+                                    root.show-column-menu(column.kind, root.context-menu-anchor-x / 1px, root.context-menu-anchor-y / 1px);
+                                }
+                                if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                                    root.column-drag-pointer-active = true;
+                                    root.column-drag-source-kind = column.kind;
+                                    root.column-drag-pointer-x = self.absolute-position.x + self.mouse-x;
+                                    root.column-drag-pointer-y = self.absolute-position.y + self.mouse-y;
+                                    root.begin-column-drag(column.kind, root.column-drag-pointer-x / 1px, root.column-drag-pointer-y / 1px);
+                                }
+                                if event.button == PointerEventButton.left && event.kind == PointerEventKind.up {
+                                    root.end-column-drag(root.column-dragging && root.column-drag-insertion-slot >= 0);
+                                }
+                            }
+                            moved => {
+                                if self.pressed && root.column-drag-pointer-active && root.column-drag-source-kind == column.kind {
+                                    root.column-drag-pointer-x = self.absolute-position.x + self.mouse-x;
+                                    root.column-drag-pointer-y = self.absolute-position.y + self.mouse-y;
+                                    let slot = root.update-column-drag(
+                                        root.column-drag-pointer-x / 1px,
+                                        root.column-drag-pointer-y / 1px,
+                                        header-viewport.absolute-position.x / 1px,
+                                        header-viewport.absolute-position.y / 1px,
+                                        header-viewport.width / 1px,
+                                        header-columns.x / 1px
+                                    );
+                                    if slot >= -1 {
+                                        root.column-dragging = true;
+                                        root.suppress-column-click = true;
+                                        root.column-drag-insertion-slot = slot;
+                                    }
+                                }
+                            }
+                            clicked => {
+                                if !root.suppress-column-click { root.change-sort(column.kind); }
+                                root.suppress-column-click = false;
+                            }
+                        }
+                    }
+                    Rectangle {
+                        // Keep the complete hit target inside its owning column so no sibling can clip or steal it.
+                        x: parent.width - 16px; width: 16px; height: 38px; z: 20;
+                        resize-touch := TouchArea {
+                            width: parent.width; height: parent.height;
+                            mouse-cursor: col-resize;
+                            private property <length> drag-start-width;
+                            private property <length> drag-start-pointer-x;
+                            pointer-event(event) => {
+                                if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                                    self.drag-start-width = root.column-width(column.kind);
+                                    self.drag-start-pointer-x = self.absolute-position.x + self.mouse-x;
+                                }
+                                if event.button == PointerEventButton.left && event.kind == PointerEventKind.up {
+                                    root.resize-column(column.kind, root.column-width(column.kind) / 1px);
+                                }
+                            }
+                            moved => {
+                                if self.pressed {
+                                    root.set-column-width(column.kind, min(4096px, max(column.min-width, self.drag-start-width + self.absolute-position.x + self.mouse-x - self.drag-start-pointer-x)));
+                                    root.resize-column(column.kind, root.column-width(column.kind) / 1px);
+                                    root.clamp-file-viewport(header-viewport.width);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.column-dragging && root.column-drag-insertion-slot >= 0: Rectangle {
+            x: header-columns.x + root.column-slot-x(root.column-drag-insertion-slot) - root.insertion-indicator-width * 1px / 2;
+            width: root.insertion-indicator-width * 1px; height: parent.height; z: 80;
+            background: root.insertion-indicator-color;
+        }
+
+    }
+
+}

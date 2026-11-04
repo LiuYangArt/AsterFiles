@@ -1,0 +1,194 @@
+import { VisualStyle } from "visual-style.slint";
+import { IconMap } from "icons/icon-map.slint";
+import { ScrollView } from "std-widgets.slint";
+import { UiTexts } from "@ui-texts";
+import { HomeItemRow, HomeCardRow } from "models.slint";
+import { InlineIcon } from "navigation-controls.slint";
+
+component HomeCard inherits Rectangle {
+    in property <HomeItemRow> item;
+    in property <string> selected-id;
+    callback selected(string);
+    callback activated(string);
+    callback menu-requested(int, string, float, float);
+    height: item.state >= 0 ? 82px : 64px;
+    border-radius: 7px;
+    border-width: 0px;
+    background: root.selected-id == item.stable-id ? VisualStyle.selection : card-touch.pressed ? VisualStyle.surface-pressed : card-touch.has-hover ? VisualStyle.surface-hover : VisualStyle.surface-subtle;
+
+    card-focus := FocusScope {
+        width: parent.width; height: parent.height;
+        KeyBinding { keys: @keys(Return); activated => { root.activated(root.item.stable-id); } }
+        KeyBinding { keys: @keys(Space); activated => { root.selected(root.item.stable-id); } }
+    }
+    HorizontalLayout {
+        padding-left: 14px; padding-right: 14px; padding-top: 11px; padding-bottom: 11px; spacing: 12px;
+        InlineIcon {
+            width: 42px; height: 42px;
+            icon-size: 38px;
+            icon-source: root.item.icon.width != 0 ? root.item.icon : (root.item.source-kind == 0 ? IconMap.file-folder : IconMap.location-drive);
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+            Text { x: 0px; y: 0px; width: parent.width; height: root.item.source-kind == 2 ? parent.height : 20px; text: root.item.label; color: VisualStyle.text-primary; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: root.item.source-kind == 2 ? clip : elide; wrap: root.item.source-kind == 2 ? word-wrap : no-wrap; }
+            Text { visible: root.item.source-kind != 2; x: 0px; y: 21px; width: parent.width; height: 17px; text: root.item.detail; color: VisualStyle.text-secondary; font-size: 11px; vertical-alignment: center; overflow: elide; }
+            if root.item.state >= 0 && root.item.source-kind != 0: Rectangle {
+                x: 0px; y: 43px; width: parent.width; height: 4px; border-radius: 2px; clip: true;
+                background: root.item.state == 3 ? VisualStyle.drive-progress-unavailable : VisualStyle.drive-progress-track;
+                Rectangle {
+                    visible: root.item.state != 3;
+                    x: root.item.state == 0 ? -parent.width * 0.35 + parent.width * 1.35 * mod(animation-tick(), 1400ms) / 1400ms : 0px;
+                    width: root.item.state == 0 ? parent.width * 0.35 : parent.width * max(0, min(1, root.item.progress));
+                    height: parent.height; border-radius: parent.border-radius;
+                    background: root.item.state == 2 ? VisualStyle.drive-progress-warning : VisualStyle.drive-progress-fill;
+                }
+            }
+
+        }
+    }
+    card-touch := TouchArea {
+        mouse-cursor: pointer;
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down && event.button == PointerEventButton.left { card-focus.focus(); }
+            if event.kind == PointerEventKind.up && event.button == PointerEventButton.right && root.item.menu-stable-id != "" {
+                root.selected(root.item.stable-id);
+                root.menu-requested(root.item.menu-group, root.item.menu-stable-id, (self.absolute-position.x + self.mouse-x) / 1px, (self.absolute-position.y + self.mouse-y) / 1px);
+            }
+        }
+        clicked => { root.selected(root.item.stable-id); }
+        double-clicked => { root.activated(root.item.stable-id); }
+    }
+    accessible-role: list-item;
+    accessible-id: "home/" + root.item.stable-id;
+    accessible-item-selectable: true;
+    accessible-item-selected: root.item.selected;
+    accessible-action-default => { root.selected(root.item.stable-id); }
+    accessible-label: root.item.status == "" ? root.item.label + ", " + root.item.detail : root.item.label + ", " + root.item.detail + ", " + root.item.status;
+}
+
+component HomeSection inherits Rectangle {
+    in property <string> title;
+    in property <[HomeCardRow]> rows;
+    in property <string> selected-id;
+    in property <bool> expanded: true;
+    in property <int> column-count: 2;
+    in property <length> card-width: 264px;
+    in property <bool> show-empty: false;
+    in property <string> empty-text: "";
+    callback toggle-expanded();
+    callback select-item(string);
+    callback activate-item(string);
+    callback item-menu-requested(int, string, float, float);
+    height: section-layout.preferred-height;
+    section-layout := VerticalLayout {
+        spacing: 8px;
+        Rectangle {
+            height: 34px; border-radius: 5px;
+            background: header-touch.has-hover ? VisualStyle.surface-hover : transparent;
+            Rectangle {
+                x: 10px; width: 12px; height: parent.height;
+                Path {
+                    x: 2px; y: (parent.height - self.height) / 2; width: 8px; height: 8px;
+                    viewbox-width: 8; viewbox-height: 8; fit: fill;
+                    commands: root.expanded ? "M 1 2.5 L 4 5.5 L 7 2.5" : "M 2.5 1 L 5.5 4 L 2.5 7";
+                    stroke: VisualStyle.icon-muted; stroke-width: 1.2px; stroke-line-cap: round; stroke-line-join: round; fill: transparent;
+                }
+            }
+            Text { x: 34px; width: parent.width - 44px; text: root.title; color: VisualStyle.text-primary; font-size: 15px; font-weight: 600; vertical-alignment: center; }
+            header-touch := TouchArea { mouse-cursor: pointer; clicked => { root.toggle-expanded(); } }
+            accessible-role: button; accessible-label: root.title; accessible-expanded: root.expanded;
+        }
+        if root.expanded: VerticalLayout {
+            spacing: 8px;
+            for row in root.rows: HorizontalLayout {
+                height: row.entries.length > 0 && row.entries[0].state >= 0 ? 82px : 64px; spacing: 10px;
+                for item in row.entries: HomeCard { width: root.card-width; item: item; selected-id: root.selected-id; selected(id) => { root.select-item(id); } activated(id) => { root.activate-item(id); } menu-requested(group, id, x, y) => { root.item-menu-requested(group, id, x, y); } }
+                Rectangle { horizontal-stretch: 1; }
+            }
+            if root.show-empty: Rectangle {
+                height: 58px; border-radius: 7px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
+                Text { x: 16px; width: parent.width - 32px; text: root.empty-text; color: VisualStyle.text-secondary; font-size: 12px; vertical-alignment: center; horizontal-alignment: center; wrap: word-wrap; }
+            }
+        }
+    }
+}
+
+export component HomePage inherits Rectangle {
+    in property <length> home-card-width;
+    in property <int> home-column-count;
+    in property <[HomeCardRow]> home-drive-items;
+    in property <bool> home-drives-expanded;
+    in property <bool> home-network-locations-expanded;
+    in property <[HomeCardRow]> home-network-locations-items;
+    in property <bool> home-quick-access-expanded;
+    in property <[HomeCardRow]> home-quick-access-items;
+    in-out property <string> home-selected-id;
+    in property <bool> minimal;
+    callback navigate-home-item(string);
+    callback select-home-item(string);
+    callback show-sidebar-menu(int, string, float, float);
+    callback toggle-home-section(int);
+    in property <Point> window-origin;
+
+    x: 0px;
+    y: 0px;
+
+    background: VisualStyle.surface;
+    home-scroll := ScrollView {
+        width: parent.width; height: parent.height;
+        horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+        vertical-scrollbar-policy: ScrollBarPolicy.as-needed;
+        viewport-width: self.width;
+        // Content must keep its own preferred height. Binding that height back to
+        // the viewport collapses the scroll range to the visible page.
+        viewport-height: max(self.height, home-content.preferred-height);
+        function clamp-viewport() {
+            let maximum = max(0px, home-content.preferred-height - self.visible-height);
+            self.viewport-y = max(-maximum, min(0px, self.viewport-y));
+        }
+        changed visible-height => { self.clamp-viewport(); }
+        changed viewport-height => { self.clamp-viewport(); }
+        home-wheel := TouchArea {
+            width: home-scroll.visible-width;
+            height: home-scroll.visible-height;
+            scroll-event(event) => {
+                let maximum = max(0px, home-content.preferred-height - home-scroll.visible-height);
+                if maximum > 0px && event.delta-y != 0px {
+                    home-scroll.viewport-y = max(-maximum, min(0px, home-scroll.viewport-y + event.delta-y));
+                    return accept;
+                }
+                return reject;
+            }
+        }
+        home-content := VerticalLayout {
+            width: home-scroll.width;
+            padding-left: root.minimal ? 18px : 30px;
+            padding-right: root.minimal ? 18px : 30px;
+            padding-top: 22px; padding-bottom: 30px; spacing: 18px;
+            Text { text: UiTexts.values.text-home; color: VisualStyle.text-primary; font-size: 24px; font-weight: 600; height: 36px; }
+            HomeSection {
+                title: UiTexts.values.text-home-quick-access; rows: root.home-quick-access-items; selected-id: root.home-selected-id; expanded: root.home-quick-access-expanded; column-count: root.home-column-count; card-width: root.home-card-width;
+                toggle-expanded => { root.toggle-home-section(0); }
+                select-item(id) => { root.home-selected-id = id; root.select-home-item(id); }
+                activate-item(id) => { root.navigate-home-item(id); }
+                item-menu-requested(group, id, x, y) => { root.show-sidebar-menu(group, id, x - root.window-origin.x / 1px, y - root.window-origin.y / 1px); }
+            }
+            HomeSection {
+                title: UiTexts.values.text-home-drives; rows: root.home-drive-items; selected-id: root.home-selected-id; expanded: root.home-drives-expanded; column-count: root.home-column-count; card-width: root.home-card-width;
+                toggle-expanded => { root.toggle-home-section(1); }
+                select-item(id) => { root.home-selected-id = id; root.select-home-item(id); }
+                activate-item(id) => { root.navigate-home-item(id); }
+                item-menu-requested(group, id, x, y) => { root.show-sidebar-menu(group, id, x - root.window-origin.x / 1px, y - root.window-origin.y / 1px); }
+            }
+            HomeSection {
+                title: UiTexts.values.text-home-network-locations; rows: root.home-network-locations-items; selected-id: root.home-selected-id; expanded: root.home-network-locations-expanded; column-count: root.home-column-count; card-width: root.home-card-width;
+                show-empty: root.home-network-locations-items.length == 0; empty-text: UiTexts.values.text-home-network-locations-empty;
+                toggle-expanded => { root.toggle-home-section(2); }
+                select-item(id) => { root.home-selected-id = id; root.select-home-item(id); }
+                activate-item(id) => { root.navigate-home-item(id); }
+                item-menu-requested(group, id, x, y) => { root.show-sidebar-menu(group, id, x - root.window-origin.x / 1px, y - root.window-origin.y / 1px); }
+            }
+        }
+    }
+
+}

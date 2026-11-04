@@ -1,0 +1,218 @@
+import { VisualStyle } from "visual-style.slint";
+import { IconMap } from "icons/icon-map.slint";
+
+export component InlineIcon inherits Rectangle {
+    in property <image> icon-source;
+    in property <length> icon-size: 18px;
+    width: root.icon-size;
+    Image { width: root.icon-size; height: root.icon-size; y: (parent.height - self.height) / 2; source: root.icon-source; }
+}
+
+export component IconButton inherits Rectangle {
+    in property <image> icon-source;
+    in property <string> tip;
+    in property <string> button-label: root.tip;
+    in property <bool> enabled: true;
+    callback clicked();
+    width: 38px;
+    height: 38px;
+    border-radius: 5px;
+    border-width: 0px;
+    background: !root.enabled ? transparent : icon-touch.pressed ? VisualStyle.surface-pressed : icon-touch.has-hover ? VisualStyle.surface-hover : transparent;
+    opacity: root.enabled ? 1 : 0.46;
+    Image {
+        width: 20px;
+        height: 20px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        source: root.icon-source;
+        image-fit: contain;
+        colorize: VisualStyle.text-primary;
+    }
+    icon-touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    accessible-role: button;
+    accessible-label: root.button-label;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
+    Tooltip { text: @markdown("\{root.tip}"); }
+}
+
+export component SidebarGroupHeader inherits Rectangle {
+    in property <string> label;
+    in property <bool> expanded: true;
+    callback toggled();
+    height: 30px;
+    background: group-touch.has-hover ? VisualStyle.navigation-hover : transparent;
+    border-radius: 5px;
+    HorizontalLayout {
+        padding-left: 7px; padding-right: 7px; spacing: 7px;
+        Rectangle {
+            width: 12px; height: parent.height;
+            Path {
+                x: 2px; y: (parent.height - self.height) / 2; width: 8px; height: 8px;
+                viewbox-width: 8; viewbox-height: 8; fit: fill;
+                commands: root.expanded ? "M 1 2.5 L 4 5.5 L 7 2.5" : "M 2.5 1 L 5.5 4 L 2.5 7";
+                stroke: VisualStyle.icon-muted; stroke-width: 1.2px; stroke-line-cap: round; stroke-line-join: round; fill: transparent;
+            }
+        }
+        Text { text: root.label; color: VisualStyle.text-muted; font-size: 12px; font-weight: 700; vertical-alignment: center; }
+    }
+    accessible-expandable: true;
+    accessible-expanded: root.expanded;
+    accessible-action-default => { root.toggled(); }
+    accessible-action-expand => { if !root.expanded { root.toggled(); } }
+    group-touch := TouchArea { mouse-cursor: pointer; clicked => { root.toggled(); } }
+    accessible-role: button;
+    accessible-label: root.label;
+}
+
+export component BreadcrumbButton inherits Rectangle {
+    in property <string> label;
+    in property <string> tip: root.label;
+    in property <bool> current: false;
+    callback clicked();
+    height: 30px;
+    clip: true;
+    border-radius: 4px;
+    background: !root.current && crumb-touch.has-hover ? VisualStyle.surface-hover : transparent;
+    Text {
+        x: 8px;
+        width: max(0px, parent.width - (root.current ? 16px : 29px));
+        height: parent.height;
+        text: root.label;
+        color: VisualStyle.text-primary;
+        font-size: 12px;
+        font-weight: root.current ? 600 : 400;
+        vertical-alignment: center;
+        overflow: elide;
+        wrap: no-wrap;
+    }
+    if !root.current: Text {
+        x: max(0px, parent.width - 16px); width: 8px; height: parent.height;
+        text: "›"; color: VisualStyle.text-muted; font-size: 14px;
+        vertical-alignment: center;
+    }
+    crumb-touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    Tooltip { text: @markdown("\{root.tip}"); }
+    accessible-role: button;
+    accessible-label: root.tip;
+    accessible-enabled: true;
+    accessible-action-default => { root.clicked(); }
+}
+
+export component AddressEditor inherits Rectangle {
+    in-out property <string> text;
+    in property <bool> has-error: false;
+    in property <string> address-label;
+    in property <string> cancel-label;
+    in property <bool> depth-enabled: false;
+    in property <bool> recursive: true;
+    in property <string> depth-label;
+    callback accepted(string);
+    callback changed(string);
+    callback cancelled();
+    callback toggle-depth();
+
+    public function focus-at-end() {
+        editor.focus();
+        editor.set-selection-offsets(2147483647, 2147483647);
+    }
+
+    background: VisualStyle.surface;
+    forward-focus: editor;
+    property <bool> editor-has-focus: editor.has-focus;
+    callback focus-lost();
+    changed editor-has-focus => {
+        if root.visible && !root.editor-has-focus { root.focus-lost(); }
+    }
+
+    Rectangle {
+        x: 0px;
+        width: 30px;
+        height: parent.height;
+        border-radius: 4px;
+        background: root.depth-enabled ? (depth-touch.pressed ? VisualStyle.surface-pressed : depth-touch.has-hover ? VisualStyle.surface-hover : transparent) : transparent;
+        opacity: root.depth-enabled ? 1 : 0.35;
+        Image {
+            width: 18px; height: 18px;
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            source: root.recursive ? IconMap.action-search-recursive : IconMap.action-search-current;
+            colorize: VisualStyle.text-primary;
+        }
+        depth-touch := TouchArea {
+            enabled: root.depth-enabled;
+            mouse-cursor: root.depth-enabled ? pointer : default;
+            clicked => { root.toggle-depth(); }
+        }
+        accessible-role: button;
+        accessible-id: "search-depth";
+        accessible-checkable: true;
+        accessible-checked: root.recursive;
+        accessible-label: root.depth-label;
+        accessible-enabled: root.depth-enabled;
+        accessible-action-default => { if root.depth-enabled { root.toggle-depth(); } }
+    }
+
+    editor := TextInput {
+        x: 32px;
+        width: parent.width - 70px;
+        height: parent.height;
+        text <=> root.text;
+        color: VisualStyle.text-primary;
+        selection-background-color: VisualStyle.selection-emphasis;
+        selection-foreground-color: VisualStyle.text-strong;
+        font-size: 13px;
+        single-line: true;
+        vertical-alignment: center;
+        accessible-role: text-input;
+        accessible-id: "address-input";
+        accessible-label: root.address-label;
+        edited => { root.changed(root.text); }
+        accepted => { root.accepted(root.text); }
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.cancelled();
+                return accept;
+            }
+            if event.text == Key.Tab && !event.modifiers.shift && !event.modifiers.control && !event.modifiers.alt && !event.modifiers.meta {
+                if root.depth-enabled {
+                    root.toggle-depth();
+                    return accept;
+                }
+                return reject;
+            }
+            return reject;
+        }
+    }
+
+    Rectangle {
+        x: parent.width - 30px;
+        width: 30px;
+        height: parent.height;
+        border-radius: 4px;
+        background: dismiss-touch.pressed ? VisualStyle.surface-pressed : dismiss-touch.has-hover ? VisualStyle.surface-hover : transparent;
+        Image {
+            width: 16px;
+            height: 16px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            source: IconMap.action-close;
+            colorize: VisualStyle.text-primary;
+        }
+        dismiss-touch := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.cancelled(); }
+        }
+        accessible-role: button;
+        accessible-id: "address-cancel";
+        accessible-action-default => { root.cancelled(); }
+        accessible-label: root.cancel-label;
+    }
+}

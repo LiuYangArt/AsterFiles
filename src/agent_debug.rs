@@ -497,13 +497,15 @@ mod tests {
     fn rendered_permission_page_has_exactly_one_inline_action() {
         use crate::app::AppWindow;
         use i_slint_backend_testing::{AccessibleRole, ElementHandle, ElementRoot};
+        use slint::ComponentHandle;
 
         i_slint_backend_testing::init_no_event_loop();
         let ui = AppWindow::new().expect("test UI can be created without a desktop window");
         ui.set_page_state(7);
         ui.set_can_navigate_back(true);
         ui.set_can_refresh(true);
-        ui.set_text_request_access("Request access with Windows".into());
+        ui.global::<crate::app::UiTexts>()
+            .set_values(crate::i18n::Texts::new(crate::i18n::Language::English).ui_texts());
         ui.set_show_request_access(
             page_projection(LoadState::PermissionDenied, true)
                 .visible_page_operations

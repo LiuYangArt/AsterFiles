@@ -142,9 +142,9 @@ impl InputFixture {
         ui.show().expect("testing backend creates no native window");
         ui.window().request_redraw();
         let touch_id = match (mode, group) {
-            (ViewMode::Details | ViewMode::List, _) => "AppWindow::mouse",
-            (_, crate::domain::GroupField::None) => "AppWindow::card-touch",
-            _ => "AppWindow::grouped-card-touch",
+            (ViewMode::Details | ViewMode::List, _) => "DetailsList::mouse",
+            (_, crate::domain::GroupField::None) => "FileGrid::card-touch",
+            _ => "FileGrid::grouped-card-touch",
         };
         Self {
             ui,

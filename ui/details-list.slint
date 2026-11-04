@@ -1,0 +1,257 @@
+import { VisualStyle } from "visual-style.slint";
+import { IconMap } from "icons/icon-map.slint";
+import { ListView } from "std-widgets.slint";
+import { FileRow, ColumnRow } from "models.slint";
+import { InlineRenameEditor } from "file-controls.slint";
+import { InlineIcon } from "navigation-controls.slint";
+
+export component DetailsList inherits ListView {
+    in property <string> accessibility-context;
+    callback activate-entry(int, bool, bool);
+    in property <int> active-geometry-revision;
+    callback begin-internal-drag(int);
+    callback begin-internal-right-drag(int, float, float);
+    callback cancel-internal-drag();
+    callback cancel-rename();
+    in property <[ColumnRow]> columns;
+    callback commit-rename(string);
+    in property <length> content-origin-y;
+    in property <length> details-hit-left;
+    in property <length> details-hit-visible-left;
+    in property <length> details-hit-visible-right;
+    in property <int> drop-hover-entry-id;
+    in property <length> file-columns-width;
+    in-out property <length> file-list-left;
+    in-out property <length> file-list-top;
+    in-out property <length> file-viewport-height;
+    in-out property <length> file-viewport-width;
+    in-out property <length> file-viewport-y;
+    in property <[FileRow]> files;
+    in-out property <length> keyboard-menu-anchor-x;
+    in-out property <length> keyboard-menu-anchor-y;
+    in property <length> layout-icon-size;
+    in property <length> layout-row-height;
+    in-out property <length> list-viewport-y;
+    in property <length> normal-created-width;
+    in property <length> normal-kind-width;
+    in property <length> normal-modified-width;
+    in property <length> normal-name-width;
+    in property <length> normal-size-width;
+    in-out property <length> rectangle-viewport-top;
+    in property <bool> rename-editing;
+    in property <int> rename-entry-id;
+    in-out property <string> rename-input;
+    in property <int> rename-selection-end;
+    in property <int> rename-submit-generation;
+    in-out property <bool> rename-submitting;
+    callback request-folder-size-range(float, float);
+    callback request-search-position(float);
+    in property <length> search-created-width;
+    in property <length> search-modified-width;
+    in property <length> search-name-width;
+    in property <length> search-parent-width;
+    in property <bool> search-results-mode;
+    in property <length> search-scroll-y;
+    in property <length> search-size-width;
+    in property <int> view-mode;
+    in property <Point> window-origin;
+
+    public pure function is-grid-view-mode(mode: int) -> bool {
+        return mode == 2 || mode == 3 || mode == 4 || mode == 5 || mode == 6;
+    }
+    public pure function column-width(kind: int) -> length {
+        return root.search-results-mode
+        ? (kind == 0 ? root.search-name-width : kind == 1 ? root.search-parent-width : kind == 2 ? root.search-size-width : kind == 3 ? root.search-modified-width : root.search-created-width)
+        : (kind == 0 ? root.normal-name-width : kind == 1 ? root.normal-kind-width : kind == 2 ? root.normal-size-width : kind == 3 ? root.normal-modified-width : root.normal-created-width);
+    }
+    accessible-id: "file-list";
+    visible: root.files.length > 0 && !root.is-grid-view-mode(root.view-mode);
+    mouse-drag-pan-enabled: false;
+
+    viewport-width: self.width;
+    vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+    viewport-y <=> root.list-viewport-y;
+
+    function sync-file-geometry() { if !root.is-grid-view-mode(root.view-mode) { root.file-list-left = self.absolute-position.x - root.window-origin.x; root.file-list-top = self.absolute-position.y - root.window-origin.y; root.rectangle-viewport-top = self.absolute-position.y - root.content-origin-y; root.file-viewport-width = self.width; root.file-viewport-height = self.visible-height; } }
+    init => { self.sync-file-geometry(); }
+    private property <int> geometry-revision: root.active-geometry-revision;
+    changed geometry-revision => { self.sync-file-geometry(); }
+    changed absolute-position => { self.sync-file-geometry(); }
+    changed width => { self.sync-file-geometry(); }
+    changed visible-height => { self.sync-file-geometry(); }
+    changed viewport-y => { if !root.is-grid-view-mode(root.view-mode) { root.file-viewport-y = self.viewport-y; if !root.search-results-mode { root.request-folder-size-range(self.viewport-y / 1px, self.visible-height / 1px); } } }
+    for entry in root.files: Rectangle {
+        width: root.view-mode == 0 ? max(root.width, root.file-columns-width + 16px) : root.width;
+        x: 0px;
+        height: entry.group-header ? (entry.group-detail == "" ? 32px : 48px) : root.layout-row-height;
+        background: VisualStyle.surface;
+        opacity: entry.group-header ? 1 : (!entry.loaded ? 0 : (entry.cut ? 0.52 : 1));
+        if entry.group-header: Rectangle {
+            x: 12px; width: parent.width - 24px; height: parent.height;
+            Text { x: 4px; y: 5px; width: parent.width - 90px; height: 20px; text: entry.group-label; color: VisualStyle.text-primary; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: elide; }
+            Text { x: 4px; y: 25px; width: parent.width - 8px; height: 18px; text: entry.group-detail; color: VisualStyle.text-tertiary; font-size: 11px; vertical-alignment: center; overflow: elide; }
+            Text { x: parent.width - 82px; y: 5px; width: 78px; height: 20px; text: entry.group-count; color: VisualStyle.text-tertiary; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+        }
+        Rectangle {
+            visible: !entry.group-header;
+            x: root.view-mode == 0 ? root.details-hit-visible-left : 16px;
+            y: 2px;
+            width: root.view-mode == 0 ? max(0px, root.details-hit-visible-right - self.x) : max(0px, parent.width - 32px);
+            height: parent.height - 4px;
+            border-radius: 5px;
+            border-width: 0px;
+            clip: true;
+            background: entry.id == root.drop-hover-entry-id ? VisualStyle.selection-emphasis : (entry.selected ? VisualStyle.selection : (mouse.has-hover ? VisualStyle.accent-hover : transparent));
+            Rectangle {
+                visible: root.view-mode != 7;
+                x: root.view-mode == 0 ? root.details-hit-left - parent.x : 0px; width: root.view-mode == 0 ? root.file-columns-width : parent.width;
+                HorizontalLayout {
+                    spacing: 0px;
+                    for column in root.columns: Rectangle {
+                        visible: column.visible && (root.view-mode == 0 || column.kind == 0);
+                        width: self.visible ? (root.view-mode == 0 ? root.column-width(column.kind) : parent.width) : 0px;
+                        clip: true;
+                        if column.kind == 0: Rectangle {
+                            clip: true;
+                            InlineIcon { x: column.content-left; width: 20px; height: 20px; icon-source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document); }
+                            if !(root.rename-editing && root.rename-entry-id == entry.id): Rectangle {
+                                x: column.content-left + column.icon-slot;
+                                clip: true;
+                                width: parent.width - column.content-left - column.content-right - column.icon-slot;
+                                property <length> fade-width: 20px;
+                                segment-layout := HorizontalLayout {
+                                    x: 0px;
+                                    width: parent.width;
+                                    alignment: start;
+                                    spacing: 0px;
+                                    for segment in entry.name-segments: Text {
+                                        text: segment.text;
+                                        color: VisualStyle.text-strong;
+                                        font-size: VisualStyle.file-name-font-size;
+                                        font-weight: segment.highlighted ? 700 : 400;
+                                        horizontal-alignment: left;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 0;
+                                    }
+                                }
+                                Rectangle {
+                                    visible: segment-layout.preferred-width > parent.width;
+                                    x: parent.width - parent.fade-width;
+                                    width: parent.fade-width;
+                                    height: parent.height;
+                                    background: entry.id == root.drop-hover-entry-id ? VisualStyle.selection-emphasis : (entry.selected ? VisualStyle.selection : (mouse.has-hover ? VisualStyle.accent-hover : VisualStyle.surface));
+                                    Text { text: "…"; color: VisualStyle.text-strong; font-size: VisualStyle.file-name-font-size; horizontal-alignment: right; vertical-alignment: center; }
+                                }
+                            }
+                            if root.rename-editing && root.rename-entry-id == entry.id && root.view-mode != 7 && !root.is-grid-view-mode(root.view-mode): InlineRenameEditor {
+                                z: 101;
+                                x: column.content-left + column.icon-slot;
+                                width: max(0px, parent.width - column.content-left - column.content-right - column.icon-slot);
+                                text <=> root.rename-input;
+                                selection-end: root.rename-selection-end;
+                                submitting <=> root.rename-submitting;
+                                submit-generation: root.rename-submit-generation;
+                                editor-id: root.accessibility-context + "/entry/" + entry.id + "/rename";
+                                label: entry.name;
+                                commit(name) => { root.commit-rename(name); }
+                                cancel => { root.cancel-rename(); }
+                            }
+                        }
+                        if column.kind != 0: Text {
+                            x: column.content-left;
+                            width: parent.width - column.content-left - column.content-right;
+                            text: column.kind == 1 ? (root.search-results-mode ? entry.parent-path : entry.kind) : column.kind == 2 ? entry.size : column.kind == 3 ? entry.modified : entry.created;
+                            color: VisualStyle.text-detail;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-alignment: column.kind == 2 ? right : left;
+                        }
+                    }
+                }
+            }
+        }
+        if root.view-mode == 7 && !entry.group-header: Rectangle {
+            x: 24px; width: max(0px, parent.width - 48px); height: parent.height; clip: true;
+            InlineIcon {
+                x: 4px; y: (parent.height - self.height) / 2;
+                width: root.layout-icon-size; height: root.layout-icon-size;
+                icon-size: root.layout-icon-size;
+                icon-source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document);
+            }
+            if !(root.rename-editing && root.rename-entry-id == entry.id): Text { x: 64px; y: 8px; width: parent.width - 76px; height: 24px; text: entry.name; color: VisualStyle.text-strong; font-size: VisualStyle.file-name-font-size; font-weight: 500; vertical-alignment: center; overflow: elide; }
+            if root.rename-editing && root.rename-entry-id == entry.id: InlineRenameEditor {
+                z: 101;
+                x: 64px; y: 8px;
+                width: max(0px, parent.width - 76px);
+                height: 24px;
+                text <=> root.rename-input;
+                selection-end: root.rename-selection-end;
+                submitting <=> root.rename-submitting;
+                submit-generation: root.rename-submit-generation;
+                editor-id: root.accessibility-context + "/entry/" + entry.id + "/rename";
+                label: entry.name;
+                commit(name) => { root.commit-rename(name); }
+                cancel => { root.cancel-rename(); }
+            }
+            Text { x: 64px; y: 34px; width: parent.width - 250px; height: 20px; text: entry.kind; color: VisualStyle.text-detail; font-size: 12px; vertical-alignment: center; overflow: elide; }
+            Text { x: parent.width - 174px; y: 34px; width: 74px; height: 20px; text: entry.size; color: VisualStyle.text-detail; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
+            Text { x: parent.width - 92px; y: 34px; width: 88px; height: 20px; text: entry.modified; color: VisualStyle.text-detail; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
+        }
+        mouse := TouchArea {
+            x: root.view-mode == 0 ? root.details-hit-visible-left : 16px;
+            width: root.view-mode == 0 ? max(0px, root.details-hit-visible-right - self.x) : max(0px, parent.width - 32px);
+            enabled: entry.loaded && !(root.rename-editing && root.rename-entry-id == entry.id);
+            private property <bool> click-control: false;
+            private property <bool> click-shift: false;
+
+            mouse-cursor: pointer;
+            pointer-event(event) => {
+                if event.kind == PointerEventKind.down {
+                    self.click-control = event.modifiers.control;
+                    self.click-shift = event.modifiers.shift;
+                    if event.button == PointerEventButton.right {
+                        root.begin-internal-right-drag(
+                            entry.id,
+                            (self.absolute-position.x + self.mouse-x - root.window-origin.x) / 1px,
+                            (self.absolute-position.y + self.mouse-y - root.window-origin.y) / 1px
+                        );
+                    }
+                    if event.button == PointerEventButton.left {
+                        root.begin-internal-drag(entry.id);
+                    }
+                }
+                if event.kind == PointerEventKind.up && event.button == PointerEventButton.left {
+                    root.cancel-internal-drag();
+                }
+            }
+            scroll-event(event) => {
+                if root.search-results-mode {
+                    root.request-search-position((root.search-scroll-y + event.delta-y) / 1px);
+                } else {
+                    root.viewport-y = max(-(root.viewport-height - root.visible-height), min(0px, root.viewport-y + event.delta-y));
+                }
+                return accept;
+            }
+            clicked => { root.activate-entry(entry.id, self.click-control, self.click-shift); }
+        }
+        if entry.focused: Rectangle {
+            init => {
+                root.keyboard-menu-anchor-x = parent.absolute-position.x + 32px - root.window-origin.x;
+                root.keyboard-menu-anchor-y = parent.absolute-position.y + parent.height / 2 - root.window-origin.y;
+            }
+        }
+        Tooltip { text: @markdown("\{entry.name}"); }
+        if entry.loaded && !entry.group-header: Rectangle {
+            width: parent.width; height: parent.height;
+            accessible-role: list-item;
+            accessible-id: root.accessibility-context + "/entry/" + entry.id;
+            accessible-label: entry.name;
+            accessible-enabled: !(root.rename-editing && root.rename-entry-id == entry.id);
+            accessible-item-selectable: true;
+            accessible-item-selected: entry.selected;
+            accessible-action-default => { if !(root.rename-editing && root.rename-entry-id == entry.id) { root.activate-entry(entry.id, false, false); } }
+        }
+    }
+
+}

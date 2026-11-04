@@ -1,0 +1,188 @@
+import { VisualStyle } from "visual-style.slint";
+import { IconMap } from "icons/icon-map.slint";
+import { ListView } from "std-widgets.slint";
+import { UiTexts } from "@ui-texts";
+import { TabRow, ColumnRow } from "models.slint";
+import { InlineRenameEditor } from "file-controls.slint";
+import { InlineIcon } from "navigation-controls.slint";
+
+export component WindowOverlays inherits Rectangle {
+    in property <string> accessibility-context: "";
+    in property <string> accessibility-window-id;
+    callback activate-tab(int);
+    callback cancel-rename();
+    callback choose-drop-effect(int);
+    in-out property <length> column-drag-pointer-x: 0px;
+    in-out property <length> column-drag-pointer-y: 0px;
+    in-out property <int> column-drag-source-kind: -1;
+    in-out property <bool> column-dragging: false;
+    in property <[ColumnRow]> columns;
+    callback commit-rename(string);
+    in-out property <length> context-menu-anchor-x: 24px;
+    in-out property <length> context-menu-anchor-y: 140px;
+    in-out property <bool> context-menu-open;
+    callback dismiss-context-menu();
+    callback drag-window-after-menu-dismiss();
+    in property <bool> drop-can-copy: false;
+    in property <bool> drop-can-link: false;
+    in property <bool> drop-can-move: false;
+    in-out property <bool> drop-menu-open: false;
+    in-out property <length> file-list-top: 0px;
+    in-out property <int> grid-rename-anchor-id: -1;
+    in-out property <string> grid-rename-context;
+    in-out property <length> grid-rename-height;
+    in-out property <string> grid-rename-label;
+    in-out property <length> grid-rename-left;
+    in-out property <length> grid-rename-top;
+    in-out property <length> grid-rename-width;
+    in property <length> normal-created-width;
+    in property <length> normal-kind-width;
+    in property <length> normal-modified-width;
+    in property <length> normal-name-width;
+    in property <length> normal-size-width;
+    in property <bool> rename-editing: false;
+    in property <int> rename-entry-id: -1;
+    in-out property <string> rename-input: "";
+    in property <int> rename-selection-end: 0;
+    in-out property <int> rename-submit-generation: 0;
+    in-out property <bool> rename-submitting: false;
+    callback reveal-tab(int);
+    in property <length> search-created-width;
+    in property <length> search-modified-width;
+    in property <length> search-name-width;
+    in property <length> search-parent-width;
+    in property <bool> search-results-mode;
+    in property <length> search-size-width;
+    in property <length> tab-strip-width;
+    in property <[TabRow]> tabs;
+    in-out property <bool> tabs-menu-open;
+    in property <bool> tabs-overflow;
+    in property <int> view-mode;
+    in property <length> window-actual-width;
+    in property <length> window-height;
+    in property <Point> window-origin;
+
+    public function dismiss-menus-and-drag-window(pointer-x: length, pointer-y: length) {
+        root.context-menu-open = false; root.dismiss-context-menu();
+        root.tabs-menu-open = false;
+        if pointer-y < 46px && pointer-x >= 8px + root.tab-strip-width + (root.tabs-overflow ? 33px : 0px) + 5px + 34px + 5px && pointer-x < root.window-actual-width - 3 * 46px {
+            root.drag-window-after-menu-dismiss();
+        }
+    }
+    public pure function column-label(kind: int) -> string {
+        return root.columns[0].kind == kind ? root.columns[0].label
+        : root.columns[1].kind == kind ? root.columns[1].label
+        : root.columns[2].kind == kind ? root.columns[2].label
+        : root.columns[3].kind == kind ? root.columns[3].label
+        : root.columns[4].label;
+    }
+    public pure function is-grid-view-mode(mode: int) -> bool {
+        return mode == 2 || mode == 3 || mode == 4 || mode == 5 || mode == 6;
+    }
+    public pure function column-width(kind: int) -> length {
+        return root.search-results-mode
+        ? (kind == 0 ? root.search-name-width : kind == 1 ? root.search-parent-width : kind == 2 ? root.search-size-width : kind == 3 ? root.search-modified-width : root.search-created-width)
+        : (kind == 0 ? root.normal-name-width : kind == 1 ? root.normal-kind-width : kind == 2 ? root.normal-size-width : kind == 3 ? root.normal-modified-width : root.normal-created-width);
+    }
+    if root.column-dragging: Rectangle {
+        x: max(4px, min(root.window-actual-width - self.width - 4px, root.column-drag-pointer-x + 12px));
+        y: max(50px, min(root.window-height - self.height - 4px, root.column-drag-pointer-y + 10px));
+        width: min(220px, max(84px, root.column-width(root.column-drag-source-kind)));
+        height: 32px; z: 100; border-radius: 5px; border-width: 1px;
+        border-color: VisualStyle.border; background: VisualStyle.surface; opacity: 0.82;
+        Text { x: 10px; width: parent.width - 20px; text: root.column-label(root.column-drag-source-kind); color: VisualStyle.text-primary; font-size: 12px; vertical-alignment: center; overflow: elide; }
+    }
+
+    if root.drop-menu-open: TouchArea {
+        z: 38; width: parent.width; height: parent.height;
+        clicked => { root.drop-menu-open = false; root.choose-drop-effect(0); }
+    }
+    if root.drop-menu-open: Rectangle {
+        z: 39;
+        x: min(max(12px, root.context-menu-anchor-x), max(12px, parent.width - self.width - 12px));
+        y: min(max(12px, root.context-menu-anchor-y), max(12px, parent.height - self.height - 12px));
+        width: 250px; height: 156px;
+        background: VisualStyle.surface; border-color: VisualStyle.border; border-width: 1px; border-radius: 7px;
+        VerticalLayout { padding: 6px;
+            for option[index] in [UiTexts.values.text-drop-copy, UiTexts.values.text-drop-move, UiTexts.values.text-drop-link, UiTexts.values.text-drop-cancel]: Rectangle {
+                height: 36px; border-radius: 5px;
+                private property <bool> option-enabled: index == 3 || (index == 0 ? root.drop-can-copy : index == 1 ? root.drop-can-move : root.drop-can-link);
+                background: self.option-enabled && option-touch.has-hover ? VisualStyle.surface-hover : transparent;
+                Text { x: 10px; text: option; color: parent.option-enabled ? VisualStyle.text-primary : VisualStyle.text-disabled; font-size: 12px; vertical-alignment: center; }
+                option-touch := TouchArea { enabled: parent.option-enabled; clicked => { root.drop-menu-open = false; root.choose-drop-effect(index == 3 ? 0 : index + 1); } }
+                accessible-role: button; accessible-label: option; accessible-enabled: self.option-enabled;
+            }
+        }
+    }
+    // The editor must escape virtualized row clipping and remain above the outside-click layer.
+    if root.rename-editing && root.is-grid-view-mode(root.view-mode) && root.grid-rename-anchor-id == root.rename-entry-id && root.grid-rename-context == root.accessibility-context: InlineRenameEditor {
+        z: 101;
+        x: root.grid-rename-left;
+        y: max(root.file-list-top, min(root.grid-rename-top, root.window-height - 32px - self.height));
+        width: root.grid-rename-width;
+        multiline: root.view-mode != 3 && root.view-mode != 6;
+        editor-height-limit: max(30px, root.window-height - root.file-list-top - 32px);
+        height: self.multiline ? min(self.editor-height-limit, max(30px, self.content-height)) : root.grid-rename-height;
+        text <=> root.rename-input;
+        selection-end: root.rename-selection-end;
+        submitting <=> root.rename-submitting;
+        submit-generation: root.rename-submit-generation;
+        editor-id: root.accessibility-context + "/entry/" + root.rename-entry-id + "/rename";
+        label: root.grid-rename-label;
+        commit(name) => { root.commit-rename(name); }
+        cancel => { root.cancel-rename(); }
+    }
+    if root.rename-editing: TouchArea {
+        z: 100;
+        width: parent.width;
+        height: parent.height;
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down && event.button == PointerEventButton.left && !root.rename-submitting {
+                root.rename-submitting = true;
+                root.commit-rename(root.rename-input);
+            }
+        }
+    }
+
+    if root.tabs-menu-open: TouchArea {
+        z: 19;
+        width: parent.width;
+        height: parent.height;
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                root.dismiss-menus-and-drag-window(
+                    self.absolute-position.x + self.mouse-x - root.window-origin.x,
+                    self.absolute-position.y + self.mouse-y - root.window-origin.y
+                );
+            }
+        }
+        clicked => { root.tabs-menu-open = false; }
+    }
+
+    if root.tabs-menu-open: Rectangle {
+        x: max(8px, parent.width - 3 * 46px - 270px); y: 46px;
+        width: 260px; height: min(354px, 12px + min(root.tabs.length, 9) * 38px); z: 20;
+        background: VisualStyle.surface; border-color: VisualStyle.border; border-width: 1px; border-radius: 7px;
+        clip: true;
+        ListView {
+            x: 6px; y: 6px; width: parent.width - 12px; height: parent.height - 12px;
+            vertical-scrollbar-policy: ScrollBarPolicy.as-needed;
+            for tab[index] in root.tabs: Rectangle {
+                height: 38px; border-radius: 5px;
+                background: tab.active ? VisualStyle.selection : (tabs-menu-touch.has-hover ? VisualStyle.surface-hover : transparent);
+                HorizontalLayout {
+                    padding-left: 8px; padding-right: 8px; spacing: 8px;
+                    InlineIcon { icon-source: tab.is-settings ? IconMap.action-settings : tab.is-home ? IconMap.location-home : (tab.icon.width != 0 ? tab.icon : (tab.is-drive ? IconMap.location-drive : IconMap.file-folder)); icon-size: 16px; }
+                    Text { text: tab.title; color: VisualStyle.text-primary; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; font-weight: tab.active ? 600 : 400; }
+                }
+                tabs-menu-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.tabs-menu-open = false; root.activate-tab(tab.id); root.reveal-tab(index); }
+                }
+                accessible-role: AccessibleRole.tab; accessible-id: root.accessibility-window-id + "/tabs-menu/" + tab.id; accessible-label: tab.title; accessible-item-selectable: true; accessible-item-selected: tab.active;
+                accessible-action-default => { root.tabs-menu-open = false; root.activate-tab(tab.id); root.reveal-tab(index); }
+            }
+        }
+    }
+
+}

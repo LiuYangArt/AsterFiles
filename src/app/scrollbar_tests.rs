@@ -312,7 +312,7 @@ fn issue_178_track_horizontal_and_settings_use_the_same_release_rule() {
     assert!(!fixture.ui.get_scrollbar_pointer_active());
     fixture.release(position);
 
-    let track = fixture.element("AppWindow::horizontal-scroll-touch");
+    let track = fixture.element("FileView::horizontal-scroll-touch");
     let origin = track.absolute_position();
     let position =
         slint::LogicalPosition::new(origin.x + 30.0, origin.y + track.size().height / 2.0);

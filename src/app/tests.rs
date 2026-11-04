@@ -210,7 +210,7 @@ fn issue_86_home_layout_switches_between_default_and_narrow_columns() {
     ui.set_home_content_width(home_content_width_for_window(520.0));
     assert_eq!(ui.get_home_column_count(), 1);
     assert_eq!(ui.get_home_card_width(), 264.0);
-    let source = include_str!("../../ui/app-window.slint");
+    let source = include_str!("../../ui/home-page.slint");
     assert!(source.contains("wrap: root.item.source-kind == 2 ? word-wrap : no-wrap"));
     assert!(source.contains("visible: root.item.source-kind != 2"));
     assert!(!source.contains("height: home-scroll.viewport-height"));
@@ -228,13 +228,13 @@ fn home_wheel_scrolls_overflow_without_moving_the_file_list() {
     ui.set_home_quick_access_items(ModelRc::new(VecModel::from(Vec::new())));
     update_test_layout(&ui);
     let content_y = || {
-        named_element(&ui, "AppWindow::home-content")
+        named_element(&ui, "HomePage::home-content")
             .expect("home content")
             .absolute_position()
             .y
     };
     let scroll_home = || {
-        named_element(&ui, "AppWindow::home-scroll")
+        named_element(&ui, "HomePage::home-scroll")
             .expect("home scroll")
             .scroll(0.0, -160.0);
         update_test_layout(&ui);
@@ -1346,12 +1346,15 @@ fn issue_147_type_select_rejects_non_file_targets_ime_modifiers_and_invalid_text
 }
 #[test]
 fn issue_49_active_tab_uses_one_continuous_contour() {
-    let ui = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
+    let ui = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/ui/tab-controls.slint"
+    ));
     let shape = ui
         .split_once("component ActiveTabShape inherits Rectangle {")
         .expect("active tab shape exists")
         .1
-        .split_once("component IconButton inherits Rectangle {")
+        .split_once("component WindowButton inherits Rectangle {")
         .expect("active tab shape has a component boundary")
         .0;
 
@@ -1364,11 +1367,14 @@ fn issue_49_active_tab_uses_one_continuous_contour() {
 }
 #[test]
 fn issue_67_active_and_hovered_tabs_share_one_corner_radius() {
-    let ui = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
+    let ui = include_str!("../../ui/tab-bar.slint");
+    let style = include_str!("../../ui/visual-style.slint");
+    let controls = include_str!("../../ui/tab-controls.slint");
     let radius = "VisualStyle.tab-corner-radius";
 
     assert_eq!(
-        ui.matches("out property <length> tab-corner-radius: 7px;")
+        style
+            .matches("out property <length> tab-corner-radius: 7px;")
             .count(),
         1
     );
@@ -1393,11 +1399,11 @@ fn issue_67_active_and_hovered_tabs_share_one_corner_radius() {
     assert!(tab_visual.contains(&format!("border-radius: {radius};")));
     assert!(tab_visual.contains(&format!("corner-radius: {radius};")));
 
-    let active_shape = ui
+    let active_shape = controls
         .split_once("component ActiveTabShape inherits Rectangle {")
         .expect("active tab shape exists")
         .1
-        .split_once("component IconButton inherits Rectangle {")
+        .split_once("component WindowButton inherits Rectangle {")
         .expect("active tab shape has a component boundary")
         .0;
     assert!(active_shape.contains("in property <length> corner-radius;"));
@@ -1405,16 +1411,21 @@ fn issue_67_active_and_hovered_tabs_share_one_corner_radius() {
 }
 #[test]
 fn issue_43_file_name_font_size_has_one_semantic_source() {
-    let ui = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
+    let details = include_str!("../../ui/details-list.slint");
+    let grid = include_str!("../../ui/file-grid.slint");
+    let controls = include_str!("../../ui/file-controls.slint");
+    let style = include_str!("../../ui/visual-style.slint");
+    let ui = [details, grid, controls].concat();
     let semantic_font_size = "font-size: VisualStyle.file-name-font-size;";
 
     assert_eq!(
-        ui.matches("out property <length> file-name-font-size: 12px;")
+        style
+            .matches("out property <length> file-name-font-size: 12px;")
             .count(),
         1
     );
     assert_eq!(ui.matches(semantic_font_size).count(), 6);
-    let details_and_list_name = ui
+    let details_and_list_name = details
         .split_once("for segment in entry.name-segments: Text {")
         .expect("details and list must render segmented file names")
         .1;
@@ -1424,7 +1435,7 @@ fn issue_43_file_name_font_size_has_one_semantic_source() {
             .count(),
         3
     );
-    let rename_editor = ui
+    let rename_editor = controls
         .split_once("rename-editor := TextInput {")
         .expect("rename editor must exist")
         .1;
@@ -1473,7 +1484,10 @@ fn issue_14_everything_status_text_covers_progress_success_and_failures() {
 
 #[test]
 fn issue_14_everything_page_is_fully_localized_and_wired() {
-    let ui = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
+    let ui = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/ui/settings-page.slint"
+    ));
 
     for marker in [
         "text-everything-title",
@@ -1691,12 +1705,22 @@ fn issue_116_grid_columns_use_content_width_instead_of_window_minus_292() {
             "width={width} card={card_width}"
         );
     }
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
-    assert!(source.contains("width: parent.width - 28px;"));
+    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/file-grid.slint"));
+    let viewport = include_str!("../../ui/file-view.slint");
+    for view in ["list := DetailsList {", "grid := FileGrid {"] {
+        let instance = viewport.split_once(view).unwrap().1;
+        assert!(
+            instance
+                .trim_start()
+                .starts_with("width: parent.width - 28px;")
+        );
+    }
     assert!(source.contains("padding-left: 16px;"));
     assert!(source.contains("padding-right: 16px;"));
     assert!(source.contains("spacing: 8px;"));
-    assert!(source.contains("width: root.compact ? 184px : 218px;"));
+    assert!(
+        include_str!("../../ui/sidebar.slint").contains("width: root.compact ? 184px : 218px;")
+    );
 }
 
 #[test]
@@ -2648,10 +2672,22 @@ fn issue_72_search_placeholder_stays_concise() {
     let ui = AppWindow::new().expect("headless app window should initialize");
 
     apply_ui_texts(&ui, Language::Chinese);
-    assert_eq!(ui.get_text_context_search().as_str(), "搜索命令");
+    assert_eq!(
+        ui.global::<UiTexts>()
+            .get_values()
+            .text_context_search
+            .as_str(),
+        "搜索命令"
+    );
 
     apply_ui_texts(&ui, Language::English);
-    assert_eq!(ui.get_text_context_search().as_str(), "Search commands");
+    assert_eq!(
+        ui.global::<UiTexts>()
+            .get_values()
+            .text_context_search
+            .as_str(),
+        "Search commands"
+    );
 }
 #[test]
 fn quick_menu_filter_matches_text_pinyin_initials_and_verb_without_shell_work() {
@@ -4794,7 +4830,10 @@ fn issue_62_running_eta_waits_for_recent_speed() {
 
 #[test]
 fn issue_82_operation_window_has_one_hide_control() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/ui/operation-window.slint"
+    ));
     assert!(source.contains("close-requested => { root.close(); }"));
     assert!(!source.contains("show-minimize"));
     assert!(!source.contains("minimize-requested"));
@@ -4863,7 +4902,10 @@ fn issue_62_real_operation_window_height_tracks_visible_rows() {
     assert_eq!(operation_window_height(3), 650.0);
     assert_eq!(operation_window_height(12), 650.0);
 
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/ui/operation-window.slint"
+    ));
     assert!(source.contains("visible: index + 1 < root.operations.length"));
 }
 
@@ -4906,11 +4948,13 @@ fn issue_62_progress_updates_model_until_cancel_then_ignores_late_events() {
 
 #[test]
 fn issue_62_operation_rows_use_flat_single_layer_style() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
-    assert!(!source.contains("background: operation.prominent"));
-    assert!(!source.contains(
-        "border-color: VisualStyle.border;\n                    accessible-role: groupbox"
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/ui/operation-window.slint"
     ));
+    assert!(!source.contains("background: operation.prominent"));
+    let style = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(!style.contains("border-color: VisualStyle.border; accessible-role: groupbox"));
 }
 
 #[test]
@@ -8031,7 +8075,14 @@ fn issue_83_ctrl_z_routes_only_from_the_file_list_focus_domain() {
 fn light_theme_uses_navigation_background_for_tab_address_sidebar_corner_and_settings() {
     let ui = headless_file_view();
     ui.set_dark_theme(false);
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
+    let source = [
+        include_str!("../../ui/tab-bar.slint"),
+        include_str!("../../ui/address-bar.slint"),
+        include_str!("../../ui/sidebar.slint"),
+        include_str!("../../ui/file-view.slint"),
+        include_str!("../../ui/settings-page.slint"),
+    ]
+    .concat();
     assert_eq!(
         source
             .matches("VisualStyle.navigation-surface-background")
@@ -8290,7 +8341,7 @@ fn issue_113_home_fills_content_to_window_bottom() {
     ui.set_page_state(3);
     ui.set_active_is_home(true);
     update_test_layout(&ui);
-    let home = named_element(&ui, "AppWindow::home-area").expect("home area exists");
+    let home = named_element(&ui, "FileView::home-area").expect("home area exists");
     let top = home.absolute_position().y;
     let bottom = top + home.size().height;
     let window_height = ui
@@ -8335,7 +8386,7 @@ fn short_window_keeps_file_status_bar_above_the_bottom_edge() {
     let status = ui
         .root_element()
         .query_descendants()
-        .match_id("AppWindow::status-bar")
+        .match_id("FileView::status-bar")
         .find_all()
         .into_iter()
         .next()
@@ -8348,13 +8399,13 @@ fn short_window_keeps_file_status_bar_above_the_bottom_edge() {
 
 #[test]
 fn issue_115_content_area_does_not_publish_window_height_as_max() {
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
+    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/file-view.slint"));
     assert!(!source.contains("max-height: root.height"));
     assert!(!source.contains("Rectangle { min-height: 0px; }"));
     assert!(source.contains("content-pane := Rectangle"));
     assert!(source.contains("if !root.active-is-home: content-area := Rectangle"));
     assert!(source.contains("if !root.active-is-home: status-bar := Rectangle"));
-    assert!(source.contains("if root.active-is-home: home-area := Rectangle"));
+    assert!(source.contains("if root.active-is-home: home-area := HomePage"));
 }
 
 #[test]
@@ -8370,20 +8421,20 @@ fn issue_115_switching_home_keeps_window_height_and_fills_bottom() {
     ui.set_active_is_home(true);
     update_test_layout(&ui);
     assert!((height() - 960.0).abs() < 0.5);
-    let home = named_element(&ui, "AppWindow::home-area").expect("home area exists");
+    let home = named_element(&ui, "FileView::home-area").expect("home area exists");
     let home_top = home.absolute_position().y;
     assert!(home_top > 80.0 && home_top < 130.0);
     assert!((home_top + home.size().height - 960.0).abs() <= 1.0);
-    assert!(named_element(&ui, "AppWindow::content-area").is_none());
-    assert!(named_element(&ui, "AppWindow::status-bar").is_none());
+    assert!(named_element(&ui, "FileView::content-area").is_none());
+    assert!(named_element(&ui, "FileView::status-bar").is_none());
 
     ui.set_active_is_home(false);
     update_test_layout(&ui);
     assert!((height() - 960.0).abs() < 0.5);
-    assert!(named_element(&ui, "AppWindow::home-area").is_none());
-    let files = named_element(&ui, "AppWindow::content-area").expect("file content area exists");
+    assert!(named_element(&ui, "FileView::home-area").is_none());
+    let files = named_element(&ui, "FileView::content-area").expect("file content area exists");
     assert!(files.absolute_position().y > 80.0 && files.absolute_position().y < 180.0);
-    let status = named_element(&ui, "AppWindow::status-bar").expect("file status bar exists");
+    let status = named_element(&ui, "FileView::status-bar").expect("file status bar exists");
     assert_eq!(status.size().height, 30.0);
     assert!((status.absolute_position().y + status.size().height - 960.0).abs() <= 1.0);
 }
@@ -8419,7 +8470,7 @@ fn issue_130_sidebar_survives_scale_changes_before_resize_is_committed() {
             assert_eq!(ui.get_home_content_width(), expected_home_width);
             assert_eq!(ui.get_grid_column_count(), expected_columns);
             assert_eq!(
-                named_element(&ui, "AppWindow::sidebar-scroll")
+                named_element(&ui, "Sidebar::sidebar-scroll")
                     .unwrap()
                     .size()
                     .width,
@@ -8433,7 +8484,7 @@ fn issue_130_sidebar_survives_scale_changes_before_resize_is_committed() {
             update_test_layout(&ui);
             assert_eq!(ui.get_window_width(), 1180.0);
             assert_eq!(
-                named_element(&ui, "AppWindow::sidebar-scroll")
+                named_element(&ui, "Sidebar::sidebar-scroll")
                     .unwrap()
                     .size()
                     .width,
@@ -8473,7 +8524,7 @@ fn issue_130_sidebar_still_follows_real_logical_resize_at_each_scale() {
             update_test_layout(&ui);
             assert_eq!(ui.get_window_width(), width);
             assert_eq!(
-                named_element(&ui, "AppWindow::sidebar-scroll").map(|item| item.size().width),
+                named_element(&ui, "Sidebar::sidebar-scroll").map(|item| item.size().width),
                 sidebar_width,
                 "logical width {width} at scale {scale_factor}",
             );
@@ -8514,7 +8565,7 @@ fn overflowing_sidebar_uses_its_own_scroll_view() {
     let scroll = ui
         .root_element()
         .query_descendants()
-        .match_id("AppWindow::sidebar-scroll")
+        .match_id("Sidebar::sidebar-scroll")
         .find_all()
         .into_iter()
         .next()
@@ -8522,7 +8573,7 @@ fn overflowing_sidebar_uses_its_own_scroll_view() {
     let content = ui
         .root_element()
         .query_descendants()
-        .match_id("AppWindow::sidebar-content")
+        .match_id("Sidebar::sidebar-content")
         .find_all()
         .into_iter()
         .next()
@@ -8570,7 +8621,7 @@ fn issue_16_drive_row_is_compact_and_other_rows_keep_their_height() {
     let drive = ui
         .root_element()
         .query_descendants()
-        .match_id("AppWindow::drive-row")
+        .match_id("Sidebar::drive-row")
         .find_all()
         .into_iter()
         .find(|element| element.size().height > 0.0)
@@ -8620,7 +8671,7 @@ fn issue_70_sidebar_collapse_clamps_stale_scroll_position() {
     let scroll = ui
         .root_element()
         .query_descendants()
-        .match_id("AppWindow::sidebar-scroll")
+        .match_id("Sidebar::sidebar-scroll")
         .find_all()
         .into_iter()
         .next()
@@ -8694,9 +8745,9 @@ fn issue_87_settings_stays_fixed_and_preserves_sidebar_background_hit_area() {
             .next()
             .unwrap_or_else(|| panic!("missing element: {id}"))
     };
-    let settings_row = find("AppWindow::settings-row");
-    let settings_button = find("AppWindow::settings-button");
-    let sidebar_scroll = find("AppWindow::sidebar-scroll");
+    let settings_row = find("Sidebar::settings-row");
+    let settings_button = find("Sidebar::settings-button");
+    let sidebar_scroll = find("Sidebar::sidebar-scroll");
     let initial_y = settings_row.absolute_position().y;
 
     assert_eq!(settings_row.size().height, 42.0);
@@ -8723,13 +8774,13 @@ fn issue_87_settings_stays_fixed_and_preserves_sidebar_background_hit_area() {
     settings_row.mock_single_click(slint::platform::PointerEventButton::Right);
     assert_eq!(background_menu_count.get(), 1);
 
-    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app-window.slint"));
+    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/sidebar.slint"));
     assert!(!source.contains("action-menu"));
     assert!(!source.contains("root.menu-open"));
     assert!(source.contains("settings-row := Rectangle"));
     assert!(source.contains("settings-button := Rectangle"));
     assert!(source.contains("icon-size: 22px;"));
-    assert!(!source.contains("Text { text: root.text-settings;"));
+    assert!(!source.contains("Text { text: UiTexts.values.text-settings;"));
 }
 #[test]
 fn issue_74_hiding_all_categories_clamps_scroll_and_preserves_expansion() {
@@ -8763,7 +8814,7 @@ fn issue_74_hiding_all_categories_clamps_scroll_and_preserves_expansion() {
     let scroll = ui
         .root_element()
         .query_descendants()
-        .match_id("AppWindow::sidebar-scroll")
+        .match_id("Sidebar::sidebar-scroll")
         .find_all()
         .into_iter()
         .next()
@@ -8825,7 +8876,7 @@ fn sidebar_wheel_scrolls_sidebar_without_moving_file_list() {
     let scroll = ui
         .root_element()
         .query_descendants()
-        .match_id("AppWindow::sidebar-scroll")
+        .match_id("Sidebar::sidebar-scroll")
         .find_all()
         .into_iter()
         .next()
@@ -9292,18 +9343,26 @@ fn issue_64_shortcut_event_rejects_stale_request_and_reused_entry_id() {
 
 #[test]
 fn issue_171_visual_style_uses_semantic_color_names() {
-    for source in [
-        include_str!("../../ui/app-window.slint"),
-        include_str!("../../ui/quick-menu.slint"),
-        include_str!("../../ui/icons/icon-map.slint"),
-    ] {
-        for word in source.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-') {
-            assert!(
-                !(word.len() == 7
-                    && word.starts_with('c')
-                    && word[1..].chars().all(|ch| ch.is_ascii_hexdigit())),
-                "color-value token remains: {word}"
-            );
+    let mut directories = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("ui")];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                directories.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "slint")
+            {
+                let source = std::fs::read_to_string(path).unwrap();
+                for word in source.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-') {
+                    assert!(
+                        !(word.len() == 7
+                            && word.starts_with('c')
+                            && word[1..].chars().all(|ch| ch.is_ascii_hexdigit())),
+                        "color-value token remains: {word}"
+                    );
+                }
+            }
         }
     }
 }

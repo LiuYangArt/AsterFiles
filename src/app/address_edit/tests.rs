@@ -165,8 +165,8 @@ fn issue_177_outside_click_uses_actual_bounds_and_does_not_cancel_loading() {
         .1;
     for position in [(10.0, 200.0), (700.0, 300.0), (1170.0, 700.0), (10.0, 10.0)] {
         f.edit();
-        let bounds = f.element("AppWindow::address-bar").absolute_position();
-        let size = f.element("AppWindow::address-bar").size();
+        let bounds = f.element("NavigationBar::address-bar").absolute_position();
+        let size = f.element("NavigationBar::address-bar").size();
         f.ui.invoke_dismiss_address_edit_outside(
             bounds.x + size.width / 2.0,
             bounds.y + size.height / 2.0,
@@ -393,7 +393,7 @@ fn issue_177_native_left_list_click_exits_and_selects_on_first_click() {
             .select_entry(EntryId(id as u32), toggle, extend);
     });
     f.edit();
-    let bounds = f.element("AppWindow::mouse").absolute_position();
+    let bounds = f.element("DetailsList::mouse").absolute_position();
     f.native_left_click(slint::LogicalPosition::new(
         bounds.x + 10.0,
         bounds.y + 10.0,
@@ -417,7 +417,7 @@ fn issue_177_native_left_sidebar_click_exits_and_activates_first_click() {
     let observed = destination.clone();
     f.ui.on_navigate_sidebar(move |index| observed.set(index));
     f.edit();
-    let bounds = f.element("AppWindow::side-touch").absolute_position();
+    let bounds = f.element("Sidebar::side-touch").absolute_position();
     f.native_left_click(slint::LogicalPosition::new(
         bounds.x + 10.0,
         bounds.y + 10.0,
@@ -433,7 +433,7 @@ fn issue_177_native_left_blank_click_exits_and_keeps_rectangle_gesture() {
     let observed = gestures.clone();
     f.ui.on_begin_rectangle_selection(move |_, _, _, _| observed.set(observed.get() + 1));
     f.edit();
-    let background = f.element("AppWindow::background-touch");
+    let background = f.element("FileView::background-touch");
     let bounds = background.absolute_position();
     f.native_left_click(slint::LogicalPosition::new(
         bounds.x + 20.0,
@@ -448,7 +448,7 @@ fn issue_177_native_inside_press_and_outside_release_keep_editor_open() {
     use winit::event::{DeviceId, ElementState, MouseButton, WindowEvent as Native};
     let f = Fixture::new(r"C:\same");
     f.edit();
-    let bar = f.element("AppWindow::address-bar");
+    let bar = f.element("NavigationBar::address-bar");
     let origin = bar.absolute_position();
     let point =
         winit::dpi::LogicalPosition::new(origin.x + bar.size().width / 2.0, origin.y + 10.0)

@@ -1,0 +1,353 @@
+import { VisualStyle } from "visual-style.slint";
+import { IconMap } from "icons/icon-map.slint";
+import { CheckBox, Slider } from "std-widgets.slint";
+import { UiTexts } from "@ui-texts";
+import { StandaloneActionButton } from "action-controls.slint";
+import { LightScrollBar } from "file-controls.slint";
+import { InlineIcon } from "navigation-controls.slint";
+
+export component SettingsPage inherits Rectangle {
+    in property <string> app-version;
+    callback change-file-list-quick-search(bool);
+    callback change-file-visibility(bool, bool);
+    callback change-language(int);
+    callback change-new-tab-opens-home(bool);
+    callback change-quick-menu-backdrop(bool);
+    callback change-quick-menu-backdrop-opacity(float);
+    callback change-theme(int);
+    in property <bool> debug-tools-enabled;
+    callback discover-everything();
+    callback download-everything();
+    callback enable-folder-integration();
+    callback enable-win-e-integration();
+    in property <bool> everything-busy;
+    in-out property <string> everything-instance;
+    in-out property <string> everything-path;
+    in property <string> everything-status;
+    in property <bool> file-list-quick-search;
+    in property <string> folder-integration-bound-path;
+    in property <bool> folder-integration-enabled;
+    in property <bool> folder-integration-needs-repair;
+    in property <string> folder-integration-status;
+    in property <int> language-mode;
+    in property <bool> minimal;
+    in property <bool> new-tab-opens-home;
+    in property <bool> quick-menu-backdrop;
+    in property <float> quick-menu-backdrop-opacity;
+    callback repair-folder-integration();
+    callback repair-win-e-integration();
+    callback restore-folder-integration();
+    callback restore-win-e-integration();
+    in-out property <bool> scrollbar-pointer-active;
+    callback select-everything-program();
+    in-out property <int> settings-section;
+    callback show-debug-window(int);
+    in property <bool> show-hidden-files;
+    in property <bool> show-system-files;
+    callback start-everything();
+    callback start-window-trace();
+    in property <bool> system-integration-busy;
+    callback test-everything-connection();
+    in property <int> theme-mode;
+    callback update-everything-config(string, string);
+    in property <string> win-e-integration-bound-path;
+    in property <bool> win-e-integration-enabled;
+    in property <bool> win-e-integration-needs-repair;
+    in property <string> win-e-integration-status;
+    in property <bool> window-trace-active;
+    in property <string> window-trace-status;
+
+    public pure function settings-title(section: int) -> string {
+        if section == 0 { return UiTexts.values.text-settings-general; }
+        if section == 1 { return UiTexts.values.text-settings-appearance; }
+        if section == 2 { return UiTexts.values.text-everything-title; }
+        if section == 3 { return UiTexts.values.text-settings-developer; }
+        return UiTexts.values.text-settings-about;
+    }
+    vertical-stretch: 1;
+    background: VisualStyle.navigation-surface-background;
+    HorizontalLayout {
+        padding-left: root.minimal ? 16px : 28px;
+        padding-right: root.minimal ? 16px : 28px;
+        padding-top: 24px;
+        padding-bottom: 24px;
+        spacing: root.minimal ? 16px : 28px;
+        Rectangle {
+            width: root.minimal ? 150px : 236px;
+            background: VisualStyle.surface-subtle;
+            border-radius: 9px;
+            VerticalLayout {
+                padding-left: 12px; padding-right: 12px; padding-top: 18px; padding-bottom: 18px; spacing: 6px;
+                Text { text: UiTexts.values.text-settings-title; color: VisualStyle.text-primary; font-size: 22px; font-weight: 600; height: 42px; }
+                for section[index] in [UiTexts.values.text-settings-general, UiTexts.values.text-settings-appearance, UiTexts.values.text-everything, UiTexts.values.text-settings-developer, UiTexts.values.text-settings-about]: Rectangle {
+                    visible: index != 3 || root.debug-tools-enabled;
+                    height: 42px; border-radius: 6px;
+                    background: root.settings-section == index ? VisualStyle.selection : (settings-nav-touch.has-hover ? VisualStyle.surface-hover : transparent);
+                    Rectangle { visible: root.settings-section == index; x: 0px; y: 9px; width: 3px; height: 24px; border-radius: 2px; background: VisualStyle.accent; }
+                    HorizontalLayout {
+                        padding-left: 13px; padding-right: 10px; spacing: 10px;
+                        InlineIcon { icon-source: index == 0 ? IconMap.action-language : IconMap.action-settings; icon-size: 18px; }
+                        Text { text: section; color: VisualStyle.text-primary; font-size: 14px; vertical-alignment: center; overflow: elide; }
+                    }
+                    settings-nav-touch := TouchArea { mouse-cursor: pointer; clicked => { root.settings-section = index; } }
+                    accessible-role: button; accessible-label: section;
+                }
+                Rectangle { vertical-stretch: 1; }
+            }
+        }
+        settings-pane := Rectangle {
+            horizontal-stretch: 1;
+            background: VisualStyle.navigation-surface-background;
+            settings-scroll := Flickable {
+                width: parent.width - 16px; height: parent.height;
+                viewport-width: self.width;
+                viewport-height: max(self.height, settings-content.preferred-height);
+                settings-wheel := TouchArea {
+                    width: settings-scroll.width;
+                    height: settings-scroll.height;
+                    scroll-event(event) => {
+                        let maximum = max(0px, settings-content.preferred-height - settings-scroll.height);
+                        if maximum > 0px && event.delta-y != 0px {
+                            settings-scroll.viewport-y = max(-maximum, min(0px, settings-scroll.viewport-y + event.delta-y));
+                            return accept;
+                        }
+                        return reject;
+                    }
+                }
+                settings-content := VerticalLayout {
+                    width: settings-scroll.width;
+                    spacing: 16px;
+                    Text { text: root.settings-title(root.settings-section); color: VisualStyle.text-primary; font-size: 22px; font-weight: 600; height: 44px; }
+                    if root.settings-section == 0: VerticalLayout {
+                        spacing: 12px;
+                        Rectangle {
+                            height: 232px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
+                            VerticalLayout {
+                                padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 12px;
+                                Text { text: UiTexts.values.text-language; color: VisualStyle.text-primary; font-size: 15px; font-weight: 600; }
+                                HorizontalLayout {
+                                    height: 42px; spacing: 8px;
+                                    for language-option[index] in [UiTexts.values.text-language-chinese, UiTexts.values.text-language-english]: Rectangle {
+                                        horizontal-stretch: 1; border-radius: 6px; border-width: root.language-mode == index ? 2px : 1px;
+                                        border-color: root.language-mode == index ? VisualStyle.accent : VisualStyle.border;
+                                        background: language-card-touch.pressed ? VisualStyle.surface-pressed : language-card-touch.has-hover ? VisualStyle.surface-hover : VisualStyle.surface;
+                                        Text { text: language-option; color: VisualStyle.text-primary; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                                        language-card-touch := TouchArea { mouse-cursor: pointer; clicked => { root.change-language(index); } }
+                                        accessible-role: button; accessible-label: language-option;
+                                    }
+                                }
+                                CheckBox { text: UiTexts.values.text-new-tab-opens-home; checked: root.new-tab-opens-home; toggled => { root.change-new-tab-opens-home(self.checked); } }
+                                CheckBox { text: UiTexts.values.text-show-hidden-files; checked: root.show-hidden-files; toggled => { root.change-file-visibility(self.checked, root.show-system-files); } }
+                                CheckBox { text: UiTexts.values.text-show-system-files; checked: root.show-system-files; toggled => { root.change-file-visibility(root.show-hidden-files, self.checked); } }
+                            }
+                        }
+                        Rectangle {
+                            height: 208px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
+                            VerticalLayout {
+                                padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 8px;
+                                Text { text: UiTexts.values.text-system-integration; color: VisualStyle.text-primary; font-size: 15px; font-weight: 600; }
+                                Text { text: UiTexts.values.text-folder-default-title; color: VisualStyle.text-primary; font-size: 14px; font-weight: 600; }
+                                Text { text: UiTexts.values.text-folder-default-detail; color: VisualStyle.text-secondary; font-size: 12px; wrap: word-wrap; }
+                                Text { text: UiTexts.values.text-integration-status + " " + root.folder-integration-status; color: root.folder-integration-enabled && !root.folder-integration-needs-repair ? VisualStyle.accent : VisualStyle.text-secondary; font-size: 12px; overflow: elide; }
+                                HorizontalLayout {
+                                    height: 32px; spacing: 8px;
+                                    StandaloneActionButton {
+                                        width: 132px; height: 32px; enabled: !root.system-integration-busy && (!root.folder-integration-enabled || root.folder-integration-needs-repair);
+                                        label: root.folder-integration-needs-repair ? UiTexts.values.text-integration-repair : UiTexts.values.text-integration-enable;
+                                        clicked => {
+                                            if root.folder-integration-needs-repair { root.repair-folder-integration(); }
+                                            else { root.enable-folder-integration(); }
+                                        }
+                                    }
+                                    StandaloneActionButton { horizontal-stretch: 1; height: 32px; enabled: !root.system-integration-busy && root.folder-integration-enabled; label: UiTexts.values.text-integration-restore; clicked => { root.restore-folder-integration(); } }
+                                }
+                                Rectangle {
+                                    height: 18px;
+                                    Text { text: UiTexts.values.text-integration-path-label + " " + root.folder-integration-bound-path; color: VisualStyle.text-secondary; font-size: 11px; overflow: elide; }
+                                    Tooltip { text: @markdown("\{root.folder-integration-bound-path}"); }
+                                }
+                            }
+                        }
+                        Rectangle {
+                            height: 238px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
+                            VerticalLayout {
+                                padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 8px;
+                                HorizontalLayout {
+                                    height: 22px; spacing: 10px;
+                                    Text { text: UiTexts.values.text-win-e-title; color: VisualStyle.text-primary; font-size: 14px; font-weight: 600; vertical-alignment: center; }
+                                    Rectangle {
+                                        width: 72px; height: 22px; border-radius: 11px; background: VisualStyle.navigation-hover;
+                                        Text { text: UiTexts.values.text-integration-experimental; color: VisualStyle.text-secondary; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                                Text { text: UiTexts.values.text-win-e-detail; color: VisualStyle.text-secondary; font-size: 12px; wrap: word-wrap; }
+                                Text { text: UiTexts.values.text-win-e-risk; color: VisualStyle.danger; font-size: 11px; wrap: word-wrap; }
+                                Text { text: UiTexts.values.text-integration-status + " " + root.win-e-integration-status; color: root.win-e-integration-enabled && !root.win-e-integration-needs-repair ? VisualStyle.accent : VisualStyle.text-secondary; font-size: 12px; overflow: elide; }
+                                Rectangle {
+                                    height: 18px;
+                                    Text { text: UiTexts.values.text-integration-path-label + " " + root.win-e-integration-bound-path; color: VisualStyle.text-secondary; font-size: 11px; overflow: elide; }
+                                    Tooltip { text: @markdown("\{root.win-e-integration-bound-path}"); }
+                                }
+                                HorizontalLayout {
+                                    height: 32px; spacing: 8px;
+                                    StandaloneActionButton {
+                                        width: 132px; height: 32px; enabled: !root.system-integration-busy && (!root.win-e-integration-enabled || root.win-e-integration-needs-repair);
+                                        label: root.win-e-integration-needs-repair ? UiTexts.values.text-integration-repair : UiTexts.values.text-integration-enable;
+                                        clicked => {
+                                            if root.win-e-integration-needs-repair { root.repair-win-e-integration(); }
+                                            else { root.enable-win-e-integration(); }
+                                        }
+                                    }
+                                    StandaloneActionButton { horizontal-stretch: 1; height: 32px; enabled: !root.system-integration-busy && root.win-e-integration-enabled; label: UiTexts.values.text-integration-restore; clicked => { root.restore-win-e-integration(); } }
+                                }
+                            }
+                        }
+                    }
+                    if root.settings-section == 1: Rectangle {
+                        height: 212px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
+                        VerticalLayout {
+                            padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 12px;
+                            Text { text: UiTexts.values.text-theme; color: VisualStyle.text-primary; font-size: 15px; font-weight: 600; }
+                            HorizontalLayout {
+                                height: 42px; spacing: 8px;
+                                for theme-option[index] in [UiTexts.values.text-theme-system, UiTexts.values.text-theme-light, UiTexts.values.text-theme-dark]: Rectangle {
+                                    horizontal-stretch: 1; border-radius: 6px; border-width: root.theme-mode == index ? 2px : 1px;
+                                    border-color: root.theme-mode == index ? VisualStyle.accent : VisualStyle.border;
+                                    background: theme-card-touch.pressed ? VisualStyle.surface-pressed : theme-card-touch.has-hover ? VisualStyle.surface-hover : VisualStyle.surface;
+                                    Text { text: theme-option; color: VisualStyle.text-primary; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                                    theme-card-touch := TouchArea { mouse-cursor: pointer; clicked => { root.change-theme(index); } }
+                                    accessible-role: button; accessible-label: theme-option;
+                                }
+                            }
+                            CheckBox { text: UiTexts.values.text-quick-menu-backdrop; checked: root.quick-menu-backdrop; toggled => { root.change-quick-menu-backdrop(self.checked); } }
+                            HorizontalLayout {
+                                height: 20px;
+                                Text { text: UiTexts.values.text-quick-menu-backdrop-opacity; color: VisualStyle.text-primary; font-size: 13px; vertical-alignment: center; }
+                                Text { text: root.quick-menu-backdrop-opacity + "%"; color: VisualStyle.text-secondary; font-size: 13px; horizontal-alignment: right; vertical-alignment: center; }
+                            }
+                            Slider {
+                                height: 28px;
+                                enabled: root.quick-menu-backdrop;
+                                minimum: 0;
+                                maximum: 100;
+                                step: 5;
+                                value: root.quick-menu-backdrop-opacity;
+                                changed(value) => { root.change-quick-menu-backdrop-opacity(value); }
+                            }
+                        }
+                    }
+                    if root.settings-section == 2: VerticalLayout {
+                        spacing: 12px;
+                        Rectangle {
+                            height: 274px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
+                            VerticalLayout {
+                                padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 8px;
+                                Text { text: UiTexts.values.text-everything-connection; color: VisualStyle.text-primary; font-size: 15px; font-weight: 600; }
+                                Text { text: UiTexts.values.text-everything-path; color: VisualStyle.text-primary; font-size: 12px; }
+                                HorizontalLayout {
+                                    height: 32px; spacing: 8px;
+                                    Rectangle {
+                                        horizontal-stretch: 1; border-width: 1px; border-color: VisualStyle.border; border-radius: 4px; background: VisualStyle.surface;
+                                        TextInput { x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.everything-path; single-line: true; vertical-alignment: center; edited => { root.update-everything-config(root.everything-path, root.everything-instance); } }
+                                    }
+                                    StandaloneActionButton { width: 112px; height: 32px; label: UiTexts.values.text-select-everything-program; enabled: !root.everything-busy; clicked => { root.select-everything-program(); } }
+                                }
+                                Text { text: UiTexts.values.text-everything-instance; color: VisualStyle.text-primary; font-size: 12px; }
+                                Rectangle {
+                                    height: 32px; border-width: 1px; border-color: VisualStyle.border; border-radius: 4px; background: VisualStyle.surface;
+                                    TextInput { x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.everything-instance; single-line: true; vertical-alignment: center; edited => { root.update-everything-config(root.everything-path, root.everything-instance); } }
+                                }
+                                Text { text: UiTexts.values.text-everything-instance-help; color: VisualStyle.text-secondary; font-size: 11px; wrap: word-wrap; }
+                                CheckBox { text: UiTexts.values.text-file-list-quick-search; checked: root.file-list-quick-search; toggled => { root.change-file-list-quick-search(self.checked); } }
+                            }
+                        }
+                        Rectangle {
+                            height: 142px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
+                            VerticalLayout {
+                                padding-left: 20px; padding-right: 20px; padding-top: 14px; padding-bottom: 14px; spacing: 8px;
+                                Text { text: UiTexts.values.text-everything-actions; color: VisualStyle.text-primary; font-size: 15px; font-weight: 600; }
+                                Text { text: root.everything-status; color: VisualStyle.text-secondary; font-size: 12px; wrap: word-wrap; }
+                                HorizontalLayout {
+                                    height: 32px; spacing: 8px;
+                                    StandaloneActionButton { width: (parent.width - 8px) / 2; height: 32px; label: UiTexts.values.text-test-connection; enabled: !root.everything-busy; clicked => { root.test-everything-connection(); } }
+                                    StandaloneActionButton { width: (parent.width - 8px) / 2; height: 32px; label: UiTexts.values.text-start-everything; enabled: !root.everything-busy; clicked => { root.start-everything(); } }
+                                }
+                            }
+                        }
+                        Rectangle {
+                            height: 174px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
+                            VerticalLayout {
+                                padding-left: 20px; padding-right: 20px; padding-top: 14px; padding-bottom: 14px; spacing: 6px;
+                                Text { text: UiTexts.values.text-everything-help; color: VisualStyle.text-primary; font-size: 15px; font-weight: 600; }
+                                Text { text: UiTexts.values.text-everything-help-install; color: VisualStyle.text-secondary; font-size: 11px; wrap: word-wrap; }
+                                Text { text: UiTexts.values.text-everything-help-dependencies; color: VisualStyle.text-secondary; font-size: 11px; wrap: word-wrap; }
+                                Text { text: UiTexts.values.text-everything-help-independent; color: VisualStyle.text-secondary; font-size: 11px; wrap: word-wrap; }
+                                Text { text: UiTexts.values.text-everything-help-settings; color: VisualStyle.text-secondary; font-size: 11px; wrap: word-wrap; }
+                            }
+                        }
+                        HorizontalLayout {
+                            height: 32px; spacing: 8px;
+                            StandaloneActionButton { width: (parent.width - 8px) / 2; height: 32px; label: UiTexts.values.text-discover-everything; enabled: !root.everything-busy; clicked => { root.discover-everything(); } }
+                            StandaloneActionButton { width: (parent.width - 8px) / 2; height: 32px; label: UiTexts.values.text-download-everything; enabled: !root.everything-busy; clicked => { root.download-everything(); } }
+                        }
+                    }
+                    if root.settings-section == 3 && root.debug-tools-enabled: VerticalLayout {
+                        spacing: 12px;
+                        Rectangle {
+                            height: 244px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
+                            VerticalLayout {
+                                padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 12px;
+                                Text { text: UiTexts.values.text-ui-showcase; color: VisualStyle.text-primary; font-size: 15px; font-weight: 600; }
+                                Text { text: UiTexts.values.text-ui-showcase-detail; color: VisualStyle.text-secondary; font-size: 12px; wrap: word-wrap; }
+                                HorizontalLayout {
+                                    height: 34px; spacing: 8px;
+                                    StandaloneActionButton { width: (parent.width - 8px) / 2; label: UiTexts.values.text-show-delete-confirmation; clicked => { root.show-debug-window(0); } }
+                                    StandaloneActionButton { width: (parent.width - 8px) / 2; label: UiTexts.values.text-show-conflict-confirmation; clicked => { root.show-debug-window(1); } }
+                                }
+                                HorizontalLayout {
+                                    height: 34px; spacing: 8px;
+                                    StandaloneActionButton { width: (parent.width - 8px) / 2; label: UiTexts.values.text-show-exit-confirmation; clicked => { root.show-debug-window(2); } }
+                                    StandaloneActionButton { width: (parent.width - 8px) / 2; label: UiTexts.values.text-show-operation-window; clicked => { root.show-debug-window(3); } }
+                                }
+                            }
+                        }
+                        Rectangle {
+                            height: 170px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
+                            VerticalLayout {
+                                padding-left: 20px; padding-right: 20px; padding-top: 16px; padding-bottom: 16px; spacing: 10px;
+                                Text { text: UiTexts.values.text-window-trace-title; color: VisualStyle.text-primary; font-size: 15px; font-weight: 600; }
+                                Text { text: UiTexts.values.text-window-trace-detail; color: VisualStyle.text-secondary; font-size: 12px; wrap: word-wrap; }
+                                HorizontalLayout {
+                                    height: 34px; spacing: 12px;
+                                    StandaloneActionButton { width: 132px; enabled: !root.window-trace-active; label: root.window-trace-active ? UiTexts.values.text-window-trace-active : UiTexts.values.text-window-trace-start; clicked => { root.start-window-trace(); } }
+                                    Text { text: root.window-trace-status; color: root.window-trace-active ? VisualStyle.accent : VisualStyle.text-secondary; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                                }
+                            }
+                        }
+                    }
+                    if root.settings-section == 4: Rectangle {
+                        height: 144px; border-radius: 8px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface-subtle;
+                        VerticalLayout {
+                            padding-left: 20px; padding-right: 20px; padding-top: 20px; padding-bottom: 20px; spacing: 10px;
+                            Text { text: "AsterFiles"; color: VisualStyle.text-primary; font-size: 20px; font-weight: 600; }
+                            Text { text: UiTexts.values.text-version + " " + root.app-version; color: VisualStyle.text-secondary; font-size: 14px; }
+                            Text { text: "GNU General Public License v3.0"; color: VisualStyle.text-secondary; font-size: 12px; }
+                        }
+                    }
+                    Rectangle { height: 16px; }
+                }
+            }
+            LightScrollBar {
+                pointer-active-changed(active) => { root.scrollbar-pointer-active = active; }
+                x: parent.width - self.width;
+                height: parent.height;
+                value: settings-scroll.viewport-y;
+                maximum: max(0px, settings-content.preferred-height - settings-scroll.height);
+                page-size: settings-scroll.height;
+                scrolled(viewport-y) => { settings-scroll.viewport-y = viewport-y; }
+            }
+        }
+    }
+
+}

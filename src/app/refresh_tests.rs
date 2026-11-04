@@ -38,7 +38,7 @@ fn fixture(count: u32, mode: ViewMode, group: GroupField) -> (WindowSessions, Ap
     let ui = AppWindow::new().unwrap();
     ui.window().set_size(slint::LogicalSize::new(1180.0, 760.0));
     refresh_ui(&ui, &state);
-    assert!(!ui.get_text_settings().is_empty());
+    assert!(!ui.global::<UiTexts>().get_values().text_settings.is_empty());
     assert!(ui.get_sidebar_items().row_count() > 0);
     (state, ui)
 }

@@ -1,0 +1,99 @@
+import { VisualStyle } from "visual-style.slint";
+import { CheckBox, Palette } from "std-widgets.slint";
+import { StandaloneActionButton, StandaloneTitleBar } from "action-controls.slint";
+
+export component ConfirmationWindow inherits Window {
+    title: root.title-text;
+    icon: @image-url("../assets/app-icon.png");
+    no-frame: true;
+    resize-border-width: 0px;
+    // 冲突弹窗按内容计算高度，长文案或展开的完整路径会自然增高；删除、退出弹窗保持固定高度。
+    property <length> window-height: root.kind == 1 ? body.preferred-height : 220px;
+    preferred-width: 520px;
+    preferred-height: root.window-height;
+    min-width: 520px;
+    max-width: 520px;
+    min-height: root.window-height;
+    max-height: root.window-height;
+    background: VisualStyle.surface;
+    default-font-family: "Segoe UI";
+
+    in property <int> kind: 0;
+    in property <string> operation-id: "";
+    in property <bool> demo-mode: false;
+    in property <bool> dark-theme: false;
+    in property <string> title-text: "";
+    in property <string> detail-text: "";
+    in property <string> source-text: "";
+    in property <string> destination-text: "";
+    in property <string> source-label: "来源：";
+    in property <string> destination-label: "目标：";
+    in property <string> cancel-text: "取消";
+    in property <string> primary-text: "";
+    in property <string> secondary-text: "";
+    in property <string> tertiary-text: "";
+    in property <string> apply-all-text: "";
+    in-out property <bool> apply-all: false;
+    in property <string> close-text: "关闭";
+    callback safe-cancel();
+    callback primary-action();
+    callback secondary-action();
+    callback tertiary-action();
+    callback drag-window();
+
+    // 标准 CheckBox 跟随 Palette 着色；每个窗口有独立的全局实例，需随应用主题同步，而不是跟随系统主题。
+    init => { Palette.color-scheme = root.dark-theme ? ColorScheme.dark : ColorScheme.light; }
+    changed dark-theme => {
+        VisualStyle.dark-theme = root.dark-theme;
+        Palette.color-scheme = root.dark-theme ? ColorScheme.dark : ColorScheme.light;
+    }
+
+    body := VerticalLayout {
+        StandaloneTitleBar { title: root.title-text; close-label: root.close-text; title-inset: root.kind == 1 ? 20px : 16px; close-requested => { root.safe-cancel(); } drag-window => { root.drag-window(); } }
+        if root.kind != 1: Rectangle {
+            vertical-stretch: 1;
+            background: VisualStyle.surface;
+            VerticalLayout {
+                padding-left: 20px; padding-right: 20px; padding-top: 12px; padding-bottom: 20px; spacing: 10px;
+                Text { text: root.detail-text; color: VisualStyle.text-secondary; font-size: 13px; wrap: word-wrap; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    alignment: end; spacing: 8px;
+                    if root.kind == 0: StandaloneActionButton { width: 96px; accessible-id: "dialog-cancel"; label: root.cancel-text; clicked => { root.safe-cancel(); } }
+                    if root.kind == 2: StandaloneActionButton { width: 120px; accessible-id: "confirmation-secondary"; label: root.secondary-text; clicked => { root.secondary-action(); } }
+                    StandaloneActionButton { width: root.kind == 2 ? 150px : 96px; accessible-id: "confirmation-primary"; label: root.primary-text; dangerous: root.kind == 0; clicked => { root.primary-action(); } }
+                }
+            }
+        }
+        // 冲突弹窗：说明与路径、批量选项、操作按钮三段，区间 16、区内 8，不放弹性空白。
+        if root.kind == 1: VerticalLayout {
+            padding-left: 20px; padding-right: 20px; padding-top: 4px; padding-bottom: 20px; spacing: 16px;
+            VerticalLayout {
+                spacing: 8px;
+                Text { text: root.detail-text; color: VisualStyle.text-secondary; font-size: 13px; wrap: word-wrap; }
+                GridLayout {
+                    spacing-horizontal: 8px; spacing-vertical: 4px;
+                    // 完整路径直接换行显示：同名冲突的两行文件名相同，只能靠目录区分，不能省略。
+                    Row {
+                        Text { text: root.source-label; color: VisualStyle.text-secondary; font-size: 12px; vertical-alignment: top; }
+                        Text { accessible-id: "confirmation-source"; horizontal-stretch: 1; text: root.source-text; color: VisualStyle.text-primary; font-size: 12px; wrap: char-wrap; }
+                    }
+                    Row {
+                        Text { text: root.destination-label; color: VisualStyle.text-secondary; font-size: 12px; vertical-alignment: top; }
+                        Text { accessible-id: "confirmation-destination"; horizontal-stretch: 1; text: root.destination-text; color: VisualStyle.text-primary; font-size: 12px; wrap: char-wrap; }
+                    }
+                }
+            }
+            HorizontalLayout {
+                alignment: start;
+                CheckBox { accessible-id: "confirmation-apply-all"; text: root.apply-all-text; checked <=> root.apply-all; }
+            }
+            HorizontalLayout {
+                alignment: end; spacing: 8px;
+                StandaloneActionButton { width: 108px; focusable: true; accessible-id: "confirmation-tertiary"; label: root.tertiary-text; clicked => { root.tertiary-action(); } }
+                StandaloneActionButton { width: 96px; focusable: true; accessible-id: "confirmation-secondary"; label: root.secondary-text; clicked => { root.secondary-action(); } }
+                StandaloneActionButton { width: 96px; focusable: true; accessible-id: "confirmation-primary"; label: root.primary-text; clicked => { root.primary-action(); } }
+            }
+        }
+    }
+}

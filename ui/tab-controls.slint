@@ -1,0 +1,71 @@
+import { VisualStyle } from "visual-style.slint";
+import { IconMap } from "icons/icon-map.slint";
+
+export component ActiveTabShape inherits Rectangle {
+    in property <color> shape-color;
+    in property <length> corner-radius;
+    background: transparent;
+
+    // One contour prevents independently rasterized pieces from opening seams at fractional positions.
+    Path {
+        width: parent.width;
+        height: parent.height;
+        fill: root.shape-color;
+        MoveTo { x: 0; y: root.height / 1px; }
+        CubicTo {
+            control-1-x: 4; control-1-y: root.height / 1px;
+            control-2-x: 7; control-2-y: root.height / 1px - 3;
+            x: root.corner-radius / 1px; y: root.height / 1px - root.corner-radius / 1px;
+        }
+        LineTo { x: root.corner-radius / 1px; y: root.corner-radius / 1px; }
+        CubicTo { control-1-x: root.corner-radius / 1px; control-1-y: 3; control-2-x: 10; control-2-y: 0; x: 2 * root.corner-radius / 1px; y: 0; }
+        LineTo { x: root.width / 1px - 2 * root.corner-radius / 1px; y: 0; }
+        CubicTo {
+            control-1-x: root.width / 1px - 10; control-1-y: 0;
+            control-2-x: root.width / 1px - root.corner-radius / 1px; control-2-y: 3;
+            x: root.width / 1px - root.corner-radius / 1px; y: root.corner-radius / 1px;
+        }
+        LineTo { x: root.width / 1px - root.corner-radius / 1px; y: root.height / 1px - root.corner-radius / 1px; }
+        CubicTo {
+            control-1-x: root.width / 1px - root.corner-radius / 1px; control-1-y: root.height / 1px - 3;
+            control-2-x: root.width / 1px - 4; control-2-y: root.height / 1px;
+            x: root.width / 1px; y: root.height / 1px;
+        }
+        Close { }
+    }
+}
+
+export component WindowButton inherits Rectangle {
+    in property <int> kind;
+    in property <string> label;
+    callback clicked();
+    width: 46px;
+    height: 40px;
+    background: root.kind == 2 && button-touch.has-hover ? VisualStyle.danger : button-touch.pressed ? VisualStyle.titlebar-pressed : button-touch.has-hover ? VisualStyle.titlebar-hover : transparent;
+    Rectangle {
+        visible: root.kind == 0;
+        width: 10px; height: 1px;
+        x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+        background: root.kind == 2 && button-touch.has-hover ? VisualStyle.surface : VisualStyle.text-primary;
+    }
+    Rectangle {
+        visible: root.kind == 1;
+        width: 9px; height: 9px;
+        x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+        border-width: 1px;
+        border-color: VisualStyle.text-primary;
+        background: transparent;
+    }
+    Image {
+        visible: root.kind == 2;
+        width: 14px; height: 14px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        source: button-touch.has-hover ? IconMap.action-close-hover : IconMap.action-close;
+        colorize: button-touch.has-hover ? #ffffff : VisualStyle.text-primary;
+    }
+    button-touch := TouchArea { clicked => { root.clicked(); } }
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => { root.clicked(); }
+}

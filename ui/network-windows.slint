@@ -1,0 +1,193 @@
+import { VisualStyle } from "visual-style.slint";
+import { CheckBox, LineEdit } from "std-widgets.slint";
+import { StandaloneActionButton, StandaloneTitleBar } from "action-controls.slint";
+
+export component NetworkLoginWindow inherits Window {
+    title: root.title-text;
+    icon: @image-url("../assets/app-icon.png");
+    no-frame: true;
+    resize-border-width: 0px;
+    preferred-width: 520px;
+    preferred-height: root.conflict ? 390px : 340px;
+    min-width: 520px;
+    max-width: 520px;
+    min-height: root.conflict ? 390px : 340px;
+    max-height: root.conflict ? 390px : 340px;
+    background: VisualStyle.surface;
+    default-font-family: "Segoe UI";
+
+    in property <bool> dark-theme: false;
+    in property <bool> busy: false;
+    in property <bool> conflict: false;
+    in property <string> title-text: "登录网络位置";
+    in property <string> detail-text: "输入此网络位置使用的 Windows 凭据。";
+    in property <string> target-text: "";
+    in property <string> user-label: "用户名";
+    in property <string> password-label: "密码";
+    in property <string> remember-label: "记住凭据（由 Windows 管理）";
+    in property <string> conflict-text: "Windows 已使用另一账号连接此服务器。断开会影响 Explorer 和其他软件。";
+    in property <string> cancel-text: "取消";
+    in property <string> login-text: "登录";
+    in property <string> reconnect-text: "断开并重新登录";
+    in property <string> close-text: "关闭";
+    in-out property <string> username: "";
+    in-out property <string> password: "";
+    in-out property <bool> remember: false;
+    callback login(string, string, bool, bool);
+    callback safe-cancel();
+    callback drag-window();
+
+    changed dark-theme => { VisualStyle.dark-theme = root.dark-theme; }
+
+    VerticalLayout {
+        StandaloneTitleBar { title: root.title-text; close-label: root.close-text; close-requested => { root.safe-cancel(); } drag-window => { root.drag-window(); } }
+        Rectangle {
+            vertical-stretch: 1;
+            background: VisualStyle.surface;
+            VerticalLayout {
+                padding-left: 20px; padding-right: 20px; padding-top: 12px; padding-bottom: 20px; spacing: 8px;
+                Text { text: root.detail-text; color: VisualStyle.text-secondary; font-size: 13px; wrap: word-wrap; }
+                Text { text: root.target-text; color: VisualStyle.text-primary; font-size: 12px; overflow: elide; }
+                Text { text: root.user-label; color: VisualStyle.text-secondary; font-size: 12px; }
+                LineEdit { accessible-id: "network-login-username"; accessible-label: root.user-label; text <=> root.username; enabled: !root.busy; }
+                Text { text: root.password-label; color: VisualStyle.text-secondary; font-size: 12px; }
+                Rectangle {
+                    height: 34px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface;
+                    TextInput { accessible-id: "network-login-password"; accessible-label: root.password-label; x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.password; single-line: true; input-type: InputType.password; enabled: !root.busy; accepted => { if (root.username != "" && root.password != "") { root.login(root.username, root.password, root.remember, root.conflict); } } }
+                }
+                CheckBox { accessible-id: "network-login-remember"; text: root.remember-label; checked <=> root.remember; enabled: !root.busy; }
+                if root.conflict: Text { text: root.conflict-text; color: VisualStyle.danger; font-size: 12px; wrap: word-wrap; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    alignment: end; spacing: 8px;
+                    StandaloneActionButton { width: 96px; accessible-id: "dialog-cancel"; label: root.cancel-text; enabled: !root.busy; clicked => { root.safe-cancel(); } }
+                    StandaloneActionButton { width: root.conflict ? 170px : 96px; accessible-id: "network-login-submit"; label: root.conflict ? root.reconnect-text : root.login-text; enabled: !root.busy && root.username != "" && root.password != ""; dangerous: root.conflict; clicked => { root.login(root.username, root.password, root.remember, root.conflict); } }
+                }
+            }
+        }
+    }
+}
+
+export component WebDavLocationWindow inherits Window {
+    title: root.title-text;
+    icon: @image-url("../assets/app-icon.png");
+    no-frame: true;
+    resize-border-width: 0px;
+    preferred-width: 520px;
+    preferred-height: 640px;
+    min-width: 520px;
+    max-width: 520px;
+    min-height: 640px;
+    max-height: 640px;
+    background: VisualStyle.surface;
+    default-font-family: "Segoe UI";
+
+    in property <bool> dark-theme: false;
+    in property <string> location-id: "";
+    in property <string> title-text: "添加 WebDAV 位置";
+    in property <string> name-label: "显示名称";
+    in property <string> host-label: "主机";
+    in property <string> port-label: "端口";
+    in property <string> root-label: "根路径";
+    in property <string> user-label: "用户名";
+    in property <string> password-label: "密码";
+    in property <string> https-label: "使用 HTTPS";
+    in property <string> error-text: "";
+    in property <string> cancel-text: "取消";
+    in property <string> save-text: "保存";
+    in property <string> close-text: "关闭";
+    in-out property <string> name: "";
+    in-out property <string> host: "";
+    in-out property <string> port: "443";
+    in-out property <string> root: "/";
+    in-out property <string> username: "";
+    in-out property <string> password: "";
+    in-out property <bool> https: true;
+    callback save();
+    callback safe-cancel();
+    callback drag-window();
+
+    changed dark-theme => { VisualStyle.dark-theme = root.dark-theme; }
+
+    VerticalLayout {
+        StandaloneTitleBar { title: root.title-text; close-label: root.close-text; close-requested => { root.safe-cancel(); } drag-window => { root.drag-window(); } }
+        Rectangle {
+            vertical-stretch: 1;
+            background: VisualStyle.surface;
+            VerticalLayout {
+                padding-left: 20px; padding-right: 20px; padding-top: 12px; padding-bottom: 16px; spacing: 6px;
+                Text { text: root.name-label; color: VisualStyle.text-secondary; font-size: 12px; }
+                LineEdit { accessible-id: "webdav-name"; text <=> root.name; }
+                Text { text: root.host-label; color: VisualStyle.text-secondary; font-size: 12px; }
+                LineEdit { accessible-id: "webdav-host"; text <=> root.host; }
+                Text { text: root.port-label; color: VisualStyle.text-secondary; font-size: 12px; }
+                LineEdit { accessible-id: "webdav-port"; text <=> root.port; }
+                Text { text: root.root-label; color: VisualStyle.text-secondary; font-size: 12px; }
+                LineEdit { accessible-id: "webdav-root"; text <=> root.root; }
+                Text { text: root.user-label; color: VisualStyle.text-secondary; font-size: 12px; }
+                LineEdit { accessible-id: "webdav-username"; text <=> root.username; }
+                Text { text: root.password-label; color: VisualStyle.text-secondary; font-size: 12px; }
+                Rectangle {
+                    height: 34px; border-width: 1px; border-color: VisualStyle.border; background: VisualStyle.surface;
+                    TextInput { accessible-id: "webdav-password"; x: 8px; width: parent.width - 16px; height: parent.height; text <=> root.password; single-line: true; input-type: InputType.password; }
+                }
+                CheckBox { accessible-id: "webdav-https"; text: root.https-label; checked <=> root.https; }
+                if root.error-text != "": Text { text: root.error-text; color: VisualStyle.danger; font-size: 12px; wrap: word-wrap; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    alignment: end; spacing: 8px;
+                    StandaloneActionButton { width: 96px; accessible-id: "dialog-cancel"; label: root.cancel-text; clicked => { root.safe-cancel(); } }
+                    StandaloneActionButton { width: 96px; accessible-id: "webdav-save"; label: root.save-text; enabled: root.name != "" && root.host != "" && root.port != "" && root.root != "" && root.username != "" && (root.password != "" || root.location-id != ""); clicked => { root.save(); } }
+                }
+            }
+        }
+    }
+}
+
+export component NetworkLocationRenameWindow inherits Window {
+    title: root.title-text;
+    icon: @image-url("../assets/app-icon.png");
+    no-frame: true;
+    resize-border-width: 0px;
+    preferred-width: 460px;
+    preferred-height: 210px;
+    min-width: 460px;
+    max-width: 460px;
+    min-height: 210px;
+    max-height: 210px;
+    background: VisualStyle.surface;
+    default-font-family: "Segoe UI";
+
+    in property <bool> dark-theme: false;
+    in property <string> location-id: "";
+    in property <string> title-text: "重命名网络位置";
+    in property <string> detail-text: "输入新的显示名称。";
+    in property <string> cancel-text: "取消";
+    in property <string> save-text: "保存";
+    in property <string> close-text: "关闭";
+    in-out property <string> name: "";
+    callback save(string);
+    callback safe-cancel();
+    callback drag-window();
+
+    changed dark-theme => { VisualStyle.dark-theme = root.dark-theme; }
+
+    VerticalLayout {
+        StandaloneTitleBar { title: root.title-text; close-label: root.close-text; close-requested => { root.safe-cancel(); } drag-window => { root.drag-window(); } }
+        Rectangle {
+            vertical-stretch: 1;
+            background: VisualStyle.surface;
+            VerticalLayout {
+                padding-left: 20px; padding-right: 20px; padding-top: 12px; padding-bottom: 20px; spacing: 10px;
+                Text { text: root.detail-text; color: VisualStyle.text-secondary; font-size: 13px; }
+                LineEdit { accessible-id: "network-location-rename-input"; accessible-label: root.title-text; text <=> root.name; accepted => { if (root.name != "") { root.save(root.name); } } }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    alignment: end; spacing: 8px;
+                    StandaloneActionButton { width: 96px; accessible-id: "dialog-cancel"; label: root.cancel-text; clicked => { root.safe-cancel(); } }
+                    StandaloneActionButton { width: 96px; accessible-id: "network-location-rename-save"; label: root.save-text; enabled: root.name != ""; clicked => { root.save(root.name); } }
+                }
+            }
+        }
+    }
+}

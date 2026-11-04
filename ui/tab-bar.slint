@@ -1,0 +1,181 @@
+import { VisualStyle } from "visual-style.slint";
+import { IconMap } from "icons/icon-map.slint";
+import { UiTexts } from "@ui-texts";
+import { TabRow } from "models.slint";
+import { InlineIcon } from "navigation-controls.slint";
+import { ActiveTabShape, WindowButton } from "tab-controls.slint";
+
+export component TabBar inherits Rectangle {
+    in property <string> accessibility-window-id: "";
+    callback activate-tab(int);
+    in property <int> active-tab-index: 0;
+    callback begin-tab-drag(int, int, float, float);
+    in property <bool> can-close-tab: false;
+    callback close-tab(int);
+    in-out property <bool> context-menu-open: false;
+    callback dismiss-context-menu();
+    callback drag-window();
+    callback new-tab();
+    callback request-close();
+    in property <[TabRow]> tabs;
+    callback update-tab-drag(float, float, float, float, float, float) -> int;
+    in-out property <bool> window-maximized;
+    in-out property <bool> window-minimized;
+    in property <length> window-width: 1180px;
+    // Keep a compact drag target between the add button and window controls.
+    private property <length> max-tab-cluster-width: max(80px, root.window-width - 8px - 34px - 36px - 3 * 46px - 12px);
+    in-out property <bool> tabs-overflow: root.tabs.length * 80px + 5px * max(0, root.tabs.length - 1) > root.max-tab-cluster-width;
+    private property <length> max-tab-strip-width: max(80px, root.max-tab-cluster-width - (root.tabs-overflow ? 33px : 0px));
+    out property <length> tab-current-width: root.tabs.length == 0 ? 178px : max(80px, min(178px, (root.max-tab-strip-width - 5px * max(0, root.tabs.length - 1)) / root.tabs.length));
+    in-out property <length> tab-width: root.tab-current-width;
+    private property <length> tab-content-width: root.tabs.length * root.tab-width + 5px * max(0, root.tabs.length - 1);
+    out property <length> tab-strip-width: min(root.max-tab-strip-width, root.tab-content-width);
+    out property <length> tab-viewport-x: tab-strip.viewport-x;
+    in-out property <bool> tabs-menu-open: false;
+    in-out property <bool> tab-dragging: false;
+    private property <bool> tab-drag-pointer-active: false;
+    in-out property <bool> suppress-tab-click: false;
+    private property <int> tab-drag-source-index: -1;
+    private property <length> tab-drag-pointer-x: 0px;
+    private property <length> tab-drag-pointer-y: 0px;
+    public function clear-tab-drag() {
+        root.tab-dragging = false;
+        root.tab-drag-pointer-active = false;
+        root.tab-drag-source-index = -1;
+    }
+    public function release-tab-drag-pointer() {
+        root.tab-drag-pointer-active = false;
+    }
+
+    public function reveal-tab(index: int) {
+        if !root.tabs-overflow {
+            tab-strip.viewport-x = 0px;
+        } else {
+            if index * (root.tab-width + 5px) + tab-strip.viewport-x < 0px {
+                tab-strip.viewport-x = -index * (root.tab-width + 5px);
+            }
+            if index * (root.tab-width + 5px) + root.tab-width + tab-strip.viewport-x > tab-strip.width {
+                tab-strip.viewport-x = tab-strip.width - index * (root.tab-width + 5px) - root.tab-width;
+            }
+            tab-strip.viewport-x = max(tab-strip.width - tab-strip.viewport-width, min(0px, tab-strip.viewport-x));
+        }
+    }
+    changed active-tab-index => { root.reveal-tab(root.active-tab-index); }
+
+    height: 46px; background: VisualStyle.tab-strip-background;
+    HorizontalLayout {
+        x: 8px; y: 12px; width: parent.width - 8px - 3 * 46px; height: 34px; spacing: 5px;
+        Rectangle {
+            width: root.tab-strip-width; height: 34px; clip: true;
+            tab-strip := Flickable {
+                width: parent.width; height: parent.height;
+                interactive: false;
+                viewport-width: root.tab-content-width;
+                viewport-height: self.height;
+                changed width => { root.reveal-tab(root.active-tab-index); }
+                Rectangle {
+                    width: max(root.tab-content-width, tab-strip.width); height: 34px;
+                    for tab[index] in root.tabs: Rectangle {
+                        accessible-role: AccessibleRole.tab;
+                        accessible-id: root.accessibility-window-id + "/tab/" + tab.id;
+                        accessible-label: tab.title;
+                        accessible-item-selectable: true;
+                        accessible-item-selected: tab.active;
+                        accessible-action-default => { root.activate-tab(tab.id); root.reveal-tab(index); }
+                        x: root.tab-dragging
+                        ? (index < root.tab-drag-source-index ? index : index > root.tab-drag-source-index ? index - 1 : index) * (root.tab-width + 5px)
+                        : index * (root.tab-width + 5px);
+                        width: root.tab-width; height: 34px;
+                        visible: !root.tab-dragging || index != root.tab-drag-source-index;
+                        background: tab.active ? transparent : (tab-touch.has-hover ? VisualStyle.titlebar-hover : VisualStyle.tab-strip-background);
+                        border-radius: VisualStyle.tab-corner-radius;
+                        border-width: 0px;
+                        ActiveTabShape {
+                            visible: tab.active;
+                            width: parent.width;
+                            height: parent.height;
+                            shape-color: VisualStyle.navigation-surface-background;
+                            corner-radius: VisualStyle.tab-corner-radius;
+                        }
+                        tab-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                if !root.suppress-tab-click { root.activate-tab(tab.id); root.reveal-tab(index); }
+                                root.suppress-tab-click = false;
+                            }
+                            pointer-event(event) => {
+                                if event.button == PointerEventButton.left && event.kind == PointerEventKind.down && !tab.is-settings {
+                                    root.tab-drag-pointer-active = true;
+                                    root.tab-drag-source-index = index;
+                                    root.begin-tab-drag(tab.id, index, (8px + index * (root.tab-width + 5px) + tab-strip.viewport-x + self.mouse-x) / 1px, (12px + self.mouse-y) / 1px);
+                                }
+                                if (event.button == PointerEventButton.middle && event.kind == PointerEventKind.up && root.can-close-tab) {
+                                    root.close-tab(tab.id);
+                                }
+                            }
+                            moved => {
+                                if self.pressed && root.tab-drag-pointer-active && root.tab-drag-source-index == index {
+                                    root.tab-drag-pointer-x = 8px + index * (root.tab-width + 5px) + tab-strip.viewport-x + self.mouse-x;
+                                    root.tab-drag-pointer-y = 12px + self.mouse-y;
+                                    let insertion = root.update-tab-drag(root.tab-drag-pointer-x / 1px, root.tab-drag-pointer-y / 1px, 8, root.tab-strip-width / 1px, tab-strip.viewport-x / 1px, root.tab-width / 1px);
+                                    if insertion >= -1 {
+                                        root.tab-dragging = true;
+                                        root.suppress-tab-click = true;
+                                    }
+                                }
+                            }
+                            scroll-event(event) => {
+                                tab-strip.viewport-x = max(tab-strip.width - tab-strip.viewport-width, min(0px, tab-strip.viewport-x + (event.delta-x != 0px ? event.delta-x : event.delta-y)));
+                                return accept;
+                            }
+                        }
+                        HorizontalLayout {
+                            x: VisualStyle.tab-shoulder-width;
+                            width: parent.width - VisualStyle.tab-shoulder-span;
+                            padding-left: 10px; padding-right: 7px; spacing: 6px;
+                            InlineIcon { icon-source: tab.is-settings ? IconMap.action-settings : tab.is-home ? IconMap.location-home : (tab.icon.width != 0 ? tab.icon : (tab.is-drive ? IconMap.location-drive : IconMap.file-folder)); icon-size: 16px; }
+                            Text { text: tab.title; color: VisualStyle.text-primary; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                            Text { visible: tab.loading && !(root.can-close-tab && tab-touch.has-hover); text: "…"; color: VisualStyle.accent; vertical-alignment: center; }
+                            Rectangle {
+                                visible: root.can-close-tab && (tab-touch.has-hover || close-touch.has-hover);
+                                width: 24px; height: 34px;
+                                Rectangle {
+                                    width: 24px; height: 24px; y: 5px; border-radius: 4px;
+                                    background: close-touch.pressed ? VisualStyle.tab-close-pressed : close-touch.has-hover ? VisualStyle.tab-close-hover : transparent;
+                                    Image { width: 12px; height: 12px; x: 6px; y: 6px; source: IconMap.action-close; colorize: VisualStyle.text-primary; }
+                                }
+                                close-touch := TouchArea { mouse-cursor: pointer; clicked => { root.close-tab(tab.id); } }
+                                accessible-role: button; accessible-id: root.accessibility-window-id + "/tab/" + tab.id + "/close"; accessible-label: UiTexts.values.text-close-tab; accessible-enabled: root.can-close-tab; accessible-action-default => { if root.can-close-tab { root.close-tab(tab.id); } }
+                            }
+                        }
+                        Tooltip { text: @markdown("\{tab.title}"); }
+                    }
+                }
+            }
+        }
+        Rectangle {
+            visible: root.tabs-overflow;
+            width: self.visible ? 28px : 0px; height: 34px; border-radius: 6px;
+            background: all-tabs-touch.pressed ? VisualStyle.titlebar-pressed : all-tabs-touch.has-hover ? VisualStyle.titlebar-hover : transparent;
+            Text { text: "⌄"; color: VisualStyle.text-primary; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; }
+            all-tabs-touch := TouchArea { mouse-cursor: pointer; clicked => { root.tabs-menu-open = !root.tabs-menu-open; } }
+            accessible-role: button; accessible-id: "tabs-menu"; accessible-label: UiTexts.values.text-all-tabs; accessible-expandable: true; accessible-expanded: root.tabs-menu-open; accessible-action-default => { root.tabs-menu-open = !root.tabs-menu-open; } accessible-action-expand => { root.tabs-menu-open = true; }
+            Tooltip { text: @markdown("\{UiTexts.values.text-all-tabs}"); }
+        }
+        Rectangle { width: 34px; height: 34px; border-radius: 6px; background: add-touch.pressed ? VisualStyle.titlebar-pressed : add-touch.has-hover ? VisualStyle.titlebar-hover : transparent; Image { width: 20px; height: 20px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; source: IconMap.action-add; colorize: VisualStyle.text-primary; } add-touch := TouchArea { mouse-cursor: pointer; clicked => { root.new-tab(); } } accessible-role: button; accessible-id: "tab-new"; accessible-label: UiTexts.values.text-new-tab; accessible-action-default => { root.new-tab(); } Tooltip { text: @markdown("\{UiTexts.values.text-new-tab} (Ctrl+T)"); } }
+        Rectangle {
+            horizontal-stretch: 1;
+            drag-touch := TouchArea {
+                pointer-event(event) => { if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) { root.drag-window(); } }
+                double-clicked => { root.window-maximized = !root.window-maximized; }
+            }
+        }
+    }
+    HorizontalLayout {
+        x: parent.width - 3 * 46px; y: 0px; width: 3 * 46px; height: 40px; spacing: 0px;
+        WindowButton { accessible-id: "window-minimize"; kind: 0; label: UiTexts.values.text-window-minimize; clicked => { root.context-menu-open = false; root.dismiss-context-menu(); root.window-minimized = true; } }
+        WindowButton { accessible-id: "window-maximize"; kind: 1; label: root.window-maximized ? UiTexts.values.text-window-restore : UiTexts.values.text-window-maximize; clicked => { root.window-maximized = !root.window-maximized; } }
+        WindowButton { accessible-id: "window-close"; kind: 2; label: UiTexts.values.text-window-close; clicked => { root.request-close(); } }
+    }
+
+}

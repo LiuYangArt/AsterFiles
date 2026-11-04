@@ -1,0 +1,146 @@
+import { VisualStyle } from "visual-style.slint";
+import { IconMap } from "icons/icon-map.slint";
+import { UiTexts } from "@ui-texts";
+import { HistoryRow, BreadcrumbRow } from "models.slint";
+import { InlineIcon, IconButton, BreadcrumbButton, AddressEditor } from "navigation-controls.slint";
+
+export component NavigationBar inherits Rectangle {
+    in property <bool> active-is-home: false;
+    in property <bool> active-is-settings: false;
+    in property <bool> address-editing: false;
+    in-out property <string> address-input: "C:\\";
+    callback address-input-changed(string);
+    in property <[HistoryRow]> back-history;
+    callback begin-address-drag(float, float);
+    callback begin-search();
+    in property <[BreadcrumbRow]> breadcrumb-overflow;
+    in property <float> breadcrumb-overflow-width;
+    in property <float> breadcrumb-overflow-x;
+    callback breadcrumb-width-changed();
+    in property <[BreadcrumbRow]> breadcrumbs;
+    in property <bool> can-navigate-back: false;
+    in property <bool> can-navigate-forward: false;
+    in property <bool> can-navigate-up: false;
+    in property <bool> can-refresh: false;
+    callback cancel-address-edit();
+    in property <bool> compact;
+    in property <image> current-location-icon;
+    in property <bool> current-location-is-drive: false;
+    callback dismiss-address-edit();
+    callback end-address-drag();
+    in property <[HistoryRow]> forward-history;
+    in property <bool> minimal;
+    callback navigate-back();
+    callback navigate-breadcrumb(int, int);
+    callback navigate-forward();
+    callback navigate-history(bool, int);
+    callback navigate-path(string);
+    callback navigate-up();
+    callback refresh();
+    in property <bool> search-depth-enabled: false;
+    in property <bool> search-mode: false;
+    in property <bool> search-recursive: true;
+    in property <bool> search-results-mode: false;
+    callback toggle-search-depth();
+    callback update-address-drag(float, float);
+    in property <Point> window-origin;
+    out property <float> breadcrumb-available-width: breadcrumb-strip.width / 1px;
+    changed breadcrumb-available-width => { root.breadcrumb-width-changed(); }
+
+    private property <string> breadcrumb-measure-label;
+    private property <bool> breadcrumb-measure-current;
+    public function measure-breadcrumb(label: string, current: bool) -> float {
+        root.breadcrumb-measure-label = label;
+        root.breadcrumb-measure-current = current;
+        return ceil(breadcrumb-measure.preferred-width / 1px) + (current ? 16 : 29);
+    }
+    breadcrumb-measure := Text {
+        visible: false;
+        text: root.breadcrumb-measure-label;
+        font-size: 12px;
+        font-weight: root.breadcrumb-measure-current ? 600 : 400;
+        wrap: no-wrap;
+    }
+    public function close-breadcrumb-menu() { breadcrumb-menu.close(); }
+    changed address-editing => { root.close-breadcrumb-menu(); }
+
+    public function focus-address-editor() { address-editor.focus-at-end(); }
+    public function dismiss-address-edit-outside(x: float, y: float) {
+        if !root.address-editing { return; }
+        let left = address-bar.absolute-position.x - root.window-origin.x;
+        let top = address-bar.absolute-position.y - root.window-origin.y;
+        if x * 1px < left || x * 1px >= left + address-bar.width
+        || y * 1px < top || y * 1px >= top + address-bar.height {
+            root.dismiss-address-edit();
+        }
+    }
+
+    visible: !root.active-is-settings;
+    height: self.visible ? 56px : 0px; background: VisualStyle.navigation-surface-background; border-width: 0px;
+    HorizontalLayout {
+        padding-top: 9px; padding-bottom: 9px; padding-left: 14px; padding-right: 14px; spacing: 7px;
+        ContextMenuArea { width: 38px; height: 38px; IconButton { accessible-id: "navigation-back"; icon-source: IconMap.action-back; tip: UiTexts.values.text-back + " (Alt+Left)"; enabled: root.can-navigate-back; button-label: UiTexts.values.text-back; clicked => { root.navigate-back(); } } Menu { for history in root.back-history: MenuItem { title: history.label; activated => { root.navigate-history(true, history.index); } } } }
+        if !root.minimal: ContextMenuArea { width: 38px; height: 38px; IconButton { accessible-id: "navigation-forward"; icon-source: IconMap.action-forward; tip: UiTexts.values.text-forward + " (Alt+Right)"; enabled: root.can-navigate-forward; button-label: UiTexts.values.text-forward; clicked => { root.navigate-forward(); } } Menu { for history in root.forward-history: MenuItem { title: history.label; activated => { root.navigate-history(false, history.index); } } } }
+        IconButton { accessible-id: "navigation-up"; icon-source: IconMap.action-up; tip: UiTexts.values.text-up + " (Alt+Up)"; enabled: root.can-navigate-up; button-label: UiTexts.values.text-up; clicked => { root.navigate-up(); } }
+        if !root.compact: IconButton { accessible-id: "navigation-refresh"; icon-source: IconMap.action-refresh; tip: UiTexts.values.text-refresh + " (F5)"; enabled: root.can-refresh; button-label: UiTexts.values.text-refresh; clicked => { root.refresh(); } }
+        address-bar := Rectangle {
+            height: 38px; min-width: 0px; horizontal-stretch: 1; background: VisualStyle.dark-theme && address-hover.has-hover ? #282828 : VisualStyle.surface; border-width: root.address-editing ? 1px : 0px; border-color: VisualStyle.accent; border-radius: 5px;
+            address-hover := TouchArea {
+                breadcrumb-view := Rectangle {
+                    visible: !root.address-editing;
+                    x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px;
+                    clip: true;
+                    Rectangle {
+                        x: 8px; y: 3px; width: 18px; height: 30px;
+                        InlineIcon {
+                            y: (parent.height - self.height) / 2;
+                            icon-source: root.current-location-icon.width != 0 ? root.current-location-icon : (root.active-is-home ? IconMap.location-home : (root.current-location-is-drive ? IconMap.location-drive : IconMap.file-folder));
+                            icon-size: 16px;
+                        }
+                        address-drag-touch := TouchArea {
+                            enabled: root.can-refresh && !root.search-results-mode;
+                            mouse-cursor: self.enabled ? grab : default;
+                            pointer-event(event) => {
+                                if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                                    root.begin-address-drag((self.absolute-position.x + self.mouse-x - root.window-origin.x) / 1px, (self.absolute-position.y + self.mouse-y - root.window-origin.y) / 1px);
+                                }
+                                if event.button == PointerEventButton.left && event.kind == PointerEventKind.up { root.end-address-drag(); }
+                            }
+                            moved => {
+                                if self.pressed { root.update-address-drag((self.absolute-position.x + self.mouse-x - root.window-origin.x) / 1px, (self.absolute-position.y + self.mouse-y - root.window-origin.y) / 1px); }
+                            }
+                        }
+                    }
+                    TouchArea { x: 28px; width: max(0px, parent.width - 28px); mouse-cursor: text; clicked => { root.begin-search(); } }
+                    breadcrumb-strip := Rectangle {
+                        x: 28px; y: 3px; width: max(0px, parent.width - 54px); height: 30px;
+                        clip: true;
+                        for crumb in root.breadcrumbs: BreadcrumbButton {
+                            x: crumb.offset * 1px; width: crumb.extent * 1px;
+                            label: crumb.label; current: crumb.current;
+                            clicked => { root.navigate-breadcrumb(crumb.index, crumb.generation); }
+                        }
+                        breadcrumb-menu := ContextMenuArea {
+                            x: root.breadcrumb-overflow-x * 1px;
+                            width: root.breadcrumb-overflow-width * 1px; height: 30px;
+                            BreadcrumbButton {
+                                width: parent.width; visible: root.breadcrumb-overflow.length > 0;
+                                label: "…"; tip: UiTexts.values.text-breadcrumb-overflow;
+                                clicked => { breadcrumb-menu.show({ x: 0px, y: self.height }); }
+                            }
+                            Menu {
+                                for crumb in root.breadcrumb-overflow: MenuItem {
+                                    title: crumb.label;
+                                    activated => { root.navigate-breadcrumb(crumb.index, crumb.generation); }
+                                }
+                            }
+                        }
+                    }
+                }
+                address-editor := AddressEditor { visible: root.address-editing; x: 4px; y: 2px; width: parent.width - 8px; height: parent.height - 4px; text <=> root.address-input; address-label: root.search-mode ? UiTexts.values.text-parent-path : UiTexts.values.text-address; cancel-label: UiTexts.values.text-cancel-edit; depth-enabled: root.search-mode && root.search-depth-enabled; recursive: root.search-recursive; depth-label: !root.search-depth-enabled ? UiTexts.values.text-search-global-disabled : (root.search-recursive ? UiTexts.values.text-search-recursive : UiTexts.values.text-search-current); changed(value) => { root.address-input-changed(value); } accepted(value) => { root.navigate-path(value); } cancelled => { root.cancel-address-edit(); } focus-lost => { if root.address-editing { root.dismiss-address-edit(); } } toggle-depth => { root.toggle-search-depth(); } }
+            }
+
+        }
+    }
+
+}

@@ -1,0 +1,270 @@
+import { VisualStyle } from "visual-style.slint";
+import { IconMap } from "icons/icon-map.slint";
+import { ListView } from "std-widgets.slint";
+import { GridRow, PositionedGridRow } from "models.slint";
+
+export component FileGrid inherits Rectangle {
+    in property <string> accessibility-context;
+    callback activate-entry(int, bool, bool);
+    in property <int> active-geometry-revision;
+    callback begin-internal-drag(int);
+    callback begin-internal-right-drag(int, float, float);
+    callback cancel-internal-drag();
+    in property <length> content-origin-y;
+    in-out property <length> file-list-left;
+    in-out property <length> file-list-top;
+    in-out property <length> file-viewport-height;
+    in-out property <length> file-viewport-width;
+    in-out property <length> file-viewport-y;
+    in-out property <int> grid-rename-anchor-id;
+    in-out property <string> grid-rename-context;
+    in-out property <length> grid-rename-height;
+    in-out property <string> grid-rename-label;
+    in-out property <length> grid-rename-left;
+    in-out property <length> grid-rename-top;
+    in-out property <length> grid-rename-width;
+    in property <[GridRow]> grid-rows;
+    in-out property <length> grid-viewport-y;
+    in property <bool> grouped-grid-enabled;
+    in property <float> grouped-grid-extent;
+    in property <[PositionedGridRow]> grouped-grid-visible-rows;
+    in property <length> layout-card-width;
+    in property <length> layout-icon-size;
+    in property <length> layout-row-height;
+    in-out property <length> legacy-grid-extent;
+    in-out property <length> legacy-grid-visible-height;
+    in-out property <length> rectangle-viewport-top;
+    in property <bool> rename-editing;
+    in property <int> rename-entry-id;
+    callback request-folder-size-range(float, float);
+    in property <bool> search-results-mode;
+    in property <int> view-mode;
+    in property <Point> window-origin;
+
+    public pure function is-grid-view-mode(mode: int) -> bool {
+        return mode == 2 || mode == 3 || mode == 4 || mode == 5 || mode == 6;
+    }
+    accessible-role: AccessibleRole.list;
+    accessible-id: "file-grid";
+    visible: root.grid-rows.length > 0 && root.is-grid-view-mode(root.view-mode);
+
+    clip: true;
+    out property <length> visible-height: root.grouped-grid-enabled ? self.height : root.legacy-grid-visible-height;
+    out property <length> viewport-height: root.grouped-grid-enabled ? root.grouped-grid-extent * 1px : root.legacy-grid-extent;
+    function sync-file-geometry() { if root.is-grid-view-mode(root.view-mode) { root.file-list-left = self.absolute-position.x - root.window-origin.x; root.file-list-top = self.absolute-position.y - root.window-origin.y; root.rectangle-viewport-top = self.absolute-position.y - root.content-origin-y; root.file-viewport-width = self.width; root.file-viewport-height = self.visible-height; } }
+    init => { self.sync-file-geometry(); }
+    private property <int> geometry-revision: root.active-geometry-revision;
+    changed geometry-revision => { self.sync-file-geometry(); }
+    changed absolute-position => { self.sync-file-geometry(); }
+    changed width => { self.sync-file-geometry(); }
+    changed visible-height => { self.sync-file-geometry(); }
+    if !root.grouped-grid-enabled: ListView {
+        mouse-drag-pan-enabled: false;
+        viewport-width: self.width;
+        vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+        viewport-y <=> root.grid-viewport-y;
+        init => { root.legacy-grid-extent = self.viewport-height; root.legacy-grid-visible-height = self.visible-height; }
+        changed viewport-height => { root.legacy-grid-extent = self.viewport-height; }
+        changed visible-height => { root.legacy-grid-visible-height = self.visible-height; }
+        changed viewport-y => { if root.is-grid-view-mode(root.view-mode) && !root.grouped-grid-enabled { root.file-viewport-y = self.viewport-y; if !root.search-results-mode { root.request-folder-size-range(self.viewport-y / 1px, self.visible-height / 1px); } } }
+        for row in root.grid-rows: HorizontalLayout {
+            height: row.group-header ? (row.group-detail == "" ? 32px : 48px) : root.layout-row-height;
+            padding-left: 16px;
+            padding-right: 16px;
+            spacing: 8px;
+            if row.group-header: Rectangle {
+                width: max(0px, root.width - 32px); height: parent.height;
+                Text { x: 16px; y: 5px; width: parent.width - 110px; height: 20px; text: row.group-label; color: VisualStyle.text-primary; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: elide; }
+                Text { x: 16px; y: 25px; width: parent.width - 32px; height: 18px; text: row.group-detail; color: VisualStyle.text-tertiary; font-size: 11px; vertical-alignment: center; overflow: elide; }
+                Text { x: parent.width - 92px; y: 5px; width: 76px; height: 20px; text: row.group-count; color: VisualStyle.text-tertiary; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+            }
+            for entry in row.entries: Rectangle {
+                if entry.loaded && !entry.group-header: Rectangle {
+                    width: parent.width; height: parent.height;
+                    accessible-role: list-item;
+                    accessible-id: root.accessibility-context + "/entry/" + entry.id;
+                    accessible-label: entry.name;
+                    accessible-enabled: !(root.rename-editing && root.rename-entry-id == entry.id);
+                    accessible-item-selectable: true;
+                    accessible-item-selected: entry.selected;
+                    accessible-action-default => { if !(root.rename-editing && root.rename-entry-id == entry.id) { root.activate-entry(entry.id, false, false); } }
+                }
+                width: root.layout-card-width; height: root.layout-row-height - 8px;
+                border-radius: 7px;
+                background: entry.selected ? VisualStyle.selection : card-touch.has-hover ? VisualStyle.accent-hover : transparent;
+                Image {
+                    private property <length> fallback-size: min(root.layout-icon-size, 48px);
+                    x: root.view-mode == 3 ? 4px : root.view-mode == 6 ? 8px + (root.layout-icon-size - self.width) / 2 : (parent.width - self.width) / 2;
+                    y: root.view-mode == 3 ? 4px : entry.icon.width != 0 ? 8px : (root.layout-icon-size - self.height) / 2 + 8px;
+                    width: entry.icon.width != 0 ? root.layout-icon-size : self.fallback-size;
+                    height: entry.icon.width != 0 ? root.layout-icon-size : self.fallback-size;
+                    source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document);
+                    image-fit: contain;
+                    opacity: entry.thumbnail-state == 1 ? 0.5 : 1;
+                }
+                if !(root.rename-editing && root.rename-entry-id == entry.id): Text {
+                    x: root.view-mode == 3 ? 26px : root.view-mode == 6 ? 64px : 7px;
+                    y: root.view-mode == 3 ? 0px : root.view-mode == 6 ? 8px : root.layout-icon-size + 10px;
+                    width: root.view-mode == 3 ? parent.width - 30px : root.view-mode == 6 ? parent.width - 72px : parent.width - 14px;
+                    height: root.view-mode == 3 ? parent.height : root.view-mode == 6 ? 24px : 48px;
+                    text: entry.name; color: VisualStyle.text-strong; font-size: VisualStyle.file-name-font-size;
+                    horizontal-alignment: root.view-mode == 3 || root.view-mode == 6 ? left : center; vertical-alignment: root.view-mode == 3 || root.view-mode == 6 ? center : top; wrap: root.view-mode == 3 || root.view-mode == 6 ? no-wrap : word-wrap; overflow: elide;
+                }
+                if root.rename-editing && root.rename-entry-id == entry.id && root.is-grid-view-mode(root.view-mode): Rectangle {
+                    x: root.view-mode == 3 ? 26px : root.view-mode == 6 ? 64px : 7px;
+                    y: root.view-mode == 3 ? 0px : root.view-mode == 6 ? 8px : root.layout-icon-size + 10px;
+                    width: max(1px, root.view-mode == 3 ? parent.width - 30px : root.view-mode == 6 ? parent.width - 72px : parent.width - 14px);
+                    height: root.view-mode == 3 ? parent.height : root.view-mode == 6 ? 24px : 30px;
+                    function sync-editor-anchor() {
+                        root.grid-rename-left = self.absolute-position.x - root.window-origin.x;
+                        root.grid-rename-top = self.absolute-position.y - root.window-origin.y;
+                        root.grid-rename-width = self.width;
+                        root.grid-rename-height = self.height;
+                        root.grid-rename-label = entry.name; root.grid-rename-context = root.accessibility-context;
+                        root.grid-rename-anchor-id = entry.id;
+                    }
+                    init => { self.sync-editor-anchor(); }
+                    changed absolute-position => { self.sync-editor-anchor(); }
+                    changed width => { self.sync-editor-anchor(); }
+                    changed height => { self.sync-editor-anchor(); }
+                }
+                if root.view-mode == 6: Text {
+                    x: 64px; y: 32px; width: parent.width - 142px; height: 20px;
+                    text: entry.kind; color: VisualStyle.text-detail; font-size: 11px; vertical-alignment: center; overflow: elide;
+                }
+                if root.view-mode == 6: Text {
+                    x: parent.width - 72px; y: 32px; width: 64px; height: 20px;
+                    text: entry.size; color: VisualStyle.text-detail; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; overflow: elide;
+                }
+                card-touch := TouchArea {
+                    enabled: entry.loaded && !(root.rename-editing && root.rename-entry-id == entry.id);
+                    mouse-cursor: pointer;
+                    private property <bool> click-control: false;
+                    private property <bool> click-shift: false;
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.down {
+                            self.click-control = event.modifiers.control;
+                            self.click-shift = event.modifiers.shift;
+                            if event.button == PointerEventButton.right {
+                                root.begin-internal-right-drag(
+                                    entry.id,
+                                    (self.absolute-position.x + self.mouse-x - root.window-origin.x) / 1px,
+                                    (self.absolute-position.y + self.mouse-y - root.window-origin.y) / 1px
+                                );
+                            }
+                            if event.button == PointerEventButton.left {
+                                root.begin-internal-drag(entry.id);
+                            }
+                        }
+                        if event.kind == PointerEventKind.up && event.button == PointerEventButton.left {
+                            root.cancel-internal-drag();
+                        }
+                    }
+                    clicked => { root.activate-entry(entry.id, self.click-control, self.click-shift); }
+                }
+            }
+        }
+    }
+    if root.grouped-grid-enabled: Rectangle {
+        for placed in root.grouped-grid-visible-rows: HorizontalLayout {
+            x: 0px; y: placed.offset * 1px + root.file-viewport-y;
+            width: root.width;
+            height: placed.extent * 1px;
+            padding-left: 16px;
+            padding-right: 16px;
+            spacing: 8px;
+            if placed.row.group-header: Rectangle {
+                width: max(0px, root.width - 32px); height: parent.height;
+                Text { x: 16px; y: 5px; width: parent.width - 110px; height: 20px; text: placed.row.group-label; color: VisualStyle.text-primary; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: elide; }
+                Text { x: 16px; y: 25px; width: parent.width - 32px; height: 18px; text: placed.row.group-detail; color: VisualStyle.text-tertiary; font-size: 11px; vertical-alignment: center; overflow: elide; }
+                Text { x: parent.width - 92px; y: 5px; width: 76px; height: 20px; text: placed.row.group-count; color: VisualStyle.text-tertiary; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+            }
+            for entry in placed.row.entries: Rectangle {
+                if entry.loaded && !entry.group-header: Rectangle {
+                    width: parent.width; height: parent.height;
+                    accessible-role: list-item;
+                    accessible-id: root.accessibility-context + "/entry/" + entry.id;
+                    accessible-label: entry.name;
+                    accessible-enabled: !(root.rename-editing && root.rename-entry-id == entry.id);
+                    accessible-item-selectable: true;
+                    accessible-item-selected: entry.selected;
+                    accessible-action-default => { if !(root.rename-editing && root.rename-entry-id == entry.id) { root.activate-entry(entry.id, false, false); } }
+                }
+                width: root.layout-card-width; height: root.layout-row-height - 8px;
+                border-radius: 7px;
+                background: entry.selected ? VisualStyle.selection : grouped-card-touch.has-hover ? VisualStyle.accent-hover : transparent;
+                Image {
+                    private property <length> fallback-size: min(root.layout-icon-size, 48px);
+                    x: root.view-mode == 3 ? 4px : root.view-mode == 6 ? 8px + (root.layout-icon-size - self.width) / 2 : (parent.width - self.width) / 2;
+                    y: root.view-mode == 3 ? 4px : entry.icon.width != 0 ? 8px : (root.layout-icon-size - self.height) / 2 + 8px;
+                    width: entry.icon.width != 0 ? root.layout-icon-size : self.fallback-size;
+                    height: entry.icon.width != 0 ? root.layout-icon-size : self.fallback-size;
+                    source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document);
+                    image-fit: contain;
+                    opacity: entry.thumbnail-state == 1 ? 0.5 : 1;
+                }
+                if !(root.rename-editing && root.rename-entry-id == entry.id): Text {
+                    x: root.view-mode == 3 ? 26px : root.view-mode == 6 ? 64px : 7px;
+                    y: root.view-mode == 3 ? 0px : root.view-mode == 6 ? 8px : root.layout-icon-size + 10px;
+                    width: root.view-mode == 3 ? parent.width - 30px : root.view-mode == 6 ? parent.width - 72px : parent.width - 14px;
+                    height: root.view-mode == 3 ? parent.height : root.view-mode == 6 ? 24px : 48px;
+                    text: entry.name; color: VisualStyle.text-strong; font-size: VisualStyle.file-name-font-size;
+                    horizontal-alignment: root.view-mode == 3 || root.view-mode == 6 ? left : center; vertical-alignment: root.view-mode == 3 || root.view-mode == 6 ? center : top; wrap: root.view-mode == 3 || root.view-mode == 6 ? no-wrap : word-wrap; overflow: elide;
+                }
+                if root.rename-editing && root.rename-entry-id == entry.id && root.is-grid-view-mode(root.view-mode): Rectangle {
+                    x: root.view-mode == 3 ? 26px : root.view-mode == 6 ? 64px : 7px;
+                    y: root.view-mode == 3 ? 0px : root.view-mode == 6 ? 8px : root.layout-icon-size + 10px;
+                    width: max(1px, root.view-mode == 3 ? parent.width - 30px : root.view-mode == 6 ? parent.width - 72px : parent.width - 14px);
+                    height: root.view-mode == 3 ? parent.height : root.view-mode == 6 ? 24px : 30px;
+                    function sync-editor-anchor() {
+                        root.grid-rename-left = self.absolute-position.x - root.window-origin.x;
+                        root.grid-rename-top = self.absolute-position.y - root.window-origin.y;
+                        root.grid-rename-width = self.width;
+                        root.grid-rename-height = self.height;
+                        root.grid-rename-label = entry.name; root.grid-rename-context = root.accessibility-context;
+                        root.grid-rename-anchor-id = entry.id;
+                    }
+                    init => { self.sync-editor-anchor(); }
+                    changed absolute-position => { self.sync-editor-anchor(); }
+                    changed width => { self.sync-editor-anchor(); }
+                    changed height => { self.sync-editor-anchor(); }
+                }
+                if root.view-mode == 6: Text {
+                    x: 64px; y: 32px; width: parent.width - 142px; height: 20px;
+                    text: entry.kind; color: VisualStyle.text-detail; font-size: 11px; vertical-alignment: center; overflow: elide;
+                }
+                if root.view-mode == 6: Text {
+                    x: parent.width - 72px; y: 32px; width: 64px; height: 20px;
+                    text: entry.size; color: VisualStyle.text-detail; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; overflow: elide;
+                }
+                grouped-card-touch := TouchArea {
+                    enabled: entry.loaded && !(root.rename-editing && root.rename-entry-id == entry.id);
+                    mouse-cursor: pointer;
+                    private property <bool> click-control: false;
+                    private property <bool> click-shift: false;
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.down {
+                            self.click-control = event.modifiers.control;
+                            self.click-shift = event.modifiers.shift;
+                            if event.button == PointerEventButton.right {
+                                root.begin-internal-right-drag(
+                                    entry.id,
+                                    (self.absolute-position.x + self.mouse-x - root.window-origin.x) / 1px,
+                                    (self.absolute-position.y + self.mouse-y - root.window-origin.y) / 1px
+                                );
+                            }
+                            if event.button == PointerEventButton.left {
+                                root.begin-internal-drag(entry.id);
+                            }
+                        }
+                        if event.kind == PointerEventKind.up && event.button == PointerEventButton.left {
+                            root.cancel-internal-drag();
+                        }
+                    }
+                    clicked => { root.activate-entry(entry.id, self.click-control, self.click-shift); }
+                }
+            }
+        }
+    }
+
+}

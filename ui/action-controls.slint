@@ -1,0 +1,61 @@
+import { VisualStyle } from "visual-style.slint";
+
+export component StandaloneActionButton inherits Rectangle {
+    in property <image> icon-source;
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <bool> dangerous: false;
+    in property <bool> center-content: true;
+    // 仅冲突弹窗开启 Tab 聚焦；删除、退出弹窗保持原有纯鼠标按钮行为。
+    in property <bool> focusable: false;
+    callback clicked();
+    width: 96px;
+    height: 34px;
+    horizontal-stretch: 0;
+    border-radius: 5px;
+    border-width: focus-scope.has-focus ? 2px : 1px;
+    border-color: focus-scope.has-focus ? VisualStyle.accent : root.dangerous ? VisualStyle.danger : VisualStyle.border;
+    background: !root.enabled ? VisualStyle.surface-disabled : button-touch.pressed ? (root.dangerous ? #a4261a : VisualStyle.selection) : button-touch.has-hover ? (root.dangerous ? VisualStyle.danger : VisualStyle.accent-hover) : (root.dangerous ? #b3261e : VisualStyle.surface);
+    opacity: root.enabled ? 1 : 0.5;
+    Rectangle {
+        x: 10px; width: parent.width - 20px; height: parent.height;
+        HorizontalLayout {
+            spacing: 6px; alignment: root.center-content ? center : start;
+            if root.icon-source.width != 0: Rectangle { width: 16px; vertical-stretch: 1; Image { width: 16px; height: 16px; y: (parent.height - self.height) / 2; source: root.icon-source; image-fit: contain; colorize: VisualStyle.text-primary; } }
+            Text { horizontal-stretch: root.center-content ? 0 : 1; text: root.label; color: root.dangerous ? #ffffff : VisualStyle.text-primary; font-size: 12px; vertical-alignment: center; overflow: elide; }
+        }
+    }
+    focus-scope := FocusScope {
+        enabled: root.focusable && root.enabled;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+        button-touch := TouchArea { enabled: root.enabled; mouse-cursor: pointer; clicked => { root.clicked(); } }
+    }
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
+}
+
+export component StandaloneTitleBar inherits Rectangle {
+    in property <string> title;
+    in property <string> close-label: "关闭";
+    in property <length> title-inset: 16px;
+    callback close-requested();
+
+    callback drag-window();
+    height: 48px;
+    background: VisualStyle.surface;
+    HorizontalLayout {
+        padding-left: root.title-inset;
+        Text { text: root.title; color: VisualStyle.text-primary; font-size: 16px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+
+        Rectangle { width: 46px; Text { text: "×"; color: VisualStyle.text-primary; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; } TouchArea { clicked => { root.close-requested(); } } accessible-role: button; accessible-id: "dialog-close"; accessible-label: root.close-label; accessible-action-default => { root.close-requested(); } }
+    }
+    TouchArea { width: parent.width - 46px; pointer-event(event) => { if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) { root.drag-window(); } } }
+}

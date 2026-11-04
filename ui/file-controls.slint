@@ -1,0 +1,157 @@
+import { VisualStyle } from "visual-style.slint";
+
+export component InlineRenameEditor inherits Rectangle {
+    in-out property <string> text;
+    in property <int> selection-end;
+    in-out property <bool> submitting;
+    in property <int> submit-generation;
+    in property <string> editor-id;
+    in property <string> label;
+    in property <bool> multiline: false;
+    in property <length> editor-height-limit: 300px;
+    out property <length> content-height: rename-editor.preferred-height + 8px;
+    callback commit(string);
+    callback cancel();
+    private property <bool> editor-active: false;
+    private property <bool> submitted: false;
+    private property <bool> editor-has-focus: rename-editor.has-focus;
+    height: root.multiline ? min(root.editor-height-limit, max(30px, root.content-height)) : 30px;
+    background: VisualStyle.surface;
+    border-color: VisualStyle.accent;
+    border-width: 1px;
+    border-radius: 3px;
+    init => { self.editor-active = true; }
+    changed submit-generation => {
+        self.submitted = false;
+        rename-editor.focus();
+    }
+    function submit() {
+        if !root.submitting {
+            root.submitted = true;
+            root.submitting = true;
+            root.commit(root.text);
+        }
+    }
+    changed editor-has-focus => {
+        if self.editor-active && !self.editor-has-focus && !self.submitted {
+            root.submit();
+        }
+    }
+    editor-viewport := Rectangle {
+        x: 5px;
+        y: 4px;
+        width: max(1px, parent.width - 10px);
+        height: max(1px, parent.height - 8px);
+        clip: true;
+        rename-editor := TextInput {
+            private property <length> scroll-x: 0px;
+            private property <length> scroll-y: 0px;
+            x: root.multiline ? 0px : min(0px, max(parent.width - self.width - self.text-cursor-width, self.scroll-x));
+            y: min(0px, max(parent.height - self.height, self.scroll-y));
+            width: root.multiline ? max(1px, parent.width - self.text-cursor-width) : max(parent.width - self.text-cursor-width, self.preferred-width);
+            height: max(parent.height, self.preferred-height);
+            text <=> root.text;
+            color: VisualStyle.text-strong;
+            selection-background-color: VisualStyle.selection-emphasis;
+            selection-foreground-color: VisualStyle.text-strong;
+            font-size: VisualStyle.file-name-font-size;
+            single-line: !root.multiline;
+            wrap: root.multiline ? word-wrap : no-wrap;
+            horizontal-alignment: root.multiline ? center : left;
+            page-height: parent.height;
+            read-only: root.submitting;
+            vertical-alignment: root.multiline ? top : center;
+            init => {
+                self.focus();
+                self.set-selection-offsets(0, root.selection-end);
+            }
+            // TextInput delegates clipping and cursor visibility to its enclosing widget.
+            cursor-position-changed(position) => {
+                if position.x + self.scroll-x < 0px {
+                    self.scroll-x = -position.x;
+                } else if position.x + self.scroll-x > parent.width - self.text-cursor-width {
+                    self.scroll-x = parent.width - position.x - self.text-cursor-width;
+                }
+                if position.y + self.scroll-y < 0px {
+                    self.scroll-y = -position.y;
+                } else if position.y + self.scroll-y > parent.height - 20px {
+                    self.scroll-y = parent.height - position.y - 20px;
+                }
+            }
+            accepted => { root.submit(); }
+            key-pressed(event) => {
+                if event.text == Key.Return {
+                    root.submit();
+                    return accept;
+                }
+                if event.text == Key.Escape {
+                    root.submitted = true;
+                    root.cancel();
+                    return accept;
+                }
+                return reject;
+            }
+            accessible-role: text-input;
+            accessible-id: root.editor-id;
+            accessible-enabled: !root.submitting;
+            accessible-label: root.label;
+        }
+    }
+}
+
+export component LightScrollBar inherits Rectangle {
+    in property <length> value;
+    in property <length> maximum;
+    in property <length> page-size;
+    callback scrolled(length);
+    callback pointer-active-changed(bool);
+
+    width: 12px;
+    visible: root.maximum > 0px;
+    background: scroll-touch.has-hover ? VisualStyle.scrollbar-track-hover : transparent;
+    border-radius: 6px;
+
+    private property <length> track-padding: 4px;
+    private property <length> track-height: root.height - 2 * root.track-padding;
+    private property <length> thumb-height: max(28px, root.track-height * root.page-size / (root.maximum + root.page-size));
+    private property <length> thumb-travel: max(0px, root.track-height - root.thumb-height);
+
+    thumb := Rectangle {
+        width: scroll-touch.has-hover ? 6px : 3px;
+        height: root.thumb-height;
+        x: parent.width - self.width - 3px;
+        y: root.track-padding + root.thumb-travel * (-root.value / root.maximum);
+        border-radius: self.width / 2;
+        background: scroll-touch.has-hover ? VisualStyle.scrollbar-thumb-hover : VisualStyle.scrollbar-thumb;
+    }
+
+    scroll-touch := TouchArea {
+        property <length> press-value;
+        property <length> press-y;
+        property <bool> dragging-thumb;
+        pointer-event(event) => {
+            if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                root.pointer-active-changed(true);
+                self.dragging-thumb = false;
+                if self.mouse-y < thumb.y {
+                    root.scrolled(min(0px, root.value + root.page-size));
+                } else if self.mouse-y > thumb.y + thumb.height {
+                    root.scrolled(max(-root.maximum, root.value - root.page-size));
+                } else {
+                    self.press-value = root.value;
+                    self.press-y = self.mouse-y;
+                    self.dragging-thumb = true;
+                }
+            }
+            if event.kind == PointerEventKind.cancel || (event.button == PointerEventButton.left && event.kind == PointerEventKind.up) {
+                self.dragging-thumb = false;
+                root.pointer-active-changed(false);
+            }
+        }
+        moved => {
+            if self.pressed && self.dragging-thumb && root.thumb-travel > 0px {
+                root.scrolled(max(-root.maximum, min(0px, self.press-value - (self.mouse-y - self.press-y) * root.maximum / root.thumb-travel)));
+            }
+        }
+    }
+}

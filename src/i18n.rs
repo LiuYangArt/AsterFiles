@@ -30,14 +30,144 @@ pub struct Texts {
     pub language: Language,
 }
 
+// The build script derives the Slint record from this resource declaration.
+macro_rules! ui_texts {
+    ($($field:ident: ($chinese:literal, $english:literal)),* $(,)?) => {
+        impl Texts {
+            pub fn ui_texts(self) -> asterfiles_ui::UiTextValues {
+                asterfiles_ui::UiTextValues {
+                    $($field: self.choose($chinese, $english).into(),)*
+                }
+            }
+        }
+    };
+}
+
+ui_texts! {
+    text_back: ("后退", "Back"),
+    text_forward: ("前进", "Forward"),
+    text_up: ("向上", "Up"),
+    text_refresh: ("刷新", "Refresh"),
+    text_home: ("主页", "Home"),
+    text_desktop: ("桌面", "Desktop"),
+    text_downloads: ("下载", "Downloads"),
+    text_documents: ("文档", "Documents"),
+    text_pictures: ("图片", "Pictures"),
+    text_music: ("音乐", "Music"),
+    text_videos: ("视频", "Videos"),
+    text_quick_access: ("快速访问", "Quick access"),
+    text_drives: ("磁盘", "Drives"),
+    text_home_quick_access: ("快速访问", "Quick access"),
+    text_home_drives: ("磁盘", "Drives"),
+    text_home_network_locations: ("网络位置", "Network locations"),
+    text_home_network_locations_empty: ("暂无网络位置", "No network locations"),
+    text_network_locations: ("网络位置", "Network locations"),
+    text_network: ("网络", "Network"),
+    text_network_discovery_loading: ("正在发现网络设备…", "Discovering network devices…"),
+    text_network_discovery_empty: ("未发现网络设备", "No network devices found"),
+    text_network_discovery_error: ("网络设备发现失败", "Network discovery failed"),
+    text_name: ("名称", "Name"),
+    text_type: ("类型", "Type"),
+    text_modified: ("修改时间", "Modified"),
+    text_size: ("大小", "Size"),
+    text_request_access: ("使用 Windows 请求访问权限", "Request access with Windows"),
+    text_sign_in_network_location: ("登录网络位置", "Sign in to network location"),
+    text_settings: ("设置", "Settings"),
+    text_settings_title: ("设置", "Settings"),
+    text_theme: ("主题", "Theme"),
+    text_theme_system: ("跟随系统", "Use system setting"),
+    text_theme_light: ("浅色", "Light"),
+    text_theme_dark: ("深色", "Dark"),
+    text_language: ("语言", "Language"),
+    text_language_chinese: ("中文", "中文"),
+    text_language_english: ("English", "English"),
+    text_show_hidden_files: ("显示隐藏文件", "Show hidden files"),
+    text_show_system_files: ("显示系统文件", "Show system files"),
+    text_file_list_quick_search: ("文件列表快速搜索", "File list quick search"),
+    text_new_tab_opens_home: ("新标签页打开 Home", "Open Home in new tabs"),
+    text_quick_menu_backdrop: ("右键菜单磨砂效果", "Context menu acrylic effect"),
+    text_quick_menu_backdrop_opacity: ("菜单背景不透明度", "Menu background opacity"),
+    text_system_integration: ("系统集成", "System integration"),
+    text_folder_default_title: ("默认使用 AsterFiles 打开文件夹", "Open folders with AsterFiles by default"),
+    text_folder_default_detail: ("让本地文件夹和磁盘的默认打开动作进入 AsterFiles。仅影响当前用户，不需要管理员权限。", "Route the default action for local folders and drives to AsterFiles. This affects only the current user and requires no administrator access."),
+    text_win_e_title: ("使用 Win+E 打开 AsterFiles", "Open AsterFiles with Win+E"),
+    text_win_e_detail: ("将 Windows 的资源管理器快捷键转到 AsterFiles，可与文件夹默认打开独立设置。", "Route the Windows File Explorer shortcut to AsterFiles independently of folder handling."),
+    text_win_e_risk: ("实验功能：依赖 Windows 内部行为，系统更新后可能失效。", "Experimental: this depends on internal Windows behavior and may stop working after an update."),
+    text_integration_status: ("状态：", "Status:"),
+    text_integration_path_label: ("程序：", "Program:"),
+    text_integration_enable: ("启用", "Enable"),
+    text_integration_repair: ("修复", "Repair"),
+    text_integration_restore: ("恢复 Windows 文件资源管理器", "Restore Windows File Explorer"),
+    text_integration_experimental: ("实验功能", "Experimental"),
+    text_settings_general: ("常规", "General"),
+    text_settings_appearance: ("外观", "Appearance"),
+    text_settings_developer: ("开发工具", "Developer tools"),
+    text_settings_about: ("关于", "About"),
+    text_version: ("版本", "Version"),
+    text_everything_title: ("Everything 集成配置", "Everything integration setup"),
+    text_everything_connection: ("连接配置", "Connection settings"),
+    text_everything_path: ("程序路径", "Program path"),
+    text_select_everything_program: ("选择程序", "Choose program"),
+    text_everything_instance: ("Everything 实例名", "Everything instance name"),
+    text_everything_instance_help: ("“1.5a”是实例名，不是版本号。通常保持默认；仅在自定义或同时运行多个实例时修改，并与运行中的实例一致。", "“1.5a” is an instance name, not a version. Keep the default unless you use a custom or multiple instance, and match the running instance."),
+    text_everything_actions: ("连接状态与操作", "Connection status and actions"),
+    text_test_connection: ("测试连接", "Test connection"),
+    text_start_everything: ("启动 Everything", "Start Everything"),
+    text_everything_help: ("使用说明", "How it works"),
+    text_everything_help_install: ("• 需要安装 Everything 1.5 x64 并保持后台运行，数据库须完成加载。", "• Install Everything 1.5 x64, keep it running in the background, and wait for its database to finish loading."),
+    text_everything_help_dependencies: ("• 地址栏快速搜索、搜索结果索引信息和普通目录文件夹大小依赖 Everything；文件夹大小索引需启用，目录也必须已收录。", "• Address-bar search, indexed result details, and local folder sizes depend on Everything. Folder-size indexing must be enabled and the folder included."),
+    text_everything_help_independent: ("• 普通目录浏览和 UNC 网络路径不依赖 Everything；未索引位置不会回退为递归扫描。", "• Normal folder browsing and UNC navigation do not depend on Everything. Unindexed locations never fall back to slow recursive scanning."),
+    text_everything_help_settings: ("• 修改程序路径或实例名后请重新测试；AsterFiles 不会自动修改 Everything 的索引设置。", "• Retest after changing the path or instance. AsterFiles never changes Everything index settings automatically."),
+    text_discover_everything: ("自动发现", "Auto-detect"),
+    text_download_everything: ("下载 Everything", "Download Everything"),
+    text_everything_settings: ("前往 Everything 设置", "Open Everything settings"),
+    text_ui_showcase: ("UI 陈列室", "UI showcase"),
+    text_ui_showcase_detail: ("直接打开难以触发的窗口和状态；演示操作不会修改文件或任务。", "Open hard-to-reach windows and states directly. Demo actions do not change files or tasks."),
+    text_show_delete_confirmation: ("永久删除确认", "Delete confirmation"),
+    text_show_conflict_confirmation: ("文件冲突", "File conflict"),
+    text_show_exit_confirmation: ("退出任务确认", "Exit confirmation"),
+    text_show_operation_window: ("文件进度窗口", "File progress window"),
+    text_window_trace_title: ("窗口交互诊断", "Window interaction diagnostics"),
+    text_window_trace_detail: ("只记录窗口移动与缩放消息，不改变窗口行为。问题复现后关闭应用并把日志交给开发者。", "Records move and resize messages without changing window behavior. After reproducing the issue, close the app and send the log to the developer."),
+    text_window_trace_start: ("开始记录", "Start recording"),
+    text_window_trace_active: ("正在记录", "Recording"),
+    text_window_trace_path: ("日志位置", "Log location"),
+    text_loading: ("正在加载…", "Loading…"),
+    text_empty_folder: ("此文件夹为空", "This folder is empty"),
+    text_no_search_results: ("没有搜索结果", "No search results"),
+    text_new_tab: ("新建标签", "New tab"),
+    text_close_tab: ("关闭标签", "Close tab"),
+    text_all_tabs: ("全部标签", "All tabs"),
+    text_window_minimize: ("最小化", "Minimize"),
+    text_window_restore: ("还原", "Restore"),
+    text_window_maximize: ("最大化", "Maximize"),
+    text_window_close: ("关闭", "Close"),
+    text_address: ("路径", "Path"),
+    text_breadcrumb_overflow: ("显示隐藏的上级目录", "Show hidden parent folders"),
+    text_cancel_edit: ("取消编辑", "Cancel editing"),
+    text_search_recursive: ("搜索当前文件夹及子文件夹", "Search current folder and subfolders"),
+    text_search_current: ("仅搜索当前文件夹", "Search current folder only"),
+    text_search_global_disabled: ("全局搜索不支持切换范围", "Search depth is unavailable for global search"),
+    text_drop_copy: ("复制到此处", "Copy here"),
+    text_drop_move: ("移动到此处", "Move here"),
+    text_drop_link: ("在此处创建快捷方式", "Create shortcut here"),
+    text_drop_cancel: ("取消", "Cancel"),
+    text_context_search: ("搜索命令", "Search commands"),
+    text_context_loading: ("正在加载 Windows 菜单…", "Loading Windows menu…"),
+    text_context_empty: ("没有匹配的命令", "No matching commands"),
+    text_file_operations: ("文件操作", "File operations"),
+    text_task_count: ("个任务", "tasks"),
+    text_cancel_operation: ("取消", "Cancel"),
+    text_retry_operation: ("重试", "Retry"),
+    text_everything: ("Everything", "Everything"),
+    text_libraries: ("库", "库"),
+    text_parent_path: ("父目录", "父目录"),
+}
+
 #[allow(dead_code)]
 impl Texts {
     pub fn new(language: Language) -> Self {
         Self { language }
-    }
-
-    pub fn breadcrumb_overflow(self) -> &'static str {
-        self.choose("显示隐藏的上级目录", "Show hidden parent folders")
     }
 
     pub fn rename_validation(

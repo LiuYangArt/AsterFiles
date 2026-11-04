@@ -3,12 +3,14 @@ use i_slint_backend_testing::{ElementHandle, ElementRoot};
 use slint::{ComponentHandle, ModelRc, VecModel};
 
 fn by_id(root: &impl ElementRoot, id: &str) -> ElementHandle {
-    let id = id.to_owned();
+    let identity = id.to_owned();
     root.root_element()
         .query_descendants()
-        .match_predicate(move |element| element.accessible_id().as_deref() == Some(id.as_str()))
+        .match_predicate(move |element| {
+            element.accessible_id().as_deref() == Some(identity.as_str())
+        })
         .find_first()
-        .expect("semantic identity exists in the in-memory component")
+        .unwrap_or_else(|| panic!("semantic identity {id} exists in the in-memory component"))
 }
 
 #[test]

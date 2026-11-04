@@ -1,0 +1,468 @@
+import { VisualStyle } from "visual-style.slint";
+import { IconMap } from "icons/icon-map.slint";
+import { UiTexts } from "@ui-texts";
+import { FileRow, GridRow, PositionedGridRow, ColumnRow, OperationRow, HomeCardRow } from "models.slint";
+import { StandaloneActionButton } from "action-controls.slint";
+import { LightScrollBar } from "file-controls.slint";
+import { DetailsList } from "details-list.slint";
+import { FileGrid } from "file-grid.slint";
+import { FileHeader } from "file-header.slint";
+import { HomePage } from "home-page.slint";
+
+export component FileView inherits Rectangle {
+    in property <string> accessibility-context;
+    callback activate-entry(int, bool, bool);
+    in property <int> active-geometry-revision;
+    in property <bool> active-is-home;
+    callback begin-column-drag(int, float, float);
+    callback begin-internal-drag(int);
+    callback begin-internal-right-drag(int, float, float);
+    callback begin-rectangle-selection(float, float, bool, bool);
+    callback cancel-internal-drag();
+    callback cancel-rename();
+    callback change-sort(int);
+    callback change-view-mode(int);
+    in-out property <int> column-drag-insertion-slot;
+    in-out property <bool> column-drag-pointer-active;
+    in-out property <length> column-drag-pointer-x;
+    in-out property <length> column-drag-pointer-y;
+    in-out property <int> column-drag-source-kind;
+    in-out property <bool> column-dragging;
+    in property <[ColumnRow]> columns;
+    callback commit-rename(string);
+    in-out property <length> context-menu-anchor-x;
+    in-out property <length> context-menu-anchor-y;
+    in property <length> details-hit-left;
+    in property <length> details-hit-visible-left;
+    in property <length> details-hit-visible-right;
+    callback download-everything();
+    in property <int> drop-hover-entry-id;
+    callback end-column-drag(bool);
+    callback end-rectangle-selection();
+    in property <string> error-page-description;
+    in property <string> error-page-title;
+    in property <length> file-columns-width;
+    in-out property <length> file-list-left;
+    in-out property <length> file-list-top;
+    in-out property <length> file-viewport-height;
+    in-out property <length> file-viewport-width;
+    in-out property <length> file-viewport-x;
+    in-out property <length> file-viewport-y;
+    in property <[FileRow]> files;
+    in property <int> grid-column-count;
+    in-out property <int> grid-rename-anchor-id;
+    in-out property <string> grid-rename-context;
+    in-out property <length> grid-rename-height;
+    in-out property <string> grid-rename-label;
+    in-out property <length> grid-rename-left;
+    in-out property <length> grid-rename-top;
+    in-out property <length> grid-rename-width;
+    in property <[GridRow]> grid-rows;
+    in-out property <length> grid-viewport-y;
+    in property <bool> grouped-grid-enabled;
+    in property <float> grouped-grid-extent;
+    in property <[PositionedGridRow]> grouped-grid-visible-rows;
+    in property <length> home-card-width;
+    in property <int> home-column-count;
+    in property <[HomeCardRow]> home-drive-items;
+    in property <bool> home-drives-expanded;
+    in property <bool> home-network-locations-expanded;
+    in property <[HomeCardRow]> home-network-locations-items;
+    in property <bool> home-quick-access-expanded;
+    in property <[HomeCardRow]> home-quick-access-items;
+    in-out property <string> home-selected-id;
+    in property <color> insertion-indicator-color;
+    in property <float> insertion-indicator-width;
+    in-out property <length> keyboard-menu-anchor-x;
+    in-out property <length> keyboard-menu-anchor-y;
+    in property <length> layout-card-width;
+    in property <length> layout-icon-size;
+    in property <length> layout-row-height;
+    in-out property <length> legacy-grid-extent;
+    in-out property <length> legacy-grid-visible-height;
+    in-out property <length> list-viewport-y;
+    in property <bool> loading-hint-visible;
+    in property <bool> minimal;
+    callback navigate-home-item(string);
+    in-out property <length> normal-created-width;
+    in-out property <length> normal-kind-width;
+    in-out property <length> normal-modified-width;
+    in-out property <length> normal-name-width;
+    in-out property <length> normal-size-width;
+    callback open-operation-window();
+    callback open-settings();
+    in property <string> operation-error;
+    in property <[OperationRow]> operations;
+    in property <int> page-state;
+    in property <length> rectangle-selection-height;
+    in-out property <bool> rectangle-selection-pointer-active;
+    in property <bool> rectangle-selection-visible;
+    in property <length> rectangle-selection-width;
+    in property <length> rectangle-selection-x;
+    in property <length> rectangle-selection-y;
+    in-out property <length> rectangle-viewport-top;
+    in property <bool> rename-editing;
+    in property <int> rename-entry-id;
+    in-out property <string> rename-input;
+    in property <int> rename-selection-end;
+    in property <int> rename-submit-generation;
+    in-out property <bool> rename-submitting;
+    callback request-folder-access();
+    callback request-folder-size-range(float, float);
+    callback request-search-position(float);
+    callback resize-column(int, float);
+    in-out property <bool> scrollbar-pointer-active;
+    in-out property <length> search-created-width;
+    in-out property <length> search-modified-width;
+    in-out property <length> search-name-width;
+    in-out property <length> search-parent-width;
+    in property <bool> search-results-mode;
+    in property <length> search-scroll-y;
+    in-out property <length> search-size-width;
+    in property <int> search-total-items;
+    callback select-home-item(string);
+    in-out property <int> settings-section;
+    callback show-background-menu(float, float);
+    callback show-column-menu(int, float, float);
+    in property <bool> show-everything-help;
+    in property <bool> show-request-access;
+    in property <bool> request-access-is-network;
+    callback show-sidebar-menu(int, string, float, float);
+    in property <bool> show-start-everything;
+    in property <bool> sort-descending;
+    in property <int> sort-field;
+    callback start-everything();
+    in property <string> status-text;
+    in-out property <bool> suppress-column-click;
+    callback toggle-home-section(int);
+    callback update-column-drag(float, float, float, float, float, float) -> int;
+    callback update-rectangle-selection(float, float);
+    in property <int> view-mode;
+    in property <length> window-actual-width;
+    in property <Point> window-origin;
+
+    public pure function is-grid-view-mode(mode: int) -> bool {
+        return mode == 2 || mode == 3 || mode == 4 || mode == 5 || mode == 6;
+    }
+    pure function search-scroll-maximum(visible-height: length) -> length {
+        let rows = root.is-grid-view-mode(root.view-mode)
+        ? ceil(root.search-total-items / max(1, root.grid-column-count))
+        : root.search-total-items;
+        return max(0px, rows * root.search-row-height() - visible-height);
+    }
+    pure function search-row-height() -> length { return root.layout-row-height; }
+    VerticalLayout {
+        spacing: 0px;
+        file-header := FileHeader {
+            active-is-home: root.active-is-home;
+            begin-column-drag(p0, p1, p2) => { root.begin-column-drag(p0, p1, p2); }
+            change-sort(p0) => { root.change-sort(p0); }
+            column-drag-insertion-slot <=> root.column-drag-insertion-slot;
+            column-drag-pointer-active <=> root.column-drag-pointer-active;
+            column-drag-pointer-x <=> root.column-drag-pointer-x;
+            column-drag-pointer-y <=> root.column-drag-pointer-y;
+            column-drag-source-kind <=> root.column-drag-source-kind;
+            column-dragging <=> root.column-dragging;
+            columns: root.columns;
+            context-menu-anchor-x <=> root.context-menu-anchor-x;
+            context-menu-anchor-y <=> root.context-menu-anchor-y;
+            end-column-drag(p0) => { root.end-column-drag(p0); }
+            file-columns-width: root.file-columns-width;
+            file-viewport-x <=> root.file-viewport-x;
+            insertion-indicator-color: root.insertion-indicator-color;
+            insertion-indicator-width: root.insertion-indicator-width;
+            normal-created-width <=> root.normal-created-width;
+            normal-kind-width <=> root.normal-kind-width;
+            normal-modified-width <=> root.normal-modified-width;
+            normal-name-width <=> root.normal-name-width;
+            normal-size-width <=> root.normal-size-width;
+            resize-column(p0, p1) => { root.resize-column(p0, p1); }
+            search-created-width <=> root.search-created-width;
+            search-modified-width <=> root.search-modified-width;
+            search-name-width <=> root.search-name-width;
+            search-parent-width <=> root.search-parent-width;
+            search-results-mode: root.search-results-mode;
+            search-size-width <=> root.search-size-width;
+            show-column-menu(p0, p1, p2) => { root.show-column-menu(p0, p1, p2); }
+            sort-descending: root.sort-descending;
+            sort-field: root.sort-field;
+            suppress-column-click <=> root.suppress-column-click;
+            update-column-drag(p0, p1, p2, p3, p4, p5) => { return root.update-column-drag(p0, p1, p2, p3, p4, p5); }
+            view-mode: root.view-mode;
+            window-origin: root.window-origin;
+        }
+
+        // Overlay home/file panes so neither publishes a finite window max-height.
+        content-pane := Rectangle {
+            vertical-stretch: 1;
+            min-height: 0px;
+            clip: true;
+
+            if root.active-is-home: home-area := HomePage {
+                width: parent.width; height: parent.height;
+                home-card-width: root.home-card-width;
+                home-column-count: root.home-column-count;
+                home-drive-items: root.home-drive-items;
+                home-drives-expanded: root.home-drives-expanded;
+                home-network-locations-expanded: root.home-network-locations-expanded;
+                home-network-locations-items: root.home-network-locations-items;
+                home-quick-access-expanded: root.home-quick-access-expanded;
+                home-quick-access-items: root.home-quick-access-items;
+                home-selected-id <=> root.home-selected-id;
+                minimal: root.minimal;
+                navigate-home-item(p0) => { root.navigate-home-item(p0); }
+                select-home-item(p0) => { root.select-home-item(p0); }
+                show-sidebar-menu(p0, p1, p2, p3) => { root.show-sidebar-menu(p0, p1, p2, p3); }
+                toggle-home-section(p0) => { root.toggle-home-section(p0); }
+                window-origin: root.window-origin;
+            }
+
+            if !root.active-is-home: content-area := Rectangle {
+                x: 0px;
+                y: 0px;
+                width: parent.width;
+                height: parent.height;
+                background: VisualStyle.surface;
+                background-touch := TouchArea {
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                            root.rectangle-selection-pointer-active = true;
+                            root.begin-rectangle-selection(
+                                self.mouse-x / 1px,
+                                self.mouse-y / 1px,
+                                event.modifiers.control,
+                                event.modifiers.shift
+                            );
+                        }
+                        if event.kind == PointerEventKind.move && self.pressed {
+                            root.update-rectangle-selection(self.mouse-x / 1px, self.mouse-y / 1px);
+                        }
+                        if event.kind == PointerEventKind.up && event.button == PointerEventButton.left {
+                            root.rectangle-selection-pointer-active = false;
+                            root.end-rectangle-selection();
+                        }
+                        if event.kind == PointerEventKind.up && event.button == PointerEventButton.right {
+                            root.context-menu-anchor-x = self.absolute-position.x + self.mouse-x - root.window-origin.x;
+                            root.context-menu-anchor-y = self.absolute-position.y + self.mouse-y - root.window-origin.y;
+                            root.keyboard-menu-anchor-x = self.absolute-position.x + 24px - root.window-origin.x;
+                            root.keyboard-menu-anchor-y = self.absolute-position.y + 24px - root.window-origin.y;
+                            root.show-background-menu(
+                                root.context-menu-anchor-x / 1px,
+                                root.context-menu-anchor-y / 1px
+                            );
+                        }
+                    }
+                }
+                list := DetailsList {
+                    width: parent.width - 28px;
+                    accessibility-context: root.accessibility-context;
+                    activate-entry(p0, p1, p2) => { root.activate-entry(p0, p1, p2); }
+                    active-geometry-revision: root.active-geometry-revision;
+                    begin-internal-drag(p0) => { root.begin-internal-drag(p0); }
+                    begin-internal-right-drag(p0, p1, p2) => { root.begin-internal-right-drag(p0, p1, p2); }
+                    cancel-internal-drag() => { root.cancel-internal-drag(); }
+                    cancel-rename() => { root.cancel-rename(); }
+                    columns: root.columns;
+                    commit-rename(p0) => { root.commit-rename(p0); }
+                    content-origin-y: content-area.absolute-position.y;
+                    details-hit-left: root.details-hit-left;
+                    details-hit-visible-left: root.details-hit-visible-left;
+                    details-hit-visible-right: root.details-hit-visible-right;
+                    drop-hover-entry-id: root.drop-hover-entry-id;
+                    file-columns-width: root.file-columns-width;
+                    file-list-left <=> root.file-list-left;
+                    file-list-top <=> root.file-list-top;
+                    file-viewport-height <=> root.file-viewport-height;
+                    file-viewport-width <=> root.file-viewport-width;
+                    file-viewport-y <=> root.file-viewport-y;
+                    files: root.files;
+                    keyboard-menu-anchor-x <=> root.keyboard-menu-anchor-x;
+                    keyboard-menu-anchor-y <=> root.keyboard-menu-anchor-y;
+                    layout-icon-size: root.layout-icon-size;
+                    layout-row-height: root.layout-row-height;
+                    list-viewport-y <=> root.list-viewport-y;
+                    normal-created-width: root.normal-created-width;
+                    normal-kind-width: root.normal-kind-width;
+                    normal-modified-width: root.normal-modified-width;
+                    normal-name-width: root.normal-name-width;
+                    normal-size-width: root.normal-size-width;
+                    rectangle-viewport-top <=> root.rectangle-viewport-top;
+                    rename-editing: root.rename-editing;
+                    rename-entry-id: root.rename-entry-id;
+                    rename-input <=> root.rename-input;
+                    rename-selection-end: root.rename-selection-end;
+                    rename-submit-generation: root.rename-submit-generation;
+                    rename-submitting <=> root.rename-submitting;
+                    request-folder-size-range(p0, p1) => { root.request-folder-size-range(p0, p1); }
+                    request-search-position(p0) => { root.request-search-position(p0); }
+                    search-created-width: root.search-created-width;
+                    search-modified-width: root.search-modified-width;
+                    search-name-width: root.search-name-width;
+                    search-parent-width: root.search-parent-width;
+                    search-results-mode: root.search-results-mode;
+                    search-scroll-y: root.search-scroll-y;
+                    search-size-width: root.search-size-width;
+                    view-mode: root.view-mode;
+                    window-origin: root.window-origin;
+                }
+                horizontal-scroll := Rectangle {
+                    x: 16px; y: parent.height - 11px;
+                    width: parent.width - 44px; height: 10px;
+                    visible: root.view-mode == 0 && root.file-columns-width > self.width;
+                    background: horizontal-scroll-touch.has-hover ? VisualStyle.scrollbar-track-hover : transparent;
+                    border-radius: 5px;
+                    private property <length> thumb-width: max(40px, self.width * self.width / root.file-columns-width);
+                    private property <length> thumb-travel: max(0px, self.width - self.thumb-width);
+                    Rectangle {
+                        x: horizontal-scroll.thumb-travel * (-root.file-viewport-x / max(1px, root.file-columns-width - horizontal-scroll.width));
+                        y: 3px; width: horizontal-scroll.thumb-width; height: horizontal-scroll-touch.has-hover ? 6px : 3px;
+                        border-radius: self.height / 2;
+                        background: horizontal-scroll-touch.has-hover ? VisualStyle.scrollbar-thumb-hover : VisualStyle.scrollbar-thumb;
+                    }
+                    horizontal-scroll-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        private property <length> press-x;
+                        private property <length> press-value;
+                        pointer-event(event) => {
+                            if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                                root.scrollbar-pointer-active = true;
+                                self.press-x = self.mouse-x;
+                                self.press-value = root.file-viewport-x;
+                            }
+                            if event.kind == PointerEventKind.cancel || (event.button == PointerEventButton.left && event.kind == PointerEventKind.up) {
+                                root.scrollbar-pointer-active = false;
+                            }
+                        }
+                        moved => {
+                            if self.pressed && horizontal-scroll.thumb-travel > 0px {
+                                root.file-viewport-x = max(horizontal-scroll.width - root.file-columns-width, min(0px, self.press-value - (self.mouse-x - self.press-x) * (root.file-columns-width - horizontal-scroll.width) / horizontal-scroll.thumb-travel));
+                            }
+                        }
+                    }
+                }
+                grid := FileGrid {
+                    width: parent.width - 28px;
+                    accessibility-context: root.accessibility-context;
+                    activate-entry(p0, p1, p2) => { root.activate-entry(p0, p1, p2); }
+                    active-geometry-revision: root.active-geometry-revision;
+                    begin-internal-drag(p0) => { root.begin-internal-drag(p0); }
+                    begin-internal-right-drag(p0, p1, p2) => { root.begin-internal-right-drag(p0, p1, p2); }
+                    cancel-internal-drag() => { root.cancel-internal-drag(); }
+                    content-origin-y: content-area.absolute-position.y;
+                    file-list-left <=> root.file-list-left;
+                    file-list-top <=> root.file-list-top;
+                    file-viewport-height <=> root.file-viewport-height;
+                    file-viewport-width <=> root.file-viewport-width;
+                    file-viewport-y <=> root.file-viewport-y;
+                    grid-rename-anchor-id <=> root.grid-rename-anchor-id;
+                    grid-rename-context <=> root.grid-rename-context;
+                    grid-rename-height <=> root.grid-rename-height;
+                    grid-rename-label <=> root.grid-rename-label;
+                    grid-rename-left <=> root.grid-rename-left;
+                    grid-rename-top <=> root.grid-rename-top;
+                    grid-rename-width <=> root.grid-rename-width;
+                    grid-rows: root.grid-rows;
+                    grid-viewport-y <=> root.grid-viewport-y;
+                    grouped-grid-enabled: root.grouped-grid-enabled;
+                    grouped-grid-extent: root.grouped-grid-extent;
+                    grouped-grid-visible-rows: root.grouped-grid-visible-rows;
+                    layout-card-width: root.layout-card-width;
+                    layout-icon-size: root.layout-icon-size;
+                    layout-row-height: root.layout-row-height;
+                    legacy-grid-extent <=> root.legacy-grid-extent;
+                    legacy-grid-visible-height <=> root.legacy-grid-visible-height;
+                    rectangle-viewport-top <=> root.rectangle-viewport-top;
+                    rename-editing: root.rename-editing;
+                    rename-entry-id: root.rename-entry-id;
+                    request-folder-size-range(p0, p1) => { root.request-folder-size-range(p0, p1); }
+                    search-results-mode: root.search-results-mode;
+                    view-mode: root.view-mode;
+                    window-origin: root.window-origin;
+                }
+                if root.rectangle-selection-visible: Rectangle {
+                    x: root.rectangle-selection-x;
+                    y: root.rectangle-selection-y;
+                    width: root.rectangle-selection-width;
+                    height: root.rectangle-selection-height;
+                    z: 90;
+                    background: VisualStyle.rectangle-selection-fill;
+                    border-color: VisualStyle.rectangle-selection-border;
+                    border-width: 1px;
+                }
+                LightScrollBar {
+                    pointer-active-changed(active) => { root.scrollbar-pointer-active = active; }
+                    x: parent.width - self.width - 9px;
+                    height: parent.height;
+                    value: root.search-results-mode ? root.search-scroll-y : root.file-viewport-y;
+                    maximum: root.search-results-mode
+                    ? root.search-scroll-maximum(root.is-grid-view-mode(root.view-mode) ? grid.visible-height : list.visible-height)
+                    : (root.is-grid-view-mode(root.view-mode) ? max(0px, grid.viewport-height - grid.visible-height) : max(0px, list.viewport-height - list.visible-height));
+                    page-size: root.is-grid-view-mode(root.view-mode) ? grid.visible-height : list.visible-height;
+                    scrolled(viewport-y) => {
+                        if root.search-results-mode {
+                            root.request-search-position(viewport-y / 1px);
+                        } else {
+                            root.file-viewport-y = viewport-y;
+                        }
+                    }
+                }
+                if (root.page-state == 1 && root.loading-hint-visible) || root.page-state == 3: VerticalLayout {
+                    alignment: center; spacing: 8px;
+                    Text { text: root.page-state == 1 ? UiTexts.values.text-loading : (root.search-results-mode ? UiTexts.values.text-no-search-results : UiTexts.values.text-empty-folder); color: VisualStyle.text-secondary; font-size: 16px; horizontal-alignment: center; }
+                }
+                if root.page-state >= 5: VerticalLayout {
+                    alignment: center; spacing: 12px;
+                    if !root.show-everything-help: HorizontalLayout { alignment: center; Image { width: 48px; height: 48px; source: IconMap.status-locked; } }
+                    Text { text: root.error-page-title; color: VisualStyle.text-primary; font-size: 20px; font-weight: 600; horizontal-alignment: center; }
+                    HorizontalLayout { alignment: center; Text { width: min(root.window-actual-width - 40px, 900px); text: root.error-page-description; color: VisualStyle.text-secondary; font-size: 13px; horizontal-alignment: center; wrap: word-wrap; } }
+                    Rectangle { height: 4px; }
+                    error-page-actions := Rectangle {
+                        height: 32px;
+                        accessible-role: groupbox;
+                        accessible-id: "error-page-actions";
+                        HorizontalLayout {
+                            alignment: center; spacing: 8px;
+                            if root.show-request-access: StandaloneActionButton { width: 260px; center-content: false; icon-source: IconMap.status-locked; label: root.request-access-is-network ? UiTexts.values.text-sign-in-network-location : UiTexts.values.text-request-access; clicked => { root.request-folder-access(); } }
+                            if root.show-everything-help: StandaloneActionButton { width: 180px; label: UiTexts.values.text-download-everything; clicked => { root.download-everything(); } }
+                            if root.show-start-everything: StandaloneActionButton { width: 180px; label: UiTexts.values.text-start-everything; clicked => { root.start-everything(); } }
+                            if root.show-everything-help: StandaloneActionButton { width: 180px; label: UiTexts.values.text-everything-settings; clicked => { root.settings-section = 2; root.open-settings(); } }
+                        }
+                    }
+                }
+
+            }
+
+        }
+
+        if !root.active-is-home: status-bar := Rectangle {
+            height: 30px; background: VisualStyle.surface-subtle;
+            Text { x: 14px; text: root.operation-error != "" ? root.operation-error : root.status-text; color: root.operation-error != "" ? VisualStyle.danger : VisualStyle.text-tertiary; font-size: 11px; vertical-alignment: center; }
+            Rectangle {
+                x: parent.width - 220px; width: 84px; height: 26px; y: 2px;
+                HorizontalLayout {
+                    spacing: 2px;
+                    for mode in [0, 1, 2]: Rectangle {
+                        width: 26px; border-radius: 4px; background: root.view-mode == mode ? VisualStyle.selection : mode-touch.has-hover ? VisualStyle.accent-hover : transparent;
+                        Text { text: mode == 0 ? "≡" : mode == 1 ? "☷" : "▦"; color: VisualStyle.text-primary; horizontal-alignment: center; vertical-alignment: center; }
+                        mode-touch := TouchArea { clicked => { root.change-view-mode(mode); } mouse-cursor: pointer; }
+                    }
+                }
+            }
+            Rectangle {
+                visible: root.operations.length > 0;
+                x: parent.width - 126px; width: 118px; height: 26px; y: 2px; border-radius: 5px;
+                background: task-touch.has-hover ? VisualStyle.surface-hover : transparent;
+                Text { text: root.operations.length + " " + UiTexts.values.text-task-count; color: VisualStyle.text-primary; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                task-touch := TouchArea { clicked => { root.open-operation-window(); } mouse-cursor: pointer; }
+                accessible-role: button; accessible-id: "operations-open"; accessible-label: UiTexts.values.text-file-operations; accessible-action-default => { root.open-operation-window(); }
+            }
+        }
+    }
+    Path {
+        x: 0px; y: 0px; width: 5px; height: 5px; z: 100;
+        viewbox-width: 5; viewbox-height: 5; fit: fill;
+        commands: "M 0 0 L 5 0 C 2.2 0 0 2.2 0 5 Z";
+        fill: VisualStyle.navigation-surface-background;
+    }
+
+}

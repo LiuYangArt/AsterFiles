@@ -1,0 +1,13 @@
+export struct HighlightSegment { text: string, highlighted: bool }
+export struct FileRow { id: int, loaded: bool, group-header: bool, group-label: string, group-detail: string, group-count: int, name: string, name-segments: [HighlightSegment], kind: string, parent-path: string, size: string, modified: string, created: string, is-directory: bool, selected: bool, focused: bool, cut: bool, thumbnail-state: int, icon: image }
+export struct GridRow { group-header: bool, group-label: string, group-detail: string, group-count: int, entries: [FileRow] }
+export struct PositionedGridRow { row: GridRow, offset: float, extent: float }
+export struct HistoryRow { index: int, label: string }
+export struct BreadcrumbRow { index: int, label: string, current: bool, natural-width: float, offset: float, extent: float, generation: int }
+export struct TabRow { id: int, title: string, active: bool, loading: bool, icon: image, is-drive: bool, is-home: bool, is-settings: bool }
+export struct SidebarRow { index: int, stable-id: string, label: string, icon-kind: int, group-kind: int, source-kind: int, is-drive: bool, icon: image, drive-progress: float, drive-state: int, drive-status: string }
+export struct ColumnRow { kind: int, label: string, visible: bool, min-width: length, content-left: length, content-right: length, icon-slot: length }
+export struct ContextCommandRow { id: int, node-id: int, label: string, search-text: string, hint: string, enabled: bool, separator: bool, shell: bool, checked: bool, default: bool, submenu: bool, loading: bool, placeholder: bool, icon-kind: int }
+export struct OperationRow { id: int, title: string, status: string, queue: string, failure-summary: string, accessible-label: string, source-line: string, destination-line: string, current-item-line: string, percent: string, file-progress: string, transferred: string, speed: string, eta: string, progress: float, progress-known: bool, state: int, paused: bool, pause-pending: bool, cancel-pending: bool, can-pause: bool, can-cancel: bool, can-retry: bool }
+export struct HomeItemRow { stable-id: string, label: string, detail: string, icon: image, progress: float, state: int, status: string, selected: bool, focused: bool, source-kind: int, menu-group: int, menu-stable-id: string }
+export struct HomeCardRow { entries: [HomeItemRow] }

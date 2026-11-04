@@ -77,6 +77,7 @@
 | [#169](#issue-169) | Agent 场景登记与 Release 入口（#169） |
 | [#170](#issue-170) | 大目录条目内存（#170） |
 | [#171](#issue-171) | 语义颜色令牌与双主题（#171） |
+| [#172](#issue-172) | 界面拆分与文案投影（#172） |
 | [#175](#issue-175) | Issue #175 十万条目目录加载、框选与滚动 |
 | [#176](#issue-176) | Temp 监听循环与本地刷新（#176） |
 | [#177](#issue-177) | Issue #177 地址栏退出编辑 |
@@ -1216,3 +1217,18 @@ python tools/verify.py --release
 - `artifacts/logs/drag-drop/`
 - `artifacts/state/drag-drop/`
 - `artifacts/perf/drag-drop/`
+
+<a id="issue-172"></a>
+
+## 界面拆分与文案投影（#172）
+
+完整验证：`python tools/verify.py`。其中工作区测试继续覆盖无障碍语义、#146 行内重命名和 #160 右键拖拽；这些测试只使用无窗口后端，不操作桌面 UI。新增 `issue_172` 检查区域归属、每个 Slint 文件的行数、文案一次赋值、中英文即时切换，条件区域隐藏期间写入状态后的保留行为，以及标签宽度、列宽和主页卡片宽度不被区域创建清零。
+
+专项回归：`python tools/build.py test --workspace --locked issue_172 -- --nocapture`。汇总位于 `artifacts/verify/summary.json`，完整测试输出位于 `artifacts/logs/verify-test.log`，无界面场景状态位于 `artifacts/state/`。
+
+用户手动验收：
+
+1. 打开 `target/debug/asterfiles.exe`，在中英文之间切换，确认导航按钮、标签菜单、侧栏、主页和设置文案即时更新。
+2. 分别查看主页、详情、列表、网格和设置，确认布局、滚动和主题与拆分前一致。
+3. 切换设置页再返回文件页，缩窄再还原窗口，确认列表内容、侧栏、列宽和选择保持正常。
+4. 在详情和网格里试一次重命名、文件右键和标签拖动，确认编辑框与浮层位置正常。

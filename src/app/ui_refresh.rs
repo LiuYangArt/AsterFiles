@@ -472,21 +472,14 @@ fn project_navigation(
         .visible_page_operations
         .contains(&agent_debug::PageOperation::RequestWindowsAccess);
     ui.set_show_request_access(show_request_access);
-    if show_request_access
-        && tab
-            .requested_location()
-            .as_ref()
-            .and_then(NavigationLocation::directory_path)
-            .is_some_and(crate::network::is_unc_path)
-    {
-        ui.set_text_request_access(
-            match app.language {
-                Language::Chinese => "登录网络位置",
-                Language::English => "Sign in to network location",
-            }
-            .into(),
-        );
-    }
+    ui.set_request_access_is_network(
+        show_request_access
+            && tab
+                .requested_location()
+                .as_ref()
+                .and_then(NavigationLocation::directory_path)
+                .is_some_and(crate::network::is_unc_path),
+    );
     ui.set_show_everything_help(
         tab.page_source == PageSource::Search
             && matches!(

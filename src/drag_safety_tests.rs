@@ -250,11 +250,11 @@ fn actual_file_view_release_cancels_after_model_rebuild(mode: i32, grouped: bool
             .root_element()
             .query_descendants()
             .match_id(if grouped {
-                "AppWindow::grouped-card-touch"
+                "FileGrid::grouped-card-touch"
             } else if mode == 2 {
-                "AppWindow::card-touch"
+                "FileGrid::card-touch"
             } else {
-                "AppWindow::mouse"
+                "DetailsList::mouse"
             })
             .find_all()
             .into_iter()
