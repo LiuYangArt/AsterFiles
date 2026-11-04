@@ -54,6 +54,7 @@ use crate::platform::windows::address_path::{
     classify_external_launches_off_thread,
 };
 
+mod accent_palette;
 pub(crate) mod action_scenario;
 mod actions;
 mod address_edit;
@@ -96,6 +97,7 @@ mod rename_updates;
 mod scrollbar_tests;
 #[cfg(test)]
 mod selection_scale_tests;
+mod system_accent;
 #[cfg(test)]
 mod test_support;
 mod ui_refresh;
@@ -1249,11 +1251,15 @@ fn insertion_indicator_screen_rect(
 }
 
 fn project_native_insertion_indicator(target: Option<(WindowId, usize)>, state: &SharedSessions) {
-    let dark_theme = state.lock().ok().is_some_and(|app| app.dark_theme());
+    let accent = state
+        .lock()
+        .ok()
+        .map(|app| accent_palette::Palette::derive(app.system_accent, app.dark_theme()).accent)
+        .unwrap_or(accent_palette::LIGHT_DEFAULT);
     let projected = target.and_then(|(window_id, insertion_index)| {
         let ui = window_ui(window_id)?;
         let (x, y, width, height) = insertion_indicator_screen_rect(&ui, insertion_index)?;
-        platform::windows::tab_insertion_indicator::show(x, y, width, height, dark_theme).ok()?;
+        platform::windows::tab_insertion_indicator::show(x, y, width, height, accent).ok()?;
         Some(())
     });
     if projected.is_none() {
@@ -1627,6 +1633,7 @@ struct AppState {
     quick_menu_backdrop_opacity: u8,
     sidebar_visibility: session_store::SidebarVisibility,
     system_dark_theme: bool,
+    system_accent: Option<u32>,
     icons: HashMap<(TabId, RequestId, EntryId), platform::windows::shell_icons::ShellIconRgba>,
     image_cache: icon_cache::IconCache,
     type_icon_requests: HashSet<(platform::windows::shell_icons::ShellTypeIconKey, u32)>,
@@ -1844,6 +1851,7 @@ impl AppState {
             quick_menu_backdrop_opacity: session_store::DEFAULT_QUICK_MENU_BACKDROP_OPACITY,
             sidebar_visibility: session_store::SidebarVisibility::default(),
             system_dark_theme,
+            system_accent: None,
             icons: HashMap::new(),
             image_cache: icon_cache::IconCache::default(),
             type_icon_requests: HashSet::new(),
@@ -3600,6 +3608,18 @@ pub fn run(
         wire_native_drag_drop(&ui, operation_sender.clone(), scoped_state.clone());
     let directory_watch_timer = start_directory_watchers(request_sender.clone(), state.clone());
     let drive_capacity_timer = start_drive_capacity_timer(state.clone());
+    let (accent_watcher, accent_receiver) =
+        platform::windows::appearance::AccentWatcher::start()
+            .map_err(|error| slint::PlatformError::Other(error.to_string()))?;
+    let accent_timer = system_accent::start(
+        accent_receiver,
+        state.clone(),
+        &operation_ui,
+        ConfirmationWindows::new(&delete_ui, &conflict_ui, &exit_ui),
+        &network_login_ui,
+        &network_location_rename_ui,
+        &webdav_location_ui,
+    );
     WINDOW_RUNTIMES.with_borrow_mut(|runtimes| {
         runtimes.insert(
             initial_window_id,
@@ -3648,6 +3668,8 @@ pub fn run(
     }
     drop(directory_watch_timer);
     drop(drive_capacity_timer);
+    drop(accent_timer);
+    drop(accent_watcher);
     for weak in [delete_weak, conflict_weak, exit_weak] {
         if let Some(window) = weak.upgrade() {
             let _ = window.hide();

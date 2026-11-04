@@ -1,13 +1,31 @@
+export struct AccentPalette {
+    accent: color,
+    selection: color,
+    emphasis: color,
+    hover: color,
+    rectangle-fill: color,
+    rectangle-border: color,
+}
+
 export global VisualStyle {
     in-out property <bool> dark-theme: false;
+    in-out property <AccentPalette> light-accent-palette: {
+        accent: #4f6bed, selection: #dce6ff, emphasis: #c7d7ff, hover: #eff4ff,
+        rectangle-fill: #4f6bed1a, rectangle-border: #4f6bed99,
+    };
+    in-out property <AccentPalette> dark-accent-palette: {
+        accent: #7fa0ff, selection: #263d66, emphasis: #35548f, hover: #303b4d,
+        rectangle-fill: #7fa0ff1a, rectangle-border: #7fa0ff99,
+    };
+    private property <AccentPalette> accent-palette: dark-theme ? dark-accent-palette : light-accent-palette;
     out property <color> text-strong: dark-theme ? #f2f2f2 : #24252a;
     out property <color> text-primary: dark-theme ? #f2f2f2 : #30333a;
     out property <color> navigation-surface-background: dark-theme ? #323437 : #e9e9e9;
     out property <color> column-divider: dark-theme ? #57595c : #75787c;
     out property <color> text-navigation: dark-theme ? #d0d0d0 : #4f535d;
-    out property <color> accent: dark-theme ? #7fa0ff : #4f6bed;
-    out property <color> rectangle-selection-fill: dark-theme ? #7fa0ff1a : #4f6bed1a;
-    out property <color> rectangle-selection-border: dark-theme ? #7fa0ff99 : #4f6bed99;
+    out property <color> accent: accent-palette.accent;
+    out property <color> rectangle-selection-fill: accent-palette.rectangle-fill;
+    out property <color> rectangle-selection-border: accent-palette.rectangle-border;
     out property <color> drive-progress-track: dark-theme ? #55585c : #c9ccd1;
     out property <color> drive-progress-fill: accent;
     out property <color> drive-progress-warning: dark-theme ? #ff8c82 : #c42b1c;
@@ -21,17 +39,17 @@ export global VisualStyle {
     out property <color> scrollbar-thumb-hover: dark-theme ? #8a8a8a : #9a9da3;
     out property <color> scrollbar-thumb: dark-theme ? #737373 : #aeb1b6;
     out property <color> danger: #c42b1c;
-    out property <color> selection-emphasis: dark-theme ? #35548f : #c7d7ff;
+    out property <color> selection-emphasis: accent-palette.emphasis;
     out property <color> tab-close-pressed: dark-theme ? #4a4a4a : #d7dae0;
     out property <color> titlebar-pressed: dark-theme ? #454545 : #d9dce2;
-    out property <color> selection: dark-theme ? #263d66 : #dce6ff;
+    out property <color> selection: accent-palette.selection;
     out property <color> surface-pressed: dark-theme ? #464646 : #dde3ed;
     out property <color> border: dark-theme ? #4b4b4b : #e0e2e7;
     out property <color> tab-close-hover: dark-theme ? #4c4c4c : #e1e4ea;
     out property <color> navigation-hover: dark-theme ? #414141 : #e5e9f2;
     out property <color> titlebar-hover: dark-theme ? #3d3d3d : #e8eaf0;
     out property <color> surface-hover: dark-theme ? #424242 : #edf1f6;
-    out property <color> accent-hover: dark-theme ? #303b4d : #eff4ff;
+    out property <color> accent-hover: accent-palette.hover;
     out property <color> scrollbar-track-hover: dark-theme ? #343434 : #f1f2f5;
     out property <color> tab-strip-background: dark-theme ? #292929 : #f1f2f5;
     out property <color> window-background: dark-theme ? #202020 : #f5f6f8;

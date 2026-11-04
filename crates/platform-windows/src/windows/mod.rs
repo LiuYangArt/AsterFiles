@@ -1,4 +1,5 @@
 pub mod address_path;
+pub mod appearance;
 pub mod atomic_file;
 pub mod clipboard;
 pub mod context_menu;

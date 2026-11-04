@@ -34,6 +34,12 @@ asterfiles（应用组装与协调）
 
 快速菜单继续使用 `ui/quick-menu.slint` 的独立主题输入。颜色收敛规则与双主题人工检查见 [#171 验证说明](agent/debug-validation.md#issue-171)。
 
+## Windows 系统强调色（#173）
+
+`windows/appearance.rs` 在独立后台线程创建 `UISettings`，订阅 `ColorValuesChanged`。回调只发送普通颜色值。协调层合并通知，将当前颜色投影到所有主窗口和独立弹窗的 `VisualStyle`；退出时移除订阅并结束线程。新窗口从共享应用状态取得当前颜色。
+
+`src/app/accent_palette.rs` 从系统颜色生成浅色、暗色两套强调色、选中背景、强调背景、悬停背景和框选颜色。按 sRGB 相对亮度保证强调文字及选中区域详情文字至少 4.5:1 的对比度，必要时向主题端点调整。读取失败沿用原有两套默认色，其他颜色令牌不变。原生标签插入指示器接收同一强调色，使用系统共享画刷重绘，不按颜色注册窗口类。
+
 ## 界面区域与文案（#172）
 
 `ui/app-window.slint` 只负责窗口级状态、区域连接和快捷键。标签栏、地址栏、侧栏、主页和设置分别位于 `tab-bar.slint`、`address-bar.slint`、`sidebar.slint`、`home-page.slint` 和 `settings-page.slint`。`file-view.slint` 组合列头、详情列表、网格和状态栏；窗口浮层位于 `window-overlays.slint`。共享行结构、颜色和小控件分别维护，不反向依赖主窗口。

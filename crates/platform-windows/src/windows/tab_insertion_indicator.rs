@@ -2,77 +2,73 @@ use std::{cell::Cell, io, ptr};
 
 use windows_sys::Win32::{
     Foundation::HWND,
-    Graphics::Gdi::{CreateSolidBrush, HBRUSH},
+    Graphics::Gdi::{
+        BeginPaint, DC_BRUSH, EndPaint, FillRect, GetStockObject, InvalidateRect, PAINTSTRUCT,
+        SetDCBrushColor, UpdateWindow,
+    },
     UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, HWND_TOP, IsWindow, LWA_ALPHA,
         RegisterClassW, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetLayeredWindowAttributes,
-        SetWindowPos, ShowWindow, WM_NCHITTEST, WNDCLASSW, WS_DISABLED, WS_EX_LAYERED,
+        SetWindowPos, ShowWindow, WM_NCHITTEST, WM_PAINT, WNDCLASSW, WS_DISABLED, WS_EX_LAYERED,
         WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
     },
 };
 
-const LIGHT_CLASS_NAME: &[u16] = &[
+const CLASS_NAME: &[u16] = &[
     65, 115, 116, 101, 114, 70, 105, 108, 101, 115, 46, 84, 97, 98, 73, 110, 115, 101, 114, 116,
-    105, 111, 110, 73, 110, 100, 105, 99, 97, 116, 111, 114, 46, 76, 105, 103, 104, 116, 0,
-];
-const DARK_CLASS_NAME: &[u16] = &[
-    65, 115, 116, 101, 114, 70, 105, 108, 101, 115, 46, 84, 97, 98, 73, 110, 115, 101, 114, 116,
-    105, 111, 110, 73, 110, 100, 105, 99, 97, 116, 111, 114, 46, 68, 97, 114, 107, 0,
+    105, 111, 110, 73, 110, 100, 105, 99, 97, 116, 111, 114, 0,
 ];
 pub const INDICATOR_WIDTH: f32 = 5.0;
-pub const LIGHT_ACCENT_ARGB: u32 = 0xff4f_6bed;
-pub const DARK_ACCENT_ARGB: u32 = 0xff7f_a0ff;
-const LIGHT_ACCENT_COLORREF: u32 = 0x00ed_6b4f;
-const DARK_ACCENT_COLORREF: u32 = 0x00ff_a07f;
 
 thread_local! {
     static INDICATOR: Cell<HWND> = const { Cell::new(ptr::null_mut()) };
-    static INDICATOR_DARK: Cell<bool> = const { Cell::new(false) };
-    static LIGHT_INDICATOR_BRUSH: Cell<HBRUSH> = const { Cell::new(ptr::null_mut()) };
-    static DARK_INDICATOR_BRUSH: Cell<HBRUSH> = const { Cell::new(ptr::null_mut()) };
+    static ACCENT: Cell<u32> = const { Cell::new(0) };
 }
 
-pub fn show(x: i32, y: i32, width: i32, height: i32, dark_theme: bool) -> io::Result<()> {
+fn colorref(argb: u32) -> u32 {
+    (argb & 0xff) << 16 | (argb & 0xff00) | (argb >> 16 & 0xff)
+}
+
+pub fn set_accent(argb: u32) {
+    let color = colorref(argb);
+    if ACCENT.replace(color) == color {
+        return;
+    }
+    INDICATOR.with(|indicator| {
+        let hwnd = indicator.get();
+        if !hwnd.is_null() {
+            // SAFETY: This thread owns the indicator; invalidation retains no Rust pointer.
+            unsafe {
+                InvalidateRect(hwnd, ptr::null(), 0);
+                UpdateWindow(hwnd);
+            }
+        }
+    });
+}
+
+pub fn show(x: i32, y: i32, width: i32, height: i32, accent: u32) -> io::Result<()> {
+    set_accent(accent);
     let hwnd = INDICATOR.with(|indicator| {
         let existing = indicator.get();
-        if !existing.is_null()
-            // SAFETY: This is a borrowed HWND from the owning thread's indicator slot; IsWindow accepts
-            // stale handles without dereferencing Rust memory.
-            && unsafe { IsWindow(existing) } != 0
-            && INDICATOR_DARK.with(Cell::get) == dark_theme
-        {
+        // SAFETY: IsWindow accepts a possibly stale borrowed HWND and retains no Rust memory.
+        if !existing.is_null() && unsafe { IsWindow(existing) } != 0 {
             return existing;
         }
-        // SAFETY: The thread-local slot may hold a destroyed HWND, so the OS validates it before reuse or
-        // destruction.
-        if !existing.is_null() && unsafe { IsWindow(existing) } != 0 {
-            // SAFETY: This live indicator was created and is destroyed on this same thread before its slot
-            // is cleared.
-            unsafe { DestroyWindow(existing) };
-        }
         indicator.set(ptr::null_mut());
-        let class_name = if dark_theme {
-            DARK_CLASS_NAME
-        } else {
-            LIGHT_CLASS_NAME
-        };
         let class = WNDCLASSW {
             lpfnWndProc: Some(indicator_window_proc),
-            hbrBackground: indicator_brush(dark_theme),
-            lpszClassName: class_name.as_ptr(),
+            lpszClassName: CLASS_NAME.as_ptr(),
             ..Default::default()
         };
-        // SAFETY: class points to a static NUL-terminated name, a static callback and a brush kept alive
-        // for the registered class.
+        // SAFETY: The class uses a static NUL-terminated name and callback, with no owned brush.
         unsafe {
             let _ = RegisterClassW(&class);
         }
-        // SAFETY: The registered class name is static and NUL-terminated; all optional pointer parameters
-        // are null, and this thread owns the new HWND.
+        // SAFETY: The class name is static; optional pointers are null; this thread owns the new HWND.
         let created = unsafe {
             CreateWindowExW(
                 WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                class_name.as_ptr(),
+                CLASS_NAME.as_ptr(),
                 ptr::null(),
                 WS_POPUP | WS_DISABLED,
                 x,
@@ -86,19 +82,16 @@ pub fn show(x: i32, y: i32, width: i32, height: i32, dark_theme: bool) -> io::Re
             )
         };
         if !created.is_null() {
-            // SAFETY: created is a successful layered-window HWND owned by this thread; alpha is a scalar
-            // and no pointer is retained.
+            // SAFETY: created is this thread's layered HWND; the scalar alpha borrows no memory.
             let _ = unsafe { SetLayeredWindowAttributes(created, 0, 255, LWA_ALPHA) };
             indicator.set(created);
-            INDICATOR_DARK.set(dark_theme);
         }
         created
     });
     if hwnd.is_null() {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: hwnd is this thread's live indicator; its positive dimensions and non-activating flags carry
-    // no borrowed memory.
+    // SAFETY: hwnd is this thread's live indicator; dimensions and flags contain no borrowed memory.
     if unsafe {
         SetWindowPos(
             hwnd,
@@ -116,28 +109,7 @@ pub fn show(x: i32, y: i32, width: i32, height: i32, dark_theme: bool) -> io::Re
     Ok(())
 }
 
-fn indicator_brush(dark_theme: bool) -> HBRUSH {
-    let (brush, color) = if dark_theme {
-        (&DARK_INDICATOR_BRUSH, DARK_ACCENT_COLORREF)
-    } else {
-        (&LIGHT_INDICATOR_BRUSH, LIGHT_ACCENT_COLORREF)
-    };
-    brush.with(|brush| {
-        let existing = brush.get();
-        if !existing.is_null() {
-            existing
-        } else {
-            // SAFETY: The scalar COLORREF creates an owned brush that remains in the thread-local cache for
-            // the registered class lifetime.
-            let created = unsafe { CreateSolidBrush(color) };
-            brush.set(created);
-            created
-        }
-    })
-}
-
-// SAFETY: Windows calls this static registered procedure with its native window/message parameters; no Rust
-// state pointer is stored.
+// SAFETY: Windows invokes this static procedure on its window's owning thread with native parameters.
 unsafe extern "system" fn indicator_window_proc(
     hwnd: HWND,
     message: u32,
@@ -147,7 +119,19 @@ unsafe extern "system" fn indicator_window_proc(
     if message == WM_NCHITTEST {
         return -1;
     }
-    // SAFETY: The callback forwards untouched native parameters on its window's owning thread.
+    if message == WM_PAINT {
+        let mut paint = PAINTSTRUCT::default();
+        // SAFETY: The live HWND owns this paint cycle; DC_BRUSH is a borrowed stock object,
+        // and BeginPaint is balanced after painting the invalidated rectangle.
+        unsafe {
+            let dc = BeginPaint(hwnd, &mut paint);
+            SetDCBrushColor(dc, ACCENT.with(Cell::get));
+            FillRect(dc, &paint.rcPaint, GetStockObject(DC_BRUSH));
+            EndPaint(hwnd, &paint);
+        }
+        return 0;
+    }
+    // SAFETY: Untouched native parameters are forwarded on the window's owning thread.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
@@ -155,8 +139,7 @@ pub fn hide() {
     INDICATOR.with(|indicator| {
         let hwnd = indicator.get();
         if !hwnd.is_null() {
-            // SAFETY: The HWND belongs to this thread's indicator slot; ShowWindow uses only the handle and
-            // scalar show command.
+            // SAFETY: This thread owns the indicator and passes only a scalar show command.
             unsafe { ShowWindow(hwnd, SW_HIDE) };
         }
     });
@@ -166,9 +149,18 @@ pub fn destroy() {
     INDICATOR.with(|indicator| {
         let hwnd = indicator.replace(ptr::null_mut());
         if !hwnd.is_null() {
-            // SAFETY: replace cleared the sole thread-local owner; this thread destroys its own indicator
-            // window once.
+            // SAFETY: The sole thread-local owner was cleared before destroying its window once.
             unsafe { DestroyWindow(hwnd) };
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn issue_173_native_colorref_matches_slint_rgb() {
+        assert_eq!(super::colorref(0xff12_3456), 0x0056_3412);
+        assert_eq!(super::colorref(0xff4f_6bed), 0x00ed_6b4f);
+        assert_eq!(super::colorref(0xff7f_a0ff), 0x00ff_a07f);
+    }
 }

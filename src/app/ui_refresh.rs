@@ -196,12 +196,7 @@ fn project_settings(ui: &AppWindow, app: &AppState) {
     let dark_theme = app.dark_theme();
     ui.set_dark_theme(dark_theme);
     ui.set_insertion_indicator_width(platform::windows::tab_insertion_indicator::INDICATOR_WIDTH);
-    let accent = if dark_theme {
-        platform::windows::tab_insertion_indicator::DARK_ACCENT_ARGB
-    } else {
-        platform::windows::tab_insertion_indicator::LIGHT_ACCENT_ARGB
-    };
-    ui.set_insertion_indicator_color(Color::from_argb_encoded(accent));
+    system_accent::project(ui, app.system_accent);
     apply_ui_texts(ui, app.language);
 }
 

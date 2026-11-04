@@ -4,7 +4,7 @@ import { HighlightSegment, FileRow, GridRow, PositionedGridRow, HistoryRow, Brea
 export { PopupCommandRow, QuickMenuWindow, QuickSubmenuWindow } from "quick-menu.slint";
 export { UiTexts, UiTextValues } from "@ui-texts";
 export { HighlightSegment, FileRow, GridRow, PositionedGridRow, HistoryRow, BreadcrumbRow, TabRow, SidebarRow, ColumnRow, ContextCommandRow, OperationRow, HomeItemRow, HomeCardRow } from "models.slint";
-export { VisualStyle } from "visual-style.slint";
+export { VisualStyle, AccentPalette } from "visual-style.slint";
 export { OperationWindow } from "operation-window.slint";
 export { ConfirmationWindow } from "confirmation-window.slint";
 export { NetworkLoginWindow, WebDavLocationWindow, NetworkLocationRenameWindow } from "network-windows.slint";
@@ -84,7 +84,7 @@ export component AppWindow inherits Window {
     in property <[SidebarRow]> sidebar-items;
     in property <[ColumnRow]> columns <=> overlays.columns;
     in property <float> insertion-indicator-width: 5;
-    in property <color> insertion-indicator-color: #4f6bed;
+    out property <color> insertion-indicator-color: VisualStyle.accent;
     in property <[ContextCommandRow]> context-commands;
     in property <[ContextCommandRow]> context-submenu-commands;
     in property <[ContextCommandRow]> context-submenu-parent-commands;
