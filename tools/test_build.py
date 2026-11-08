@@ -22,7 +22,6 @@ class BuildPolicyTests(unittest.TestCase):
         build.CACHE_ROOT = root / ".cache"
         build.STORE = build.CACHE_ROOT / "kache"
         build.EVIDENCE = root / "artifacts" / "verify"
-        build.STAMP = build.CACHE_ROOT / "build-inputs.json"
         build.KACHE = build.CACHE_ROOT / "tools" / "kache.exe"
         build.KACHE_VERSION = "test"
         build.TARGET_LIMIT = 1024 * 1024
@@ -63,51 +62,68 @@ class BuildPolicyTests(unittest.TestCase):
         build.report("status")
         self.assertTrue((build.EVIDENCE / "build-cache-status.json").is_file())
 
-    def test_prepare_cleans_on_first_run_and_input_change_but_not_unchanged(self):
-        stale = build.TARGET / "debug" / "stale.o"
-        stale.parent.mkdir(parents=True)
-        stale.write_bytes(b"stale")
+    def test_prepare_preserves_existing_outputs_on_first_and_repeated_runs(self):
+        artifact = build.TARGET / "debug" / "existing.o"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(b"reusable")
+        with mock.patch.object(build, "run", return_value=mock.Mock(stdout="kache test\n")):
+            for _ in range(2):
+                build.prepare()
+                self.assertEqual(artifact.read_bytes(), b"reusable")
+
+    def test_prepare_leaves_input_invalidation_to_cargo(self):
+        artifact = build.TARGET / "debug" / "existing.o"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(b"reusable")
+        inputs = ["rust-toolchain.toml", "Cargo.lock", "Cargo.toml",
+                  ".cargo/config.toml", ".kache.toml"]
+        member = build.ROOT / "crates" / "domain" / "Cargo.toml"
+        with mock.patch.object(build, "run", return_value=mock.Mock(stdout="kache test\n")):
+            build.prepare()
+            for name in inputs:
+                with self.subTest(changed=name):
+                    (build.ROOT / name).write_text("changed", encoding="utf-8")
+                    build.prepare()
+                    self.assertEqual(artifact.read_bytes(), b"reusable")
+            member.parent.mkdir(parents=True)
+            for change in ("added", "changed", None):
+                with self.subTest(member=change):
+                    if change is None:
+                        member.unlink()
+                    else:
+                        member.write_text(change, encoding="utf-8")
+                    build.prepare()
+                    self.assertEqual(artifact.read_bytes(), b"reusable")
+
+    def test_prepare_over_budget_cleans_outputs_but_keeps_exe_and_pdb(self):
+        profile = build.TARGET / "debug"
+        profile.mkdir(parents=True)
+        exe = profile / "asterfiles.exe"
+        pdb = profile / "asterfiles.pdb"
+        stale = profile / "stale.o"
+        exe.write_bytes(b"runnable")
+        pdb.write_bytes(b"symbols")
+        stale.write_bytes(b"x" * 10000)
+        build.TARGET_LIMIT = 8192
         with mock.patch.object(build, "run", return_value=mock.Mock(stdout="kache test\n")):
             build.prepare()
         self.assertFalse(stale.exists())
-        fresh = build.TARGET / "debug" / "fresh.o"
-        fresh.parent.mkdir(parents=True)
-        fresh.write_bytes(b"fresh")
-        with mock.patch.object(build, "run", return_value=mock.Mock(stdout="kache test\n")):
-            build.prepare()
-        self.assertTrue(fresh.exists())
-        (build.ROOT / "Cargo.lock").write_text("changed", encoding="utf-8")
-        with mock.patch.object(build, "run", return_value=mock.Mock(stdout="kache test\n")):
-            build.prepare()
-        self.assertFalse(fresh.exists())
+        self.assertEqual(exe.read_bytes(), b"runnable")
+        self.assertEqual(pdb.read_bytes(), b"symbols")
 
-    def test_workspace_manifest_changes_retire_obsolete_build_outputs(self):
-        member = build.ROOT / "crates" / "domain" / "Cargo.toml"
-        member.parent.mkdir(parents=True)
-        member.write_text("member", encoding="utf-8")
-        with mock.patch.object(build, "run", return_value=mock.Mock(stdout="kache test\n")):
-            build.prepare()
-            for change in ("changed", None):
-                fresh = build.TARGET / "debug" / "fresh.o"
-                fresh.parent.mkdir(parents=True, exist_ok=True)
-                fresh.write_bytes(b"fresh")
-                build.prepare()
-                self.assertTrue(fresh.exists())
-                if change is None:
-                    member.unlink()
-                else:
-                    member.write_text(change, encoding="utf-8")
-                build.prepare()
-                self.assertFalse(fresh.exists())
-
-    def test_workspace_manifest_addition_changes_build_inputs(self):
-        before = build.build_inputs()
-        member = build.ROOT / "crates" / "domain" / "Cargo.toml"
-        member.parent.mkdir(parents=True)
-        member.write_text("member", encoding="utf-8")
-        after = build.build_inputs()
-        self.assertNotEqual(before, after)
-        self.assertIn("crates/domain/Cargo.toml", after)
+    def test_explicit_clean_keeps_final_programs_and_symbols(self):
+        for profile in ("debug", "release"):
+            directory = build.TARGET / profile
+            directory.mkdir(parents=True)
+            (directory / "asterfiles.exe").write_bytes(b"runnable")
+            (directory / "asterfiles.pdb").write_bytes(b"symbols")
+            (directory / "stale.o").write_bytes(b"stale")
+        self.assertEqual(build.main(["clean"]), 0)
+        for profile in ("debug", "release"):
+            directory = build.TARGET / profile
+            self.assertEqual((directory / "asterfiles.exe").read_bytes(), b"runnable")
+            self.assertEqual((directory / "asterfiles.pdb").read_bytes(), b"symbols")
+            self.assertFalse((directory / "stale.o").exists())
 
     def test_safe_tree_accepts_short_names_that_resolve_inside_the_root(self):
         build.TARGET.mkdir()

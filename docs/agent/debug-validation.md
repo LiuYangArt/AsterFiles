@@ -83,7 +83,12 @@
 | [#176](#issue-176) | Temp 监听循环与本地刷新（#176） |
 | [#177](#issue-177) | Issue #177 地址栏退出编辑 |
 | [#178](#issue-178) | 滚动条离窗释放（#178） |
+| [#180](#issue-180) | Windows 异步请求回收（#180） |
+| [#181](#issue-181) | Shell PIDL 失败清理（#181） |
+| [#182](#issue-182) | Windows 平台包独立检查（#182） |
+| [#183](#issue-183) | 快速访问 COM 配对（#183） |
 | [#184](#issue-184) | CI 性能测量隔离（#184） |
+| [#191](#issue-191) | 构建与缓存（#140、#191） |
 
 <a id="issue-173"></a>
 
@@ -183,9 +188,13 @@ CI 运行 `41298432239` 中完整加载为 5089.7 ms，其中等待辅助进程 
 
 <a id="issue-140"></a>
 
-## 构建与缓存（#140）
+<a id="issue-191"></a>
+
+## 构建与缓存（#140、#191）
 
 日常构建使用 `python tools/build.py build --locked`，运行使用 `python tools/build.py run --locked`。完整验证自动执行构建前维护与失败后的收尾。空间预算、NTFS 恢复成本、工具安装与排查入口见 [构建缓存策略](build-cache.md)。
+
+#191 回归运行 `python tools/test_build.py`，覆盖首次运行、锁文件与配置变化、成员增删时保留输出，以及超预算和主动清理时保留最终程序。完整验证后，再执行一次 `python tools/build.py build --locked`，核对没有 Skia 下载或无必要的整树清理。日志为 `artifacts/logs/build-cache-fix-tests.log`、`build-cache-fix-full.log` 和 `build-cache-fix-hot-build.log`；证据汇总为 `artifacts/state/build-cache-fix/result.json`。
 
 <a id="issue-147"></a>
 
@@ -1084,6 +1093,34 @@ python tools/verify.py
 验证同时检查：工作区 Clippy 通过；临时加入缺少安全说明的测试块时，Clippy 必须报 `undocumented_unsafe_blocks`，恢复后再执行完整验证。原始源码逐行对比保留在 `artifacts/state/issue-168/source-audit.json`，用于确认运行代码未改变。
 
 证据集中在 `artifacts/state/issue-168/`：`lint-probe.json` 保存反向检查，`verification.json` 保存汇总。完整验证及本地 Release 收尾日志保存在 `artifacts/logs/issue-168/`。注释陈述必要前提，不代替对运行时内存安全的证明；审查发现但超出本次范围的既有问题由 GitHub Issues #179、#180、#181、#182 和 #183 跟踪。
+
+<a id="issue-180"></a>
+<a id="issue-181"></a>
+<a id="issue-182"></a>
+<a id="issue-183"></a>
+
+## Windows 平台资源生命周期（#180、#181、#182、#183）
+
+在可见终端运行以下无界面检查，再执行完整验证：
+
+```powershell
+cargo check --locked -p asterfiles-platform-windows
+cargo clippy --locked -p asterfiles-platform-windows --all-targets -- -D warnings
+cargo test --locked -p asterfiles-platform-windows issue_180 -- --nocapture
+cargo test --locked -p asterfiles-platform-windows issue_181 -- --nocapture
+cargo test --locked -p asterfiles-platform-windows issue_183 -- --nocapture
+python tools/verify.py
+```
+
+#180 使用真实目录异步读取注入等待失败，先确认请求仍在途，再检查正常完成、超时、取消和异常退出前请求已结束。补充真实命名管道的超时后读写复用、消息截断错误，以及目录监听的变更交付和退出回收。测试只操作独占临时目录和管道。
+
+#181 使用真实 Shell PIDL 分配，在解析、克隆、移除末级和创建数据对象处注入失败，逐项核对每个分配恰好释放一次。成功路径覆盖单项、公共父目录和不同父目录；原 PIDL 释放后，再核对数据对象的文件路径和 Shell 身份。
+
+#182 在平台包自身声明 `Win32_Security`。独立包检查避免应用或 UI 的依赖功能合并掩盖缺项；其他直接依赖保持原声明和版本。修复前日志为 `artifacts/logs/issue-182/before-check.log`，独立包检查日志为同目录的 `after-check.log` 和 `after-clippy.log`。
+
+#183 在独立线程调用真实快速访问枚举，覆盖首次初始化、已有 MTA 的重复初始化，以及已有 STA 的模式冲突。通过相反模式初始化的系统返回值核对引用配对，不依赖其他并行测试的隐式 MTA 状态。
+
+专项日志为 `artifacts/logs/issues-180-183-test-<编号>.log`，退出码汇总为 `artifacts/state/issues-180-183/standalone.json`。完整验证汇总为 `artifacts/verify/summary.json`，日志为 `artifacts/logs/verify-*.log`。这些资源回收与依赖声明问题以原生受控测试、独立审查和完整非 UI 验证验收。
 
 <a id="issue-169"></a>
 

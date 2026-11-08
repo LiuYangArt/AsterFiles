@@ -20,7 +20,6 @@ CACHE_ROOT = ROOT / ".cache"
 KACHE = CACHE_ROOT / "tools" / "kache.exe"
 STORE = CACHE_ROOT / "kache"
 EVIDENCE = ROOT / "artifacts" / "verify"
-STAMP = CACHE_ROOT / "build-inputs.json"
 KACHE_VERSION = "0.27.0"
 KACHE_SHA256 = "bda91971a843b386d9862679f73e21840acb2736264bd636e293b4a886c1f476"
 TARGET_LIMIT = 8 * 1024**3
@@ -146,14 +145,6 @@ def clean_target(preserve_outputs: bool = True) -> None:
             shutil.copy2(staging / relative, destination)
 
 
-def build_inputs() -> dict[str, str]:
-    paths = [ROOT / name for name in
-             ("rust-toolchain.toml", "Cargo.lock", "Cargo.toml", ".cargo/config.toml", ".kache.toml")]
-    paths.extend(sorted((ROOT / "crates").glob("*/Cargo.toml")))
-    return {path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in paths}
-
-
 def gc() -> None:
     if KACHE.is_file():
         # Explicit GC starts a daemon in kache 0.27; retire our private runtime afterwards.
@@ -175,14 +166,11 @@ def prepare() -> None:
     if os.environ.get("CARGO_TARGET_DIR") or os.environ.get("RUSTC_WRAPPER"):
         raise RuntimeError("Remove CARGO_TARGET_DIR/RUSTC_WRAPPER overrides to use the repository build policy.")
     before = report("before")
-    current = build_inputs()
-    previous = json.loads(STAMP.read_text(encoding="utf-8")) if STAMP.exists() else None
-    if previous != current or before["target"]["allocated_bytes"] > TARGET_LIMIT:
-        print("Retiring obsolete build outputs; reusable compiler cache is retained.", flush=True)
+    # Cargo tracks input changes; retire outputs only when the storage budget requires it.
+    if before["target"]["allocated_bytes"] > TARGET_LIMIT:
+        print("Retiring build outputs above the storage budget; reusable compiler cache is retained.", flush=True)
         clean_target()
     gc()
-    CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-    STAMP.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
 
 
 def finish() -> None:

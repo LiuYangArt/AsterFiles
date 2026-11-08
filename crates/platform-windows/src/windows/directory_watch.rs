@@ -16,7 +16,6 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{
         CloseHandle, ERROR_NOTIFY_ENUM_DIR, ERROR_OPERATION_ABORTED, HANDLE, INVALID_HANDLE_VALUE,
-        WAIT_OBJECT_0,
     },
     Storage::FileSystem::{
         CreateFileW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED,
@@ -27,8 +26,8 @@ use windows_sys::Win32::{
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadDirectoryChangesW,
     },
     System::{
-        IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
-        Threading::{CreateEventW, INFINITE, ResetEvent, WaitForSingleObject},
+        IO::{CancelIoEx, OVERLAPPED},
+        Threading::{CreateEventW, INFINITE, ResetEvent},
     },
 };
 
@@ -193,7 +192,7 @@ fn watch_directory(
             ..Default::default()
         };
         // SAFETY: directory was opened for overlapped reads; buffer and overlapped must outlive
-        // request completion. Exceptional-wait cleanup does not yet establish this lifetime; see #180.
+        // request completion, which finish_overlapped confirms before this iteration ends.
         let started = unsafe {
             ReadDirectoryChangesW(
                 directory,
@@ -214,33 +213,30 @@ fn watch_directory(
             break;
         }
 
-        // SAFETY: event belongs to this worker and is retained while waiting for the pending directory request.
-        if unsafe { WaitForSingleObject(event, INFINITE) } != WAIT_OBJECT_0 {
-            send_error(&events, &root, io::Error::last_os_error());
-            break;
-        }
-
-        let mut bytes = 0u32;
-        // SAFETY: The event signaled the request represented by overlapped; bytes is writable and the request buffers remain alive.
-        let completed = unsafe { GetOverlappedResult(directory, &overlapped, &mut bytes, 0) };
-        if completed == 0 {
-            let error = io::Error::last_os_error();
-            if is_cancelled(&shared, &error) {
-                break;
-            }
-            if error.raw_os_error() == Some(ERROR_NOTIFY_ENUM_DIR as i32) {
-                coalescer.clear();
-                if events
-                    .send(DirectoryWatchEvent::Overflow { root: root.clone() })
-                    .is_err()
-                {
+        // SAFETY: This worker retains the directory, event, OVERLAPPED and buffer until
+        // finish_overlapped drains the request on both successful and exceptional waits.
+        let completion =
+            unsafe { super::overlapped_io::finish_overlapped(directory, &overlapped, INFINITE) };
+        let bytes = match completion {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if is_cancelled(&shared, &error) {
                     break;
                 }
-                continue;
+                if error.raw_os_error() == Some(ERROR_NOTIFY_ENUM_DIR as i32) {
+                    coalescer.clear();
+                    if events
+                        .send(DirectoryWatchEvent::Overflow { root: root.clone() })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
+                send_error(&events, &root, error);
+                break;
             }
-            send_error(&events, &root, error);
-            break;
-        }
+        };
 
         if bytes == 0 {
             coalescer.clear();
@@ -487,6 +483,69 @@ fn absolute_changes(root: &Path, changes: Vec<DirectoryChange>) -> Vec<Directory
 mod tests {
     use super::*;
 
+    #[test]
+    fn issue_180_directory_watch_delivers_changes_and_releases_on_cancel_and_drop() {
+        use std::sync::atomic::AtomicU64;
+        use std::time::{Duration, Instant};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "asterfiles-issue-180-watch-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let mut watch = DirectoryWatch::start(&root, sender).unwrap();
+        // There is no readiness signal: repeat fresh names until one is delivered, so
+        // the assertion does not depend on the worker winning a startup race.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut delivered = false;
+        let mut attempt = 0;
+        while Instant::now() < deadline {
+            let path = root.join(format!("created-{attempt}.txt"));
+            std::fs::write(&path, b"watch").unwrap();
+            attempt += 1;
+            match receiver.recv_timeout(Duration::from_millis(50)) {
+                Ok(DirectoryWatchEvent::Changes {
+                    root: changed_root,
+                    changes,
+                }) => {
+                    assert_eq!(changed_root, root);
+                    delivered = changes.iter().any(|change| matches!(change, DirectoryChange::Added(path) if path.parent() == Some(root.as_path())));
+                    if delivered {
+                        break;
+                    }
+                }
+                Ok(other) => panic!("unexpected watch event: {other:?}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(error) => panic!("watch disconnected before delivering a change: {error}"),
+            }
+        }
+        assert!(
+            delivered,
+            "native directory watch did not deliver a created file"
+        );
+        watch.cancel();
+        assert!(watch.worker.is_none());
+        assert_eq!(*watch.shared.directory.lock().unwrap(), 0);
+        assert!(watch.shared.cancelled.load(Ordering::Acquire));
+        watch.cancel();
+        drop(watch);
+
+        let (sender, receiver) = mpsc::channel();
+        let watch = DirectoryWatch::start(&root, sender).unwrap();
+        let shared = watch.shared.clone();
+        drop(watch);
+        assert_eq!(*shared.directory.lock().unwrap(), 0);
+        assert!(shared.cancelled.load(Ordering::Acquire));
+        assert!(
+            receiver
+                .try_iter()
+                .all(|event| !matches!(event, DirectoryWatchEvent::Error { .. }))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn pairs_rename_records_in_one_native_delivery() {
         let mut coalescer = ChangeCoalescer::default();

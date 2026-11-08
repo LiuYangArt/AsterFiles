@@ -13,17 +13,17 @@ use windows_sys::Win32::{
     Foundation::{
         CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED,
         ERROR_PIPE_BUSY, ERROR_SUCCESS, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, HWND,
-        INVALID_HANDLE_VALUE, LPARAM, LRESULT, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
+        INVALID_HANDLE_VALUE, LPARAM, LRESULT, WPARAM,
     },
     Storage::FileSystem::{
         CreateFileW, FILE_FLAG_OVERLAPPED, GetDriveTypeW, OPEN_EXISTING, ReadFile, WriteFile,
     },
     System::{
         DataExchange::COPYDATASTRUCT,
-        IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
+        IO::OVERLAPPED,
         Pipes::WaitNamedPipeW,
         Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW},
-        Threading::{CreateEventW, WaitForSingleObject},
+        Threading::CreateEventW,
     },
     UI::WindowsAndMessaging::{
         CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
@@ -1121,7 +1121,7 @@ fn overlapped_io(
     overlapped.hEvent = event;
     let mut transferred = 0u32;
     // SAFETY: Private callers supply readable/writable storage for byte_count bytes. The buffer,
-    // OVERLAPPED and event must outlive completion; exceptional-wait cleanup is tracked in #180.
+    // OVERLAPPED and event are retained until finish_overlapped confirms completion.
     let ok = unsafe {
         if reading {
             ReadFile(
@@ -1150,33 +1150,20 @@ fn overlapped_io(
         if code != ERROR_IO_PENDING {
             pipe_io_error(code)
         } else {
-            // SAFETY: The event is the valid owned completion event assigned to this operation and has not
-            // yet been closed.
-            match unsafe { WaitForSingleObject(event, millis(timeout)) } {
-                WAIT_OBJECT_0 => {
-                    // SAFETY: The completion event is signalled; overlapped and transferred are still live
-                    // output storage for this pipe request.
-                    if unsafe { GetOverlappedResult(handle, &overlapped, &mut transferred, 0) } != 0
-                    {
-                        Ok(transferred as usize)
-                    } else {
-                        // SAFETY: This reads GetOverlappedResult's failure status immediately on the same
-                        // thread.
-                        pipe_io_error(unsafe { GetLastError() })
-                    }
-                }
-                WAIT_TIMEOUT => {
-                    // SAFETY: The pending operation still owns this OVERLAPPED; cancellation is followed by
-                    // a blocking completion check before timeout returns.
-                    unsafe {
-                        CancelIoEx(handle, &overlapped);
-                        GetOverlappedResult(handle, &overlapped, &mut transferred, 1);
-                    }
+            // SAFETY: Private callers retain the handle and buffer, and this function retains
+            // OVERLAPPED and event until completion, including exceptional wait results.
+            match unsafe {
+                super::overlapped_io::finish_overlapped(handle, &overlapped, millis(timeout))
+            } {
+                Ok(transferred) => Ok(transferred as usize),
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
                     Err(EverythingError::Timeout)
                 }
-                // SAFETY: This reads the unexpected wait result's thread-local error without dereferencing
-                // the pending I/O state.
-                _ => pipe_io_error(unsafe { GetLastError() }),
+                Err(error) => pipe_io_error(
+                    error
+                        .raw_os_error()
+                        .expect("native completion has a Windows error") as u32,
+                ),
             }
         }
     };
@@ -1347,6 +1334,187 @@ mod tests {
         )
     }
 
+    struct Issue180Pipe {
+        server: std::fs::File,
+        client: std::os::windows::io::OwnedHandle,
+    }
+
+    impl Issue180Pipe {
+        fn connect() -> Self {
+            use std::os::windows::io::FromRawHandle;
+            use windows_sys::Win32::{
+                Foundation::ERROR_PIPE_CONNECTED,
+                Storage::FileSystem::PIPE_ACCESS_DUPLEX,
+                System::Pipes::{
+                    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE,
+                    PIPE_WAIT, SetNamedPipeHandleState,
+                },
+            };
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let name = wide(format!(
+                r"\\.\pipe\asterfiles-issue-180-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            // SAFETY: The NUL-terminated name is borrowed only for creation; success transfers an owned pipe handle.
+            let server = unsafe {
+                CreateNamedPipeW(
+                    name.as_ptr(),
+                    PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                    1,
+                    4096,
+                    4096,
+                    5000,
+                    ptr::null(),
+                )
+            };
+            assert_ne!(server, INVALID_HANDLE_VALUE);
+            // SAFETY: CreateNamedPipeW transferred this live handle to the fixture.
+            let server_file = unsafe { std::fs::File::from_raw_handle(server) };
+            // SAFETY: The pipe name is live and NUL-terminated; success transfers a separate owned client handle.
+            let client = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OVERLAPPED,
+                    ptr::null_mut(),
+                )
+            };
+            assert_ne!(client, INVALID_HANDLE_VALUE);
+            // SAFETY: CreateFileW transferred this live client handle to the fixture.
+            let owned_client =
+                unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(client) };
+            // SAFETY: The server is owned and has no pending operation; client connected before this call.
+            let connected = unsafe { ConnectNamedPipe(server, ptr::null_mut()) };
+            // SAFETY: Capture the immediately preceding Win32 status on this thread.
+            let code = unsafe { GetLastError() };
+            assert!(connected != 0 || code == ERROR_PIPE_CONNECTED);
+            let mode = PIPE_READMODE_MESSAGE;
+            // SAFETY: The client handle is live; the by-value mode buffer is borrowed synchronously.
+            let configured =
+                unsafe { SetNamedPipeHandleState(client, &mode, ptr::null(), ptr::null()) };
+            assert_ne!(configured, 0);
+            Self {
+                server: server_file,
+                client: owned_client,
+            }
+        }
+
+        fn client(&self) -> HANDLE {
+            use std::os::windows::io::AsRawHandle;
+            self.client.as_raw_handle()
+        }
+    }
+
+    #[test]
+    fn issue_180_everything_pipe_timeout_then_read_and_write_reuse() {
+        use std::io::{Read, Write};
+        let mut pipe = Issue180Pipe::connect();
+        let mut reply = [0; 4];
+        assert_eq!(
+            overlapped_read(pipe.client(), &mut reply, Duration::from_millis(1)),
+            Err(EverythingError::Timeout)
+        );
+        pipe.server.write_all(b"pong").unwrap();
+        assert_eq!(
+            overlapped_read(pipe.client(), &mut reply, Duration::from_secs(5)),
+            Ok(4)
+        );
+        assert_eq!(&reply, b"pong");
+        assert_eq!(
+            overlapped_write(pipe.client(), b"ping", Duration::from_secs(5)),
+            Ok(4)
+        );
+        pipe.server.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"ping");
+    }
+
+    #[test]
+    fn issue_180_signaled_partial_message_preserves_more_data_error() {
+        use std::io::Write;
+        use windows_sys::Win32::{
+            Foundation::ERROR_MORE_DATA,
+            System::{
+                IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
+                Threading::CreateEventW,
+            },
+        };
+
+        struct PendingRead<'a> {
+            handle: HANDLE,
+            event: HANDLE,
+            overlapped: &'a mut OVERLAPPED,
+            buffer: &'a mut [u8],
+            started: bool,
+        }
+
+        impl Drop for PendingRead<'_> {
+            fn drop(&mut self) {
+                // SAFETY: Borrowed request storage and pipe remain alive, including during unwinding.
+                unsafe {
+                    if self.started {
+                        let mut transferred = 0;
+                        CancelIoEx(self.handle, self.overlapped);
+                        GetOverlappedResult(self.handle, self.overlapped, &mut transferred, 1);
+                    }
+                    CloseHandle(self.event);
+                }
+            }
+        }
+
+        let mut pipe = Issue180Pipe::connect();
+        // SAFETY: This unnamed event has no borrowed pointers and is owned locally.
+        let event = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
+        assert!(!event.is_null());
+        let mut overlapped = OVERLAPPED {
+            hEvent: event,
+            ..Default::default()
+        };
+        let mut buffer = [0; 2];
+        let mut request = PendingRead {
+            handle: pipe.client(),
+            event,
+            overlapped: &mut overlapped,
+            buffer: &mut buffer,
+            started: false,
+        };
+        let mut transferred = 0;
+        // SAFETY: The guard retains request storage and drains before any assertion can unwind.
+        let started = unsafe {
+            ReadFile(
+                request.handle,
+                request.buffer.as_mut_ptr(),
+                2,
+                &mut transferred,
+                request.overlapped,
+            )
+        };
+        // SAFETY: Capture the just-issued request's status before another Win32 call.
+        let code = unsafe { GetLastError() };
+        request.started = started != 0 || code == ERROR_IO_PENDING || code == ERROR_MORE_DATA;
+        assert_eq!(started, 0);
+        assert_eq!(code, ERROR_IO_PENDING);
+        pipe.server.write_all(b"long message").unwrap();
+        // SAFETY: The guard retains all handles and request storage for the completion query.
+        let result = unsafe {
+            super::super::overlapped_io::finish_overlapped(request.handle, request.overlapped, 5000)
+        };
+        assert_eq!(
+            result.unwrap_err().raw_os_error(),
+            Some(ERROR_MORE_DATA as i32)
+        );
+        // SAFETY: The helper has ended the request; all storage remains retained by the guard.
+        let completed =
+            unsafe { GetOverlappedResult(request.handle, request.overlapped, &mut transferred, 0) };
+        // SAFETY: Capture the failed completion's status immediately.
+        let code = unsafe { GetLastError() };
+        assert_eq!(completed, 0);
+        assert_eq!(code, ERROR_MORE_DATA);
+    }
     #[test]
     fn scope_uses_everything_character_entities_for_space_parentheses_and_operators() {
         assert_eq!(

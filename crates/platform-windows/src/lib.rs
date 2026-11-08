@@ -114,14 +114,13 @@ mod windows_impl {
         struct ComGuard;
         impl Drop for ComGuard {
             fn drop(&mut self) {
-                // SAFETY: COM uninitialization must balance success on this same thread. The eager
-                // then_some failure path does not establish that prerequisite; see #183.
+                // SAFETY: This guard is constructed only after successful initialization on this thread.
                 unsafe { CoUninitialize() };
             }
         }
         // SAFETY: COM initialization affects this thread only; a successful result is balanced by the local guard.
         let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
-        let _guard = initialized.then_some(ComGuard);
+        let _guard = initialized.then(|| ComGuard);
         let namespace = "shell:::{3936e9e4-d92c-4eee-a85a-bc16d5ea0819}\0"
             .encode_utf16()
             .collect::<Vec<_>>();
@@ -381,6 +380,104 @@ mod windows_impl {
             )))
         } else {
             Ok(())
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows::Win32::{
+            Foundation::S_OK,
+            System::Com::{
+                APTTYPE, APTTYPE_MAINSTA, APTTYPE_MTA, APTTYPE_STA, APTTYPEQUALIFIER, COINIT,
+                COINIT_APARTMENTTHREADED, CoGetApartmentType,
+            },
+        };
+
+        struct TestApartment;
+
+        impl TestApartment {
+            fn initialize(mode: COINIT) -> Self {
+                // SAFETY: Each test owns its dedicated thread and balances this successful call with Drop.
+                assert_eq!(unsafe { CoInitializeEx(None, mode) }, S_OK);
+                Self
+            }
+        }
+
+        impl Drop for TestApartment {
+            fn drop(&mut self) {
+                // SAFETY: This test guard balances its one successful initialization on the same dedicated thread.
+                unsafe { CoUninitialize() };
+            }
+        }
+
+        fn apartment_type() -> windows::core::Result<APTTYPE> {
+            let mut apartment = APTTYPE::default();
+            let mut qualifier = APTTYPEQUALIFIER::default();
+            // SAFETY: Both outputs are initialized writable storage; the query only reads the current thread's COM state.
+            unsafe { CoGetApartmentType(&mut apartment, &mut qualifier) }?;
+            Ok(apartment)
+        }
+
+        fn assert_uninitialized() {
+            // A fresh STA succeeds even if another test keeps an implicit process-wide MTA alive.
+            drop(TestApartment::initialize(COINIT_APARTMENTTHREADED));
+        }
+
+        fn assert_mode_conflict(mode: COINIT) {
+            // SAFETY: The test owns an apartment of the opposite mode, so this failed call acquires no reference.
+            assert_eq!(unsafe { CoInitializeEx(None, mode) }, RPC_E_CHANGED_MODE);
+        }
+
+        #[test]
+        fn issue_183_pins_balance_successful_initialization() {
+            std::thread::spawn(|| {
+                assert_uninitialized();
+                let result = explorer_pinned_locations().map(|items| items.len());
+                assert_uninitialized();
+                let sta = TestApartment::initialize(COINIT_APARTMENTTHREADED);
+                assert!(matches!(
+                    apartment_type().unwrap(),
+                    APTTYPE_STA | APTTYPE_MAINSTA
+                ));
+                drop(sta);
+                assert_uninitialized();
+                eprintln!(
+                    "issue-183 fresh thread: enumeration={result:?}; initialization balanced"
+                );
+            })
+            .join()
+            .unwrap();
+        }
+
+        #[test]
+        fn issue_183_pins_balance_s_false_without_releasing_existing_mta() {
+            std::thread::spawn(|| {
+                let mta = TestApartment::initialize(COINIT_MULTITHREADED);
+                let result = explorer_pinned_locations().map(|items| items.len());
+                assert_eq!(apartment_type().unwrap(), APTTYPE_MTA);
+                assert_mode_conflict(COINIT_APARTMENTTHREADED);
+                drop(mta);
+                assert_uninitialized();
+                eprintln!("issue-183 existing MTA: enumeration={result:?}; S_FALSE balanced once");
+            })
+            .join()
+            .unwrap();
+        }
+
+        #[test]
+        fn issue_183_pins_preserve_existing_sta_after_initialization_failure() {
+            std::thread::spawn(|| {
+                let sta = TestApartment::initialize(COINIT_APARTMENTTHREADED);
+                assert_mode_conflict(COINIT_MULTITHREADED);
+
+                let result = explorer_pinned_locations().map(|items| items.len());
+                assert!(matches!(apartment_type().unwrap(), APTTYPE_STA | APTTYPE_MAINSTA));
+                drop(sta);
+                assert_uninitialized();
+                eprintln!("issue-183 existing STA: enumeration={result:?}; failed initialization did not uninitialize");
+            })
+            .join()
+            .unwrap();
         }
     }
 }

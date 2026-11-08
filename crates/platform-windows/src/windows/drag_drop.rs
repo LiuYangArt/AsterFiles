@@ -2272,17 +2272,34 @@ fn shell_data_object(paths: &[PathBuf], supplemental: &IDataObject) -> io::Resul
                 .chain(std::iter::once(0))
                 .collect::<Vec<_>>();
             let mut pidl = ptr::null_mut();
+            #[cfg(test)]
+            shell_pidl_tests::checkpoint("parse")?;
             // SAFETY: validate_drag_path rejected embedded NULs; the terminated path and pidl output stay alive through parsing.
             unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut pidl, 0, None) }
                 .map_err(windows_error)?;
+            // Register ownership before the next fallible step so partial iterations use the same cleanup.
+            pidls.push(pidl);
+            #[cfg(test)]
+            shell_pidl_tests::allocated(pidl);
+            #[cfg(not(test))]
             // SAFETY: SHParseDisplayName returned an owned absolute PIDL; cloning reads it without transferring ownership.
             let parent = unsafe { ILClone(pidl) };
-            // SAFETY: parent is checked nonnull before trimming the owned PIDL clone.
-            if parent.is_null() || !unsafe { ILRemoveLastID(Some(parent)) }.as_bool() {
+            #[cfg(test)]
+            let parent = shell_pidl_tests::clone_pidl(pidl);
+            if parent.is_null() {
                 return Err(io::Error::other("unable to resolve outbound Shell parent"));
             }
-            pidls.push(pidl);
             parent_pidls.push(parent);
+            #[cfg(test)]
+            shell_pidl_tests::allocated(parent);
+            #[cfg(not(test))]
+            // SAFETY: parent is a nonnull, uniquely owned PIDL clone.
+            let removed = unsafe { ILRemoveLastID(Some(parent)) }.as_bool();
+            #[cfg(test)]
+            let removed = shell_pidl_tests::remove_last_id(parent);
+            if !removed {
+                return Err(io::Error::other("unable to resolve outbound Shell parent"));
+            }
         }
         let common_parent = parent_pidls.first().copied().filter(|first| {
             parent_pidls
@@ -2297,14 +2314,7 @@ fn shell_data_object(paths: &[PathBuf], supplemental: &IDataObject) -> io::Resul
                 .map(|pidl| unsafe { ILFindLastID(*pidl) }.cast_const())
                 .collect::<Vec<_>>();
             // SAFETY: The parent and child PIDLs remain owned until this call copies them; supplemental is a live COM interface.
-            unsafe {
-                SHCreateDataObject::<_, IDataObject>(
-                    Some(parent.cast_const()),
-                    Some(&children),
-                    supplemental,
-                )
-            }
-            .map_err(windows_error)
+            unsafe { create_shell_data_object(parent.cast_const(), &children, supplemental) }
         } else {
             let absolute = pidls
                 .iter()
@@ -2314,26 +2324,40 @@ fn shell_data_object(paths: &[PathBuf], supplemental: &IDataObject) -> io::Resul
             let desktop = unsafe { SHGetDesktopFolder() }.map_err(windows_error)?;
             // SAFETY: desktop is a retained COM interface; the returned PIDL is owned and freed after object creation.
             let desktop_pidl = unsafe { SHGetIDListFromObject(&desktop) }.map_err(windows_error)?;
-            // SAFETY: desktop_pidl and all absolute child PIDLs remain allocated during the call; supplemental is also retained.
+            #[cfg(test)]
+            shell_pidl_tests::allocated(desktop_pidl);
+            // SAFETY: The desktop and absolute PIDLs remain allocated until this synchronous call returns.
             let created = unsafe {
-                SHCreateDataObject::<_, IDataObject>(
-                    Some(desktop_pidl.cast_const()),
-                    Some(&absolute),
-                    supplemental,
-                )
-            }
-            .map_err(windows_error);
+                create_shell_data_object(desktop_pidl.cast_const(), &absolute, supplemental)
+            };
+            #[cfg(test)]
+            shell_pidl_tests::released(desktop_pidl);
             // SAFETY: Object creation has finished borrowing this uniquely owned PIDL returned by SHGetIDListFromObject.
             unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(desktop_pidl.cast())) };
             created
         }
     })();
     for pidl in pidls.into_iter().chain(parent_pidls) {
+        #[cfg(test)]
+        shell_pidl_tests::released(pidl);
         // SAFETY: Each entry is a distinct Shell-allocated PIDL owned by these vectors, and no borrowed child pointers remain.
         unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(pidl.cast())) };
     }
     result
 }
+
+unsafe fn create_shell_data_object(
+    parent: *const ITEMIDLIST,
+    children: &[*const ITEMIDLIST],
+    supplemental: &IDataObject,
+) -> io::Result<IDataObject> {
+    #[cfg(test)]
+    shell_pidl_tests::checkpoint("create")?;
+    // SAFETY: The caller retains the parent and children PIDLs until Shell has copied them.
+    unsafe { SHCreateDataObject::<_, IDataObject>(Some(parent), Some(children), supplemental) }
+        .map_err(windows_error)
+}
+
 struct OleApartment;
 
 impl OleApartment {
@@ -2958,6 +2982,10 @@ impl ExplicitRevoke for DragDropRegistration {
 fn windows_error(error: windows::core::Error) -> io::Error {
     io::Error::other(error.to_string())
 }
+
+#[cfg(test)]
+#[path = "drag_drop/shell_pidl_tests.rs"]
+mod shell_pidl_tests;
 
 #[cfg(test)]
 mod tests {
