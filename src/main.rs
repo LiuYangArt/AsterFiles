@@ -8,6 +8,7 @@ mod group_projection;
 mod i18n;
 #[cfg(test)]
 mod input_order_tests;
+mod panic_diagnostics;
 mod quick_menu_popup;
 mod session_store;
 
@@ -23,6 +24,7 @@ fn main_network_child() -> std::io::Result<bool> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    panic_diagnostics::install();
     struct AuditFlush;
     impl Drop for AuditFlush {
         fn drop(&mut self) {

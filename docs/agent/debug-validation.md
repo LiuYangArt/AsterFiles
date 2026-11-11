@@ -79,6 +79,7 @@
 | [#171](#issue-171) | 语义颜色令牌与双主题（#171） |
 | [#172](#issue-172) | 界面拆分与文案投影（#172） |
 | [#173](#issue-173) | Windows 系统强调色（#173） |
+| [#187](#issue-187)、[#188](#issue-188) | 编辑器命中、延迟改名与双击 |
 | [#175](#issue-175) | Issue #175 十万条目目录加载、框选与滚动 |
 | [#176](#issue-176) | Temp 监听循环与本地刷新（#176） |
 | [#177](#issue-177) | Issue #177 地址栏退出编辑 |
@@ -1285,3 +1286,29 @@ python tools/verify.py --release
 2. 分别查看主页、详情、列表、网格和设置，确认布局、滚动和主题与拆分前一致。
 3. 切换设置页再返回文件页，缩窄再还原窗口，确认列表内容、侧栏、列宽和选择保持正常。
 4. 在详情和网格里试一次重命名、文件右键和标签拖动，确认编辑框与浮层位置正常。
+
+<a id="issue-187"></a>
+<a id="issue-188"></a>
+
+## 改名编辑与名称点击（#187、#188）
+
+专项测试使用无原生窗口后端，不操作 AsterFiles 桌面界面：
+
+```powershell
+cargo test --workspace --locked rename_ -- --nocapture
+python tools/verify.py --quick
+```
+
+#187 覆盖文字点击、拖选、内边距、框外提交、Enter、Esc、中文与长名称。#188 使用可控时间检查双击优先、延迟和失效目标，并区分名称与图标、空白、其他列的命中。
+
+#188 的单击改名崩溃诊断复用 `artifacts/logs/file-operation-audit.jsonl`。`rename-delay-fired`、`rename-editor-preparing`、`rename-editor-activating` 和 `rename-editor-activated` 标记进入阶段；`rust-panic` 记录错误位置与完整栈，致命错误退出前等待后台日志写入完成。测试中的 `issue-188-owned-panic-diagnostic-probe` 是独占子进程主动触发的预期测试记录，排查用户崩溃时按进程号区分。
+
+#188 的焦点回归检查“无障碍查询构建编辑器时不抢焦点，下一事件轮才选中主名”，并检查立即取消与已有改名交互。实际崩溃栈为 `artifacts/logs/issue-188-crash/confirmed-user-stack.txt`。根因与排查入口见 [改名焦点复盘](../postmortem/postmortem-2026-11-10-rename-accessibility-focus.md)。
+
+#187 的框外点击回归覆盖详情、列表、内容、普通／分组网格和搜索结果，检查原目标提交一次、原点击选中新条目，以及 Ctrl／Shift 选择。另检查网格长名折行上移后的实际编辑边界。悬停外观由用户检查。
+
+专项日志：`artifacts/logs/issue-187-pointer/targeted.log`；收尾日志：`artifacts/logs/rename-finish/`；统一验证汇总：`artifacts/verify/summary.json`。
+
+用户手动验收：
+
+1. 在详情、列表、内容、普通及分组网格中，F2 后点击文字首中尾、拖选、点击内边距，确认继续编辑；检查 Enter、Esc；编辑期间移向其他条目应有悬停，单击一次即提交原改名并选中目标，Ctrl／Shift 选择规则不变。再检查已选项名称单击等待、快速双击、Ctrl／Shift、多选、拖拽和等待期间换目录／标签或失焦。

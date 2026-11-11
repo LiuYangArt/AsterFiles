@@ -40,6 +40,10 @@ export component WindowOverlays inherits Rectangle {
     in property <length> normal-modified-width;
     in property <length> normal-name-width;
     in property <length> normal-size-width;
+    private property <length> rename-editor-left;
+    private property <length> rename-editor-top;
+    private property <length> rename-editor-width;
+    private property <length> rename-editor-height;
     in property <bool> rename-editing: false;
     in property <int> rename-entry-id: -1;
     in-out property <string> rename-input: "";
@@ -114,13 +118,13 @@ export component WindowOverlays inherits Rectangle {
             }
         }
     }
-    // The editor must escape virtualized row clipping and remain above the outside-click layer.
-    if root.rename-editing && root.is-grid-view-mode(root.view-mode) && root.grid-rename-anchor-id == root.rename-entry-id && root.grid-rename-context == root.accessibility-context: InlineRenameEditor {
+    // Keep editing above virtualized rows without intercepting other rows' pointer events.
+    if root.rename-editing && root.grid-rename-anchor-id == root.rename-entry-id && root.grid-rename-context == root.accessibility-context: rename-editor := InlineRenameEditor {
         z: 101;
         x: root.grid-rename-left;
         y: max(root.file-list-top, min(root.grid-rename-top, root.window-height - 32px - self.height));
         width: root.grid-rename-width;
-        multiline: root.view-mode != 3 && root.view-mode != 6;
+        multiline: root.is-grid-view-mode(root.view-mode) && root.view-mode != 3 && root.view-mode != 6;
         editor-height-limit: max(30px, root.window-height - root.file-list-top - 32px);
         height: self.multiline ? min(self.editor-height-limit, max(30px, self.content-height)) : root.grid-rename-height;
         text <=> root.rename-input;
@@ -129,19 +133,27 @@ export component WindowOverlays inherits Rectangle {
         submit-generation: root.rename-submit-generation;
         editor-id: root.accessibility-context + "/entry/" + root.rename-entry-id + "/rename";
         label: root.grid-rename-label;
+        function sync-editor-bounds() {
+            root.rename-editor-left = self.x;
+            root.rename-editor-top = self.y;
+            root.rename-editor-width = self.width;
+            root.rename-editor-height = self.height;
+        }
+        init => { self.sync-editor-bounds(); }
+        changed x => { self.sync-editor-bounds(); }
+        changed y => { self.sync-editor-bounds(); }
+        changed width => { self.sync-editor-bounds(); }
+        changed height => { self.sync-editor-bounds(); }
         commit(name) => { root.commit-rename(name); }
         cancel => { root.cancel-rename(); }
     }
-    if root.rename-editing: TouchArea {
-        z: 100;
-        width: parent.width;
-        height: parent.height;
-        pointer-event(event) => {
-            if event.kind == PointerEventKind.down && event.button == PointerEventButton.left && !root.rename-submitting {
-                root.rename-submitting = true;
-                root.commit-rename(root.rename-input);
-            }
-        }
+    public function dismiss-rename-outside(x: float, y: float) {
+        if !root.rename-editing || root.rename-submitting { return; }
+        if root.grid-rename-anchor-id == root.rename-entry-id && root.grid-rename-context == root.accessibility-context
+            && x * 1px >= root.rename-editor-left && x * 1px < root.rename-editor-left + root.rename-editor-width
+            && y * 1px >= root.rename-editor-top && y * 1px < root.rename-editor-top + root.rename-editor-height { return; }
+        root.rename-submitting = true;
+        root.commit-rename(root.rename-input);
     }
 
     if root.tabs-menu-open: TouchArea {

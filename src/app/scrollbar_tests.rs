@@ -269,7 +269,7 @@ fn issue_178_cancel_does_not_swallow_other_pointer_gestures_or_wheel() {
     let clicked = clicks.clone();
     fixture
         .ui
-        .on_activate_entry(move |_, _, _| clicked.set(clicked.get() + 1));
+        .on_activate_entry(move |_, _, _, _| clicked.set(clicked.get() + 1));
     let position = slint::LogicalPosition::new(
         fixture.ui.get_file_list_left() + 50.0,
         fixture.ui.get_file_list_top() + 20.0,

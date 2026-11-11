@@ -321,6 +321,7 @@ fn issue_154_rename_enter_commits_without_newline_and_escape_cancels() {
             let cancelled_result = cancelled.clone();
             ui.on_cancel_rename(move || cancelled_result.set(cancelled_result.get() + 1));
             let _editor = by_id(&ui, "window/1/tab/1/request/1/entry/4/rename");
+            i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(1));
             assert!(
                 committed.borrow().is_empty(),
                 "mounting the editor must not submit"
@@ -352,6 +353,7 @@ fn issue_154_single_line_cursor_scrolls_to_end_and_returns_home() {
         let ui = issue_154_grid_editor(grouped, name);
         ui.set_view_mode(3);
         let editor = by_id(&ui, "window/1/tab/1/request/1/entry/4/rename");
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(1));
         let send_key = |key: Key| {
             let text: slint::SharedString = key.into();
             ui.window()

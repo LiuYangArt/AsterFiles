@@ -226,7 +226,7 @@ fn actual_file_view_release_cancels_after_model_rebuild(mode: i32, grouped: bool
     let activated_app = app.clone();
     let activated_events = events.clone();
     let weak = ui.as_weak();
-    ui.on_activate_entry(move |id, _, _| {
+    ui.on_activate_entry(move |id, _, _, _| {
         assert_eq!(id, 7);
         activated_events.borrow_mut().push("clicked");
         let mut app = activated_app.borrow_mut();

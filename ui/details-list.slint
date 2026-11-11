@@ -2,19 +2,16 @@ import { VisualStyle } from "visual-style.slint";
 import { IconMap } from "icons/icon-map.slint";
 import { ListView } from "std-widgets.slint";
 import { FileRow, ColumnRow } from "models.slint";
-import { InlineRenameEditor } from "file-controls.slint";
 import { InlineIcon } from "navigation-controls.slint";
 
 export component DetailsList inherits ListView {
     in property <string> accessibility-context;
-    callback activate-entry(int, bool, bool);
+    callback activate-entry(int, bool, bool, bool);
     in property <int> active-geometry-revision;
     callback begin-internal-drag(int);
     callback begin-internal-right-drag(int, float, float);
     callback cancel-internal-drag();
-    callback cancel-rename();
     in property <[ColumnRow]> columns;
-    callback commit-rename(string);
     in property <length> content-origin-y;
     in property <length> details-hit-left;
     in property <length> details-hit-visible-left;
@@ -27,6 +24,13 @@ export component DetailsList inherits ListView {
     in-out property <length> file-viewport-width;
     in-out property <length> file-viewport-y;
     in property <[FileRow]> files;
+    in-out property <int> grid-rename-anchor-id;
+    in-out property <string> grid-rename-context;
+    in-out property <length> grid-rename-height;
+    in-out property <string> grid-rename-label;
+    in-out property <length> grid-rename-left;
+    in-out property <length> grid-rename-top;
+    in-out property <length> grid-rename-width;
     in-out property <length> keyboard-menu-anchor-x;
     in-out property <length> keyboard-menu-anchor-y;
     in property <length> layout-icon-size;
@@ -40,10 +44,6 @@ export component DetailsList inherits ListView {
     in-out property <length> rectangle-viewport-top;
     in property <bool> rename-editing;
     in property <int> rename-entry-id;
-    in-out property <string> rename-input;
-    in property <int> rename-selection-end;
-    in property <int> rename-submit-generation;
-    in-out property <bool> rename-submitting;
     callback request-folder-size-range(float, float);
     callback request-search-position(float);
     in property <length> search-created-width;
@@ -80,7 +80,11 @@ export component DetailsList inherits ListView {
     changed width => { self.sync-file-geometry(); }
     changed visible-height => { self.sync-file-geometry(); }
     changed viewport-y => { if !root.is-grid-view-mode(root.view-mode) { root.file-viewport-y = self.viewport-y; if !root.search-results-mode { root.request-folder-size-range(self.viewport-y / 1px, self.visible-height / 1px); } } }
-    for entry in root.files: Rectangle {
+    for entry in root.files: file-row := Rectangle {
+        property <length> name-left;
+        property <length> name-top;
+        property <length> name-width;
+        property <length> name-height;
         width: root.view-mode == 0 ? max(root.width, root.file-columns-width + 16px) : root.width;
         x: 0px;
         height: entry.group-header ? (entry.group-detail == "" ? 32px : 48px) : root.layout-row-height;
@@ -114,11 +118,25 @@ export component DetailsList inherits ListView {
                         if column.kind == 0: Rectangle {
                             clip: true;
                             InlineIcon { x: column.content-left; width: 20px; height: 20px; icon-source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document); }
-                            if !(root.rename-editing && root.rename-entry-id == entry.id): Rectangle {
+                            if !(root.rename-editing && root.rename-entry-id == entry.id): details-name := Rectangle {
                                 x: column.content-left + column.icon-slot;
                                 clip: true;
                                 width: parent.width - column.content-left - column.content-right - column.icon-slot;
                                 property <length> fade-width: 20px;
+                                property <length> hit-width: min(self.width, segment-layout.preferred-width);
+                                property <length> hit-height: min(self.height, segment-layout.preferred-height);
+                                function sync-name-hit() {
+                                    if root.view-mode != 7 {
+                                        file-row.name-left = self.absolute-position.x;
+                                        file-row.name-top = self.absolute-position.y + (self.height - self.hit-height) / 2;
+                                        file-row.name-width = self.hit-width;
+                                        file-row.name-height = self.hit-height;
+                                    }
+                                }
+                                init => { self.sync-name-hit(); }
+                                changed absolute-position => { self.sync-name-hit(); }
+                                changed hit-width => { self.sync-name-hit(); }
+                                changed hit-height => { self.sync-name-hit(); }
                                 segment-layout := HorizontalLayout {
                                     x: 0px;
                                     width: parent.width;
@@ -143,18 +161,24 @@ export component DetailsList inherits ListView {
                                     Text { text: "…"; color: VisualStyle.text-strong; font-size: VisualStyle.file-name-font-size; horizontal-alignment: right; vertical-alignment: center; }
                                 }
                             }
-                            if root.rename-editing && root.rename-entry-id == entry.id && root.view-mode != 7 && !root.is-grid-view-mode(root.view-mode): InlineRenameEditor {
+                            if root.rename-editing && root.rename-entry-id == entry.id && root.view-mode != 7 && !root.is-grid-view-mode(root.view-mode): Rectangle {
                                 z: 101;
                                 x: column.content-left + column.icon-slot;
                                 width: max(0px, parent.width - column.content-left - column.content-right - column.icon-slot);
-                                text <=> root.rename-input;
-                                selection-end: root.rename-selection-end;
-                                submitting <=> root.rename-submitting;
-                                submit-generation: root.rename-submit-generation;
-                                editor-id: root.accessibility-context + "/entry/" + entry.id + "/rename";
-                                label: entry.name;
-                                commit(name) => { root.commit-rename(name); }
-                                cancel => { root.cancel-rename(); }
+                                height: 30px;
+                                function sync-editor-anchor() {
+                                    root.grid-rename-left = max(root.file-list-left, self.absolute-position.x - root.window-origin.x);
+                                    root.grid-rename-top = self.absolute-position.y - root.window-origin.y;
+                                    root.grid-rename-width = max(1px, min(self.absolute-position.x - root.window-origin.x + self.width, root.file-list-left + root.file-viewport-width) - root.grid-rename-left);
+                                    root.grid-rename-height = self.height;
+                                    root.grid-rename-label = entry.name;
+                                    root.grid-rename-context = root.accessibility-context;
+                                    root.grid-rename-anchor-id = entry.id;
+                                }
+                                init => { self.sync-editor-anchor(); }
+                                changed absolute-position => { self.sync-editor-anchor(); }
+                                changed width => { self.sync-editor-anchor(); }
+                                changed height => { self.sync-editor-anchor(); }
                             }
                         }
                         if column.kind != 0: Text {
@@ -179,20 +203,42 @@ export component DetailsList inherits ListView {
                 icon-size: root.layout-icon-size;
                 icon-source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document);
             }
-            if !(root.rename-editing && root.rename-entry-id == entry.id): Text { x: 64px; y: 8px; width: parent.width - 76px; height: 24px; text: entry.name; color: VisualStyle.text-strong; font-size: VisualStyle.file-name-font-size; font-weight: 500; vertical-alignment: center; overflow: elide; }
-            if root.rename-editing && root.rename-entry-id == entry.id: InlineRenameEditor {
+            if !(root.rename-editing && root.rename-entry-id == entry.id): content-name := Text {
+                x: 64px; y: 8px; width: parent.width - 76px; height: 24px;
+                text: entry.name; color: VisualStyle.text-strong; font-size: VisualStyle.file-name-font-size;
+                font-weight: 500;
+                vertical-alignment: center; overflow: elide;
+                property <length> hit-width: min(self.width, self.preferred-width);
+                property <length> hit-height: min(self.height, self.preferred-height);
+                function sync-name-hit() {
+                    file-row.name-left = self.absolute-position.x;
+                    file-row.name-top = self.absolute-position.y + (self.height - self.hit-height) / 2;
+                    file-row.name-width = self.hit-width;
+                    file-row.name-height = self.hit-height;
+                }
+                init => { self.sync-name-hit(); }
+                changed absolute-position => { self.sync-name-hit(); }
+                changed hit-width => { self.sync-name-hit(); }
+                changed hit-height => { self.sync-name-hit(); }
+            }
+            if root.rename-editing && root.rename-entry-id == entry.id: Rectangle {
                 z: 101;
                 x: 64px; y: 8px;
                 width: max(0px, parent.width - 76px);
                 height: 24px;
-                text <=> root.rename-input;
-                selection-end: root.rename-selection-end;
-                submitting <=> root.rename-submitting;
-                submit-generation: root.rename-submit-generation;
-                editor-id: root.accessibility-context + "/entry/" + entry.id + "/rename";
-                label: entry.name;
-                commit(name) => { root.commit-rename(name); }
-                cancel => { root.cancel-rename(); }
+                function sync-editor-anchor() {
+                    root.grid-rename-left = max(root.file-list-left, self.absolute-position.x - root.window-origin.x);
+                    root.grid-rename-top = self.absolute-position.y - root.window-origin.y;
+                    root.grid-rename-width = max(1px, min(self.absolute-position.x - root.window-origin.x + self.width, root.file-list-left + root.file-viewport-width) - root.grid-rename-left);
+                    root.grid-rename-height = self.height;
+                    root.grid-rename-label = entry.name;
+                    root.grid-rename-context = root.accessibility-context;
+                    root.grid-rename-anchor-id = entry.id;
+                }
+                init => { self.sync-editor-anchor(); }
+                changed absolute-position => { self.sync-editor-anchor(); }
+                changed width => { self.sync-editor-anchor(); }
+                changed height => { self.sync-editor-anchor(); }
             }
             Text { x: 64px; y: 34px; width: parent.width - 250px; height: 20px; text: entry.kind; color: VisualStyle.text-detail; font-size: 12px; vertical-alignment: center; overflow: elide; }
             Text { x: parent.width - 174px; y: 34px; width: 74px; height: 20px; text: entry.size; color: VisualStyle.text-detail; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
@@ -233,7 +279,11 @@ export component DetailsList inherits ListView {
                 }
                 return accept;
             }
-            clicked => { root.activate-entry(entry.id, self.click-control, self.click-shift); }
+            clicked => { root.activate-entry(entry.id, self.click-control, self.click-shift,
+                self.absolute-position.x + self.mouse-x >= file-row.name-left
+                && self.absolute-position.x + self.mouse-x < file-row.name-left + file-row.name-width
+                && self.absolute-position.y + self.mouse-y >= file-row.name-top
+                && self.absolute-position.y + self.mouse-y < file-row.name-top + file-row.name-height); }
         }
         if entry.focused: Rectangle {
             init => {
@@ -250,7 +300,7 @@ export component DetailsList inherits ListView {
             accessible-enabled: !(root.rename-editing && root.rename-entry-id == entry.id);
             accessible-item-selectable: true;
             accessible-item-selected: entry.selected;
-            accessible-action-default => { if !(root.rename-editing && root.rename-entry-id == entry.id) { root.activate-entry(entry.id, false, false); } }
+            accessible-action-default => { if !(root.rename-editing && root.rename-entry-id == entry.id) { root.activate-entry(entry.id, false, false, false); } }
         }
     }
 

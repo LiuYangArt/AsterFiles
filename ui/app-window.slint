@@ -138,7 +138,7 @@ export component AppWindow inherits Window {
         }
     }
     changed file-viewport-y => {
-        if root.rename-editing && root.is-grid-view-mode(root.view-mode) && root.grid-rename-anchor-id >= 0 {
+        if root.rename-editing && root.grid-rename-anchor-id >= 0 {
             root.grid-rename-anchor-id = -1;
             root.cancel-rename();
         }
@@ -297,7 +297,9 @@ export component AppWindow inherits Window {
     callback resize-column(int, float);
     callback show-column-menu(int, float, float);
     callback open-entry(int);
-    callback activate-entry(int, bool, bool);
+    callback activate-entry(int, bool, bool, bool);
+    callback cancel-delayed-rename(bool);
+    changed accessibility-context => { root.cancel-delayed-rename(true); }
     callback arm-internal-drag(float, float);
     callback begin-internal-drag(int);
     callback cancel-internal-drag();
@@ -369,6 +371,7 @@ export component AppWindow inherits Window {
     callback request-undo();
     callback paste-files();
     callback begin-rename();
+    public function dismiss-rename-outside(x: float, y: float) { overlays.dismiss-rename-outside(x, y); }
     callback commit-rename <=> overlays.commit-rename;
     callback cancel-rename <=> overlays.cancel-rename;
     callback request-delete(bool);
@@ -582,7 +585,7 @@ export component AppWindow inherits Window {
 
                 file-view := FileView {
                     accessibility-context: root.accessibility-context;
-                    activate-entry(p0, p1, p2) => { root.activate-entry(p0, p1, p2); }
+                    activate-entry(p0, p1, p2, p3) => { root.activate-entry(p0, p1, p2, p3); }
                     active-geometry-revision: root.active-geometry-revision;
                     active-is-home: root.active-is-home;
                     begin-column-drag(p0, p1, p2) => { root.begin-column-drag(p0, p1, p2); }
@@ -590,7 +593,6 @@ export component AppWindow inherits Window {
                     begin-internal-right-drag(p0, p1, p2) => { root.begin-internal-right-drag(p0, p1, p2); }
                     begin-rectangle-selection(p0, p1, p2, p3) => { root.begin-rectangle-selection(p0, p1, p2, p3); }
                     cancel-internal-drag() => { root.cancel-internal-drag(); }
-                    cancel-rename() => { root.cancel-rename(); }
                     change-sort(p0) => { root.change-sort(p0); }
                     change-view-mode(p0) => { root.change-view-mode(p0); }
                     column-drag-insertion-slot <=> root.column-drag-insertion-slot;
@@ -600,7 +602,6 @@ export component AppWindow inherits Window {
                     column-drag-source-kind <=> root.column-drag-source-kind;
                     column-dragging <=> root.column-dragging;
                     columns: root.columns;
-                    commit-rename(p0) => { root.commit-rename(p0); }
                     context-menu-anchor-x <=> root.context-menu-anchor-x;
                     context-menu-anchor-y <=> root.context-menu-anchor-y;
                     details-hit-left: root.details-hit-left;
@@ -674,10 +675,6 @@ export component AppWindow inherits Window {
                     rectangle-viewport-top <=> root.rectangle-viewport-top;
                     rename-editing: root.rename-editing;
                     rename-entry-id: root.rename-entry-id;
-                    rename-input <=> root.rename-input;
-                    rename-selection-end: root.rename-selection-end;
-                    rename-submit-generation: root.rename-submit-generation;
-                    rename-submitting <=> root.rename-submitting;
                     request-folder-access() => { root.request-folder-access(); }
                     request-folder-size-range(p0, p1) => { root.request-folder-size-range(p0, p1); }
                     request-search-position(p0) => { root.request-search-position(p0); }

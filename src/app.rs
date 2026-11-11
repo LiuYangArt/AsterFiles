@@ -92,6 +92,9 @@ mod loading_hint;
 mod network_sort_tests;
 #[cfg(test)]
 mod refresh_tests;
+mod rename_click;
+#[cfg(test)]
+mod rename_interaction_tests;
 mod rename_updates;
 #[cfg(test)]
 mod scrollbar_tests;
@@ -5506,10 +5509,14 @@ fn begin_rename_ui(weak: &slint::Weak<AppWindow>, state: &WindowSessions) {
     if let Some((id, input, selection_end)) = target
         && let Some(ui) = weak.upgrade()
     {
+        let context = format!("window={} entry={} name={input:?}", state.window_id.0, id.0);
+        crate::operation_audit::record("rename-editor-preparing", &context);
         ui.set_rename_entry_id(id.0 as i32);
         ui.set_rename_input(input.into());
         ui.set_rename_selection_end(selection_end as i32);
+        crate::operation_audit::record("rename-editor-activating", &context);
         ui.set_rename_editing(true);
+        crate::operation_audit::record("rename-editor-activated", &context);
     }
 }
 
@@ -10323,12 +10330,44 @@ fn wire_mouse_navigation(
     ui.window().on_winit_window_event(move |window, event| {
         handle_window_adaptation(window, event, &mut installed_hwnd);
         if let Some(ui) = weak.upgrade() {
+            if matches!(
+                event,
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    ..
+                } | WindowEvent::MouseWheel { .. }
+                    | WindowEvent::KeyboardInput { .. }
+                    | WindowEvent::Focused(false)
+                    | WindowEvent::CloseRequested
+                    | WindowEvent::Destroyed
+            ) {
+                let reset_clicks = !matches!(
+                    event,
+                    WindowEvent::MouseInput {
+                        state: ElementState::Pressed,
+                        button: winit::event::MouseButton::Left,
+                        ..
+                    }
+                );
+                ui.invoke_cancel_delayed_rename(reset_clicks);
+            }
             prepare_scrollbar_event(&ui, event);
             let position = || {
                 cursor_position
                     .get()
                     .to_logical::<f32>(f64::from(ui.window().scale_factor()))
             };
+            if matches!(
+                event,
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button: winit::event::MouseButton::Left,
+                    ..
+                }
+            ) {
+                let point = position();
+                ui.invoke_dismiss_rename_outside(point.x, point.y);
+            }
             match native_file_drag_action(event) {
                 Some(NativeFileDragAction::Arm(DragButton::Left)) => {
                     let position = position();
@@ -10601,6 +10640,7 @@ fn wire_mouse_navigation(
                 cursor_position.set(*position);
                 let logical = position.to_logical::<f32>(f64::from(ui.window().scale_factor()));
                 if ui.invoke_update_internal_drag(logical.x, logical.y) {
+                    ui.invoke_cancel_delayed_rename(true);
                     // This move predates the drop; replaying it would re-hover the source row.
                     EventResult::PreventDefault
                 } else {

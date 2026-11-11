@@ -121,36 +121,33 @@ pub(super) fn wire_selection(ui: &AppWindow, state: &WindowSessions, workers: &W
     let sender_for_activate_entry = sender.clone();
     let network_sender_for_activate_entry = network_sender.clone();
     let state_for_activate_entry = state.clone();
-    let last_click = std::rc::Rc::new(RefCell::new(None::<(TabId, ActivateTarget, Instant)>));
-    ui.on_activate_entry(move |entry_id, toggle, extend| {
+    let clicks = Rc::new(RefCell::new(rename_click::RenameClickState::default()));
+    let timer = Rc::new(slint::Timer::default());
+    let cancelled = clicks.clone();
+    let cancel_timer = timer.clone();
+    ui.on_cancel_delayed_rename(move |reset_clicks| {
+        cancelled.borrow_mut().cancel(reset_clicks);
+        cancel_timer.stop();
+    });
+    ui.on_activate_entry(move |entry_id, toggle, extend, name_hit| {
         let entry_id = EntryId(entry_id as u32);
-        let now = Instant::now();
-        let (tab_id, target) = {
-            let app = state_for_activate_entry
-                .lock()
-                .expect("app state mutex is not poisoned");
-            (
-                app.active_window_state().active_tab,
-                app.active()
-                    .visible_entry(entry_id)
-                    .map(ActivateTarget::from),
-            )
-        };
-        let double_click_interval = platform::double_click_interval();
-        let should_open = last_click.borrow().as_ref().is_some_and(
-            |(previous_tab, previous_target, previous_time)| {
-                *previous_tab == tab_id
-                    && target.as_ref() == Some(previous_target)
-                    && now.saturating_duration_since(*previous_time) <= double_click_interval
-            },
-        ) && target.is_some();
-        *last_click.borrow_mut() = if should_open {
-            None
-        } else {
-            target.map(|target| (tab_id, target, now))
-        };
-
-        if should_open {
+        let target = rename_click::RenameClickTarget::current(&state_for_activate_entry, entry_id);
+        let tab_id = state_for_activate_entry.lock().unwrap().active().id;
+        let only_selected = state_for_activate_entry
+            .lock()
+            .ok()
+            .is_some_and(|app| app.active().selected == [entry_id]);
+        let interval = platform::double_click_interval();
+        timer.stop();
+        let action = clicks.borrow_mut().click(
+            target,
+            Instant::now(),
+            interval,
+            only_selected,
+            name_hit,
+            toggle || extend,
+        );
+        if action == rename_click::ClickAction::Open {
             let target = {
                 let app = state_for_activate_entry
                     .lock()
@@ -211,11 +208,23 @@ pub(super) fn wire_selection(ui: &AppWindow, state: &WindowSessions, workers: &W
             update_file_rows(&ui, &state_for_activate_entry, tab_id, &changed_rows);
             update_selection_summary(&ui, &state_for_activate_entry);
         }
+        if action == rename_click::ClickAction::ScheduleRename {
+            rename_click::schedule(
+                weak.clone(),
+                state_for_activate_entry.clone(),
+                clicks.clone(),
+                &timer,
+                interval,
+            );
+        }
     });
     let weak = ui.as_weak();
     let state_for_select = state.clone();
     let selection_workers = action_workers.clone();
     ui.on_select_entry(move |entry_id, toggle, extend| {
+        if let Some(ui) = weak.upgrade() {
+            ui.invoke_cancel_delayed_rename(true);
+        }
         let Ok(target) = actions::target(&state_for_select) else {
             return;
         };
@@ -259,6 +268,9 @@ pub(super) fn wire_selection(ui: &AppWindow, state: &WindowSessions, workers: &W
     let weak = ui.as_weak();
     let state_for_clear = state.clone();
     ui.on_clear_selection(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.invoke_cancel_delayed_rename(true);
+        }
         let update = mutate_active_selection(&state_for_clear, TabSession::clear_selection);
         if let (Some(ui), Some((tab_id, changed))) = (weak.upgrade(), update) {
             update_file_rows(&ui, &state_for_clear, tab_id, &changed);
@@ -269,6 +281,9 @@ pub(super) fn wire_selection(ui: &AppWindow, state: &WindowSessions, workers: &W
     let weak = ui.as_weak();
     let state_for_all = state.clone();
     ui.on_select_all(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.invoke_cancel_delayed_rename(true);
+        }
         let update = mutate_active_selection(&state_for_all, TabSession::select_all);
         if let (Some(ui), Some((tab_id, changed))) = (weak.upgrade(), update) {
             update_file_rows(&ui, &state_for_all, tab_id, &changed);
@@ -279,6 +294,9 @@ pub(super) fn wire_selection(ui: &AppWindow, state: &WindowSessions, workers: &W
     let weak = ui.as_weak();
     let state_for_focus = state.clone();
     ui.on_move_focus(move |delta, extend| {
+        if let Some(ui) = weak.upgrade() {
+            ui.invoke_cancel_delayed_rename(true);
+        }
         let update = mutate_active_selection(&state_for_focus, |tab| {
             tab.move_focus(delta as isize, extend);
         });
@@ -291,6 +309,9 @@ pub(super) fn wire_selection(ui: &AppWindow, state: &WindowSessions, workers: &W
     let weak = ui.as_weak();
     let state_for_boundary = state.clone();
     ui.on_focus_boundary(move |last, extend| {
+        if let Some(ui) = weak.upgrade() {
+            ui.invoke_cancel_delayed_rename(true);
+        }
         let update = mutate_active_selection(&state_for_boundary, |tab| {
             tab.focus_boundary(last, extend);
         });
@@ -303,6 +324,9 @@ pub(super) fn wire_selection(ui: &AppWindow, state: &WindowSessions, workers: &W
     let weak = ui.as_weak();
     let state_for_toggle = state.clone();
     ui.on_toggle_focused(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.invoke_cancel_delayed_rename(true);
+        }
         let update = mutate_active_selection(&state_for_toggle, TabSession::toggle_focused);
         if let (Some(ui), Some((tab_id, changed))) = (weak.upgrade(), update) {
             update_file_rows(&ui, &state_for_toggle, tab_id, &changed);

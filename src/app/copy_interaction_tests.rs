@@ -123,7 +123,7 @@ impl InputFixture {
         let weak = ui.as_weak();
         // Exercise real TouchAreas and selection projection without constructing Shell workers.
         // Native activation and directory opening remain user acceptance checks.
-        ui.on_activate_entry(move |id, toggle, extend| {
+        ui.on_activate_entry(move |id, toggle, extend, _| {
             selected_observations
                 .borrow_mut()
                 .push(InputObservation::Activate(id, toggle, extend));

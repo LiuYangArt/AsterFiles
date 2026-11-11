@@ -11,7 +11,7 @@ import { HomePage } from "home-page.slint";
 
 export component FileView inherits Rectangle {
     in property <string> accessibility-context;
-    callback activate-entry(int, bool, bool);
+    callback activate-entry(int, bool, bool, bool);
     in property <int> active-geometry-revision;
     in property <bool> active-is-home;
     callback begin-column-drag(int, float, float);
@@ -19,7 +19,6 @@ export component FileView inherits Rectangle {
     callback begin-internal-right-drag(int, float, float);
     callback begin-rectangle-selection(float, float, bool, bool);
     callback cancel-internal-drag();
-    callback cancel-rename();
     callback change-sort(int);
     callback change-view-mode(int);
     in-out property <int> column-drag-insertion-slot;
@@ -29,7 +28,6 @@ export component FileView inherits Rectangle {
     in-out property <int> column-drag-source-kind;
     in-out property <bool> column-dragging;
     in property <[ColumnRow]> columns;
-    callback commit-rename(string);
     in-out property <length> context-menu-anchor-x;
     in-out property <length> context-menu-anchor-y;
     in property <length> details-hit-left;
@@ -103,10 +101,6 @@ export component FileView inherits Rectangle {
     in-out property <length> rectangle-viewport-top;
     in property <bool> rename-editing;
     in property <int> rename-entry-id;
-    in-out property <string> rename-input;
-    in property <int> rename-selection-end;
-    in property <int> rename-submit-generation;
-    in-out property <bool> rename-submitting;
     callback request-folder-access();
     callback request-folder-size-range(float, float);
     callback request-search-position(float);
@@ -256,14 +250,12 @@ export component FileView inherits Rectangle {
                 list := DetailsList {
                     width: parent.width - 28px;
                     accessibility-context: root.accessibility-context;
-                    activate-entry(p0, p1, p2) => { root.activate-entry(p0, p1, p2); }
+                    activate-entry(p0, p1, p2, p3) => { root.activate-entry(p0, p1, p2, p3); }
                     active-geometry-revision: root.active-geometry-revision;
                     begin-internal-drag(p0) => { root.begin-internal-drag(p0); }
                     begin-internal-right-drag(p0, p1, p2) => { root.begin-internal-right-drag(p0, p1, p2); }
                     cancel-internal-drag() => { root.cancel-internal-drag(); }
-                    cancel-rename() => { root.cancel-rename(); }
                     columns: root.columns;
-                    commit-rename(p0) => { root.commit-rename(p0); }
                     content-origin-y: content-area.absolute-position.y;
                     details-hit-left: root.details-hit-left;
                     details-hit-visible-left: root.details-hit-visible-left;
@@ -276,6 +268,13 @@ export component FileView inherits Rectangle {
                     file-viewport-width <=> root.file-viewport-width;
                     file-viewport-y <=> root.file-viewport-y;
                     files: root.files;
+                    grid-rename-anchor-id <=> root.grid-rename-anchor-id;
+                    grid-rename-context <=> root.grid-rename-context;
+                    grid-rename-height <=> root.grid-rename-height;
+                    grid-rename-label <=> root.grid-rename-label;
+                    grid-rename-left <=> root.grid-rename-left;
+                    grid-rename-top <=> root.grid-rename-top;
+                    grid-rename-width <=> root.grid-rename-width;
                     keyboard-menu-anchor-x <=> root.keyboard-menu-anchor-x;
                     keyboard-menu-anchor-y <=> root.keyboard-menu-anchor-y;
                     layout-icon-size: root.layout-icon-size;
@@ -289,10 +288,6 @@ export component FileView inherits Rectangle {
                     rectangle-viewport-top <=> root.rectangle-viewport-top;
                     rename-editing: root.rename-editing;
                     rename-entry-id: root.rename-entry-id;
-                    rename-input <=> root.rename-input;
-                    rename-selection-end: root.rename-selection-end;
-                    rename-submit-generation: root.rename-submit-generation;
-                    rename-submitting <=> root.rename-submitting;
                     request-folder-size-range(p0, p1) => { root.request-folder-size-range(p0, p1); }
                     request-search-position(p0) => { root.request-search-position(p0); }
                     search-created-width: root.search-created-width;
@@ -343,7 +338,7 @@ export component FileView inherits Rectangle {
                 grid := FileGrid {
                     width: parent.width - 28px;
                     accessibility-context: root.accessibility-context;
-                    activate-entry(p0, p1, p2) => { root.activate-entry(p0, p1, p2); }
+                    activate-entry(p0, p1, p2, p3) => { root.activate-entry(p0, p1, p2, p3); }
                     active-geometry-revision: root.active-geometry-revision;
                     begin-internal-drag(p0) => { root.begin-internal-drag(p0); }
                     begin-internal-right-drag(p0, p1, p2) => { root.begin-internal-right-drag(p0, p1, p2); }

@@ -89,6 +89,7 @@ Slint 语义使用与语言无关的控件标识。条目标识包含窗口、�
 | 图像缓存 | `src/app/icon_cache.rs`：`IconCache`、`BoundedImages` | 四套图像缓存仍由 `AppState.image_cache` 持有；普通和类型图标保留原容量规则，两套预览缓存各限 128 项，按最后写入顺序淘汰，读取不改变顺序；改名迁移在缓存内部完成 |
 | 查询与系统集成状态 | `src/app/app_state.rs`：`EverythingState`、`IntegrationState` | 仍是 `AppState` 的字段，沿用同一把锁和原有请求代次、忙碌状态及错误记录，不建立独立状态副本 |
 | 窗口回调组装 | `src/app/callbacks.rs`：`wire_callbacks` | 复用既有工作通道与确认窗口，按原顺序注册；`callbacks/` 下按地址栏、文件列表、导航、侧栏、标签、设置、菜单和任务划分职责 |
+| 名称点击与延迟改名 | `src/app/rename_click.rs`、`callbacks/file_list.rs` | 每窗独立计时；系统双击窗口内优先打开，执行前核对窗口、标签、请求、原条目身份与唯一选择；编辑器统一使用窗口覆盖层 |
 | Agent 状态导出 | `src/app/agent_exports.rs`：`export_*_state` | 从真实应用状态或领域模型生成无界面验证报告；`app` 保留原导出入口，报告格式与必要检查不变 |
 | 目录加载 | `src/app/directory_loading.rs`：`spawn_directory_workers` | 自有本地/网络队列、主机执行集合与取消状态；只通过 `DirectoryRequest` / `DirectoryEvent` 传递原始路径及标签、请求身份，不依赖应用状态或 UI |
 | 文件后台执行 | `src/app/file_operation_worker.rs`：`spawn_file_operation_worker` | 自有本地、网络和清理工作队列、冲突互斥与进度合并；依赖领域、文件系统和 Windows 平台层，不依赖应用状态或 UI |

@@ -13,6 +13,8 @@ export component InlineRenameEditor inherits Rectangle {
     callback commit(string);
     callback cancel();
     private property <bool> editor-active: false;
+    private property <bool> focus-pending: true;
+    private property <bool> initial-selection-pending: true;
     private property <bool> submitted: false;
     private property <bool> editor-has-focus: rename-editor.has-focus;
     height: root.multiline ? min(root.editor-height-limit, max(30px, root.content-height)) : 30px;
@@ -20,10 +22,24 @@ export component InlineRenameEditor inherits Rectangle {
     border-color: VisualStyle.accent;
     border-width: 1px;
     border-radius: 3px;
-    init => { self.editor-active = true; }
     changed submit-generation => {
         self.submitted = false;
-        rename-editor.focus();
+        self.focus-pending = true;
+    }
+    // Accessibility can instantiate this editor while its native adapter is borrowed.
+    // Focus only after tree construction returns, and stop the timer after one turn.
+    Timer {
+        interval: 0ms;
+        running: root.focus-pending;
+        triggered => {
+            rename-editor.focus();
+            if root.initial-selection-pending {
+                rename-editor.set-selection-offsets(0, root.selection-end);
+                root.initial-selection-pending = false;
+            }
+            root.editor-active = true;
+            root.focus-pending = false;
+        }
     }
     function submit() {
         if !root.submitting {
@@ -33,8 +49,14 @@ export component InlineRenameEditor inherits Rectangle {
         }
     }
     changed editor-has-focus => {
-        if self.editor-active && !self.editor-has-focus && !self.submitted {
+        if self.editor-active && !self.focus-pending && !self.editor-has-focus && !self.submitted {
             root.submit();
+        }
+    }
+    // Keep padding clicks inside the editor instead of selecting the row beneath it.
+    TouchArea {
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down { rename-editor.focus(); }
         }
     }
     editor-viewport := Rectangle {
@@ -61,10 +83,6 @@ export component InlineRenameEditor inherits Rectangle {
             page-height: parent.height;
             read-only: root.submitting;
             vertical-alignment: root.multiline ? top : center;
-            init => {
-                self.focus();
-                self.set-selection-offsets(0, root.selection-end);
-            }
             // TextInput delegates clipping and cursor visibility to its enclosing widget.
             cursor-position-changed(position) => {
                 if position.x + self.scroll-x < 0px {

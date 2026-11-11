@@ -5,7 +5,7 @@ import { GridRow, PositionedGridRow } from "models.slint";
 
 export component FileGrid inherits Rectangle {
     in property <string> accessibility-context;
-    callback activate-entry(int, bool, bool);
+    callback activate-entry(int, bool, bool, bool);
     in property <int> active-geometry-revision;
     callback begin-internal-drag(int);
     callback begin-internal-right-drag(int, float, float);
@@ -87,7 +87,7 @@ export component FileGrid inherits Rectangle {
                     accessible-enabled: !(root.rename-editing && root.rename-entry-id == entry.id);
                     accessible-item-selectable: true;
                     accessible-item-selected: entry.selected;
-                    accessible-action-default => { if !(root.rename-editing && root.rename-entry-id == entry.id) { root.activate-entry(entry.id, false, false); } }
+                    accessible-action-default => { if !(root.rename-editing && root.rename-entry-id == entry.id) { root.activate-entry(entry.id, false, false, false); } }
                 }
                 width: root.layout-card-width; height: root.layout-row-height - 8px;
                 border-radius: 7px;
@@ -102,7 +102,8 @@ export component FileGrid inherits Rectangle {
                     image-fit: contain;
                     opacity: entry.thumbnail-state == 1 ? 0.5 : 1;
                 }
-                if !(root.rename-editing && root.rename-entry-id == entry.id): Text {
+                file-name := Text {
+                    visible: !(root.rename-editing && root.rename-entry-id == entry.id);
                     x: root.view-mode == 3 ? 26px : root.view-mode == 6 ? 64px : 7px;
                     y: root.view-mode == 3 ? 0px : root.view-mode == 6 ? 8px : root.layout-icon-size + 10px;
                     width: root.view-mode == 3 ? parent.width - 30px : root.view-mode == 6 ? parent.width - 72px : parent.width - 14px;
@@ -160,7 +161,11 @@ export component FileGrid inherits Rectangle {
                             root.cancel-internal-drag();
                         }
                     }
-                    clicked => { root.activate-entry(entry.id, self.click-control, self.click-shift); }
+                    clicked => { root.activate-entry(entry.id, self.click-control, self.click-shift,
+                        self.mouse-x >= file-name.x + (root.view-mode == 3 || root.view-mode == 6 ? 0px : max(0px, (file-name.width - file-name.preferred-width) / 2))
+                        && self.mouse-x < file-name.x + (root.view-mode == 3 || root.view-mode == 6 ? 0px : max(0px, (file-name.width - file-name.preferred-width) / 2)) + min(file-name.width, file-name.preferred-width)
+                        && self.mouse-y >= file-name.y + (root.view-mode == 3 || root.view-mode == 6 ? max(0px, (file-name.height - file-name.preferred-height) / 2) : 0px)
+                        && self.mouse-y < file-name.y + (root.view-mode == 3 || root.view-mode == 6 ? max(0px, (file-name.height - file-name.preferred-height) / 2) : 0px) + min(file-name.height, file-name.preferred-height)); }
                 }
             }
         }
@@ -188,7 +193,7 @@ export component FileGrid inherits Rectangle {
                     accessible-enabled: !(root.rename-editing && root.rename-entry-id == entry.id);
                     accessible-item-selectable: true;
                     accessible-item-selected: entry.selected;
-                    accessible-action-default => { if !(root.rename-editing && root.rename-entry-id == entry.id) { root.activate-entry(entry.id, false, false); } }
+                    accessible-action-default => { if !(root.rename-editing && root.rename-entry-id == entry.id) { root.activate-entry(entry.id, false, false, false); } }
                 }
                 width: root.layout-card-width; height: root.layout-row-height - 8px;
                 border-radius: 7px;
@@ -203,7 +208,8 @@ export component FileGrid inherits Rectangle {
                     image-fit: contain;
                     opacity: entry.thumbnail-state == 1 ? 0.5 : 1;
                 }
-                if !(root.rename-editing && root.rename-entry-id == entry.id): Text {
+                grouped-file-name := Text {
+                    visible: !(root.rename-editing && root.rename-entry-id == entry.id);
                     x: root.view-mode == 3 ? 26px : root.view-mode == 6 ? 64px : 7px;
                     y: root.view-mode == 3 ? 0px : root.view-mode == 6 ? 8px : root.layout-icon-size + 10px;
                     width: root.view-mode == 3 ? parent.width - 30px : root.view-mode == 6 ? parent.width - 72px : parent.width - 14px;
@@ -261,7 +267,11 @@ export component FileGrid inherits Rectangle {
                             root.cancel-internal-drag();
                         }
                     }
-                    clicked => { root.activate-entry(entry.id, self.click-control, self.click-shift); }
+                    clicked => { root.activate-entry(entry.id, self.click-control, self.click-shift,
+                        self.mouse-x >= grouped-file-name.x + (root.view-mode == 3 || root.view-mode == 6 ? 0px : max(0px, (grouped-file-name.width - grouped-file-name.preferred-width) / 2))
+                        && self.mouse-x < grouped-file-name.x + (root.view-mode == 3 || root.view-mode == 6 ? 0px : max(0px, (grouped-file-name.width - grouped-file-name.preferred-width) / 2)) + min(grouped-file-name.width, grouped-file-name.preferred-width)
+                        && self.mouse-y >= grouped-file-name.y + (root.view-mode == 3 || root.view-mode == 6 ? max(0px, (grouped-file-name.height - grouped-file-name.preferred-height) / 2) : 0px)
+                        && self.mouse-y < grouped-file-name.y + (root.view-mode == 3 || root.view-mode == 6 ? max(0px, (grouped-file-name.height - grouped-file-name.preferred-height) / 2) : 0px) + min(grouped-file-name.height, grouped-file-name.preferred-height)); }
                 }
             }
         }

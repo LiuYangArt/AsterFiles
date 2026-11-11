@@ -383,7 +383,7 @@ fn issue_177_native_left_list_click_exits_and_selects_on_first_click() {
     let state = f.state.clone();
     let clicks = Rc::new(Cell::new(0));
     let observed = clicks.clone();
-    f.ui.on_activate_entry(move |id, toggle, extend| {
+    f.ui.on_activate_entry(move |id, toggle, extend, _| {
         observed.set(observed.get() + 1);
         state
             .lock()
