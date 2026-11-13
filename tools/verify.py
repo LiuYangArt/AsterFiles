@@ -24,10 +24,21 @@ FULL_DEBUG_SUMMARY = VERIFY_DIR / "full-debug-summary.json"
 DEBUG = ROOT / "target" / "debug" / "asterfiles.exe"
 RELEASE = ROOT / "target" / "release" / "asterfiles.exe"
 VALIDATION_STAMP = VERIFY_DIR / "full-debug-success.json"
-LARGE_DIRECTORY_PROFILE = (
-    "app::large_directory_tests::"
-    "issue_175_large_directory_load_selection_and_scroll_profile"
-)
+PERFORMANCE_PROFILES = [
+    (
+        "large-directory-profile",
+        "app::large_directory_tests::issue_175_large_directory_load_selection_and_scroll_profile",
+    ),
+    (
+        "icons-profile",
+        "app::file_images_tests::issue_175_icons_real_shell_and_pixel_updates_stay_viewport_bounded",
+    ),
+    ("resize-profile", "app::refresh_tests::issue_162_resize_performance"),
+    (
+        "selection-profile",
+        "app::selection_scale_tests::issue_161_large_directory_selection_patches_rows_without_quadratic_lookups",
+    ),
+]
 
 SCENARIOS = [
     ("agent-actions", "agent-actions", STATE_DIR / "agent-actions" / "sequence.json"),
@@ -314,6 +325,10 @@ def scenario_steps() -> list[tuple[str, list[str]]]:
 
 
 def validation_steps(quick: bool, include_release: bool) -> list[tuple[str, list[str]]]:
+    # Keep wall-clock measurements out of the parallel functional suite (#184, #193).
+    functional_test = ["cargo", "test", "--workspace", "--locked", "--"]
+    for _, test in PERFORMANCE_PROFILES:
+        functional_test.extend(["--skip", test])
     steps = [
         (
             "build-cache",
@@ -351,17 +366,17 @@ def validation_steps(quick: bool, include_release: bool) -> list[tuple[str, list
             "clippy",
             ["cargo", "clippy", "--workspace", "--locked", "--all-targets", "--all-features", "--", "-D", "warnings"],
         ),
-        # Keep wall-clock measurements out of the parallel functional suite (#184).
-        ("test", ["cargo", "test", "--workspace", "--locked", "--", "--skip", LARGE_DIRECTORY_PROFILE]),
-        (
-            "large-directory-profile",
+        ("test", functional_test),
+    ]
+    for name, test in PERFORMANCE_PROFILES:
+        steps.append((
+            name,
             [
                 "cargo", "test", "--locked", "-p", "asterfiles", "--bin", "asterfiles",
-                LARGE_DIRECTORY_PROFILE, "--", "--exact", "--nocapture", "--test-threads=1",
+                test, "--", "--exact", "--nocapture", "--test-threads=1",
             ],
-        ),
-        ("debug", ["cargo", "build", "--locked"]),
-    ]
+        ))
+    steps.append(("debug", ["cargo", "build", "--locked"]))
     if not quick:
         steps.extend(scenario_steps())
         steps.append((

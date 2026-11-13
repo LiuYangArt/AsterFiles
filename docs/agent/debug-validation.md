@@ -90,6 +90,7 @@
 | [#183](#issue-183) | 快速访问 COM 配对（#183） |
 | [#184](#issue-184) | CI 性能测量隔离（#184） |
 | [#191](#issue-191) | 构建与缓存（#140、#191） |
+| [#192](#issue-192)、[#193](#issue-193) | 性能夹具与测量隔离 |
 
 <a id="issue-173"></a>
 
@@ -173,7 +174,7 @@ gh run download <失败演练编号> --dir artifacts/ci-failure-probe
 
 ## CI 性能测量隔离（#184）
 
-`python tools/verify.py` 的普通工作区测试保持默认并发，只排除 #175 十万条目计时测试。随后 `large-directory-profile` 步骤在独立进程中精确运行该测试。快速、完整 Debug 和未复用的本地 Release 验证均包含此步骤；失败时停止后续构建与场景。直接运行普通 `cargo test` 仍包含该测试。
+`python tools/verify.py` 的普通工作区测试保持默认并发，排除已登记的性能测试。随后独立执行大目录加载、图标、窗口缩放和大规模选择测量（#193）。每项使用独立进程、精确测试名和单测试线程。快速、完整 Debug 和未复用的本地 Release 验证均包含这些步骤；失败时停止后续构建与场景。直接运行普通 `cargo test` 仍包含这些测试。
 
 独立复验命令：
 
@@ -186,6 +187,24 @@ python tools/verify.py
 性能上限保持不变：首批小于 1 秒，完整加载小于 4 秒，其他界面处理上限见 #175 报告。测试使用无窗口后端，不启动桌面交互。日志为 `artifacts/logs/verify-large-directory-profile.log`，报告为 `artifacts/perf/issue-175/latest.json`，CI 同时上传 `perf/`。
 
 CI 运行 `41298432239` 中完整加载为 5089.7 ms，其中等待辅助进程 4517.6 ms；单批界面处理峰值为 13.6 ms，其他指标通过。原日志不能确定等待来自磁盘、调度还是后台扫描。隔离测量消除与普通测试的资源争用，不靠重试或放宽上限通过检查。
+
+<a id="issue-192"></a>
+<a id="issue-193"></a>
+
+## 性能夹具与测量隔离（#192、#193）
+
+大目录性能测试使用 `tempfile` 创建本次运行独占的夹具。文件全部创建完成后，先断言恰有 100,000 项，再开始计时。测试不读取共享的 `asterfiles-161` 目录，也不再支持 `ASTERFILES_ISSUE_175_DIR` 覆盖。回归检查相邻共享目录含 `fff.txt` 时，两份夹具仍保持独立，清理后共享文件内容不变。
+
+统一验证在并发功能测试后依次执行以下性能步骤，原有功能断言和耗时上限均保留：
+
+| 独立步骤 | 测量内容 | 日志与报告 |
+| --- | --- | --- |
+| `large-directory-profile` | 十万条目加载、框选与滚动 | `artifacts/logs/verify-large-directory-profile.log`；`artifacts/perf/issue-175/latest.json` |
+| `icons-profile` | 真实 Shell 图标回填与滚动，均小于 16 ms | `artifacts/logs/verify-icons-profile.log`；`artifacts/perf/issue-175/icons-after-fix.json` |
+| `resize-profile` | 窗口缩放峰值小于 16 ms | `artifacts/logs/verify-resize-profile.log`；`artifacts/perf/issue-162/latest.json` |
+| `selection-profile` | 大规模选择、重绘及耗时增长比 | `artifacts/logs/verify-selection-profile.log`；`artifacts/perf/issue-161/latest.json` |
+
+专项回归：`cargo test --locked issue_192 -- --nocapture` 和 `python tools/test_verify.py`。完整验证：`python tools/verify.py`。登记测试覆盖快速、完整 Debug 和本地 Release 模式，并检查任一性能步骤失败后停止后续构建。验证汇总为 `artifacts/verify/summary.json`。
 
 <a id="issue-140"></a>
 
@@ -905,7 +924,7 @@ python tools/build.py test --workspace --locked issue_161 -- --nocapture
 python tools/verify.py
 ```
 
-专项使用真实辅助进程读取 `%TEMP%\asterfiles-161` 的十万个空文件；缺少文件时自动补齐。加载记录首批行和完整加载耗时，并拆分辅助进程传输、批次合并排序、行投影与可见区工作。框选记录命中、选择更新、行更新、指针移动和边缘滚动；滚动记录 Rust 回调耗时及图片、文件夹大小和快捷方式请求数。测量只覆盖详细信息视图，包含未分组、类型分组和含文件夹的滚动夹具。
+专项每次创建独占临时目录和十万个空文件，再使用真实辅助进程读取。夹具在测试结束时自动清理；手动浏览使用的 `%TEMP%\asterfiles-161` 保留原状（#192）。加载记录首批行和完整加载耗时，并拆分辅助进程传输、批次合并排序、行投影与可见区工作。框选记录命中、选择更新、行更新、指针移动和边缘滚动；滚动记录 Rust 回调耗时及图片、文件夹大小和快捷方式请求数。测量只覆盖详细信息视图，包含未分组、类型分组和含文件夹的滚动夹具。
 
 几何对照检查不同高度的分组标题、行边界和列表外范围。批次回归核对前插、交错和末尾追加的行顺序；原地重命名和大小排序后同步重建索引，防止后续框选、图片和选择更新使用旧位置。性能测试设置耗时和请求数量上限。窗口区域刷新见 #162，列表与网格的按需模型及八视图验证见 #165。
 

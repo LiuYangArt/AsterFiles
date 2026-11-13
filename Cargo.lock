@@ -300,6 +300,7 @@ dependencies = [
  "i-slint-backend-testing",
  "ib-pinyin",
  "slint",
+ "tempfile",
  "windows-sys 0.61.2",
 ]
 

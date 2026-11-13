@@ -65,29 +65,59 @@ impl Stats {
     }
 }
 
-/// Uses the Agent-prepared `%TEMP%\asterfiles-161` (100k empty files) and fills any gap, so a
-/// fresh CI runner measures the same directory shape the user reported.
-fn local_fixture() -> PathBuf {
-    let directory = std::env::var_os("ASTERFILES_ISSUE_175_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("asterfiles-161"));
-    let existing = std::fs::read_dir(&directory).map_or(0, |entries| entries.count());
-    if existing < LARGE as usize {
-        std::fs::create_dir_all(&directory).unwrap();
-        for id in 1..=LARGE {
-            let path = directory.join(format!("item-{id:06}.txt"));
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => panic!("cannot create {path:?}: {error}"),
-            }
-        }
+// Own the fixture for this test run; a directory used for manual browsing is not a fixture.
+fn local_fixture(parent: &Path, count: u32) -> tempfile::TempDir {
+    let directory = tempfile::Builder::new()
+        .prefix("asterfiles-175-profile-")
+        .tempdir_in(parent)
+        .unwrap();
+    for id in 1..=count {
+        let path = directory.path().join(format!("item-{id:06}.txt"));
+        std::fs::File::create_new(&path).unwrap();
     }
+    let actual_count = std::fs::read_dir(directory.path())
+        .unwrap()
+        .try_fold(0, |count, entry| entry.map(|_| count + 1))
+        .unwrap();
+    assert_eq!(actual_count, count as usize);
     directory
+}
+
+#[test]
+fn issue_192_local_fixture_is_exclusive_and_preserves_shared_files() {
+    let parent = tempfile::tempdir().unwrap();
+    let shared = parent.path().join("asterfiles-161");
+    std::fs::create_dir(&shared).unwrap();
+    let user_file = shared.join("fff.txt");
+    std::fs::write(&user_file, b"user content").unwrap();
+    std::fs::write(shared.join("item-000001.txt"), b"existing item").unwrap();
+
+    let first = local_fixture(parent.path(), 3);
+    let second = local_fixture(parent.path(), 3);
+    assert_ne!(first.path(), second.path());
+    assert_ne!(first.path(), shared);
+    for fixture in [&first, &second] {
+        let mut names = std::fs::read_dir(fixture.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            (1..=3)
+                .map(|id| OsString::from(format!("item-{id:06}.txt")))
+                .collect::<Vec<_>>()
+        );
+    }
+    first.close().unwrap();
+    assert!(second.path().is_dir());
+    second.close().unwrap();
+    assert_eq!(std::fs::read(&user_file).unwrap(), b"user content");
+    assert_eq!(
+        std::fs::read(shared.join("item-000001.txt")).unwrap(),
+        b"existing item"
+    );
+    assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
 }
 
 fn synthetic_entry(id: u32, directory_every: u32) -> FileEntry {
@@ -829,8 +859,8 @@ fn issue_175_out_of_order_batches_keep_rows_in_pending_order() {
 #[test]
 fn issue_175_large_directory_load_selection_and_scroll_profile() {
     i_slint_backend_testing::init_no_event_loop();
-    let directory = local_fixture();
-    let load = profile_local_load(&directory);
+    let directory = local_fixture(&std::env::temp_dir(), LARGE);
+    let load = profile_local_load(directory.path());
     let rectangles = [
         profile_rectangle(GroupField::None, "none"),
         profile_rectangle(GroupField::Kind, "kind"),
@@ -859,7 +889,7 @@ fn issue_175_large_directory_load_selection_and_scroll_profile() {
             "  \"rectangle_selection\": ["
         ),
         LARGE,
-        directory.display().to_string(),
+        directory.path().display().to_string(),
         load.transport_first_ms,
         load.transport_total_ms,
         load.transport_batches,
