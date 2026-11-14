@@ -31,41 +31,7 @@ pub(super) fn wire_operations(
         request_clipboard_paste(&state_for_paste, &clipboard_for_paste);
     });
 
-    let weak = ui.as_weak();
-    let state_for_rename = state.clone();
-    ui.on_begin_rename(move || {
-        begin_rename_ui(&weak, &state_for_rename);
-    });
-    let weak = ui.as_weak();
-    let state_for_commit_rename = state.clone();
-    let sender_for_rename = operation_sender.clone();
-    ui.on_commit_rename(move |name| {
-        if let Err(message) =
-            submit_rename(&state_for_commit_rename, &sender_for_rename, name.as_str())
-        {
-            if let Ok(mut app) = state_for_commit_rename.lock() {
-                app.operation_errors.push(message);
-            }
-            if let Some(ui) = weak.upgrade() {
-                ui.set_rename_submitting(false);
-                ui.set_rename_submit_generation(ui.get_rename_submit_generation() + 1);
-                refresh_regions(&ui, &state_for_commit_rename, RefreshRegions::STATUS);
-            }
-        }
-    });
-    let weak = ui.as_weak();
-    let state_for_cancel_rename = state.clone();
-    ui.on_cancel_rename(move || {
-        if let Ok(mut app) = state_for_cancel_rename.lock() {
-            app.rename_targets
-                .remove(&state_for_cancel_rename.window_id);
-        }
-        if let Some(ui) = weak.upgrade() {
-            ui.set_rename_submitting(false);
-            ui.set_rename_editing(false);
-            refresh_regions(&ui, &state_for_cancel_rename, RefreshRegions::STATUS);
-        }
-    });
+    rename_submission::wire(ui, state, &operation_sender);
 
     let weak = ui.as_weak();
     let state_for_delete = state.clone();

@@ -95,6 +95,7 @@ mod refresh_tests;
 mod rename_click;
 #[cfg(test)]
 mod rename_interaction_tests;
+mod rename_submission;
 mod rename_updates;
 #[cfg(test)]
 mod scrollbar_tests;
@@ -1674,6 +1675,7 @@ struct AppState {
     operation_notice: Option<(u64, String)>,
     operation_notice_generation: u64,
     rename_targets: HashMap<WindowId, actions::EntryTarget>,
+    submitted_renames: HashMap<OperationId, rename_submission::Submission>,
     focus_after_refresh: HashMap<TabId, PendingFocus>,
     pending_rename_ui: HashMap<WindowId, PendingRenameUi>,
     active_operation_directories: HashMap<PathBuf, usize>,
@@ -1892,6 +1894,7 @@ impl AppState {
             operation_notice: None,
             operation_notice_generation: 0,
             rename_targets: HashMap::new(),
+            submitted_renames: HashMap::new(),
             focus_after_refresh: HashMap::new(),
             pending_rename_ui: HashMap::new(),
             active_operation_directories: HashMap::new(),
@@ -5531,7 +5534,7 @@ fn submit_rename(
     state: &WindowSessions,
     sender: &mpsc::Sender<FileOperationRequest>,
     name: &str,
-) -> Result<(), String> {
+) -> Result<Option<OperationId>, String> {
     let (target, language) = {
         let app = state
             .shared
@@ -5549,9 +5552,21 @@ fn submit_rename(
             .action_error("entry-unavailable")
             .to_owned()
     })?;
-    actions::rename(&state.shared, sender, target, name.into())
-        .map(|_| ())
-        .map_err(|error| Texts::new(language).action_error(error.code()).to_owned())
+    let unchanged = state.lock().ok().is_some_and(|app| {
+        app.tab(target.tab.tab_id)
+            .filter(|tab| tab.latest_request() == target.tab.request_id)
+            .and_then(|tab| tab.visible_entry(target.entry_id))
+            .is_some_and(|entry| entry.original_name == std::ffi::OsStr::new(name))
+    });
+    if unchanged {
+        return Ok(None);
+    }
+    let receipt = actions::rename(&state.shared, sender, target, name.into())
+        .map_err(|error| Texts::new(language).action_error(error.code()).to_owned())?;
+    let actions::ActionReceipt::OperationAccepted { id } = receipt else {
+        unreachable!("rename accepts an operation");
+    };
+    Ok(Some(id))
 }
 
 fn pending_permanent_delete(state: &WindowSessions) -> Option<(TabId, Vec<OperationItem>)> {
@@ -14503,6 +14518,8 @@ fn start_file_operation_event_pump(
                         if let Some(request) = next {
                             let _ = sender.send(request);
                         }
+                        let completed_rename =
+                            rename_submission::finish(&state, event_operation_id);
                         rename_updates::present(
                             &state,
                             rename_update,
@@ -14527,6 +14544,11 @@ fn start_file_operation_event_pump(
                             &state,
                             &affected,
                         );
+                        if let Some((submission, error)) = completed_rename
+                            && let Some(ui) = window_ui(submission.window_id())
+                        {
+                            rename_submission::present_completion(&ui, &state, submission, error);
+                        }
                     }
                 }
                 if let Some(conflict_ui) = conflict_weak.upgrade()
@@ -14538,36 +14560,6 @@ fn start_file_operation_event_pump(
                     conflict_ui.set_operation_id("".into());
                     conflict_ui.set_apply_all(false);
                     let _ = conflict_ui.hide();
-                }
-                let rename_update = state.lock().ok().and_then(|app| {
-                    let task = app.operations.task(event_operation_id)?;
-                    (task.kind == FileOperationKind::Rename
-                        && task.state != OperationState::Running)
-                        .then(|| {
-                            (
-                                task.origin_tab
-                                    .and_then(|tab_id| app.window_for_tab(tab_id)),
-                                task.state == OperationState::Completed,
-                                task.items.iter().find_map(|item| item.error.clone()),
-                            )
-                        })
-                });
-                if let Some((Some(window_id), completed, error)) = rename_update
-                    && let Some(ui) = window_ui(window_id)
-                {
-                    if completed {
-                        if let Ok(mut app) = state.lock() {
-                            app.rename_targets.remove(&window_id);
-                        }
-                        ui.set_rename_submitting(false);
-                        ui.set_rename_editing(false);
-                    } else if let Some(message) = error {
-                        if let Ok(mut app) = state.lock() {
-                            app.operation_errors.push(message);
-                        }
-                        ui.set_rename_submitting(false);
-                        ui.set_rename_submit_generation(ui.get_rename_submit_generation() + 1);
-                    }
                 }
                 if state
                     .lock()
@@ -14720,6 +14712,10 @@ fn refresh_affected_tabs(
             .collect::<Vec<_>>()
     };
     for (tab, location) in targets {
+        let previous_request = state
+            .lock()
+            .ok()
+            .and_then(|app| app.tab(tab).map(TabSession::latest_request));
         let pending = state.lock().ok().and_then(|mut app| {
             let path = location.directory_path()?;
             let pending = app.focus_after_refresh.remove(&tab)?;
@@ -14734,6 +14730,16 @@ fn refresh_affected_tabs(
             location,
             NavigationKind::BackgroundRefresh,
         ) {
+            if let Ok(mut app) = state.lock()
+                && let Some(request) = app.tab(tab).map(TabSession::latest_request)
+            {
+                // This is the same directory; keep an active editor bound to its refreshed request.
+                for target in app.rename_targets.values_mut() {
+                    if target.tab.tab_id == tab && Some(target.tab.request_id) == previous_request {
+                        target.tab.request_id = request;
+                    }
+                }
+            }
             if let Some(mut pending) = pending
                 && let Ok(mut app) = state.lock()
             {

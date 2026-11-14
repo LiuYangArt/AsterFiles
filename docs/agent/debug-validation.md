@@ -1326,6 +1326,8 @@ python tools/verify.py --quick
 
 #187 的框外点击回归覆盖详情、列表、内容、普通／分组网格和搜索结果，检查原目标提交一次、原点击选中新条目，以及 Ctrl／Shift 选择。另检查网格长名折行上移后的实际编辑边界。悬停外观由用户检查。
 
+#187 提交生命周期回归使用实际改名回调，检查原名未改时不创建任务、仅大小写变化仍提交、后台未完成时编辑框已退出且另一项选中。独占磁盘夹具检查真实改名与冲突拒绝、失败恢复原输入，以及旧任务不影响新编辑器。首次失败证据为 `artifacts/logs/issue-187-submit/before.log`；修复与统一验证日志在同目录。真实大目录验收：F2 后不改文字，单击另一项应立即结束；修改为新名字后重复，编辑框同样立即结束，稍后列表显示新名称。
+
 专项日志：`artifacts/logs/issue-187-pointer/targeted.log`；收尾日志：`artifacts/logs/rename-finish/`；统一验证汇总：`artifacts/verify/summary.json`。
 
 用户手动验收：

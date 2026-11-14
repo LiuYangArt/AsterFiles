@@ -14,7 +14,10 @@ struct RenameFixture {
 
 impl RenameFixture {
     fn new(mode: ViewMode, grouped: bool, name: &str) -> Self {
-        let root = PathBuf::from(r"C:\issue-187-memory");
+        Self::at(mode, grouped, name, PathBuf::from(r"C:\issue-187-memory"))
+    }
+
+    fn at(mode: ViewMode, grouped: bool, name: &str, root: PathBuf) -> Self {
         let mut app = AppState::new_for_test(vec![root.clone()], 0, [0, 1, 2, 3]);
         app.update_directory_preference(root.clone(), |preference| {
             preference.view_mode = mode;
@@ -614,16 +617,8 @@ fn issue_187_outside_click_commits_original_target_and_selects_other_item_once()
                 };
                 update_file_rows(&weak.upgrade().unwrap(), &selected, TabId(1), &changed);
             });
-        let targets = Rc::new(RefCell::new(Vec::new()));
-        let committed = fixture.commits.clone();
-        let owner = fixture.state.clone();
-        let captured = targets.clone();
-        fixture.ui.on_commit_rename(move |name| {
-            captured
-                .borrow_mut()
-                .push(owner.lock().unwrap().rename_targets[&owner.window_id]);
-            committed.borrow_mut().push(name.to_string());
-        });
+        let (sender, _pending_work) = mpsc::channel();
+        rename_submission::wire(&fixture.ui, &fixture.state, &sender);
         fixture.begin();
         fixture.ui.set_rename_input("changed.txt".into());
         let id = match (mode, grouped) {
@@ -644,7 +639,11 @@ fn issue_187_outside_click_commits_original_target_and_selects_other_item_once()
         let origin = other.absolute_position();
         let point = slint::LogicalPosition::new(origin.x + 10.0, origin.y + 10.0);
         fixture.move_pointer(point);
-        assert!(fixture.commits.borrow().is_empty(), "hover must not submit");
+        assert_eq!(
+            fixture.state.lock().unwrap().operations.iter().count(),
+            0,
+            "hover must not submit"
+        );
         if let Some(key) = modifier {
             fixture
                 .ui
@@ -658,16 +657,22 @@ fn issue_187_outside_click_commits_original_target_and_selects_other_item_once()
                 .window()
                 .dispatch_event(WindowEvent::KeyReleased { text: key.into() });
         }
-        assert_eq!(
-            *fixture.commits.borrow(),
-            ["changed.txt"],
-            "{mode:?}/{grouped}"
+        assert!(
+            !fixture.ui.get_rename_editing(),
+            "accepted work ends the editor"
         );
+        assert_eq!(fixture.state.lock().unwrap().submitted_renames.len(), 1);
+        let app = fixture.state.lock().unwrap();
+        let task = app.operations.iter().next().unwrap();
         assert_eq!(
-            targets.borrow()[0].entry_id,
-            EntryId(1),
-            "the original item owns the rename"
+            task.items[0].source.as_deref(),
+            Some(Path::new(r"C:\issue-187-memory\original.txt"))
         );
+        assert!(
+            !task.state.is_terminal(),
+            "the background worker has not completed"
+        );
+        drop(app);
         assert_eq!(
             fixture.state.lock().unwrap().active().selected,
             if modifier.is_some() {
@@ -717,3 +722,5 @@ fn issue_187_wrapped_editor_uses_actual_bounds_after_growing_upward() {
         assert_eq!(fixture.commits.borrow().len(), 1);
     }
 }
+
+mod submission;

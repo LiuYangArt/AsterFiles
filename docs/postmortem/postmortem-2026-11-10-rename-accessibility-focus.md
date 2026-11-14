@@ -27,3 +27,13 @@
 运行 `cargo test --workspace --locked rename_ -- --nocapture` 和 `python tools/verify.py --quick`。日志与汇总分别在 `artifacts/logs/issue-188-crash/`、`artifacts/logs/verify-test.log` 和 `artifacts/verify/summary.json`。实际 Windows 复验由用户对原文件执行，不由 Agent 操作窗口。
 
 若同类问题再次出现，先查 `artifacts/logs/file-operation-audit.jsonl` 中对应用户进程的 `rust-panic`，再对照 `rename-delay-fired` 和 `rename-editor-*` 阶段。测试子进程的 `issue-188-owned-panic-diagnostic-probe` 是预期记录，应按进程号区分。
+
+## 后续回归：提交接受不等于后台完成（#187）
+
+2026-11-14 用户反馈：点击另一条目后，新条目已选中，原改名框仍存在。用户进程 95912 的日志显示，编辑 `D:\Unreal Projects` 后单击另一项，数秒后才记录同路径改名，实际磁盘执行立即成功。
+
+提交入口此前只在后台完成后隐藏编辑框。目录改名准备会收集撤销所需的整棵目录树身份；即使名称没改，也等待这一步。原组件测试只记录提交回调和新选择，没有执行实际提交入口，也未检查旧编辑器退出，因而漏掉这个时序。
+
+修复区分界面编辑与后台任务：原名完全未变时直接结束；合法新名称被接受后立即结束，并按任务保存原输入。失败时只在原目录仍有效、且没有后来的编辑器时恢复，避免旧任务关闭或覆盖新编辑。后台目录遍历仍留在工作线程。
+
+`src/app/rename_interaction_tests/submission.rs` 以实际回调检查后台未完成时的编辑框退出，并用独占磁盘夹具检查成功、冲突和失败恢复。原实现的失败证据为 `artifacts/logs/issue-187-submit/before.log`。用户日志提取为同目录 `user-rename-events.json`。
