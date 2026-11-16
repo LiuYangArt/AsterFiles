@@ -79,7 +79,7 @@
 | [#171](#issue-171) | 语义颜色令牌与双主题（#171） |
 | [#172](#issue-172) | 界面拆分与文案投影（#172） |
 | [#173](#issue-173) | Windows 系统强调色（#173） |
-| [#187](#issue-187)、[#188](#issue-188) | 编辑器命中、延迟改名与双击 |
+| [#187](#issue-187)、[#188](#issue-188)、[#195](#issue-195) | 编辑器命中、延迟改名与双击 |
 | [#175](#issue-175) | Issue #175 十万条目目录加载、框选与滚动 |
 | [#176](#issue-176) | Temp 监听循环与本地刷新（#176） |
 | [#177](#issue-177) | Issue #177 地址栏退出编辑 |
@@ -1308,8 +1308,9 @@ python tools/verify.py --release
 
 <a id="issue-187"></a>
 <a id="issue-188"></a>
+<a id="issue-195"></a>
 
-## 改名编辑与名称点击（#187、#188）
+## 改名编辑与名称点击（#187、#188、#195）
 
 专项测试使用无原生窗口后端，不操作 AsterFiles 桌面界面：
 
@@ -1318,7 +1319,7 @@ cargo test --workspace --locked rename_ -- --nocapture
 python tools/verify.py --quick
 ```
 
-#187 覆盖文字点击、拖选、内边距、框外提交、Enter、Esc、中文与长名称。#188 使用可控时间检查双击优先、延迟和失效目标，并区分名称与图标、空白、其他列的命中。
+#187 覆盖文字点击、拖选、内边距、框外提交、Enter、Esc、中文与长名称。#188 使用可控时间检查双击优先、延迟和失效目标。#195 将详情列表的改名点击范围扩大到整个名称单元格，覆盖短名称留白、上下内边距、列宽变化、列换序、横向滚动、搜索结果和分组。其他列及其他布局的点击规则保持原样。再次单击后仍等待系统双击间隔，例如系统设置为 500 ms 时就等待 500 ms。Microsoft 的 [GetDoubleClickTime 说明](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getdoubleclicktime)定义双击判定间隔；[Wine 列表参考实现](https://github.com/wine-mirror/wine/blob/master/dlls/comctl32/listview.c)也使用该间隔延迟改名。Explorer 的实际体感由用户对照验收。专项日志：`artifacts/logs/issue-195-rename/`。
 
 #188 的单击改名崩溃诊断复用 `artifacts/logs/file-operation-audit.jsonl`。`rename-delay-fired`、`rename-editor-preparing`、`rename-editor-activating` 和 `rename-editor-activated` 标记进入阶段；`rust-panic` 记录错误位置与完整栈，致命错误退出前等待后台日志写入完成。测试中的 `issue-188-owned-panic-diagnostic-probe` 是独占子进程主动触发的预期测试记录，排查用户崩溃时按进程号区分。
 
@@ -1333,6 +1334,8 @@ python tools/verify.py --quick
 用户手动验收：
 
 1. 在详情、列表、内容、普通及分组网格中，F2 后点击文字首中尾、拖选、点击内边距，确认继续编辑；检查 Enter、Esc；编辑期间移向其他条目应有悬停，单击一次即提交原改名并选中目标，Ctrl／Shift 选择规则不变。再检查已选项名称单击等待、快速双击、Ctrl／Shift、多选、拖拽和等待期间换目录／标签或失焦。
+
+2. #195：在详情列表选中短名称条目，停顿后点击名称列右侧留白、上边缘和下边缘，均应进入改名。调整名称列宽、换序并横向滚动后重复，日期等其他列应只处理选择。在搜索结果和分组列表重复。最后与 Explorer 对照慢速再次单击的等待感受，确认双击始终打开。
 
 <a id="issue-194"></a>
 

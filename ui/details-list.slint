@@ -115,8 +115,17 @@ export component DetailsList inherits ListView {
                         visible: column.visible && (root.view-mode == 0 || column.kind == 0);
                         width: self.visible ? (root.view-mode == 0 ? root.column-width(column.kind) : parent.width) : 0px;
                         clip: true;
-                        if column.kind == 0: Rectangle {
+                        if column.kind == 0: name-cell := Rectangle {
                             clip: true;
+                            function sync-cell-hit() {
+                                if root.view-mode == 0 {
+                                    file-row.name-left = self.absolute-position.x;
+                                    file-row.name-width = self.width;
+                                }
+                            }
+                            init => { self.sync-cell-hit(); }
+                            changed absolute-position => { self.sync-cell-hit(); }
+                            changed width => { self.sync-cell-hit(); }
                             InlineIcon { x: column.content-left; width: 20px; height: 20px; icon-source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document); }
                             if !(root.rename-editing && root.rename-entry-id == entry.id): details-name := Rectangle {
                                 x: column.content-left + column.icon-slot;
@@ -126,7 +135,7 @@ export component DetailsList inherits ListView {
                                 property <length> hit-width: min(self.width, segment-layout.preferred-width);
                                 property <length> hit-height: min(self.height, segment-layout.preferred-height);
                                 function sync-name-hit() {
-                                    if root.view-mode != 7 {
+                                    if root.view-mode != 0 && root.view-mode != 7 {
                                         file-row.name-left = self.absolute-position.x;
                                         file-row.name-top = self.absolute-position.y + (self.height - self.hit-height) / 2;
                                         file-row.name-width = self.hit-width;
@@ -279,11 +288,15 @@ export component DetailsList inherits ListView {
                 }
                 return accept;
             }
-            clicked => { root.activate-entry(entry.id, self.click-control, self.click-shift,
-                self.absolute-position.x + self.mouse-x >= file-row.name-left
-                && self.absolute-position.x + self.mouse-x < file-row.name-left + file-row.name-width
-                && self.absolute-position.y + self.mouse-y >= file-row.name-top
-                && self.absolute-position.y + self.mouse-y < file-row.name-top + file-row.name-height); }
+            clicked => {
+                let x = self.absolute-position.x + self.mouse-x;
+                let y = self.absolute-position.y + self.mouse-y;
+                let name-hit = x >= file-row.name-left
+                    && x < file-row.name-left + file-row.name-width
+                    && (root.view-mode == 0 || (y >= file-row.name-top
+                        && y < file-row.name-top + file-row.name-height));
+                root.activate-entry(entry.id, self.click-control, self.click-shift, name-hit);
+            }
         }
         if entry.focused: Rectangle {
             init => {

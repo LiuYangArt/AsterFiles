@@ -321,7 +321,7 @@ fn issue_187_outside_and_enter_submit_once_while_escape_only_cancels() {
 }
 
 #[test]
-fn issue_188_real_file_rows_distinguish_name_from_icon_blank_and_other_columns() {
+fn issue_195_rename_rows_distinguish_name_cell_from_other_columns_and_layouts() {
     i_slint_backend_testing::init_no_event_loop();
     for (mode, grouped) in layouts() {
         let fixture = RenameFixture::new(mode, grouped, "abcdef.txt");
@@ -377,7 +377,7 @@ fn issue_188_real_file_rows_distinguish_name_from_icon_blank_and_other_columns()
         fixture.click(icon);
         assert_eq!(
             *fixture.activations.borrow(),
-            vec![(1, false)],
+            vec![(1, mode == ViewMode::Details)],
             "{mode:?}/{grouped}: icon"
         );
         fixture.activations.borrow_mut().clear();
@@ -401,6 +401,89 @@ fn issue_188_real_file_rows_distinguish_name_from_icon_blank_and_other_columns()
                 vec![(1, false)],
                 "other details column"
             );
+        }
+    }
+}
+
+#[test]
+fn issue_195_rename_name_cell_tracks_width_order_scroll_search_and_groups() {
+    i_slint_backend_testing::init_no_event_loop();
+    for search in [false, true] {
+        for grouped in [false, true] {
+            let fixture = RenameFixture::new(ViewMode::Details, grouped, "a.txt");
+            let last_row_element = |id: &str| {
+                fixture
+                    .ui
+                    .root_element()
+                    .query_descendants()
+                    .match_id(id)
+                    .find_all()
+                    .into_iter()
+                    .rfind(|item| item.size().width > 0.0 && item.size().height > 0.0)
+                    .unwrap()
+            };
+            if search {
+                let mut app = fixture.state.lock().unwrap();
+                let entries = app.active().entries.as_ref().clone();
+                let tab = app.tab_mut(TabId(1)).unwrap();
+                tab.begin_search(SearchScope::Global, ".txt".into());
+                tab.merge_search_page(0, entries, 1, 1, 0);
+                tab.search_state = SearchState::Complete;
+                tab.select_entry(EntryId(1), false, false);
+            }
+            for (width, reorder, scroll) in
+                [(480, false, 0.0), (200, false, 0.0), (640, true, -100.0)]
+            {
+                {
+                    let mut app = fixture.state.lock().unwrap();
+                    app.update_active_column_layout(|layout| {
+                        layout.widths[ColumnKind::Name.storage_code() as usize] = width;
+                        if reorder {
+                            layout.order.swap(0, 1);
+                        }
+                    });
+                }
+                refresh_ui(&fixture.ui, &fixture.state);
+                fixture.ui.set_file_viewport_x(scroll);
+                fixture.ui.window().request_redraw();
+                let cell = last_row_element("DetailsList::name-cell");
+                let origin = cell.absolute_position();
+                let size = cell.size();
+                assert_eq!(size.width, width as f32);
+                let row = last_row_element("DetailsList::mouse");
+                let row_origin = row.absolute_position();
+                let row_size = row.size();
+                for (x, y, expected) in [
+                    (origin.x + 1.0, row_origin.y + 1.0, true),
+                    (origin.x + size.width - 1.0, row_origin.y + 1.0, true),
+                    (
+                        origin.x + size.width - 1.0,
+                        row_origin.y + row_size.height - 1.0,
+                        true,
+                    ),
+                    (
+                        origin.x + size.width,
+                        row_origin.y + row_size.height / 2.0,
+                        false,
+                    ),
+                ] {
+                    fixture.activations.borrow_mut().clear();
+                    fixture.click(slint::LogicalPosition::new(x, y));
+                    assert_eq!(
+                        *fixture.activations.borrow(),
+                        vec![(1, expected)],
+                        "search={search} grouped={grouped} width={width} reorder={reorder} scroll={scroll} at {x},{y}"
+                    );
+                }
+                if reorder {
+                    fixture.activations.borrow_mut().clear();
+                    fixture.click(slint::LogicalPosition::new(
+                        origin.x - 1.0,
+                        row_origin.y + row_size.height / 2.0,
+                    ));
+                    assert_eq!(*fixture.activations.borrow(), vec![(1, false)]);
+                }
+            }
         }
     }
 }
