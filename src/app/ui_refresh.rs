@@ -302,7 +302,10 @@ fn project_files(
                     tab,
                     app,
                     search_window,
-                    file_thumbnail_request_px(view_mode, ui.window().scale_factor()),
+                    Some(grid_thumbnail_request_px(
+                        view_mode,
+                        ui.window().scale_factor(),
+                    )),
                 ),
                 Vec::new(),
             )
@@ -355,13 +358,8 @@ fn project_navigation(
     };
     let current_location_path = tab.visible_path();
     ui.set_current_location_icon(
-        tab.visible_location()
-            .and_then(|location| match location {
-                NavigationLocation::Home | NavigationLocation::WebDav(_) => None,
-                NavigationLocation::Directory(path) => app.image_cache.ordinary.get(path),
-                NavigationLocation::Library(library) => app.library_icons.get(&library.identity),
-            })
-            .map(shell_icon_image)
+        file_images::location_icon(app, tab)
+            .map(file_images::image)
             .unwrap_or_default(),
     );
     ui.set_current_location_is_drive(current_location_path.is_some_and(is_drive_root));
@@ -532,10 +530,8 @@ fn project_tabs(ui: &AppWindow, app: &AppState, window: &WindowState) {
                 .into(),
                 active: tab.id == window.active_tab,
                 loading: matches!(tab.load_state, LoadState::Loading | LoadState::Partial),
-                icon: tab
-                    .visible_path()
-                    .and_then(|path| app.image_cache.ordinary.get(path))
-                    .map(shell_icon_image)
+                icon: file_images::location_icon(app, tab)
+                    .map(file_images::image)
                     .unwrap_or_default(),
                 is_drive: tab.visible_path().is_some_and(is_drive_root),
                 is_home: matches!(tab.visible_location(), Some(NavigationLocation::Home)),

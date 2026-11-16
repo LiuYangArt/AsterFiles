@@ -822,6 +822,7 @@ fn library_projection_entry(id: u32, source_index: usize, path: &str) -> FileEnt
         kind: crate::domain::EntryKind::File,
         open_target: None,
         library_source_index: Some(source_index),
+        icon_requires_path: false,
         parent_display: path.parent().map(display_path).unwrap_or_default(),
         size_bytes: Some(1),
         folder_size: FolderSizeState::Unknown,
@@ -3263,14 +3264,14 @@ fn issue_99_switch_to_list_dispatches_missing_icons_once_and_uses_completed_cach
             .try_recv()
             .expect("switching to a row view must request its ordinary icon");
         assert!(!request.thumbnail);
-        assert_eq!(request.requested_px, 0);
+        assert_eq!(request.requested_px, 32);
         assert_eq!(request.target, IconTarget::Entry(EntryId(1)));
         request_visible_file_images(&ui, &state, WindowId(1), &scheduler);
         assert!(receiver.try_recv().is_err());
 
         let mut completed = issue_98_icon_event(r"C:\grid\model.mtl");
         completed.path = request.path;
-        completed.requested_px = 0;
+        completed.requested_px = request.requested_px;
         completed.type_key = request.type_key;
         completed.icon = test_image(32);
         assert!(apply_icon_event(&state, completed).is_some());
@@ -3285,7 +3286,7 @@ fn issue_99_switch_to_list_dispatches_missing_icons_once_and_uses_completed_cach
                 tab,
                 Texts::new(Language::Chinese),
                 &app,
-                None
+                Some(32)
             )
             .icon
             .size()
@@ -3429,6 +3430,7 @@ fn issue_98_icon_event(path: &str) -> IconEvent {
         path: PathBuf::from(path),
         icon: test_image(128),
         actual_thumbnail: false,
+        thumbnail_requested: true,
         requested_px: 128,
         type_key: None,
         thumbnail_failed: false,
@@ -3438,6 +3440,9 @@ fn issue_98_icon_event(path: &str) -> IconEvent {
 
 fn issue_98_state() -> SharedSessions {
     let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\grid")], 0, [0, 1, 2, 3]);
+    app.update_directory_preference(PathBuf::from(r"C:\grid"), |view| {
+        view.view_mode = ViewMode::MediumIcons
+    });
     let tab = app.tab_mut(TabId(1)).unwrap();
     advance_test_navigation(tab, RequestId(12));
     tab.replace_entries(vec![focus_entry(1, r"C:\grid\model.mtl")]);
@@ -3534,6 +3539,7 @@ fn issue_155_completed_rename_refresh_requests_new_path_and_restores_thumbnail()
         path: key.path,
         icon: test_image(key.requested_px),
         actual_thumbnail: true,
+        thumbnail_requested: true,
         requested_px: key.requested_px,
         type_key: None,
         thumbnail_failed: false,
@@ -3545,70 +3551,70 @@ fn issue_155_completed_rename_refresh_requests_new_path_and_restores_thumbnail()
 }
 
 #[test]
-fn issue_156_content_and_details_request_and_project_thumbnails() {
+fn issue_156_content_requests_and_projects_thumbnails() {
     i_slint_backend_testing::init_no_event_loop();
-    for mode in [ViewMode::Content, ViewMode::Details] {
-        let ui = AppWindow::new().unwrap();
-        ui.window().set_size(slint::LogicalSize::new(1180.0, 760.0));
-        let state = issue_98_state();
-        let sessions = WindowSessions::new(state.clone(), WindowId(1));
-        {
-            let mut app = state.lock().unwrap();
-            app.update_directory_preference(PathBuf::from(r"C:\grid"), |view| {
-                view.view_mode = mode;
-                view.group_field = GroupField::Kind;
-            });
-            let tab = app.tab_mut(TabId(1)).unwrap();
-            tab.load_state = LoadState::Complete;
-            tab.replace_entries(
-                (1..=1000)
-                    .map(|id| focus_entry(id, &format!(r"C:\grid\image{id:04}.png")))
-                    .collect(),
-            );
-        }
-        refresh_ui(&ui, &sessions);
-        let (residents, requests) = list_icon_plan(&ui, &state, WindowId(1));
-        assert!(requests.len() > 1 && requests.len() < 1000);
-        let requested_px = file_thumbnail_request_px(mode, ui.window().scale_factor()).unwrap();
-        assert!(
-            requests
-                .iter()
-                .all(|request| request.thumbnail && request.requested_px == requested_px)
+    let mode = ViewMode::Content;
+    let ui = AppWindow::new().unwrap();
+    ui.window().set_size(slint::LogicalSize::new(1180.0, 760.0));
+    let state = issue_98_state();
+    let sessions = WindowSessions::new(state.clone(), WindowId(1));
+    {
+        let mut app = state.lock().unwrap();
+        app.update_directory_preference(PathBuf::from(r"C:\grid"), |view| {
+            view.view_mode = mode;
+            view.group_field = GroupField::Kind;
+        });
+        let tab = app.tab_mut(TabId(1)).unwrap();
+        tab.load_state = LoadState::Complete;
+        tab.replace_entries(
+            (1..=1000)
+                .map(|id| focus_entry(id, &format!(r"C:\grid\image{id:04}.png")))
+                .collect(),
         );
-        assert_eq!(residents.len(), requests.len());
-        let request = &requests[0];
-        let event = IconEvent {
-            tab_id: request.tab_id,
-            request_id: request.request_id,
-            target: request.target,
-            path: request.path.clone(),
-            icon: test_image(requested_px),
-            actual_thumbnail: true,
-            requested_px,
-            type_key: None,
-            thumbnail_failed: false,
-            thumbnail_plan: None,
-        };
-        update_icon_row(&ui, &state, apply_icon_event(&state, event).unwrap());
-        let first = || ui.get_files().iter().find(|row| row.id == 1).unwrap();
-        assert_eq!(first().thumbnail_state, 2);
-        assert_eq!(first().icon.size().width, requested_px);
-        refresh_ui(&ui, &sessions);
-        assert_eq!(
-            first().icon.size().width,
-            requested_px,
-            "full projection must retain cached thumbnails"
-        );
-        assert!(
-            list_icon_plan(&ui, &state, WindowId(1))
-                .1
-                .iter()
-                .all(|request| request.target != IconTarget::Entry(EntryId(1)))
-        );
-        ui.set_file_viewport_y(-800.0);
-        let (scrolled, _) = list_icon_plan(&ui, &state, WindowId(1));
-        assert!(!scrolled.contains(&EntryId(1)));
     }
+    refresh_ui(&ui, &sessions);
+    let (residents, requests) = list_icon_plan(&ui, &state, WindowId(1));
+    assert!(requests.len() > 1 && requests.len() < 1000);
+    let requested_px = grid_thumbnail_request_px(mode, ui.window().scale_factor());
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.thumbnail && request.requested_px == requested_px)
+    );
+    assert_eq!(residents.len(), requests.len());
+    let request = &requests[0];
+    let event = IconEvent {
+        tab_id: request.tab_id,
+        request_id: request.request_id,
+        target: request.target,
+        path: request.path.clone(),
+        icon: test_image(requested_px),
+        actual_thumbnail: true,
+        thumbnail_requested: true,
+        requested_px,
+        type_key: None,
+        thumbnail_failed: false,
+        thumbnail_plan: None,
+    };
+    update_icon_row(&ui, &state, apply_icon_event(&state, event).unwrap());
+    let first = || ui.get_files().iter().find(|row| row.id == 1).unwrap();
+    assert_eq!(first().thumbnail_state, 2);
+    assert_eq!(first().icon.size().width, requested_px);
+    refresh_ui(&ui, &sessions);
+    assert_eq!(
+        first().icon.size().width,
+        requested_px,
+        "full projection must retain cached thumbnails"
+    );
+    assert!(
+        list_icon_plan(&ui, &state, WindowId(1))
+            .1
+            .iter()
+            .all(|request| request.target != IconTarget::Entry(EntryId(1)))
+    );
+    ui.set_file_viewport_y(-800.0);
+    let (scrolled, _) = list_icon_plan(&ui, &state, WindowId(1));
+    assert!(!scrolled.contains(&EntryId(1)));
 }
 
 #[test]
@@ -3874,6 +3880,7 @@ fn issue_65_network_entries_request_shared_type_icons_without_thumbnails() {
         entry_type_icon_key(
             Path::new(r"C:\local\model.BLEND"),
             crate::domain::EntryKind::File,
+            false,
         )
     );
     assert_eq!(
@@ -3934,6 +3941,7 @@ fn issue_65_type_icon_events_keep_request_and_entry_identity() {
     let key = entry_type_icon_key(
         Path::new(r"\\server\share\model.obj"),
         crate::domain::EntryKind::File,
+        false,
     )
     .unwrap();
     let event = IconEvent {
@@ -3947,6 +3955,7 @@ fn issue_65_type_icon_events_keep_request_and_entry_identity() {
             pixels: vec![0, 0, 0, 0].into(),
         },
         actual_thumbnail: false,
+        thumbnail_requested: true,
         requested_px: 0,
         type_key: Some(key),
         thumbnail_failed: false,
@@ -5481,6 +5490,7 @@ fn search_and_icon_events_route_to_non_active_windows() {
             pixels: vec![0, 0, 0, 0].into(),
         },
         actual_thumbnail: false,
+        thumbnail_requested: true,
         requested_px: 0,
         type_key: None,
         thumbnail_failed: false,
@@ -6640,6 +6650,7 @@ fn icon_events_require_matching_tab_request_entry_and_path() {
         kind: crate::domain::EntryKind::File,
         open_target: None,
         library_source_index: None,
+        icon_requires_path: false,
         parent_display: "same".into(),
         size_bytes: Some(1),
         folder_size: crate::domain::FolderSizeState::Unknown,
@@ -6658,6 +6669,7 @@ fn icon_events_require_matching_tab_request_entry_and_path() {
             pixels: vec![0, 0, 0, 0].into(),
         },
         actual_thumbnail: false,
+        thumbnail_requested: true,
         requested_px: 0,
         type_key: None,
         thumbnail_failed: false,
@@ -6672,6 +6684,7 @@ fn icon_events_require_matching_tab_request_entry_and_path() {
         path: PathBuf::from("same"),
         icon: event.icon.clone(),
         actual_thumbnail: false,
+        thumbnail_requested: true,
         requested_px: 0,
         type_key: None,
         thumbnail_failed: false,
@@ -6746,6 +6759,7 @@ fn stale_folder_size_event_cannot_update_reused_entry_id() {
         kind: crate::domain::EntryKind::Directory,
         open_target: None,
         library_source_index: None,
+        icon_requires_path: false,
         parent_display: r"C:\current".into(),
         size_bytes: None,
         folder_size: FolderSizeState::Querying,
@@ -6818,6 +6832,7 @@ fn focus_entry(id: u32, path: &str) -> FileEntry {
         kind: crate::domain::EntryKind::File,
         open_target: None,
         library_source_index: None,
+        icon_requires_path: false,
         parent_display: String::new(),
         size_bytes: Some(1),
         folder_size: crate::domain::FolderSizeState::Unknown,
@@ -7533,6 +7548,7 @@ fn repeated_context_menu_hit_test_switches_between_entry_and_background() {
             kind: crate::domain::EntryKind::File,
             open_target: None,
             library_source_index: None,
+            icon_requires_path: false,
             parent_display: "C:/test".into(),
             size_bytes: Some(1),
             folder_size: crate::domain::FolderSizeState::Unknown,
@@ -7612,6 +7628,7 @@ fn context_menu_hit_test_accounts_for_negative_viewport_offset() {
                         kind: crate::domain::EntryKind::File,
                         open_target: None,
                         library_source_index: None,
+                        icon_requires_path: false,
                         parent_display: "C:/test".into(),
                         size_bytes: Some(1),
                         folder_size: crate::domain::FolderSizeState::Unknown,

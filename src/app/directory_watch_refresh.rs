@@ -259,6 +259,7 @@ fn same_entry(previous: Option<&FileEntry>, current: Option<&FileEntry>) -> bool
             previous.path == current.path
                 && previous.original_name == current.original_name
                 && original_kind == current.kind
+                && previous.icon_requires_path == current.icon_requires_path
                 && previous.size_bytes == current.size_bytes
                 && previous.modified == current.modified
                 && previous.created == current.created

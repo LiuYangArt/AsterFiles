@@ -23,6 +23,7 @@ fn fixture(count: u32, mode: ViewMode, group: GroupField) -> (WindowSessions, Ap
                     kind: crate::domain::EntryKind::File,
                     open_target: None,
                     library_source_index: None,
+                    icon_requires_path: false,
                     parent_display: String::new(),
                     size_bytes: Some(u64::from(id)),
                     folder_size: FolderSizeState::NotIndexed,

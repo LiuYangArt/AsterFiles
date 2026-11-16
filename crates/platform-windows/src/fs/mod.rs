@@ -13,5 +13,5 @@ pub fn is_directory_work_path(path: &std::path::Path) -> bool {
     })
 }
 
-pub(crate) use directory_reader::read_directory_entry;
 pub use directory_reader::read_path_entry;
+pub(crate) use directory_reader::{directory_icon_requires_path, read_directory_entry};

@@ -93,14 +93,13 @@ export component FileGrid inherits Rectangle {
                 border-radius: 7px;
                 background: entry.selected ? VisualStyle.selection : card-touch.has-hover ? VisualStyle.accent-hover : transparent;
                 Image {
-                    private property <length> fallback-size: min(root.layout-icon-size, 48px);
                     x: root.view-mode == 3 ? 4px : root.view-mode == 6 ? 8px + (root.layout-icon-size - self.width) / 2 : (parent.width - self.width) / 2;
-                    y: root.view-mode == 3 ? 4px : entry.icon.width != 0 ? 8px : (root.layout-icon-size - self.height) / 2 + 8px;
-                    width: entry.icon.width != 0 ? root.layout-icon-size : self.fallback-size;
-                    height: entry.icon.width != 0 ? root.layout-icon-size : self.fallback-size;
+                    y: root.view-mode == 3 ? 4px : 8px;
+                    width: root.layout-icon-size;
+                    height: root.layout-icon-size;
                     source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document);
                     image-fit: contain;
-                    opacity: entry.thumbnail-state == 1 ? 0.5 : 1;
+                    opacity: 1;
                 }
                 file-name := Text {
                     visible: !(root.rename-editing && root.rename-entry-id == entry.id);
@@ -199,14 +198,13 @@ export component FileGrid inherits Rectangle {
                 border-radius: 7px;
                 background: entry.selected ? VisualStyle.selection : grouped-card-touch.has-hover ? VisualStyle.accent-hover : transparent;
                 Image {
-                    private property <length> fallback-size: min(root.layout-icon-size, 48px);
                     x: root.view-mode == 3 ? 4px : root.view-mode == 6 ? 8px + (root.layout-icon-size - self.width) / 2 : (parent.width - self.width) / 2;
-                    y: root.view-mode == 3 ? 4px : entry.icon.width != 0 ? 8px : (root.layout-icon-size - self.height) / 2 + 8px;
-                    width: entry.icon.width != 0 ? root.layout-icon-size : self.fallback-size;
-                    height: entry.icon.width != 0 ? root.layout-icon-size : self.fallback-size;
+                    y: root.view-mode == 3 ? 4px : 8px;
+                    width: root.layout-icon-size;
+                    height: root.layout-icon-size;
                     source: entry.icon.width != 0 ? entry.icon : (entry.is-directory ? IconMap.file-folder : IconMap.file-document);
                     image-fit: contain;
-                    opacity: entry.thumbnail-state == 1 ? 0.5 : 1;
+                    opacity: 1;
                 }
                 grouped-file-name := Text {
                     visible: !(root.rename-editing && root.rename-entry-id == entry.id);

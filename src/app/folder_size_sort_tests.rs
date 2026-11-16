@@ -28,6 +28,7 @@ fn entry(id: u32) -> FileEntry {
         kind,
         open_target: None,
         library_source_index: None,
+        icon_requires_path: false,
         parent_display: DIRECTORY.to_owned(),
         size_bytes,
         folder_size: FolderSizeState::Unknown,

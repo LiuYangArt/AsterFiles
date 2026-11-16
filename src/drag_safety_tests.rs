@@ -24,6 +24,7 @@ fn memory_app() -> AppState {
         kind: crate::domain::EntryKind::Directory,
         open_target: None,
         library_source_index: None,
+        icon_requires_path: false,
         parent_display: "C:/issue-93-memory/source".into(),
         size_bytes: None,
         folder_size: FolderSizeState::Unknown,

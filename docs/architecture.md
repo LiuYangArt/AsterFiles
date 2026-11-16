@@ -86,7 +86,7 @@ Slint 语义使用与语言无关的控件标识。条目标识包含窗口、�
 | 职责 | 实现入口 | 状态与依赖边界 |
 | --- | --- | --- |
 | 目录按需显示 | `src/app/directory_model.rs`：`DirectoryRows`、`DirectoryGrid`、`PositionedDirectoryGrid` | 共享原始条目快照与显示索引；按请求生成列表和网格行；模型直接提供条目位置与分组几何，选择、图片和内容更新只通知变化行；Everything 保留原有稀疏分页 |
-| 图像缓存 | `src/app/icon_cache.rs`：`IconCache`、`BoundedImages` | 四套图像缓存仍由 `AppState.image_cache` 持有；普通和类型图标保留原容量规则，两套预览缓存各限 128 项，按最后写入顺序淘汰，读取不改变顺序；改名迁移在缓存内部完成 |
+| 图像缓存 | `src/app/icon_cache.rs`：`IconCache`、`BoundedImages` | 图像缓存由 `AppState.image_cache` 持有；普通和类型图标保留原容量规则，私有尺寸图标、真实缩略图和预览后系统图标各限 128 项（#194），按最后写入顺序淘汰，读取不改变顺序；改名迁移在缓存内部完成 |
 | 查询与系统集成状态 | `src/app/app_state.rs`：`EverythingState`、`IntegrationState` | 仍是 `AppState` 的字段，沿用同一把锁和原有请求代次、忙碌状态及错误记录，不建立独立状态副本 |
 | 窗口回调组装 | `src/app/callbacks.rs`：`wire_callbacks` | 复用既有工作通道与确认窗口，按原顺序注册；`callbacks/` 下按地址栏、文件列表、导航、侧栏、标签、设置、菜单和任务划分职责 |
 | 名称点击与延迟改名 | `src/app/rename_click.rs`、`src/app/rename_submission.rs`、`callbacks/file_list.rs` | 每窗独立计时；系统双击窗口内优先打开，执行前核对原始身份与唯一选择；提交接受即退出窗口覆盖层编辑器，后台失败按任务自己的输入和目标恢复 |

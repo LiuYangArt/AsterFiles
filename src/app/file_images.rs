@@ -36,6 +36,32 @@ pub(super) fn image(source: &ShellIconRgba) -> Image {
     })
 }
 
+/// Location chrome reuses system icons while its path-specific Shell request is pending.
+pub(super) fn location_icon<'a>(app: &'a AppState, tab: &TabSession) -> Option<&'a ShellIconRgba> {
+    match tab.visible_location()? {
+        NavigationLocation::Home | NavigationLocation::WebDav(_) => None,
+        NavigationLocation::Library(library) => app.library_icons.get(&library.identity),
+        NavigationLocation::Directory(path) => app
+            .image_cache
+            .ordinary
+            .get(path)
+            .or_else(|| app.sidebar_icons.get(path))
+            .or_else(|| app.image_cache.path_icons.get(&(path.clone(), 32)))
+            .or_else(|| app.image_cache.grid_icons.get(&(path.clone(), 32)))
+            .or_else(|| {
+                if is_drive_root(path) {
+                    return None;
+                }
+                app.image_cache
+                    .types
+                    .iter()
+                    .filter(|((key, _), _)| *key == ShellTypeIconKey::Directory)
+                    .min_by_key(|((_, px), _)| px.abs_diff(32))
+                    .map(|(_, icon)| icon)
+            }),
+    }
+}
+
 pub(super) fn shared_icon_request(
     app: &mut AppState,
     tab_id: TabId,
@@ -44,7 +70,7 @@ pub(super) fn shared_icon_request(
     size: u32,
 ) -> Option<IconRequest> {
     let entry_path = entry.path();
-    let type_key = entry_type_icon_key(&entry_path, entry.kind);
+    let type_key = entry_type_icon_key(&entry_path, entry.kind, entry.icon_requires_path);
     let path = if let Some(key) = &type_key {
         let identity = (key.clone(), size);
         if app.image_cache.types.contains_key(&identity) || !app.type_icon_requests.insert(identity)
@@ -53,10 +79,17 @@ pub(super) fn shared_icon_request(
         }
         key.query_path()
     } else {
-        if app.image_cache.ordinary.contains_key(&entry_path)
+        let cached = if size == 0 {
+            app.image_cache.ordinary.contains_key(&entry_path)
+        } else {
+            app.image_cache
+                .path_icons
+                .contains_key(&(entry_path.clone(), size))
+        };
+        if cached
             || !app
                 .ordinary_icon_requests
-                .insert((tab_id, request_id, entry_path.clone()))
+                .insert((tab_id, request_id, entry_path.clone(), size))
         {
             return None;
         }
@@ -123,36 +156,48 @@ pub(super) fn row_image(
     grid_requested_px: Option<u32>,
 ) -> (Image, i32) {
     let entry_path = entry.path();
-    let grid_image = grid_requested_px.and_then(|requested_px| {
-        app.image_cache
-            .thumbnails
-            .get(&(entry_path.clone(), requested_px))
-    });
+    let previews = app
+        .view_mode_for_tab(tab.id)
+        .is_some_and(view_uses_thumbnails);
+    let grid_image = grid_requested_px
+        .filter(|_| previews)
+        .and_then(|requested_px| {
+            app.image_cache
+                .thumbnails
+                .get(&(entry_path.clone(), requested_px))
+        });
     let grid_icon = grid_requested_px.and_then(|requested_px| {
         app.image_cache
             .grid_icons
             .get(&(entry_path.clone(), requested_px))
     });
-    let shared_icon = entry_type_icon_key(&entry_path, entry.kind).and_then(|key| {
-        let size = if crate::network::is_unc_path(&entry_path) {
-            0
-        } else {
-            grid_requested_px.unwrap_or(0)
-        };
-        app.image_cache.types.get(&(key, size))
-    });
-    let image = grid_image.or(grid_icon).or(shared_icon).or_else(|| {
-        if grid_requested_px.is_some() {
-            return None;
-        }
-        app.icons
-            .get(&(tab.id, tab.latest_request(), entry.id))
-            .or_else(|| app.image_cache.ordinary.get(&entry_path))
-    });
+    let path_icon =
+        grid_requested_px.and_then(|px| app.image_cache.path_icons.get(&(entry_path.clone(), px)));
+    let shared_icon = entry_type_icon_key(&entry_path, entry.kind, entry.icon_requires_path)
+        .and_then(|key| {
+            let size = if crate::network::is_unc_path(&entry_path) {
+                0
+            } else {
+                grid_requested_px.unwrap_or(0)
+            };
+            app.image_cache.types.get(&(key, size))
+        });
+    let image = grid_image
+        .or(grid_icon)
+        .or(path_icon)
+        .or(shared_icon)
+        .or_else(|| {
+            if grid_requested_px.is_some() {
+                return None;
+            }
+            app.icons
+                .get(&(tab.id, tab.latest_request(), entry.id))
+                .or_else(|| app.image_cache.ordinary.get(&entry_path))
+        });
     let state = grid_requested_px.map_or(0, |requested_px| {
         if grid_image.is_some() {
             2
-        } else if grid_icon.is_some() || shared_icon.is_some() {
+        } else if grid_icon.is_some() || path_icon.is_some() || shared_icon.is_some() {
             4
         } else if app.thumbnail_failures.contains_key(&(
             tab.id,
@@ -197,7 +242,7 @@ pub(super) fn patch_images(
     let Some(mode) = app.view_mode_for_tab(tab_id) else {
         return 0;
     };
-    let size = file_thumbnail_request_px(mode, ui.window().scale_factor());
+    let size = Some(grid_thumbnail_request_px(mode, ui.window().scale_factor()));
     let updates = ids
         .iter()
         .filter_map(|id| tab.visible_entry(*id))
@@ -300,12 +345,18 @@ pub(super) fn present_batch(
         (
             app.windows
                 .iter()
-                .map(|(id, window)| (*id, window.active_tab))
+                .map(|(id, window)| {
+                    (
+                        *id,
+                        window.active_tab,
+                        window.tab_order.iter().any(|tab| locations.contains(tab)),
+                    )
+                })
                 .collect::<Vec<_>>(),
             app.active_window,
         )
     };
-    for (window_id, tab_id) in windows {
+    for (window_id, tab_id, location_changed) in windows {
         let target = window_ui(window_id);
         let ui = match target.as_ref() {
             Some(ui) => ui,
@@ -321,22 +372,25 @@ pub(super) fn present_batch(
                         .into_iter()
                         .filter(|id| {
                             tab.visible_entry(*id)
-                                .and_then(|entry| entry_type_icon_key(&entry.path(), entry.kind))
+                                .and_then(|entry| {
+                                    entry_type_icon_key(
+                                        &entry.path(),
+                                        entry.kind,
+                                        entry.icon_requires_path,
+                                    )
+                                })
                                 .is_some_and(|key| types.contains(&key))
                         }),
                 );
             }
         }
         changed += patch_images(ui, state, tab_id, &ids);
-        if locations.contains(&tab_id) {
-            update_icon_row(
+        if location_changed || types.contains(&ShellTypeIconKey::Directory) {
+            refresh_window_regions(
                 ui,
                 state,
-                IconUpdate {
-                    tab_id,
-                    entry_id: None,
-                    type_key: None,
-                },
+                window_id,
+                RefreshRegions::NAVIGATION | RefreshRegions::TABS,
             );
         }
         if !types.is_empty() {

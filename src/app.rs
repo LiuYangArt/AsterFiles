@@ -136,9 +136,10 @@ const TYPE_SELECT_TIMEOUT: Duration = Duration::from_millis(1_000);
 fn entry_type_icon_key(
     path: &Path,
     kind: crate::domain::EntryKind,
+    icon_requires_path: bool,
 ) -> Option<platform::windows::shell_icons::ShellTypeIconKey> {
     let network = crate::network::is_unc_path(path);
-    if kind == crate::domain::EntryKind::Directory && !network {
+    if !network && icon_requires_path {
         return None;
     }
     let path_specific_local_file = !network
@@ -396,7 +397,7 @@ fn install_directory_models(
         groups.clone(),
         tab,
         app,
-        file_thumbnail_request_px(mode, ui.window().scale_factor()),
+        Some(grid_thumbnail_request_px(mode, ui.window().scale_factor())),
         file_row_height(mode),
     );
     let rows = if preserve && let Some(current) = directory_rows(ui) {
@@ -657,9 +658,7 @@ fn native_tab_drag_image(
     let app = state.lock().ok()?;
     let drag = app.tab_drag?;
     let tab = app.tab(drag.tab_id)?;
-    let icon = tab
-        .visible_path()
-        .and_then(|path| app.image_cache.ordinary.get(path))
+    let icon = file_images::location_icon(&app, tab)
         .map(|icon| (icon.width, icon.height, icon.pixels.to_vec()));
     let title = tab
         .visible_path()
@@ -826,15 +825,18 @@ fn list_icon_plan(
         }
     }
     let residents = entries.iter().map(|entry| entry.id).collect();
-    let requested_px = file_thumbnail_request_px(view_mode, ui.window().scale_factor());
+    let requested_px = grid_thumbnail_request_px(view_mode, ui.window().scale_factor());
     let requests = entries
         .iter()
         .filter_map(|entry| {
-            if let Some(px) = requested_px {
-                thumbnail_request(&mut app, tab_id, request_id, entry, px)
-            } else {
-                ordinary_icon_request(&mut app, tab_id, request_id, entry)
-            }
+            file_image_request(
+                &mut app,
+                tab_id,
+                request_id,
+                entry,
+                requested_px,
+                view_uses_thumbnails(view_mode),
+            )
         })
         .collect();
     (residents, requests)
@@ -912,17 +914,44 @@ fn grid_thumbnail_plan(
     let resident_ids = entries.iter().map(|entry| entry.id).collect::<HashSet<_>>();
     let mut requests = Vec::new();
     for entry in entries {
-        if let Some(request) = thumbnail_request(&mut app, tab_id, request_id, &entry, requested_px)
-        {
+        if let Some(request) = file_image_request(
+            &mut app,
+            tab_id,
+            request_id,
+            &entry,
+            requested_px,
+            view_uses_thumbnails(view_mode),
+        ) {
             requests.push(request);
         }
     }
     (tab_id, resident_ids, requests)
 }
 
-fn file_thumbnail_request_px(view_mode: ViewMode, scale: f32) -> Option<u32> {
-    (view_mode.uses_grid_layout() || matches!(view_mode, ViewMode::Details | ViewMode::Content))
-        .then(|| grid_thumbnail_request_px(view_mode, scale))
+fn view_uses_thumbnails(mode: ViewMode) -> bool {
+    match mode {
+        ViewMode::List | ViewMode::Details => false,
+        ViewMode::Icons(size) => size > 16,
+        ViewMode::Tiles | ViewMode::Content => true,
+    }
+}
+
+fn file_image_request(
+    app: &mut AppState,
+    tab_id: TabId,
+    request_id: RequestId,
+    entry: &FileEntry,
+    requested_px: u32,
+    thumbnails: bool,
+) -> Option<IconRequest> {
+    if crate::network::is_unc_path(&entry.path()) {
+        return ordinary_icon_request(app, tab_id, request_id, entry);
+    }
+    if thumbnails {
+        thumbnail_request(app, tab_id, request_id, entry, requested_px)
+    } else {
+        file_images::shared_icon_request(app, tab_id, request_id, entry, requested_px)
+    }
 }
 
 fn thumbnail_request(
@@ -947,7 +976,7 @@ fn thumbnail_request(
     {
         return None;
     }
-    if let Some(type_key) = entry_type_icon_key(&entry_path, entry.kind)
+    if let Some(type_key) = entry_type_icon_key(&entry_path, entry.kind, entry.icon_requires_path)
         && (entry.size_bytes == Some(0) || app.thumbnail_types.get(&type_key) != Some(&true))
     {
         return file_images::shared_icon_request(app, tab_id, request_id, entry, requested_px);
@@ -1642,7 +1671,7 @@ struct AppState {
     image_cache: icon_cache::IconCache,
     type_icon_requests: HashSet<(platform::windows::shell_icons::ShellTypeIconKey, u32)>,
     thumbnail_types: HashMap<platform::windows::shell_icons::ShellTypeIconKey, bool>,
-    ordinary_icon_requests: HashSet<(TabId, RequestId, PathBuf)>,
+    ordinary_icon_requests: HashSet<(TabId, RequestId, PathBuf, u32)>,
     sidebar_icons: HashMap<PathBuf, platform::windows::shell_icons::ShellIconRgba>,
     libraries: Vec<platform::windows::libraries::WindowsLibrary>,
     library_failures: Vec<platform::windows::libraries::LibraryFailure>,
@@ -3021,6 +3050,7 @@ struct IconEvent {
     path: PathBuf,
     icon: platform::windows::shell_icons::ShellIconRgba,
     actual_thumbnail: bool,
+    thumbnail_requested: bool,
     requested_px: u32,
     type_key: Option<platform::windows::shell_icons::ShellTypeIconKey>,
     thumbnail_failed: bool,
@@ -4057,7 +4087,7 @@ fn submit_navigation(
         app.thumbnail_failures
             .retain(|(request_tab, _, _, _), _| *request_tab != tab_id);
         app.ordinary_icon_requests
-            .retain(|(request_tab, _, _)| *request_tab != tab_id);
+            .retain(|(request_tab, _, _, _)| *request_tab != tab_id);
         app.focus_after_refresh.remove(&tab_id);
         let visibility = app.file_visibility;
         let (request_id, cancel) = {
@@ -4120,7 +4150,7 @@ fn submit_network_navigation(
         app.thumbnail_failures
             .retain(|(request_tab, _, _, _), _| *request_tab != tab_id);
         app.ordinary_icon_requests
-            .retain(|(request_tab, _, _)| *request_tab != tab_id);
+            .retain(|(request_tab, _, _, _)| *request_tab != tab_id);
         app.focus_after_refresh.remove(&tab_id);
         let visibility = app.file_visibility;
         let (request_id, cancel) = {
@@ -4332,7 +4362,7 @@ fn submit_library_navigation(
         app.thumbnail_failures
             .retain(|(request_tab, _, _, _), _| *request_tab != tab_id);
         app.ordinary_icon_requests
-            .retain(|(request_tab, _, _)| *request_tab != tab_id);
+            .retain(|(request_tab, _, _, _)| *request_tab != tab_id);
         app.focus_after_refresh.remove(&tab_id);
         let visibility = app.file_visibility;
         let Some(tab) = app.tab_mut(tab_id) else {
@@ -15900,6 +15930,7 @@ fn spawn_everything_worker(
                                     },
                                     open_target: None,
                                     library_source_index: None,
+                                    icon_requires_path: item.icon_requires_path,
                                     parent_display: item
                                         .parent
                                         .as_os_str()
@@ -17182,6 +17213,7 @@ fn run_icon_request(
                 request.tab_id,
                 request.request_id,
                 request.path.clone(),
+                request.requested_px,
             ));
         }
         if let Some((_, key)) = thumbnail_plan {
@@ -17206,6 +17238,11 @@ fn run_icon_request(
             app.image_cache
                 .types
                 .get(&(key.clone(), request.requested_px))
+                .map(|image| (image.clone(), false))
+        } else if request.requested_px > 0 {
+            app.image_cache
+                .path_icons
+                .get(&(request.path.clone(), request.requested_px))
                 .map(|image| (image.clone(), false))
         } else {
             app.image_cache
@@ -17267,9 +17304,17 @@ fn run_icon_request(
         )
     } else {
         (
-            cached
-                .map(|(image, _)| image)
-                .or_else(|| platform::windows::shell_icons::shell_icon_rgba(&request.path).ok()),
+            cached.map(|(image, _)| image).or_else(|| {
+                if request.requested_px == 0 {
+                    platform::windows::shell_icons::shell_icon_rgba(&request.path).ok()
+                } else {
+                    platform::windows::shell_icons::shell_icon_rgba_at_size(
+                        &request.path,
+                        request.requested_px,
+                    )
+                    .ok()
+                }
+            }),
             false,
         )
     };
@@ -17288,6 +17333,7 @@ fn run_icon_request(
             path: request.path,
             icon,
             actual_thumbnail,
+            thumbnail_requested: request.thumbnail,
             requested_px: request.requested_px,
             type_key: request.type_key,
             thumbnail_failed: false,
@@ -17305,6 +17351,7 @@ fn run_icon_request(
                 pixels: Vec::new().into(),
             },
             actual_thumbnail: false,
+            thumbnail_requested: true,
             requested_px: request.requested_px,
             type_key: None,
             thumbnail_failed,
@@ -17314,8 +17361,12 @@ fn run_icon_request(
         if let Some(key) = request.type_key {
             app.type_icon_requests.remove(&(key, request.requested_px));
         }
-        app.ordinary_icon_requests
-            .remove(&(request.tab_id, request.request_id, request.path));
+        app.ordinary_icon_requests.remove(&(
+            request.tab_id,
+            request.request_id,
+            request.path,
+            request.requested_px,
+        ));
     }
     if let Some((_, key)) = thumbnail_plan {
         thumbnails.finish(&key);
@@ -18304,10 +18355,12 @@ fn apply_icon_event(state: &SharedSessions, event: IconEvent) -> Option<IconUpda
             type_key: None,
         });
     }
-    if event.requested_px == 0 {
-        app.ordinary_icon_requests
-            .remove(&(event.tab_id, event.request_id, event.path.clone()));
-    }
+    app.ordinary_icon_requests.remove(&(
+        event.tab_id,
+        event.request_id,
+        event.path.clone(),
+        event.requested_px,
+    ));
     if let Some(key) = event.type_key.as_ref() {
         app.type_icon_requests
             .remove(&(key.clone(), event.requested_px));
@@ -18347,8 +18400,10 @@ fn apply_icon_event(state: &SharedSessions, event: IconEvent) -> Option<IconUpda
         ));
         let cache = if event.actual_thumbnail {
             &mut app.image_cache.thumbnails
-        } else {
+        } else if event.thumbnail_requested {
             &mut app.image_cache.grid_icons
+        } else {
+            &mut app.image_cache.path_icons
         };
         cache.insert((event.path.clone(), event.requested_px), event.icon);
     } else {
@@ -18367,7 +18422,9 @@ fn icon_event_is_current(app: &AppState, event: &IconEvent) -> bool {
             && match event.target {
                 IconTarget::Entry(entry_id) => tab.visible_entry(entry_id).is_some_and(|entry| {
                     event.type_key.as_ref().is_some_and(|key| {
-                        entry_type_icon_key(&entry.path(), entry.kind).as_ref() == Some(key)
+                        entry_type_icon_key(&entry.path(), entry.kind, entry.icon_requires_path)
+                            .as_ref()
+                            == Some(key)
                             && event.path == key.query_path()
                     }) || (event.type_key.is_none() && entry.path.matches(&event.path))
                 }),
@@ -18453,6 +18510,7 @@ fn append_active_file_rows(
     ui.set_status_text(status_text(tab, Texts::new(app.language)).into());
 }
 
+#[cfg(test)]
 fn update_icon_row(ui: &AppWindow, state: &SharedSessions, update: IconUpdate) {
     let app = state.lock().expect("app state mutex is not poisoned");
     let Some(window_id) = app.window_for_tab(update.tab_id) else {
@@ -18472,7 +18530,8 @@ fn update_icon_row(ui: &AppWindow, state: &SharedSessions, update: IconUpdate) {
             .into_iter()
             .filter_map(|id| tab.visible_entry(id))
             .filter(|entry| {
-                entry_type_icon_key(&entry.path(), entry.kind).as_ref() == Some(&type_key)
+                entry_type_icon_key(&entry.path(), entry.kind, entry.icon_requires_path).as_ref()
+                    == Some(&type_key)
             })
             .map(|entry| entry.id)
             .collect::<HashSet<_>>();
@@ -18481,11 +18540,12 @@ fn update_icon_row(ui: &AppWindow, state: &SharedSessions, update: IconUpdate) {
         return;
     }
     let Some(entry_id) = update.entry_id else {
-        let path = tab.visible_path();
-        ui.set_current_location_icon(
-            path.and_then(|path| app.image_cache.ordinary.get(path))
-                .map(shell_icon_image)
-                .unwrap_or_default(),
+        drop(app);
+        refresh_window_regions(
+            ui,
+            state,
+            window_id,
+            RefreshRegions::NAVIGATION | RefreshRegions::TABS,
         );
         return;
     };
@@ -18597,7 +18657,10 @@ fn update_file_rows(
     let Some(view_mode) = app.view_mode_for_tab(tab_id) else {
         return;
     };
-    let grid_requested_px = file_thumbnail_request_px(view_mode, ui.window().scale_factor());
+    let grid_requested_px = Some(grid_thumbnail_request_px(
+        view_mode,
+        ui.window().scale_factor(),
+    ));
     let rows = changed
         .iter()
         .filter_map(|id| tab.visible_entry(*id))

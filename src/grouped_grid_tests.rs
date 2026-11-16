@@ -20,6 +20,7 @@ fn fixture(mode: ViewMode) -> (AppWindow, WindowSessions) {
                 kind: crate::domain::EntryKind::File,
                 open_target: None,
                 library_source_index: None,
+                icon_requires_path: false,
                 parent_display: String::new(),
                 size_bytes: Some(1),
                 folder_size: FolderSizeState::Unknown,

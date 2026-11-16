@@ -523,6 +523,7 @@ mod tests {
             kind,
             open_target: None,
             library_source_index: None,
+            icon_requires_path: false,
             parent_display: String::new(),
             size_bytes: size,
             folder_size: FolderSizeState::Unknown,

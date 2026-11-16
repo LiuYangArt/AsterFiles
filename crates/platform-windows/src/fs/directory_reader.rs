@@ -81,8 +81,11 @@ fn entry_from_metadata(
     if !metadata_is_visible(&metadata, visibility) {
         return None;
     }
+    let icon_requires_path = metadata_icon_requires_path(&metadata);
     let metadata = metadata_for_entry(&path, metadata);
-    Some(file_entry(name, path, metadata, id))
+    let mut entry = file_entry(name, path, metadata, id);
+    entry.icon_requires_path |= icon_requires_path;
+    Some(entry)
 }
 
 fn file_entry(
@@ -107,6 +110,7 @@ fn file_entry(
         kind,
         open_target: None,
         library_source_index: None,
+        icon_requires_path: metadata_icon_requires_path(&metadata),
         parent_display: String::new(),
         size_bytes: metadata.is_file().then_some(metadata.len()),
         folder_size: crate::domain::FolderSizeState::Unknown,
@@ -114,6 +118,24 @@ fn file_entry(
         created: metadata.created().ok(),
         webdav: None,
     }
+}
+
+#[cfg(windows)]
+fn metadata_icon_requires_path(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    let attributes = metadata.file_attributes();
+    directory_icon_requires_path(attributes & 0x10 != 0, attributes)
+}
+
+#[cfg(not(windows))]
+fn metadata_icon_requires_path(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+pub(crate) fn directory_icon_requires_path(directory: bool, attributes: u32) -> bool {
+    // Shell honors desktop.ini on read-only/system folders; reparse points can own icons too.
+    const CUSTOM_DIRECTORY_ATTRIBUTES: u32 = 0x1 | 0x4 | 0x400;
+    directory && attributes & CUSTOM_DIRECTORY_ATTRIBUTES != 0
 }
 
 #[cfg(windows)]
@@ -175,6 +197,17 @@ mod tests {
         on_batch: impl FnMut(Vec<FileEntry>),
     ) -> io::Result<ReadOutcome> {
         collect_directory_fixture(path, cancel, FileVisibility::default(), on_batch)
+    }
+
+    #[test]
+    fn issue_194_directory_icon_attributes_preserve_shell_customization() {
+        for attributes in [0x1, 0x4, 0x400, 0x11, 0x14, 0x410] {
+            assert!(directory_icon_requires_path(true, attributes));
+            assert!(!directory_icon_requires_path(false, attributes));
+        }
+        for attributes in [0, 0x10, 0x12, 0x20] {
+            assert!(!directory_icon_requires_path(true, attributes));
+        }
     }
 
     #[test]

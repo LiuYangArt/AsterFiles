@@ -12,6 +12,7 @@ fn entry(id: u32, extension: &str, size: u64) -> FileEntry {
         kind: crate::domain::EntryKind::File,
         open_target: None,
         library_source_index: None,
+        icon_requires_path: false,
         parent_display: r"C:\issue-175-icons".into(),
         size_bytes: Some(size),
         folder_size: FolderSizeState::NotIndexed,
@@ -49,6 +50,7 @@ fn icon_event(request: IconRequest, value: u8) -> IconEvent {
             pixels: vec![value; (size * size * 4) as usize].into(),
         },
         actual_thumbnail: request.thumbnail,
+        thumbnail_requested: request.thumbnail,
         requested_px: request.requested_px,
         type_key: request.type_key,
         thumbnail_failed: false,
@@ -136,7 +138,7 @@ fn issue_175_icons_real_shell_and_pixel_updates_stay_viewport_bounded() {
     assert!(!request.thumbnail);
     assert_eq!(
         request.requested_px,
-        file_thumbnail_request_px(ViewMode::Details, ui.window().scale_factor()).unwrap()
+        grid_thumbnail_request_px(ViewMode::Details, ui.window().scale_factor())
     );
     assert!(requests.try_recv().is_err());
     assert_eq!(scheduler.shared.0.lock().unwrap().plans.next_any(), None);
@@ -223,6 +225,13 @@ fn issue_175_icons_real_shell_and_pixel_updates_stay_viewport_bounded() {
 fn issue_175_icons_type_identity_size_navigation_and_preview_capabilities() {
     i_slint_backend_testing::init_no_event_loop();
     let (state, ui) = fixture(50, "png", 200);
+    state
+        .lock()
+        .unwrap()
+        .update_directory_preference(PathBuf::from(r"C:\issue-175-icons"), |view| {
+            view.view_mode = ViewMode::Content
+        });
+    refresh_ui(&ui, &WindowSessions::new(state.clone(), WindowId(1)));
     let (sender, receiver) = mpsc::channel();
     let scheduler = ThumbnailScheduler::new(sender);
     request_visible_file_images(&ui, &state, WindowId(1), &scheduler);
@@ -306,6 +315,13 @@ fn shared_request_after_navigation(app: &mut AppState) -> IconRequest {
 fn issue_175_icons_batch_updates_real_pixels_once_and_discards_stale_previews() {
     i_slint_backend_testing::init_no_event_loop();
     let (state, ui) = fixture(100, "png", 500);
+    state
+        .lock()
+        .unwrap()
+        .update_directory_preference(PathBuf::from(r"C:\issue-175-icons"), |view| {
+            view.view_mode = ViewMode::Content
+        });
+    refresh_ui(&ui, &WindowSessions::new(state.clone(), WindowId(1)));
     let (sender, receiver) = mpsc::channel();
     let scheduler = ThumbnailScheduler::new(sender);
     request_visible_file_images(&ui, &state, WindowId(1), &scheduler);
@@ -364,5 +380,358 @@ fn issue_175_icons_batch_updates_real_pixels_once_and_discards_stale_previews() 
     assert_eq!(
         file_images::resident_ids(&ui, &app, WindowId(1), app.tab(TabId(1)).unwrap()),
         [tail]
+    );
+}
+
+fn issue_194_set_mode(state: &SharedSessions, ui: &AppWindow, mode: ViewMode) {
+    state
+        .lock()
+        .unwrap()
+        .update_directory_preference(PathBuf::from(r"C:\issue-175-icons"), |view| {
+            view.view_mode = mode
+        });
+    refresh_ui(ui, &WindowSessions::new(state.clone(), WindowId(1)));
+}
+
+#[test]
+fn issue_194_icon_only_views_skip_content_at_all_dpi_scales() {
+    i_slint_backend_testing::init_no_event_loop();
+    for mode in [ViewMode::List, ViewMode::Details, ViewMode::SmallIcons] {
+        let (state, ui) = fixture(100, "png", 500);
+        issue_194_set_mode(&state, &ui, mode);
+        let (sender, requests) = mpsc::channel();
+        let scheduler = ThumbnailScheduler::new(sender);
+        {
+            let mut app = state.lock().unwrap();
+            app.thumbnail_types
+                .insert(ShellTypeIconKey::Extension("png".into()), true);
+        }
+        request_visible_file_images(&ui, &state, WindowId(1), &scheduler);
+        let actual = requests.try_iter().collect::<Vec<_>>();
+        assert_eq!(actual.len(), 1, "{mode:?} shares one type request");
+        assert!(!actual[0].thumbnail);
+        assert!(
+            scheduler
+                .shared
+                .0
+                .lock()
+                .unwrap()
+                .plans
+                .next_any()
+                .is_none()
+        );
+        let request_id = state.lock().unwrap().active().latest_request();
+        for scale in [1.0, 1.5, 2.0, 3.0] {
+            let size = grid_thumbnail_request_px(mode, scale);
+            let mut app = state.lock().unwrap();
+            for extension in ["jpg", "exe", "lnk", "ico", "url"] {
+                let target = entry(200, extension, 500);
+                let request = file_image_request(
+                    &mut app,
+                    TabId(1),
+                    request_id,
+                    &target,
+                    size,
+                    view_uses_thumbnails(mode),
+                );
+                if let Some(request) = request {
+                    assert!(!request.thumbnail, "{mode:?} at {scale}");
+                    assert_eq!(request.requested_px, size);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn issue_194_folders_share_cache_across_navigation_and_keep_sizes_separate() {
+    i_slint_backend_testing::init_no_event_loop();
+    let (state, _ui) = fixture(1, "txt", 100);
+    let mut folder = entry(1, "folder", 0);
+    folder.kind = crate::domain::EntryKind::Directory;
+    let mut other = folder.clone();
+    other.id = EntryId(2);
+    other.path = PathBuf::from(r"C:\another-directory\another-folder").into();
+    let request = {
+        let mut app = state.lock().unwrap();
+        let request_id = app.active().latest_request();
+        let request =
+            file_image_request(&mut app, TabId(1), request_id, &folder, 32, false).unwrap();
+        assert_eq!(request.type_key, Some(ShellTypeIconKey::Directory));
+        assert!(file_image_request(&mut app, TabId(2), RequestId(99), &other, 32, false).is_none());
+        assert!(file_image_request(&mut app, TabId(2), RequestId(99), &other, 48, false).is_some());
+        request
+    };
+    assert!(apply_icon_event(&state, icon_event(request, 194)).is_some());
+    let mut app = state.lock().unwrap();
+    let (request_id, _) = app.tab_mut(TabId(1)).unwrap().begin_directory_navigation(
+        PathBuf::from(r"C:\another-directory"),
+        NavigationKind::Normal,
+    );
+    assert!(file_image_request(&mut app, TabId(1), request_id, &other, 32, false).is_none());
+    let tab = app.tab(TabId(1)).unwrap();
+    let (image, status) = file_images::row_image(&other, tab, &app, Some(32));
+    assert_eq!(status, 4);
+    assert_eq!(image.to_rgba8().unwrap().as_bytes()[0], 194);
+}
+
+#[test]
+fn issue_194_private_icons_are_sized_and_do_not_suppress_later_previews() {
+    i_slint_backend_testing::init_no_event_loop();
+    let (state, _ui) = fixture(1, "exe", 100);
+    for extension in ["exe", "lnk", "ico", "url"] {
+        let target = entry(1, extension, 100);
+        let mut app = state.lock().unwrap();
+        let request_id = app.active().latest_request();
+        let request =
+            file_image_request(&mut app, TabId(1), request_id, &target, 32, false).unwrap();
+        assert!(request.type_key.is_none());
+        assert!(!request.thumbnail);
+        assert_eq!(request.path, target.path());
+        assert!(file_image_request(&mut app, TabId(1), request_id, &target, 32, false).is_none());
+        assert!(file_image_request(&mut app, TabId(1), request_id, &target, 48, false).is_some());
+    }
+    let mut target = entry(1, "folder", 0);
+    target.kind = crate::domain::EntryKind::Directory;
+    target.icon_requires_path = true;
+    let request = {
+        let mut app = state.lock().unwrap();
+        app.tab_mut(TabId(1))
+            .unwrap()
+            .replace_entries(vec![target.clone()]);
+        let request_id = app.active().latest_request();
+        file_image_request(&mut app, TabId(1), request_id, &target, 32, false).unwrap()
+    };
+    assert!(request.type_key.is_none() && !request.thumbnail);
+    assert!(apply_icon_event(&state, icon_event(request, 17)).is_some());
+    let mut app = state.lock().unwrap();
+    let request_id = app.active().latest_request();
+    assert!(file_image_request(&mut app, TabId(1), request_id, &target, 32, false).is_none());
+    assert!(
+        file_image_request(&mut app, TabId(1), request_id, &target, 32, true)
+            .unwrap()
+            .thumbnail
+    );
+    assert!(
+        app.image_cache
+            .path_icons
+            .contains_key(&(target.path(), 32))
+    );
+    assert!(
+        !app.image_cache
+            .grid_icons
+            .contains_key(&(target.path(), 32))
+    );
+}
+
+#[test]
+fn issue_194_same_pixel_size_switch_drops_cached_thumbnail_from_both_models() {
+    i_slint_backend_testing::init_no_event_loop();
+    let (state, ui) = fixture(1, "png", 500);
+    issue_194_set_mode(&state, &ui, ViewMode::Icons(32));
+    let source = ShellIconRgba {
+        width: 32,
+        height: 32,
+        pixels: vec![7; 32 * 32 * 4].into(),
+    };
+    {
+        let mut app = state.lock().unwrap();
+        let path = app.active().entries[0].path();
+        app.image_cache
+            .thumbnails
+            .insert((path, 32), source.clone());
+        app.image_cache.types.insert(
+            (ShellTypeIconKey::Extension("png".into()), 32),
+            ShellIconRgba {
+                pixels: vec![3; 32 * 32 * 4].into(),
+                ..source
+            },
+        );
+    }
+    refresh_ui(&ui, &WindowSessions::new(state.clone(), WindowId(1)));
+    let retained = directory_rows(&ui).unwrap();
+    assert_eq!(retained.row_data(0).unwrap().thumbnail_state, 2);
+    let (sender, _) = mpsc::channel();
+    let scheduler = ThumbnailScheduler::new(sender);
+    request_visible_file_images(&ui, &state, WindowId(1), &scheduler);
+    issue_194_set_mode(&state, &ui, ViewMode::Details);
+    let current = directory_rows(&ui).unwrap();
+    let row = current.row_data(0).unwrap();
+    assert_eq!(row.thumbnail_state, 4);
+    assert_eq!(row.icon.to_rgba8().unwrap().as_bytes()[0], 3);
+    retained.replace_from(&current);
+    let row = retained.row_data(0).unwrap();
+    assert_eq!(row.thumbnail_state, 4);
+    assert_eq!(row.icon.to_rgba8().unwrap().as_bytes()[0], 3);
+    let app = state.lock().unwrap();
+    let (image, status) =
+        file_images::row_image(&app.active().entries[0], app.active(), &app, Some(32));
+    assert_eq!(status, 4);
+    assert_eq!(image.to_rgba8().unwrap().as_bytes()[0], 3);
+}
+
+#[test]
+fn issue_194_preview_views_keep_folder_content_and_unc_never_reads_remote_images() {
+    let mut app = AppState::new_for_test(vec![PathBuf::from(r"C:\policy")], 0, [0, 1, 2, 3]);
+    let mut target = entry(1, "folder", 0);
+    target.kind = crate::domain::EntryKind::Directory;
+    target.size_bytes = None;
+    app.thumbnail_types
+        .insert(ShellTypeIconKey::Directory, true);
+    for mode in [
+        ViewMode::MediumIcons,
+        ViewMode::LargeIcons,
+        ViewMode::ExtraLargeIcons,
+        ViewMode::Tiles,
+        ViewMode::Content,
+    ] {
+        assert!(view_uses_thumbnails(mode));
+        assert!(
+            file_image_request(&mut app, TabId(1), RequestId(1), &target, 48, true)
+                .unwrap()
+                .thumbnail
+        );
+    }
+    target.path = PathBuf::from(r"\\server\share\folder").into();
+    let request = file_image_request(&mut app, TabId(1), RequestId(1), &target, 48, false).unwrap();
+    assert!(!request.thumbnail);
+    assert_eq!(request.requested_px, 0);
+    assert_eq!(request.type_key, Some(ShellTypeIconKey::Directory));
+}
+
+fn issue_194_location_event(state: &SharedSessions, tab_id: TabId, value: u8) -> IconEvent {
+    let app = state.lock().unwrap();
+    let tab = app.tab(tab_id).unwrap();
+    icon_event(
+        IconRequest {
+            tab_id,
+            request_id: tab.latest_request(),
+            target: IconTarget::Location,
+            path: tab.visible_path().unwrap().to_path_buf(),
+            thumbnail: false,
+            requested_px: 0,
+            type_key: None,
+        },
+        value,
+    )
+}
+
+#[test]
+fn issue_194_location_result_refreshes_tab_and_address_without_rebuilding_files() {
+    i_slint_backend_testing::init_no_event_loop();
+    let (state, ui) = fixture(1, "txt", 100);
+    let before = ui.get_files();
+    assert_eq!(ui.get_tabs().row_data(0).unwrap().icon.size().width, 0);
+    let (sender, _) = mpsc::channel();
+    let scheduler = ThumbnailScheduler::new(sender);
+    let event = issue_194_location_event(&state, TabId(1), 71);
+    file_images::present_batch(&ui, &state, &scheduler, vec![event]);
+    assert_eq!(
+        ui.get_tabs()
+            .row_data(0)
+            .unwrap()
+            .icon
+            .to_rgba8()
+            .unwrap()
+            .as_bytes()[0],
+        71
+    );
+    assert_eq!(
+        ui.get_current_location_icon()
+            .to_rgba8()
+            .unwrap()
+            .as_bytes()[0],
+        71
+    );
+    assert!(std::ptr::eq(before.as_any(), ui.get_files().as_any()));
+}
+
+#[test]
+fn issue_194_background_location_result_updates_its_tab_without_changing_active_address() {
+    i_slint_backend_testing::init_no_event_loop();
+    let (state, ui) = fixture(1, "txt", 100);
+    let background = {
+        let mut app = state.lock().unwrap();
+        let id = app.create_tab(PathBuf::from(r"C:\background-folder"));
+        app.active_window_state_mut().active_tab = TabId(1);
+        id
+    };
+    refresh_ui(&ui, &WindowSessions::new(state.clone(), WindowId(1)));
+    let address = ui.get_current_location_icon();
+    let (sender, _) = mpsc::channel();
+    let scheduler = ThumbnailScheduler::new(sender);
+    let event = issue_194_location_event(&state, background, 83);
+    file_images::present_batch(&ui, &state, &scheduler, vec![event]);
+    let row = ui
+        .get_tabs()
+        .iter()
+        .find(|row| row.id == background.0 as i32)
+        .unwrap();
+    assert_eq!(row.icon.to_rgba8().unwrap().as_bytes()[0], 83);
+    assert_eq!(ui.get_current_location_icon().size(), address.size());
+    assert_eq!(
+        state.lock().unwrap().active_window_state().active_tab,
+        TabId(1)
+    );
+}
+
+#[test]
+fn issue_194_shared_folder_image_updates_location_chrome_and_specific_icon_takes_priority() {
+    i_slint_backend_testing::init_no_event_loop();
+    let (state, ui) = fixture(1, "txt", 100);
+    let event = {
+        let app = state.lock().unwrap();
+        icon_event(
+            IconRequest {
+                tab_id: TabId(1),
+                request_id: app.active().latest_request(),
+                target: IconTarget::Entry(EntryId(1)),
+                path: ShellTypeIconKey::Directory.query_path(),
+                thumbnail: false,
+                requested_px: 32,
+                type_key: Some(ShellTypeIconKey::Directory),
+            },
+            91,
+        )
+    };
+    let (sender, _) = mpsc::channel();
+    let scheduler = ThumbnailScheduler::new(sender);
+    file_images::present_batch(&ui, &state, &scheduler, vec![event]);
+    assert_eq!(
+        ui.get_tabs()
+            .row_data(0)
+            .unwrap()
+            .icon
+            .to_rgba8()
+            .unwrap()
+            .as_bytes()[0],
+        91
+    );
+    assert_eq!(
+        ui.get_current_location_icon()
+            .to_rgba8()
+            .unwrap()
+            .as_bytes()[0],
+        91
+    );
+    let event = issue_194_location_event(&state, TabId(1), 92);
+    file_images::present_batch(&ui, &state, &scheduler, vec![event]);
+    refresh_ui(&ui, &WindowSessions::new(state.clone(), WindowId(1)));
+    assert_eq!(
+        ui.get_tabs()
+            .row_data(0)
+            .unwrap()
+            .icon
+            .to_rgba8()
+            .unwrap()
+            .as_bytes()[0],
+        92
+    );
+    assert_eq!(
+        ui.get_current_location_icon()
+            .to_rgba8()
+            .unwrap()
+            .as_bytes()[0],
+        92
     );
 }

@@ -8,10 +8,12 @@ type ImageKey = (PathBuf, u32);
 
 struct Images {
     requested_px: Option<u32>,
+    previews: bool,
     ordinary: HashMap<PathBuf, ShellIconRgba>,
     types: HashMap<(ShellTypeIconKey, u32), ShellIconRgba>,
     thumbnails: HashMap<ImageKey, ShellIconRgba>,
     grid_icons: HashMap<ImageKey, ShellIconRgba>,
+    path_icons: HashMap<ImageKey, ShellIconRgba>,
     entries: HashMap<EntryId, ShellIconRgba>,
     failed: HashSet<PathBuf>,
 }
@@ -20,6 +22,9 @@ impl Images {
     fn new(tab: &TabSession, app: &AppState, requested_px: Option<u32>) -> Self {
         Self {
             requested_px,
+            previews: app
+                .view_mode_for_tab(tab.id)
+                .is_some_and(view_uses_thumbnails),
             ordinary: if requested_px.is_none() {
                 app.image_cache.ordinary.clone()
             } else {
@@ -28,6 +33,7 @@ impl Images {
             types: app.image_cache.types.clone(),
             thumbnails: app.image_cache.thumbnails.snapshot(),
             grid_icons: app.image_cache.grid_icons.snapshot(),
+            path_icons: app.image_cache.path_icons.snapshot(),
             entries: app
                 .icons
                 .iter()
@@ -50,30 +56,39 @@ impl Images {
     }
 
     fn evict(&mut self, id: EntryId, path: &Path) -> bool {
-        let previous = self.thumbnails.len() + self.grid_icons.len();
+        let previous = self.thumbnails.len() + self.grid_icons.len() + self.path_icons.len();
         self.thumbnails
             .retain(|(candidate, _), _| candidate != path);
         self.grid_icons
             .retain(|(candidate, _), _| candidate != path);
+        self.path_icons
+            .retain(|(candidate, _), _| candidate != path);
         let ordinary = self.ordinary.remove(path).is_some();
         let entry = self.entries.remove(&id).is_some();
-        previous != self.thumbnails.len() + self.grid_icons.len() || ordinary || entry
+        previous != self.thumbnails.len() + self.grid_icons.len() + self.path_icons.len()
+            || ordinary
+            || entry
     }
 
     fn get(&self, entry: &FileEntry) -> (Image, i32) {
         let entry_path = entry.path();
         let key = self.requested_px.map(|px| (entry_path.clone(), px));
-        let thumbnail = key.as_ref().and_then(|key| self.thumbnails.get(key));
+        let thumbnail = key
+            .as_ref()
+            .filter(|_| self.previews)
+            .and_then(|key| self.thumbnails.get(key));
         let grid = key.as_ref().and_then(|key| self.grid_icons.get(key));
-        let shared = entry_type_icon_key(&entry_path, entry.kind).and_then(|key| {
-            let px = if crate::network::is_unc_path(&entry_path) {
-                0
-            } else {
-                self.requested_px.unwrap_or(0)
-            };
-            self.types.get(&(key, px))
-        });
-        let image = thumbnail.or(grid).or(shared).or_else(|| {
+        let path_icon = key.as_ref().and_then(|key| self.path_icons.get(key));
+        let shared = entry_type_icon_key(&entry_path, entry.kind, entry.icon_requires_path)
+            .and_then(|key| {
+                let px = if crate::network::is_unc_path(&entry_path) {
+                    0
+                } else {
+                    self.requested_px.unwrap_or(0)
+                };
+                self.types.get(&(key, px))
+            });
+        let image = thumbnail.or(grid).or(path_icon).or(shared).or_else(|| {
             if self.requested_px.is_some() {
                 return None;
             }
@@ -84,7 +99,7 @@ impl Images {
         let state = self.requested_px.map_or(0, |_| {
             if thumbnail.is_some() {
                 2
-            } else if grid.is_some() || shared.is_some() {
+            } else if grid.is_some() || path_icon.is_some() || shared.is_some() {
                 4
             } else if self.failed.contains(&entry_path) {
                 3
@@ -148,6 +163,7 @@ fn same_entry(left: &FileEntry, right: &FileEntry) -> bool {
         && left.display_name == right.display_name
         && left.name_highlights == right.name_highlights
         && left.kind == right.kind
+        && left.icon_requires_path == right.icon_requires_path
         && left.open_target == right.open_target
         && left.parent_display == right.parent_display
         && left.size_bytes == right.size_bytes
@@ -466,6 +482,8 @@ impl DirectoryRows {
             let new_count = next.visuals.len();
             for index in 0..old_count.min(new_count) {
                 let differs = state.visuals[index] != next.visuals[index]
+                    || state.images.requested_px != next.images.requested_px
+                    || state.images.previews != next.images.previews
                     || match next.visuals[index] {
                         ListVisualRow::Entry { entry_id } => {
                             state.texts.language != next.texts.language
@@ -492,7 +510,10 @@ impl DirectoryRows {
             }
             // Keep viewport images across reorders, but never carry an old extension's icon.
             for (id, image) in &state.image_updates {
-                if let (Some(old), Some(new)) = (state.entry(*id), next.entry(*id))
+                if state.images.requested_px == next.images.requested_px
+                    && state.images.previews == next.images.previews
+                    && let (Some(old), Some(new)) = (state.entry(*id), next.entry(*id))
+                    && old.icon_requires_path == new.icon_requires_path
                     && (old.path == new.path
                         || old.path.extension().map(|ext| ext.to_ascii_lowercase())
                             == new.path.extension().map(|ext| ext.to_ascii_lowercase())
@@ -891,6 +912,9 @@ mod tests {
     fn fixture(count: u32, shared_icon: bool) -> (AppState, Rc<DirectoryRows>) {
         let root = PathBuf::from(r"C:\issue-165-images");
         let mut app = AppState::new_for_test(vec![root.clone()], 0, [0, 1, 2, 3]);
+        app.update_directory_preference(root.clone(), |view| {
+            view.view_mode = ViewMode::MediumIcons
+        });
         let tab = app.tab_mut(TabId(1)).unwrap();
         tab.load_state = LoadState::Complete;
         tab.replace_entries(
@@ -906,6 +930,7 @@ mod tests {
                         kind: crate::domain::EntryKind::File,
                         open_target: None,
                         library_source_index: None,
+                        icon_requires_path: false,
                         parent_display: root.display().to_string(),
                         size_bytes: Some(1),
                         folder_size: FolderSizeState::NotIndexed,
@@ -922,8 +947,12 @@ mod tests {
             pixels: Arc::from([20, 40, 80, 255]),
         };
         if shared_icon {
-            let key = entry_type_icon_key(&root.join("item-1.png"), crate::domain::EntryKind::File)
-                .unwrap();
+            let key = entry_type_icon_key(
+                &root.join("item-1.png"),
+                crate::domain::EntryKind::File,
+                false,
+            )
+            .unwrap();
             app.image_cache.types.insert((key, 48), image);
         } else {
             app.image_cache

@@ -542,7 +542,7 @@ impl AppState {
             tab.cancel_pending();
             self.icons.retain(|(tab_id, _, _), _| *tab_id != closing);
             self.ordinary_icon_requests
-                .retain(|(tab_id, _, _)| *tab_id != closing);
+                .retain(|(tab_id, _, _, _)| *tab_id != closing);
             if tab.kind == TabKind::Files
                 && let Some(path) = tab.current_location().clone()
             {
@@ -1269,6 +1269,7 @@ mod tests {
                 kind: crate::domain::EntryKind::File,
                 open_target: None,
                 library_source_index: None,
+                icon_requires_path: false,
                 parent_display: "same".into(),
                 size_bytes: Some(1),
                 folder_size: crate::domain::FolderSizeState::Unknown,

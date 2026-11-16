@@ -441,6 +441,7 @@ fn encode_batch(entries: &[FileEntry], skipped: usize, done: bool) -> io::Result
             EntryKind::File => 1,
             EntryKind::Other => 2,
         });
+        bytes.push(u8::from(entry.icon_requires_path));
         write_optional_u64(&mut bytes, entry.size_bytes);
         write_system_time(&mut bytes, entry.modified)?;
         write_system_time(&mut bytes, entry.created)?;
@@ -545,6 +546,11 @@ fn read_batch(reader: impl Read) -> io::Result<(Vec<FileEntry>, usize, bool)> {
                 ));
             }
         };
+        let icon_requires_path = match read_byte(&bytes, &mut offset)? {
+            0 => false,
+            1 => true,
+            _ => return Err(io::ErrorKind::InvalidData.into()),
+        };
         let size_bytes = read_optional_u64(&bytes, &mut offset)?;
         let modified = read_system_time(&bytes, &mut offset)?;
         let created = read_system_time(&bytes, &mut offset)?;
@@ -557,6 +563,7 @@ fn read_batch(reader: impl Read) -> io::Result<(Vec<FileEntry>, usize, bool)> {
             kind,
             open_target: None,
             library_source_index: None,
+            icon_requires_path,
             parent_display: String::new(),
             size_bytes,
             folder_size: if crate::network::is_unc_path(&entry_path) {
@@ -585,6 +592,18 @@ pub use test_support::{run_test_directory_child, test_directory_stream_started};
 mod test_support {
     use super::*;
 
+    #[test]
+    fn issue_194_directory_helper_retains_independent_icon_marker() {
+        for independent in [false, true] {
+            let mut item = entry(1);
+            item.kind = EntryKind::Directory;
+            item.icon_requires_path = independent;
+            let bytes = encode_batch(&[item], 0, false).unwrap();
+            let (decoded, _, _) = read_batch(bytes.as_slice()).unwrap();
+            assert_eq!(decoded[0].icon_requires_path, independent);
+        }
+    }
+
     pub(super) fn entry(id: u32) -> FileEntry {
         let name = OsString::from(format!("file-{id}"));
         FileEntry {
@@ -596,6 +615,7 @@ mod test_support {
             kind: EntryKind::File,
             open_target: None,
             library_source_index: None,
+            icon_requires_path: false,
             parent_display: String::new(),
             size_bytes: Some(u64::from(id)),
             folder_size: FolderSizeState::NotIndexed,

@@ -33,6 +33,7 @@ fn fixture(count: u32, mode: ViewMode, group: GroupField) -> SharedSessions {
                     kind: crate::domain::EntryKind::File,
                     open_target: None,
                     library_source_index: None,
+                    icon_requires_path: false,
                     parent_display: ROOT.into(),
                     size_bytes: Some(u64::from(id)),
                     folder_size: FolderSizeState::NotIndexed,
@@ -60,11 +61,7 @@ fn eager_reference(
         .map(|entry| (entry.id, entry))
         .collect::<HashMap<_, _>>();
     let texts = Texts::new(app.language);
-    let requested_px = if mode.uses_grid_layout() {
-        Some(grid_thumbnail_request_px(mode, 1.0))
-    } else {
-        file_thumbnail_request_px(mode, 1.0)
-    };
+    let requested_px = Some(grid_thumbnail_request_px(mode, 1.0));
     if mode.uses_grid_layout() {
         let projection = IconProjection::from_groups(
             &groups,
@@ -363,11 +360,7 @@ fn issue_165_lazy_rows_match_eager_contents_and_preserve_nested_models() {
             let app = state.lock().unwrap();
             let tab = app.tab(TabId(1)).unwrap();
             let groups = directory_group_projections(&app, tab, tab.visible_entries());
-            let requested_px = if mode.uses_grid_layout() {
-                Some(grid_thumbnail_request_px(mode, 1.0))
-            } else {
-                file_thumbnail_request_px(mode, 1.0)
-            };
+            let requested_px = Some(grid_thumbnail_request_px(mode, 1.0));
             let model = DirectoryRows::new(
                 tab.entries.clone(),
                 groups.clone(),

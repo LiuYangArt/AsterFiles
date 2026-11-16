@@ -172,6 +172,7 @@ pub struct EverythingSearchItem {
     pub created: Option<SystemTime>,
     pub modified: Option<SystemTime>,
     pub is_directory: bool,
+    pub icon_requires_path: bool,
     pub name_highlights: Vec<EverythingHighlightSegment>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -779,6 +780,10 @@ fn parse_item(
         created,
         modified,
         is_directory: item_flags & 1 != 0 || attributes & 0x10 != 0,
+        icon_requires_path: crate::fs::directory_icon_requires_path(
+            item_flags & 1 != 0 || attributes & 0x10 != 0,
+            attributes,
+        ),
         name_highlights,
     })
 }
@@ -1640,6 +1645,27 @@ mod tests {
         );
         assert_eq!(get32(&encoded, 20).unwrap(), REQ_FULL | 0x20);
         assert_eq!(get32(&encoded, 24).unwrap(), 12);
+    }
+
+    #[test]
+    fn issue_194_search_preserves_custom_directory_attributes() {
+        for attributes in [0x10_u32, 0x11, 0x14, 0x410] {
+            let full = wide(r"C:\data\folder");
+            let table_end = LIST_HEADER + ITEM_SIZE;
+            let mut bytes = vec![0_u8; table_end];
+            put32(&mut bytes, 0, 1);
+            put32(&mut bytes, 4, 1);
+            put32(&mut bytes, 12, REQ_FULL | REQ_ATTRIBUTES);
+            put32(&mut bytes, LIST_HEADER + 4, table_end as u32);
+            bytes.extend_from_slice(&((full.len() - 1) as u32).to_le_bytes());
+            for unit in full {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            bytes.extend_from_slice(&attributes.to_le_bytes());
+            let page = parse_results(&bytes).unwrap();
+            assert!(page.items[0].is_directory);
+            assert_eq!(page.items[0].icon_requires_path, attributes != 0x10);
+        }
     }
 
     #[test]

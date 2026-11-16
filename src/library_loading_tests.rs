@@ -488,6 +488,7 @@ fn partial_failure_reader(
             kind: crate::domain::EntryKind::File,
             open_target: None,
             library_source_index: None,
+            icon_requires_path: false,
             parent_display: "partial".into(),
             size_bytes: Some(104),
             folder_size: FolderSizeState::Unknown,

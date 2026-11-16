@@ -16,6 +16,7 @@ fn entry(id: u32, name: &str) -> FileEntry {
         kind: EntryKind::File,
         open_target: None,
         library_source_index: None,
+        icon_requires_path: false,
         parent_display: NETWORK_PATH.to_owned(),
         size_bytes: Some(u64::from(id)),
         folder_size: FolderSizeState::NotIndexed,

@@ -132,7 +132,7 @@ pub(super) fn apply_completed(app: &mut AppState, old: &Path, new: &Path) -> Ren
     app.thumbnail_failures
         .retain(|(_, _, path, _), _| path != old && path != new);
     app.ordinary_icon_requests
-        .retain(|(_, _, path)| path != old && path != new);
+        .retain(|(_, _, path, _)| path != old && path != new);
     for path in &mut app.cut_paths {
         if path == old {
             *path = new.to_path_buf();
@@ -226,6 +226,7 @@ mod tests {
             kind: EntryKind::File,
             open_target: None,
             library_source_index: None,
+            icon_requires_path: false,
             parent_display: String::new(),
             size_bytes: Some(7),
             folder_size: FolderSizeState::Unknown,
@@ -378,6 +379,7 @@ mod tests {
             path: PathBuf::from(r"C:\photos\a.png"),
             icon: image(48),
             actual_thumbnail: true,
+            thumbnail_requested: true,
             requested_px: 48,
             type_key: None,
             thumbnail_failed: false,
@@ -617,9 +619,12 @@ mod tests {
             });
             let px = grid_thumbnail_request_px(mode, 1.0);
             for name in ["a.png", "b.png"] {
-                app.image_cache
-                    .thumbnails
-                    .insert((PathBuf::from(r"C:\photos").join(name), px), image(px));
+                let cache = if view_uses_thumbnails(mode) {
+                    &mut app.image_cache.thumbnails
+                } else {
+                    &mut app.image_cache.path_icons
+                };
+                cache.insert((PathBuf::from(r"C:\photos").join(name), px), image(px));
             }
             let state = Arc::new(Mutex::new(app));
             refresh_ui(&ui, &WindowSessions::new(state.clone(), WindowId(1)));
@@ -682,7 +687,7 @@ mod tests {
             );
             assert_eq!(
                 rows.iter().find(|row| row.id == 1).unwrap().thumbnail_state,
-                2
+                if view_uses_thumbnails(mode) { 2 } else { 4 }
             );
         }
     }

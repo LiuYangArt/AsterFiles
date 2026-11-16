@@ -140,6 +140,7 @@ fn synthetic_entry(id: u32, directory_every: u32) -> FileEntry {
         },
         open_target: None,
         library_source_index: None,
+        icon_requires_path: false,
         parent_display: SYNTHETIC_DIRECTORY.to_owned(),
         size_bytes: (!directory).then_some(u64::from(id)),
         folder_size: if directory {

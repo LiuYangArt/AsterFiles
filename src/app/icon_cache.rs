@@ -14,6 +14,7 @@ pub(super) struct IconCache {
     pub(super) types: HashMap<(ShellTypeIconKey, u32), ShellIconRgba>,
     pub(super) thumbnails: BoundedImages,
     pub(super) grid_icons: BoundedImages,
+    pub(super) path_icons: BoundedImages,
 }
 
 impl Default for IconCache {
@@ -23,6 +24,7 @@ impl Default for IconCache {
             types: HashMap::new(),
             thumbnails: BoundedImages::new(PREVIEW_CACHE_CAPACITY),
             grid_icons: BoundedImages::new(PREVIEW_CACHE_CAPACITY),
+            path_icons: BoundedImages::new(PREVIEW_CACHE_CAPACITY),
         }
     }
 }
@@ -31,6 +33,7 @@ impl IconCache {
     pub(super) fn rename_paths(&mut self, old: &Path, new: &Path, retain: bool) {
         self.thumbnails.rename_paths(old, new, retain);
         self.grid_icons.rename_paths(old, new, retain);
+        self.path_icons.rename_paths(old, new, retain);
         let old_icon = self.ordinary.remove(old);
         self.ordinary.remove(new);
         if retain && let Some(icon) = old_icon {
