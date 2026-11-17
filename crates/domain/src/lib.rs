@@ -733,6 +733,8 @@ pub struct TabSession {
     directory_snapshot: Option<DirectorySnapshot>,
     navigation_kind: NavigationKind,
     retain_directory_view: bool,
+    viewport_y: f32,
+    search_scroll_y: f32,
     back_history: Vec<NavigationLocation>,
     forward_history: Vec<NavigationLocation>,
     pub entries: Arc<Vec<FileEntry>>,
@@ -776,6 +778,8 @@ impl TabSession {
             directory_snapshot: None,
             navigation_kind: NavigationKind::Normal,
             retain_directory_view: false,
+            viewport_y: 0.0,
+            search_scroll_y: 0.0,
             back_history: Vec::new(),
             forward_history: Vec::new(),
             entries: Arc::new(Vec::new()),
@@ -818,6 +822,39 @@ impl TabSession {
 
     pub fn retains_directory_view(&self) -> bool {
         self.retain_directory_view && self.page_source == PageSource::Directory
+    }
+
+    pub fn viewport(&self) -> (f32, f32) {
+        (self.viewport_y, self.search_scroll_y)
+    }
+
+    pub fn remember_viewport(
+        &mut self,
+        request_id: RequestId,
+        viewport_y: f32,
+        search_scroll_y: f32,
+    ) -> bool {
+        let retained_request = self.retains_directory_view()
+            && request_id.0.checked_add(1) == Some(self.latest_request.0);
+        if self.latest_request != request_id && !retained_request {
+            return false;
+        }
+        self.viewport_y = if viewport_y.is_finite() {
+            viewport_y.min(0.0)
+        } else {
+            0.0
+        };
+        self.search_scroll_y = if search_scroll_y.is_finite() {
+            search_scroll_y.min(0.0)
+        } else {
+            0.0
+        };
+        true
+    }
+
+    fn reset_viewport(&mut self) {
+        self.viewport_y = 0.0;
+        self.search_scroll_y = 0.0;
     }
 
     pub fn displayed_load_state(&self) -> LoadState {
@@ -880,6 +917,8 @@ impl TabSession {
             directory_snapshot: None,
             navigation_kind: NavigationKind::Normal,
             retain_directory_view: false,
+            viewport_y: 0.0,
+            search_scroll_y: 0.0,
             back_history: source.back_history.clone(),
             forward_history: source.forward_history.clone(),
             entries: source.entries.clone(),
@@ -1066,6 +1105,7 @@ impl TabSession {
         }
         self.page_source = PageSource::Search;
         self.retain_directory_view = false;
+        self.reset_viewport();
         self.address_mode = AddressMode::Smart;
         self.address_editing = true;
         self.search_scope = scope;
@@ -1119,6 +1159,9 @@ impl TabSession {
             self.rebuild_entry_indices();
         }
         self.page_source = PageSource::Directory;
+        if was_search {
+            self.reset_viewport();
+        }
         self.address_editing = false;
         self.address_mode = AddressMode::Normal;
         self.address_input.clear();
@@ -1155,6 +1198,9 @@ impl TabSession {
             && location
                 .directory_path()
                 .is_some_and(|path| !crate::network::is_unc_path(path));
+        if !self.retain_directory_view {
+            self.reset_viewport();
+        }
         self.requested_location = Some(location);
         self.page_source = PageSource::Directory;
         self.directory_snapshot = None;
@@ -1187,6 +1233,7 @@ impl TabSession {
         self.latest_request.0 += 1;
         self.navigation_kind = kind;
         self.retain_directory_view = false;
+        self.reset_viewport();
         self.commit_location(NavigationLocation::Home);
         self.page_source = PageSource::Directory;
         self.directory_snapshot = None;

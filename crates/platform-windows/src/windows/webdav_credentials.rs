@@ -100,13 +100,19 @@ fn read_generic(connection_id: u64) -> io::Result<Option<String>> {
             Err(code)
         };
     }
-    // SAFETY: CredReadW owns the live header/blob until CredFree. Constructing the slice additionally
-    // requires a non-null blob even when empty; the empty-blob path does not establish this (#179).
+    // SAFETY: CredReadW owns the live header/blob until CredFree. Windows may return a null
+    // blob for an empty password; that case must not construct a Rust slice from the pointer.
     let value = unsafe {
         let header = &*credential;
-        let bytes =
-            std::slice::from_raw_parts(header.CredentialBlob, header.CredentialBlobSize as usize);
-        let password = String::from_utf8(bytes.to_vec()).ok();
+        let password = if header.CredentialBlobSize == 0 {
+            Some(String::new())
+        } else {
+            let bytes = std::slice::from_raw_parts(
+                header.CredentialBlob,
+                header.CredentialBlobSize as usize,
+            );
+            String::from_utf8(bytes.to_vec()).ok()
+        };
         CredFree(credential.cast());
         password
     };
@@ -147,10 +153,47 @@ fn wide_null(value: &str) -> Vec<u16> {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    struct TestCredential(u64);
+
+    #[cfg(windows)]
+    impl TestCredential {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64;
+            let id = stamp
+                ^ (u64::from(std::process::id()) << 32)
+                ^ NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(load(id).unwrap(), None);
+            Self(id)
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for TestCredential {
+        fn drop(&mut self) {
+            delete(self.0).expect("remove owned test credential");
+        }
+    }
+
     #[test]
     #[cfg(windows)]
-    fn webdav_password_roundtrip_stays_out_of_the_target_name() {
-        let id = 0x1570_0000_u64.wrapping_add(std::process::id() as u64);
+    fn issue_179_empty_windows_credential_returns_an_empty_password() {
+        let credential = TestCredential::new();
+        store(credential.0, "reader", "").unwrap();
+        assert_eq!(load(credential.0).unwrap(), Some(String::new()));
+        delete(credential.0).unwrap();
+        assert_eq!(load(credential.0).unwrap(), None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn issue_179_webdav_password_roundtrip_stays_out_of_the_target_name() {
+        let credential = TestCredential::new();
+        let id = credential.0;
         let password = "webdav-test-secret";
         store(id, "reader", password).unwrap();
         let loaded = load(id).unwrap();

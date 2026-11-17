@@ -2563,6 +2563,46 @@ fn merge_report(report: &mut FileOperationReport, child: FileOperationReport) {
     }
 }
 
+// Only exact paths owned by the current copy reach this cleanup; never scan by name prefix.
+pub(crate) fn remove_copy_temporary(path: &Path) -> io::Result<()> {
+    let result = match fs::remove_file(path) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => error,
+    };
+    #[cfg(windows)]
+    if result.kind() == io::ErrorKind::PermissionDenied {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_file() && metadata.permissions().readonly() {
+            let mut permissions = metadata.permissions();
+            // Windows-only: clear the copied read-only bit, without changing the file's ACL.
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            fs::set_permissions(path, permissions)?;
+            return fs::remove_file(path);
+        }
+    }
+    Err(result)
+}
+
+fn discard_copy_temporary(temporary: &Path, original: OperationError) -> OperationError {
+    match remove_copy_temporary(temporary) {
+        Ok(()) => original,
+        Err(cleanup) => {
+            let message = format!(
+                "{original:?}; temporary copy cleanup failed: {}: {cleanup}",
+                temporary.display()
+            );
+            crate::operation_audit::record("copy-temporary-cleanup-failed", &message);
+            OperationError::Io {
+                path: temporary.to_path_buf(),
+                kind: cleanup.kind(),
+                message,
+            }
+        }
+    }
+}
+
 fn copy_file_safely(
     source: &Path,
     destination: &Path,
@@ -2577,14 +2617,12 @@ fn copy_file_safely(
         .map_err(|error| OperationError::io(&temporary, error))?;
     let result = copy_file_to_new_path(source, &temporary, execution, progress, report);
     if let Err(error) = result {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
+        return Err(discard_copy_temporary(&temporary, error));
     }
     let private_identity = match file_identity(&temporary) {
         Ok(identity) => identity,
         Err(error) => {
-            let _ = fs::remove_file(&temporary);
-            return Err(error);
+            return Err(discard_copy_temporary(&temporary, error));
         }
     };
     if let Err(error) = if replace_existing {
@@ -2592,8 +2630,7 @@ fn copy_file_safely(
     } else {
         fs::rename(&temporary, destination).map_err(|error| OperationError::io(destination, error))
     } {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
+        return Err(discard_copy_temporary(&temporary, error));
     }
     let published_identity = file_identity(destination)?;
     if !same_stable_file(private_identity, published_identity) {
@@ -2647,14 +2684,12 @@ fn copy_symlink_safely(
     check_cancel(cancel)?;
     let temporary = unique_sibling(destination, ".asterfiles-copy");
     if let Err(error) = copy_symlink(source, &temporary, metadata) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
+        return Err(discard_copy_temporary(&temporary, error));
     }
     let identity = match file_identity(&temporary) {
         Ok(identity) => identity,
         Err(error) => {
-            let _ = fs::remove_file(&temporary);
-            return Err(error);
+            return Err(discard_copy_temporary(&temporary, error));
         }
     };
     let result = if replace_existing {
@@ -2663,8 +2698,7 @@ fn copy_symlink_safely(
         fs::rename(&temporary, destination).map_err(|error| OperationError::io(destination, error))
     };
     if let Err(error) = result {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
+        return Err(discard_copy_temporary(&temporary, error));
     }
     Ok(identity)
 }
@@ -5200,3 +5234,7 @@ mod tests {
 #[cfg(all(test, windows))]
 #[path = "file_operations/issue_102_tests.rs"]
 mod issue_102_tests;
+
+#[cfg(all(test, windows))]
+#[path = "file_operations/issue_185_tests.rs"]
+mod issue_185_tests;

@@ -66,89 +66,93 @@ export component TabBar inherits Rectangle {
     HorizontalLayout {
         x: 8px; y: 12px; width: parent.width - 8px - 3 * 46px; height: 34px; spacing: 5px;
         Rectangle {
-            width: root.tab-strip-width; height: 34px; clip: true;
-            tab-strip := Flickable {
-                width: parent.width; height: parent.height;
-                interactive: false;
-                viewport-width: root.tab-content-width;
-                viewport-height: self.height;
-                changed width => { root.reveal-tab(root.active-tab-index); }
-                Rectangle {
-                    width: max(root.tab-content-width, tab-strip.width); height: 34px;
-                    for tab[index] in root.tabs: Rectangle {
-                        accessible-role: AccessibleRole.tab;
-                        accessible-id: root.accessibility-window-id + "/tab/" + tab.id;
-                        accessible-label: tab.title;
-                        accessible-item-selectable: true;
-                        accessible-item-selected: tab.active;
-                        accessible-action-default => { root.activate-tab(tab.id); root.reveal-tab(index); }
-                        x: root.tab-dragging
-                        ? (index < root.tab-drag-source-index ? index : index > root.tab-drag-source-index ? index - 1 : index) * (root.tab-width + 5px)
-                        : index * (root.tab-width + 5px);
-                        width: root.tab-width; height: 34px;
-                        visible: !root.tab-dragging || index != root.tab-drag-source-index;
-                        background: tab.active ? transparent : (tab-touch.has-hover ? VisualStyle.titlebar-hover : VisualStyle.tab-strip-background);
-                        border-radius: VisualStyle.tab-corner-radius;
-                        border-width: 0px;
-                        ActiveTabShape {
-                            visible: tab.active;
-                            width: parent.width;
-                            height: parent.height;
-                            shape-color: VisualStyle.navigation-surface-background;
-                            corner-radius: VisualStyle.tab-corner-radius;
-                        }
-                        tab-touch := TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => {
-                                if !root.suppress-tab-click { root.activate-tab(tab.id); root.reveal-tab(index); }
-                                root.suppress-tab-click = false;
+            width: root.tab-strip-width; height: 34px;
+            // Extend only the paint clip; tab layout and pointer targets stay 34px high.
+            Rectangle {
+                width: parent.width; height: parent.height + 1px; clip: true;
+                tab-strip := Flickable {
+                    width: parent.width; height: parent.height;
+                    interactive: false;
+                    viewport-width: root.tab-content-width;
+                    viewport-height: self.height;
+                    changed width => { root.reveal-tab(root.active-tab-index); }
+                    Rectangle {
+                        width: max(root.tab-content-width, tab-strip.width); height: 34px;
+                        for tab[index] in root.tabs: Rectangle {
+                            accessible-role: AccessibleRole.tab;
+                            accessible-id: root.accessibility-window-id + "/tab/" + tab.id;
+                            accessible-label: tab.title;
+                            accessible-item-selectable: true;
+                            accessible-item-selected: tab.active;
+                            accessible-action-default => { root.activate-tab(tab.id); root.reveal-tab(index); }
+                            x: root.tab-dragging
+                            ? (index < root.tab-drag-source-index ? index : index > root.tab-drag-source-index ? index - 1 : index) * (root.tab-width + 5px)
+                            : index * (root.tab-width + 5px);
+                            width: root.tab-width; height: 34px;
+                            visible: !root.tab-dragging || index != root.tab-drag-source-index;
+                            background: tab.active ? transparent : (tab-touch.has-hover ? VisualStyle.titlebar-hover : VisualStyle.tab-strip-background);
+                            border-radius: VisualStyle.tab-corner-radius;
+                            border-width: 0px;
+                            ActiveTabShape {
+                                visible: tab.active;
+                                width: parent.width;
+                                height: parent.height;
+                                shape-color: VisualStyle.navigation-surface-background;
+                                corner-radius: VisualStyle.tab-corner-radius;
                             }
-                            pointer-event(event) => {
-                                if event.button == PointerEventButton.left && event.kind == PointerEventKind.down && !tab.is-settings {
-                                    root.tab-drag-pointer-active = true;
-                                    root.tab-drag-source-index = index;
-                                    root.begin-tab-drag(tab.id, index, (8px + index * (root.tab-width + 5px) + tab-strip.viewport-x + self.mouse-x) / 1px, (12px + self.mouse-y) / 1px);
+                            tab-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    if !root.suppress-tab-click { root.activate-tab(tab.id); root.reveal-tab(index); }
+                                    root.suppress-tab-click = false;
                                 }
-                                if (event.button == PointerEventButton.middle && event.kind == PointerEventKind.up && root.can-close-tab) {
-                                    root.close-tab(tab.id);
-                                }
-                            }
-                            moved => {
-                                if self.pressed && root.tab-drag-pointer-active && root.tab-drag-source-index == index {
-                                    root.tab-drag-pointer-x = 8px + index * (root.tab-width + 5px) + tab-strip.viewport-x + self.mouse-x;
-                                    root.tab-drag-pointer-y = 12px + self.mouse-y;
-                                    let insertion = root.update-tab-drag(root.tab-drag-pointer-x / 1px, root.tab-drag-pointer-y / 1px, 8, root.tab-strip-width / 1px, tab-strip.viewport-x / 1px, root.tab-width / 1px);
-                                    if insertion >= -1 {
-                                        root.tab-dragging = true;
-                                        root.suppress-tab-click = true;
+                                pointer-event(event) => {
+                                    if event.button == PointerEventButton.left && event.kind == PointerEventKind.down && !tab.is-settings {
+                                        root.tab-drag-pointer-active = true;
+                                        root.tab-drag-source-index = index;
+                                        root.begin-tab-drag(tab.id, index, (8px + index * (root.tab-width + 5px) + tab-strip.viewport-x + self.mouse-x) / 1px, (12px + self.mouse-y) / 1px);
+                                    }
+                                    if (event.button == PointerEventButton.middle && event.kind == PointerEventKind.up && root.can-close-tab) {
+                                        root.close-tab(tab.id);
                                     }
                                 }
-                            }
-                            scroll-event(event) => {
-                                tab-strip.viewport-x = max(tab-strip.width - tab-strip.viewport-width, min(0px, tab-strip.viewport-x + (event.delta-x != 0px ? event.delta-x : event.delta-y)));
-                                return accept;
-                            }
-                        }
-                        HorizontalLayout {
-                            x: VisualStyle.tab-shoulder-width;
-                            width: parent.width - VisualStyle.tab-shoulder-span;
-                            padding-left: 10px; padding-right: 7px; spacing: 6px;
-                            InlineIcon { icon-source: tab.is-settings ? IconMap.action-settings : tab.is-home ? IconMap.location-home : (tab.icon.width != 0 ? tab.icon : (tab.is-drive ? IconMap.location-drive : IconMap.file-folder)); icon-size: 16px; }
-                            Text { text: tab.title; color: VisualStyle.text-primary; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
-                            Text { visible: tab.loading && !(root.can-close-tab && tab-touch.has-hover); text: "…"; color: VisualStyle.accent; vertical-alignment: center; }
-                            Rectangle {
-                                visible: root.can-close-tab && (tab-touch.has-hover || close-touch.has-hover);
-                                width: 24px; height: 34px;
-                                Rectangle {
-                                    width: 24px; height: 24px; y: 5px; border-radius: 4px;
-                                    background: close-touch.pressed ? VisualStyle.tab-close-pressed : close-touch.has-hover ? VisualStyle.tab-close-hover : transparent;
-                                    Image { width: 12px; height: 12px; x: 6px; y: 6px; source: IconMap.action-close; colorize: VisualStyle.text-primary; }
+                                moved => {
+                                    if self.pressed && root.tab-drag-pointer-active && root.tab-drag-source-index == index {
+                                        root.tab-drag-pointer-x = 8px + index * (root.tab-width + 5px) + tab-strip.viewport-x + self.mouse-x;
+                                        root.tab-drag-pointer-y = 12px + self.mouse-y;
+                                        let insertion = root.update-tab-drag(root.tab-drag-pointer-x / 1px, root.tab-drag-pointer-y / 1px, 8, root.tab-strip-width / 1px, tab-strip.viewport-x / 1px, root.tab-width / 1px);
+                                        if insertion >= -1 {
+                                            root.tab-dragging = true;
+                                            root.suppress-tab-click = true;
+                                        }
+                                    }
                                 }
-                                close-touch := TouchArea { mouse-cursor: pointer; clicked => { root.close-tab(tab.id); } }
-                                accessible-role: button; accessible-id: root.accessibility-window-id + "/tab/" + tab.id + "/close"; accessible-label: UiTexts.values.text-close-tab; accessible-enabled: root.can-close-tab; accessible-action-default => { if root.can-close-tab { root.close-tab(tab.id); } }
+                                scroll-event(event) => {
+                                    tab-strip.viewport-x = max(tab-strip.width - tab-strip.viewport-width, min(0px, tab-strip.viewport-x + (event.delta-x != 0px ? event.delta-x : event.delta-y)));
+                                    return accept;
+                                }
                             }
+                            HorizontalLayout {
+                                x: VisualStyle.tab-shoulder-width;
+                                width: parent.width - VisualStyle.tab-shoulder-span;
+                                padding-left: 10px; padding-right: 7px; spacing: 6px;
+                                InlineIcon { icon-source: tab.is-settings ? IconMap.action-settings : tab.is-home ? IconMap.location-home : (tab.icon.width != 0 ? tab.icon : (tab.is-drive ? IconMap.location-drive : IconMap.file-folder)); icon-size: 16px; }
+                                Text { text: tab.title; color: VisualStyle.text-primary; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                                Text { visible: tab.loading && !(root.can-close-tab && tab-touch.has-hover); text: "…"; color: VisualStyle.accent; vertical-alignment: center; }
+                                Rectangle {
+                                    visible: root.can-close-tab && (tab-touch.has-hover || close-touch.has-hover);
+                                    width: 24px; height: 34px;
+                                    Rectangle {
+                                        width: 24px; height: 24px; y: 5px; border-radius: 4px;
+                                        background: close-touch.pressed ? VisualStyle.tab-close-pressed : close-touch.has-hover ? VisualStyle.tab-close-hover : transparent;
+                                        Image { width: 12px; height: 12px; x: 6px; y: 6px; source: IconMap.action-close; colorize: VisualStyle.text-primary; }
+                                    }
+                                    close-touch := TouchArea { mouse-cursor: pointer; clicked => { root.close-tab(tab.id); } }
+                                    accessible-role: button; accessible-id: root.accessibility-window-id + "/tab/" + tab.id + "/close"; accessible-label: UiTexts.values.text-close-tab; accessible-enabled: root.can-close-tab; accessible-action-default => { if root.can-close-tab { root.close-tab(tab.id); } }
+                                }
+                            }
+                            Tooltip { text: @markdown("\{tab.title}"); }
                         }
-                        Tooltip { text: @markdown("\{tab.title}"); }
                     }
                 }
             }

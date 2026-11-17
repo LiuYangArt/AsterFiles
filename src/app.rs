@@ -91,6 +91,8 @@ mod loading_hint;
 #[cfg(test)]
 mod network_sort_tests;
 #[cfg(test)]
+mod ready_visual_tests;
+#[cfg(test)]
 mod refresh_tests;
 mod rename_click;
 #[cfg(test)]
@@ -102,6 +104,8 @@ mod scrollbar_tests;
 #[cfg(test)]
 mod selection_scale_tests;
 mod system_accent;
+#[cfg(test)]
+mod tab_scroll_tests;
 #[cfg(test)]
 mod test_support;
 mod ui_refresh;
@@ -16364,7 +16368,7 @@ fn start_everything_event_pump(
                         let _ = sender_for_search_consistency.send(request);
                     }
                     if active {
-                        project_search_page(&ui, &state, tab_id, request_id, offset, total);
+                        project_search_page(&ui, &state, tab_id, request_id, total);
 
                     }
                     return;
@@ -16553,7 +16557,6 @@ fn project_search_page(
     state: &SharedSessions,
     tab_id: TabId,
     request_id: RequestId,
-    offset: u32,
     total: u32,
 ) {
     let should_refresh = state.lock().ok().is_some_and(|app| {
@@ -16565,10 +16568,6 @@ fn project_search_page(
     });
     if !should_refresh {
         return;
-    }
-    if offset == 0 {
-        ui.set_file_viewport_y(0.0);
-        ui.set_search_scroll_y(0.0);
     }
     refresh_tab_window(state, tab_id);
     ui.set_page_state(if total == 0 { 3 } else { 4 });

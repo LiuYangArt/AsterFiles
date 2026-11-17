@@ -362,11 +362,29 @@ impl Staging {
         if self.retired {
             return Ok(());
         }
-        match fs::remove_file(self.file()) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            result => result?,
-        }
+        crate::fs::file_operations::remove_copy_temporary(&self.file())?;
         fs::remove_dir(&self.path)
+    }
+
+    fn finish(&self, outcome: Result<u64, CopyFileError>) -> Result<u64, CopyFileError> {
+        match (outcome, self.cleanup()) {
+            (Ok(bytes), Ok(())) => Ok(bytes),
+            (Err(error), Ok(())) => Err(error),
+            (result, Err(cleanup)) => {
+                let message = format!(
+                    "{}; staging cleanup failed at {} (staged file {}): {cleanup}",
+                    result.err().map_or_else(
+                        || "copy completed".to_owned(),
+                        |error| error.error.to_string()
+                    ),
+                    self.path.display(),
+                    self.file().display(),
+                );
+                crate::operation_audit::record("copy-temporary-cleanup-failed", &message);
+                // Cleanup failure must survive the caller's cancellation-only error mapping.
+                Err(failed(io::Error::other(message)))
+            }
+        }
     }
 }
 
@@ -657,25 +675,7 @@ fn copy_file_with(
         stall_limit,
     );
     execution.set_recovering(false);
-    let cleanup = staging.cleanup();
-    match (outcome, cleanup) {
-        (Ok(bytes), Ok(())) => Ok(bytes),
-        (Err(error), Ok(())) => Err(error),
-        (result, Err(cleanup)) => Err(CopyFileError {
-            kind: result
-                .as_ref()
-                .err()
-                .map_or(CopyFileErrorKind::Failed, |error| error.kind),
-            error: io::Error::other(format!(
-                "{}; staging cleanup failed at {}: {cleanup}",
-                result.err().map_or_else(
-                    || "copy completed".to_owned(),
-                    |error| error.error.to_string()
-                ),
-                staging.path.display()
-            )),
-        }),
-    }
+    staging.finish(outcome)
 }
 
 fn copy_into_staging(
@@ -828,6 +828,40 @@ fn copy_into_staging(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue_185_cancelled_staging_cleanup_failure_remains_a_reportable_error() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = fixture();
+        let source = root.join("source.bin");
+        let destination = root.join("private-copy");
+        let keep = root.join("keep.bin");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&keep, b"other task").unwrap();
+        let execution = CopyExecution::local(CancellationToken::new());
+        let staging = Staging::new(&source, &destination, &execution).unwrap();
+        fs::write(staging.file(), b"partial").unwrap();
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(staging.file())
+            .unwrap();
+        let error = staging.finish(Err(cancelled())).unwrap_err();
+        drop(held);
+        let cleanup = staging.finish(Err(cancelled())).unwrap_err();
+        assert_eq!(error.kind, CopyFileErrorKind::Failed);
+        let message = error.error.to_string();
+        assert!(message.contains("staging cleanup failed"));
+        assert!(message.contains(&staging.file().display().to_string()));
+        assert!(message.contains(&cancelled().error.to_string()));
+        assert_eq!(cleanup.kind, CopyFileErrorKind::Cancelled);
+        assert!(!staging.path.exists());
+        assert!(!destination.exists());
+        assert_eq!(fs::read(&keep).unwrap(), b"other task");
+        assert_eq!(fs::read(&source).unwrap(), b"source");
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn issue_137_read_only_query_retries_network_error_and_timeout() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));

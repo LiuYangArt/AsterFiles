@@ -6,10 +6,10 @@ export component ActiveTabShape inherits Rectangle {
     in property <length> corner-radius;
     background: transparent;
 
-    // One contour prevents independently rasterized pieces from opening seams at fractional positions.
+    // Paint past the shared edge so fractional physical pixels cannot expose the strip below it.
     Path {
         width: parent.width;
-        height: parent.height;
+        height: parent.height + 1px;
         fill: root.shape-color;
         MoveTo { x: 0; y: root.height / 1px; }
         CubicTo {
@@ -31,6 +31,8 @@ export component ActiveTabShape inherits Rectangle {
             control-2-x: root.width / 1px - 4; control-2-y: root.height / 1px;
             x: root.width / 1px; y: root.height / 1px;
         }
+        LineTo { x: root.width / 1px; y: root.height / 1px + 1; }
+        LineTo { x: 0; y: root.height / 1px + 1; }
         Close { }
     }
 }

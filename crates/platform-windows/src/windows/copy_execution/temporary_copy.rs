@@ -252,10 +252,12 @@ pub(crate) fn cleanup_registered(
         }
     }
     if !registry.staged.as_os_str().is_empty() {
-        remove_staging(&registry.staged)?;
+        remove_staging(&registry.staged)
+            .map_err(|error| snapshot_error(&registry.staged, error))?;
     }
     if !registry.current.as_os_str().is_empty() {
-        remove_owned_file(&registry.current)?;
+        remove_owned_file(&registry.current)
+            .map_err(|error| snapshot_error(&registry.current, error))?;
     }
     registry.current.clear();
     registry.staged.clear();
@@ -307,10 +309,7 @@ fn remove_staging(staged: &Path) -> io::Result<()> {
 }
 
 fn remove_owned_file(path: &Path) -> io::Result<()> {
-    match std::fs::remove_file(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        result => result,
-    }
+    crate::fs::file_operations::remove_copy_temporary(path)
 }
 
 fn validate_local_path(path: &Path) -> io::Result<()> {
@@ -390,6 +389,32 @@ mod tests {
         ));
         std::fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn issue_185_registered_cleanup_removes_readonly_owned_outputs_only() {
+        let root = root("readonly");
+        let registry = root.join("registry");
+        let current = root.join(format!(".asterfiles-copy-{}-12345-1", std::process::id()));
+        let staged = current.with_extension("stage-0").join("source.bin");
+        let other = root.join(format!(".asterfiles-copy-{}-12345-2", std::process::id()));
+        std::fs::create_dir(staged.parent().unwrap()).unwrap();
+        for path in [&current, &staged, &other] {
+            std::fs::write(path, b"readonly content").unwrap();
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+        let execution =
+            CopyExecution::isolated(CancellationToken::new(), Some(registry.clone())).unwrap();
+        execution.register_staging(&current, &staged).unwrap();
+        assert!(cleanup_registered(&registry, std::process::id(), false).unwrap());
+        assert!(!current.exists());
+        assert!(!staged.parent().unwrap().exists());
+        assert_eq!(std::fs::read(&other).unwrap(), b"readonly content");
+        assert!(std::fs::metadata(&other).unwrap().permissions().readonly());
+        crate::fs::file_operations::remove_copy_temporary(&other).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

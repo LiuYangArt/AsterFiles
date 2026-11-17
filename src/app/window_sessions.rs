@@ -255,7 +255,6 @@ impl AppState {
         self.windows.get(&id)
     }
 
-    #[cfg(test)]
     pub(super) fn window_mut(&mut self, id: WindowId) -> Option<&mut WindowState> {
         self.windows.get_mut(&id)
     }

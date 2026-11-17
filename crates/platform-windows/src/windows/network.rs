@@ -1119,8 +1119,8 @@ pub fn isolated_network_file_operation(
         }
         if let Err(cleanup) = cleanup {
             record_runtime_event(&format!(
-                "temporary_copy_cleanup_failed code={:?}",
-                cleanup.raw_os_error()
+                "temporary_copy_cleanup_failed registry={} error={cleanup}",
+                temporary_copy.display()
             ));
             return Err(match result {
                 Err(error) => io::Error::new(error.kind(), format!("{error}; {cleanup}")),

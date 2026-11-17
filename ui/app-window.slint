@@ -130,7 +130,7 @@ export component AppWindow inherits Window {
     in property <length> layout-row-height: 32px;
     in property <length> layout-card-width: 0px;
     in property <length> layout-icon-size: 32px;
-    function sync-active-file-viewport() {
+    public function sync-active-file-viewport() {
         if root.is-grid-view-mode(root.view-mode) {
             root.grid-viewport-y = root.file-viewport-y;
         } else {

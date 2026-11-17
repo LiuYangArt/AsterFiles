@@ -48,7 +48,10 @@ pub(super) fn refresh_window_regions(
         dismiss_stale_rename(ui, state, window_id);
         ui.invoke_cancel_internal_drag();
     }
-    let app = state.lock().expect("app state mutex is not poisoned");
+    let mut app = state.lock().expect("app state mutex is not poisoned");
+    if regions.intersects(RefreshRegions::FILES) {
+        remember_projected_viewport(ui, &mut app, window_id);
+    }
     let Some(window) = app.window(window_id) else {
         return;
     };
@@ -110,6 +113,9 @@ pub(super) fn refresh_window_regions(
     if regions.intersects(RefreshRegions::COLUMNS) {
         project_column_layout(ui, tab, &app);
     }
+    if regions.intersects(RefreshRegions::FILES) {
+        restore_projected_viewport(ui, tab, view_mode);
+    }
     drop(app);
     if regions.intersects(RefreshRegions::FILES) {
         apply_pending_rename_ui(ui, state, window_id);
@@ -127,6 +133,44 @@ pub(super) fn refresh_window_regions(
             dismiss_quick_menu_session(window_id, false);
         }
     }
+}
+
+fn remember_projected_viewport(ui: &AppWindow, app: &mut AppState, window_id: WindowId) {
+    let projected = ui.get_projected_file_tab_id();
+    let request = ui.get_projected_file_request_id();
+    if projected < 0 || request < 0 {
+        return;
+    }
+    // The outgoing projection belongs to its original tab, not the newly active tab.
+    if let Some(tab) = app
+        .window_mut(window_id)
+        .and_then(|window| window.tabs.get_mut(&TabId(projected as u32)))
+    {
+        tab.remember_viewport(
+            RequestId(request as u64),
+            ui.get_file_viewport_y(),
+            ui.get_search_scroll_y(),
+        );
+    }
+}
+
+fn restore_projected_viewport(ui: &AppWindow, tab: &TabSession, mode: ViewMode) {
+    let (directory_y, search_y) = tab.viewport();
+    let viewport_y = if tab.page_source == PageSource::Search {
+        let columns = ui.get_grid_column_count().max(1) as usize;
+        let total = tab.search_total.unwrap_or(0);
+        let maximum = search_logical_maximum(total, mode, columns, ui.get_file_viewport_height());
+        let scroll = search_y.clamp(-maximum, 0.0);
+        ui.set_search_scroll_y(scroll);
+        let window = search_window_for_scroll(scroll, total, mode, columns);
+        search_window_viewport_y(scroll, window, mode, columns)
+    } else {
+        let maximum = projected_scroll_maximum(ui, mode, ui.get_file_viewport_height());
+        directory_y.clamp(-maximum, 0.0)
+    };
+    ui.set_file_viewport_y(viewport_y);
+    // Layout switches can retain the same numeric offset but require a different ListView.
+    ui.invoke_sync_active_file_viewport();
 }
 
 fn project_settings(ui: &AppWindow, app: &AppState) {
@@ -260,15 +304,22 @@ fn project_files(
         if ui.get_rectangle_selection_pointer_active() {
             ui.invoke_cancel_rectangle_selection();
         }
-        if ui.get_projected_file_tab_id() != projected_tab_id || !tab.retains_directory_view() {
-            ui.set_file_viewport_y(0.0);
-            ui.set_search_scroll_y(0.0);
-        }
+        ui.set_file_viewport_y(0.0);
+        ui.set_search_scroll_y(tab.viewport().1);
         ui.set_projected_file_tab_id(projected_tab_id);
         ui.set_projected_file_request_id(projected_request_id);
     }
     let grid_columns = grid_column_count_for_view(ui, view_mode);
     let total = tab.search_total.unwrap_or(tab.entries.len() as u32);
+    if tab.page_source == PageSource::Search {
+        let maximum = search_logical_maximum(
+            total,
+            view_mode,
+            grid_columns,
+            ui.get_file_viewport_height(),
+        );
+        ui.set_search_scroll_y(tab.viewport().1.clamp(-maximum, 0.0));
+    }
     let search_index =
         search_result_index_at_scroll(ui.get_search_scroll_y(), total, view_mode, grid_columns);
     let search_window = search_window_for_index(search_index, total, grid_columns);

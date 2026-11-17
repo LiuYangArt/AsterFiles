@@ -75,6 +75,7 @@ export component OperationWindow inherits Window {
                         height: 22px;
                         border-radius: 11px;
                         background: VisualStyle.border;
+                        clip: true;
                         Rectangle {
                             x: operation.progress-known ? 0px : -parent.width + (parent.width * mod(animation-tick(), 2s) / 1s);
                             width: operation.progress-known ? max(0px, min(parent.width, parent.width * operation.progress)) : parent.width;
